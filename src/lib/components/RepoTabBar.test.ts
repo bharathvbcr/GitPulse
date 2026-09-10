@@ -13,6 +13,7 @@ describe("RepoTabBar", () => {
     const { body } = render(RepoTabBar);
     expect(body).toContain('data-testid="tasks-tab-chip"');
     expect(body).toContain('data-testid="fleet-tab-chip"');
+    expect(body).toContain('data-testid="open-repo-tab"');
     expect(body).toContain('title="Open repository"');
   });
 
@@ -128,6 +129,51 @@ describe("RepoTabBar", () => {
     expect(source).toContain("repoStore.moveTabBy");
     expect(source).toContain('aria-live="polite"');
     expect(source).toContain("Drag to reorder");
+  });
+
+  it("keeps Open beside the repository tabs instead of stranded after a growing spacer", () => {
+    const scroller = source.slice(
+      source.indexOf('aria-label="Open repositories"') - 220,
+      source.indexOf('role="tablist"'),
+    );
+    expect(scroller).toContain("min-w-0");
+    expect(scroller).toContain("shrink");
+    expect(scroller).not.toContain("flex-1");
+  });
+
+  it("paints open repository tabs as plates, not ghost text on glass", () => {
+    expect(source).toContain("function repoTabChrome");
+    expect(source).toContain("border-accent/60 bg-accent/10 text-accent");
+    expect(source).toContain("border-border/70 bg-background/50 text-textPrimary");
+    expect(source).not.toContain(
+      "border-transparent text-textMuted hover:text-textPrimary hover:bg-surfaceHover/60",
+    );
+  });
+
+  it("styles Open repository as a labelled pill, not a ghost icon", () => {
+    const openStart = source.indexOf('data-testid="open-repo-tab"');
+    const recents = source.indexOf('<div class="relative shrink-0" data-recents-menu>');
+    const open = source.slice(openStart - 80, recents);
+    expect(open).toContain("gp-btn");
+    expect(open).toContain('title="Open repository"');
+    expect(open).toContain("<span>Open</span>");
+    expect(open).not.toContain("gp-icon-btn");
+  });
+
+  it("opens Tasks from the chip and closes it with a sibling control", () => {
+    expect(source).toContain("setTasksOpen(true)");
+    expect(source).toContain("setTasksOpen(false)");
+    expect(source).toContain('data-testid="tasks-tab-close"');
+    expect(source).toContain("taskChrome");
+    expect(source).toContain("ListChecks");
+    expect(source).toContain("border-accent/60 bg-accent/10 text-accent");
+    expect(source).not.toContain('globalSurface === "tasks" ? "repository" : "tasks"');
+  });
+
+  it("reveals the repository surface when a repository tab is chosen", () => {
+    expect(source).toContain("function selectRepoTab");
+    expect(source).toContain('interfaceStore.setGlobalSurface("repository")');
+    expect(source).toContain("onclick={() => selectRepoTab(tab.id)}");
   });
 
   it("bounds recent repositories dropdown height and enables scrolling to prevent viewport clipping", () => {

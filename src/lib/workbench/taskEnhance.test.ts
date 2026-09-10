@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Task } from "./client";
-import { acceptEnhancementInput, createEnhancementInput, reviewable } from "./taskEnhance";
+import { acceptEnhancementInput, createEnhancementInput } from "./taskEnhance";
 
 const task: Task = {
   id: "t1", revision: 4, updated_at: 1, title: "Keep E42", description: "evidence",
@@ -17,14 +17,6 @@ describe("createEnhancementInput", () => {
     expect(createEnhancementInput(task, ["description"], "  ", "m", { id: "e", requestId: "r" })).toBeNull();
     expect(createEnhancementInput(task, ["description"], "local", "x".repeat(513), { id: "e", requestId: "r" })).toBeNull();
     expect(createEnhancementInput(task, ["description"], "local", "m", { id: "", requestId: "r" })).toBeNull();
-  });
-});
-
-describe("reviewable", () => {
-  it("is true only for a ready proposal", () => {
-    expect(reviewable(null)).toBe(false);
-    expect(reviewable({ state: "ready" } as never)).toBe(true);
-    expect(reviewable({ state: "pending" } as never)).toBe(false);
   });
 });
 

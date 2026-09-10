@@ -1,4 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { selectionWire, type ModelSelection } from "./taskModel";
+
+export type { ModelSelection };
 
 export const STATUSES = ["inbox", "backlog", "ready", "in_progress", "review", "done"] as const;
 export type TaskStatus = (typeof STATUSES)[number];
@@ -445,12 +448,21 @@ export async function listEnhancements(taskID: string, cursor?: string): Promise
 export async function changeEnhancement(method: EnhancementMutation, input: Record<string, unknown>): Promise<Enhancement> {
   return record(await request(method, input), enhancement);
 }
-export async function enhancementConfiguration(): Promise<EnhancementConfiguration> {
-  const raw = object(await request("enhancements.configuration", {}));
+/** Start generation for a pending enhancement; optional model selects the sidecar env. */
+export async function generateEnhancement(
+  input: { id: string; request_id: string; expected_revision: number },
+  selection?: ModelSelection | null,
+): Promise<Enhancement> {
+  return changeEnhancement("enhancements.generate", { ...input, ...selectionWire(selection) });
+}
+export async function enhancementConfiguration(selection?: ModelSelection | null): Promise<EnhancementConfiguration> {
+  const raw = object(await request("enhancements.configuration", selectionWire(selection)));
   if (raw.ok !== true) return invalid();
   const providers = strings(raw.providers), provider = text(raw.provider), model = text(raw.model);
   if (!providers.length || providers.length > 64 || new Set(providers).size !== providers.length || !providers.includes(provider) || model.length > 512) return invalid();
-  return { provider, model, model_source: text(raw.model_source), providers };
+  const model_source = text(raw.model_source);
+  if (model_source.length > 64) return invalid();
+  return { provider, model, model_source, providers };
 }
 export function scopeParams(scope: Scope): Record<string, string> { return scope.kind === "global" ? {} : scope.kind === "workspace" ? { workspace_id: scope.id } : { repository_id: scope.id }; }
 export async function listTasks(scope: Scope, status: TaskStatus, query: string, cursor?: string): Promise<Page<TaskCard>> {
@@ -551,25 +563,27 @@ let wakePending: Promise<void> | null = null, wakeAgain = false;
 let automaticEpoch = 0;
 // This is a delivery hint, not a second scheduler. Manvi owns debounce, claims,
 // quotas and recovery. A failed wake never rejects an already committed save.
-export function wakeAutomatic(): Promise<void> {
+export function wakeAutomatic(selection?: ModelSelection | null): Promise<void> {
   automaticEpoch++;
   wakeAgain = true;
   if (wakePending) return wakePending;
+  const wire = selectionWire(selection);
   wakePending = (async () => {
     do {
       wakeAgain = false;
-      try { publishAutomatic({ status: automaticStatus(await request("enhancements.wake", {})), error: "" }); }
+      try { publishAutomatic({ status: automaticStatus(await request("enhancements.wake", wire)), error: "" }); }
       catch (error) { publishAutomatic({ status: null, error: explainError(error) }); }
     } while (wakeAgain);
-  })().finally(() => { wakePending = null; if (wakeAgain) void wakeAutomatic(); });
+  })().finally(() => { wakePending = null; if (wakeAgain) void wakeAutomatic(selection); });
   return wakePending;
 }
 let statusPending: Promise<void> | null = null;
-export function refreshAutomatic(): Promise<void> {
+export function refreshAutomatic(selection?: ModelSelection | null): Promise<void> {
   if (statusPending) return statusPending;
   const epoch = automaticEpoch;
+  const wire = selectionWire(selection);
   statusPending = (async () => {
-    try { const status = automaticStatus(await request("enhancements.worker", {})); if (epoch === automaticEpoch) publishAutomatic({ status, error: "" }); }
+    try { const status = automaticStatus(await request("enhancements.worker", wire)); if (epoch === automaticEpoch) publishAutomatic({ status, error: "" }); }
     catch (error) { if (epoch === automaticEpoch) publishAutomatic({ status: null, error: explainError(error) }); }
   })().finally(() => { statusPending = null; });
   return statusPending;

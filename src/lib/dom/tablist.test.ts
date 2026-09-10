@@ -50,6 +50,7 @@ describe("every tablist in the app implements the pattern it announces", () => {
     ["ViewSectionBar.svelte", "section switcher"],
     ["ViewTabBar.svelte", "view switcher"],
     ["FileViewer.svelte", "open-file strip"],
+    ["TaskBoard.svelte", "open-task strip"],
   ];
 
   it.each(TABLISTS)("%s handles arrow keys", (file) => {
@@ -73,6 +74,7 @@ describe("every tablist in the app implements the pattern it announces", () => {
     // while no element in the app carried `role="tabpanel"` at all.
     expect(read("ViewSectionPanel.svelte")).toContain('role="tabpanel"');
     expect(read("FileViewer.svelte")).toContain('role="tabpanel"');
+    expect(read("TaskBoard.svelte")).toContain('role="tabpanel"');
   });
 
   it("names the section tablist by its display label, not its raw id", () => {

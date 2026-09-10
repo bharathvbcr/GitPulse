@@ -29,8 +29,16 @@ export function reviewDue(preferences: HygienePreferences, now: number): boolean
   return preferences.weeklyReview && (preferences.lastReview > now || now - preferences.lastReview >= 7 * 86_400_000);
 }
 
+/**
+ * Gitignore-literal escape. Backslash is in the set so a later `\` cannot
+ * undo an earlier meta escape (CodeQL `js/incomplete-sanitization`).
+ */
+export function escapeGitignoreLiteral(value: string): string {
+  return value.replace(/[\\!*?\[\]# ]/g, "\\$&");
+}
+
 /** One anchored literal directory rule, never a broad glob or an index edit. */
 export function ignoreRule(path: string): string | null {
   if (!path || path.length > 4096 || /[\x00-\x1f\x7f\\]/.test(path) || path.split("/").some(p => !p || p === "." || p === ".." || p === ".git")) return null;
-  return "/" + path.replace(/[!*?\[\]# ]/g, "\\$&") + "/";
+  return "/" + escapeGitignoreLiteral(path) + "/";
 }

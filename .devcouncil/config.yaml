@@ -1,0 +1,128 @@
+code_intelligence:
+  allow_polling_fallback: true
+  auto_sync: true
+  debounce_ms: 750
+  debug:
+    auto_discover: false
+    max_value_chars: 4096
+    redact_values: true
+  enabled: true
+  query_freshness_timeout_ms: 2000
+  reconcile_seconds: 60
+commands:
+  lint:
+  - eslint .
+  test:
+  - npm test
+  typecheck:
+  - npm run check
+execution:
+  checkpoint_before_each_task: true
+  coding_cli_probe_order: []
+  cursor_resume_mode: 'off'
+  default_executor: manual
+  grok_resume_mode: 'off'
+  max_repair_attempts: 3
+  refresh_stale_map_on_checkout: true
+  refresh_stale_map_on_verify: true
+  stream_cli_output: false
+gates:
+  block_dependency_changes_without_approval: true
+  block_failed_commands: true
+  block_missing_tests_for_high_requirements: true
+  block_orphan_diffs: true
+  block_schema_change_without_migration: true
+  mode: enforce
+  require_clean_git_before_task: true
+indexing:
+  auto_refresh: true
+  auto_refresh_max_files: 40
+  corpus:
+    auto_refresh_on_verify: true
+    enabled: true
+    paths:
+    - docs
+    - README.md
+  lsp_refs: false
+integrations:
+  agent_flow:
+    enabled: false
+    mode: jsonl
+    trace_path: .devcouncil/logs/traces.jsonl
+  cli_agents:
+    agents: {}
+    enabled: true
+    profiles:
+      default:
+        description: 'Balanced local execution with DevCouncil verification. Claude
+          Code advisor (optional): set model: sonnet and advisor_model: opus.'
+      prod:
+        description: Restrictive execution for high-risk repositories.
+        prompt_preamble: 'Profile: prod. Keep edits minimal and explicitly within
+          task scope.'
+        require_explicit_confirmation: true
+        timeout_seconds: 1800
+      yolo:
+        description: Faster local execution; DevCouncil still verifies the final diff.
+        prompt_preamble: 'Profile: yolo. Move efficiently within the task scope.'
+        timeout_seconds: 3600
+  code_review_graph:
+    command: code-review-graph
+    enabled: false
+    optional: true
+  live_review:
+    cards_path: .devcouncil/live/cards
+    default_client: claude
+    enabled: true
+    signals_path: .devcouncil/live/signals
+models:
+  provider: openrouter
+  roles:
+    arbiter:
+      model: qwen/qwen3-max
+    critic_a:
+      model: qwen/qwen3-max
+    critic_b:
+      model: qwen/qwen3-max
+    implementation_reviewer:
+      model: qwen/qwen3-max
+    live_reviewer:
+      model: qwen/qwen3-max
+    native_agent:
+      model: qwen/qwen3-max
+    planner_a:
+      model: qwen/qwen3-max
+    planner_b:
+      model: qwen/qwen3-max
+    prompt_enhancer:
+      model: qwen/qwen3-max
+    spec_writer:
+      model: qwen/qwen3-max
+privacy:
+  redact_env_vars: true
+  redact_secrets_in_logs: true
+  store_prompts_locally: true
+project:
+  default_branch: main
+  name: GitPulse
+  root: .
+telemetry:
+  cost_budget_usd: null
+verification:
+  rigor:
+    acceptance_corpus: soft
+    acceptance_samples_on_hard: 2
+    coarse_acceptance_proof: hard
+    corpus_stale: soft
+    dead_symbols: hard
+    doc_code_ref: soft
+    effort_heuristics: hard
+    enabled: true
+    enforce_coverage_on_hard: true
+    extra_repair_attempts_on_hard: 1
+    liveness_ratchet: hard
+    min_added_lines_per_planned_file: 5
+    reviewer_required_on_hard: false
+    stale_map: hard
+    stub_detection: hard
+    unwired_files: hard

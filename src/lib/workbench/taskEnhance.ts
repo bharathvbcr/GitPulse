@@ -1,20 +1,18 @@
 import {
   changeEnhancement,
-  enhancementConfiguration,
-  getEnhancement,
   getTask,
-  listEnhancements,
   newID,
   WorkbenchError,
   type Enhancement,
   type EnhancementConfiguration,
   type EnhancementField,
-  type EnhancementSummary,
   type EnhancementMutation,
+  type ModelSelection,
   type Task,
 } from "./client";
 import { canQuickEnhance, enhanceableFields } from "./taskOrganize";
 import { bounded } from "./taskActions";
+import { selectionWire } from "./taskModel";
 
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
   proposal !== null && ["pending", "running", "cancel_requested"].includes(proposal.state);
@@ -25,7 +23,10 @@ type PendingEnhancement = { method: EnhancementMutation; input: Record<string, u
 export class EnhancementAction {
   pending: PendingEnhancement | null = null;
   private running = false;
-  constructor(private io = { change: changeEnhancement, read: getTask }) {}
+  constructor(
+    private io = { change: changeEnhancement, read: getTask },
+    private selection: () => ModelSelection | null = () => null,
+  ) {}
 
   async run(method: EnhancementMutation, input: Record<string, unknown>): Promise<{ proposal: Enhancement; task: Task | null }> {
     if (this.running) throw new WorkbenchError("busy", "An enhancement action is already in progress.");
@@ -55,7 +56,16 @@ export class EnhancementAction {
           }
         }
         if (action.method === "enhancements.create" && proposal.state === "pending") {
-          this.pending = { method: "enhancements.generate", input: { id: proposal.id, request_id: newID(), expected_revision: proposal.revision }, result: null };
+          this.pending = {
+            method: "enhancements.generate",
+            input: {
+              id: proposal.id,
+              request_id: newID(),
+              expected_revision: proposal.revision,
+              ...selectionWire(this.selection()),
+            },
+            result: null,
+          };
           continue;
         }
         this.pending = null;
@@ -100,23 +110,6 @@ export function createEnhancementInput(
   };
 }
 
-export async function loadQuickEnhance(
-  taskId: string,
-): Promise<{
-  task: Task;
-  configuration: EnhancementConfiguration;
-  entries: EnhancementSummary[];
-  proposal: Enhancement | null;
-}> {
-  const [task, configuration, page] = await Promise.all([
-    getTask(taskId),
-    enhancementConfiguration(),
-    listEnhancements(taskId),
-  ]);
-  const proposal = page.items[0] ? await getEnhancement(page.items[0].id) : null;
-  return { task, configuration, entries: page.items, proposal };
-}
-
 export async function startQuickEnhance(
   task: Task,
   fields: readonly EnhancementField[],
@@ -133,10 +126,6 @@ export async function startQuickEnhance(
   if (!input) throw new Error("Nothing is available to enhance.");
   const { proposal } = await action.run("enhancements.create", input);
   return { task, proposal };
-}
-
-export function reviewable(proposal: Enhancement | null): boolean {
-  return proposal?.state === "ready";
 }
 
 export function acceptEnhancementInput(

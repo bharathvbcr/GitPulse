@@ -4,8 +4,9 @@
   import { onMount, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { Clipboard, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2 } from "@lucide/svelte";
+  import { Clipboard, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
+  import { createListenerTracker } from "../dom/listenerTracker";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
@@ -25,6 +26,23 @@
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { reorderPlan } from "../workbench/taskOrganization";
+  import {
+    MAX_TASK_TABS,
+    TASK_EDITOR_PANE_ID,
+    activateTaskTab,
+    canOpenTaskTab,
+    closeTaskTab,
+    emptyTaskTabs,
+    openSavedTaskIds,
+    openTaskTab,
+    publishTaskChrome,
+    retargetTaskTab,
+    updateTaskTab,
+    taskTabLabel,
+    type TaskTabState,
+  } from "../workbench/taskTabs";
+  import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
+  import ScrollCue from "./ScrollCue.svelte";
   import TaskActionDialog from "./TaskActionDialog.svelte";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
@@ -45,9 +63,11 @@
   let columns = $state<Partial<Record<TaskStatus, Page<TaskCard>>>>({});
   let search = $state(""); let initialized = $state(false); let loading = $state(false);
   let error = $state(""); let catalogError = $state(""); let announce = $state("");
-  let taskEditor = $state<{ value: Task | null; status?: TaskStatus; seed?: Partial<TaskDraft> } | null>(null);
+  let taskTabs = $state<TaskTabState>(emptyTaskTabs());
+  let session = $state<{ tabId: string; pane: string; value: Task | null; status?: TaskStatus; seed?: Partial<TaskDraft> } | null>(null);
   let workspaceEditor = $state<{ value: Workspace | null } | null>(null);
   let editorHandle = $state<{ canLeave: () => Promise<boolean> }>();
+  let tabStrip: HTMLDivElement | undefined = $state();
   let workspaceHandle = $state<{ canLeave: () => Promise<boolean> }>();
   let pendingUpdate = $state<TaskBatch | null>(null);
   let actionDialog = $state<{ cards: TaskCard[]; action: TaskAction } | null>(null);
@@ -97,6 +117,12 @@
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
   const selectedCards = $derived(cardsById(displayColumns, selected));
   const busy = $derived(moving || opening || deleting || actionDialog !== null || pendingUpdate !== null);
+  const openCardIds = $derived(openSavedTaskIds(taskTabs));
+  const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
+  $effect(() => {
+    if (repositoryPath) return;
+    publishTaskChrome({ openTabs: taskTabs.tabs.length, inProgress: inProgressCount });
+  });
   const shown = $derived.by(() => {
     const counts = Object.fromEntries(STATUSES.map((status) => [status, visibleIn(status).length])) as Partial<Record<TaskStatus, number>>;
     return visibleStatuses(counts, drag !== null);
@@ -158,8 +184,8 @@
   }
   $effect(() => { const path = repositoryPath; untrack(() => { void initialize(path); }); });
   onMount(() => {
-    let unlisten: (() => void) | undefined;
-    if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => { if (disposed) stop(); else unlisten = stop; }).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
+    const listeners = createListenerTracker();
+    if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
     const onPointerDown = (event: PointerEvent) => { if (addMenu && shouldDismissOverlay(event.target, "[data-add-repo]")) addMenu = false; };
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape" && addMenu) addMenu = false;
@@ -168,11 +194,12 @@
     window.addEventListener("focus", scheduleRefresh);
     window.addEventListener("pointerdown", onPointerDown, true);
     window.addEventListener("keydown", onKey);
+    listeners.track(() => window.clearInterval(clock));
+    listeners.track(() => window.removeEventListener("focus", scheduleRefresh));
+    listeners.track(() => window.removeEventListener("pointerdown", onPointerDown, true));
+    listeners.track(() => window.removeEventListener("keydown", onKey));
     return () => {
-      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); unlisten?.(); window.clearInterval(clock);
-      window.removeEventListener("focus", scheduleRefresh);
-      window.removeEventListener("pointerdown", onPointerDown, true);
-      window.removeEventListener("keydown", onKey);
+      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); listeners.dispose();
     };
   });
   $effect(() => {
@@ -259,12 +286,78 @@
     try { const next = await listWorkspaces(workspaceCursor); workspaces = [...workspaces, ...next.items.filter((r) => !workspaces.some((old) => old.id === r.id))]; workspaceCursor = next.next_cursor; workspaceTotal = next.total; }
     catch (cause) { catalogError = explainError(cause); }
   }
+  async function canLeaveSession(): Promise<boolean> {
+    if (!session) return true;
+    return (await editorHandle?.canLeave()) !== false;
+  }
+  function dropDraftSessionTab() {
+    if (session?.value === null) taskTabs = closeTaskTab(taskTabs, session.tabId);
+  }
   async function confirmDiscard(_message: string): Promise<boolean> {
-    return (!taskEditor || await editorHandle?.canLeave() === true) && (!workspaceEditor || await workspaceHandle?.canLeave() === true);
+    if (!(await canLeaveSession())) return false;
+    dropDraftSessionTab();
+    return !workspaceEditor || await workspaceHandle?.canLeave() === true;
+  }
+  async function openQuickEnhance(id: string) {
+    if (!(await confirmDiscard("Open Quick Enhance? Unsaved edits in the current editor will be discarded."))) return;
+    session = null;
+    enhanceId = id;
+  }
+  function refuseAtCeiling(id: string): boolean {
+    if (canOpenTaskTab(taskTabs, id)) return false;
+    announce = `At most ${MAX_TASK_TABS} tasks can be open. Close one before opening another.`;
+    return true;
+  }
+  async function restoreActiveTab() {
+    const id = taskTabs.activeId;
+    if (!id || session?.tabId === id) return;
+    const tab = taskTabs.tabs.find((item) => item.id === id);
+    if (!tab || tab.draft) {
+      if (tab?.draft) taskTabs = closeTaskTab(taskTabs, id);
+      return;
+    }
+    opening = true; const ticket = ++openingRevision;
+    try {
+      const full = await bounded(getTask(id));
+      if (disposed || ticket !== openingRevision) return;
+      session = { tabId: full.id, pane: full.id, value: full };
+      taskTabs = updateTaskTab(taskTabs, id, { title: full.title, status: full.status, draft: false });
+    } catch (cause) {
+      if (!disposed && ticket === openingRevision) {
+        error = explainError(cause);
+        taskTabs = closeTaskTab(taskTabs, id);
+      }
+    } finally { if (!disposed && ticket === openingRevision) opening = false; }
+  }
+  async function closeOpenTab(id: string) {
+    if (session?.tabId === id) {
+      if (!(await canLeaveSession())) return;
+      session = null;
+    }
+    taskTabs = closeTaskTab(taskTabs, id);
+    if (!session && taskTabs.activeId) void restoreActiveTab();
+  }
+  async function focusOpenTab(id: string) {
+    if (session?.tabId === id || busy) return;
+    if (!(await canLeaveSession())) return;
+    dropDraftSessionTab();
+    taskTabs = activateTaskTab(taskTabs, id);
+    session = null;
+    void restoreActiveTab();
+  }
+  function onTaskTabStripKeydown(event: KeyboardEvent) {
+    const current = taskTabs.tabs.findIndex((tab) => tab.id === taskTabs.activeId);
+    const move = handleTablistKeydown(event.key, current, taskTabs.tabs.length);
+    if (!move) return;
+    event.preventDefault();
+    const target = taskTabs.tabs[move.index];
+    if (!target) return;
+    void focusOpenTab(target.id);
+    focusTabAt(tabStrip, move.index);
   }
   async function newWorkspace() {
     if (busy || !await confirmDiscard("Open a new workspace?") || disposed) return;
-    workspaceEditor = { value: null }; taskEditor = null; enhanceId = null;
+    session = null; taskTabs = emptyTaskTabs(); enhanceId = null; workspaceEditor = { value: null };
   }
   async function editWorkspace(id: string) {
     if (busy) return;
@@ -273,20 +366,31 @@
       if (!await confirmDiscard("Open workspace settings?")) return;
       const full = await bounded(getWorkspace(id));
       if (disposed || ticket !== openingRevision) return;
-      taskEditor = null; enhanceId = null; workspaceEditor = { value: full };
+      session = null; taskTabs = emptyTaskTabs(); enhanceId = null; workspaceEditor = { value: full };
     } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
     finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
   async function openTask(id: string) {
-    if (busy || taskEditor?.value?.id === id) return;
+    if (session?.tabId === id && session.value) return;
+    if (busy) return;
+    if (refuseAtCeiling(id)) return;
     opening = true; const ticket = ++openingRevision;
     try {
-      if (!await confirmDiscard("Open another task?")) return;
+      if (!(await canLeaveSession())) return;
+      dropDraftSessionTab();
+      if (disposed || ticket !== openingRevision) return;
       const full = await bounded(getTask(id));
       if (disposed || ticket !== openingRevision) return;
-      workspaceEditor = null; enhanceId = null; taskEditor = { value: full };
+      workspaceEditor = null; enhanceId = null;
+      taskTabs = openTaskTab(taskTabs, { id: full.id, title: full.title, status: full.status, draft: false });
+      session = { tabId: full.id, pane: full.id, value: full };
     } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
     finally { if (!disposed && ticket === openingRevision) opening = false; }
+  }
+  function openLoaded(task: Task) {
+    workspaceEditor = null; enhanceId = null;
+    taskTabs = openTaskTab(taskTabs, { id: task.id, title: task.title, status: task.status, draft: false });
+    session = { tabId: task.id, pane: task.id, value: task };
   }
   async function pageColumn(status: TaskStatus, cursor?: string) {
     if (loading || moving || loadedKey !== boardKey) return;
@@ -421,7 +525,7 @@
     }
     if (e.key === "e" && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault();
-      enhanceId = card.id;
+      void openQuickEnhance(card.id);
       return;
     }
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -436,7 +540,7 @@
     const target = e.target;
     if (!(target instanceof Node) || !boardEl.contains(target)) return;
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
-    if (target instanceof HTMLElement && target.closest("[role=dialog], .task-editor, .workspace-editor, [data-task-menu]")) return;
+    if (target instanceof HTMLElement && target.closest("[role=dialog], .task-editor, .workspace-editor, [data-task-menu], .editor-dock")) return;
     if (e.key === "Escape") {
       if (menu) { menu = null; return; }
       if (selected.size) { selected = new Set(); selectionAnchor = null; return; }
@@ -498,8 +602,24 @@
   }
   async function createTask(status: TaskStatus = "inbox") {
     if (busy) return;
+    const draftId = `draft-${newID()}`;
+    if (refuseAtCeiling(draftId)) return;
     if (!(await confirmDiscard("Start a new task and discard the current unsaved edits?"))) return;
-    workspaceEditor = null; enhanceId = null; taskEditor = { value: null, status };
+    workspaceEditor = null; enhanceId = null;
+    taskTabs = openTaskTab(taskTabs, { id: draftId, title: "New task", status, draft: true });
+    session = { tabId: draftId, pane: draftId, value: null, status };
+  }
+  function onEditorSaved(saved: Task) {
+    void loadBoard();
+    if (!session) return;
+    taskTabs = retargetTaskTab(taskTabs, session.tabId, { id: saved.id, title: saved.title, status: saved.status, draft: false });
+    session = { ...session, tabId: saved.id, value: saved, status: saved.status };
+  }
+  function onEditorClose() {
+    const id = session?.tabId;
+    session = null;
+    if (id) taskTabs = closeTaskTab(taskTabs, id);
+    if (taskTabs.activeId) void restoreActiveTab();
   }
   async function removeSelected() {
     const cards = selectedCards;
@@ -510,8 +630,11 @@
   function tasksChanged(ids: string[]) {
     columns = removeFromColumns(columns, new Set(ids));
     selected = new Set([...selected].filter(id => !ids.includes(id)));
-    if (taskEditor?.value && ids.includes(taskEditor.value.id)) taskEditor = null;
+    const dropped = Boolean(session?.value && ids.includes(session.value.id));
+    if (dropped) session = null;
+    for (const id of ids) taskTabs = closeTaskTab(taskTabs, id);
     if (enhanceId && ids.includes(enhanceId)) enhanceId = null;
+    if (dropped && taskTabs.activeId) void restoreActiveTab();
     if (ids.length) { void loadBoard(); void loadUnread(); }
   }
   async function copyValues(text: string, ok: string) {
@@ -553,16 +676,12 @@
         if (cards[0]) void openTask(cards[0].id);
         break;
       case "enhance":
-        if (cards[0]) {
-          void confirmDiscard("Open Quick Enhance? Unsaved edits in the current editor will be discarded.").then((ok) => {
-            if (!ok) return;
-            taskEditor = null;
-            enhanceId = cards[0].id;
-          });
-        }
+        if (cards[0]) void openQuickEnhance(cards[0].id);
         break;
       case "duplicate":
         if (cards[0]) {
+          const draftId = `draft-${newID()}`;
+          if (refuseAtCeiling(draftId)) return;
           void confirmDiscard("Start a duplicate and discard the current unsaved edits?").then((ok) => {
             if (!ok) return;
             opening = true;
@@ -571,7 +690,9 @@
               workspaceEditor = null;
               enhanceId = null;
               const copy = taskDraft(full);
-              taskEditor = { value: null, status: full.status, seed: { ...copy, title: duplicateTitle(full.title), position: Date.now() } };
+              const title = duplicateTitle(full.title);
+              taskTabs = openTaskTab(taskTabs, { id: draftId, title, status: full.status, draft: true });
+              session = { tabId: draftId, pane: draftId, value: null, status: full.status, seed: { ...copy, title, position: Date.now() } };
             }).catch((cause) => { if (!disposed) error = explainError(cause); })
               .finally(() => { opening = false; });
           });
@@ -671,7 +792,10 @@
   {/if}
   <main class="board-main">
     <header class="gp-glass">
-      <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
+      <div class="heading">
+        <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
+        {#if inProgressCount > 0}<span class="gp-pill">{inProgressCount} in progress</span>{/if}
+      </div>
       <div class="actions">
         <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
@@ -733,7 +857,7 @@
         <span>{selected.size} selected</span>
         {#if selected.size === 1}
           <button type="button" class="gp-btn" onclick={() => { const id = [...selected][0]; if (id) void openTask(id); }}><SquarePen size={12} /> Open</button>
-          <button type="button" class="gp-btn" onclick={() => { const id = [...selected][0]; if (id) enhanceId = id; }}><Sparkles size={12} /> Quick Enhance</button>
+          <button type="button" class="gp-btn" onclick={() => { const id = [...selected][0]; if (id) void openQuickEnhance(id); }}><Sparkles size={12} /> Quick Enhance</button>
         {/if}
         <button type="button" class="gp-btn" onclick={() => void copyCardsForAgent(selectedCards)} disabled={busy}><Clipboard size={12} /> Copy for agent</button>
         <button type="button" class="gp-btn-danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
@@ -762,9 +886,11 @@
             type="button"
             class="row gp-card"
             class:selected={selected.has(card.id)}
+            class:open={openCardIds.has(card.id)}
             data-testid="task-card"
             data-task-card
             data-card-id={card.id}
+            data-open-task={openCardIds.has(card.id) || undefined}
             aria-haspopup="menu"
             aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
             aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"
@@ -775,6 +901,7 @@
           >
             <span class="status">{STATUS_LABELS[card.status]}</span>
             <span class="row-title">{face.title}</span>
+            {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
             {#if face.repo}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
             {#if chrome.owner}<span class="muted">{chrome.owner}</span>{/if}
             {#if dueLabel(chrome.due)}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
@@ -809,9 +936,11 @@
                   class="card bg-surface"
                   class:dragging={drag?.card.id === card.id}
                   class:selected={selected.has(card.id)}
+                  class:open={openCardIds.has(card.id)}
                   data-testid="task-card"
                   data-task-card
                   data-card-id={card.id}
+                  data-open-task={openCardIds.has(card.id) || undefined}
                   draggable="false"
                   aria-grabbed={drag?.card.id === card.id}
                   aria-haspopup="menu"
@@ -829,6 +958,7 @@
                   <div class="card-meta">
                     {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
                     <h3>{face.title}</h3>
+                    {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
                   </div>
                   {#if face.repo}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
                   <div class="card-extra">
@@ -867,15 +997,84 @@
     <QuickEnhanceSheet
       taskId={enhanceId}
       {repoName}
-      onClose={() => { enhanceId = null; }}
+      onClose={() => { enhanceId = null; if (!session && taskTabs.activeId) void restoreActiveTab(); }}
       onApplied={(saved) => {
         void loadBoard();
-        if (taskEditor?.value?.id === saved.id) taskEditor = { value: saved, status: saved.status };
+        if (session?.value?.id === saved.id) {
+          session = { ...session, value: saved, status: saved.status };
+          taskTabs = updateTaskTab(taskTabs, saved.id, { title: saved.title, status: saved.status });
+        }
       }}
-      onOpenEditor={(task) => { enhanceId = null; taskEditor = { value: task }; }}
+      onOpenEditor={(task) => {
+        enhanceId = null;
+        if (refuseAtCeiling(task.id)) return;
+        void canLeaveSession().then((ok) => {
+          if (!ok) return;
+          dropDraftSessionTab();
+          openLoaded(task);
+        });
+      }}
     />
   {/if}
-  {#if taskEditor}{#key taskEditor}<TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={taskEditor.value} seed={taskEditor.seed ?? null} initialStatus={taskEditor.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : scope.kind === "workspace" ? workspaceMemberIds?.[0] ?? "" : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
+  {#if taskTabs.tabs.length}
+    <div class="editor-dock">
+      <div class="task-tabs">
+        <div
+          bind:this={tabStrip}
+          class="task-tab-strip gp-header-scroll"
+          role="tablist"
+          aria-label="Open tasks"
+          tabindex="-1"
+          onkeydown={onTaskTabStripKeydown}
+        >
+          {#each taskTabs.tabs as tab (tab.id)}
+            {@const isActive = tab.id === taskTabs.activeId}
+            <div class="task-tab-shell" class:is-active={isActive} class:is-draft={tab.draft}>
+              <div
+                role="tab"
+                data-task-tab={tab.id}
+                tabindex={isActive ? 0 : -1}
+                aria-selected={isActive}
+                aria-controls={TASK_EDITOR_PANE_ID}
+                title={tab.draft ? `${taskTabLabel(tab)} (draft)` : tab.title}
+                onclick={() => void focusOpenTab(tab.id)}
+                onkeydown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    void focusOpenTab(tab.id);
+                  }
+                  if (e.key === "Delete" || e.key === "Backspace") {
+                    e.preventDefault();
+                    void closeOpenTab(tab.id);
+                  }
+                }}
+              >
+                {#if !tab.draft}<span class="tab-pip" data-status={tab.status ?? "inbox"}></span>{/if}
+                <span class="tab-title">{taskTabLabel(tab)}</span>
+              </div>
+              <button
+                type="button"
+                class="tab-close"
+                tabindex="-1"
+                data-testid="task-tab-close"
+                aria-label={`Close ${taskTabLabel(tab)}`}
+                title="Close tab"
+                onclick={(e) => { e.stopPropagation(); void closeOpenTab(tab.id); }}
+              ><X size={11} /></button>
+            </div>
+          {/each}
+        </div>
+        <ScrollCue target={tabStrip} axis="x" />
+      </div>
+      {#if session}
+        {#key session.pane}
+          <div id={TASK_EDITOR_PANE_ID} role="tabpanel" class="task-panel">
+            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : scope.kind === "workspace" ? workspaceMemberIds?.[0] ?? "" : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={onEditorSaved} onClose={onEditorClose} />
+          </div>
+        {/key}
+      {/if}
+    </div>
+  {/if}
   {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor bind:this={workspaceHandle} value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
@@ -926,7 +1125,22 @@
   .row{cursor:pointer;display:grid;grid-template-columns:7rem minmax(0,1fr) auto auto auto;gap:8px;align-items:center}
   .card:focus-visible,.row:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
   .card.dragging{opacity:.35;cursor:grabbing}
-  .card.selected,.row.selected{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.45)}
+  .card.selected,.row.selected,.card.open,.row.open{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.45)}
+  .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
+  .open-mark{font-size:9px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-accent));flex-shrink:0;margin-top:2px}
+  .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
+  .task-tabs{position:relative;width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);border-bottom:1px solid rgb(var(--c-border) / 0.65)}
+  .task-tab-strip{display:flex;align-items:stretch;gap:4px;min-width:0;overflow-x:auto;padding:6px 8px}
+  .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:8px;border:1px solid transparent;padding:0 2px 0 8px}
+  .task-tab-shell.is-active{border-color:rgb(var(--c-accent) / 0.45);background:color-mix(in srgb,rgb(var(--c-accent)) 12%,transparent)}
+  .task-tab-shell.is-draft [role="tab"]{font-style:italic}
+  .task-tab-shell [role="tab"]{display:flex;align-items:center;gap:6px;min-width:0;flex:1;padding:5px 0;cursor:pointer;font-size:11px}
+  .tab-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .tab-pip{width:6px;height:6px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
+  .tab-close{width:18px;height:18px;padding:0;border:0;background:transparent;color:rgb(var(--c-text-muted));display:inline-flex;align-items:center;justify-content:center;border-radius:5px;flex-shrink:0}
+  .tab-close:hover{color:#e11d48;background:rgb(var(--c-surface-hover))}
+  .task-panel{flex:1;min-height:0;display:flex}
+  .task-panel :global(.task-editor){flex:1}
   .card h3,.row-title{font-size:12px;line-height:1.4;font-weight:550;margin:0;overflow-wrap:anywhere;min-width:0}
   .card-meta{display:flex;align-items:flex-start;gap:6px}
   .pip{width:7px;height:7px;margin-top:4px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}

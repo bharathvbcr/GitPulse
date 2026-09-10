@@ -250,19 +250,43 @@ describe("App overlay wiring", () => {
     expect(source).toContain("Conflict drafts are retained for recovery when local storage is available");
     expect(source.indexOf("conflictSessions.flush()")).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
   });
+
+  it("owns boot unlistens through createListenerTracker, not an inline array", () => {
+    // The tracker is the one owner of the late-registration race. An inline
+    // `unsubs` + `disposed` copy next to it is how the helper goes unwired
+    // while App still has to solve the same problem.
+    const { script } = scriptAndTemplate(source);
+    expect(script).toContain('import { createListenerTracker } from "./lib/dom/listenerTracker"');
+    expect(script).toContain("createListenerTracker()");
+    expect(script).not.toContain("const unsubs:");
+    expect(script).not.toMatch(/let disposed = false;/);
+  });
+
+  it("scans GitHub alerts when a repository opens and warns on serious findings", () => {
+    const { script } = scriptAndTemplate(source);
+    expect(script).toContain("maybeNotifyGithubAlerts");
+    expect(script).toContain("loadGithubAlerts");
+    expect(script).toContain("autoScanGithubAlerts");
+    expect(script).toContain('setActiveTab("insights", "health")');
+    expect(script).toContain('diagnostics.warn("github-alerts:check"');
+    expect(script).toContain("scanGithubAlerts(path)");
+    expect(script).toContain("interfaceStore.subscribe");
+  });
 });
 
 
 describe("App chrome preferences", () => {
-  it("drops the header action labels without dropping their accessible name", () => {
-    // The words are decoration; the icon plus aria-label is what identifies
-    // the button, so a decluttered header stays usable by a screen reader.
-    expect(source).toContain('aria-label="Open a repository"');
-    expect(source).toContain('aria-label="Clone a repository"');
-    expect(source).toContain(
+  it("merges Open and Clone into one header menu without dropping their actions", () => {
+    // The two title-bar pills became one menu so Clone stops occupying a
+    // second hit target. The trigger's accessible name, and the two item
+    // labels, live on HeaderRepoMenu — App only has to keep both actions wired.
+    expect(source).toContain("<HeaderRepoMenu");
+    expect(source).toContain("onOpen={() => void repoStore.pickAndOpenRepo()}");
+    expect(source).toContain("onClone={openCloneDialog}");
+    expect(source).not.toContain(
       "{#if $interfaceStore.showHeaderActionLabels}<span>Open...</span>{/if}",
     );
-    expect(source).toContain(
+    expect(source).not.toContain(
       "{#if $interfaceStore.showHeaderActionLabels}<span>Clone...</span>{/if}",
     );
   });

@@ -34,7 +34,9 @@ flowchart TD
 ### Zero Telemetry & No Remote Phoning Home
 - GitPulse has no centralized backend or analytics tracking.
 - Network-capable features run through user actions or explicitly enabled settings,
-  including scheduled release checks and automatic task suggestions.
+  including scheduled release checks, automatic task suggestions, and the
+  default-on GitHub alert scan (Dependabot and code scanning via the local `gh`
+  CLI when a repository opens). A failed GitHub check does not toast.
 - The webview does not load external CDN scripts, styles, or telemetry trackers.
 
 ### Local `gh` Credential Safety
@@ -60,6 +62,16 @@ flowchart TD
   native launch validation alone does not prove the provider's effective policy.
   See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the verification limits.
 - Model-assisted remediation actions (`cmd_manvi_run_action`) are restricted to a strict command allowlist and require explicit user confirmation.
+
+### GitHub Alert Scans
+- Opening a repository fetches Dependabot and code scanning alerts through the
+  locally authenticated `gh` CLI. This is on by default under **Settings →
+  Analysis**. GitPulse still does not read or store GitHub tokens.
+- Only critical and high findings raise a warning. A check that could not run
+  (missing `gh`, not a GitHub remote, API error) is listed in Health and recorded
+  in diagnostics, never presented as an all-clear.
+- **Scan local** on the Health panel does not call GitHub. The **Check GitHub
+  alerts** button remains a manual refresh.
 
 ### Opt-In Release Checks
 - Automatic application release checks are off by default; GitPulse does not

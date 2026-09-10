@@ -28,8 +28,16 @@ describe("interfaceStore", () => {
     expect(get(interfaceStore).showStatusIcon).toBe(false);
     interfaceStore.setShowStatusIcon(true);
     expect(get(interfaceStore).showStatusIcon).toBe(true);
+    expect(get(interfaceStore).hideDockWhenClosed).toBe(true);
+    expect(get(interfaceStore).statusIconCounts).toBe(false);
+    interfaceStore.setHideDockWhenClosed(false);
+    interfaceStore.setStatusIconCounts(true);
+    expect(get(interfaceStore).hideDockWhenClosed).toBe(false);
+    expect(get(interfaceStore).statusIconCounts).toBe(true);
     interfaceStore.reset();
     expect(get(interfaceStore).showStatusIcon).toBe(false);
+    expect(get(interfaceStore).hideDockWhenClosed).toBe(true);
+    expect(get(interfaceStore).statusIconCounts).toBe(false);
   });
 
   it("hides and re-shows the language bar independently", () => {
@@ -138,6 +146,15 @@ describe("interfaceStore", () => {
     expect(get(interfaceStore).autoRunCoverage).toBe(false);
   });
 
+  it("checks GitHub alerts on launch by default", () => {
+    interfaceStore.reset();
+    expect(get(interfaceStore).autoScanGithubAlerts).toBe(true);
+    interfaceStore.setAutoScanGithubAlerts(false);
+    expect(get(interfaceStore).autoScanGithubAlerts).toBe(false);
+    interfaceStore.reset();
+    expect(get(interfaceStore).autoScanGithubAlerts).toBe(true);
+  });
+
   it("starts with the Fleet dashboard closed", () => {
     interfaceStore.reset();
     expect(get(interfaceStore).globalSurface).toBe("repository");
@@ -152,6 +169,16 @@ describe("interfaceStore", () => {
     interfaceStore.toggleFleet();
     expect(get(interfaceStore).globalSurface).toBe("fleet");
     interfaceStore.setFleetOpen(false);
+    expect(get(interfaceStore).globalSurface).toBe("repository");
+  });
+
+  it("opens and closes the Tasks surface without toggling", () => {
+    interfaceStore.reset();
+    interfaceStore.setTasksOpen(true);
+    expect(get(interfaceStore).globalSurface).toBe("tasks");
+    interfaceStore.setTasksOpen(true);
+    expect(get(interfaceStore).globalSurface).toBe("tasks");
+    interfaceStore.setTasksOpen(false);
     expect(get(interfaceStore).globalSurface).toBe("repository");
   });
 
@@ -245,6 +272,34 @@ describe("interfaceStore", () => {
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
+  it("honours an explicit stored false for GitHub launch scans", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: unknown) => {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ autoScanGithubAlerts: stored }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore).autoScanGithubAlerts;
+    };
+    try {
+      expect(await load(false)).toBe(false);
+      expect(await load(true)).toBe(true);
+      // Missing or corrupt values follow the default (on), not coverage's
+      // fail-closed-off rule: turning this off is opt-out, not opt-in.
+      expect(await load(undefined)).toBe(true);
+      expect(await load("no")).toBe(true);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else delete (globalThis as { window?: unknown }).window;
       vi.resetModules();
     }
   });

@@ -19,6 +19,11 @@ mod terminal_run;
 
 const MAX_IN_FLIGHT: usize = 8;
 const MAX_INPUT: usize = 256 * 1024;
+const MAX_MODEL_BASE_URL: usize = 512;
+const MAX_MODEL_ID: usize = 128;
+
+/// Identity of the Manvi child environment. Changing it retires the worker.
+type WorkerFingerprint = Option<(String, String)>;
 
 #[derive(Debug, Serialize)]
 pub struct WorkbenchError {
@@ -49,8 +54,13 @@ struct Inner {
     // Only tests supply a path. IPC cannot select a repository lease database.
     path: Option<PathBuf>,
     notifications: OnceLock<notifications::Coordinator>,
-    worker:
-        OnceLock<Result<crate::harness::sidecar::ProfileConnection, crate::harness::HarnessError>>,
+    // Arc so callers release the slot lock before a long generate round-trip.
+    worker: Mutex<
+        Option<(
+            WorkerFingerprint,
+            Arc<crate::harness::sidecar::ProfileConnection>,
+        )>,
+    >,
     managed_launch: Mutex<()>,
 }
 
@@ -105,9 +115,11 @@ impl WorkbenchState {
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
-        if let Some(Ok(worker)) = self.0.worker.get() {
-            if !worker.shutdown() {
-                log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+        if let Ok(guard) = self.0.worker.lock() {
+            if let Some((_, worker)) = guard.as_ref() {
+                if !worker.shutdown() {
+                    log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+                }
             }
         }
     }
@@ -216,8 +228,8 @@ impl WorkbenchState {
                 | "enhancements.wake"
                 | "enhancements.worker"
         ) {
-            let params = generation_input(method, input)?;
-            return self.worker_call(&format!("work.{method}"), params);
+            let HostControl { params, selection } = generation_input(method, input)?;
+            return self.worker_call(&format!("work.{method}"), params, selection);
         }
         let result = self.with_store(|store| query(store, method, input));
         if result.is_ok() && method == "notifications.settings.put" {
@@ -228,15 +240,40 @@ impl WorkbenchState {
         result
     }
 
-    fn worker_call(&self, method: &str, params: Value) -> Result<Value, WorkbenchError> {
+    fn worker_call(
+        &self,
+        method: &str,
+        params: Value,
+        selection: Option<crate::harness::sidecar::ModelSelection>,
+    ) -> Result<Value, WorkbenchError> {
         self.check_open()?;
         let path = self.profile_path()?;
-        let worker = self
-            .0
-            .worker
-            .get_or_init(|| crate::harness::sidecar::ProfileConnection::new(path))
+        let fingerprint: WorkerFingerprint = selection
             .as_ref()
-            .map_err(|e| worker_error(e.clone()))?;
+            .map(|s| (s.base_url.clone(), s.model.clone()));
+        let worker = {
+            let mut guard = self.0.worker.lock().map_err(|_| {
+                WorkbenchError::new(
+                    "worker_error",
+                    "Task worker lock failed; restart the application.",
+                )
+            })?;
+            let rebuild = match guard.as_ref() {
+                Some((fp, _)) => *fp != fingerprint,
+                None => true,
+            };
+            if rebuild {
+                if let Some((_, previous)) = guard.take() {
+                    if !previous.retire() {
+                        log::warn!(target: "workbench", "profile worker retire could not acquire the active request; prior generation may remain unresolved");
+                    }
+                }
+                let connection = crate::harness::sidecar::ProfileConnection::new(path, selection)
+                    .map_err(worker_error)?;
+                *guard = Some((fingerprint, Arc::new(connection)));
+            }
+            Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
+        };
         // Initialization is lazy and can overlap shutdown; never spawn after it.
         if let Err(error) = self.check_open() {
             worker.shutdown();
@@ -292,19 +329,73 @@ impl WorkbenchState {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelSelectionInput {
+    base_url: String,
+    model: String,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GenerationInput {
     id: String,
     request_id: String,
     expected_revision: u64,
+    #[serde(default)]
+    model: Option<ModelSelectionInput>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ConfigurationInput {}
+struct ConfigurationInput {
+    #[serde(default)]
+    model: Option<ModelSelectionInput>,
+}
 
-fn generation_input(method: &str, input: &str) -> Result<Value, WorkbenchError> {
+#[derive(Debug)]
+struct HostControl {
+    params: Value,
+    selection: Option<crate::harness::sidecar::ModelSelection>,
+}
+
+fn parse_model_selection(
+    input: Option<ModelSelectionInput>,
+) -> Result<Option<crate::harness::sidecar::ModelSelection>, WorkbenchError> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    if input.base_url.len() > MAX_MODEL_BASE_URL || input.model.len() > MAX_MODEL_ID {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Model selection exceeds the size limit.",
+        ));
+    }
+    if input.base_url.is_empty() || input.model.is_empty() {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Model selection requires both base_url and model.",
+        ));
+    }
+    if input
+        .model
+        .bytes()
+        .any(|b| b <= 0x20 || b == 0x7f || b >= 0x80)
+    {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Model id contains spaces or control characters.",
+        ));
+    }
+    let endpoint = crate::ai::http::parse_base_url(&input.base_url)
+        .map_err(|e| WorkbenchError::new("invalid_input", e))?;
+    Ok(Some(crate::harness::sidecar::ModelSelection {
+        base_url: endpoint.base_url(),
+        model: input.model,
+    }))
+}
+
+fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchError> {
     let invalid = |e: serde_json::Error| WorkbenchError::new("invalid_input", e.to_string());
     if input.len() > 4096 {
         return Err(WorkbenchError::new(
@@ -325,7 +416,12 @@ fn generation_input(method: &str, input: &str) -> Result<Value, WorkbenchError> 
         "enhancements.configuration" | "enhancements.wake" | "enhancements.worker"
     ) {
         let parsed: ConfigurationInput = serde_json::from_str(input).map_err(invalid)?;
-        return serde_json::to_value(parsed).map_err(invalid);
+        let selection = parse_model_selection(parsed.model)?;
+        return Ok(HostControl {
+            // Manvi's host methods take an empty object; selection is spawn-only.
+            params: json!({}),
+            selection,
+        });
     }
     let parsed: GenerationInput = serde_json::from_str(input).map_err(invalid)?;
     let valid_id = |id: &str| {
@@ -345,7 +441,15 @@ fn generation_input(method: &str, input: &str) -> Result<Value, WorkbenchError> 
             "Generation requires valid task identities and a positive exact revision.",
         ));
     }
-    serde_json::to_value(parsed).map_err(invalid)
+    let selection = parse_model_selection(parsed.model)?;
+    Ok(HostControl {
+        params: json!({
+            "id": parsed.id,
+            "request_id": parsed.request_id,
+            "expected_revision": parsed.expected_revision,
+        }),
+        selection,
+    })
 }
 
 fn worker_error(error: crate::harness::HarnessError) -> WorkbenchError {
@@ -357,7 +461,13 @@ fn worker_error(error: crate::harness::HarnessError) -> WorkbenchError {
         crate::harness::HarnessError::NotInstalled(message) => {
             WorkbenchError::new("not_installed", message)
         }
-        other => WorkbenchError::new("transport_error", other.message()),
+        crate::harness::HarnessError::Timeout(message) => WorkbenchError::new("timeout", message),
+        crate::harness::HarnessError::Unavailable(message) => {
+            WorkbenchError::new("unavailable", message)
+        }
+        crate::harness::HarnessError::Protocol(message) => {
+            WorkbenchError::new("protocol_error", message)
+        }
     }
 }
 
@@ -443,9 +553,13 @@ pub async fn cmd_workbench_register_repository(
 
 #[cfg(test)]
 mod tests {
-    use super::{generation_input, Inner, WorkbenchState, MAX_IN_FLIGHT};
+    use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT};
     use serde_json::json;
     use std::sync::Arc;
+
+    fn worker_absent(host: &WorkbenchState) -> bool {
+        host.0.worker.lock().unwrap().is_none()
+    }
 
     #[test]
     fn automatic_controls_accept_only_empty_objects_before_starting_a_host() {
@@ -453,7 +567,9 @@ mod tests {
         let path = dir.path().join("absent/profile.sqlite");
         let host = state(&path);
         for method in ["enhancements.wake", "enhancements.worker"] {
-            assert_eq!(generation_input(method, "{}").unwrap(), json!({}));
+            let parsed = generation_input(method, "{}").unwrap();
+            assert_eq!(parsed.params, json!({}));
+            assert!(parsed.selection.is_none());
             for input in [
                 "null",
                 "[]",
@@ -468,7 +584,7 @@ mod tests {
             }
         }
         assert!(!path.parent().unwrap().exists());
-        assert!(host.0.worker.get().is_none());
+        assert!(worker_absent(&host));
     }
 
     fn state(path: &std::path::Path) -> WorkbenchState {
@@ -476,6 +592,118 @@ mod tests {
             path: Some(path.to_path_buf()),
             ..Inner::default()
         }))
+    }
+
+    #[test]
+    fn host_control_accepts_loopback_model_selection_and_strips_it_from_params() {
+        let parsed = generation_input(
+            "enhancements.configuration",
+            r#"{"model":{"base_url":"http://127.0.0.1:11434/v1","model":"qwen3.8:27b-mlx"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.params, json!({}));
+        let selection = parsed.selection.unwrap();
+        assert_eq!(selection.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(selection.model, "qwen3.8:27b-mlx");
+
+        let generate = generation_input(
+            "enhancements.generate",
+            r#"{"id":"e","request_id":"r","expected_revision":1,"model":{"base_url":"http://localhost:11434/v1","model":"gemma4:31b-mlx"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            generate.params,
+            json!({"id":"e","request_id":"r","expected_revision":1})
+        );
+        assert_eq!(generate.selection.as_ref().unwrap().model, "gemma4:31b-mlx");
+
+        for input in [
+            r#"{"model":{"base_url":"https://127.0.0.1:11434/v1","model":"x"}}"#,
+            r#"{"model":{"base_url":"http://example.com/v1","model":"x"}}"#,
+            r#"{"model":{"base_url":"http://127.0.0.1:11434/v1","model":""}}"#,
+            &format!(
+                r#"{{"model":{{"base_url":"{}","model":"x"}}}}"#,
+                format!("http://127.0.0.1:11434/{}", "a".repeat(500))
+            ),
+        ] {
+            assert_eq!(
+                generation_input("enhancements.wake", input)
+                    .unwrap_err()
+                    .code,
+                "invalid_input"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_error_preserves_timeout_unavailable_and_protocol_codes() {
+        assert_eq!(
+            worker_error(crate::harness::HarnessError::Timeout("slow".into())).code,
+            "timeout"
+        );
+        assert_eq!(
+            worker_error(crate::harness::HarnessError::Unavailable("down".into())).code,
+            "unavailable"
+        );
+        assert_eq!(
+            worker_error(crate::harness::HarnessError::Protocol("bad".into())).code,
+            "protocol_error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_fingerprint_change_retires_and_respawns_the_profile_worker() {
+        use crate::harness::sidecar::{set_test_binary, test_serial};
+        use std::os::unix::fs::PermissionsExt;
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        let binary = dir.path().join("fingerprint-sidecar");
+        // Echoes the spawn-time MANVI_MODEL. Reusing a OnceLock child could not
+        // change that value; a fingerprint rebuild must.
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  case "$line" in
+    *'"op":"hello"'*) result='{"protocol":1,"ops":["hello","work.enhancements.configuration"],"posture":"host"}' ;;
+    *) result="{\"ok\":true,\"provider\":\"local\",\"model\":\"${MANVI_MODEL:-none}\",\"model_source\":\"env\",\"providers\":[\"local\"]}" ;;
+  esac
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$result"
+done
+"#;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        set_test_binary(&serial, Some(binary.to_str().unwrap().into()));
+        let outcome = std::panic::catch_unwind(|| {
+            let path = dir.path().join("profile.sqlite");
+            let host = state(&path);
+            let first = host
+                .request(
+                    "enhancements.configuration",
+                    r#"{"model":{"base_url":"http://127.0.0.1:11434/v1","model":"model-a"}}"#,
+                )
+                .unwrap();
+            assert_eq!(first["model"], "model-a");
+            let same = host
+                .request(
+                    "enhancements.configuration",
+                    r#"{"model":{"base_url":"http://127.0.0.1:11434/v1","model":"model-a"}}"#,
+                )
+                .unwrap();
+            assert_eq!(same["model"], "model-a");
+            let second = host
+                .request(
+                    "enhancements.configuration",
+                    r#"{"model":{"base_url":"http://127.0.0.1:11434/v1","model":"model-b"}}"#,
+                )
+                .unwrap();
+            assert_eq!(second["model"], "model-b");
+            host.shutdown();
+        });
+        set_test_binary(&serial, None);
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -505,7 +733,7 @@ mod tests {
         );
         assert!(!brief.to_string().contains("credential@"));
         assert_eq!(host.request("events.list", "{}").unwrap(), events);
-        assert!(host.0.worker.get().is_none());
+        assert!(worker_absent(&host));
         drop(host);
         let reopened = state(&path);
         assert_eq!(
@@ -521,7 +749,7 @@ mod tests {
                 .code,
             "revision_conflict"
         );
-        assert!(reopened.0.worker.get().is_none());
+        assert!(worker_absent(&reopened));
     }
 
     #[cfg(unix)]
@@ -546,10 +774,22 @@ mod tests {
             |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
         // Overrides belong to this child only. Configuration and the stale claim
         // below must not resolve a provider or contact any model endpoint.
+        // When a live local server URL is present, forward it so the ignored
+        // real-profile path can exercise the same env the host now sets.
+        let local_base = std::env::var("MANVI_LLM_LOCAL_BASE_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                format!(
+                    "export MANVI_LLM_LOCAL_BASE_URL='{}'\n",
+                    value.replace('\'', "'\\''")
+                )
+            })
+            .unwrap_or_default();
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nexport MANVI_MODEL=native-fixture-model\nexport MANVI_LLM_PROVIDER_DEFAULT=local\nexport MANVI_STORE_BINARY={}\nexec {} \"$@\"\n",
+                "#!/bin/sh\nexport MANVI_MODEL=native-fixture-model\nexport MANVI_LLM_PROVIDER_DEFAULT=local\n{local_base}export MANVI_STORE_BINARY={}\nexec {} \"$@\"\n",
                 quote(&store), quote(&binary)
             ),
         )
@@ -632,7 +872,7 @@ mod tests {
             assert_eq!(host.request(method, "{}").unwrap_err().code, "host_only");
         }
         assert!(!path.parent().unwrap().exists());
-        assert!(host.0.worker.get().is_none());
+        assert!(worker_absent(&host));
     }
 
     #[test]
@@ -665,14 +905,15 @@ mod tests {
                 .code,
             "invalid_input"
         );
-        assert!(host.0.worker.get().is_none());
+        assert!(worker_absent(&host));
         assert!(!path.parent().unwrap().exists());
         let parsed = generation_input(
             "enhancements.generate",
             r#"{"id":"e","request_id":"r","expected_revision":1}"#,
         )
         .unwrap();
-        assert_eq!(parsed["id"], "e");
+        assert_eq!(parsed.params["id"], "e");
+        assert!(parsed.selection.is_none());
     }
 
     #[test]
@@ -692,7 +933,7 @@ mod tests {
         for method in ["items.list", "enhancements.configuration"] {
             assert_eq!(host.request(method, "{}").unwrap_err().code, "closed");
         }
-        assert!(host.0.worker.get().is_none());
+        assert!(worker_absent(&host));
         assert!(host.0.store.lock().unwrap().is_none());
         assert!(!path.parent().unwrap().exists());
     }

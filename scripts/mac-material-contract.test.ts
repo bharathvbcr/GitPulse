@@ -392,4 +392,15 @@ describe("macOS material", () => {
     }
     expect(css).toMatch(/background-color: rgb\(var\(--c-bg\) \/ var\(--mac-shell-veil\)\)/);
   });
+
+  it("paints the repository strip denser than shared chrome so tab labels stay readable", () => {
+    const rule = css.match(
+      /html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/,
+    );
+    expect(rule?.[1]).toMatch(/background-color:\s*rgb\(var\(--c-surface\) \/ 0\.78\)/);
+    const reduced = css.slice(css.indexOf("@media (prefers-reduced-transparency: reduce)"));
+    expect(reduced).toMatch(
+      /html\.macos \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
+    );
+  });
 });

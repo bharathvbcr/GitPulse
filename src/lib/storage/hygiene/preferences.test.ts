@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PREFERENCES, ignoreRule, readPreferences, reviewDue, savePreferences } from "./preferences";
+import { DEFAULT_PREFERENCES, escapeGitignoreLiteral, ignoreRule, readPreferences, reviewDue, savePreferences } from "./preferences";
 import type { StorageLike } from "../../repos/persist";
 
 function memory(): StorageLike {
@@ -39,6 +39,12 @@ describe("literal ignore rules", () => {
   it("anchors and escapes one directory, including Git glob metacharacters", () => {
     expect(ignoreRule("src-tauri/target")).toBe("/src-tauri/target/");
     expect(ignoreRule("space !#[a]*?/cache")).toBe("/space\\ \\!\\#\\[a\\]\\*\\?/cache/");
+  });
+  it("doubles backslash in the sanitizer so a crafted \\* cannot undo a meta escape", () => {
+    expect(escapeGitignoreLiteral("cache\\*.tmp")).toBe("cache\\\\\\*.tmp");
+    expect(escapeGitignoreLiteral("a\\b")).toBe("a\\\\b");
+    expect(ignoreRule("cache\\*.tmp")).toBeNull();
+    expect(ignoreRule("a\\b")).toBeNull();
   });
   it("refuses traversal, control characters and Git internals", () => {
     for (const path of ["", "/target", "../target", "a/./target", "a//target", "a/.git/cache", "a\\b", "target\n.env", "a\u007f", "x".repeat(4097)]) expect(ignoreRule(path)).toBeNull();

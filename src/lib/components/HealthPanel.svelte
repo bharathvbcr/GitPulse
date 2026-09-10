@@ -58,6 +58,10 @@
   } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
   import { coverageGap, formatHealthReport, observedTotal } from "../health/report";
+  import {
+    githubAlertsCache,
+    loadGithubAlerts,
+  } from "../health/githubAlerts";
   import { buildRunnablePlanSteps } from "../terminal/tokenize";
   import type {
     Vulnerability,
@@ -271,8 +275,8 @@
     loading = true;
     errorMsg = null;
     actionError = null;
-    // Automatic scans stay local. Dependabot uses the user's GitHub CLI
-    // credentials and the network, so it has a separate explicit action.
+    // Automatic local scans stay local. GitHub alerts use the GitHub CLI
+    // and the network; they run through scanDependabot, not this path.
     const [deps, dead, graph] = await Promise.allSettled([
       invoke<DepsHealthReport>("cmd_scan_deps_health", { repoPath }),
       getDeadSymbols(repoPath),
@@ -363,7 +367,7 @@
     });
   }
 
-  async function scanDependabot(path?: string) {
+  async function scanDependabot(path?: string, options?: { force?: boolean }) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
     dependabotInflight?.cancel();
@@ -372,54 +376,23 @@
     checkingGithub = true;
     actionError = null;
     try {
-      const [depSettled, csSettled] = await Promise.allSettled([
-        invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath }),
-        invoke<CodeScanningReport>("cmd_github_code_scanning_alerts", { repoPath }),
-      ]);
+      const snapshot = await loadGithubAlerts(repoPath, {
+        force: options?.force === true,
+      });
       if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
-      const checkedAt = Date.now();
-      const next: DependabotReport =
-        depSettled.status === "fulfilled"
-          ? depSettled.value
-          : {
-              available: false,
-              // Neutral sentinels only satisfy the wire shape. The separate
-              // failure bit prevents either from being interpreted as backend
-              // evidence.
-              cli_present: true,
-              is_github_remote: false,
-              slug: "",
-              alerts: [],
-              truncated: false,
-              error: formatError(depSettled.reason),
-            };
-      const depFailed = depSettled.status === "rejected";
-      const nextCodeScanning: CodeScanningReport =
-        csSettled.status === "fulfilled"
-          ? csSettled.value
-          : {
-              available: false,
-              cli_present: true,
-              is_github_remote: false,
-              slug: "",
-              alerts: [],
-              truncated: false,
-              error: formatError(csSettled.reason),
-            };
-      const csFailed = csSettled.status === "rejected";
-      dependabot = next;
-      dependabotCheckedAt = checkedAt;
-      dependabotRequestFailed = depFailed;
-      codeScanning = nextCodeScanning;
-      codeScanningCheckedAt = checkedAt;
-      codeScanningRequestFailed = csFailed;
+      dependabot = snapshot.dependabot;
+      dependabotCheckedAt = snapshot.checkedAt;
+      dependabotRequestFailed = snapshot.dependabotRequestFailed;
+      codeScanning = snapshot.codeScanning;
+      codeScanningCheckedAt = snapshot.checkedAt;
+      codeScanningRequestFailed = snapshot.codeScanningRequestFailed;
       cacheDependabotResult(
         repoPath,
-        next,
-        checkedAt,
-        depFailed,
-        nextCodeScanning,
-        csFailed,
+        snapshot.dependabot,
+        snapshot.checkedAt,
+        snapshot.dependabotRequestFailed,
+        snapshot.codeScanning,
+        snapshot.codeScanningRequestFailed,
       );
     } finally {
       if (guard.isLive()) checkingGithub = false;
@@ -431,7 +404,17 @@
     const current = report;
     const repoPath = $repoStore.currentPath;
     if (!current || !repoPath) return null;
-    const text = formatHealthReport(current, repoPath, dependabot, codeScanning);
+    const deadCode =
+      deadSymbolsAvailable || deadSymbolsReason != null
+        ? {
+            available: deadSymbolsAvailable,
+            reason: deadSymbolsReason,
+            items: deadSymbols,
+            total: Math.max(deadSymbolsTotal, deadSymbols.length),
+            truncated: deadSymbolsTruncated,
+          }
+        : null;
+    const text = formatHealthReport(current, repoPath, dependabot, codeScanning, deadCode);
     const stamps: string[] = [];
     if (dependabot && dependabotCheckedAt !== null) {
       stamps.push(
@@ -616,6 +599,7 @@
     // Hydrate last-known data synchronously so a revisit renders instantly
     // (the placeholder below only fires when there is no cached report).
     const cached = healthCache.get(path);
+    const github = githubAlertsCache.get(path);
     if (cached) {
       report = cached.deps;
       dependabot = cached.dependabot;
@@ -637,7 +621,18 @@
       deadSymbolsReason = null;
       codegraph = null;
     }
+    if (github) {
+      dependabot = github.dependabot;
+      dependabotCheckedAt = github.checkedAt;
+      dependabotRequestFailed = github.dependabotRequestFailed;
+      codeScanning = github.codeScanning;
+      codeScanningCheckedAt = github.checkedAt;
+      codeScanningRequestFailed = github.codeScanningRequestFailed;
+    }
     void scan(path);
+    // Launch also fetches these; this call joins that in-flight request or
+    // hydrates from its cache so opening Health after a warning is not empty.
+    if ($interfaceStore.autoScanGithubAlerts && !github) void scanDependabot(path);
   });
 
   async function openExternal(url: string) {
@@ -837,7 +832,8 @@
       <!-- All four states are named. "Checked, nothing open" and "never
            checked" used to render the same empty space, so a clean local
            audit read as an all-clear for a repository whose GitHub alerts
-           nobody had looked at — and GitHub is never checked automatically. -->
+           nobody had looked at. Launch checks them when the Analysis
+           preference is on; this header still has to say so if it did not. -->
       {#if openDependabotCount > 0}
         <span class={`truncate ${dependabotBadgeClass}`}>
           · Dependabot {openDependabotCount}{dependabot?.truncated ? "+" : ""}
@@ -867,7 +863,7 @@
       <button
         type="button"
         aria-describedby="dependabot-permission-note"
-        onclick={() => scanDependabot()}
+        onclick={() => scanDependabot(undefined, { force: true })}
         disabled={checkingGithub}
         class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
         title="Use the GitHub CLI, its credentials, and the network to check Dependabot and code scanning alerts"
@@ -924,8 +920,10 @@
   <div class="flex-1 overflow-auto p-4 space-y-5">
     <div class="rounded-xl border border-border/70 bg-surface px-3 py-2 text-[11px] text-textMuted max-w-3xl space-y-1">
       <p id="dependabot-permission-note">
-        GitHub alerts are not checked automatically. The explicit check uses the GitHub CLI,
+        GitHub alerts are checked when GitPulse launches and when this repository
+        opens, unless turned off in Settings → Analysis. The check uses the GitHub CLI,
         its credentials, and the network to fetch Dependabot and code scanning alerts.
+        Critical and high findings raise a warning.
       </p>
       {#if displayedGithubFreshness}
         <p role="status">

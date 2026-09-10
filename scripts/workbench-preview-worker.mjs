@@ -91,7 +91,19 @@ export async function previewWorker(binary, storeBinary, root, database) {
   } catch (error) { await close(); throw error; }
   return {
     /** @param {string} method @param {string} input */
-    request: (method, input) => call(`work.${method}`, JSON.parse(input)),
+    request: (method, input) => {
+      // Match GitPulse Rust: `model` is spawn/env only and must not reach Manvi's
+      // empty-object host methods or generate params (unsupported-field refusal).
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "model" in parsed) {
+        const { model: _model, ...rest } = parsed;
+        return call(`work.${method}`,
+          method === "enhancements.configuration" || method === "enhancements.wake" || method === "enhancements.worker"
+            ? {}
+            : rest);
+      }
+      return call(`work.${method}`, parsed);
+    },
     close,
   };
 }

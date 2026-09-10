@@ -5,7 +5,7 @@ import {
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
   getEnhancement, listEnhancements, changeEnhancement, enhancementConfiguration,
-  deleteTask, deleteWorkspace,
+  generateEnhancement, deleteTask, deleteWorkspace,
 } from "./client";
 import type { Task, Workspace } from "./client";
 
@@ -176,5 +176,26 @@ describe("native workbench boundary", () => {
       native.mockResolvedValueOnce(JSON.stringify({ ...settings, ...change }));
       await expect(enhancementConfiguration()).rejects.toMatchObject({ code: "protocol_error" });
     }
+  });
+
+  it("threads the local model selection into configuration and generate host calls", async () => {
+    const selection = { base_url: "http://127.0.0.1:11434/v1", model: "qwen" };
+    const settings = { ok: true, provider: "local", model: "qwen", model_source: "env", providers: ["local"] };
+    native.mockResolvedValueOnce(JSON.stringify(settings));
+    expect(await enhancementConfiguration(selection)).toMatchObject({ model: "qwen", model_source: "env" });
+    expect(JSON.parse(String((native.mock.calls[0]?.[1] as { input: string }).input))).toEqual({ model: selection });
+
+    const proposal = {
+      id: "e", revision: 2, updated_at: 140, created_at: 135, expires_at: 255, task_id: item.id,
+      source_revision: item.revision, source: item, fields: ["title"], state: "running",
+      provider: "local", model: "qwen", automatic: false,
+      worker_id: "worker-1", failure: "", accepted_fields: [], edited_fields: [], outcome_uncertain: false,
+      rationale: "",
+    };
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: proposal }));
+    await generateEnhancement({ id: "e", request_id: "r", expected_revision: 1 }, selection);
+    expect(JSON.parse(String((native.mock.calls[1]?.[1] as { input: string }).input))).toMatchObject({
+      id: "e", request_id: "r", expected_revision: 1, model: selection,
+    });
   });
 });

@@ -1142,6 +1142,13 @@ html.macos .gp-welcome {
   background-color: transparent;
 }
 
+/* The repository strip paints 12px labels on glass. The shared chrome fill
+   is 40% so the hue field shows through, which drops muted text below AA;
+   this row is denser so an open tab remains a plate rather than a ghost. */
+html.macos .gp-glass.gp-repo-tabs {
+  background-color: rgb(var(--c-surface) / 0.78);
+}
+
 html.macos .gp-welcome-card {
   padding: 32px;
   border: 1px solid var(--mac-glass-edge);
@@ -1260,6 +1267,10 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     border-color: rgb(var(--c-border));
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
+  }
+
+  html.macos .gp-glass.gp-repo-tabs {
+    background-color: rgb(var(--c-surface));
   }
 
   html.macos :is(.gp-scrim, .backdrop-blur-sm) {

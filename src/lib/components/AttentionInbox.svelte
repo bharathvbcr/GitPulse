@@ -3,6 +3,7 @@
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import { listen } from "@tauri-apps/api/event";
   import { isTauri } from "../platform";
+  import { createListenerTracker } from "../dom/listenerTracker";
   import { formatRelativeTime } from "../format";
   import { automaticUpdates, explainError, getAttention, listAttention, type Attention, type AttentionFilter, type Page, type Scope } from "../workbench/client";
 
@@ -27,12 +28,15 @@
     clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { void load(); }, 200);
   }
   onMount(() => {
-    let unlisten: (() => void) | undefined;
-    if (isTauri()) void listen("workbench-changed", schedule).then((stop) => { if (disposed) stop(); else unlisten = stop; }).catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Use Refresh inbox.`; });
+    const listeners = createListenerTracker();
+    if (isTauri()) void listen("workbench-changed", schedule).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Use Refresh inbox.`; });
     const automatic = automaticUpdates.subscribe(schedule);
     const visibility = () => { visible = !document.hidden; };
     visibility(); document.addEventListener("visibilitychange", visibility); window.addEventListener("focus", schedule);
-    return () => { disposed = true; generation++; clearTimeout(refreshTimer); unlisten?.(); automatic(); document.removeEventListener("visibilitychange", visibility); window.removeEventListener("focus", schedule); };
+    listeners.track(automatic);
+    listeners.track(() => document.removeEventListener("visibilitychange", visibility));
+    listeners.track(() => window.removeEventListener("focus", schedule));
+    return () => { disposed = true; generation++; clearTimeout(refreshTimer); listeners.dispose(); };
   });
   $effect(() => {
     scope; filter; active; visible;

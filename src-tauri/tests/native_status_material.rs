@@ -33,6 +33,25 @@ fn main() {
                     ..Default::default()
                 },
             )?;
+            // Phase 1: the status item must not keep a menu attached at rest.
+            if let Some(tray) = app.handle().tray_by_id("gitpulse-status") {
+                tray.with_inner_tray_icon(|inner| {
+                    #[cfg(target_os = "macos")]
+                    {
+                        use objc2::msg_send;
+                        use objc2::runtime::AnyObject;
+                        let item = inner.ns_status_item().expect("status item");
+                        unsafe {
+                            let item_ptr = objc2::rc::Retained::as_ptr(&item).cast::<AnyObject>();
+                            let menu: *mut AnyObject = msg_send![item_ptr, menu];
+                            assert!(
+                                menu.is_null(),
+                                "status item must not keep an NSMenu attached at rest"
+                            );
+                        }
+                    }
+                })?;
+            }
             Ok(())
         })
         .build(context)

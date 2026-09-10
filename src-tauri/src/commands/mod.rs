@@ -1601,6 +1601,38 @@ pub async fn cmd_repo_operation(repo_path: String) -> Result<Option<RepoOperatio
     .await
 }
 
+/// mtime of `FETCH_HEAD` in the shared git dir (worktrees share one), as epoch ms.
+pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, String> {
+    use crate::engine::git_cli::resolve_git_common_dir;
+    use std::time::UNIX_EPOCH;
+
+    let common = resolve_git_common_dir(repo)?;
+    let fetch_head = common.join("FETCH_HEAD");
+    match std::fs::metadata(&fetch_head) {
+        Ok(meta) => {
+            let modified = meta
+                .modified()
+                .map_err(|error| format!("Could not read FETCH_HEAD mtime: {error}"))?;
+            let millis = modified
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("FETCH_HEAD mtime is before the epoch: {error}"))?
+                .as_millis();
+            Ok(Some(millis as i64))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read FETCH_HEAD: {error}")),
+    }
+}
+
+#[tauri::command(async)]
+pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, String> {
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        last_fetch_at_ms(&repo)
+    })
+    .await
+}
+
 /// Aborts, continues, or skips the parked operation.
 ///
 /// The gate judges the argv that [`crate::engine::repo_op::action_argv`]
@@ -2463,6 +2495,19 @@ mod tests {
 
         assert_eq!(discard_file_op(&root, "README.md"), "modify");
         assert_eq!(discard_file_op(&root, "fresh.txt"), "delete");
+    }
+
+    #[test]
+    fn last_fetch_at_reads_fetch_head_mtime_or_none() {
+        let dir = repo_with_tracked_and_untracked();
+        let repo = validate_repo(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(last_fetch_at_ms(&repo).unwrap(), None);
+        let fetch_head = crate::engine::git_cli::resolve_git_common_dir(&repo)
+            .unwrap()
+            .join("FETCH_HEAD");
+        std::fs::write(&fetch_head, "deadbeef\t\tbranch 'main' of somewhere\n").unwrap();
+        let stamp = last_fetch_at_ms(&repo).unwrap().expect("FETCH_HEAD mtime");
+        assert!(stamp > 0);
     }
 
     #[test]

@@ -262,8 +262,7 @@ rather than presenting a floor as a total.
   - `govulncheck` (Go)
   - `composer audit` (PHP)
   - `bundler-audit` (Ruby)
-  - GitHub Dependabot alerts (via local `gh` CLI)
-  - GitHub Code Scanning alerts (CodeQL / GHAS, via the same `gh` CLI)
+  - GitHub Dependabot and code scanning alerts (via local `gh` CLI), fetched when a repository opens. Critical and high findings raise a warning. Turn off under Settings → Analysis. The Health **Scan local** button still does not call GitHub.
 - **Code map status & dead symbols**: When a DevMap store is present (schema 20), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
 

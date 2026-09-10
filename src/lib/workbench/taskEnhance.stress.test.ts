@@ -117,4 +117,55 @@ describe("enhancement transaction adversarial boundaries", () => {
     expect(acceptEnhancementInput(proposal, {...task, id: "other"}, ["title"], "r")).toBeNull();
     expect(acceptEnhancementInput(proposal, {...task, revision: 5}, ["title"], "r")).toBeNull();
   });
+
+  it("bakes the live model selection into the generate step after create", async () => {
+    const selection = { base_url: "http://127.0.0.1:11434/v1", model: "qwen" };
+    const change = vi.fn().mockImplementation(async (method: string) => {
+      if (method === "enhancements.create") return {...proposal, revision: 1, state: "pending"};
+      return {...proposal, revision: 2, state: "running"};
+    });
+    const action = new EnhancementAction({ change, read: vi.fn() }, () => selection);
+    await action.run("enhancements.create", {
+      id: "e", request_id: "create", expected_revision: 0, task_id: "t", source_revision: 4,
+      fields: ["title"], provider: "local", model: "qwen",
+    });
+    const generateCall = change.mock.calls.find(([method]) => method === "enhancements.generate");
+    expect(generateCall?.[1]).toMatchObject({
+      id: "e",
+      expected_revision: 1,
+      model: selection,
+    });
+  });
+
+  it("keeps one receipt across interleaved create/generate/accept with a mid-flight model switch", async () => {
+    let selection = { base_url: "http://127.0.0.1:11434/v1", model: "first" };
+    const change = vi.fn().mockImplementation(async (method: string, input: Record<string, unknown>) => {
+      if (method === "enhancements.create") return {...proposal, revision: 1, state: "pending", model: "first"};
+      if (method === "enhancements.generate") {
+        expect(input.model).toEqual({ base_url: "http://127.0.0.1:11434/v1", model: "first" });
+        return {...proposal, revision: 2, state: "ready", model: "first"};
+      }
+      return accepted;
+    });
+    const action = new EnhancementAction({ change, read: vi.fn().mockResolvedValue(saved) }, () => selection);
+    const started = await action.run("enhancements.create", {
+      id: "e", request_id: "c", expected_revision: 0, task_id: "t", source_revision: 4,
+      fields: ["title"], provider: "local", model: "first",
+    });
+    selection = { base_url: "http://127.0.0.1:11434/v1", model: "second" };
+    expect(started.proposal.state).toBe("ready");
+    await action.run("enhancements.accept", input);
+    expect(change.mock.calls.filter(([method]) => method === "enhancements.generate")).toHaveLength(1);
+  });
+
+  it("randomized sequences still yield one receipt per accepted action", async () => {
+    for (let i = 0; i < 40; i++) {
+      const change = vi.fn().mockResolvedValue(accepted);
+      const action = new EnhancementAction({ change, read: vi.fn().mockResolvedValue(saved) });
+      const burst = await Promise.allSettled(Array.from({ length: 5 }, () => action.run("enhancements.accept", input)));
+      const ok = burst.filter((result) => result.status === "fulfilled");
+      expect(ok).toHaveLength(1);
+      expect(change).toHaveBeenCalledTimes(1);
+    }
+  });
 });

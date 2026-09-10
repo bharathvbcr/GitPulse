@@ -14,9 +14,9 @@ flowchart TD
 
 ## Guarantees
 
-**No remote phoning home.** Network-capable features follow user actions or opt-in settings, including scheduled release checks and automatic task suggestions. The webview does not load CDN scripts or trackers.
+**No remote phoning home.** Network-capable features follow user actions or opt-in settings, including scheduled release checks, automatic task suggestions, and the default-on GitHub alert scan. The webview does not load CDN scripts or trackers.
 
-**GitHub credentials.** GitPulse never requests, reads, stores, or transmits GitHub tokens. PR / Actions / Dependabot features delegate to the `gh` CLI you already authenticated.
+**GitHub credentials.** GitPulse never requests, reads, stores, or transmits GitHub tokens. PR / Actions / Dependabot / code scanning features delegate to the `gh` CLI you already authenticated. Dependabot and code scanning alerts are fetched when a repository opens (Settings → Analysis; on by default). Critical and high findings warn; a check that did not run is not an all-clear.
 
 **Local AI transport.** Built-in local completions and model probes reject remote base URLs. Profile Manvi task suggestions and explicitly launched agents use their configured provider and run settings; the loopback restriction does not apply to those separate execution paths.
 

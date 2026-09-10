@@ -31,7 +31,13 @@ export interface SettingEntry {
 
 export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   { id: "status-icon", section: "layout", label: "Menu bar status icon",
-    keywords: "tray background close hide window repository conflicts menu bar stash pulse fleet terminal" },
+    keywords: "tray background close hide window repository conflicts menu bar stash pulse fleet terminal dock launch login autostart counts" },
+  { id: "hide-dock", section: "layout", label: "Hide Dock icon while closed",
+    keywords: "dock accessory menu bar hide closed window" },
+  { id: "status-icon-counts", section: "layout", label: "Show counts beside the icon",
+    keywords: "tray title counts conflicts changed menu bar" },
+  { id: "launch-at-login", section: "layout", label: "Launch at login",
+    keywords: "autostart launch agent login item startup background" },
   { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {
     id: "theme",
@@ -164,6 +170,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "diff",
     label: "Tab width",
     keywords: "tab size indent indentation columns spaces 2 4 8",
+  },
+  {
+    id: "auto-github-alerts",
+    section: "analysis",
+    label: "Check GitHub alerts on launch",
+    keywords: "dependabot code scanning codeql github security gh alerts launch automatic",
   },
   {
     id: "auto-coverage",

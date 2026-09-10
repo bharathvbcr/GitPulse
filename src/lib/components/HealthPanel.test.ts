@@ -96,7 +96,7 @@ describe("HealthPanel rendering", () => {
     const { body } = render(HealthPanel);
     expect(body).toContain("Health");
     expect(body).toContain("Scan");
-    expect(body).toContain("GitHub alerts are not checked automatically");
+    expect(body).toContain("GitHub alerts are checked when GitPulse launches");
     // With no repository open there is nothing to have checked, so the
     // Dependabot state chip stays out of the header entirely.
     expect(body).not.toContain("Dependabot not checked");
@@ -110,29 +110,47 @@ describe("HealthPanel rendering", () => {
   });
 
   it("includes Dependabot in the copied report and shows every alert severity in the header", () => {
-    expect(source).toContain("formatHealthReport(current, repoPath, dependabot, codeScanning)");
+    expect(source).toContain(
+      "formatHealthReport(current, repoPath, dependabot, codeScanning, deadCode)",
+    );
     expect(source).toContain("Dependabot checked at:");
     expect(source).toContain("Code scanning checked at:");
     expect(source).toContain("{#if openDependabotCount > 0}");
     expect(source).toContain("{#if openCodeScanningCount > 0}");
   });
 
-  it("keeps credentialed GitHub checks behind an explicit user action", () => {
+  it("feeds the dead-code table into the copied report, not only the on-screen table", () => {
+    const body = source.slice(
+      source.indexOf("function renderedReport"),
+      source.indexOf("async function copyReport"),
+    );
+    expect(body).toContain("deadSymbolsAvailable");
+    expect(body).toContain("deadSymbolsReason");
+    expect(body).toContain("deadSymbolsTotal");
+    expect(body).toContain("deadSymbolsTruncated");
+    expect(body).toContain("items: deadSymbols");
+    expect(source).toContain(
+      "formatHealthReport(current, repoPath, dependabot, codeScanning, deadCode)",
+    );
+  });
+
+  it("keeps credentialed GitHub checks off the local scan path", () => {
     const localScan = source.slice(
       source.indexOf("async function scan("),
       source.indexOf("async function scanDependabot"),
     );
     expect(localScan).not.toContain("cmd_github_dependabot_alerts");
     expect(localScan).not.toContain("cmd_github_code_scanning_alerts");
+    expect(localScan).not.toContain("loadGithubAlerts");
     expect(source).toContain("async function scanDependabot");
-    expect(source).toContain("GitHub alerts are not checked automatically");
+    expect(source).toContain("GitHub alerts are checked when GitPulse launches");
     expect(source).toMatch(/uses the GitHub CLI,\s+its credentials, and the network/);
     expect(source).toContain('aria-describedby="dependabot-permission-note"');
     expect(source).not.toContain('class="hidden xl:inline text-[10px] text-textMuted"');
     expect(source).toContain("Check GitHub alerts");
-    expect(source).toContain("onclick={() => scanDependabot()}");
-    expect(source).toContain("cmd_github_code_scanning_alerts");
-    expect(source).toContain("Promise.allSettled");
+    expect(source).toContain("onclick={() => scanDependabot(undefined, { force: true })}");
+    expect(source).toContain("loadGithubAlerts");
+    expect(source).toContain("autoScanGithubAlerts");
   });
 
   it("shows an IPC failure instead of misdiagnosing it as a missing GitHub CLI", () => {
@@ -149,9 +167,9 @@ describe("HealthPanel rendering", () => {
     );
     const renderedError = section.slice(errorBranch, missingCliBranch);
     expect(renderedError).toContain("!dependabotRequestFailed");
-    expect(source).toContain("dependabotRequestFailed = depFailed;");
+    expect(source).toContain("dependabotRequestFailed = snapshot.dependabotRequestFailed;");
     expect(source).toContain("dependabotRequestFailed = false;");
-    expect(source).toContain("codeScanningRequestFailed = csFailed;");
+    expect(source).toContain("codeScanningRequestFailed = snapshot.codeScanningRequestFailed;");
   });
 
   it("shows an IPC failure for code scanning instead of misdiagnosing it as a missing GitHub CLI", () => {
@@ -185,21 +203,23 @@ describe("HealthPanel flicker contracts", () => {
     );
     const effectBody = source.slice(source.indexOf("scanned.path = path;"), source.indexOf("async function openExternal"));
     expect(effectBody).toContain("healthCache.get(path)");
+    expect(effectBody).toContain("githubAlertsCache.get(path)");
     expect(effectBody).toContain("dependabotCheckedAt = cached.dependabotCheckedAt;");
+    expect(effectBody).toContain("autoScanGithubAlerts");
+    expect(effectBody).toContain("void scanDependabot(path)");
   });
 
-  it("timestamps and caches the latest successful or failed explicit GitHub check", () => {
+  it("timestamps and caches the latest successful or failed GitHub check", () => {
     const body = source.slice(
       source.indexOf("async function scanDependabot"),
       source.indexOf("function renderedReport"),
     );
-    expect(body).toContain("const checkedAt = Date.now();");
-    expect(body).toContain("dependabotCheckedAt = checkedAt;");
-    expect(body).toContain("codeScanningCheckedAt = checkedAt;");
-    expect(body).toContain("Promise.allSettled");
-    expect(body).toContain("cmd_github_code_scanning_alerts");
+    expect(body).toContain("loadGithubAlerts(repoPath");
+    expect(body).toContain("force: options?.force === true");
+    expect(body).toContain("dependabotCheckedAt = snapshot.checkedAt");
+    expect(body).toContain("codeScanningCheckedAt = snapshot.checkedAt");
     expect(body).toContain("cacheDependabotResult(");
-    expect(body).toContain("nextCodeScanning");
+    expect(body).toContain("snapshot.codeScanning");
   });
 
   it("does not resurrect an older GitHub result after the local rescan fails", () => {
@@ -323,9 +343,9 @@ describe("HealthPanel error-state separation (regression)", () => {
   });
 
   /**
-   * GitHub alerts are never checked automatically, so "nobody has looked" is
-   * the default state — and it rendered as the same empty space as "looked,
-   * nothing open". A clean local audit next to that blank read as an
+   * GitHub alerts can still be unchecked (preference off, or the fetch has
+   * not returned). That state used to render as the same empty space as
+   * "looked, nothing open". A clean local audit next to that blank read as an
    * all-clear for a repository whose alerts had never been fetched.
    */
   it("distinguishes an unchecked Dependabot from a checked-and-clear one", () => {

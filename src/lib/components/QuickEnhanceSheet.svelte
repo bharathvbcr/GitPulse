@@ -5,10 +5,10 @@
   import { LAYERS } from "../ui/layers";
   import { cardScale, backdropFade, backdropFadeOut } from "../ui/transitions";
   import { fade, scale } from "svelte/transition";
-  import { getTask, explainError, type Task } from "../workbench/client";
+  import { getTask, explainError, type EnhancementField, type Task } from "../workbench/client";
   import { hiddenTaskDetails, visibleHiddenDetails } from "../workbench/taskOrganize";
   import { bounded } from "../workbench/taskActions";
-  import TaskEnhancements from "./TaskEnhancements.svelte";
+  import TaskManviAssist from "./TaskManviAssist.svelte";
   import SettingToggle from "./SettingToggle.svelte";
 
   let {
@@ -30,6 +30,9 @@
   let busy = $state(false);
   let error = $state("");
   let showEmpty = $state(false);
+  let title = $state("");
+  let description = $state("");
+  let lockedFields = $state<EnhancementField[]>([]);
   let disposed = false;
   const details = $derived(task ? hiddenTaskDetails(task, repoName) : []);
   const visibleDetails = $derived(visibleHiddenDetails(details, showEmpty));
@@ -38,7 +41,12 @@
     loading = true; error = "";
     try {
       const loaded = await bounded(getTask(taskId));
-      if (!disposed) task = loaded;
+      if (!disposed) {
+        task = loaded;
+        title = loaded.title;
+        description = loaded.description;
+        lockedFields = [...(loaded.locked_fields ?? [])];
+      }
     } catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) loading = false; }
   }
@@ -75,7 +83,7 @@
           Quick Enhance
         </p>
         <p class="text-[11px] text-textMuted mt-1 leading-relaxed">
-          Surface the fields the board hides, then let Manvi rewrite title and description. Acceptance still changes only the fields you select.
+          Review hidden fields, then let Manvi rewrite title and description.
         </p>
       </div>
       <button type="button" class="gp-icon-btn" aria-label="Close Quick Enhance" onclick={onClose} disabled={busy}><X size={14} /></button>
@@ -109,12 +117,21 @@
           {/each}
           {#if visibleDetails.length === 0}<p class="text-textMuted">No extra fields are filled in. Toggle empty fields to inspect them.</p>{/if}
         </div>
-        <TaskEnhancements {task} disabled={loading} quick onApplied={(saved) => { task = saved; onApplied(saved); }} onBusy={(value) => { busy = value; }} />
+        <TaskManviAssist
+          {task}
+          bind:title
+          bind:description
+          bind:lockedFields
+          repositoryIds={task.repository_ids}
+          disabled={loading}
+          quick
+          onApplied={(saved) => { task = saved; title = saved.title; description = saved.description; lockedFields = [...(saved.locked_fields ?? [])]; onApplied(saved); }}
+          onBusy={(value) => { busy = value; }}
+        />
       {/if}
     </div>
     <footer class="p-3 border-t border-border/60 gp-section-edge flex justify-between gap-2">
       <button type="button" class="gp-btn" disabled={!task || busy} onclick={() => { if (task) onOpenEditor(task); }}>Open full editor</button>
-
     </footer>
   </div>
 </div>

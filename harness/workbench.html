@@ -29,6 +29,17 @@
   window.__TAURI_INTERNALS__ = {
     invoke: async (cmd, args) => {
       if (cmd === "cmd_pick_folder") return null;
+      if (cmd === "cmd_ai_status") {
+        return {
+          harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
+          endpoints: [{ base_url: "http://127.0.0.1:11434/v1", reachable: true, detail: "", models: ["fixture-model"] }],
+          selected: { base_url: args?.baseUrl ?? "http://127.0.0.1:11434/v1", model: args?.model ?? "fixture-model" },
+          model_info: null,
+          model_detail: "",
+          ready: true,
+          detail: "Fixture model ready.",
+        };
+      }
       if (cmd === "cmd_workbench_request" && ["notifications.native.status", "notifications.native.authorize"].includes(args.method)) return JSON.stringify({ available: false, authorization: "unavailable", error: "This browser fixture cannot request OS permission or display native notifications." });
       if (cmd === "cmd_workbench_request" && args.method === "notifications.native.pending") args = { method: "notifications.activations.list", input: JSON.stringify({ limit: 1 }) };
       if (cmd !== "cmd_workbench_request") throw new Error(`Unconfigured fixture command: ${cmd}`);
@@ -58,8 +69,18 @@
     try {
       const { runWorkbenchChecks } = await import("./workbenchChecks.ts");
       const checks = await runWorkbenchChecks();
+      const payload = { results: checks.map((name) => ({ name, pass: true })) };
       verdict.textContent = `${checks.length}/${checks.length} enhancement checks passed\n${checks.join("\n")}`;
-    } catch (error) { verdict.textContent = `Enhancement checks failed: ${error.message}`; }
+      document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(payload));
+      if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      verdict.textContent = `Enhancement checks failed: ${message}`;
+      document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results: [{ name: message, pass: false }] }));
+      if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    }
     finally { run.disabled = false; }
   };
+  const params = new URLSearchParams(location.search);
+  if (params.has("check")) await run.onclick();
 </script></body></html>

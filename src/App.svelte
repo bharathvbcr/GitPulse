@@ -110,6 +110,7 @@
   const loadShortcutsModal = () => import("./lib/components/ShortcutsModal.svelte");
   const loadCommandPalette = () => import("./lib/components/CommandPalette.svelte");
   const loadDiagnosticsModal = () => import("./lib/components/DiagnosticsModal.svelte");
+  import HeaderRepoMenu from "./lib/components/HeaderRepoMenu.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
@@ -128,11 +129,16 @@
     runBootSequence,
     type NativeShellHandlers,
   } from "./lib/boot/bootSequence";
+  import { createListenerTracker } from "./lib/dom/listenerTracker";
   import {
     checkForAppUpdate,
     describeUpdateCheck,
     maybeNotifyUpdate,
   } from "./lib/updates/updateCheck";
+  import {
+    loadGithubAlerts,
+    maybeNotifyGithubAlerts,
+  } from "./lib/health/githubAlerts";
   import { openExternal } from "./lib/desktop/openExternal";
   import { shouldSkipWebviewShortcut } from "./lib/ui/webviewShortcuts";
   import { applyUiScale, nativeZoomSetter } from "./lib/ui/uiScale";
@@ -369,15 +375,11 @@
 
   onMount(() => {
     applyPlatformClass();
-    const unsubs: Array<() => void> = [];
     // HMR/unmount can tear the component down while the async subscription
-    // chain is still awaiting; listeners pushed after cleanup must be
-    // unwound immediately instead of leaking past the component.
-    let disposed = false;
-    const track = (unsub: () => void) => {
-      if (disposed) unsub();
-      else unsubs.push(unsub);
-    };
+    // chain is still awaiting; listeners tracked after dispose unlisten
+    // immediately instead of leaking past the component.
+    const listeners = createListenerTracker();
+    const { track } = listeners;
 
     track(installBackgroundScope({
       subscribe: repoStore.subscribe,
@@ -406,7 +408,7 @@
     }).then(
       (unlisten) => {
         track(unlisten);
-        if (disposed) return;
+        if (listeners.disposed) return;
         void invoke("cmd_set_exit_guard_ready").catch((error) =>
           diagnostics.warn("boot:exit-guard", error),
         );
@@ -646,6 +648,52 @@
       (err) => diagnostics.warn("boot:ledger-appended", err),
     );
 
+    // GitHub Dependabot / code scanning at repository open. Detached from
+    // boot the same way as the release check: a slow `gh api` must not delay
+    // workspace restore. Preference off means no request at all.
+    let githubScanPath = "";
+    const notifiedGithub = new Map<string, string>();
+    const scanGithubAlerts = (path: string) => {
+      void maybeNotifyGithubAlerts({
+        repoPath: path,
+        enabled: get(interfaceStore).autoScanGithubAlerts,
+        load: loadGithubAlerts,
+        notified: notifiedGithub,
+        notify: (_snapshot, message) => {
+          toastStore.warning(
+            message,
+            {
+              label: "Open Health",
+              onClick: () => repoStore.setActiveTab("insights", "health"),
+            },
+            12_000,
+          );
+        },
+        onError: (message) => diagnostics.warn("github-alerts:check", message),
+      });
+    };
+    track(
+      repoStore.subscribe((state) => {
+        const path = state.currentPath;
+        if (!path || path === githubScanPath) return;
+        githubScanPath = path;
+        scanGithubAlerts(path);
+      }),
+    );
+    // Turning the setting on for a repository that is already open has to
+    // scan too: repoStore will not fire again until the path changes.
+    let githubAlertsEnabled = get(interfaceStore).autoScanGithubAlerts;
+    track(
+      interfaceStore.subscribe((prefs) => {
+        const enabled = prefs.autoScanGithubAlerts;
+        const turnedOn = enabled && !githubAlertsEnabled;
+        githubAlertsEnabled = enabled;
+        if (!turnedOn) return;
+        const path = get(repoStore).currentPath;
+        if (path) scanGithubAlerts(path);
+      }),
+    );
+
     // Opt-in release check. `maybeNotifyUpdate` makes no request at all while
     // the preference is off, so the default build never contacts the network
     // about itself. Detached from the boot sequence deliberately: a slow or
@@ -678,12 +726,11 @@
     });
 
     return () => {
-      disposed = true;
+      listeners.dispose();
       if (dropHideTimer !== null) {
         clearTimeout(dropHideTimer);
         dropHideTimer = null;
       }
-      for (const unsub of unsubs) unsub();
     };
   });
 
@@ -829,27 +876,10 @@
     <div class="relative min-w-0 flex-1 h-full">
     <div bind:this={headerScroller} class="gp-header-scroll min-w-0 h-full">
       <div class="flex items-center gap-2 min-w-full w-max px-2 h-full">
-        <!-- The icons carry the meaning on their own; the words are the part
-             the Layout setting drops. Both keep their accessible name either
-             way, so the label is decoration, never the only cue. -->
-        <button
-          onclick={() => repoStore.pickAndOpenRepo()}
-          class="gp-btn py-1! shrink-0"
-          title="Open a repository"
-          aria-label="Open a repository"
-        >
-          <FolderOpen size={13} class="text-accent" />
-          {#if $interfaceStore.showHeaderActionLabels}<span>Open...</span>{/if}
-        </button>
-        <button
-          onclick={openCloneDialog}
-          class="gp-btn py-1! shrink-0"
-          title="Clone a repository"
-          aria-label="Clone a repository"
-        >
-          <Download size={13} class="text-accent" />
-          {#if $interfaceStore.showHeaderActionLabels}<span>Clone...</span>{/if}
-        </button>
+        <HeaderRepoMenu
+          onOpen={() => void repoStore.pickAndOpenRepo()}
+          onClone={openCloneDialog}
+        />
 
         {#if $repoStore.currentPath}
           <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>

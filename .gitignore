@@ -150,3 +150,6 @@ CLAUDE.md
 
 # Local DevMap preview input
 /harness/.devmap-preview.json
+
+# DevCouncil local state
+!.devcouncil/config.yaml

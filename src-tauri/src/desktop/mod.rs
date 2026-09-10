@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, Window, Windo
 use crate::engine::find_git_root;
 use actions::NativeAction;
 use menu::build_native_menu;
+use tray::GlyphVariant;
 
 pub const MENU_EVENT: &str = "gitpulse-menu";
 pub const OPEN_REPO_EVENT: &str = "gitpulse-open-repo";
@@ -30,6 +31,7 @@ pub struct DesktopState {
     menu_state: Mutex<MenuState>,
     pending_open: Mutex<Option<String>>,
     exit_guard_ready: AtomicBool,
+    tray_glyph: Mutex<Option<GlyphVariant>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -169,7 +171,17 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
     let app = window.app_handle();
     if menu_state(app).show_status_icon && app.tray_by_id(tray::TRAY_ID).is_some() {
         match window.hide() {
-            Ok(()) => return true,
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let state = menu_state(app);
+                    apply_dock_policy(
+                        app,
+                        dock_policy(state.show_status_icon, state.hide_dock_when_closed, false),
+                    );
+                }
+                return true;
+            }
             Err(error) => log::warn!(target: "desktop", "Could not hide main window: {error}"),
         }
     }
@@ -306,10 +318,37 @@ fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .get_webview_window("main")
         .ok_or("GitPulse main window is unavailable")?;
     #[cfg(target_os = "macos")]
-    app.show().map_err(|error| error.to_string())?;
+    {
+        apply_dock_policy(app, DockMode::Regular);
+        app.show().map_err(|error| error.to_string())?;
+    }
     window.show().map_err(|error| error.to_string())?;
     window.unminimize().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
+}
+
+/// Dock visibility for menu-bar-only mode. Pure so MockRuntime tests can pin the matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockMode {
+    Accessory,
+    Regular,
+}
+
+pub fn dock_policy(show_status_icon: bool, hide_dock_pref: bool, main_visible: bool) -> DockMode {
+    if show_status_icon && hide_dock_pref && !main_visible {
+        DockMode::Accessory
+    } else {
+        DockMode::Regular
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_dock_policy<R: Runtime>(app: &AppHandle<R>, mode: DockMode) {
+    let policy = match mode {
+        DockMode::Accessory => tauri::ActivationPolicy::Accessory,
+        DockMode::Regular => tauri::ActivationPolicy::Regular,
+    };
+    let _ = app.set_activation_policy(policy);
 }
 
 pub fn menu_state<R: Runtime>(app: &AppHandle<R>) -> MenuState {
@@ -324,7 +363,12 @@ pub fn menu_state<R: Runtime>(app: &AppHandle<R>) -> MenuState {
 pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result<(), String> {
     next.validate()?;
     let previous = menu_state(app);
-    let menu = if previous.repositories != next.repositories {
+    let rebuild_menu = previous
+        .repositories
+        .iter()
+        .map(state::repository_switcher_key)
+        .ne(next.repositories.iter().map(state::repository_switcher_key));
+    let menu = if rebuild_menu {
         let menu = build_native_menu(app, &recent_menu_entries(app), &next)
             .map_err(|error| error.to_string())?;
         app.set_menu(menu.clone())
@@ -334,13 +378,16 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         app.menu().ok_or("Native menu is unavailable")?
     };
     menu::apply_presentation(&menu, &next).map_err(|error| error.to_string())?;
+    let glyph_changed = tray::glyph_variant(&previous) != tray::glyph_variant(&next);
     if previous.show_status_icon != next.show_status_icon
         || previous.tray_summary != next.tray_summary
         || previous.tray_detail != next.tray_detail
         || previous.tray_details != next.tray_details
+        || previous.tray_title != next.tray_title
         || previous.repositories != next.repositories
         || previous.enabled(actions::REFRESH) != next.enabled(actions::REFRESH)
         || previous.status.primary_label != next.status.primary_label
+        || glyph_changed
     {
         tray::apply(app, &next)?;
     }
@@ -514,5 +561,33 @@ mod tests {
         assert!(!should_guard_exit(false, true));
         assert!(should_guard_exit(true, false));
         assert!(!should_guard_exit(true, true));
+    }
+
+    #[test]
+    fn dock_policy_hides_only_while_closed_with_status_icon() {
+        assert_eq!(dock_policy(true, true, false), DockMode::Accessory);
+        assert_eq!(dock_policy(true, true, true), DockMode::Regular);
+        assert_eq!(dock_policy(true, false, false), DockMode::Regular);
+        assert_eq!(dock_policy(false, true, false), DockMode::Regular);
+    }
+
+    #[test]
+    fn repository_count_churn_does_not_change_switcher_identity() {
+        use state::{repository_switcher_key, MenuRepository};
+        let a = MenuRepository {
+            path: "/r/a".into(),
+            label: "A".into(),
+            active: true,
+            changed: Some(1),
+            conflicts: None,
+            busy: false,
+        };
+        let mut b = a.clone();
+        b.changed = Some(9);
+        b.conflicts = Some(2);
+        b.busy = true;
+        assert_eq!(repository_switcher_key(&a), repository_switcher_key(&b));
+        b.active = false;
+        assert_ne!(repository_switcher_key(&a), repository_switcher_key(&b));
     }
 }

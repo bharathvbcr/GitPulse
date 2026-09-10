@@ -55,6 +55,17 @@
     mockIPC((command, args) => {
       if (command === "cmd_pick_folder") return null;
       if (command === "cmd_workbench_register_repository") return JSON.stringify({ ok: true, repository: repositories[0] });
+      if (command === "cmd_ai_status") {
+        return {
+          harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
+          endpoints: [{ base_url: "http://127.0.0.1:11434/v1", reachable: true, detail: "", models: ["fixture-model"] }],
+          selected: { base_url: "http://127.0.0.1:11434/v1", model: "fixture-model" },
+          model_info: null,
+          model_detail: "",
+          ready: true,
+          detail: "Fixture model ready.",
+        };
+      }
       if (command !== "cmd_workbench_request") throw new Error(`Unconfigured fixture command: ${command}`);
       const input = JSON.parse(args.input);
       switch (args.method) {
@@ -88,6 +99,8 @@
         default: throw new Error(`Unconfigured fixture method: ${args.method}`);
       }
     }, { shouldMockEvents: true });
+    const { harnessStore } = await import("../src/lib/stores/harnessStore");
+    void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "fixture-model" });
     mount(TaskBoard, { target: document.getElementById("board"), props: params.has("repository") ? { repositoryPath: "/fixture/GitPulse" } : {} });
     const theme = document.getElementById("theme"), platform = document.getElementById("platform");
     theme.onchange = () => {

@@ -58,7 +58,7 @@ Four on-demand scans of **this repository**. Each must say when it was capped ra
 | --- | --- |
 | **Pulse** | Heatmap, rhythm, punch card, LOC trend, commit hygiene, hotspots, bus factor, local DORA, exportable SVG card. Unscanned tiles are an em dash with a reason. |
 | **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, JaCoCo, Clover. Toolchain hints and failure recovery. |
-| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus Dependabot via `gh`. |
+| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus Dependabot and code scanning via `gh` when a repository opens. Critical and high findings warn. |
 | **Storage** | Packfiles, loose objects, LFS, submodules, build caches, size history. |
 
 ![Coverage scanner](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-coverage.png)

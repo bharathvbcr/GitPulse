@@ -142,10 +142,36 @@ describe("TaskBoard", () => {
     expect(source).toContain("Unassigned");
     expect(source).toContain('e.key.toLowerCase() === "a"');
     expect(source).toContain("Open Quick Enhance?");
+    expect(source).toContain("openQuickEnhance");
     expect(source).toContain("Start a duplicate");
+  });
+
+  it("routes key e and toolbar Quick Enhance through discard + session clear", () => {
+    expect(source).toContain('e.key === "e"');
+    expect(source).toContain("void openQuickEnhance(card.id)");
+    expect(source).toContain("void openQuickEnhance(id)");
+    expect(source).toContain("session = null");
+    expect(source).toContain("enhanceId = id");
   });
 
   it("does not add a second backdrop-filter on the board scrim path", () => {
     expect(source).not.toMatch(/\bbackdrop-blur-/);
+  });
+
+  it("keeps open tasks in a tab strip with a close control beside each tab", () => {
+    expect(source).toContain('role="tablist"');
+    expect(source).toContain('aria-label="Open tasks"');
+    expect(source).toContain("handleTablistKeydown");
+    expect(source).toContain("tabindex={isActive ? 0 : -1}");
+    expect(source).toContain("aria-controls={TASK_EDITOR_PANE_ID}");
+    expect(source).toContain('role="tabpanel"');
+    expect(source).toContain('data-testid="task-tab-close"');
+    expect(source).toContain("data-open-task");
+    expect(source).toContain("in progress");
+    expect(source).toContain(".editor-dock");
+    const strip = source.slice(source.indexOf('aria-label="Open tasks"'), source.indexOf("ScrollCue target={tabStrip}"));
+    expect(strip).toContain('role="tab"');
+    expect(strip).toContain('data-testid="task-tab-close"');
+    expect(strip.indexOf("</div>")).toBeLessThan(strip.indexOf('data-testid="task-tab-close"'));
   });
 });

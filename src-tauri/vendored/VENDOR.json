@@ -346,7 +346,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "4ccadc604f40e21a3a14471d0af3c7674265e15f"
+        "commit": "75050891d311b8091599e32450e397d2ca8fff75"
       },
       "omitted": [
         "tests/",
@@ -366,7 +366,7 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "e5dc425795f69001658e1a5408ffa8af7bfa2685277936767ab5b8b8ba46c1e5",
+        "src/db.rs": "2db68a57277a52653823811af0ed7bccde48f827a29bce5307352fbb196246fb",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
         "src/lib.rs": "189e97c932a71f282967282540b103003c5c927021e2fe238ce47745ddea892e",

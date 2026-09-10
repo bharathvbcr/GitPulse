@@ -167,3 +167,28 @@ export interface CodeScanningReport {
   truncated: boolean;
   error?: string | null;
 }
+
+/**
+ * Dead-code query the Health view already shows. Field names match
+ * `CodeintelDeadSymbol` / `CodeintelResponse` so the panel can pass its
+ * bindings through without a second mapping layer.
+ *
+ * `available: false` is "could not check" — distinct from an empty `items`
+ * list, which only ever means the indexed graph had no unreferenced symbols.
+ */
+export interface DeadCodeFinding {
+  symbol_name: string;
+  file_path: string;
+  confidence: number;
+  is_exempt: boolean;
+  exemption_reason?: string | null;
+}
+
+export interface DeadCodeReport {
+  available: boolean;
+  reason?: string | null;
+  items: DeadCodeFinding[];
+  /** Observed total, never below `items.length`. */
+  total: number;
+  truncated: boolean;
+}

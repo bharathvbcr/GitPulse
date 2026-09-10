@@ -8,6 +8,7 @@ import {
   type NativeMenuHandlers,
   type NativeEvent,
 } from "./nativeActions";
+import { createListenerTracker } from "../dom/listenerTracker";
 
 export async function takePendingOpen(): Promise<string | null> {
   if (!isTauri()) return null;
@@ -32,19 +33,19 @@ export async function subscribeNativeShell(handlers: NativeMenuHandlers): Promis
 
   // Handles are collected as they resolve so a later failure unwinds the
   // earlier listeners instead of leaking them.
-  const unlistenAll: Array<() => void> = [];
+  const listeners = createListenerTracker();
   try {
-    unlistenAll.push(
+    listeners.track(
       await listen<NativeEvent>("gitpulse-menu", (event) => {
         dispatchNativeMenu(event.payload, handlers);
       }),
     );
-    unlistenAll.push(
+    listeners.track(
       await listen<NativeEvent>("gitpulse-open-repo", (event) => {
         if (event.payload.path) handlers.openRepo(event.payload.path);
       }),
     );
-    unlistenAll.push(
+    listeners.track(
       await listen<string>("gitpulse-open-error", (event) => {
         handlers.openError(event.payload);
       }),
@@ -58,7 +59,7 @@ export async function subscribeNativeShell(handlers: NativeMenuHandlers): Promis
     // the Kanban board and the tab strip.
     let sawFiles = false;
     let overlay = false;
-    unlistenAll.push(
+    listeners.track(
       await getCurrentWindow().onDragDropEvent(async (event) => {
         const decision = reduceFileDrop(event.payload, { sawFiles });
         sawFiles = decision.sawFiles;
@@ -79,17 +80,9 @@ export async function subscribeNativeShell(handlers: NativeMenuHandlers): Promis
       }),
     );
   } catch (err) {
-    for (const unlisten of unlistenAll) {
-      try {
-        unlisten();
-      } catch {
-        /* an already-dead listener must not mask the original failure */
-      }
-    }
+    listeners.dispose();
     throw err;
   }
 
-  return () => {
-    for (const unlisten of unlistenAll) unlisten();
-  };
+  return () => listeners.dispose();
 }

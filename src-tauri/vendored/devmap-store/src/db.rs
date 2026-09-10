@@ -36,6 +36,18 @@ fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
+/// Shared by [`Store::save_generation_timed`] and [`Store::restamp_latest_head`].
+/// A stamp is provenance, not a git-object proof: `"unavailable"` and `"unknown"`
+/// are valid, which is what the CLI writes when `rev-parse` fails.
+fn validate_head_sha(head_sha: &str) -> Result<()> {
+    if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace) {
+        return Err(refusal(
+            "head_sha must be non-empty, whitespace-free, and at most 128 characters",
+        ));
+    }
+    Ok(())
+}
+
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
 use crate::schema::{
@@ -4045,12 +4057,7 @@ impl Store {
     ) -> Result<(u32, WriteBreakdown)> {
         let mut spent = WriteBreakdown::default();
         self.refuse_if_read_only()?;
-        if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace)
-        {
-            return Err(refusal(
-                "head_sha must be non-empty, whitespace-free, and at most 128 characters",
-            ));
-        }
+        validate_head_sha(head_sha)?;
         let mut unique_paths = std::collections::BTreeSet::new();
         for extraction in extractions {
             if !unique_paths.insert(extraction.file_path.as_str()) {
@@ -5440,6 +5447,63 @@ impl Store {
         Ok(sha)
     }
 
+    /// Rewrite the latest generation's git identity without writing a new graph.
+    ///
+    /// Callers that have already proved the working tree matches this
+    /// generation — the CLI skip path, a daemon drain whose HEAD moved but
+    /// whose file hashes did not — used to leave `head_sha` on the commit the
+    /// generation was first written at. `status` then treated that lag as
+    /// "rebuild required", and the rebuild skipped, so freshness could never
+    /// recover. This is the missing write: same generation id, same hashes,
+    /// current HEAD.
+    pub fn restamp_latest_head(&self, head_sha: &str) -> Result<()> {
+        self.refuse_if_read_only()?;
+        validate_head_sha(head_sha)?;
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
+        let changed = tx.execute(
+            "UPDATE generations SET head_sha = ?1
+             WHERE id = (SELECT max(id) FROM generations)",
+            params![head_sha],
+        )?;
+        if changed == 0 {
+            return Err(refusal(
+                "no generation to restamp: nothing has been indexed yet — run `devmap build`",
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the latest generation still describes the working tree.
+    ///
+    /// Payload identity, per-file content hashes, and discovery refusals.
+    /// Git HEAD is not consulted: it is provenance, restamped by the caller
+    /// once this returns true. `false` means a full rebuild (or a drain that
+    /// re-reads the tree) is required; an error means the question could not
+    /// be asked, which callers must treat as "do not skip".
+    #[cfg(feature = "parse")]
+    pub fn latest_generation_matches_working_tree(&self) -> Result<bool> {
+        if !self.latest_generation_payload_is_current()? {
+            return Ok(false);
+        }
+        let Some(root) = self.latest_repo_root()? else {
+            return Ok(false);
+        };
+        let hashes = self.latest_file_hashes()?;
+        let refusals = self.latest_discovery_refusals()?;
+        let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                return Err(refusal(format!(
+                    "working tree could not be compared to the indexed generation: {error}"
+                )))
+            }
+        };
+        Ok(scanned.matches_file_hashes(&hashes)
+            && crate::discovery_refusals(&scanned.report) == refusals)
+    }
+
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
@@ -5730,7 +5794,6 @@ impl Store {
         };
         let hashes = self.latest_file_hashes()?;
         let refusals = self.latest_discovery_refusals()?;
-        let head = self.latest_generation_head()?;
         let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
             Ok(scanned) => scanned,
             Err(error) => return Ok(Some(format!("source freshness unverified: {error}"))),
@@ -5747,24 +5810,14 @@ impl Store {
                     .to_string(),
             ));
         }
-        if let Some(head) =
-            head.filter(|head| !head.is_empty() && head != "unavailable" && head != "unknown")
-        {
-            match current_git_head(Path::new(&root)) {
-                Ok(current) if current == head => {}
-                Ok(_) => {
-                    return Ok(Some(
-                        "repository HEAD differs from the indexed generation; rebuild required"
-                            .to_string(),
-                    ))
-                }
-                Err(error) => {
-                    return Ok(Some(format!(
-                        "repository HEAD freshness unverified: {error}"
-                    )))
-                }
-            }
-        }
+        // Git HEAD is provenance, not a source-tree signal. The hash and
+        // refusal comparisons above have already asked whether every indexed
+        // path still matches; a new SHA with the same bytes (empty commit,
+        // identical-tree checkout) cannot change the graph. Treating that lag
+        // as "rebuild required" made `is_fresh` a lie: the rebuild hashed the
+        // same files, skipped, and left the stamp behind. The daemon still
+        // uses HEAD to *wake* a drain (B5); once the drain (or a CLI skip)
+        // proves the tree unchanged it restamps rather than rebuilding.
         let after = self.status_snapshot("")?;
         if after.latest_generation != Some(generation) || after.pending_count != 0 {
             return Ok(Some(

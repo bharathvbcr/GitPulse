@@ -1,4 +1,5 @@
 import type { MenuState } from "./menuState";
+import { createListenerTracker } from "../dom/listenerTracker";
 
 type StatusBridge = {
   read: () => Promise<MenuState>;
@@ -9,33 +10,32 @@ type StatusBridge = {
 
 /** Subscribe before reading; live updates win over a delayed initial response. */
 export function createStatusConnection(bridge: StatusBridge) {
-  let disposed = false;
+  const listeners = createListenerTracker();
   let revision = 0;
-  let stop: (() => void) | null = null;
   let inflight: Promise<void> | null = null;
   return {
     connect(): Promise<void> {
-      if (disposed) return Promise.resolve();
+      if (listeners.disposed) return Promise.resolve();
       if (inflight) return inflight;
       inflight = (async () => {
         let startedAt = revision;
         try {
-          if (!stop) {
+          if (listeners.size === 0) {
             const unsubscribe = await bridge.subscribe((next) => {
-              if (!disposed) { revision++; bridge.apply(next); }
+              if (!listeners.disposed) { revision++; bridge.apply(next); }
             });
-            if (disposed) { unsubscribe(); return; }
-            stop = unsubscribe;
+            listeners.track(unsubscribe);
+            if (listeners.disposed) return;
           }
           startedAt = revision;
           const next = await bridge.read();
-          if (!disposed && startedAt === revision) bridge.apply(next);
+          if (!listeners.disposed && startedAt === revision) bridge.apply(next);
         } catch (error) {
-          if (!disposed && startedAt === revision) bridge.failed(error);
+          if (!listeners.disposed && startedAt === revision) bridge.failed(error);
         }
       })().finally(() => { inflight = null; });
       return inflight;
     },
-    dispose() { disposed = true; stop?.(); stop = null; },
+    dispose() { listeners.dispose(); },
   };
 }

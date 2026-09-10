@@ -124,6 +124,7 @@ devmap-resolve = { path = "vendored/devmap-resolve", default-features = false }
 # so cbindgen / the C ABI stay out of this build; `highlight` pulls the six
 # grammars DiffViewer and CodeViewer dispatch to for rust/js/ts/python/json/shell.
 markdev = { path = "vendored/markdev", default-features = false, features = ["highlight"] }
+tauri-plugin-autostart = "2.5.1"
 
 # Process-group control for children we spawn (`src/procguard`).
 #

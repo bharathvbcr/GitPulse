@@ -723,6 +723,14 @@ const VOLATILE_SPANS: readonly (readonly [RegExp, string])[] = [
   // Elapsed times. The unit is required, so bare numbers — exit codes, line
   // numbers, counts — are never touched.
   [/\b\d+(?:\.\d+)?\s?(?:ns|µs|us|ms|s|m|h)\b/g, "⟨duration⟩"],
+  // The UI timer probe stamps a fresh count and max every 30s. Those are
+  // samples of one condition (`max_delay_ms=629` is not a duration token —
+  // the unit sits in the key), so leaving them unmasked turned overnight
+  // WKWebView coalescing into dozens of "distinct" warnings.
+  [/\d+ delayed UI timer sample\(s\)/g, "⟨n⟩ delayed UI timer sample(s)"],
+  [/\d+ long observation gap\(s\)/g, "⟨n⟩ long observation gap(s)"],
+  [/max_delay_ms=\d+(?:\.\d+)?/g, "max_delay_ms=⟨n⟩"],
+  [/max_gap_ms=\d+(?:\.\d+)?/g, "max_gap_ms=⟨n⟩"],
   [/\b0x[0-9a-fA-F]+\b/g, "⟨address⟩"],
   [/(?:\/private)?\/(?:var\/folders|tmp)\/\S+/g, "⟨tmp⟩"],
 ];
@@ -739,6 +747,43 @@ export function diagnosticFingerprint(message: string): string {
     key = key.replace(pattern, placeholder);
   }
   return key;
+}
+
+function sameOccurrence(a: DiagnosticEntry, b: DiagnosticEntry): boolean {
+  return a.severity === b.severity
+    && a.source === b.source
+    && a.version === b.version
+    && a.buildId === b.buildId
+    && diagnosticFingerprint(a.message) === diagnosticFingerprint(b.message);
+}
+
+/**
+ * Fold a consecutive run of the same observation, newest-first.
+ *
+ * Restore is the only caller: live recording already folds the head, so a
+ * blob written by this build should be a no-op. Older blobs that stamped a
+ * fresh `max_delay_ms` on every 30s sample are the case this exists for.
+ */
+function coalesceConsecutive(entries: DiagnosticEntry[]): DiagnosticEntry[] {
+  if (entries.length < 2) return entries;
+  const out: DiagnosticEntry[] = [entries[0]];
+  let changed = false;
+  for (let i = 1; i < entries.length; i += 1) {
+    const newer = out[out.length - 1];
+    const older = entries[i];
+    if (!sameOccurrence(newer, older)) {
+      out.push(older);
+      continue;
+    }
+    const varied = newer.varied === true || older.varied === true || newer.message !== older.message;
+    out[out.length - 1] = {
+      ...newer,
+      count: Math.min(Number.MAX_SAFE_INTEGER, newer.count + older.count),
+      ...(varied ? { varied: true as const } : {}),
+    };
+    changed = true;
+  }
+  return changed ? out : entries;
 }
 
 /**
@@ -842,12 +887,20 @@ function loadPersisted(storage: StorageLike | null, development: boolean): {
   const repairIds = new Set(entries.map(entry => entry.id)).size !== entries.length ||
     (entries[0]?.id ?? 0) >= Number.MAX_SAFE_INTEGER - MAX_DIAGNOSTIC_ENTRIES;
   if (repairIds) entries = entries.map((entry, index) => ({ ...entry, id: entries.length - index }));
+  // Live coalescing only folds the head, and only after fingerprint masking
+  // exists. A blob written before that (or by an older build) can still hold
+  // a consecutive run of the same observation — collapse it here so restore
+  // does not reopen as dozens of "distinct" warnings.
+  const coalesced = coalesceConsecutive(entries);
+  const coalescedChanged = coalesced.length !== entries.length;
+  entries = coalesced;
   const nextId = entries[0]?.id ?? 0;
   const sanitizedChanged = sanitized.some(
     (entry, index) => JSON.stringify(entry) !== JSON.stringify(parsed[index]),
   );
   const rewritten =
-    repairIds || sanitized.length !== parsed.length || entries.length !== sanitized.length || sanitizedChanged;
+    repairIds || sanitized.length !== parsed.length || entries.length !== sanitized.length || sanitizedChanged
+    || coalescedChanged;
   const invalid = parsed.length - sanitized.length;
   return { entries, nextId, rewritten, restorationError: invalid > 0 ? `${invalid} invalid saved diagnostic entries could not be restored.` : null };
 }

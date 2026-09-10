@@ -75,7 +75,7 @@ export async function checkStatusPopover() {
     check("light glass text and accents retain contrast over black and white backdrops", contrastOnGlass());
     check("collapsed panel fits the native window", fits() && Math.abs(element(".panel").getBoundingClientRect().width - 360) <= 1 && element(".panel").offsetHeight < 360);
     check("reference counts render from the snapshot", metrics().map(m => m.querySelector("strong")?.textContent).join(",") === "12,4,0");
-    check("last-fetch comparison remains explicit", element(".sync").textContent?.includes("last fetch") === true && !!document.querySelector('[aria-label="3 ahead"]'));
+    check("last-fetch comparison remains explicit", /fetched \d+ min ago|never fetched/.test(element(".sync").textContent ?? "") && !!document.querySelector('[aria-label="3 ahead"]'));
     check("stashes and shortcuts are initially disclosed", !details() && !document.querySelector('[aria-label="2 stashes"], [aria-label="Go"], [aria-label="Tools"], [aria-label="Command palette"]'));
     check("only one primary action is visible", document.querySelectorAll(".primary").length === 1 && element(".primary").textContent?.includes("Review changes") === true);
     check("zero conflicts cannot navigate", button('[aria-label="0 conflicts"]').disabled);

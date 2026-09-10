@@ -197,6 +197,18 @@ describe("SettingsModal view visibility", () => {
   });
 });
 
+describe("SettingsModal automatic GitHub alerts", () => {
+  it("checks GitHub alerts on launch by default and names the gh CLI cost", () => {
+    const analysis = panel(open(), "analysis");
+    expect(analysis).toContain(
+      'aria-label="Automatically check GitHub Dependabot and code scanning alerts when a repository opens"',
+    );
+    expect(analysis).toContain("On by default");
+    expect(analysis).toContain("GitHub CLI");
+    expect(analysis).toContain("Critical and high");
+  });
+});
+
 describe("SettingsModal automatic coverage toggle", () => {
   it("offers automatic coverage generation as an explicit opt-in, off by default", () => {
     const body = open();

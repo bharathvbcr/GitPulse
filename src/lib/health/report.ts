@@ -1,9 +1,37 @@
 import { formatAuditCounts } from "./format";
 import { cappedSuffix, observedTotal as observedScanTotal } from "../scan/limits";
-import type { CodeScanningReport, DependabotReport, DepsHealthReport } from "./types";
+import type {
+  CodeScanningReport,
+  DeadCodeFinding,
+  DeadCodeReport,
+  DependabotReport,
+  DepsHealthReport,
+} from "./types";
 
 function line(items: (string | undefined | null)[]): string {
   return items.filter((item) => item !== undefined && item !== null && item !== "").join(" · ");
+}
+
+function deadCodeItems(deadCode: DeadCodeReport): DeadCodeFinding[] {
+  return Array.isArray(deadCode.items) ? deadCode.items : [];
+}
+
+function deadCodeObservedTotal(deadCode: DeadCodeReport, shown: number): number {
+  const total =
+    typeof deadCode.total === "number" && Number.isFinite(deadCode.total)
+      ? Math.max(0, Math.trunc(deadCode.total))
+      : 0;
+  return Math.max(total, shown);
+}
+
+function formatDeadCodeConfidence(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  return `${(value * 100).toFixed(0)}%`;
+}
+
+function formatDeadCodeStatus(item: DeadCodeFinding): string {
+  if (!item.is_exempt) return "Unreferenced";
+  return item.exemption_reason ? `Exempt: ${item.exemption_reason}` : "Exempt";
 }
 
 /**
@@ -122,13 +150,15 @@ export function coverageGap(report: DepsHealthReport): string | null {
 /**
  * Renders the health report as plain markdown-ish text that survives a paste
  * into an issue, an agent prompt or a notes file: every finding keeps its
- * severity, fix version and advisory link, and capped scans say so.
+ * severity, fix version and advisory link, capped scans say so, and the
+ * dead-code table the Health view shows is included rather than dropped.
  */
 export function formatHealthReport(
   report: DepsHealthReport,
   repoPath?: string | null,
   dependabot?: DependabotReport | null,
   codeScanning?: CodeScanningReport | null,
+  deadCode?: DeadCodeReport | null,
 ): string {
   const out: string[] = [];
   out.push("# Dependency health report");
@@ -194,6 +224,23 @@ export function formatHealthReport(
   if (codeScanning?.available) {
     out.push(
       `GitHub Code Scanning: ${codeScanning.truncated ? "at least " : ""}${codeScanning.alerts.length} open alert(s).`,
+    );
+  }
+  const deadItems = deadCode ? deadCodeItems(deadCode) : [];
+  const deadTotal = deadCode ? deadCodeObservedTotal(deadCode, deadItems.length) : 0;
+  if (deadCode && !deadCode.available) {
+    out.push(
+      `Dead-code check could not run${deadCode.reason ? `: ${deadCode.reason}` : ""}. That is not the same as finding no unreferenced symbols.`,
+    );
+  } else if (deadCode?.available && deadItems.length === 0 && deadCode.truncated) {
+    out.push(
+      "The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear.",
+    );
+  } else if (deadCode?.available && deadItems.length === 0) {
+    out.push("Dead code: 0 unreferenced symbol(s).");
+  } else if (deadCode?.available) {
+    out.push(
+      `Dead code: ${deadCode.truncated ? "at least " : ""}${deadTotal} unreferenced symbol(s).`,
     );
   }
   if (report.truncated || dependabot?.truncated || codeScanning?.truncated) {
@@ -281,12 +328,36 @@ export function formatHealthReport(
     }
   }
 
+  if (deadCode?.available && deadItems.length === 0 && !deadCode.truncated) {
+    out.push("", "No unreferenced symbols in the indexed graph.");
+  } else if (deadCode?.available && deadItems.length > 0) {
+    if (deadCode.truncated) {
+      out.push(
+        "",
+        "NOTE: the dead-symbol query stopped at its token budget, so this list is a floor, not the complete set.",
+      );
+    }
+    out.push(
+      "",
+      `## Dead code & unreferenced symbols (${deadTotal}${cappedSuffix(deadTotal, deadItems.length)})`,
+    );
+    for (const item of deadItems) {
+      if (!item || typeof item !== "object") continue;
+      const name = item.symbol_name || "(unnamed)";
+      const file = item.file_path ? ` (${item.file_path})` : "";
+      out.push(
+        `- ${name}${file} — ${formatDeadCodeConfidence(item.confidence)} — ${formatDeadCodeStatus(item)}`,
+      );
+    }
+  }
+
   const nothingReported =
     report.issues.length === 0 &&
     report.vulnerabilities.length === 0 &&
     report.outdated.length === 0 &&
     (!dependabot?.available || dependabot.alerts.length === 0) &&
-    (!codeScanning?.available || codeScanning.alerts.length === 0);
+    (!codeScanning?.available || codeScanning.alerts.length === 0) &&
+    deadItems.length === 0;
   if (nothingReported && skipped.length === 0 && auditComplete) {
     out.push("", "No issues, vulnerabilities or outdated packages were reported.");
   } else if (nothingReported && !auditComplete) {

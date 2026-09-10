@@ -8,11 +8,14 @@ describe("UI responsiveness diagnostics", () => {
 
   function probe(initial: DocumentVisibilityState = "visible") {
     const target = Object.assign(new EventTarget(), { visibilityState: initial });
+    const frame = new EventTarget();
     const warn = vi.fn();
     let time = 0;
-    stop = installResponsivenessDiagnostics({ warn }, { document: target, now: () => time });
+    stop = installResponsivenessDiagnostics({ warn }, {
+      document: target, window: frame, now: () => time,
+    });
     return {
-      target, warn,
+      target, frame, warn,
       async tick(elapsed = 500) { time += elapsed; await vi.advanceTimersByTimeAsync(500); },
       advance(elapsed: number) { time += elapsed; },
     };
@@ -67,6 +70,48 @@ describe("UI responsiveness diagnostics", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("does no unfocused-window work and rebases the clock on return", async () => {
+    // WKWebView coalesces timers to ~1s behind another app even while
+    // visibilityState stays "visible". Sampling that as a UI freeze filled
+    // Diagnostics with a warning every 30s overnight.
+    const p = probe();
+    p.frame.dispatchEvent(new Event("blur"));
+    expect(vi.getTimerCount()).toBe(0);
+    p.advance(60_000);
+    p.frame.dispatchEvent(new Event("focus"));
+    await p.tick();
+    expect(p.warn).not.toHaveBeenCalled();
+    p.frame.dispatchEvent(new Event("blur"));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("discards delayed samples when the window loses focus instead of reporting them later", async () => {
+    const p = probe();
+    await p.tick(800);
+    await p.tick(900);
+    await p.tick(1_200);
+    expect(p.warn).toHaveBeenCalledTimes(1);
+    p.frame.dispatchEvent(new Event("blur"));
+    p.advance(60_000);
+    p.frame.dispatchEvent(new Event("focus"));
+    for (let i = 0; i < 60; i++) await p.tick();
+    expect(p.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards delayed samples when the window is hidden instead of reporting them later", async () => {
+    const p = probe();
+    await p.tick(800);
+    await p.tick(900);
+    expect(p.warn).toHaveBeenCalledTimes(1);
+    p.target.visibilityState = "hidden";
+    p.target.dispatchEvent(new Event("visibilitychange"));
+    p.advance(60_000);
+    p.target.visibilityState = "visible";
+    p.target.dispatchEvent(new Event("visibilitychange"));
+    for (let i = 0; i < 60; i++) await p.tick();
+    expect(p.warn).toHaveBeenCalledTimes(1);
+  });
+
   it("labels sleep-sized gaps as ambiguous instead of declaring a UI freeze", async () => {
     const p = probe();
     await p.tick(60_500);
@@ -79,6 +124,7 @@ describe("UI responsiveness diagnostics", () => {
     const p = probe();
     stop(); stop();
     p.target.dispatchEvent(new Event("visibilitychange"));
+    p.frame.dispatchEvent(new Event("blur"));
     await p.tick(10_000);
     expect(vi.getTimerCount()).toBe(0);
     expect(p.warn).not.toHaveBeenCalled();

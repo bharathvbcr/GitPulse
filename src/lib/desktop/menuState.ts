@@ -6,7 +6,14 @@ import { actionLabel, blocksOtherMutations, headline } from "../repos/operation"
 import type { NativeEvent } from "./nativeActions";
 
 export interface MenuLabel { id: string; text: string }
-export interface MenuRepository { path: string; label: string; active: boolean }
+export interface MenuRepository {
+  path: string;
+  label: string;
+  active: boolean;
+  changed: number | null;
+  conflicts: number | null;
+  busy: boolean;
+}
 export interface StatusCard {
   repository: string;
   branch: string;
@@ -25,6 +32,7 @@ export interface StatusCard {
   operation: string | null;
   activity: string | null;
   elsewhere: number;
+  fetchedAt: number | null;
 }
 
 export interface StatusShortcut {
@@ -57,6 +65,8 @@ export interface MenuState {
   repositories: MenuRepository[];
   activePath: string | null;
   showStatusIcon: boolean;
+  hideDockWhenClosed: boolean;
+  trayTitle: string | null;
   trayDetails: string[];
   traySummary: MenuLabel;
   trayDetail: string;
@@ -163,7 +173,9 @@ export function buildMenuState(
   const details = hasRepo ? [`Repository: ${repo.currentPath}`, `Branch: ${branch}`,
     ...(!loaded ? [status] : [`${changes} changed · ${staged} staged · ${conflicts} conflicts`,
       repo.stashFailed ? "Stashes unavailable" : `${repo.stashEntries.length} listed stashes`,
-      tracking ? `${tracking.ahead_count} ahead · ${tracking.behind_count} behind ${tracking.upstream} (last fetch)`
+      tracking ? `${tracking.ahead_count} ahead · ${tracking.behind_count} behind ${tracking.upstream} (${
+        repo.fetchedAt == null ? "never fetched" : `fetched ${formatFetchAge(repo.fetchedAt)}`
+      })`
         : branchInfo?.is_gone ? "Upstream no longer exists" : branchInfo ? "No upstream configured" : "Upstream status unavailable", watch]),
     ...(operation ? [headline(operation)] : [])] : [];
   if (totalBusy) details.push(`${totalBusy} Git action${totalBusy === 1 ? "" : "s"} running${workingRepos.length > 8 ? ` · showing 8 of ${workingRepos.length} repositories` : ""}`,
@@ -177,11 +189,29 @@ export function buildMenuState(
     : changes ? `${changes} changed${staged ? ` · ${staged} staged` : ""}`
     : operation ? headline(operation) : status;
   const elsewhere = totalBusy - gitBusy.length;
+  const repositories = repo.openTabs.map((tab) => {
+    const tabBusy = (gitActivity[tab.path] ?? []).length > 0 || tab.isLoading;
+    const countsKnown = !tab.isLoading && !tab.error && !tab.isBare;
+    return {
+      path: tab.path,
+      label: menuText(tab.label),
+      active: tab.isActive,
+      changed: countsKnown ? tab.changedCount : null,
+      conflicts: countsKnown ? tab.conflictedCount : null,
+      busy: tabBusy,
+    };
+  });
+  const rawTitle = !prefs.statusIconCounts || !hasRepo || !loaded || repo.isBare
+    ? null
+    : [String(changes), conflicts ? `⚠${conflicts}` : null].filter(Boolean).join(" · ");
+  const trayTitle = rawTitle ? menuText(rawTitle, 24) : null;
   return {
     enabled, checked, labels,
-    repositories: repo.openTabs.map((tab) => ({ path: tab.path, label: menuText(tab.label), active: tab.isActive })),
+    repositories,
     activePath: repo.currentPath,
     showStatusIcon: prefs.showStatusIcon,
+    hideDockWhenClosed: prefs.hideDockWhenClosed,
+    trayTitle,
     status: {
       repository: menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "GitPulse", 100),
       branch: menuText(branch, 120),
@@ -206,6 +236,7 @@ export function buildMenuState(
           ?? "Git action running…", 72)
         : null,
       elsewhere: Math.max(0, elsewhere),
+      fetchedAt: loaded ? repo.fetchedAt : null,
     },
     trayDetails: details.map((detail) => menuText(detail)),
     traySummary: { id: trayTarget, text: menuText([brief, sync,
@@ -213,6 +244,18 @@ export function buildMenuState(
     trayDetail: hasRepo ? [menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "Repository", 32),
       menuText(branch, 36)].join(" · ") : "GitPulse",
   };
+}
+
+/** Compact relative age for the tray/popover; empty when the clock is wrong. */
+export function formatFetchAge(fetchedAtMs: number, nowMs = Date.now()): string {
+  const delta = Math.max(0, nowMs - fetchedAtMs);
+  const minutes = Math.floor(delta / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 export function menuActionEnabled(state: MenuState, id: string): boolean {

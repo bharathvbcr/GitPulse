@@ -4,7 +4,7 @@ import { compile } from "svelte/compiler";
 import { render } from "svelte/server";
 import TaskBoard from "../src/lib/components/TaskBoard.svelte";
 
-const panels = ["TaskEditor", "WorkspaceEditor", "AutomaticEnhancements", "AttentionInbox", "TaskEnhancements", "TaskRuns", "AgentDecisions", "NativeNotificationSettings"];
+const panels = ["TaskEditor", "WorkspaceEditor", "AutomaticEnhancements", "AttentionInbox", "TaskManviAssist", "TaskRuns", "AgentDecisions", "NativeNotificationSettings"];
 const read = (name: string) => readFileSync(new URL(`../src/lib/components/${name}.svelte`, import.meta.url), "utf8");
 
 describe("Tasks material coverage", () => {

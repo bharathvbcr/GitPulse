@@ -2,7 +2,7 @@
   import { slide } from "svelte/transition";
   import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
   import type { MenuState } from "./menuState";
-  import { statusDetailRows, statusInsights, statusKeyAction, statusShortcuts } from "./menuState";
+  import { formatFetchAge, statusDetailRows, statusInsights, statusKeyAction, statusShortcuts } from "./menuState";
   let { snapshot, error = null, pending = false, material = "opaque", onaction }: {
     snapshot: MenuState | null; error?: string | null; pending?: boolean;
     material?: "opaque" | "preview" | "native";
@@ -12,8 +12,20 @@
   let choosing = $state(false);
   let copied = $state<string | null>(null);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+  let clock = $state(Date.now());
+  $effect(() => {
+    const timer = setInterval(() => { clock = Date.now(); }, 30_000);
+    return () => clearInterval(timer);
+  });
   const card = $derived(snapshot?.status);
   const hasRepo = $derived(!!snapshot?.activePath);
+  const fetchCaption = $derived(
+    !card || card.ahead === null || card.behind === null
+      ? null
+      : card.fetchedAt == null
+        ? "never fetched"
+        : `fetched ${formatFetchAge(card.fetchedAt, clock)}`,
+  );
   const enabled = (id: string) => !pending && !!snapshot?.enabled.includes(id);
   const dark = $derived(!!snapshot?.checked.includes("theme-dark"));
   const motion = $derived(card?.reduceMotion ? 0 : 180);
@@ -81,6 +93,13 @@
             <span>
               <strong>{repo.label}</strong>
               <em>{repo.path}</em>
+              {#if repo.busy || repo.changed != null || repo.conflicts}
+                <span class="repo-badges" aria-hidden="true">
+                  {#if repo.busy}<span class="badge busy">…</span>{/if}
+                  {#if repo.changed}<span class="badge">{repo.changed}</span>{/if}
+                  {#if repo.conflicts}<span class="badge warn">⚠{repo.conflicts}</span>{/if}
+                </span>
+              {/if}
             </span>
             {#if repo.active}<Check size={14} />{/if}
           </button>
@@ -124,7 +143,7 @@
               <span aria-label={`${card.ahead} ahead`}><ArrowUp size={12} />{card.ahead}</span>
               <span aria-label={`${card.behind} behind`}><ArrowDown size={12} />{card.behind}</span>
             </div>
-            <span class="upstream">{card.upstream}</span><span class="caption">last fetch</span>
+            <span class="upstream">{card.upstream}</span><span class="caption">{fetchCaption}</span>
           {:else}
             <GitBranch size={13} /><span class="upstream">{card.branch ? "No upstream data" : "Branch unavailable"}</span>
           {/if}
@@ -367,6 +386,10 @@
   .repositories strong { font-weight:550; }
   .repositories em { font-size:10px; font-style:normal; color:var(--muted); }
   .repositories button:hover,.repositories .current { background:var(--soft); }
+  .repo-badges { display:flex; flex-direction:row; gap:4px; margin-top:2px; }
+  .repo-badges .badge { font-size:10px; font-variant-numeric:tabular-nums; color:var(--muted); background:var(--soft); border-radius:4px; padding:1px 5px; }
+  .repo-badges .badge.warn { color:var(--amber); }
+  .repo-badges .badge.busy { letter-spacing:.5px; }
   .empty { text-align:center; padding:6px 0 22px; }
   .empty-mark { width:56px; height:56px; border-radius:16px; display:grid; place-items:center; margin:0 auto 16px; background:var(--soft); color:var(--muted); }
   .empty h1 { font-size:16px; font-weight:600; }

@@ -397,11 +397,14 @@ labels plus an explicitly grouped overflow bucket. Fast commands take clock
 readings without acquiring the timing-state mutex. Commands that never finish
 cannot emit a completion timing; existing panic logging remains independent.
 
-`diagnostics/responsiveness.ts` samples the visible UI every 500 ms and records
-timer lateness of at least 250 ms under `performance:ui`. It stops while the
-document is hidden, rebases on return, and aggregates repeated observations
+`diagnostics/responsiveness.ts` samples the visible, focused UI every 500 ms and
+records timer lateness of at least 250 ms under `performance:ui`. It stops
+while the document is hidden or the window is unfocused, drops unreported
+samples on the way out, rebases on return, and aggregates repeated observations
 into at most one report per 30 seconds. Gaps of 30 seconds or more are labelled
-as possibly including system sleep or suspension. This detects scheduling
+as possibly including system sleep or suspension. Restore also folds consecutive
+observations that differ only in sample counts, so a blob written before that
+masking does not reopen as dozens of distinct warnings. This detects scheduling
 delays, not frame rate or root cause, and does not cover every short stall.
 
 `async/pacedQueue.ts` owns bounded background scheduling for document and

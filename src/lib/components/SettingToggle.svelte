@@ -9,6 +9,7 @@
     label,
     description = "",
     checked = false,
+    disabled = false,
     ariaLabel = "",
     onchange,
   }: {
@@ -16,25 +17,30 @@
     /** Optional second line explaining what the switch costs or changes. */
     description?: string;
     checked?: boolean;
+    disabled?: boolean;
     /** Defaults to the visible label; set it when the label needs context. */
     ariaLabel?: string;
     onchange?: (next: boolean) => void;
   } = $props();
+
+  const switchId = `setting-toggle-${Math.random().toString(36).slice(2, 10)}`;
 </script>
 
-<div class="flex items-start justify-between gap-3 py-1.5">
+<div class="flex items-start justify-between gap-3 py-1.5" class:opacity-50={disabled}>
   <div class="min-w-0">
-    <div class="text-textPrimary text-[11px] font-medium">{label}</div>
+    <label class="text-textPrimary text-[11px] font-medium cursor-pointer" for={switchId}>{label}</label>
     {#if description}
       <div class="text-textMuted text-[10px] leading-snug mt-0.5">{description}</div>
     {/if}
   </div>
   <button
+    id={switchId}
     type="button"
     role="switch"
     aria-checked={checked}
     aria-label={ariaLabel || label}
-    onclick={() => onchange?.(!checked)}
+    {disabled}
+    onclick={() => { if (!disabled) onchange?.(!checked); }}
     class="relative w-8 h-[18px] rounded-full transition-colors shrink-0 mt-0.5 {checked
       ? 'bg-accent'
       : 'bg-border'}"

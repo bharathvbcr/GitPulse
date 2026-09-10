@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { isTauri } from "../platform";
+  import { createListenerTracker } from "../dom/listenerTracker";
   import { LAYERS } from "../ui/layers";
   import { trapFocus } from "../ui/focusTrap";
   import type { Attention, NotificationDelivery, Repository, Task, WorkspaceCard } from "../workbench/client";
@@ -48,11 +49,15 @@
   }
   onMount(() => {
     if (!isTauri()) return;
+    const listeners = createListenerTracker();
     void receive();
-    let stop: (() => void) | undefined;
-    void listen("workbench-notification-open", () => { void receive(); }).then((unlisten) => { if (disposed) unlisten(); else { stop = unlisten; void receive(); } }).catch(() => { if (!disposed) error = "Native activation updates are unavailable. Open the activity inbox."; });
+    void listen("workbench-notification-open", () => { void receive(); }).then((unlisten) => {
+      listeners.track(unlisten);
+      if (!listeners.disposed) void receive();
+    }).catch(() => { if (!disposed) error = "Native activation updates are unavailable. Open the activity inbox."; });
     const focus = () => { void receive(); }; window.addEventListener("focus", focus);
-    return () => { disposed = true; stop?.(); window.removeEventListener("focus", focus); };
+    listeners.track(() => window.removeEventListener("focus", focus));
+    return () => { disposed = true; listeners.dispose(); };
   });
 </script>
 

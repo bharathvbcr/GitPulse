@@ -14,7 +14,8 @@ describe("QuickEnhanceSheet", () => {
     expect(source).toContain("gp-scrim");
     expect(source).toContain("shadow-float");
     expect(source).toContain("hiddenTaskDetails");
-    expect(source).toContain("TaskEnhancements");
+    expect(source).toContain("TaskManviAssist");
+    expect(source).toContain("quick");
     expect(source).toContain("quick-enhance-title");
     expect(source).toContain("aria-labelledby=\"quick-enhance-title\"");
     expect(source).not.toMatch(/\bbackdrop-blur-/);

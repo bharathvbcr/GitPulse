@@ -10,10 +10,14 @@ pub struct MenuLabel {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct MenuRepository {
     pub path: String,
     pub label: String,
     pub active: bool,
+    pub changed: Option<u32>,
+    pub conflicts: Option<u32>,
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -36,6 +40,8 @@ pub struct StatusCard {
     pub operation: Option<String>,
     pub activity: Option<String>,
     pub elsewhere: u32,
+    /// Epoch milliseconds of `FETCH_HEAD` mtime; `None` when never fetched.
+    pub fetched_at: Option<i64>,
 }
 
 impl Default for StatusCard {
@@ -58,6 +64,7 @@ impl Default for StatusCard {
             operation: None,
             activity: None,
             elsewhere: 0,
+            fetched_at: None,
         }
     }
 }
@@ -71,6 +78,10 @@ pub struct MenuState {
     pub repositories: Vec<MenuRepository>,
     pub active_path: Option<String>,
     pub show_status_icon: bool,
+    /// Hide the Dock icon while the main window is closed and the status icon is on.
+    pub hide_dock_when_closed: bool,
+    /// Optional counts rendered beside the menu-bar glyph; `None` when the pref is off.
+    pub tray_title: Option<String>,
     pub tray_details: Vec<String>,
     pub tray_summary: MenuLabel,
     pub tray_detail: String,
@@ -108,6 +119,8 @@ impl Default for MenuState {
             repositories: vec![],
             active_path: None,
             show_status_icon: false,
+            hide_dock_when_closed: true,
+            tray_title: None,
             tray_details: vec![],
             tray_summary: MenuLabel {
                 id: actions::OPEN.into(),
@@ -117,6 +130,11 @@ impl Default for MenuState {
             status: StatusCard::default(),
         }
     }
+}
+
+/// Identity for the native application-menu repository switcher (counts churn separately).
+pub fn repository_switcher_key(repo: &MenuRepository) -> (&str, &str, bool) {
+    (repo.path.as_str(), repo.label.as_str(), repo.active)
 }
 
 pub fn checkable(id: &str) -> bool {
@@ -224,6 +242,11 @@ impl MenuState {
             if repo.active != (self.active_path.as_ref() == Some(&repo.path)) {
                 return Err("Native menu active repository does not match its path".into());
             }
+            if repo.changed.is_some_and(|n| n > 1_000_000)
+                || repo.conflicts.is_some_and(|n| n > 1_000_000)
+            {
+                return Err("Native menu repository counts exceed their limit".into());
+            }
         }
         if self
             .active_path
@@ -240,6 +263,10 @@ impl MenuState {
             || self.tray_details.iter().any(|text| text.len() > 2048)
             || self.tray_summary.text.len() > 2048
             || self.tray_detail.len() > 2048
+            || self
+                .tray_title
+                .as_ref()
+                .is_some_and(|title| title.chars().count() > 24)
         {
             return Err("Native menu text exceeds its limit".into());
         }

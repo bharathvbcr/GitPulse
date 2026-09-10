@@ -1,0 +1,7 @@
+# Attach this file to CodeQL default setup (github-codeql-config-file property
+# or the CodeQL configuration UI). These trees are local Tauri/GTK consumer
+# ports: bindgen offsetof tests dereference null to measure field offsets, and
+# WRY cookie builders copy Secure from the webview rather than minting cookies.
+name: GitPulse CodeQL
+paths-ignore:
+  - src-tauri/framework/**

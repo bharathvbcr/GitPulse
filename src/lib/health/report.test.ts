@@ -3,6 +3,8 @@ import { coverageGap, failedAudits, formatHealthReport, skippedAudits } from "./
 import type {
   CodeScanningAlertInfo,
   CodeScanningReport,
+  DeadCodeFinding,
+  DeadCodeReport,
   DependabotAlertInfo,
   DependabotReport,
   DepsHealthReport,
@@ -96,6 +98,31 @@ function codeScanningReport(
     alerts,
     truncated: false,
     error: null,
+    ...overrides,
+  };
+}
+
+function deadFinding(overrides: Partial<DeadCodeFinding> = {}): DeadCodeFinding {
+  return {
+    symbol_name: "unusedHelper",
+    file_path: "src/lib/unused.ts",
+    confidence: 0.85,
+    is_exempt: false,
+    exemption_reason: null,
+    ...overrides,
+  };
+}
+
+function deadCodeReport(
+  overrides: Partial<DeadCodeReport> = {},
+  items: DeadCodeFinding[] = [deadFinding()],
+): DeadCodeReport {
+  return {
+    available: true,
+    reason: null,
+    items,
+    total: items.length,
+    truncated: false,
     ...overrides,
   };
 }
@@ -471,6 +498,105 @@ describe("formatHealthReport", () => {
     expect(text).toContain("scanners: npm audit, github-dependabot, github-code-scanning");
     expect(text).toContain("GitHub Dependabot: 0 open alert(s).");
     expect(text).toContain("GitHub Code Scanning: 0 open alert(s).");
+  });
+
+  it("omits dead code entirely when no codeintel data exists", () => {
+    const text = formatHealthReport(emptyReport(), "/repo", null, null);
+    expect(text).not.toContain("Dead code");
+    expect(text).not.toContain("unreferenced");
+    expect(text).not.toContain("Dead-code check");
+  });
+
+  it("carries dead-code findings with file, confidence and status", () => {
+    const text = formatHealthReport(emptyReport(), "/repo", null, null, deadCodeReport());
+    expect(text).toContain("Dead code: 1 unreferenced symbol(s).");
+    expect(text).toContain("## Dead code & unreferenced symbols (1)");
+    expect(text).toContain("- unusedHelper (src/lib/unused.ts) — 85% — Unreferenced");
+    expect(text).not.toContain("were reported.");
+  });
+
+  it("reports a failed dead-code query instead of laundering it into all-clear silence", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      null,
+      null,
+      deadCodeReport({ available: false, reason: "no code graph", items: [], total: 0 }),
+    );
+    expect(text).toContain("Dead-code check could not run: no code graph");
+    expect(text).toContain("That is not the same as finding no unreferenced symbols");
+    expect(text).not.toContain("## Dead code");
+  });
+
+  it("flags a truncated dead-code list as a floor, not complete coverage", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      null,
+      null,
+      deadCodeReport({ total: 12, truncated: true }, [deadFinding()]),
+    );
+    expect(text).toContain("Dead code: at least 12 unreferenced symbol(s).");
+    expect(text).toContain("## Dead code & unreferenced symbols (12; showing 1)");
+    expect(text).toContain("token budget");
+    expect(text).toContain("floor, not the complete set");
+  });
+
+  it("does not treat a truncated empty dead-code result as an all-clear", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      null,
+      null,
+      deadCodeReport({ items: [], total: 0, truncated: true }),
+    );
+    expect(text).toContain("this is not an all-clear");
+    expect(text).not.toContain("No unreferenced symbols in the indexed graph");
+  });
+
+  it("keeps the explicit all-clear when dead-code ran clean alongside an empty local scan", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      null,
+      null,
+      deadCodeReport({ items: [], total: 0 }),
+    );
+    expect(text).toContain("Dead code: 0 unreferenced symbol(s).");
+    expect(text).toContain("No unreferenced symbols in the indexed graph");
+    expect(text).toContain("No issues, vulnerabilities or outdated packages were reported.");
+  });
+
+  it("names exempt symbols as exempt rather than unreferenced", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      null,
+      null,
+      deadCodeReport({}, [
+        deadFinding({
+          symbol_name: "main",
+          file_path: "src/main.rs",
+          confidence: 0.3,
+          is_exempt: true,
+          exemption_reason: "entry point",
+        }),
+      ]),
+    );
+    expect(text).toContain("- main (src/main.rs) — 30% — Exempt: entry point");
+    expect(text).not.toMatch(/main \(src\/main\.rs\).*Unreferenced/);
+  });
+
+  it("does not print NaN as a confidence when the query returns a non-finite value", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      null,
+      null,
+      deadCodeReport({}, [deadFinding({ confidence: Number.NaN })]),
+    );
+    expect(text).toContain("— unknown — Unreferenced");
+    expect(text).not.toContain("NaN");
   });
 });
 

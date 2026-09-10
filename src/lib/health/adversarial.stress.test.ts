@@ -23,7 +23,12 @@ import {
   observedTotal,
   skippedAudits,
 } from "./report";
-import type { CodeScanningReport, DependabotReport, DepsHealthReport } from "./types";
+import type {
+  CodeScanningReport,
+  DeadCodeReport,
+  DependabotReport,
+  DepsHealthReport,
+} from "./types";
 
 function bareReport(over: Partial<DepsHealthReport> = {}): DepsHealthReport {
   return {
@@ -143,7 +148,22 @@ describe("health renderers survive hostile scanner output", () => {
           },
         ],
       };
-      expect(() => formatHealthReport(report, s, dependabot, codeScanning)).not.toThrow();
+      const deadCode: DeadCodeReport = {
+        available: true,
+        reason: s,
+        truncated: true,
+        total: 1,
+        items: [
+          {
+            symbol_name: s,
+            file_path: s,
+            confidence: Number.NaN,
+            is_exempt: true,
+            exemption_reason: s,
+          },
+        ],
+      };
+      expect(() => formatHealthReport(report, s, dependabot, codeScanning, deadCode)).not.toThrow();
       expect(() => skippedAudits(report)).not.toThrow();
       expect(() => normalizeSeverity(s)).not.toThrow();
       expect(() => severityClass(s)).not.toThrow();

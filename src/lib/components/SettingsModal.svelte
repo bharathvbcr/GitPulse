@@ -72,6 +72,32 @@
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
+  let launchAtLogin = $state(false);
+
+  async function refreshLaunchAtLogin() {
+    try {
+      const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+      launchAtLogin = await isEnabled();
+    } catch {
+      launchAtLogin = false;
+    }
+  }
+
+  async function setLaunchAtLogin(next: boolean) {
+    try {
+      const { enable, disable, isEnabled } = await import("@tauri-apps/plugin-autostart");
+      if (next) await enable();
+      else await disable();
+      launchAtLogin = await isEnabled();
+    } catch (error) {
+      launchAtLogin = false;
+      console.warn("Launch at login unavailable:", error);
+    }
+  }
+
+  $effect(() => {
+    if (isOpen) void refreshLaunchAtLogin();
+  });
 
   function setTheme(preference: ThemePreference) {
     themePreference = preference;
@@ -620,6 +646,37 @@
                       checked={$interfaceStore.showStatusIcon}
                       onchange={(next) => interfaceStore.setShowStatusIcon(next)}
                     />
+                    {#if $interfaceStore.showStatusIcon}
+                      <div class="mt-3 space-y-3 pl-1">
+                        <div data-setting="hide-dock">
+                          <SettingToggle
+                            label="Hide Dock icon while closed"
+                            description="Keep GitPulse in the menu bar only after you close the window. Opening GitPulse from the status panel restores the Dock."
+                            ariaLabel="Hide Dock icon while the main window is closed"
+                            checked={$interfaceStore.hideDockWhenClosed}
+                            onchange={(next) => interfaceStore.setHideDockWhenClosed(next)}
+                          />
+                        </div>
+                        <div data-setting="status-icon-counts">
+                          <SettingToggle
+                            label="Show counts beside the icon"
+                            description="Optional changed and conflict counts next to the menu bar glyph. Off by default."
+                            ariaLabel="Show counts beside the menu bar status icon"
+                            checked={$interfaceStore.statusIconCounts}
+                            onchange={(next) => interfaceStore.setStatusIconCounts(next)}
+                          />
+                        </div>
+                        <div data-setting="launch-at-login">
+                          <SettingToggle
+                            label="Launch at login"
+                            description="Start GitPulse when you sign in. Uses a per-user LaunchAgent; the operating system is the source of truth."
+                            ariaLabel="Launch GitPulse at login"
+                            checked={launchAtLogin}
+                            onchange={(next) => void setLaunchAtLogin(next)}
+                          />
+                        </div>
+                      </div>
+                    {/if}
                   </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>
                     <div class="text-textMuted text-[10px] mb-1.5">Status bar</div>
@@ -651,7 +708,7 @@
                     <div data-setting="header-labels" hidden={!shown("header-labels")}>
                       <SettingToggle
                         label="Header button labels"
-                        description="Words beside the Open and Clone icons in the title bar."
+                        description="Word beside the Open menu in the title bar."
                         ariaLabel="Show labels on header action buttons"
                         checked={$interfaceStore.showHeaderActionLabels}
                         onchange={(next) => interfaceStore.setShowHeaderActionLabels(next)}
@@ -858,14 +915,25 @@
                   </div>
                 </div>
               {:else if entry.id === "analysis"}
-                <div data-setting="auto-coverage">
-                  <SettingToggle
-                    label="Generate coverage automatically"
-                    description="Off by default. When on, opening a repository with missing coverage runs its test suites once per session — minutes of CPU on a large project — and writes coverage artifacts into the working tree. A run that only completes because files were excluded is always labelled, never reported as a clean result."
-                    ariaLabel="Automatically generate coverage for repositories that have none"
-                    checked={$interfaceStore.autoRunCoverage}
-                    onchange={(next) => interfaceStore.setAutoRunCoverage(next)}
-                  />
+                <div class="space-y-3">
+                  <div data-setting="auto-github-alerts" hidden={!shown("auto-github-alerts")}>
+                    <SettingToggle
+                      label="Check GitHub alerts on launch"
+                      description="On by default. When a repository opens, GitPulse uses the GitHub CLI, its credentials, and the network to fetch Dependabot and code scanning alerts. Critical and high findings raise a warning. A check that did not run is listed in Health, never toasted as an all-clear."
+                      ariaLabel="Automatically check GitHub Dependabot and code scanning alerts when a repository opens"
+                      checked={$interfaceStore.autoScanGithubAlerts}
+                      onchange={(next) => interfaceStore.setAutoScanGithubAlerts(next)}
+                    />
+                  </div>
+                  <div data-setting="auto-coverage" hidden={!shown("auto-coverage")}>
+                    <SettingToggle
+                      label="Generate coverage automatically"
+                      description="Off by default. When on, opening a repository with missing coverage runs its test suites once per session — minutes of CPU on a large project — and writes coverage artifacts into the working tree. A run that only completes because files were excluded is always labelled, never reported as a clean result."
+                      ariaLabel="Automatically generate coverage for repositories that have none"
+                      checked={$interfaceStore.autoRunCoverage}
+                      onchange={(next) => interfaceStore.setAutoRunCoverage(next)}
+                    />
+                  </div>
                 </div>
               {:else if entry.id === "agents"}
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>

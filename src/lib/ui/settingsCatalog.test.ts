@@ -50,6 +50,7 @@ describe("matchSettings", () => {
     expect(matchSettings("side by side").settings).toContain("diff-layout");
     expect(matchSettings("indent").settings).toContain("tab-width");
     expect(matchSettings("animation").settings).toContain("motion");
+    expect(matchSettings("dependabot").settings).toContain("auto-github-alerts");
   });
 
   it("is case-insensitive", () => {

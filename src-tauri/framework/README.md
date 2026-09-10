@@ -52,6 +52,11 @@ test; release verification is recorded in `docs/DEPENDENCY_HEALTH.md`.
 
 ## Maintenance
 
+CodeQL default setup excludes this directory (see `.github/codeql/codeql-config.yml`).
+The offsetof tests and WRY cookie conversion are not GitPulse sinks; do not
+"fix" them in the port. Revisit the exclusion when a published upstream
+replaces a snapshot.
+
 Unlike `../vendored`, these are intentionally maintained local ports. Do not
 refresh them with the sibling repository vendor command. For an update:
 

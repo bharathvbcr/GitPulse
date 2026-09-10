@@ -412,6 +412,94 @@ describe("createDiagnostics", () => {
       { id: 1, at: 1, severity: "error", source: "pane-crash", message: "graph blew up", count: 1 },
     ]);
   });
+
+  it("compacts consecutive fingerprint matches already in the persisted blob", () => {
+    // Live coalescing only folds the head, and only after fingerprint masking
+    // exists. Overnight UI-timer warnings written before that masking stay as
+    // dozens of "distinct" rows until restore folds them.
+    const ui = (samples: number, max: number) =>
+      `${samples} delayed UI timer sample(s); max_delay_ms=${max}. This measures event-loop scheduling delay, not a specific cause.`;
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        {
+          id: 47,
+          at: 47,
+          severity: "error",
+          source: "coverage",
+          message: "Coverage command failed (exit 4)",
+          count: 1,
+          version: "0.1.0",
+          buildId: "current",
+        },
+        {
+          id: 46,
+          at: 46,
+          severity: "warning",
+          source: "performance:ui",
+          message: ui(22, 629),
+          count: 1,
+          version: "0.1.0",
+          buildId: "old",
+        },
+        {
+          id: 45,
+          at: 45,
+          severity: "warning",
+          source: "performance:ui",
+          message: ui(31, 684),
+          count: 1,
+          version: "0.1.0",
+          buildId: "old",
+        },
+        {
+          id: 44,
+          at: 44,
+          severity: "warning",
+          source: "performance:ui",
+          message: ui(30, 652),
+          count: 1,
+          version: "0.1.0",
+          buildId: "old",
+        },
+      ]),
+    });
+    const store = createDiagnostics({ storage, buildId: "current" });
+    const entries = get(store);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].message).toBe("Coverage command failed (exit 4)");
+    expect(entries[1].source).toBe("performance:ui");
+    expect(entries[1].count).toBe(3);
+    expect(entries[1].varied).toBe(true);
+    expect(entries[1].message).toContain("max_delay_ms=629");
+    expect(entries[1].at).toBe(46);
+    expect(JSON.parse(storage.getItem(DIAGNOSTIC_STORAGE_KEY) ?? "[]")).toHaveLength(2);
+  });
+
+  it("does not fold restored observations from different builds or interrupted runs", () => {
+    const ui = (max: number) =>
+      `22 delayed UI timer sample(s); max_delay_ms=${max}. This measures event-loop scheduling delay, not a specific cause.`;
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        {
+          id: 4, at: 4, severity: "warning", source: "performance:ui",
+          message: ui(629), count: 1, version: "0.1.0", buildId: "a",
+        },
+        {
+          id: 3, at: 3, severity: "warning", source: "performance:ui",
+          message: ui(684), count: 1, version: "0.1.0", buildId: "b",
+        },
+        {
+          id: 2, at: 2, severity: "warning", source: "console",
+          message: "unrelated", count: 1, version: "0.1.0", buildId: "a",
+        },
+        {
+          id: 1, at: 1, severity: "warning", source: "performance:ui",
+          message: ui(652), count: 1, version: "0.1.0", buildId: "a",
+        },
+      ]),
+    });
+    expect(get(createDiagnostics({ storage }))).toHaveLength(4);
+  });
 });
 describe("isHostRuntimeNoise", () => {
   it("matches the Tauri reload, IPC fallback, and Vite HMR messages from a WKWebView session", () => {
@@ -812,6 +900,20 @@ describe("diagnosticFingerprint", () => {
     same("no tests ran in 17.30s", "no tests ran in 2ms");
   });
 
+  it("masks UI timer observation counts and maxima", () => {
+    // The 500ms probe reports a fresh count and max_delay_ms every 30s.
+    // Those numbers are samples of one condition; leaving them unmasked
+    // turned overnight timer coalescing into 46 "distinct" warnings.
+    same(
+      "22 delayed UI timer sample(s); max_delay_ms=629. This measures event-loop scheduling delay, not a specific cause.",
+      "31 delayed UI timer sample(s); max_delay_ms=1623. This measures event-loop scheduling delay, not a specific cause.",
+    );
+    same(
+      "1 long observation gap(s); max_gap_ms=60000 (may include system sleep or suspension)",
+      "3 long observation gap(s); max_gap_ms=120000 (may include system sleep or suspension)",
+    );
+  });
+
   it("masks heap addresses and handles", () => {
     same("segfault at 0xdeadbeef", "segfault at 0x1");
   });
@@ -864,6 +966,23 @@ describe("coalescing across per-run detail (regression)", () => {
       "INTERNALERROR> SystemExit: 0",
       `=========== no tests ran in ${seconds} ===========`,
     ].join("\n");
+
+  it("folds UI timer observations whose only difference is the sample count", () => {
+    const { store } = makeStore([1, 2]);
+    store.warn(
+      "performance:ui",
+      "22 delayed UI timer sample(s); max_delay_ms=629. This measures event-loop scheduling delay, not a specific cause.",
+    );
+    store.warn(
+      "performance:ui",
+      "31 delayed UI timer sample(s); max_delay_ms=684. This measures event-loop scheduling delay, not a specific cause.",
+    );
+    const entries = get(store);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].count).toBe(2);
+    expect(entries[0].varied).toBe(true);
+    expect(entries[0].message).toContain("max_delay_ms=684");
+  });
 
   it("folds repeats whose only difference is an embedded duration", () => {
     // Exact-equality coalescing was defeated by pytest stamping its own

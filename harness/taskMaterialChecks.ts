@@ -69,13 +69,16 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
 
     click("[data-task-card]");
     await wait(() => !!document.querySelector(".task-runs") && !document.querySelector(".task-runs [role=alert]"));
-    material(`${mode} task details`, ".task-editor,.task-editor .gp-field,.task-editor select");
+    material(`${mode} task details`, ".task-editor,.task-editor .gp-field:not(.draft),.task-editor select");
     floating(`${mode} task header`, ".task-editor > header");
-    click(".enhancements > .heading");
-    await wait(() => document.querySelector<HTMLInputElement>(".enhancements input[list]")?.value === "fixture");
-    material(`${mode} suggestions`, ".enhancements .gp-field");
+    await wait(() => !!document.querySelector(".manvi-assist .change-link"));
+    check(`${mode}: merged Manvi section has Change link and no Model input`,
+      Boolean(document.querySelector(".manvi-assist .change-link"))
+      && ![...document.querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent?.trim() === "Model"));
+    material(`${mode} Manvi assist`, ".manvi-assist .gp-field:not(.draft),.manvi-assist textarea");
     material(`${mode} agent run controls`, ".task-runs .gp-field,.task-runs select");
     const editor = find(".task-editor");
+    check(`${mode}: task revision attribute is present`, editor.hasAttribute("data-task-revision"));
     const body = find(".task-editor .sheet-body");
     body.scrollTop = 200;
     await new Promise(resolve => requestAnimationFrame(resolve));
@@ -103,6 +106,7 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     await wait(() => !!document.querySelector(".inbox .empty"));
     material(`${mode} inbox`, ".inbox");
     click(".inbox > details > summary");
+    await wait(() => !!document.querySelector(".inbox .native-settings"));
     click(".inbox .native-settings > summary");
     await wait(() => !!document.querySelector(".inbox .native-settings fieldset"));
     material(`${mode} notification buttons`, ".inbox .native-settings button");

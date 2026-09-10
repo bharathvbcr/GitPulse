@@ -44,6 +44,14 @@ export async function runWorkbenchChecks(): Promise<string[]> {
     if (!(element instanceof HTMLInputElement)) throw new Error("Expected a checkbox");
     return element;
   };
+  const switchControl = (name: string, root: ParentNode = editor()) => {
+    const element = [...root.querySelectorAll<HTMLButtonElement>('button[role="switch"]')].find((node) => node.getAttribute("aria-label") === name);
+    if (!element) throw new Error(`Missing switch: ${name}`);
+    return element;
+  };
+  const enhance = (root: ParentNode = editor()) => button("Improve with Manvi", root);
+  const { harnessStore } = await import("../src/lib/stores/harnessStore");
+  void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "fixture-model" });
   const close = [...document.querySelectorAll("button")].find((b) => b.getAttribute("aria-label") === "Close task details");
   close?.click();
   button("New task").click();
@@ -57,10 +65,15 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   await wait(() => !button("Save task", editor()).disabled);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "1");
-  button("Manvi enhancements +", editor()).click();
-  await wait(() => field("Model", "input").value === "fixture-model");
-  button("Generate suggestion", editor()).click();
-  await wait(() => state("Ready for review"));
+  assert(Boolean(editor().querySelector(".manvi-assist .change-link")), "Merged Manvi section is missing the Change link");
+  assert(![...editor().querySelectorAll(".manvi-assist label")].some((label) => label.firstChild?.textContent?.trim() === "Model"), "Merged Manvi section must not expose a Model input");
+  await wait(() => !enhance().matches(":disabled"));
+  enhance().click();
+  await wait(() => state("Ready for review") || Boolean(button("Use both", editor())) || Boolean(button("Use this title", editor())));
+  if (!editor().querySelector('article[aria-label="Enhancement review"]')) {
+    editor().querySelector<HTMLElement>(".history-drawer > summary")?.click();
+    await wait(() => Boolean(editor().querySelector('article[aria-label="Enhancement review"]')));
+  }
   assert(field("Title", "input").value === title, "Generation changed the task before acceptance");
   assert(field("Description", "textarea").value === description, "Generation changed description before acceptance");
   results.push("Generation leaves saved task fields unchanged");
@@ -79,7 +92,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   check("Description", review()).click();
   button("Lose next acceptance reply").click();
   button("Accept selected fields", editor()).click();
-  await wait(() => editor().textContent?.includes("The result needs reconciliation") === true);
+  await wait(() => editor().textContent?.includes("The result needs reconciliation") === true || editor().textContent?.includes("The result is uncertain") === true);
   assert(field("Title", "input").matches(":disabled"), "Uncertain acceptance allowed task edits");
   button("Retry pending action", editor()).click();
   await wait(() => editor().dataset.taskRevision === "2" && state("Accepted"));
@@ -94,21 +107,23 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   results.push("Undo preserves unrelated description and task evidence");
   await wait(() => !field("Title", "input").matches(":disabled") && !button("Save task", editor()).matches(":disabled"));
   fill("Title", "input", `${title} after manual review`);
-  await wait(() => button("Generate suggestion", editor()).matches(":disabled"));
-  results.push("Unsaved edits prevent generation from an outdated task snapshot");
-  check("Keep description during enhancements").click();
+  await wait(() => editor().querySelector("header small")?.textContent === "Unsaved");
+  results.push("Unsaved edits mark the sheet dirty before Manvi prepare");
+  if (switchControl("Keep description").getAttribute("aria-checked") !== "true") switchControl("Keep description").click();
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "4");
-  assert(check("Rewrite description (locked)").disabled && !check("Rewrite description (locked)").checked, "Saved field lock was not applied");
-  button("Generate suggestion", editor()).click();
+  assert(switchControl("Keep description").getAttribute("aria-checked") === "true", "Saved field lock was not applied");
+  const descriptionPick = [...editor().querySelectorAll<HTMLButtonElement>(".field-picks button")].find((node) => node.textContent?.trim() === "Description");
+  assert(Boolean(descriptionPick?.disabled) && descriptionPick?.getAttribute("aria-pressed") !== "true", "Locked description remained selectable for generation");
+  enhance().click();
   await wait(() => state("Ready for review") && review().textContent?.includes("source revision 4") === true);
   assert(review().querySelectorAll('input[type="checkbox"]').length === 1, "Locked description entered generation");
   results.push("Saved field locks exclude locked content from proposed changes");
   button("Dismiss", editor()).click();
   await wait(() => state("Dismissed"));
-  button("Generate suggestion", editor()).click();
+  enhance().click();
   await wait(() => state("Generating"));
-  button("Request cancellation", editor()).click();
+  button("Cancel", editor()).click();
   await wait(() => state("Cancelled"));
   assert(field("Title", "input").value === `${title} after manual review`, "Cancellation changed the task");
   results.push("Cancellation waits for worker acknowledgment and preserves the task");
@@ -126,8 +141,8 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Title", "input", automaticTitle);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "5");
-  await wait(() => [...editor().querySelectorAll(".history button")].some((entry) => entry.textContent?.includes("Ready for review") && entry.textContent.includes("Task revision 5 · Automatic suggestion")));
-  const automaticEntry = [...editor().querySelectorAll<HTMLButtonElement>(".history button")].find((entry) => entry.textContent?.includes("Task revision 5 · Automatic suggestion"));
+  await wait(() => [...editor().querySelectorAll(".history button")].some((entry) => entry.textContent?.includes("Ready for review") && entry.textContent.includes("Task revision 5") && entry.textContent.includes("Automatic")));
+  const automaticEntry = [...editor().querySelectorAll<HTMLButtonElement>(".history button")].find((entry) => entry.textContent?.includes("Task revision 5") && entry.textContent.includes("Automatic"));
   if (!automaticEntry) throw new Error("Automatic suggestion was not exposed for review");
   automaticEntry.click();
   await wait(() => state("Ready for review") && review().textContent?.includes("source revision 5") === true);

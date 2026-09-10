@@ -7,12 +7,22 @@ describe("compact status popover", () => {
   it("matches the reference's three-card first glance and keeps secondary controls behind Details", () => {
     const { body } = render(StatusPopover, { props: { snapshot: statusFixture("changes"), onaction: () => {} } });
     expect(body.match(/class="metric\s/g)).toHaveLength(3);
-    expect(body).toContain("last fetch");
+    expect(body).toContain("fetched 4 min ago");
+    expect(body).toContain('class="caption');
+    expect(body).not.toContain('>last fetch<');
     expect(body).not.toContain('aria-label="2 stashes"');
     expect(body).not.toContain('aria-label="Go"');
     expect(body).not.toContain('aria-label="Tools"');
     expect(body).not.toContain('aria-label="Command palette"');
     expect(body).not.toContain("4 of 12 staged");
+  });
+  it("projects per-repo badges into the switcher fixture", () => {
+    const snapshot = statusFixture("changes");
+    expect(snapshot.repositories[1]).toMatchObject({ changed: 3, conflicts: 1, busy: true });
+  });
+  it("surfaces never-fetched upstream state", () => {
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("never fetched"), onaction: () => {} } });
+    expect(body).toContain("never fetched");
   });
   it("shows review metrics and the primary action without expanding the details", () => {
     const { body } = render(StatusPopover, { props: { snapshot: statusFixture("changes"), onaction: () => {} } });

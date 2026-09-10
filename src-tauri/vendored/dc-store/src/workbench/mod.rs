@@ -1159,6 +1159,8 @@ fn item_query(
 
 #[cfg(test)]
 mod item_query_tests;
+#[cfg(test)]
+mod enhancement_lifecycle_tests;
 
 fn list_events(input: &Input<'_>) -> Result<String> {
     input.fields(&["limit", "after"])?;

@@ -1,13 +1,32 @@
-# Dependency health — 2026-09-08
+# Dependency health — 2026-09-10
 
-The four reported dependency findings are resolved in this worktree. The Rust
-migration uses GTK3 0.19.0, GLib 0.22.9 and Soup 0.9.0, with local consumer
-patches until Tauri and its platform crates adopt those bindings upstream.
-Neither advisory is ignored or filtered out.
+The Health panel report of 2026-09-10 (44 CodeQL alerts, three outdated npm
+packages, cargo discovery capped at 24 of 754) is resolved in this worktree
+as follows. The Rust GTK migration from 2026-09-08 remains in place. Neither
+RustSec advisory is ignored or filtered out.
+
+## Code scanning
+
+`.github/codeql/codeql-config.yml` excludes `src-tauri/framework/**`. Attach it
+to CodeQL default setup with the `github-codeql-config-file` repository
+property (or the CodeQL configuration UI). The custom-properties API 404s on
+this personal repository, so the file is in-tree and the attachment is a GitHub
+Settings step; until it is attached, the framework alerts are dismissed as
+false positives / used-in-tests so they do not return on an unchanged tree.
+
+| Alert | Resolution |
+| --- | --- |
+| [js/incomplete-sanitization](https://github.com/bharathvbcr/GitPulse/security/code-scanning/26) in `ignoreRule` | The gitignore sanitizer now escapes `\` as well as `!*?[]# ` (CodeQL: "This does not escape backslash characters in the input."). Copy-ignore still refuses paths that contain `\` as an ambiguous shape. |
+| 40× [rust/access-invalid-pointer](https://github.com/bharathvbcr/GitPulse/security/code-scanning/27) in `libappindicator-sys` | Bindgen `#[test]` offsetof probes (`&(*null).field`). Excluded with the local framework ports. |
+| 3× [rust/insecure-cookie](https://github.com/bharathvbcr/GitPulse/security/code-scanning/67) in WRY | Cookie builders copy `is_secure()` / `IsSecure` / `isSecure()` from the webview. Forcing `Secure=true` would break HTTP localhost cookies. Excluded with the local framework ports. |
+
+`src-tauri/src` and `src-tauri/vendored` stay in the scan.
 
 ## npm toolchain
 
-- `@lucide/svelte` is locked at **1.43.0**.
+- `@lucide/svelte` is locked at **1.44.0**.
+- `vite` is locked at **8.3.0**.
+- `@types/node` is locked at **26.5.1** (not the Node 22 `latest` dist-tag).
 - The `@typescript/native-preview` nightly is replaced by stable **TypeScript
   7.0.2**, installed under the `@typescript/native` alias.
 - `typescript` resolves to Microsoft's `@typescript/typescript6` **6.0.2**
@@ -64,7 +83,9 @@ The local protocol handler belongs only to the native integration test.
 ## Uncapped audit scope — verified
 
 The application lockfiles were audited directly, without the Health UI's
-artifact-discovery cap, platform filtering or advisory exclusions:
+artifact-discovery cap, platform filtering or advisory exclusions.
+
+2026-09-08:
 
 - `npm audit --json`: **0 vulnerabilities**, 174 dependencies in its metadata.
 - `npm outdated --json`: **{}**, exit **0**, for direct dependencies.
@@ -73,11 +94,31 @@ artifact-discovery cap, platform filtering or advisory exclusions:
 - RustSec database: `bf25f6575a93a35f30796c65c0ed91bee7fa19fd`, 1,242 advisories,
   updated `2026-09-08T11:58:15+02:00`.
 
+2026-09-10 follow-up (this change): Dependabot **0** open alerts. `cargo audit
+--file src-tauri/Cargo.lock --deny warnings` exit **0**. `npm audit` **0**
+vulnerabilities. CodeQL alerts **27–66** dismissed as used-in-tests, **67–69**
+as false positives. Alert **26** stays open until this branch is scanned.
+Direct npm refreshes: `@lucide/svelte` 1.44.0, `vite` 8.3.0, `@types/node`
+26.5.1. `npm outdated` still lists `@types/node` only because `latest` is the
+Node 22 dist-tag (22.20.2); wanted and current are 26.5.1.
+
 This covers the resolved application dependencies in these lockfiles. It does
 not claim coverage of every generated artifact or defects absent from the
 advisory databases.
 
 ## Verification
+
+2026-09-10 (this change, macOS): `escapeGitignoreLiteral` / `ignoreRule` tests
+and the advisory lockfile contract passed (14 tests). Vite **8.3.0** production
+build succeeded; entry chunk **683.64 kB** under the 780 kB budget. `npm run
+typecheck` and `npm run check:release` passed. `npm run check` (svelte-check)
+was not used as evidence: the worktree also has unrelated TaskBoard edits that
+fail svelte-check independently of this change. Browser hygiene harness and
+`npm run ci:local` were not re-run. GitNexus was stale versus HEAD; DevMap
+answered `ignoreRule` with two deterministic callers (`copyIgnore`, the unit
+tests) and `walk_incomplete` (index-wide unresolved sites). Source grep agreed.
+
+The GTK migration verification below is unchanged from 2026-09-08.
 
 The new dependency contracts failed against the old versions. The native CLI
 selection assertion also failed against bare `tsc`. The framework integrity

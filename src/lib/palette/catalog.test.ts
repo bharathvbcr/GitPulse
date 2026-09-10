@@ -175,7 +175,7 @@ describe("command catalog and context", () => {
     expect(create).toHaveBeenCalledOnce();
   });
   it("routes recent/open repositories by path, disambiguates their names, and verifies activation", async () => {
-    const tab = (id: string, path: string, isActive: boolean) => ({ id, path, name: "same", label: `${id}/same`, pinned: false, isActive, isBare: false, isDirty: false, isLoading: false, error: null, currentBranch: "main", conflictedCount: 0 });
+    const tab = (id: string, path: string, isActive: boolean) => ({ id, path, name: "same", label: `${id}/same`, pinned: false, isActive, isBare: false, isDirty: false, isLoading: false, error: null, currentBranch: "main", conflictedCount: 0, changedCount: 0 });
     let current = { ...ready(), activeTabId: "b", currentPath: "/two/same", openTabs: [tab("a", "/one/same", false), tab("b", "/two/same", true), tab("c", "/three/same", false)], recentRepos: ["/one/same", "/four/same"] };
     vi.spyOn(repoStore, "subscribe").mockImplementation(listener => { listener(current); return () => {}; });
     const open = vi.spyOn(repoStore, "openRepo").mockImplementation(async path => { current = { ...current, currentPath: path }; return true; });

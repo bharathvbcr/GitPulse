@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createListenerTracker } from "./listenerTracker";
 
@@ -66,5 +69,22 @@ describe("createListenerTracker", () => {
     tracker.track(() => order.push("newest"));
     expect(() => tracker.dispose()).not.toThrow();
     expect(order).toEqual(["newest", "oldest"]);
+  });
+});
+
+const PRODUCTION_OWNERS = [
+  "../../App.svelte",
+  "../desktop/nativeShell.ts",
+  "../desktop/statusConnection.ts",
+  "../components/NativeNotificationBridge.svelte",
+  "../components/AttentionInbox.svelte",
+  "../components/TaskBoard.svelte",
+] as const;
+
+describe("createListenerTracker production owners", () => {
+  it.each(PRODUCTION_OWNERS)("%s routes unlistens through the tracker", (relative) => {
+    const text = readFileSync(join(dirname(fileURLToPath(import.meta.url)), relative), "utf8");
+    expect(text).toContain("createListenerTracker");
+    expect(text).not.toMatch(/if \(disposed\) (?:unlisten|stop|unsubscribe)\(\)/);
   });
 });

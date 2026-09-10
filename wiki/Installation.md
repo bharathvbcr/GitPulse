@@ -40,7 +40,7 @@ GitPulse shells out to tools you already have:
 | Tool | Required? | Used for |
 | --- | --- | --- |
 | `git` | Yes | Every repository operation |
-| `gh` | Optional | PRs, issues, workflow runs, Dependabot alerts |
+| `gh` | Optional | PRs, issues, workflow runs, Dependabot and code scanning alerts (fetched when a repository opens) |
 | Local LLM (Ollama, LM Studio, llama.cpp, vLLM) | Optional | Commit messages, explanations, health/coverage suggestions |
 | `manvi` sidecar | Optional | Policy gate; absent → verdicts are **unchecked**, never silently allowed |
 

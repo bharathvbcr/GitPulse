@@ -5,10 +5,11 @@ report after reproducing a slow action. Keep the time, repository size, open
 view, and action with the report; they help correlate UI observations with
 native commands.
 
-- `performance:ui`: the visible UI timer ran at least 250 ms late. The report
-  records delayed samples and maximum lateness. It does not identify the
-  cause or measure FPS. Hidden windows are not sampled; very long gaps are
-  labelled as potentially including system sleep or suspension.
+- `performance:ui`: the visible, focused UI timer ran at least 250 ms late.
+  The report records delayed samples and maximum lateness. It does not
+  identify the cause or measure FPS. Hidden and unfocused windows are not
+  sampled; unreported samples are dropped when leaving the foreground. Very
+  long gaps are labelled as potentially including system sleep or suspension.
 - Backend `[performance]`: a command through the shared blocking wrapper took
   at least one second. `queue_ms` measures waiting for a blocking worker;
   `work_ms` includes everything inside that command, including subprocess and

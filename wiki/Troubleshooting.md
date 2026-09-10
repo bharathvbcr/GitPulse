@@ -31,7 +31,7 @@ Only loopback is allowed: `127.0.0.1`, `localhost`, `[::1]`. A LAN or cloud base
 
 ## Coverage / Health / Storage look empty
 
-Those Insights sections are **on-demand**. Nothing is scanned until you run it. A cell that was not scanned is *not scanned*, not `0%` or `0` vulnerabilities.
+Coverage and Storage stay **on-demand**. Health runs a local audit when you open the section, and fetches GitHub Dependabot and code scanning alerts when a repository opens (Settings → Analysis). A cell that was not scanned is *not scanned*, not `0%` or `0` vulnerabilities.
 
 ## Fleet shows "not scanned" or "could not read"
 

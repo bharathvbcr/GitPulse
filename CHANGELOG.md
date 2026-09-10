@@ -11,6 +11,33 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Scan GitHub Dependabot and code scanning alerts when a repository opens, and
+  warn when critical or high findings are open. Turn off under Settings →
+  Analysis. Failures stay in Health and diagnostics, not as an all-clear toast.
+- Menu bar status enhancements: attention-dot glyph, optional tray title counts,
+  per-repo switcher badges, real `FETCH_HEAD` age, hide-Dock-while-closed, and
+  Launch at login (LaunchAgent with `--background`).
+
+### Security
+
+- Complete gitignore-literal escaping for copied hygiene ignore rules so a
+  backslash cannot undo a later meta escape. Paths that still contain `\` are
+  refused for copy-ignore and need manual review.
+- Launch at login writes a per-user LaunchAgent only. It starts GitPulse with
+  `--background` and does not add network access or broaden filesystem rights.
+  Autostart IPC is limited to the main window capability.
+
+### Changed
+
+- Fix macOS status-icon left click: do not keep an `NSMenu` attached at rest so
+  clicks open the popover instead of the native menu (verified on macOS 27).
+- Add a CodeQL config that excludes `src-tauri/framework/**`. Bindgen
+  offsetof tests and WRY cookie conversion in those ports are not GitPulse
+  sinks. Attach the file to default setup in GitHub Settings.
+- Refresh `@lucide/svelte` 1.44.0, Vite 8.3.0, and `@types/node` 26.5.1.
+
 ## [0.1.0] - 2026-09-10
 
 First minor release after the 0.0.x desktop series. Native menus, the macOS

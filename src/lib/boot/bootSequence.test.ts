@@ -193,8 +193,9 @@ describe("runBootSequence", () => {
   });
 
   it("composes with listenerTracker: teardown before resolution still unwinds late registrations", async () => {
-    // Simulates the disposed-flag race App.svelte guards: cleanup runs
-    // (dispose) while boot awaits, then steps resolve and must not leak.
+    // Simulates the disposed-flag race App.svelte owns through
+    // createListenerTracker: cleanup runs (dispose) while boot awaits, then
+    // steps resolve and must not leak.
     const tracker = createListenerTracker();
     const unlisten = vi.fn();
     const h = createHarness({

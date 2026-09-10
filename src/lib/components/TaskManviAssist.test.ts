@@ -10,21 +10,25 @@ describe("TaskManviAssist", () => {
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
   });
 
-  it("captures notes, asks Manvi for title and description, and accepts field by field", () => {
-    expect(source).toContain("What do you need?");
-    expect(source).toContain("Draft with Manvi");
-    expect(source).toContain("Improve with Manvi");
+  it("gates Ask on manviGate and uses the shared local model selection", () => {
+    expect(source).toContain("!manviGate.ok");
+    expect(source).toContain("effectiveSelection");
+    expect(source).toContain("requestManviFocus(\"model\")");
+    expect(source).toContain("Pick a local model in Local model servers");
+    expect(source).toContain("enhancementConfiguration(liveSelection)");
+    expect(source).not.toContain("bind:value={configuration.model}");
+    expect(source).not.toContain("Task model settings");
+  });
+
+  it("keeps inline accept, compact history, and field locks in one section", () => {
     expect(source).toContain("startQuickEnhance");
-    expect(source).toContain("acceptEnhancementInput");
     expect(source).toContain("Use this title");
     expect(source).toContain("Use this description");
-    expect(source).toContain("Use both");
-    expect(source).toContain("bind:value={title}");
-    expect(source).toContain("bind:value={description}");
-    expect(source).toContain("Type a few sentences");
-    expect(source).toContain('aria-label="Fields Manvi may change"');
-    expect(source).toContain("manviReady");
-    expect(source).toContain("Boolean(gate) || !manviReady");
-    expect(source).not.toMatch(/\bbackdrop-blur-/);
+    expect(source).toContain("history-drawer");
+    expect(source).toContain("Keep title");
+    expect(source).toContain("Keep description");
+    expect(source).toContain("explainEnhancementFailure");
+    expect(source).toContain("Resolve uncertain attempt");
+    expect(source).toContain('{proposal.state === "running" ? "Cancel" : "Dismiss"}');
   });
 });

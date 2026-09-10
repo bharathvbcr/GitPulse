@@ -364,7 +364,7 @@ mod tests {
             state.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["revision"],
             1
         );
-        assert!(state.0.worker.get().is_none());
+        assert!(state.0.worker.lock().unwrap().is_none());
         drop(state);
         let restored = host(&db).request("runs.get", r#"{"id":"run"}"#).unwrap();
         assert_eq!(
@@ -423,7 +423,7 @@ mod tests {
             );
         }
         assert!(!db.parent().unwrap().exists());
-        assert!(state.0.worker.get().is_none());
+        assert!(state.0.worker.lock().unwrap().is_none());
     }
 
     #[test]

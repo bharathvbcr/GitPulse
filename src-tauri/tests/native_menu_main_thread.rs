@@ -223,11 +223,13 @@ fn main() {
             path: "/r/one/repo".into(),
             label: "one/repo".into(),
             active: true,
+            ..Default::default()
         },
         gitpulse_lib::desktop::state::MenuRepository {
             path: "/r/two/repo".into(),
             label: "two/repo".into(),
             active: false,
+            ..Default::default()
         },
     ];
     selected.enabled.extend(
@@ -354,6 +356,7 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
             path: "/r/with:colon/repo".into(),
             label: "repo".into(),
             active: true,
+            ..Default::default()
         });
     state.enabled.extend(ids.iter().map(|id| id.to_string()));
     set_menu_state(app.handle(), state.clone()).unwrap();

@@ -20,6 +20,7 @@
     "core:window:allow-outer-position",
     "core:window:allow-available-monitors",
     "opener:allow-open-url",
-    "opener:allow-default-urls"
+    "opener:allow-default-urls",
+    "autostart:default"
   ]
 }

@@ -168,6 +168,7 @@ export interface OpenRepoTab {
   error: string | null;
   currentBranch: string | null;
   conflictedCount: number;
+  changedCount: number;
 }
 
 /**
@@ -289,6 +290,8 @@ export interface RepoSession {
    * stale. Recorded here so the poll can compensate and the UI can say so.
    */
   watch: WatchState;
+  /** Epoch ms of FETCH_HEAD mtime; null when absent or unread. */
+  fetchedAt: number | null;
 }
 
 export interface RepoState {
@@ -359,6 +362,8 @@ export interface RepoState {
   tagsFailed: boolean;
   /** Whether the active session is receiving live filesystem updates. */
   watch: WatchState;
+  /** Epoch ms of FETCH_HEAD mtime for the active repo; null when never fetched. */
+  fetchedAt: number | null;
 }
 
 interface InternalState {
@@ -475,6 +480,7 @@ function emptyProjected(): RepoState {
     tagsTruncated: false,
     tagsFailed: false,
     watch: WATCH_UNKNOWN,
+    fetchedAt: null,
   };
 }
 
@@ -525,6 +531,7 @@ function createSession(
     tagsTruncated: extras.tagsTruncated ?? false,
     tagsFailed: extras.tagsFailed ?? false,
     watch: extras.watch ?? WATCH_UNKNOWN,
+    fetchedAt: extras.fetchedAt ?? null,
   };
 }
 
@@ -548,6 +555,7 @@ function project(internal: InternalState): RepoState {
       error: session?.error ?? null,
       currentBranch: session?.currentBranch ?? null,
       conflictedCount: statuses.filter((file) => file.is_conflicted).length,
+      changedCount: new Set(statuses.map((file) => file.path)).size,
     };
   });
   const active = internal.workspace.activeId
@@ -590,6 +598,7 @@ function project(internal: InternalState): RepoState {
     tagsTruncated: active?.tagsTruncated ?? false,
     tagsFailed: active?.tagsFailed ?? false,
     watch: active?.watch ?? WATCH_UNKNOWN,
+    fetchedAt: active?.fetchedAt ?? null,
   };
 }
 
@@ -1031,8 +1040,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     stashFailed: boolean;
     tagsTruncated: boolean;
     tagsFailed: boolean;
+    fetchedAt: number | null;
   }> {
-    const [branches, statuses, tags, operation, stash] = await Promise.all([
+    const [branches, statuses, tags, operation, stash, fetchedAt] = await Promise.all([
       invokeFn<BranchInfo[]>("cmd_list_branches", { repoPath: path }),
       invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path }),
       invokeFn<unknown>("cmd_list_tags", { repoPath: path })
@@ -1052,6 +1062,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       invokeFn<StashEntry[]>("cmd_stash_list", { repoPath: path })
         .then((entries) => ({ entries: entries ?? [], failed: false }))
         .catch(() => ({ entries: [] as StashEntry[], failed: true })),
+      invokeFn<number | null>("cmd_last_fetch_at", { repoPath: path })
+        .then((value) => (typeof value === "number" ? value : null))
+        .catch(() => null),
     ]);
     const currentBranch = branches.find((b) => b.is_current)?.name || null;
     const defaultBranch =
@@ -1067,6 +1080,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       stashFailed: stash.failed,
       tagsTruncated: tags.truncated,
       tagsFailed: tags.failed,
+      fetchedAt,
     };
   }
 
@@ -1132,6 +1146,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       stashFailed: boolean;
       tagsTruncated: boolean;
       tagsFailed: boolean;
+      fetchedAt: number | null;
     },
   ) {
     if (live.branches.length === 0) return snapshot;

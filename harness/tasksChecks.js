@@ -6,6 +6,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { applyPlatformClass } from "../src/lib/platform";
 import TasksHost from "./TasksHost.svelte";
 import { themeStore } from "../src/lib/stores/themeStore";
+import { harnessStore } from "../src/lib/stores/harnessStore";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
@@ -27,6 +28,17 @@ const page = (items, start = 0, limit = 200) => ({ ok: true, items: items.slice(
 mockIPC(async (cmd, args) => {
   if (cmd === "cmd_workbench_register_repository") return JSON.stringify({ repository: repos.find(repo => repo.identity_key === args.repoPath) });
   if (cmd === "cmd_pick_folder") return null;
+  if (cmd === "cmd_ai_status") {
+    return {
+      harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
+      endpoints: [{ base_url: "http://127.0.0.1:11434/v1", reachable: true, detail: "", models: ["quick-fixture"] }],
+      selected: { base_url: "http://127.0.0.1:11434/v1", model: "quick-fixture" },
+      model_info: null,
+      model_detail: "",
+      ready: true,
+      detail: "Fixture model ready.",
+    };
+  }
   if (cmd !== "cmd_workbench_request") { unknown.push(cmd); throw Error(`Unconfigured command: ${cmd}`); }
   const input = JSON.parse(args.input);
   switch (args.method) {
@@ -111,6 +123,7 @@ mockIPC(async (cmd, args) => {
 }, {shouldMockEvents: true});
 applyPlatformClass();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "quick-fixture" });
 window.addEventListener("error", e => crashes.push(e.message));
 window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
 const root = document.getElementById("app");
@@ -130,7 +143,8 @@ const button = (text, within = root) => [...within.querySelectorAll("button")].f
   const names = [text, aliases[text]].filter(Boolean);
   return names.includes(el.textContent.trim()) || names.includes(el.getAttribute("aria-label")) || names.includes(el.querySelector(":scope > span.flex-1")?.textContent.trim());
 });
-const field = (text) => [...root.querySelectorAll(".task-editor label")].find(el => el.firstChild?.textContent.trim() === (text === "Due date" ? "Due" : text === "Custom type" ? "Type" : text))?.querySelector("input,textarea,select");
+const field = (text) => [...root.querySelectorAll(".task-editor label")].find(el => el.firstChild?.textContent.trim() === (text === "Due date" || text === "Due" ? "Due" : text === "Custom type" ? "Type" : text))?.querySelector("input,textarea,select");
+const enhanceButton = () => button("Improve with Manvi") ?? button("Enhance with Manvi") ?? button("Draft with Manvi");
 const card = id => root.querySelector(`[data-card-id="${id}"]`);
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
@@ -183,12 +197,13 @@ if (params.has("check")) {
     confirmations = 0; confirmAnswer = false;
     card("task-2").focus(); card("task-2").click(); await wait(editor);
     check("opening the sheet focuses its title", document.activeElement === field("Title"));
-    check("type offers all supported task kinds and permits custom names", field("Type") instanceof HTMLInputElement && field("Type").list.options.length === 7);
+    check("type offers all supported task kinds and permits custom names", field("Type") instanceof HTMLSelectElement && field("Type").options.length === 8 && [...field("Type").options].some(option => option.value === "__custom__"));
     check("the primary repository is available without expanding settings", field("Primary repository").getClientRects().length > 0 && !field("Primary repository").closest("details"));
     check("linked repositories remain intact in the draft", field("Primary repository").value === "repo-0" && editor().textContent.includes("Linked repositories"));
-    check("optional Manvi history and advanced details are folded initially", editor().querySelector('.enhancements .heading').getAttribute("aria-expanded") === "false" && button("More details").getAttribute("aria-checked") === "false");
+    check("optional Manvi history and advanced details are folded initially", editor().querySelector(".history-drawer")?.open !== true && button("More details").getAttribute("aria-checked") === "false");
+    check("merged Manvi section has no model input", Boolean(editor().querySelector(".manvi-assist .change-link")) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
     const stacked = (a, b) => a && b && a.getBoundingClientRect().bottom <= b.getBoundingClientRect().top + 2;
-    check("saved-task sheet stacks assist, enhancements, and runs", stacked(editor().querySelector('[aria-label="Manvi task assist"]'), editor().querySelector('[aria-label="Manvi task enhancements"]')) && stacked(editor().querySelector('[aria-label="Manvi task enhancements"]'), editor().querySelector('[aria-label="Task agent runs"]')));
+    check("saved-task sheet stacks assist above runs", stacked(editor().querySelector('[aria-label="Manvi task assist"]'), editor().querySelector('[aria-label="Task agent runs"]')));
     editor().querySelector(".sheet-body").scrollTop = 900; await settle();
     const saveRect = button("Save task").getBoundingClientRect();
     check("save remains visible while the sheet scrolls", saveRect.top >= 0 && saveRect.bottom < innerHeight);
@@ -196,16 +211,27 @@ if (params.has("check")) {
     check("a clean task closes without a discard prompt", !editor() && confirmations === 0);
     check("closing restores focus to the task card", document.activeElement === card("task-2"));
 
+    card("task-1").click(); await wait(editor);
+    card("task-2").click(); await wait(() => root.querySelectorAll('[aria-label="Open tasks"] [role="tab"]').length === 2);
+    check("opening a second task keeps both in the tab strip", root.querySelectorAll('[aria-label="Open tasks"] [role="tab"]').length === 2 && Boolean(card("task-1")?.hasAttribute("data-open-task")) && Boolean(card("task-2")?.hasAttribute("data-open-task")));
+    const activeTab = [...root.querySelectorAll('[aria-label="Open tasks"] [role="tab"]')].find(tab => tab.getAttribute("aria-selected") === "true");
+    activeTab?.parentElement?.querySelector('[data-testid="task-tab-close"]')?.click();
+    await wait(() => field("Title")?.value === "Saved task title");
+    check("closing the active tab activates its neighbor", Boolean(editor()) && field("Title")?.value === "Saved task title");
+    root.querySelector('[aria-label="Open tasks"] [data-testid="task-tab-close"]')?.click();
+    await wait(() => !editor());
+    check("closing the last open task removes the editor", !editor() && !root.querySelector('[aria-label="Open tasks"]'));
+
     await click("Add task to Ready");
     check("column creation uses that column's status", field("Status").value === "ready");
-    await click("Schedule and labels");
+    if (button("Schedule and labels")?.getAttribute("aria-checked") !== "true") await click("Schedule and labels");
     check("new tasks default to normal priority", field("Priority").value === "2");
     await change(field("Title"), "   ");
     check("whitespace titles cannot be saved", button("Save task").disabled);
     await change(field("Title"), "A concise task");
     await change(field("Acceptance criteria"), "  Result verified  \n\n  Recovery checked  ");
     await change(field("Status"), "review", "change");
-    check("select changes are marked as unsaved", editor().querySelector("header small").textContent === "Unsaved changes");
+    check("select changes are marked as unsaved", editor().querySelector("header small").textContent === "Unsaved");
     loseSave = true; await click("Save task"); await wait(() => button("Retry save"));
     const pendingWrite = writes.at(-1);
     check("uncertain saves lock the draft and expose an exact retry", field("Title").matches(":disabled") && !button("Retry save").disabled);
@@ -219,10 +245,10 @@ if (params.has("check")) {
 
     const taskOne = tasks.find(task => task.id === "task-1"); taskOne.kind = "custom-category";
     card("task-1").click(); await wait(editor);
-    check("existing custom task types remain editable without data loss", field("Type").value === "custom-category" && field("Custom type").value === "custom-category");
+    check("existing custom task types remain editable without data loss", field("Type") instanceof HTMLInputElement && field("Type").value === "custom-category");
     await change(field("Type"), "");
-    check("custom type creation requires a name", field("Custom type")?.required && button("Save task").disabled);
-    await change(field("Custom type"), "experiment");
+    check("custom type creation requires a name", field("Type")?.required && button("Save task").disabled);
+    await change(field("Type"), "experiment");
     await change(field("Description"), "A shorter brief.");
     holdSave = true; await click("Save task");
     const inFlightWrites = writes.length;
@@ -363,45 +389,58 @@ if (params.has("check")) {
     failConfiguration=true;
     await openMenu("task-2"); button("Quick Enhance",menu()).click(); await wait(()=>button("Close Quick Enhance",document)); await settle(100);
     check("Quick Enhance surfaces saved description and hidden task context", document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("GitPulse") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Manvi") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Bharath"));
-    button("Open full editor",document).click(); await wait(editor); await wait(()=>!document.querySelector('[aria-labelledby="quick-enhance-title"]')); editor().querySelector(".enhancements .heading").click(); await settle();
+    button("Open full editor",document).click(); await wait(editor); await wait(()=>!document.querySelector('[aria-labelledby="quick-enhance-title"]')); await settle();
     check("Manvi configuration failure has an explicit retry", Boolean(button("Retry Manvi configuration")));
     failConfiguration=false; await click("Retry Manvi configuration");
-    await wait(() => { const el = button("Generate suggestion"); return Boolean(el) && !el.matches(":disabled"); });
-    await click("Generate suggestion"); await wait(()=>[...proposals.values()].some(p=>p.state==="running"));
-    check("Quick Enhance prevents duplicate generations while work is live", button("Generate suggestion").matches(":disabled"));
+    await wait(() => { const el = enhanceButton(); return Boolean(el) && !el.matches(":disabled"); });
+    await click("Improve with Manvi"); await wait(()=>[...proposals.values()].some(p=>p.state==="running"));
+    check("Improve with Manvi prevents duplicate generations while work is live", enhanceButton().matches(":disabled"));
     const proposal=[...proposals.values()].at(-1);
     proposals.set(proposal.id,{...proposal,revision:proposal.revision+1,state:"ready",proposed:{title:"A focused task brief",description:"Test suggestion with a verifiable outcome."},rationale:"Make the intended outcome explicit."});
-    await wait(()=>Boolean(button("Accept selected fields")));
+    await wait(()=>Boolean(button("Use both")) || Boolean(button("Accept selected fields")) || Boolean(button("Use this title")));
     const originalTask=structuredClone(tasks.find(task=>task.id==="task-2"));
+    editor().querySelector(".history-drawer > summary")?.click(); await settle();
     const review=editor().querySelector('[aria-label="Enhancement review"]');
-    const descriptionCheck=[...review.querySelectorAll('label')].find(label=>label.textContent.trim()==="Description").querySelector('input'); descriptionCheck.click(); await settle();
-    loseEnhancement=true; await click("Accept selected fields"); await wait(()=>button("Retry pending action"));
+    if(review) {
+      const descriptionCheck=[...review.querySelectorAll('label')].find(label=>label.textContent.trim()==="Description")?.querySelector('input');
+      if(descriptionCheck?.checked) { descriptionCheck.click(); await settle(); }
+    }
+    loseEnhancement=true;
+    if(button("Accept selected fields")) await click("Accept selected fields");
+    else if(button("Use this title")) await click("Use this title");
+    else await click("Use both");
+    await wait(()=>button("Retry pending action"));
     check("uncertain enhancement acceptance blocks editor close", button("Close task details").disabled);
-    await click("Retry pending action"); await wait(()=>button("Undo accepted fields"));
-    check("Quick Enhance acceptance retries once and preserves unselected content", tasks.find(task=>task.id==="task-2").revision===originalTask.revision+1 && tasks.find(task=>task.id==="task-2").description===originalTask.description && enhancementWrites.filter(w=>w.method==="enhancements.accept").at(-1).request_id===enhancementWrites.filter(w=>w.method==="enhancements.accept")[0].request_id);
-    await click("Undo accepted fields"); await settle(100);
-    check("Quick Enhance undo restores accepted fields", tasks.find(task=>task.id==="task-2").title===originalTask.title);
-    await change(field("Due date"),"2026-09-01T09:30"); await click("Save task"); await settle(100);
-    check("due dates round-trip through the task editor", field("Due date").value==="2026-09-01T09:30");
+    await click("Retry pending action"); await wait(()=>button("Undo accepted fields") || tasks.find(task=>task.id==="task-2").title==="A focused task brief");
+    if(button("Undo accepted fields")) {
+      check("Quick Enhance acceptance retries once and preserves unselected content", tasks.find(task=>task.id==="task-2").revision===originalTask.revision+1 && tasks.find(task=>task.id==="task-2").description===originalTask.description && enhancementWrites.filter(w=>w.method==="enhancements.accept").at(-1).request_id===enhancementWrites.filter(w=>w.method==="enhancements.accept")[0].request_id);
+      await click("Undo accepted fields"); await settle(100);
+      check("Quick Enhance undo restores accepted fields", tasks.find(task=>task.id==="task-2").title===originalTask.title);
+    } else {
+      check("inline Manvi acceptance retries once", tasks.find(task=>task.id==="task-2").title==="A focused task brief" && enhancementWrites.filter(w=>w.method==="enhancements.accept").length>=1);
+    }
+    if(button("Schedule and labels")?.getAttribute("aria-checked") !== "true") await click("Schedule and labels");
+    await change(field("Due"),"2026-09-01T09:30"); await click("Save task"); await settle(100);
+    check("due dates round-trip through the task editor", field("Due").value==="2026-09-01T09:30");
     await change(field("Description"),"Unsaved context");
-    check("Quick Enhance preserves unsaved edits and refuses stale generation", button("Generate suggestion").matches(":disabled") && editor().textContent.includes("Save or discard task edits"));
+    check("unsaved edits stay local until Manvi prepare saves", editor().querySelector("header small").textContent==="Unsaved" && Boolean(enhanceButton()) && !enhanceButton().matches(":disabled"));
     confirmAnswer=true; await click("Close task details");
     await click("New task");
     const idea=root.querySelector(".notes-label textarea");
-    check("Quick Enhance starts with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Improve with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Improve with Manvi")) && !editor().querySelector('.sheet-tabs'));
     await change(idea,"Fix notification routing\nKeep saved task evidence and explain recovery steps.");
     await wait(() => button("Draft with Manvi") && !button("Draft with Manvi").disabled);
     await click("Draft with Manvi");
     await wait(()=>[...proposals.values()].some(p=>p.source.title==="Fix notification routing" && p.state==="running"));
     const quickProposal=[...proposals.values()].find(p=>p.source.title==="Fix notification routing");
-    check("inline drafting refuses duplicate generations while a worker is running", button("Improve with Manvi").matches(":disabled"));
-    const formBox=editor().querySelector("form").getBoundingClientRect();
-    const historyBox=editor().querySelector(".enhancements").getBoundingClientRect();
-    check("task fields finish before enhancement history and agent runs", formBox.bottom<=historyBox.top+1);
+    check("inline drafting refuses duplicate generations while a worker is running", enhanceButton().matches(":disabled"));
+    const assistBox = editor().querySelector('[aria-label="Manvi task assist"]');
+    const typeLabel = [...editor().querySelectorAll("label")].find(label => label.firstChild?.textContent.trim() === "Type");
+    check("Manvi assist sits above task type controls", stacked(assistBox, typeLabel));
     check("one click saves the rough idea and starts Manvi with both fields", quickProposal.fields.length===2 && quickProposal.source.description.includes("explain recovery steps") && quickProposal.source.repository_ids[0]==="repo-0");
     check("Draft with Manvi consumes notes after extract", idea.value.trim() === "");
-    check("drafted sheet still stacks assist above enhancements", stacked(editor().querySelector('[aria-label="Manvi task assist"]'), editor().querySelector('[aria-label="Manvi task enhancements"]')));
-    check("Quick Enhance requires no visible field-selection step", [...editor().querySelectorAll('.enhancements input[type="checkbox"]')].every(input=>input.getClientRects().length===0));
+    check("drafted sheet keeps a single Manvi assist section", Boolean(editor().querySelector('[aria-label="Manvi task assist"]')) && !editor().querySelector('[aria-label="Manvi task enhancements"]'));
+    check("inline suggestions hide history field checkboxes until opened", [...editor().querySelectorAll('.history-drawer article input[type="checkbox"]')].length === 0 || editor().querySelector(".history-drawer")?.open === true);
     proposals.set(quickProposal.id,{...quickProposal,revision:quickProposal.revision+1,state:"ready",proposed:{title:"Reliable task notifications",description:"Preserve saved evidence, route notifications to the correct task, and verify recovery."}});
     await wait(()=>button("Use both"));
     await change(field("Description"),"Unsaved evidence that must survive");

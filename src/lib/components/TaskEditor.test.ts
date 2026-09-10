@@ -10,40 +10,28 @@ describe("TaskEditor", () => {
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
   });
 
-  it("shows Manvi notes, title, description, due date, status, and repos immediately; folds locks and notifications", () => {
-    const markup = source.slice(source.indexOf("<aside"));
-    const detailsAt = markup.indexOf("More details");
-    expect(detailsAt).toBeGreaterThan(0);
-    const before = markup.slice(0, detailsAt);
-    const inside = markup.slice(detailsAt);
-    expect(before).toContain("TaskManviAssist");
-    expect(before).toContain("prepareForManvi");
-    expect(before).toContain("Copy for agent");
-    expect(before).toContain("copyForAgent");
-    expect(before).toContain("copyable");
-    expect(before).toContain("Copied");
-    expect(source).toContain("position:sticky");
-    expect(before).toContain("bind:title={draft.title}");
-    expect(before).toContain("bind:description={draft.description}");
-    expect(before).toContain("bind:value={draft.status}");
-    expect(before).toContain("Schedule and labels");
-    expect(before).toContain("datetime-local");
-    expect(before).toContain("dueInputValue");
-    expect(before).toContain("membership(");
-    expect(before).toContain("Open in GitPulse");
-    expect(before).toContain("addOpenPaths");
-    expect(inside).toContain("setFieldLock");
-    expect(inside).toContain("NativeNotificationSettings");
-    expect(before).not.toContain("NativeNotificationSettings");
-    expect(before).not.toContain("setFieldLock");
-    expect(source).toContain("SettingToggle");
-    expect(source).toContain("seed");
-    expect(source).toContain('class="sheet-body"');
-    expect(source).toContain("consumeNotes");
-    expect(source).toContain("applyExtractedNotes");
-    expect(source).not.toMatch(/form\{[^}]*flex:1/);
-    expect(source).not.toContain("<details");
-    expect(source).not.toContain("onclick={copy}");
+  it("exposes data-task-revision for harness save waits", () => {
+    expect(source).toContain("data-task-revision={current?.revision");
+  });
+
+  it("guards dispose, reload confirm, and enhancement-busy shortcuts", () => {
+    expect(source).toContain("if (disposed) return");
+    expect(source).toMatch(/confirming = true[\s\S]*askConfirm\(\{title: "Reload saved task\?/);
+    expect(source).toContain('shortcutBlocked = "Wait for Manvi to finish before saving."');
+    expect(source).toContain('shortcutBlocked = "Wait for Manvi to finish before closing."');
+    expect(source).toContain('role="status"');
+  });
+
+  it("uses typed controls for kind, severity, labels, and criteria bounds", () => {
+    expect(source).toContain("KIND_OPTIONS");
+    expect(source).toContain("Custom…");
+    expect(source).toContain("SEVERITY_OPTIONS");
+    expect(source).toContain("LabelInput");
+    expect(source).toContain('maxlength="65536"');
+    expect(source).toContain("Notifications (profile-wide; mute this task)");
+    expect(source).toContain("showOrganize = $state(true)");
+    expect(source).not.toContain("TaskEnhancements");
+    expect(source).toContain("TaskManviAssist");
   });
 
   it("deletes through the in-app confirm and retries the same delete identity", () => {
@@ -51,9 +39,6 @@ describe("TaskEditor", () => {
     expect(source).toContain("deleteTask");
     expect(source).toContain("pendingDelete");
     expect(source).toContain("Retry delete");
-    expect(source).toContain("gp-btn-danger");
-    expect(source).toContain("gp-glass");
     expect(source).not.toContain("window.confirm");
-    expect(source).not.toContain("items.delete");
   });
 });

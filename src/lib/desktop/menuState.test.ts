@@ -25,6 +25,38 @@ describe("native menu projection", () => {
     expect(Array.from(state.trayDetail).length).toBeLessThanOrEqual(72);
     expect(state.traySummary.text).toBe("Clean · 1 running elsewhere");
   });
+  it("omits tray title counts unless the preference is on", () => {
+    const repo = {
+      ...loaded(),
+      statuses: [{
+        path: "a",
+        status_code: " M",
+        is_staged: false,
+        is_conflicted: false,
+        additions: 0,
+        deletions: 0,
+      }],
+      openTabs: [{
+        id: "1", path: "/r/a", name: "a", label: "a", pinned: false, isActive: true,
+        isBare: false, isDirty: true, isLoading: false, error: null, currentBranch: "main",
+        conflictedCount: 0, changedCount: 1,
+      }],
+      fetchedAt: Date.now() - 120_000,
+    };
+    expect(buildMenuState(repo, { ...prefs(), statusIconCounts: false }, "system", {}, false).trayTitle).toBeNull();
+    expect(buildMenuState(repo, { ...prefs(), statusIconCounts: true }, "system", {}, false).trayTitle).toBe("1");
+  });
+  it("carries hideDockWhenClosed and fetch age into the projection", () => {
+    const state = buildMenuState(
+      { ...loaded(), fetchedAt: Date.now() - 4 * 60_000 },
+      { ...prefs(), hideDockWhenClosed: false },
+      "system",
+      {},
+      false,
+    );
+    expect(state.hideDockWhenClosed).toBe(false);
+    expect(state.status.fetchedAt).not.toBeNull();
+  });
   it("disables repository work at startup while Help and Open remain available", () => {
     const state = model();
     for (const id of ["fetch", "stage-all", "stash-pop", "terminal-dock", "tab-work", "section:history:graph", "copy-repo-path"]) {
@@ -84,12 +116,14 @@ describe("native menu projection", () => {
     expect(degraded.trayDetails).toContain("Polling · live updates unavailable");
   });
   it("labels upstream counts as the last fetch and never infers remote freshness", () => {
-    const repo = { ...loaded(), branches: [{ name: "main", is_current: true, is_remote: false,
+    const repo = { ...loaded(), fetchedAt: Date.now() - 4 * 60_000, branches: [{ name: "main", is_current: true, is_remote: false,
       tip_commit_id: "a".repeat(40), ahead_count: 2, behind_count: 3, upstream: "origin/main",
       is_default: true, is_gone: false, last_commit_timestamp: 0, last_author: "", last_summary: "",
       commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0 }] };
     expect(model(repo).traySummary.text).toContain("↑2 ↓3");
-    expect(model(repo).trayDetails).toContain("2 ahead · 3 behind origin/main (last fetch)");
+    expect(model(repo).trayDetails).toContain("2 ahead · 3 behind origin/main (fetched 4 min ago)");
+    const never = { ...repo, fetchedAt: null };
+    expect(model(never).trayDetails).toContain("2 ahead · 3 behind origin/main (never fetched)");
     repo.branches[0].is_gone = true;
     expect(model(repo).traySummary.text).not.toContain("↑");
     expect(model(repo).trayDetails).toContain("Upstream no longer exists");

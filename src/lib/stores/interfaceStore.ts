@@ -77,12 +77,16 @@ export interface InterfacePrefs {
   hiddenViews: ViewTab[];
   /** How much of the bottom status bar is drawn. */
   statusBarMode: StatusBarMode;
-  /** Word labels beside the header's Open/Clone icons. */
+  /** Word label beside the header's Open menu. */
   showHeaderActionLabels: boolean;
   /** Drop the repository tab strip while a single repository is open. */
   autoHideRepoTabs: boolean;
   /** Keep a status icon available; closing the window hides it while enabled. */
   showStatusIcon: boolean;
+  /** Hide the Dock icon while the main window is closed and the status icon is on. */
+  hideDockWhenClosed: boolean;
+  /** Show changed/conflict counts beside the menu-bar glyph. Off by default. */
+  statusIconCounts: boolean;
   /** When the header's diagnostics button is drawn. */
   diagnosticsButton: DiagnosticsButtonMode;
   /**
@@ -150,6 +154,13 @@ export interface InterfacePrefs {
    * tree. GitPulse does not do that to a repository until the user asks.
    */
   autoRunCoverage: boolean;
+  /**
+   * Automatic GitHub Dependabot and code scanning fetch when a repository
+   * opens. On by default: the same `gh` CLI path the Health panel already
+   * uses. Critical and high findings toast; a check that did not run does
+   * not. Stored `false` stays off.
+   */
+  autoScanGithubAlerts: boolean;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -174,6 +185,8 @@ const DEFAULTS: InterfacePrefs = {
   showHeaderActionLabels: true,
   autoHideRepoTabs: false,
   showStatusIcon: false,
+  hideDockWhenClosed: true,
+  statusIconCounts: false,
   diagnosticsButton: "always",
   globalSurface: "repository",
   fleetPulseOpen: true,
@@ -188,6 +201,7 @@ const DEFAULTS: InterfacePrefs = {
   lastUpdateCheckAt: 0,
   dismissedUpdateVersion: "",
   autoRunCoverage: false,
+  autoScanGithubAlerts: true,
 };
 
 /**
@@ -287,6 +301,8 @@ function readPrefs(): InterfacePrefs {
       ),
       autoHideRepoTabs: bool(parsed.autoHideRepoTabs, DEFAULTS.autoHideRepoTabs),
       showStatusIcon: parsed.showStatusIcon === true,
+      hideDockWhenClosed: bool(parsed.hideDockWhenClosed, DEFAULTS.hideDockWhenClosed),
+      statusIconCounts: parsed.statusIconCounts === true,
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
@@ -316,6 +332,13 @@ function readPrefs(): InterfacePrefs {
       // Same rule, and it matters more here: this one runs the repository's
       // test suites and writes files into the working tree.
       autoRunCoverage: parsed.autoRunCoverage === true,
+      // Missing key follows the default (on). Only an explicit false
+      // disables launch scans; a corrupt value does not quietly opt out
+      // of a check the Health panel still offers by hand.
+      autoScanGithubAlerts: bool(
+        parsed.autoScanGithubAlerts,
+        DEFAULTS.autoScanGithubAlerts,
+      ),
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -394,6 +417,8 @@ function createInterfaceStore() {
     setStatusBarMode: (mode: StatusBarMode) => patch({ statusBarMode: mode }),
     setShowHeaderActionLabels: (show: boolean) => patch({ showHeaderActionLabels: show }),
     setShowStatusIcon: (show: boolean) => patch({ showStatusIcon: show }),
+    setHideDockWhenClosed: (hide: boolean) => patch({ hideDockWhenClosed: hide }),
+    setStatusIconCounts: (show: boolean) => patch({ statusIconCounts: show }),
     setAutoHideRepoTabs: (hide: boolean) => patch({ autoHideRepoTabs: hide }),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),
@@ -412,9 +437,12 @@ function createInterfaceStore() {
     zoomOut: () => patch((prefs) => ({ uiFontScale: clampScale(prefs.uiFontScale - 0.05) })),
     resetZoom: () => patch({ uiFontScale: DEFAULTS.uiFontScale }),
     setAutoRunCoverage: (enabled: boolean) => patch({ autoRunCoverage: enabled }),
+    setAutoScanGithubAlerts: (enabled: boolean) =>
+      patch({ autoScanGithubAlerts: enabled }),
     setGlobalSurface: (globalSurface: GlobalSurface) => patch({ globalSurface }),
     setFleetOpen: (open: boolean) => patch({ globalSurface: open ? "fleet" : "repository" }),
     toggleFleet: () => patch((prefs) => ({ globalSurface: prefs.globalSurface === "fleet" ? "repository" : "fleet" })),
+    setTasksOpen: (open: boolean) => patch({ globalSurface: open ? "tasks" : "repository" }),
     toggleFleetPulse: () => patch((prefs) => ({ fleetPulseOpen: !prefs.fleetPulseOpen })),
     toggleFleetColumn: (key: string) =>
       patch((prefs) => ({

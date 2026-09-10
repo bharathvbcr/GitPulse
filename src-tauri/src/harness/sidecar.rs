@@ -756,9 +756,17 @@ fn not_installed_message() -> String {
     format!("no `manvi` binary on PATH, in {searched}, or named by GITPULSE_MANVI_BIN")
 }
 
+/// Local model the host selected for this Manvi session. Frozen into the
+/// child's environment at spawn; changing it requires retiring the process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelSelection {
+    pub base_url: String,
+    pub model: String,
+}
+
 /// The `manvi serve` invocation, built separately so its environment can be
 /// asserted without starting a sidecar.
-fn sidecar_command(binary: &str, dir: &Path) -> Command {
+fn sidecar_command(binary: &str, dir: &Path, selection: Option<&ModelSelection>) -> Command {
     let mut command = Command::new(binary);
     command
         .args(["serve", "--posture", "host"])
@@ -786,19 +794,40 @@ fn sidecar_command(binary: &str, dir: &Path) -> Command {
             command.env("PATH", child_path);
         }
     }
+    // Always pin or clear model env. An ambient shell `MANVI_*` would otherwise
+    // leak into a GUI-launched child and contradict the Local model servers card.
+    match selection {
+        Some(selection) => {
+            command
+                .env("MANVI_LLM_PROVIDER_DEFAULT", "local")
+                .env("MANVI_MODEL", &selection.model)
+                .env("MANVI_LLM_LOCAL_BASE_URL", &selection.base_url)
+                .env_remove("MANVI_LLM_LOCAL_MODEL");
+        }
+        None => {
+            command
+                .env_remove("MANVI_LLM_PROVIDER_DEFAULT")
+                .env_remove("MANVI_MODEL")
+                .env_remove("MANVI_LLM_LOCAL_BASE_URL")
+                .env_remove("MANVI_LLM_LOCAL_MODEL");
+        }
+    }
     command
 }
 
 fn spawn() -> Result<Sidecar, HarnessError> {
-    spawn_with_profile(None)
+    spawn_with_profile(None, None)
 }
 
-fn spawn_with_profile(profile: Option<&Path>) -> Result<Sidecar, HarnessError> {
+fn spawn_with_profile(
+    profile: Option<&Path>,
+    selection: Option<&ModelSelection>,
+) -> Result<Sidecar, HarnessError> {
     let binary =
         resolve_binary().ok_or_else(|| HarnessError::NotInstalled(resolve_binary_absence()))?;
 
     let dir = scratch_dir()?;
-    let mut command = sidecar_command(&binary, &dir);
+    let mut command = sidecar_command(&binary, &dir, selection);
     if let Some(profile) = profile {
         command.args([std::ffi::OsStr::new("--workbench-db"), profile.as_os_str()]);
         // The profile path is host-owned. Repository root overrides must not
@@ -899,6 +928,7 @@ struct Slot {
     last_error: Option<HarnessError>,
     backoff_until: Option<Instant>,
     profile: Option<PathBuf>,
+    selection: Option<ModelSelection>,
     closed: bool,
 }
 
@@ -910,6 +940,7 @@ fn slot() -> &'static Mutex<Slot> {
             last_error: None,
             backoff_until: None,
             profile: None,
+            selection: None,
             closed: false,
         })
     })
@@ -963,7 +994,7 @@ impl Slot {
                 }
             }
             let started = match &self.profile {
-                Some(profile) => spawn_with_profile(Some(profile)),
+                Some(profile) => spawn_with_profile(Some(profile), self.selection.as_ref()),
                 None => spawn(),
             };
             match started {
@@ -1090,7 +1121,10 @@ pub(crate) struct ProfileConnection {
 }
 
 impl ProfileConnection {
-    pub(crate) fn new(profile: PathBuf) -> Result<Self, HarnessError> {
+    pub(crate) fn new(
+        profile: PathBuf,
+        selection: Option<ModelSelection>,
+    ) -> Result<Self, HarnessError> {
         if !profile.is_absolute() {
             return Err(HarnessError::Protocol(
                 "workbench database path must be absolute".into(),
@@ -1102,6 +1136,7 @@ impl ProfileConnection {
                 last_error: None,
                 backoff_until: None,
                 profile: Some(profile),
+                selection,
                 closed: false,
             }),
             closing: std::sync::atomic::AtomicBool::new(false),
@@ -1135,6 +1170,21 @@ impl ProfileConnection {
             DEFAULT_CALL_TIMEOUT,
             Some(&self.closing),
         )
+    }
+
+    /// Drops the live child (6 s grace) so the next call can spawn with a new
+    /// model selection. Distinct from [`Self::shutdown`]: the connection stays
+    /// reusable and does not refuse later work.
+    pub(crate) fn retire(&self) -> bool {
+        let Some(mut guard) =
+            acquire_slot_for(&self.slot, Instant::now() + Duration::from_millis(1200))
+        else {
+            return false;
+        };
+        guard.sidecar = None;
+        guard.last_error = None;
+        guard.backoff_until = None;
+        true
     }
 
     pub(crate) fn shutdown(&self) -> bool {
@@ -1727,7 +1777,7 @@ done
     #[test]
     fn sidecar_children_inherit_the_extended_path() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cmd = sidecar_command("manvi", dir.path());
+        let cmd = sidecar_command("manvi", dir.path(), None);
         let path = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
@@ -1739,6 +1789,59 @@ done
                 entries.contains(&fallback),
                 "sidecar PATH must reach {}: {entries:?}",
                 fallback.display()
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_command_pins_or_clears_model_environment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let selection = ModelSelection {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "qwen3.8:27b-mlx".into(),
+        };
+        let with = sidecar_command("manvi", dir.path(), Some(&selection));
+        let envs: std::collections::HashMap<_, _> = with
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|value| value.to_owned())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MANVI_LLM_PROVIDER_DEFAULT"))
+                .and_then(|v| v.as_ref()),
+            Some(&std::ffi::OsString::from("local"))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MANVI_MODEL"))
+                .and_then(|v| v.as_ref()),
+            Some(&std::ffi::OsString::from("qwen3.8:27b-mlx"))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MANVI_LLM_LOCAL_BASE_URL"))
+                .and_then(|v| v.as_ref()),
+            Some(&std::ffi::OsString::from("http://127.0.0.1:11434/v1"))
+        );
+        assert!(
+            matches!(
+                envs.get(std::ffi::OsStr::new("MANVI_LLM_LOCAL_MODEL")),
+                Some(None) | None
+            ),
+            "local model alias must not ride along: {envs:?}"
+        );
+
+        let without = sidecar_command("manvi", dir.path(), None);
+        let cleared: std::collections::HashMap<_, _> = without
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|value| value.to_owned())))
+            .collect();
+        for key in [
+            "MANVI_LLM_PROVIDER_DEFAULT",
+            "MANVI_MODEL",
+            "MANVI_LLM_LOCAL_BASE_URL",
+            "MANVI_LLM_LOCAL_MODEL",
+        ] {
+            assert!(
+                matches!(cleared.get(std::ffi::OsStr::new(key)), Some(None)),
+                "{key} must be removed when no selection is given: {cleared:?}"
             );
         }
     }
@@ -1764,7 +1867,7 @@ done
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         set_test_binary(&serial, Some(binary.to_str().unwrap().into()));
         let connection =
-            ProfileConnection::new(dir.path().join("profile with spaces.sqlite")).unwrap();
+            ProfileConnection::new(dir.path().join("profile with spaces.sqlite"), None).unwrap();
         assert!(connection.slot.lock().unwrap().sidecar.is_none());
         let result = connection
             .call("work.enhancements.configuration", serde_json::json!({}))
@@ -1812,9 +1915,9 @@ done
 
     #[test]
     fn profile_connection_refuses_unscoped_or_foreign_operations_before_spawn() {
-        assert!(ProfileConnection::new(PathBuf::from("relative.sqlite")).is_err());
+        assert!(ProfileConnection::new(PathBuf::from("relative.sqlite"), None).is_err());
         let dir = tempfile::TempDir::new().unwrap();
-        let connection = ProfileConnection::new(dir.path().join("profile.sqlite")).unwrap();
+        let connection = ProfileConnection::new(dir.path().join("profile.sqlite"), None).unwrap();
         assert!(connection
             .call("policy.check.command", serde_json::json!({}))
             .is_err());

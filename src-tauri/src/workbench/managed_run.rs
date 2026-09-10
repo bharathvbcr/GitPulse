@@ -69,7 +69,7 @@ pub(super) fn launch(state: &WorkbenchState, input: &str) -> Result<Value, Workb
     launch_with(
         state,
         input,
-        |op, params| state.worker_call(op, params),
+        |op, params| state.worker_call(op, params, None),
         process_birth::read,
     )
 }
@@ -158,7 +158,7 @@ pub(super) fn stop(state: &WorkbenchState, input: &str) -> Result<Value, Workben
             "This managed attempt has no active process to stop.",
         ));
     }
-    state.worker_call("work.runs.managed.stop", json!({"id":id}))
+    state.worker_call("work.runs.managed.stop", json!({"id":id}), None)
 }
 
 #[cfg(test)]
@@ -388,6 +388,6 @@ mod tests {
             }
         }
         assert!(!path.parent().unwrap().exists());
-        assert!(state.0.worker.get().is_none());
+        assert!(state.0.worker.lock().unwrap().is_none());
     }
 }

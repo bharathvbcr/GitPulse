@@ -22,9 +22,11 @@
     FolderGit2,
     FolderOpen,
     LayoutGrid,
+    ListChecks,
   } from "@lucide/svelte";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import { taskChrome } from "../workbench/taskTabs";
 
   let {
     onOpen,
@@ -54,6 +56,7 @@
       (path) => !isPathAmong(path, $repoStore.openTabs.map((tab) => tab.path), pathOpts),
     ),
   );
+  const tasksOpen = $derived($interfaceStore.globalSurface === "tasks");
 
   function closeMenu(options?: { restoreFocus?: boolean }) {
     const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl : null;
@@ -206,11 +209,13 @@
         const digit = e.code.match(/^Digit([1-9])$/);
         if (!digit) return;
         e.preventDefault();
+        revealRepository();
         void repoStore.activateTabAt(Number(digit[1]) - 1);
         return;
       }
       case "cycleTabs": {
         e.preventDefault();
+        revealRepository();
         if (e.shiftKey) void repoStore.prevTab();
         else void repoStore.nextTab();
         return;
@@ -329,6 +334,40 @@
     }, 0);
   }
 
+  function surfaceChipClass(active: boolean): string {
+    return `shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-colors ${
+      active
+        ? "border-accent/60 bg-accent/10 text-accent"
+        : "border-border/70 bg-background/50 text-textPrimary hover:border-accent/40 hover:bg-accent/5 hover:text-accent"
+    }`;
+  }
+
+  /**
+   * Open-repository pills have to carry their own plate. Ghost text on the
+   * glass strip (`text-textMuted` + a transparent border) drops below AA
+   * against the macOS hue field, which is why a single open tab used to
+   * disappear beside Fleet.
+   */
+  function repoTabChrome(tab: { isActive: boolean }): string {
+    const viewingRepo = $interfaceStore.globalSurface === "repository";
+    if (tab.isActive && viewingRepo) {
+      return "border-accent/60 bg-accent/10 text-accent shadow-xs";
+    }
+    if (tab.isActive) {
+      return "border-border/80 bg-surfaceHover text-textPrimary";
+    }
+    return "border-border/70 bg-background/50 text-textPrimary hover:border-accent/40 hover:bg-accent/5 hover:text-accent";
+  }
+
+  function revealRepository() {
+    interfaceStore.setGlobalSurface("repository");
+  }
+
+  function selectRepoTab(id: string) {
+    revealRepository();
+    void repoStore.activateTab(id);
+  }
+
   /**
    * Container-level dragover: one handler computes the insertion point for
    * whatever tab (or gap) is under the pointer, so the indicator can't go
@@ -400,14 +439,12 @@
   });
 </script>
 
-  <div class="gp-glass gp-repo-tabs relative z-20 h-10 bg-surface/60 border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
+  <div class="gp-glass gp-repo-tabs relative z-20 h-11 bg-surface border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
     <button
       type="button"
-      class="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-colors {$interfaceStore.globalSurface === "fleet"
-        ? 'border-accent/60 bg-accent/10 text-accent'
-        : 'border-transparent text-textMuted hover:bg-surfaceHover hover:text-textPrimary'}"
+      class={surfaceChipClass($interfaceStore.globalSurface === "fleet")}
       aria-pressed={$interfaceStore.globalSurface === "fleet"}
       data-testid="fleet-tab-chip"
       onclick={() => interfaceStore.toggleFleet()}
@@ -416,9 +453,35 @@
       <LayoutGrid size={12} />
       <span>Fleet</span>
     </button>
-    <button type="button" class="shrink-0 px-2 py-1 rounded-lg border border-transparent text-textMuted hover:bg-surfaceHover" aria-pressed={$interfaceStore.globalSurface === "tasks"} data-testid="tasks-tab-chip" onclick={() => interfaceStore.setGlobalSurface($interfaceStore.globalSurface === "tasks" ? "repository" : "tasks")} title="Tasks — global, workspace and repository Kanban boards">Tasks</button>
+    <div class="{surfaceChipClass(tasksOpen)} pr-1!" data-testid="tasks-tab-chip">
+      <button
+        type="button"
+        class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
+        aria-pressed={tasksOpen}
+        onclick={() => interfaceStore.setTasksOpen(true)}
+        title="Tasks — global, workspace and repository Kanban boards"
+      >
+        <ListChecks size={12} />
+        <span>Tasks</span>
+        {#if $taskChrome.openTabs > 0}
+          <span class="gp-pill !px-1.5 !py-0 min-w-4 justify-center" title="{$taskChrome.openTabs} open {$taskChrome.openTabs === 1 ? 'task' : 'tasks'}">{$taskChrome.openTabs}</span>
+        {/if}
+      </button>
+      {#if tasksOpen}
+        <button
+          type="button"
+          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"
+          data-testid="tasks-tab-close"
+          aria-label="Close Tasks"
+          title="Close Tasks"
+          onclick={() => interfaceStore.setTasksOpen(false)}
+        >
+          <X size={11} />
+        </button>
+      {/if}
+    </div>
     <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
-    <div class="relative min-w-0 flex-1 self-stretch">
+    <div class="relative min-w-0 max-w-full shrink self-stretch">
     <div
       bind:this={scroller}
       class="h-full flex items-center gap-1 overflow-x-auto min-w-0 py-1"
@@ -447,9 +510,7 @@
           ondragend={endDrag}
           class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFromId === tab.id
             ? 'opacity-60'
-            : ''} {dropTarget?.index === index ? 'border-accent/50' : ''} {tab.isActive
-            ? 'bg-surfaceHover border-border/80 text-textPrimary shadow-xs'
-            : 'border-transparent text-textMuted hover:text-textPrimary hover:bg-surfaceHover/60'}"
+            : ''} {dropTarget?.index === index ? 'border-accent/50' : ''} {repoTabChrome(tab)}"
         >
           {#if dropTarget?.index === index}
             <span
@@ -468,7 +529,7 @@
             data-active-repo={tab.isActive ? "true" : "false"}
             data-tab-index={index}
             data-tab-id={tab.id}
-            onclick={() => repoStore.activateTab(tab.id)}
+            onclick={() => selectRepoTab(tab.id)}
             onkeydown={(e) => {
               if (e.key === "p" || e.key === "P") {
                 e.preventDefault();
@@ -488,7 +549,7 @@
             {/if}
             <span class="whitespace-nowrap font-medium">{tab.label}</span>
             {#if tab.currentBranch}
-              <span class="whitespace-nowrap text-[10px] text-textMuted/80 font-mono hidden sm:inline">{tab.currentBranch}</span>
+              <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
             {/if}
             {#if tab.conflictedCount > 0}
               <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
@@ -524,10 +585,13 @@
     <button
       type="button"
       title="Open repository"
+      aria-label="Open repository"
+      data-testid="open-repo-tab"
       onclick={() => onOpen?.()}
-      class="gp-icon-btn p-1! shrink-0 hover:text-accent"
+      class="gp-btn py-1! px-2.5! shrink-0"
     >
-      <Plus size={13} />
+      <Plus size={13} class="text-accent" />
+      <span>Open</span>
     </button>
 
     <div class="relative shrink-0" data-recents-menu>
