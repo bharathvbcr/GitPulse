@@ -70,6 +70,23 @@ describe("check:workflows", () => {
     expect(summary).toContain("--no-run");
   });
 
+  it("caps llvm-cov test threads so instrumented suites do not starve pipe and sidecar fixtures", () => {
+    const coverage = readFileSync(
+      fileURLToPath(new URL("../.github/workflows/coverage.yml", import.meta.url)),
+      "utf8",
+    );
+    const lcov = coverage
+      .split("\n")
+      .find((line) => line.includes("--lcov") && line.includes("output-path lcov.info"));
+    expect(lcov, coverage).toBeDefined();
+    expect(lcov).toContain("--test-threads=");
+    expect(lcov).not.toContain("--no-run");
+    const pkg = JSON.parse(
+      readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+    );
+    expect(pkg.scripts["ci:local"]).toContain("--test-threads=");
+  });
+
   it("scopes rust-cache to the runner image so native artifacts are not reused across MSVC upgrades", () => {
     for (const name of ["ci.yml", "coverage.yml", "release.yml"]) {
       const source = readFileSync(
