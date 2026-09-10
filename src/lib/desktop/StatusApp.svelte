@@ -6,7 +6,7 @@
   import type { MenuState } from "./menuState";
   import { createMenuSync } from "./menuSync";
   import { createStatusConnection } from "./statusConnection";
-  import { isTauri } from "../platform";
+  import { isMacOS, isTauri } from "../platform";
   import { formatError } from "../ui/formatError";
   let snapshot = $state<MenuState | null>(null);
   let error = $state<string | null>(null);
@@ -42,4 +42,5 @@
     return () => { disposed = true; connection.dispose(); observer.disconnect(); resize.dispose(); };
   });
 </script>
-<div bind:this={host}><StatusPopover {snapshot} {error} {pending} onaction={(id) => void action(id)} /></div>
+<div bind:this={host}><StatusPopover {snapshot} {error} {pending}
+  material={isTauri() && isMacOS() ? "native" : "opaque"} onaction={(id) => void action(id)} /></div>

@@ -8,7 +8,13 @@ use tauri::{
 
 pub const LABEL: &str = "status-popover";
 pub const EVENT: &str = "gitpulse-status-state";
-const WIDTH: f64 = 376.0;
+// macOS draws its own shadow outside the material. Its content bounds must
+// match the 360px panel, not the browser preview's padded shadow canvas.
+const WIDTH: f64 = if cfg!(target_os = "macos") {
+    360.0
+} else {
+    376.0
+};
 const MAX_HEIGHT: f64 = 640.0;
 
 /// Coordinates are physical so crossing displays does not reuse the old DPI.
@@ -39,9 +45,23 @@ fn position<R: Runtime>(
     // TrayIconEvent and tray-icon's rect conversion supply physical coordinates.
     let point = rect.position.to_physical::<f64>(1.0);
     let size = rect.size.to_physical::<f64>(1.0);
+    // Keep display selection in the tray's physical coordinate space. On
+    // macOS, monitor_from_point delegates to CGDisplayBounds (logical points),
+    // so a valid Retina tray position can appear outside every display.
     let monitor = app
-        .monitor_from_point(point.x, point.y)
+        .available_monitors()
         .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|monitor| {
+            let origin = monitor.position();
+            let extent = monitor.size();
+            let x = point.x + size.width / 2.0;
+            let y = point.y + size.height / 2.0;
+            x >= origin.x as f64
+                && y >= origin.y as f64
+                && x < origin.x as f64 + extent.width as f64
+                && y < origin.y as f64 + extent.height as f64
+        })
         .ok_or("Status icon display is unavailable")?;
     let work = monitor.work_area();
     let [x, y, width, height] = placement(
@@ -87,7 +107,7 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         }
         window
     } else {
-        let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("status.html".into()))
+        let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("status.html".into()))
             .title("GitPulse Status")
             .inner_size(WIDTH, 400.0)
             .decorations(false)
@@ -98,9 +118,19 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             .always_on_top(true)
             .visible_on_all_workspaces(true)
             .transparent(true)
-            .shadow(true)
-            .build()
-            .map_err(|e| e.to_string())?;
+            .shadow(true);
+        #[cfg(target_os = "macos")]
+        let builder = {
+            use tauri::window::{Effect, EffectState, EffectsBuilder};
+            builder.effects(
+                EffectsBuilder::new()
+                    .effect(Effect::UnderWindowBackground)
+                    .state(EffectState::FollowsWindowActiveState)
+                    .radius(18.0)
+                    .build(),
+            )
+        };
+        let window = builder.build().map_err(|e| e.to_string())?;
         let handle = app.clone();
         window.on_window_event(move |event| {
             if matches!(event, WindowEvent::Focused(false)) {
@@ -116,7 +146,9 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .to_logical::<f64>(window.scale_factor().map_err(|e| e.to_string())?)
         .height;
-    position(app, &window, height.clamp(240.0, MAX_HEIGHT))?;
+    // Preserve the measured panel height on reopen, including short connecting
+    // and error states; extra height would expose a strip of native material.
+    position(app, &window, height.clamp(100.0, MAX_HEIGHT))?;
     publish(app, &menu_state(app))?;
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())
@@ -242,7 +274,7 @@ mod tests {
                 1.0,
                 400.0
             ),
-            [618.0, 30.0, 376.0, 400.0]
+            [1000.0 - WIDTH - 6.0, 30.0, WIDTH, 400.0]
         );
         for scale in [1.0, 2.0] {
             for left in [-1920.0, 0.0, 1920.0] {

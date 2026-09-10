@@ -263,6 +263,18 @@ describe("macOS material", () => {
     expect(cargoToml).toMatch(/^\[dependencies\][\s\S]*?^tauri = \{[^}]*macos-private-api/m);
   });
 
+  it("also attaches the native material to the separately built status window", () => {
+    // The main-window JSON cannot configure this lazy window. A transparent
+    // status webview alone exposes the desktop without blurring it.
+    const native = readFileSync(new URL("../src-tauri/src/desktop/popover.rs", import.meta.url), "utf8");
+    const construction = native.slice(native.indexOf("pub fn toggle"), native.indexOf("fn keeps_popover"));
+    expect(construction).toContain(".transparent(true)");
+    expect(construction).toMatch(/\.effects\([\s\S]*?\.effect\(Effect::UnderWindowBackground\)/);
+    expect(construction).toContain(".radius(18.0)");
+    expect(construction).toContain('#[cfg(target_os = "macos")]');
+    expect(construction).toContain("height.clamp(100.0, MAX_HEIGHT)");
+  });
+
   /*
    * A base plate inside a base plate is a repaint, not depth — free while both
    * were opaque, a visible darkening once neither is. The graph gutter is the
