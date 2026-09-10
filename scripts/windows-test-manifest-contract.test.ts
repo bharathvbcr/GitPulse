@@ -4,10 +4,13 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * Windows `cargo test --lib` builds `gitpulse_lib-*.exe`. The comctl32 v6
- * manifest used to be passed only as `rustc-link-arg-tests` / `rustc-cdylib-link-arg`,
- * so integration binaries started and the lib harness died at load with
+ * Windows `cargo test --lib` builds `gitpulse_lib-*.exe`. tauri-winres links
+ * its resource only as `rustc-link-arg-bins`, and `rustc-link-arg-tests` only
+ * covers `tests/*.rs`, so the lib harness died at load with
  * STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) — no test name, nothing checked.
+ *
+ * Catch-all `/MANIFEST:EMBED` reaches that harness, but the same flag on bins
+ * while tauri-winres still embeds RT_MANIFEST is CVT1100 (duplicate resource).
  */
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cargo = readFileSync(path.join(REPO, "src-tauri", "Cargo.toml"), "utf8");
@@ -20,19 +23,16 @@ describe("Windows test binaries and the lib cdylib share the comctl32 manifest",
     expect(lib).toContain("cdylib");
   });
 
-  it("embeds the manifest on the lib harness, --test binaries, and the cdylib", () => {
-    expect(buildRs).toContain("rustc-link-arg-tests");
-    expect(buildRs).toContain("rustc-cdylib-link-arg");
+  it("embeds comctl32 once via catch-all link args, not a second RT_MANIFEST on bins", () => {
+    expect(buildRs).toContain("new_without_app_manifest");
+    expect(buildRs).toContain("try_build");
+    expect(buildRs).not.toMatch(/tauri_build::build\s*\(\s*\)/);
     expect(buildRs).toContain("tests.manifest");
-    const kinds = [...buildRs.matchAll(/"(rustc-[^"]+)"/g)].map((m) => m[1]);
-    expect(kinds).toEqual(
-      expect.arrayContaining([
-        "rustc-link-arg-tests",
-        "rustc-cdylib-link-arg",
-        "rustc-link-arg-bins",
-        "rustc-link-arg",
-      ]),
-    );
+    const kindsBlock = buildRs.match(/for kind in \[([\s\S]*?)\]/)?.[1] ?? "";
+    const kinds = [...kindsBlock.matchAll(/"(rustc-[^"]+)"/g)].map((m) => m[1]);
+    expect(kinds).toEqual(["rustc-link-arg"]);
+    expect(buildRs).toContain("/MANIFEST:EMBED");
+    expect(buildRs).toContain("/MANIFESTINPUT:");
   });
 
   it("keeps XML comments free of -- so mt.exe can parse the manifest", () => {

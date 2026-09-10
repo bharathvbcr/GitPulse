@@ -103,14 +103,12 @@ workbench board land together on `main`.
 - Keep Windows clippy from treating the unix-only hygiene worker waiter as unused.
 - Capture panic-redaction diagnostics from the child stderr pipe so Windows
   observes the hook instead of an inherited file handle that never received it.
-- Embed the Windows comctl32 v6 manifest with `rustc-link-arg` as well as
-  `--test` binaries and the `cdylib`, so `cargo test --lib` loads instead of
-  dying with `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs.
+- Embed the Windows comctl32 v6 manifest with catch-all `rustc-link-arg` so
+  `cargo test --lib` loads instead of dying with `STATUS_ENTRYPOINT_NOT_FOUND`
+  before any unit test runs. Omit tauri-winres's default app manifest from the
+  bin `.res`; a second `/MANIFEST:EMBED` on `gitpulse.exe` is CVT1100.
 - Keep XML comments in that manifest free of `--`, which made `mt.exe` reject
   the file with c1010070 and aborted the Windows lib link.
-- Pass the same comctl32 manifest as a bin and catch-all link arg so the
-  Windows `unittests src/lib.rs` harness loads; `-tests` alone still left
-  that executable dying with `STATUS_ENTRYPOINT_NOT_FOUND`.
 - Wait for the bounded-output worker to start before the first write, so a
   100 ms stderr deadline is I/O time rather than thread-start time on Windows.
 - Keep hand-built test loggers off the harness stderr pipe, so a `--nocapture`
