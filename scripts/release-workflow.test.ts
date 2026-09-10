@@ -60,6 +60,13 @@ it("guards draft identity before uploads and verifies the notes round trip", () 
   expect(workflow).toContain("node scripts/release-state.mjs finalize");
 });
 
+it("uploads into the prepared release id without retargeting the tag", () => {
+  const action = workflow.slice(workflow.indexOf("tauri-apps/tauri-action"), workflow.indexOf("\n  verify:"));
+  expect(action).toContain("releaseId: ${{ needs.prepare.outputs.release_id }}");
+  expect(action).not.toMatch(/^\s+tagName:/m);
+  expect(action).not.toMatch(/^\s+releaseCommitish:/m);
+});
+
 
 it("supports hosted runners without an external devmap CLI and reports that absence", () => {
   const line = workflow.split("\n").find(line => line.includes("run: npm run check:vendor-schema"));

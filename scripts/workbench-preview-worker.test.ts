@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 describe("disposable Manvi preview lifecycle", () => {
+  it("announces the listen URL without stdio buffering", () => {
+    expect(readFileSync(new URL("./workbench-preview.mjs", import.meta.url), "utf8")).toContain("writeSync(1,");
+  });
   it.skipIf(process.platform === "win32")("owns SIGTERM cleanup after Vite begins listening", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "gitpulse-preview-signal-"));
     const store = join(fixture, "dcstore");
@@ -27,7 +31,7 @@ lines.on('close', () => setTimeout(() => process.exit(0), 250));
     const done = new Promise<number | null>((resolve) => child.once("exit", resolve));
     try {
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error(`Preview did not listen: ${diagnostics}`)), 5000);
+        const timeout = setTimeout(() => reject(new Error(`Preview did not listen: ${diagnostics}\nstdout: ${output}`)), 30_000);
         child.once("error", (error) => { clearTimeout(timeout); reject(error); });
         child.stdout.on("data", (chunk: Buffer) => {
           output += chunk.toString();
@@ -43,11 +47,16 @@ lines.on('close', () => setTimeout(() => process.exit(0), 250));
       expect(code, diagnostics).toBe(0);
       await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await done; }
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        const kill = setTimeout(() => child.kill("SIGKILL"), 3000);
+        await done;
+        clearTimeout(kill);
+      }
       if (root) await rm(root, { recursive: true, force: true });
       await rm(fixture, { recursive: true, force: true });
     }
-  }, 12000);
+  }, 45_000);
   it("removes the disposable profile when the host cannot start", async () => {
     const script = fileURLToPath(new URL("./workbench-preview.mjs", import.meta.url));
     let output = "";

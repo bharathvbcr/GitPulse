@@ -228,9 +228,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ env.RELEASE_TAG }}
+          # releaseId is the only lookup key. tagName/releaseCommitish would let
+          # tauri-action find-or-create by tag and rewrite draft identity; v1 can
+          # also retarget a release when those inputs are present. Updater JSON
+          # is off, so the tag is not needed for latest.json URLs.
           releaseId: ${{ needs.prepare.outputs.release_id }}
-          releaseCommitish: ${{ needs.preflight.outputs.commit }}
           releaseDraft: true
           prerelease: false
           # No updater plugin is configured in tauri.conf.json, so there is no

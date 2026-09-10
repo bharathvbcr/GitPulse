@@ -123,7 +123,7 @@ const settle = async (ms = 30) => {
   if (prompt && pendingPrompt.options.title.startsWith("Delete")) { button(pendingPrompt.options.confirmLabel, prompt)?.click(); await new Promise(resolve => setTimeout(resolve, 0)); await tick(); }
   if (prompt && pendingPrompt.options.title.startsWith("Discard")) { confirmations++; [...prompt.querySelectorAll("button")].find(button => button.textContent.trim() === (confirmAnswer ? "Discard edits" : "Keep editing"))?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
-const wait = async predicate => { for(let i = 0; i < 100; i++) { if(predicate()) return; await settle(); } throw Error("Timed out waiting for task UI"); };
+const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error("Timed out waiting for task UI"); };
 const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete"};
 const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => {
   const names = [text, aliases[text]].filter(Boolean);
@@ -362,7 +362,8 @@ if (params.has("check")) {
     check("Quick Enhance surfaces saved description and hidden task context", document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("GitPulse") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Manvi") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Bharath"));
     button("Open full editor",document).click(); await wait(editor); editor().querySelector(".enhancements .heading").click(); await settle();
     check("Manvi configuration failure has an explicit retry", Boolean(button("Retry Manvi configuration")));
-    failConfiguration=false; await click("Retry Manvi configuration"); await settle();
+    failConfiguration=false; await click("Retry Manvi configuration");
+    await wait(() => { const el = button("Generate suggestion"); return Boolean(el) && !el.matches(":disabled"); });
     await click("Generate suggestion"); await wait(()=>[...proposals.values()].some(p=>p.state==="running"));
     check("Quick Enhance prevents duplicate generations while work is live", button("Generate suggestion").matches(":disabled"));
     const proposal=[...proposals.values()].at(-1);

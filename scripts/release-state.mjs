@@ -60,11 +60,26 @@ export function runReleaseStage(options, run = runCommand) {
     const tagged = refs.find(([, ref]) => ref === `refs/tags/${tag}`);
     const peeled = refs.find(([, ref]) => ref === `refs/tags/${tag}^{}`);
     if (!tagged || (peeled ?? tagged)[0] !== commit) throw new Error("Remote release tag moved or names another commit");
+    return { object: tagged[0].toLowerCase(), peeled: (peeled ?? tagged)[0].toLowerCase() };
   }
+  const tagIdentity = checkTag();
   /** @param {Record<string, unknown> | null} release */
   function checkDraft(release) {
     if (!release || release.draft !== true || release.prerelease !== false || release.immutable === true || release.published_at !== null) throw new Error("Release is not a mutable unpublished draft");
-    if (release.tag_name !== tag || release.target_commitish !== commit) throw new Error("Draft tag or commit differs from preflight");
+    if (release.tag_name !== tag) throw new Error(`Draft tag differs from preflight (${String(release.tag_name)})`);
+    // GitHub keeps the SHA we POST, then often echoes a branch or tag name once
+    // the existing git tag is associated. v0.0.9's finalize died on that rewrite
+    // after every installer had uploaded. The remote tag peel is the pin;
+    // a 40-character SHA here must still be this commit or the annotated tag
+    // object, and a ref name is not a second pin.
+    if (typeof release.target_commitish !== "string" || !release.target_commitish) throw new Error("Draft commitish is missing");
+    if (/^[a-f0-9]{7,40}$/i.test(release.target_commitish)) {
+      const sha = release.target_commitish.toLowerCase();
+      const pins = [commit, tagIdentity.object, tagIdentity.peeled];
+      if (!pins.some(pin => pin === sha || pin.startsWith(sha))) {
+        throw new Error(`Draft commit SHA differs from preflight (${release.target_commitish})`);
+      }
+    }
     if (typeof release.id !== "number" || !Number.isSafeInteger(release.id) || release.id <= 0 || (releaseId && String(release.id) !== releaseId)) throw new Error("Draft release ID changed or is invalid");
     return release;
   }
@@ -82,7 +97,6 @@ export function runReleaseStage(options, run = runCommand) {
     if (new Set(assets.map(asset => asset.id)).size !== assets.length) throw new Error("Duplicate release asset IDs");
     return JSON.stringify(assets);
   }
-  checkTag();
   let release;
   if (stage === "prepare") {
     // The newest run must have completed successfully, including every matrix

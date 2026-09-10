@@ -47,6 +47,9 @@ pub(super) struct Coordinator {
 }
 pub(super) enum Event {
     Wake,
+    /// macOS notification center delivers this. Other targets never construct
+    /// it, but the worker still matches it so the protocol stays one type.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Activate(String),
 }
 #[derive(Clone, serde::Serialize)]
@@ -401,6 +404,14 @@ pub(super) fn native_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn activation_is_a_queued_event_distinct_from_wake() {
+        assert!(!matches!(Event::Wake, Event::Activate(_)));
+        assert!(matches!(
+            Event::Activate("gitpulse.0123456789abcdef0123456789abcdef.event-1".into()),
+            Event::Activate(native) if notice_id(&native) == Some("event-1")
+        ));
+    }
     #[test]
     fn native_id_cannot_be_a_path_command_or_another_namespace() {
         assert_eq!(

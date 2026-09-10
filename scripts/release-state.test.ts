@@ -81,13 +81,34 @@ describe("remote release lifecycle", () => {
     const {run} = fixture({remote: `${"c".repeat(40)}\trefs/tags/${tag}\n${commit}\trefs/tags/${tag}^{}\n`});
     expect(runReleaseStage(options, run).commit).toBe(commit);
   });
+  it("accepts GitHub echoing the annotated tag object SHA as target_commitish", () => {
+    const tagObject = "c".repeat(40);
+    const {run} = fixture({
+      remote: `${tagObject}\trefs/tags/${tag}\n${commit}\trefs/tags/${tag}^{}\n`,
+      release: {...draft(), target_commitish: tagObject},
+    });
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+  });
   it.each([
     {draft: false}, {draft: undefined}, {published_at: "2026-09-08"}, {immutable: true}, {prerelease: true},
-    {tag_name: "v0.0.8"}, {target_commitish: "main"}, {id: 0}, {id: 9007199254740992},
+    {tag_name: "v0.0.8"}, {target_commitish: "c".repeat(40)}, {id: 0}, {id: 9007199254740992},
   ])("refuses unsafe existing release metadata %j", change => {
     const {run, calls} = fixture({release: {...draft(), ...change}});
     expect(() => runReleaseStage(options, run)).toThrow();
     expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
+  });
+  it.each(["main", tag, `refs/tags/${tag}`, commit.slice(0, 7)])("accepts GitHub echoing ref name %s after the tag is associated", commitish => {
+    const {run, calls} = fixture({release: {...draft(), target_commitish: commitish}});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
+  });
+  it("accepts an annotated tag object's SHA as target_commitish", () => {
+    const object = "c".repeat(40);
+    const {run} = fixture({
+      remote: `${object}\trefs/tags/${tag}\n${commit}\trefs/tags/${tag}^{}\n`,
+      release: {...draft(), target_commitish: object},
+    });
+    expect(runReleaseStage(options, run).release_id).toBe("42");
   });
   it.each(["failure", "cancelled", "skipped", null])("refuses CI conclusion %s", conclusion => {
     const {run, calls} = fixture({ci: {head_sha: commit, event: "push", status: "completed", conclusion}});

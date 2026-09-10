@@ -11,39 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Added
-
-- Add task board/list layouts, priority/type/owner/label/due filters over loaded
-  cards, multi-selection and keyboard-accessible context menus. Actions include
-  duplication, status/priority changes, agent copying and confirmed deletion with
-  per-task outcomes and bounded delete passes.
-- Add notes-to-draft editing, inline Manvi title/description suggestions and a
-  Quick Enhance sheet for saved tasks. Proposals respect field locks and require
-  explicit acceptance against the saved revision.
-- Add agent copy for new unsaved drafts and saved task briefs. Saved copies name
-  their revision and exclude unsaved edits; board copying reports its eight-task
-  limit and partial results.
-
-### Changed
-
-- Give the macOS status popover the app's native background blur, translucent
-  surfaces and rounded material bounds. Preserve the compact layout and provide
-  opaque accessibility fallbacks. Match the native window to the panel on resize
-  and reopen; the browser fixture includes a labeled glass simulation. Select
-  the tray display using physical bounds so Retina coordinates can open the panel.
-
-- Refine the macOS status popover around three large Changed, Staged and Conflicts
-  cards, a monochrome repository header, last-fetch counts and one blue primary
-  action. Keep stashes, workspace insights, the command palette and secondary
-  shortcuts inside Details, with Open GitPulse, Settings and Quit in the footer.
-
-- Refresh README, feature, architecture, contributor and wiki guidance for Tasks,
-  schema-20 DevMap, current shortcuts, module ownership and verification limits.
-  Add a Tasks and workspaces guide; preserve older implementation plans as plans.
-- Resolve repository maps per worktree in both agent guides and document
-  `devmap build --manifest` for missing generated state.
-
-## [0.1.0] - 2026-09-09
+## [0.1.0] - 2026-09-10
 
 First minor release after the 0.0.x desktop series. Native menus, the macOS
 status popover, repository hygiene, the rebuilt command palette, and the
@@ -85,6 +53,16 @@ workbench board land together on `main`.
   and workspace editor, registering a path only when it is not already linked.
 - Keep selected task title and description locked while automatic enhancements
   run.
+- Add task board/list layouts, priority/type/owner/label/due filters over loaded
+  cards, multi-selection and keyboard-accessible context menus. Actions include
+  duplication, status/priority changes, agent copying and confirmed deletion with
+  per-task outcomes and bounded delete passes.
+- Add notes-to-draft editing, inline Manvi title/description suggestions and a
+  Quick Enhance sheet for saved tasks. Proposals respect field locks and require
+  explicit acceptance against the saved revision.
+- Add agent copy for new unsaved drafts and saved task briefs. Saved copies name
+  their revision and exclude unsaved edits; board copying reports its eight-task
+  limit and partial results.
 
 ### Fixed
 
@@ -105,6 +83,19 @@ workbench board land together on `main`.
 - Keep Swift coverage `--package-path` inside the repository. Plan Go coverage
   from a root `go.work` or each nested module, and prefer a JavaScript project's
   declared coverage script or runner instead of inventing `npx` commands.
+- Identify a draft release by its git tag when GitHub rewrites `target_commitish`
+  to a branch name, and upload assets by release ID only so tauri-action cannot
+  retarget the tag. v0.0.9 failed verify after every installer had uploaded.
+- Identify a GitHub release draft by its tag and release ID. GitHub often
+  rewrites `target_commitish` to a branch name after associating an existing
+  tag, which aborted v0.0.9 after every installer had uploaded. A SHA in that
+  field must still match the pinned commit; a ref name is not a second pin.
+  Platform builds upload by release ID only so tauri-action cannot retarget
+  the draft.
+- Keep Linux and Windows clippy from treating macOS notification activation as
+  unused. The worker still matches that event so the protocol stays one type.
+- Announce the workbench preview URL without stdio buffering and give CI enough
+  time for Vite to listen so the lifecycle test is not a 5-second race.
 
 ### Changed
 
@@ -121,6 +112,20 @@ workbench board land together on `main`.
   repository membership into editor details.
 - Consolidate remaining agent worktrees onto `main` and retire detached checkouts
   whose commits were already ancestors of this release.
+- Give the macOS status popover the app's native background blur, translucent
+  surfaces and rounded material bounds. Preserve the compact layout and provide
+  opaque accessibility fallbacks. Match the native window to the panel on resize
+  and reopen; the browser fixture includes a labeled glass simulation. Select
+  the tray display using physical bounds so Retina coordinates can open the panel.
+- Refine the macOS status popover around three large Changed, Staged and Conflicts
+  cards, a monochrome repository header, last-fetch counts and one blue primary
+  action. Keep stashes, workspace insights, the command palette and secondary
+  shortcuts inside Details, with Open GitPulse, Settings and Quit in the footer.
+- Refresh README, feature, architecture, contributor and wiki guidance for Tasks,
+  schema-20 DevMap, current shortcuts, module ownership and verification limits.
+  Add a Tasks and workspaces guide; preserve older implementation plans as plans.
+- Resolve repository maps per worktree in both agent guides and document
+  `devmap build --manifest` for missing generated state.
 
 ## [0.0.9] - 2026-09-08
 

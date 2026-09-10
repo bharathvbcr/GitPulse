@@ -1,6 +1,7 @@
 // Disposable UI integration fixture backed by the real Manvi store binary.
 // Usage: node scripts/workbench-preview.mjs /absolute/path/to/dcstore [/absolute/path/to/manvi]
 import { execFile } from "node:child_process";
+import { writeSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -8,13 +9,16 @@ import { promisify } from "node:util";
 import { createServer as createHTTPServer } from "node:http";
 import { createServer } from "vite";
 import { previewWorker } from "./workbench-preview-worker.mjs";
+function announce(message) {
+  writeSync(1, `${message}\n`);
+}
 
 const binary = process.argv[2];
 const manviBinary = process.argv[3];
 if (!binary || !isAbsolute(binary)) throw new Error("Supply an absolute dcstore binary path.");
 if (manviBinary && !isAbsolute(manviBinary)) throw new Error("Supply an absolute Manvi binary path.");
 const root = await mkdtemp(join(tmpdir(), "gitpulse-workbench-preview-"));
-console.log(`Disposable fixture directory: ${root}`);
+announce(`Disposable fixture directory: ${root}`);
 // Vite's optimizer can finish writing a cancelled bundle after server.close()
 // resolves. Remove the disposable profile/cache only once those writes drain.
 // The normal close path also removes it eagerly for top-level startup errors,
@@ -119,6 +123,6 @@ requireRunning();
 const address = http.address();
 if (!address || typeof address === "string") throw new Error("Preview has no TCP address");
 allowedHost = `127.0.0.1:${address.port}`;
-console.log(`Disposable profile: ${db}\nPreview: http://${allowedHost}/harness/workbench.html`);
+announce(`Disposable profile: ${db}\nPreview: http://${allowedHost}/harness/workbench.html`);
 starting = false;
 } catch (error) { starting = false; await close(); if (!stopRequested) throw error; }
