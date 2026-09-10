@@ -111,6 +111,15 @@ workbench board land together on `main`.
   resolve those paths with `canonicalize_plain`. `canonicalize` plus `git init`
   or `File::open` on a directory is os error 1, so `--lib` never checked the
   policy once the lib harness actually loaded.
+- Return repository roots from `validate_repo` in the same spelling
+  `canonicalize_plain` uses, so Windows discovery can match a found `.git`
+  against the walk. `canonicalize` kept the verbatim prefix and every repo
+  looked like a boundary mismatch.
+- Set hygiene fixture mtimes with a writable handle on Windows. Read-only
+  `File::open` cannot `SetFileTime` (`ERROR_ACCESS_DENIED`), which panicked
+  the fixture and poisoned the shared test lock.
+- Compare shared-cache prefixes with normalized slashes, so
+  `Library\Caches\go-build` on Windows is the same root as `Library/Caches/`.
 - Keep XML comments in that manifest free of `--`, which made `mt.exe` reject
   the file with c1010070 and aborted the Windows lib link.
 - Wait for the bounded-output worker to start before the first write, so a

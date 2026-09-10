@@ -150,6 +150,7 @@ fn missing_or_replaced_lock_is_unavailable_not_a_running_job() {
     fs::create_dir(cleaner.dir.join("run.lock")).unwrap();
     assert!(cleaner.state().is_err());
 }
+#[cfg(unix)]
 #[test]
 fn a_disabled_or_future_schedule_cannot_start_or_mutate_history() {
     let (_temp, cleaner, root) = fixture();
@@ -168,6 +169,18 @@ fn a_disabled_or_future_schedule_cannot_start_or_mutate_history() {
         .start(true, state.config.revision, u64::MAX)
         .is_err());
     assert!(!cleaner.active.load(std::sync::atomic::Ordering::SeqCst));
+}
+#[cfg(not(unix))]
+#[test]
+fn enabled_schedules_are_refused_on_this_platform() {
+    let (_temp, cleaner, root) = fixture();
+    let mut c = config(&cleaner, &root);
+    c.enabled = true;
+    c.next_run_at = crate::storage::hygiene::now() + 3600;
+    assert!(cleaner
+        .save(c)
+        .unwrap_err()
+        .contains("unavailable on this platform"));
 }
 #[test]
 fn external_cancellation_and_policy_edits_revoke_authority() {
@@ -511,6 +524,7 @@ fn global_status_never_invokes_a_repository_fsmonitor_hook() {
     assert!(!r.join(".git/fsmonitor-was-invoked").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn background_registration_failure_disables_durable_authority_and_surfaces_recovery() {
     let (_temp, cleaner, root) = fixture();
@@ -542,6 +556,7 @@ fn background_registration_failure_disables_durable_authority_and_surfaces_recov
     assert!(!repaired.config.enabled);
 }
 
+#[cfg(unix)]
 #[test]
 fn turning_off_background_mode_revokes_before_unloading_and_plain_saves_do_not_register_jobs() {
     let (_temp, cleaner, root) = fixture();

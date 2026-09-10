@@ -45,17 +45,17 @@ fn age(path: &Path) {
     let old = SystemTime::now() - Duration::from_secs(100 * 86400);
     let times = FileTimes::new().set_modified(old);
     #[cfg(windows)]
-    if path.is_dir() {
-        // File::open on a directory is ERROR_INVALID_FUNCTION (os error 1).
-        // FILE_FLAG_BACKUP_SEMANTICS is required to set a directory mtime.
+    {
+        // Read-only File::open cannot SetFileTime (ERROR_ACCESS_DENIED). A
+        // directory also needs FILE_FLAG_BACKUP_SEMANTICS or open is
+        // ERROR_INVALID_FUNCTION.
         use std::os::windows::fs::OpenOptionsExt;
-        File::options()
-            .write(true)
-            .custom_flags(0x0200_0000)
-            .open(path)
-            .unwrap()
-            .set_times(times)
-            .unwrap();
+        let mut options = File::options();
+        options.write(true);
+        if path.is_dir() {
+            options.custom_flags(0x0200_0000);
+        }
+        options.open(path).unwrap().set_times(times).unwrap();
         return;
     }
     File::open(path).unwrap().set_times(times).unwrap();

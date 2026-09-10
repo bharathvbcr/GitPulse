@@ -185,7 +185,7 @@ fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, String> {
     let relative = resolved
         .strip_prefix(&home)
         .map_err(|_| "Cache is outside the home directory; use its owning tool manually")?;
-    let text = relative.to_string_lossy();
+    let text = relative.to_string_lossy().replace('\\', "/");
     let permitted = [
         "Library/Caches/",
         ".cache/",
