@@ -39,13 +39,20 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # ImageOS/ImageVersion are runner process env vars. They are not in the
+      # workflow `env` context, so interpolating env.ImageOS as the cache
+      # prefix was the empty string and rust-cache kept the default Windows
+      # key. Restored MSVC artifacts from older VS then failed `--lib`
+      # with 0xc0000139.
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          # Hosted Windows images moved to VS2026; reuse of older MSVC artifacts
-          # failed `--lib` with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139).
-          prefix-key: ${{ env.ImageOS }}
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7

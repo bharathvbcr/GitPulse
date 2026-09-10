@@ -96,8 +96,16 @@ describe("check:workflows", () => {
       const caches = source.split("uses: Swatinem/rust-cache@v2");
       expect(caches.length, name).toBeGreaterThan(1);
       for (const block of caches.slice(1)) {
-        expect(block, name).toContain("prefix-key:");
-        expect(block, name).toContain("ImageOS");
+        // ImageOS is a runner process env var, not a workflow `env` key, so
+        // interpolating it here is always the empty string.
+        expect(block, name).not.toMatch(/prefix-key:\s*\$\{\{\s*env\.ImageOS\s*\}\}/);
+        expect(block, name).toContain("prefix-key: ${{ env.RUST_CACHE_PREFIX }}");
+      }
+      const exports = source.split("Key the Rust cache to this runner image");
+      expect(exports.length, name).toBe(caches.length);
+      for (const block of exports.slice(1)) {
+        expect(block, name).toContain('RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}');
+        expect(block, name).toContain("$GITHUB_ENV");
       }
     }
   });

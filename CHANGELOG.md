@@ -103,9 +103,9 @@ workbench board land together on `main`.
 - Keep Windows clippy from treating the unix-only hygiene worker waiter as unused.
 - Capture panic-redaction diagnostics from the child stderr pipe so Windows
   observes the hook instead of an inherited file handle that never received it.
-- Embed the Windows comctl32 v6 manifest on the `cdylib` as well as `--test`
-  binaries, so `cargo test --lib` loads instead of dying with
-  `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs.
+- Embed the Windows comctl32 v6 manifest with `rustc-link-arg` as well as
+  `--test` binaries and the `cdylib`, so `cargo test --lib` loads instead of
+  dying with `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs.
 - Keep XML comments in that manifest free of `--`, which made `mt.exe` reject
   the file with c1010070 and aborted the Windows lib link.
 - Pass the same comctl32 manifest as a bin and catch-all link arg so the
@@ -126,8 +126,10 @@ workbench board land together on `main`.
   instrumented lib suite cannot fail a live fixture handshake.
 - Cap llvm-cov at four test threads so instrumented lib tests cannot starve
   stderr drains and sidecar handshakes.
-- Key the CI Rust cache on the runner image so Windows native artifacts are
-  not reused across Visual Studio upgrades.
+- Key the CI Rust cache from the runner's `ImageOS` and `ImageVersion` via
+  `GITHUB_ENV`. `${{ env.ImageOS }}` is empty in the workflow env context, so
+  the previous prefix never applied and Windows kept restoring mixed MSVC
+  artifacts.
 
 ### Changed
 

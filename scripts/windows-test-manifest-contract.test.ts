@@ -4,9 +4,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * Windows `cargo test --lib` loads this package's `cdylib`. The comctl32 v6
- * manifest used to be passed only as `rustc-link-arg-tests`, so integration
- * binaries started and the lib harness died at load with
+ * Windows `cargo test --lib` builds `gitpulse_lib-*.exe`. The comctl32 v6
+ * manifest used to be passed only as `rustc-link-arg-tests` / `rustc-cdylib-link-arg`,
+ * so integration binaries started and the lib harness died at load with
  * STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) — no test name, nothing checked.
  */
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -20,7 +20,7 @@ describe("Windows test binaries and the lib cdylib share the comctl32 manifest",
     expect(lib).toContain("cdylib");
   });
 
-  it("embeds the manifest on both --test binaries and the cdylib", () => {
+  it("embeds the manifest on the lib harness, --test binaries, and the cdylib", () => {
     expect(buildRs).toContain("rustc-link-arg-tests");
     expect(buildRs).toContain("rustc-cdylib-link-arg");
     expect(buildRs).toContain("tests.manifest");
