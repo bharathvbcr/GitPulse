@@ -106,6 +106,8 @@ workbench board land together on `main`.
 - Embed the Windows comctl32 v6 manifest on the `cdylib` as well as `--test`
   binaries, so `cargo test --lib` loads instead of dying with
   `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs.
+- Keep XML comments in that manifest free of `--`, which made `mt.exe` reject
+  the file with c1010070 and aborted the Windows lib link.
 - Wait for the bounded-output worker to start before the first write, so a
   100 ms stderr deadline is I/O time rather than thread-start time on Windows.
 - Probe daemon stdout failure by saturating the pipe. `--help` fits in an

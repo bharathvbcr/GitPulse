@@ -2,11 +2,11 @@
 <!--
   Application manifest for this crate's TEST binaries and its Windows cdylib.
 
-  Without it, suites that reach muda's and wry's window code — including
-  `cargo test --lib`, which loads the cdylib — died at load with
-  STATUS_ENTRYPOINT_NOT_FOUND before main ran. Declaring the comctl32 version
-  6 dependency binds the side-by-side assembly instead of the 5.82 copy in
-  System32.
+  Without it, suites that reach muda's and wry's window code died at load
+  with STATUS_ENTRYPOINT_NOT_FOUND before main ran. Declaring the comctl32
+  version 6 dependency binds the side-by-side assembly instead of the 5.82
+  copy in System32. The library test harness loads the cdylib, so it needs
+  the same manifest as the integration binaries.
 
   The application binary gets an equivalent manifest from tauri_build. See
   build.rs for what was and was not verified about the exact failing import.

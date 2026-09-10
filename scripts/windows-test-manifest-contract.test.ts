@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cargo = readFileSync(path.join(REPO, "src-tauri", "Cargo.toml"), "utf8");
 const buildRs = readFileSync(path.join(REPO, "src-tauri", "build.rs"), "utf8");
+const manifest = readFileSync(path.join(REPO, "src-tauri", "tests.manifest"), "utf8");
 
 describe("Windows test binaries and the lib cdylib share the comctl32 manifest", () => {
   it("declares a cdylib that cargo test --lib will load", () => {
@@ -27,5 +28,13 @@ describe("Windows test binaries and the lib cdylib share the comctl32 manifest",
     expect(kinds).toEqual(
       expect.arrayContaining(["rustc-link-arg-tests", "rustc-cdylib-link-arg"]),
     );
+  });
+
+  it("keeps XML comments free of -- so mt.exe can parse the manifest", () => {
+    const comments = [...manifest.matchAll(/<!--([\s\S]*?)-->/g)].map((m) => m[1]);
+    expect(comments.length).toBeGreaterThan(0);
+    for (const comment of comments) {
+      expect(comment, "XML comments cannot contain -- (mt.exe c1010070)").not.toContain("--");
+    }
   });
 });
