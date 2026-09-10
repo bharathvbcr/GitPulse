@@ -49,8 +49,6 @@ fn embed_test_manifest() {
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests.manifest");
     let path = manifest.display();
-    for kind in ["rustc-link-arg"] {
-        println!("cargo:{kind}=/MANIFEST:EMBED");
-        println!("cargo:{kind}=/MANIFESTINPUT:{path}");
-    }
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{path}");
 }

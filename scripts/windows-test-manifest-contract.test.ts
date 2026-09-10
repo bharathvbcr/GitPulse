@@ -28,11 +28,11 @@ describe("Windows test binaries and the lib cdylib share the comctl32 manifest",
     expect(buildRs).toContain("try_build");
     expect(buildRs).not.toMatch(/tauri_build::build\s*\(\s*\)/);
     expect(buildRs).toContain("tests.manifest");
-    const kindsBlock = buildRs.match(/for kind in \[([\s\S]*?)\]/)?.[1] ?? "";
-    const kinds = [...kindsBlock.matchAll(/"(rustc-[^"]+)"/g)].map((m) => m[1]);
-    expect(kinds).toEqual(["rustc-link-arg"]);
-    expect(buildRs).toContain("/MANIFEST:EMBED");
-    expect(buildRs).toContain("/MANIFESTINPUT:");
+    expect(buildRs).toContain('println!("cargo:rustc-link-arg=/MANIFEST:EMBED")');
+    expect(buildRs).toContain("cargo:rustc-link-arg=/MANIFESTINPUT:");
+    expect(buildRs).not.toMatch(/println!\("cargo:rustc-link-arg-tests=/);
+    expect(buildRs).not.toMatch(/println!\("cargo:rustc-link-arg-bins=/);
+    expect(buildRs).not.toMatch(/println!\("cargo:rustc-cdylib-link-arg=/);
   });
 
   it("keeps XML comments free of -- so mt.exe can parse the manifest", () => {
