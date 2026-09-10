@@ -37,4 +37,15 @@ describe("PromptModal", () => {
     expect(body).toContain("This cannot be undone.");
     expect(body).not.toContain("<input");
   });
+
+  it("uses the danger button for destructive confirms", () => {
+    void askConfirm({
+      title: "Delete task?",
+      destructive: true,
+      confirmLabel: "Delete task",
+    });
+    const { body } = render(PromptModal);
+    expect(body).toContain("gp-btn-danger");
+    expect(body).toContain("Delete task");
+  });
 });

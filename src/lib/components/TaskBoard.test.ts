@@ -43,7 +43,9 @@ describe("TaskBoard", () => {
     expect(source).toContain("ArrowLeft");
     expect(source).toContain("ArrowRight");
     expect(source).toContain("neighborStatus");
-    expect(source).toContain('aria-keyshortcuts="ArrowLeft ArrowRight"');
+    expect(source).toContain("ArrowLeft");
+    expect(source).toContain("ContextMenu");
+    expect(source).toContain('aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"');
   });
 
   it("keeps the board chrome short and skips generic marketing labels", () => {
@@ -54,7 +56,7 @@ describe("TaskBoard", () => {
     expect(source).not.toContain("Drop a task here");
     expect(source).not.toContain("Activity inbox");
     expect(source).not.toContain("Add repositories to start creating linked tasks");
-    expect(source).toContain(">New<");
+    expect(source).toContain(">New task<");
     expect(source).toContain('aria-label="Inbox"');
   });
 
@@ -99,5 +101,33 @@ describe("TaskBoard", () => {
     expect(source).toContain('aria-controls="task-add-repo-menu"');
     expect(source).toContain("onAddMenuKey");
     expect(source).toContain("class=\"add-path\"");
+  });
+
+  it("uses in-app confirms, a task context menu, liquid glass, and Quick Enhance", () => {
+    expect(source).toContain("askConfirm");
+    expect(source).not.toContain("window.confirm");
+    expect(source).toContain("oncontextmenu");
+    expect(source).toContain("TaskContextMenu");
+    expect(source).toContain("QuickEnhanceSheet");
+    expect(source).toContain("gp-glass");
+    expect(source).toContain("gp-btn-danger");
+    expect(source).toContain("deleteTasks");
+    expect(source).toContain("removeSelected");
+    expect(source).toContain("isContextMenuKey");
+    expect(source).toContain("aria-label=\"Task layout\"");
+    expect(source).toContain("gp-liquid-tabs");
+    expect(source).toContain("duplicateTitle");
+    expect(source).toContain("copyCardsForAgent");
+    expect(source).toContain("Copy for agent");
+    expect(source).toContain("copyAgent");
+    expect(source).toContain("id=\"task-search\"");
+    expect(source).toContain("Unassigned");
+    expect(source).toContain('e.key.toLowerCase() === "a"');
+    expect(source).toContain("Open Quick Enhance?");
+    expect(source).toContain("Start a duplicate");
+  });
+
+  it("does not add a second backdrop-filter on the board scrim path", () => {
+    expect(source).not.toMatch(/\bbackdrop-blur-/);
   });
 });

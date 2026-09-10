@@ -22,4 +22,12 @@ describe("WorkspaceEditor", () => {
     expect(source).toContain("title={tab.path}");
     expect(source).toContain("open-mark");
   });
+
+  it("deletes a workspace through the in-app confirm instead of window.confirm", () => {
+    expect(source).toContain("askConfirm");
+    expect(source).toContain("deleteWorkspace");
+    expect(source).toContain("gp-glass");
+    expect(source).toContain("SettingToggle");
+    expect(source).not.toContain("window.confirm");
+  });
 });

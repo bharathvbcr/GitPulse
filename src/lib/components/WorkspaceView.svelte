@@ -63,7 +63,7 @@
   <ViewSectionPanel {view} {section}>
 
     {#if section === "tasks"}
-      <LazyView load={loadTasks} name="repository tasks" />
+      <LazyView load={loadTasks} name="repository tasks" props={{ active: section === "tasks" }} />
     {:else if section === "resolve"}
       <LazyView load={loadConflict} name="the conflict editor" />
     {:else if section === "remote"}

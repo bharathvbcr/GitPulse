@@ -5,6 +5,7 @@ import {
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
   getEnhancement, listEnhancements, changeEnhancement, enhancementConfiguration,
+  deleteTask, deleteWorkspace,
 } from "./client";
 import type { Task, Workspace } from "./client";
 
@@ -95,6 +96,26 @@ describe("native workbench boundary", () => {
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, item, automatic_enhancement_queued: false }));
     expect(await putTask({ request_id: "move-once" })).toEqual(item);
     expect(native).toHaveBeenCalledTimes(3);
+  });
+
+  it("deletes a task with the caller-supplied request identity and refuses a failed receipt", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...item, deleted: true, revision: 8 }, sequence: 1 }));
+    await deleteTask(item.id, item.revision, "del-1");
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {
+      method: "items.delete",
+      input: JSON.stringify({ id: item.id, expected_revision: item.revision, request_id: "del-1" }),
+    });
+    native.mockResolvedValueOnce(JSON.stringify({ ok: false }));
+    await expect(deleteTask(item.id, item.revision, "del-1")).rejects.toMatchObject({ code: "protocol_error" });
+  });
+
+  it("deletes a workspace through the same receipt gate", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...group, deleted: true }, sequence: 2 }));
+    await deleteWorkspace(group.id, group.revision, "ws-del");
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {
+      method: "workspaces.delete",
+      input: JSON.stringify({ id: group.id, expected_revision: group.revision, request_id: "ws-del" }),
+    });
   });
 
   it.each(["revision_conflict", "not_found", "busy", "store_error"])("preserves native %s errors for recovery decisions", async (code) => {

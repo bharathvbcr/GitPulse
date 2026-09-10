@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import { askConfirm } from "../stores/modalStore";
   import { automaticUpdates, changeEnhancement, enhancementConfiguration, explainError, getEnhancement, getTask, listEnhancements, newID, WorkbenchError, type Enhancement, type EnhancementField, type EnhancementMutation, type EnhancementSummary, type Task } from "../workbench/client";
 
   let { task, disabled, onApplied, onBusy }: { task: Task; disabled: boolean; onApplied: (task: Task) => void; onBusy: (busy: boolean) => void } = $props();
@@ -137,13 +138,19 @@
     }
     void mutate("enhancements.revise", input);
   }
-  function act(method: EnhancementMutation) {
+  async function act(method: EnhancementMutation) {
     if (!proposal) return;
     const input: Record<string, unknown> = { id: proposal.id, request_id: newID(), expected_revision: proposal.revision };
     if (method === "enhancements.accept" || method === "enhancements.undo") input.expected_task_revision = task.revision;
     if (method === "enhancements.accept") input.fields = [...selected];
     if (method === "enhancements.recover") {
-      if (!window.confirm("Release this expired attempt? Its provider outcome is unknown. Starting again may create another model call.")) return;
+      if (!await askConfirm({
+        title: "Release this expired attempt?",
+        message: "Its provider outcome is unknown. Starting again may create another model call.",
+        confirmLabel: "Release",
+        cancelLabel: "Keep waiting",
+        destructive: true,
+      })) return;
       input.worker_id = proposal.worker_id; input.acknowledge_uncertain = true;
     }
     void mutate(method, input);

@@ -96,7 +96,11 @@
           <button type="button" onclick={cancelPrompt} class="gp-btn">
             {options.cancelLabel ?? "Cancel"}
           </button>
-          <button bind:this={confirmEl} type="submit" class="gp-btn-primary">
+          <button
+            bind:this={confirmEl}
+            type="submit"
+            class={isConfirm && options.mode === "confirm" && options.destructive ? "gp-btn-danger" : "gp-btn-primary"}
+          >
             {options.confirmLabel ?? "OK"}
           </button>
         </div>

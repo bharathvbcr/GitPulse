@@ -16,6 +16,8 @@ export interface TextPromptOptions extends PromptBaseOptions {
 
 export interface ConfirmPromptOptions extends PromptBaseOptions {
   mode: "confirm";
+  /** Danger confirm (delete). The confirm control uses the danger button. */
+  destructive?: boolean;
 }
 
 export type PromptOptions = TextPromptOptions | ConfirmPromptOptions;

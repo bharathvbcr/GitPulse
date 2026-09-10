@@ -56,6 +56,13 @@ describe("modalStore prompts", () => {
     await expect(second).resolves.toBe("ok");
   });
 
+  it("passes a destructive confirm through so the prompt can use the danger control", async () => {
+    const pending = askConfirm({ title: "Delete tasks?", destructive: true, confirmLabel: "Delete task" });
+    expect(get(promptState)?.options).toMatchObject({ mode: "confirm", destructive: true, confirmLabel: "Delete task" });
+    completePrompt(true);
+    await expect(pending).resolves.toBe(true);
+  });
+
   it("completing with no open prompt is a no-op", () => {
     expect(() => completePrompt("x")).not.toThrow();
     expect(() => cancelPrompt()).not.toThrow();

@@ -91,6 +91,24 @@
   }
 }
 
+@utility gp-btn-danger {
+  /* Pill button (destructive): same geometry as primary, rose ramp. */
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
+  background-image: linear-gradient(135deg, #fb7185, #e11d48);
+  box-shadow: 0 6px 22px -8px rgb(225 29 72 / 0.55);
+  &:hover {
+    filter: brightness(1.08);
+  }
+  &:active {
+    transform: scale(0.97);
+  }
+  &:disabled {
+    @apply cursor-not-allowed opacity-40;
+    filter: none;
+    box-shadow: none;
+  }
+}
+
 @utility gp-icon-btn {
   /* Round icon button (ghost). */
   @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
@@ -698,6 +716,7 @@
     .gp-btn,
     .gp-btn-primary,
     .gp-btn-success,
+    .gp-btn-danger,
     .gp-field,
     .gp-separator,
     .gp-menu-sep {

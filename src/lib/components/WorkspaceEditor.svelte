@@ -1,7 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
-  import { explainError, newID, putWorkspace, registerRepository, request, workspaceDraft, WorkbenchError, type Repository, type Workspace, type WorkspaceDraft } from "../workbench/client";
+  import { askConfirm } from "../stores/modalStore";
+  import SettingToggle from "./SettingToggle.svelte";
+  import { deleteWorkspace, explainError, newID, putWorkspace, registerRepository, workspaceDraft, WorkbenchError, type Repository, type Workspace, type WorkspaceDraft } from "../workbench/client";
   import { addableOpenTabs, openMembershipCandidates, withRepositoryId, type OpenTabRef } from "../workbench/openMembership";
   let { value, repositories, openTabs = [], onSaved, onClose }: {
     value: Workspace | null; repositories: Repository[]; openTabs?: OpenTabRef[]; onSaved: () => void; onClose: () => void;
@@ -38,13 +40,20 @@
     finally { saving = false; }
   }
   async function remove() {
-    if (!value || !window.confirm(`Delete workspace “${value.name}”? Repositories, tasks and history will be kept.`)) return;
+    if (!value) return;
+    if (!await askConfirm({
+      title: `Delete workspace “${value.name}”?`,
+      message: "Repositories, tasks and history will be kept. This workspace ID cannot be reused.",
+      confirmLabel: "Delete workspace",
+      cancelLabel: "Keep workspace",
+      destructive: true,
+    })) return;
     saving = true;
-    try { await request("workspaces.delete", { id, expected_revision: value.revision, request_id: newID() }); onSaved(); onClose(); }
+    try { await deleteWorkspace(id, value.revision, newID()); onSaved(); onClose(); }
     catch (cause) { error = explainError(cause); } finally { saving = false; }
   }
 </script>
-<aside class="workspace-editor" aria-label="Workspace settings">
+<aside class="workspace-editor gp-glass" aria-label="Workspace settings">
   <header><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={onClose} type="button" aria-label="Close workspace settings">✕</button></header>
   <form onsubmit={(e) => { e.preventDefault(); void save(); }}>
     <fieldset disabled={saving || pending !== null}>
@@ -52,7 +61,8 @@
       <label>Description<textarea bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
       <label>Icon<input bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>
       <label>Color<input bind:value={draft.color} maxlength="64" placeholder="Optional color name" /></label>
-      <label class="check"><input type="checkbox" bind:checked={draft.pinned} />Pinned</label><label class="check"><input type="checkbox" bind:checked={draft.archived} />Archived</label>
+      <SettingToggle label="Pinned" description="Keep this workspace at the top of the navigator." checked={draft.pinned} onchange={(next) => { draft.pinned = next; }} />
+      <SettingToggle label="Archived" description="Hide this workspace unless Show archived is on." checked={draft.archived} onchange={(next) => { draft.archived = next; }} />
       <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><input type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => { draft.repository_ids = e.currentTarget.checked ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
       {#if addable.length}
         <p>Open in GitPulse</p>
@@ -68,9 +78,9 @@
     </fieldset>
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#if pending}<p>Retry this save to reconcile the uncertain result.</p>{/if}
-    <footer><button disabled={saving || adding} class="primary" type="submit">{saving ? "Saving…" : pending ? "Retry save" : "Save workspace"}</button>{#if value}<button type="button" onclick={remove} disabled={saving || adding || pending !== null}>Delete workspace</button>{/if}</footer>
+    <footer><button disabled={saving || adding} class="gp-btn-primary" type="submit">{saving ? "Saving…" : pending ? "Retry save" : "Save workspace"}</button>{#if value}<button type="button" class="gp-btn-danger" onclick={remove} disabled={saving || adding || pending !== null}>Delete workspace</button>{/if}</footer>
   </form>
 </aside>
 <style>
-  .workspace-editor{width:min(380px,45vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border));padding:18px;overflow:auto;background:rgb(var(--c-surface));font-size:12px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg));color:inherit}.check{flex-direction:row;align-items:center;gap:8px}button{padding:7px 10px;border:1px solid rgb(var(--c-border));border-radius:7px}.primary{background:rgb(var(--c-accent));color:white}footer{display:flex;gap:8px;flex-wrap:wrap}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
+  .workspace-editor{width:min(380px,45vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:18px;overflow:auto;background:transparent;font-size:12px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
 </style>

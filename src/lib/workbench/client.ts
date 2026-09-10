@@ -476,6 +476,19 @@ export async function putTask(input: Record<string, unknown>): Promise<Task> {
 }
 export async function putWorkspace(input: Record<string, unknown>): Promise<Workspace> { return record(await request("workspaces.put", input), workspace); }
 
+function mutationOk(response: unknown): void {
+  if (object(response).ok !== true) return invalid();
+}
+
+/** Soft-delete. History is kept; the same id cannot be reused or restored from the board. */
+export async function deleteTask(id: string, expectedRevision: number, requestId: string): Promise<void> {
+  mutationOk(await request("items.delete", { id, expected_revision: expectedRevision, request_id: requestId }));
+}
+
+export async function deleteWorkspace(id: string, expectedRevision: number, requestId: string): Promise<void> {
+  mutationOk(await request("workspaces.delete", { id, expected_revision: expectedRevision, request_id: requestId }));
+}
+
 export function automationSettings(value: unknown): AutomationSettings {
   const raw = object(value), base = version(raw), provider = nullableText(raw.provider), model = nullableText(raw.model);
   if (base.id !== "profile" || (provider === null) !== (model === null) ||
