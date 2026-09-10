@@ -9,7 +9,9 @@ it.each(["AGENTS.md", "CLAUDE.md"])("%s exposes DevMap before the generated GitN
   expect(workflow).toContain("devmap status --json");
   expect(workflow).toContain("gitpulse_codeintel_search");
   expect(workflow).toContain("devmap impact");
-  expect(workflow).toContain(".devcouncil/repo_map.json");
+  expect(workflow).toContain("devmap paths --json");
+  expect(workflow).toContain("devmap build --manifest");
+  expect(workflow).toContain("Never copy another worktree");
   expect(workflow).toContain("unavailable");
   expect(workflow).toContain("truncated");
 });

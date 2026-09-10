@@ -73,11 +73,45 @@ fn probe(mode: &str) {
         .stdout(output)
         .spawn()
         .unwrap();
+    // Each registration/retirement has the same three-second bound. The
+    // source-failure case starts 17 real streams, so an aggregate three-second
+    // deadline confuses successful repeated cleanup with a shutdown hang.
+    let mut completed = 0;
+    let mut deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        let progress = fs::read_to_string(&child_log)
+            .unwrap()
+            .matches("GITPULSE_WATCH_PROBE_COMPLETE")
+            .count();
+        if progress > completed && progress <= 17 {
+            completed = progress;
+            deadline = Instant::now() + Duration::from_secs(3);
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!(
+                "{mode}: registration {completed} exceeded its deadline: {}",
+                fs::read_to_string(&child_log).unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(
-        finish(&mut child, Duration::from_secs(3)).success(),
+        status.success(),
         "{mode}: {}",
-        fs::read_to_string(child_log).unwrap()
+        fs::read_to_string(&child_log).unwrap()
     );
+    if mode == "source" {
+        assert_eq!(
+            fs::read_to_string(child_log).unwrap().matches("GITPULSE_SHUTDOWN_SOURCE_FAULT").count(),
+            17,
+            "the initial registration and all 16 ownership probes must inject the shutdown allocation failure"
+        );
+    }
 }
 
 #[test]
@@ -97,6 +131,7 @@ fn watcher_fault_child() {
                 panic!("native startup failure was reported as a ready watcher");
             }
         }
+        eprintln!("GITPULSE_WATCH_PROBE_COMPLETE");
         // Every public registration route must propagate errors and release
         // callback ownership, including the stream/context allocated before
         // native startup. Repetition catches retained failed generations.
@@ -117,6 +152,7 @@ fn watcher_fault_child() {
                 1,
                 "failed stream retained its callback"
             );
+            eprintln!("GITPULSE_WATCH_PROBE_COMPLETE");
         }
     } else {
         drop(result.expect("healthy stream must start"));

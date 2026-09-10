@@ -4,6 +4,24 @@ import { compile } from "svelte/compiler";
 
 const source = readFileSync(new URL("./TaskBoard.svelte", import.meta.url), "utf8");
 
+describe("TaskBoard materials", () => {
+  it("lets the shared material system paint the board instead of covering it with opaque local fills", () => {
+    for (const selector of ["workbench", "search", "column-title", "card", "ghost"]) {
+      const rule = source.match(new RegExp(`\\.${selector}\\{([^}]*)\\}`))?.[1];
+      expect(rule, `missing .${selector} rule`).toBeDefined();
+      expect(rule, `.${selector} covers the shared material`).not.toMatch(/(?:^|;)background(?:-color)?:/);
+    }
+    expect(source).toContain('class="workbench bg-background"');
+    expect(source).toContain('class="card bg-surface"');
+  });
+
+  it("uses a shared floating material for the drag preview without filtering every card", () => {
+    expect(source).toContain('class="ghost gp-glass bg-surface shadow-float"');
+    expect(source).not.toContain("backdrop-filter:");
+    expect(source).not.toContain("backdrop-blur-");
+  });
+});
+
 describe("TaskBoard", () => {
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "TaskBoard.svelte" });

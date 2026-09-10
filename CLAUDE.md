@@ -1,7 +1,13 @@
 # Code navigation for every agent
 
-Start with DevMap in this repository. Read `.devcouncil/repo_map.json` for file
-ownership, then run `devmap status --json` before relying on graph answers.
+Start with DevMap in this repository. From the repository root, run
+`devmap paths --json` to resolve the database and `repo_map` paths, then run
+`devmap status --json` before relying on graph answers. Read the resolved
+`repo_map` file for ownership; do not assume the legacy `.devcouncil/` location.
+Generated state is per-worktree and is not copied by Git. If the store or map
+is missing, run `devmap build --manifest` from this worktree's root, then check
+status and read the map again. A plain build updates only the database.
+Never copy another worktree's database to conceal missing local state.
 The CLI and GitPulse MCP both query the DevMap store:
 
 - Use `gitpulse_codeintel_search` with this repository's absolute `repo_path`,
@@ -12,8 +18,8 @@ The CLI and GitPulse MCP both query the DevMap store:
   `shown`, `total`, and `walk_incomplete`; partial results never justify skipping
   the full required checks.
 - If DevMap is unavailable or stale, state the reason and use source inspection
-  or GitNexus while rebuilding with `devmap build`. An unavailable query is not
-  evidence that there are no callers or affected tests.
+  or GitNexus while rebuilding with `devmap build --manifest`. An unavailable
+  query is not evidence that there are no callers or affected tests.
 
 GitNexus complements DevMap with its process graph and the required impact and
 change checks below. Run both tools' applicable checks; the generated GitNexus

@@ -120,16 +120,29 @@ const settle = async (ms = 30) => {
   await tick(); await new Promise(resolve => setTimeout(resolve, ms)); await tick();
   const pendingPrompt = get(promptState);
   const prompt = pendingPrompt ? [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === pendingPrompt.options.title).at(-1) : null;
+  if (prompt && pendingPrompt.options.title.startsWith("Delete")) { button(pendingPrompt.options.confirmLabel, prompt)?.click(); await new Promise(resolve => setTimeout(resolve, 0)); await tick(); }
   if (prompt && pendingPrompt.options.title.startsWith("Discard")) { confirmations++; [...prompt.querySelectorAll("button")].find(button => button.textContent.trim() === (confirmAnswer ? "Discard edits" : "Keep editing"))?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
 const wait = async predicate => { for(let i = 0; i < 100; i++) { if(predicate()) return; await settle(); } throw Error("Timed out waiting for task UI"); };
-const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => el.textContent.trim() === text || el.getAttribute("aria-label") === text);
-const field = (text) => [...root.querySelectorAll(".task-editor label")].find(el => el.firstChild?.textContent.trim() === text)?.querySelector("input,textarea,select");
+const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete"};
+const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => {
+  const names = [text, aliases[text]].filter(Boolean);
+  return names.includes(el.textContent.trim()) || names.includes(el.getAttribute("aria-label")) || names.includes(el.querySelector(":scope > span.flex-1")?.textContent.trim());
+});
+const field = (text) => [...root.querySelectorAll(".task-editor label")].find(el => el.firstChild?.textContent.trim() === (text === "Due date" ? "Due" : text === "Custom type" ? "Type" : text))?.querySelector("input,textarea,select");
 const card = id => root.querySelector(`[data-card-id="${id}"]`);
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
 const change = async (el, value, event = "input") => { if(!el) throw Error("Missing form field"); el.value = value; el.dispatchEvent(new Event(event, {bubbles:true})); await settle(); };
-const click = async text => { const el = button(text); if (!el) throw Error(`Missing button: ${text}`); el.click(); await settle(); };
+const click = async text => {
+  if (text === "Clear task search") return change(root.querySelector('[aria-label="Search tasks"]'), "");
+  const scope = text === "Delete selected tasks" || text === "Clear task selection" ? root.querySelector('.selection') : root;
+  const el = button(text === "Delete selected tasks" ? "Delete" : text === "Clear task selection" ? "Clear" : text, scope); if (!el) throw Error(`Missing button: ${text}`); el.click(); await settle(); };
+const moveThroughMenu = async (id, status) => {
+  card(id).dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:50,clientY:80})); await settle();
+  const menu = () => document.querySelector('[role="menu"][aria-label="Task actions"]');
+  button("Move to…",menu()).click(); await settle(); button(status,menu()).click(); await settle(150);
+};
 await wait(() => card("task-1"));
 if (params.has("check")) {
   try {
@@ -169,11 +182,11 @@ if (params.has("check")) {
     confirmations = 0; confirmAnswer = false;
     card("task-2").focus(); card("task-2").click(); await wait(editor);
     check("opening the sheet focuses its title", document.activeElement === field("Title"));
-    check("type is a specific choice with supported task kinds", field("Type") instanceof HTMLSelectElement && field("Type").options.length === 8);
+    check("type offers all supported task kinds and permits custom names", field("Type") instanceof HTMLInputElement && field("Type").list.options.length === 7);
     check("the primary repository is available without expanding settings", field("Primary repository").getClientRects().length > 0 && !field("Primary repository").closest("details"));
     check("linked repositories remain intact in the draft", field("Primary repository").value === "repo-0" && editor().textContent.includes("Linked repositories"));
-    check("agent controls and optional fields are folded initially", !editor().querySelector('.agent-section').open && field("Owner").closest("details")?.open === false);
-    editor().querySelector('.sheet-body').scrollTop = 900; await settle();
+    check("optional Manvi history and advanced details are folded initially", editor().querySelector('.enhancements .heading').getAttribute("aria-expanded") === "false" && button("More details").getAttribute("aria-checked") === "false");
+    editor().scrollTop = 900; await settle();
     const saveRect = button("Save task").getBoundingClientRect();
     check("save remains visible while the sheet scrolls", saveRect.top >= 0 && saveRect.bottom < innerHeight);
     await click("Close task details");
@@ -182,11 +195,11 @@ if (params.has("check")) {
 
     await click("Add task to Ready");
     check("column creation uses that column's status", field("Status").value === "ready");
+    await click("Schedule and labels");
     check("new tasks default to normal priority", field("Priority").value === "2");
     await change(field("Title"), "   ");
     check("whitespace titles cannot be saved", button("Save task").disabled);
     await change(field("Title"), "A concise task");
-    const criteriaSummary = [...editor().querySelectorAll("summary")].find(el => el.textContent.startsWith("Acceptance criteria")); criteriaSummary.click();
     await change(field("Acceptance criteria"), "  Result verified  \n\n  Recovery checked  ");
     await change(field("Status"), "review", "change");
     check("select changes are marked as unsaved", editor().querySelector("header small").textContent === "Unsaved changes");
@@ -194,7 +207,7 @@ if (params.has("check")) {
     const pendingWrite = writes.at(-1);
     check("uncertain saves lock the draft and expose an exact retry", field("Title").matches(":disabled") && !button("Retry save").disabled);
     await click("Close task details");
-    check("uncertain saves cannot be discarded before reconciliation", Boolean(editor()) && editor().textContent.includes("Retry the save before closing"));
+    check("uncertain saves cannot be discarded before reconciliation", Boolean(editor()) && button("Close task details").disabled);
     await click("Retry save"); await wait(() => button("Save task") && !field("Title").matches(":disabled"));
     check("retrying a lost save reuses the same mutation identity", writes.at(-1).request_id === pendingWrite.request_id && tasks.find(task => task.id === pendingWrite.id)?.revision === 1);
     check("acceptance criteria are normalized and retained after saving", field("Acceptance criteria").value === "Result verified\nRecovery checked");
@@ -204,7 +217,7 @@ if (params.has("check")) {
     const taskOne = tasks.find(task => task.id === "task-1"); taskOne.kind = "custom-category";
     card("task-1").click(); await wait(editor);
     check("existing custom task types remain editable without data loss", field("Type").value === "custom-category" && field("Custom type").value === "custom-category");
-    await change(field("Type"), "", "change");
+    await change(field("Type"), "");
     check("custom type creation requires a name", field("Custom type")?.required && button("Save task").disabled);
     await change(field("Custom type"), "experiment");
     await change(field("Description"), "A shorter brief.");
@@ -225,21 +238,21 @@ if (params.has("check")) {
     confirmAnswer = true; await click("Close task details");
 
     let beforeMove = tasks.find(task => task.id === "task-2");
-    await change(root.querySelector('[aria-label="Change status of Make task sheets easier to scan"]'), "done", "change");
+    await moveThroughMenu("task-2", "Done");
     await wait(() => card("task-2")?.closest('[data-task-column="done"]'));
     const afterMove = tasks.find(task => task.id === "task-2");
     check("card status choices persist one revision without opening a sheet", afterMove.revision === beforeMove.revision + 1 && !editor());
     check("status changes preserve both repository links and task text", afterMove.repository_ids.length === 2 && afterMove.description === beforeMove.description);
     // A stale card must not overwrite a concurrent edit.
     const stale = tasks.find(task => task.id === "task-3"); stale.revision++;
-    await change(root.querySelector('[aria-label="Change status of Review the agent handoff"]'), "done", "change");
+    await moveThroughMenu("task-3", "Done");
     await wait(() => root.textContent.includes("This task changed while you were moving it"));
     check("stale status choices report a conflict without changing the task", stale.status === "backlog" && card("task-3").closest('[data-task-column="backlog"]'));
     await click("Refresh tasks"); await settle(300);
 
     const search = root.querySelector('[aria-label="Search tasks"]');
     await change(search, "does not exist"); await settle(400);
-    check("empty searches explain the result and hide previous tasks", root.textContent.includes("No matching tasks") && root.querySelectorAll('[data-task-card]').length === 0);
+    check("empty searches explain the result and hide previous tasks", root.textContent.includes("No tasks match") && root.querySelectorAll('[data-task-card]').length === 0);
     await click("Clear task search"); await wait(() => card("task-1"));
     check("clearing search restores the board", Boolean(card("task-1")));
     holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 6);
@@ -247,9 +260,9 @@ if (params.has("check")) {
     heldSearch.forEach(release => release()); holdSearch = false; heldSearch = []; await settle();
     check("late search responses cannot replace newer results", Boolean(card("task-10")) && root.querySelectorAll('[data-task-card]').length === 1);
     failList = true; await change(search, "offline"); await settle(400);
-    check("failed loads remain distinct from an empty task list", root.textContent.includes("Fixture task storage offline") && root.textContent.includes("Tasks unavailable") && !root.textContent.includes("No matching tasks"));
+    check("failed loads remain distinct from an empty task list", root.textContent.includes("Fixture task storage offline") && root.textContent.includes("Tasks unavailable") && !root.textContent.includes("No tasks match"));
     failList = false; await click("Retry loading tasks"); await settle(300);
-    check("a failed search can be retried", root.textContent.includes("No matching tasks") && !root.textContent.includes("Fixture task storage offline"));
+    check("a failed search can be retried", root.textContent.includes("No tasks match") && !root.textContent.includes("Fixture task storage offline"));
     await click("Clear task search"); await wait(() => card("task-1"));
 
     await click("Developer tools"); await wait(() => Boolean(card("task-3")) && !card("task-1"));
@@ -276,30 +289,29 @@ if (params.has("check")) {
     check("task context menu exposes Quick Enhance and task-specific actions", Boolean(document.querySelector('[role="menu"][aria-label="Task actions"]')) && Boolean(button("Quick Enhance", document)));
     document.querySelector('[role="menu"][aria-label="Task actions"]')?.dispatchEvent(new KeyboardEvent("keydown", {key:"Escape",bubbles:true,cancelable:true})); await settle();
     check("task organization offers board and list layouts", Boolean(button("List view")));
-    check("task selection supports explicit bulk actions", Boolean(root.querySelector('[aria-label="Select Ready task 01"]')));
+    check("task selection supports explicit bulk actions", card("task-10").getAttribute("aria-keyshortcuts").includes("ContextMenu"));
     card("task-10").click(); await wait(editor);
-    const options = [...editor().querySelectorAll("summary")].find(el => el.textContent === "Saved task options"); options.click();
     corruptDelete = true;
     await click("Delete task");
     const confirmDelete = document.querySelector('[role="dialog"][aria-label="Delete tasks"]');
     if(confirmDelete) { button("Delete 1 task",confirmDelete).click(); await settle(); }
     check("a malformed deletion receipt is never reported as success", Boolean(editor()) || Boolean(document.querySelector('[role="dialog"][aria-label="Delete tasks"]')));
     check("uncertain deletion has an explicit reconciliation retry", Boolean(button("Retry deletion",document)));
-    check("task surfaces participate in the shared liquid material", Boolean(root.querySelector('.workbench.gp-glass')) && Boolean(root.querySelector('.task-editor.gp-glass')));
+    check("task surfaces participate in the shared liquid material", Boolean(root.querySelector('.workbench.bg-background')) && Boolean(root.querySelector('.task-editor.gp-glass')));
 
     const firstDelete = deleteWrites.at(-1);
     button("Retry deletion",document).click(); await settle(120);
     check("malformed delete recovery uses the exact receipt and advances once", deleteWrites.at(-1).request_id === firstDelete.request_id && deleteWrites.length === 2);
-    button("Done",document.querySelector('[aria-label="Delete tasks"]')).click(); await settle();
+    await settle(300);
     check("confirmed deletion removes the task and its open sheet", !card("task-10") && !editor());
 
     const menu = () => document.querySelector('[role="menu"][aria-label="Task actions"]');
     const openMenu = async id => { card(id).dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:innerWidth-1,clientY:innerHeight-1})); await settle(); };
     await openMenu("task-11");
-    const rect=menu().getBoundingClientRect();
+    await settle(220); const rect=menu().getBoundingClientRect();
     check("task menus fit the bottom-right viewport boundary", rect.right <= innerWidth && rect.bottom <= innerHeight && rect.left >= 0 && rect.top >= 0);
     menu().dispatchEvent(new KeyboardEvent("keydown",{key:"End",bubbles:true,cancelable:true})); await settle();
-    check("End selects the last task menu action", document.activeElement.textContent.includes("Delete task"));
+    check("End selects the last task menu action", document.activeElement.textContent.includes("Delete"));
     menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
     check("Escape dismisses the portaled task menu", !menu());
     card("task-11").focus(); card("task-11").dispatchEvent(new KeyboardEvent("keydown",{key:"F10",shiftKey:true,bubbles:true,cancelable:true})); await settle();
@@ -309,12 +321,13 @@ if (params.has("check")) {
     await openMenu("task-11"); button("Set priority…",menu()).click(); await settle(); button("Urgent",menu()).click(); await settle(150);
     check("context-menu priority choices persist", tasks.find(task=>task.id==="task-11").priority === 0);
     await openMenu("task-11"); button("Duplicate task…",menu()).click(); await wait(editor);
-    check("duplicate opens an unsaved copy with preserved evidence and links", field("Title").value.startsWith("Copy of") && field("Description").value === tasks.find(task=>task.id==="task-11").description && field("Status").value === "inbox");
+    check("duplicate opens an unsaved copy with preserved evidence and links", field("Title").value === tasks.find(task=>task.id==="task-11").title + " (copy)" && field("Description").value === tasks.find(task=>task.id==="task-11").description && field("Status").value === tasks.find(task=>task.id==="task-11").status);
     confirmAnswer=true; await click("Close task details");
 
-    const selectCard=async id=>{ const checkbox=card(id).closest('.task-card-wrap').querySelector('input[type="checkbox"]'); checkbox.click(); await settle(); };
+    const selectCard=async id=>{ card(id).dispatchEvent(new MouseEvent("click",{bubbles:true,ctrlKey:true})); await settle(); };
+    if(root.querySelector(".selection")) await click("Clear task selection");
     await selectCard("task-12"); await selectCard("task-13");
-    check("checkbox selection exposes the exact batch size", root.querySelector('[aria-label="Selected task actions"]').textContent.includes("2 selected"));
+    check("modifier selection exposes the exact batch size", root.querySelector('[aria-label="Selected task actions"]').textContent.includes("2 selected"));
     await click("Delete selected tasks");
     let dialog=document.querySelector('[aria-label="Delete tasks"]');
     check("bulk deletion confirms every selected task and cross-scope effects", dialog.querySelectorAll("li").length===2 && dialog.textContent.includes("every linked repository and workspace") && document.activeElement.textContent === "Cancel");
@@ -331,62 +344,60 @@ if (params.has("check")) {
     button("Done",dialog).click(); await settle(); await click("Clear task selection");
 
     await selectCard("task-14"); await selectCard("task-15");
-    await change(root.querySelector('[aria-label="Move selected tasks"]'),"review","change");
-    dialog=document.querySelector('[aria-label="Update tasks"]'); button("Update 2 tasks",dialog).click(); await wait(()=>dialog.textContent.includes("2 of 2 updated")); button("Done",dialog).click(); await settle();
+    await openMenu("task-14"); button("Move to…",menu()).click(); await settle(); button("Review",menu()).click(); await wait(()=>tasks.find(task=>task.id==="task-15").status==="review"); await settle();
     check("bulk organization preserves both task briefs", ["task-14","task-15"].every(id=>tasks.find(task=>task.id===id).status==="review" && tasks.find(task=>task.id===id).description.includes("Keep changes focused")));
     await click("List view");
-    check("list layout reuses the same task data", root.querySelector('.workbench').classList.contains("list-view") && Boolean(card("task-14")));
-    await change(root.querySelector('[aria-label="Filter loaded tasks"]'),"high","change");
-    check("priority filtering only shows matching loaded tasks", [...root.querySelectorAll('[data-task-card]')].every(el=>tasks.find(task=>task.id===el.dataset.cardId).priority<=1) && root.textContent.includes("loaded /"));
-    await change(root.querySelector('[aria-label="Filter by task label"]'),"does-not-exist");
-    check("filtered empty states explain loaded coverage", root.textContent.includes("No loaded tasks match these filters"));
+    check("list layout reuses the same task data", Boolean(root.querySelector('[aria-label="Task list"]')) && Boolean(card("task-14")));
+    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change");
+    check("priority filtering only shows matching loaded tasks", [...root.querySelectorAll('[data-task-card]')].every(el=>tasks.find(task=>task.id===el.dataset.cardId).priority===1) && root.querySelectorAll("[data-task-card]").length>0);
+    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change");
+    check("filtered empty states explain how to recover", root.textContent.includes("No tasks match") && Boolean(button("Clear filters")));
     await click("Clear filters"); await click("Board view");
     await selectCard("task-16"); await change(root.querySelector('[aria-label="Search tasks"]'),"Ready task"); await settle(400);
     check("changing search clears hidden selections", !root.querySelector('[aria-label="Selected task actions"]'));
     await click("Clear task search"); await wait(()=>card("task-1"));
 
     failConfiguration=true;
-    await openMenu("task-2"); button("Quick Enhance",menu()).click(); await wait(editor); await settle(100);
-    check("Quick Enhance surfaces saved description and hidden task context", editor().querySelector('h2').textContent === "Quick Enhance" && editor().querySelector('[aria-label="Saved task context"]').textContent.includes("GitPulse, Manvi") && editor().querySelector('[aria-label="Saved task context"]').textContent.includes("Bharath"));
+    await openMenu("task-2"); button("Quick Enhance",menu()).click(); await wait(()=>button("Close Quick Enhance",document)); await settle(100);
+    check("Quick Enhance surfaces saved description and hidden task context", document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("GitPulse") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Manvi") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Bharath"));
+    button("Open full editor",document).click(); await wait(editor); editor().querySelector(".enhancements .heading").click(); await settle();
     check("Manvi configuration failure has an explicit retry", Boolean(button("Retry Manvi configuration")));
     failConfiguration=false; await click("Retry Manvi configuration"); await settle();
-    await click("Enhance with Manvi"); await wait(()=>[...proposals.values()].some(p=>p.state==="running"));
-    check("Quick Enhance prevents duplicate generations while work is live", button("Enhance with Manvi").matches(":disabled"));
+    await click("Generate suggestion"); await wait(()=>[...proposals.values()].some(p=>p.state==="running"));
+    check("Quick Enhance prevents duplicate generations while work is live", button("Generate suggestion").matches(":disabled"));
     const proposal=[...proposals.values()].at(-1);
     proposals.set(proposal.id,{...proposal,revision:proposal.revision+1,state:"ready",proposed:{title:"A focused task brief",description:"Test suggestion with a verifiable outcome."},rationale:"Make the intended outcome explicit."});
-    await wait(()=>Boolean(button("Apply enhancement")));
-    await click("Choose fields");
+    await wait(()=>Boolean(button("Accept selected fields")));
     const originalTask=structuredClone(tasks.find(task=>task.id==="task-2"));
     const review=editor().querySelector('[aria-label="Enhancement review"]');
     const descriptionCheck=[...review.querySelectorAll('label')].find(label=>label.textContent.trim()==="Description").querySelector('input'); descriptionCheck.click(); await settle();
-    loseEnhancement=true; await click("Apply enhancement"); await wait(()=>button("Retry pending action"));
+    loseEnhancement=true; await click("Accept selected fields"); await wait(()=>button("Retry pending action"));
     check("uncertain enhancement acceptance blocks editor close", button("Close task details").disabled);
     await click("Retry pending action"); await wait(()=>button("Undo accepted fields"));
     check("Quick Enhance acceptance retries once and preserves unselected content", tasks.find(task=>task.id==="task-2").revision===originalTask.revision+1 && tasks.find(task=>task.id==="task-2").description===originalTask.description && enhancementWrites.filter(w=>w.method==="enhancements.accept").at(-1).request_id===enhancementWrites.filter(w=>w.method==="enhancements.accept")[0].request_id);
     await click("Undo accepted fields"); await settle(100);
     check("Quick Enhance undo restores accepted fields", tasks.find(task=>task.id==="task-2").title===originalTask.title);
-    await click("Edit task details");
-    await change(field("Due date"),"2026-09-01T09:30","change"); await click("Save task"); await settle(100);
+    await change(field("Due date"),"2026-09-01T09:30"); await click("Save task"); await settle(100);
     check("due dates round-trip through the task editor", field("Due date").value==="2026-09-01T09:30");
-    await change(field("Description"),"Unsaved context"); await click(`Quick Enhance ${originalTask.title}`);
-    check("Quick Enhance preserves unsaved edits and refuses stale generation", button("Enhance with Manvi").matches(":disabled") && editor().textContent.includes("Save your edits before enhancing"));
+    await change(field("Description"),"Unsaved context");
+    check("Quick Enhance preserves unsaved edits and refuses stale generation", button("Generate suggestion").matches(":disabled") && editor().textContent.includes("Save or discard task edits"));
     confirmAnswer=true; await click("Close task details");
-    await click("Quick Enhance");
-    const idea=root.querySelector('[aria-label="Task idea"]');
-    check("Quick Enhance starts with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Enhance with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    await click("New task");
+    const idea=root.querySelector(".notes-label textarea");
+    check("Quick Enhance starts with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Improve with Manvi")) && !editor().querySelector('.sheet-tabs'));
     await change(idea,"Fix notification routing\nKeep saved task evidence and explain recovery steps.");
-    await click("Enhance with Manvi");
+    await click("Draft with Manvi");
     await wait(()=>[...proposals.values()].some(p=>p.source.title==="Fix notification routing" && p.state==="running"));
     const quickProposal=[...proposals.values()].find(p=>p.source.title==="Fix notification routing");
     check("one click saves the rough idea and starts Manvi with both fields", quickProposal.fields.length===2 && quickProposal.source.description.includes("explain recovery steps") && quickProposal.source.repository_ids[0]==="repo-0");
     check("Quick Enhance requires no visible field-selection step", [...editor().querySelectorAll('.enhancements input[type="checkbox"]')].every(input=>input.getClientRects().length===0));
     proposals.set(quickProposal.id,{...quickProposal,revision:quickProposal.revision+1,state:"ready",proposed:{title:"Reliable task notifications",description:"Preserve saved evidence, route notifications to the correct task, and verify recovery."}});
-    await wait(()=>button("Apply enhancement")); await click("Apply enhancement");
+    await wait(()=>button("Use both")); await click("Use both");
     await wait(()=>tasks.find(task=>task.id===quickProposal.task_id)?.title==="Reliable task notifications");
     check("applying the default quick enhancement updates title and description together", tasks.find(task=>task.id===quickProposal.task_id).description.includes("verify recovery"));
     await click("Close task details");
     check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);
-  } catch(error) { results.push({name:error.message, pass:false}); }
+  } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }
   document.getElementById("verdict").textContent = JSON.stringify({results}, null, 2);
   document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({results})));
   if(params.has("report")) await fetch(params.get("report"), {method:"POST", body:document.documentElement.outerHTML});

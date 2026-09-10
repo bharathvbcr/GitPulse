@@ -32,10 +32,10 @@
 
   function fit() {
     if (!menuEl) return;
-    const rect = menuEl.getBoundingClientRect();
-    const next = clampMenuPosition(x, y, rect.width, rect.height, window.innerWidth, window.innerHeight);
-    left = next.left;
-    top = next.top;
+    // Layout dimensions remain stable while the opening animation scales the menu.
+    const next = clampMenuPosition(x, y, menuEl.offsetWidth, menuEl.offsetHeight, window.innerWidth - 8, window.innerHeight - 8);
+    left = Math.max(8, next.left);
+    top = Math.max(8, next.top);
   }
 
   onMount(() => {

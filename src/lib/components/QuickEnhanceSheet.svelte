@@ -224,6 +224,7 @@
         <div>
           <h3 class="text-[11px] font-semibold uppercase tracking-wide text-textMuted mb-1">Task</h3>
           <p class="font-medium text-textPrimary wrap-break-word">{task.title}</p>
+          <p class="text-[11px] text-textMuted mt-0.5">Primary repository: {repoName(task.primary_repository_id) ?? task.primary_repository_id}</p>
           <p class="text-[11px] text-textMuted mt-0.5">Revision {task.revision} · {task.status.replace("_", " ")}</p>
         </div>
         <div class="space-y-2">

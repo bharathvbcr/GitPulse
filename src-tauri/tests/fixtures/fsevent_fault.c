@@ -1,5 +1,7 @@
 #include <CoreServices/CoreServices.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <stdlib.h>
 
 #define INTERPOSE(replacement, original) \
     __attribute__((used)) static struct { const void *new_fn; const void *old_fn; } \
@@ -40,7 +42,19 @@ INTERPOSE(probe_waiting, CFRunLoopIsWaiting);
 #elif defined(GITPULSE_FAULT_SOURCE)
 static CFRunLoopSourceRef probe_source(CFAllocatorRef allocator, CFIndex order,
     CFRunLoopSourceContext *context) {
-    return NULL;
+    // Fail only the callback-only source used by notify for sticky shutdown.
+    // Core Foundation and FSEvents also allocate sources while starting up.
+    if (context && context->version == 0 && !context->info && !context->retain &&
+        !context->release && !context->copyDescription && !context->equal &&
+        !context->hash && !context->schedule && !context->cancel && context->perform) {
+        static const char evidence[] = "GITPULSE_SHUTDOWN_SOURCE_FAULT\n";
+        write(STDERR_FILENO, evidence, sizeof(evidence) - 1);
+        return NULL;
+    }
+    typedef CFRunLoopSourceRef (*CreateSource)(CFAllocatorRef, CFIndex, CFRunLoopSourceContext *);
+    CreateSource original = (CreateSource)dlsym(RTLD_NEXT, "CFRunLoopSourceCreate");
+    if (!original || original == probe_source) abort();
+    return original(allocator, order, context);
 }
 INTERPOSE(probe_source, CFRunLoopSourceCreate);
 

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { crossfade } from "svelte/transition";
+  import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
@@ -34,6 +36,8 @@
   import Skeleton from "./Skeleton.svelte";
 
   let { repositoryPath = null, active = true }: { repositoryPath?: string | null; active?: boolean } = $props();
+  const macos = isMacOS();
+  const [sendScope, receiveScope] = crossfade(liquidSelection());
   let scope = $state<Scope>({ kind: "global" });
   let repositories = $state<Repository[]>([]), workspaces = $state<WorkspaceCard[]>([]);
   let repositoryCursor = $state<string | null>(null), workspaceCursor = $state<string | null>(null);
@@ -75,7 +79,6 @@
   let boardEl: HTMLDivElement | undefined = $state();
   let revision = 0; let disposed = false; let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
-  const macos = isMacOS();
   const openTabRefs = $derived($repoStore.openTabs.map((tab) => ({ path: tab.path, label: tab.label })));
   const catalogIds = $derived(repositories.map((repo) => repo.id));
   const selectedForMenu = $derived(pickerSelectionIds(scope.kind, workspaceMemberIds, catalogIds));
@@ -629,14 +632,17 @@
   }
 </script>
 
+{#snippet scopeSelection(selected: boolean)}
+  {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
+{/snippet}
 <svelte:window onkeydown={onBoardKeydown} />
-<div bind:this={boardEl} class="workbench" class:is-dragging={drag !== null} data-testid="task-board">
+<div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} data-testid="task-board">
   {#if !repositoryPath}
-    <nav class="navigator gp-glass" aria-label="Task scopes">
+    <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
       <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></div>
-      <button type="button" class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>All</button>
+      <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
       {#each [...visibleWorkspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
-        <div class="nav-row"><button type="button" class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        <div class="nav-row"><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
       {/each}
       {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
       {#if workspaces.some((group) => group.archived)}
@@ -657,12 +663,14 @@
           </div>
         {/if}
       </div>
-      {#each repositories as repo (repo.id)}<button type="button" class:selected={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>{repo.name}</button>{/each}
+      {#each repositories as repo (repo.id)}<button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>
+        {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}</span>
+      </button>{/each}
       {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
     </nav>
   {/if}
   <main class="board-main">
-    <header>
+    <header class="gp-glass">
       <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
       <div class="actions">
         <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
@@ -679,7 +687,7 @@
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
-        <button type="button" class="gp-btn-primary" onclick={() => createTask()} disabled={!initialized || !repositories.length} aria-label="New task">New task</button>
+        <button type="button" class="gp-btn-primary" onclick={() => createTask()} disabled={!initialized || !repositories.length || (scope.kind === "workspace" && !workspaceMemberIds?.length)} aria-label="New task">New task</button>
         {#if initialized && !repositories.length}
           {#if emptyAddLabel}
             <button type="button" class="hint-action" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
@@ -721,7 +729,7 @@
       </div>
     {/if}
     {#if selected.size > 0}
-      <div class="selection gp-glass" role="status">
+      <div class="selection gp-glass" role="status" aria-label="Selected task actions">
         <span>{selected.size} selected</span>
         {#if selected.size === 1}
           <button type="button" class="gp-btn" onclick={() => { const id = [...selected][0]; if (id) void openTask(id); }}><SquarePen size={12} /> Open</button>
@@ -739,9 +747,11 @@
     <div class="sr-only" role="status" aria-live="polite">{announce}</div>
     {#if !initialized && loading}
       <div class="pad"><Skeleton variant="card" count={4} /></div>
-    {:else if initialized && total === 0 && !filtering}
+    {:else if initialized && error && loadedKey !== boardKey}
+      <EmptyState icon={Inbox} title="Tasks unavailable" hint="Retry to load this scope." action={{label:"Retry loading tasks",onClick:()=>void loadBoard(),variant:"secondary"}} />
+    {:else if initialized && !loading && total === 0 && !filtering}
       <EmptyState icon={Inbox} title="No tasks yet" hint="Create a task in this scope. Cards stay on this board until you delete them." action={repositories.length ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
-    {:else if initialized && listCards.length === 0 && filtering}
+    {:else if initialized && !loading && listCards.length === 0 && filtering}
       <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
       <div class="list" data-testid="task-columns" aria-busy={loading || moving} aria-label="Task list">
@@ -786,7 +796,7 @@
               <span>{STATUS_LABELS[status]}</span>
               <span class="column-meta">
                 <span>{columns[status]?.total ?? "—"}</span>
-                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} disabled={!initialized || !repositories.length} onclick={() => void createTask(status)}><Plus size={11} /></button>
+                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} disabled={!initialized || !repositories.length || (scope.kind === "workspace" && !workspaceMemberIds?.length)} onclick={() => void createTask(status)}><Plus size={11} /></button>
               </span>
             </div>
             <div class="cards">
@@ -796,7 +806,7 @@
                 {#if insertBefore(status, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
                 <button
                   type="button"
-                  class="card gp-card"
+                  class="card bg-surface"
                   class:dragging={drag?.card.id === card.id}
                   class:selected={selected.has(card.id)}
                   data-testid="task-card"
@@ -841,7 +851,7 @@
     {/if}
   </main>
   {#if drag}
-    <div class="ghost gp-card shadow-float" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
+    <div class="ghost gp-glass bg-surface shadow-float" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
   {/if}
   {#if menu}
     <TaskContextMenu
@@ -865,19 +875,22 @@
       onOpenEditor={(task) => { enhanceId = null; taskEditor = { value: task }; }}
     />
   {/if}
-  {#if taskEditor}{#key taskEditor}<TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={taskEditor.value} seed={taskEditor.seed ?? null} initialStatus={taskEditor.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
+  {#if taskEditor}{#key taskEditor}<TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={taskEditor.value} seed={taskEditor.seed ?? null} initialStatus={taskEditor.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : scope.kind === "workspace" ? workspaceMemberIds?.[0] ?? "" : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
   {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor bind:this={workspaceHandle} value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
 {#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
 
 <style>
-  .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));background:transparent;overflow:hidden}
+  .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
   .workbench.is-dragging{cursor:grabbing;user-select:none}
   .navigator{width:188px;flex-shrink:0;border-right:1px solid rgb(var(--c-border) / 0.65);padding:10px 8px;overflow:auto}
   .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;background:transparent}
   .navigator button:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
+  .navigator.gp-liquid-tabs{padding:10px 8px}
+  .navigator.gp-liquid-tabs button.selected{background:transparent}
+  .navigator .gp-seg-btn > span:not(:global(.gp-liquid-selection)){display:block;overflow:hidden;text-overflow:ellipsis}
   .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;color:rgb(var(--c-text-muted));font-size:10px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
   .nav-heading > button,.icon,.nav-row>button:last-child{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
   .add-menu{position:absolute;right:0;top:calc(100% + 4px);width:min(260px,70vw);max-height:min(16rem,50vh);overflow:auto}
@@ -905,10 +918,11 @@
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
   .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}
-  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);padding:8px 10px;background:transparent}
+  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);padding:8px 10px;}
   .column-meta{display:flex;align-items:center;gap:4px;color:rgb(var(--c-text-muted));font-weight:400}
   .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
-  .card,.row{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;cursor:grab;touch-action:none;user-select:none;background:rgb(var(--c-surface) / 0.55)}
+  .card{border:1px solid rgb(var(--c-border) / 0.65);border-radius:10px}
+  .card,.row{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;cursor:grab;touch-action:none;user-select:none}
   .row{cursor:pointer;display:grid;grid-template-columns:7rem minmax(0,1fr) auto auto auto;gap:8px;align-items:center}
   .card:focus-visible,.row:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
   .card.dragging{opacity:.35;cursor:grabbing}

@@ -48,18 +48,18 @@
 </script>
 
 <section class="agent-decisions" aria-label="Agent requests">
-  <div class="heading"><h4>Agent requests</h4><button type="button" onclick={() => refresh()} disabled={loading || busy || !!pending}>Refresh requests</button></div>
+  <div class="heading"><h4>Agent requests</h4><button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading || busy || !!pending}>Refresh requests</button></div>
   <p>Decisions apply to the exact request below. Saving a decision does not prove that the provider received it or accept the task.</p>
   <p>{rows.length} shown / {total} requests</p>
   {#if error}<p role="alert">{error}</p>{/if}
-  {#if pending}<p role="status">The save result is uncertain. Retry this exact decision before choosing another.</p><button type="button" onclick={() => { if (pending) void decide(pending.source, pending.input.decision); }} disabled={busy}>Retry saved decision</button>{/if}
+  {#if pending}<p role="status">The save result is uncertain. Retry this exact decision before choosing another.</p><button class="gp-btn" type="button" onclick={() => { if (pending) void decide(pending.source, pending.input.decision); }} disabled={busy}>Retry saved decision</button>{/if}
   {#if !rows.length}<p>{loading ? "Loading requests…" : "No structured requests recorded. Terminal handoffs continue to ask in the provider’s terminal."}</p>{/if}
   {#each rows as item (item.id)}
     <article>
       <strong>{item.kind === "permission" ? "Permission request" : "Question"} · {labels[item.state]}</strong>
       <p>Repository {item.repository_id} · saved task revision {item.source_revision} · policy revision {item.policy_revision}</p>
       <p>{item.cwd}</p>
-      <textarea class="payload" readonly rows="8" aria-label="Complete agent request" value={item.payload}></textarea>
+      <textarea class="payload gp-field gp-field-multi" readonly rows="8" aria-label="Complete agent request" value={item.payload}></textarea>
       <details><summary>Request identity</summary><p>Run {item.run_id} · session {item.session_id}</p><p>Provider task {item.provider_thread_id} · turn {item.provider_turn_id} · request {item.protocol_request_id}</p><p>SHA-256 {item.payload_digest}</p></details>
       <p>Expires {new Date(item.expires_at * 1000).toLocaleString()}</p>
       {#if item.reason}<p>{item.reason}</p>{/if}
@@ -69,24 +69,24 @@
           {#if item.kind === "question"}
             {#if questions[item.id]?.length}
               {#each questions[item.id] as question (question.id)}
-                <label>{question.question}<textarea value={structured[item.id]?.[question.id] ?? ""} oninput={(event) => { structured[item.id] = {...structured[item.id], [question.id]:event.currentTarget.value}; }} maxlength="4096" rows="3"></textarea></label>
+                <label>{question.question}<textarea class="gp-field gp-field-multi" value={structured[item.id]?.[question.id] ?? ""} oninput={(event) => { structured[item.id] = {...structured[item.id], [question.id]:event.currentTarget.value}; }} maxlength="4096" rows="3"></textarea></label>
                 {#each question.options as option}
-                  <button type="button" title={option.description} onclick={() => { structured[item.id] = {...structured[item.id], [question.id]:option.label}; }}>{option.label}</button>
+                  <button class="gp-btn" type="button" title={option.description} onclick={() => { structured[item.id] = {...structured[item.id], [question.id]:option.label}; }}>{option.label}</button>
                 {/each}
               {/each}
-              <button type="button" onclick={() => decide(item, "answer")} disabled={!questions[item.id].every((q) => structured[item.id]?.[q.id]?.trim())}>Save answers</button>
+              <button class="gp-btn" type="button" onclick={() => decide(item, "answer")} disabled={!questions[item.id].every((q) => structured[item.id]?.[q.id]?.trim())}>Save answers</button>
             {:else}
-              <label>Answer<textarea bind:value={answers[item.id]} maxlength="16384" rows="3"></textarea></label><button type="button" onclick={() => decide(item, "answer")} disabled={!answers[item.id]?.trim()}>Save answer</button>
+              <label>Answer<textarea class="gp-field gp-field-multi" bind:value={answers[item.id]} maxlength="16384" rows="3"></textarea></label><button class="gp-btn" type="button" onclick={() => decide(item, "answer")} disabled={!answers[item.id]?.trim()}>Save answer</button>
             {/if}
-          {:else}<button type="button" onclick={() => decide(item, "allow_once")}>Allow once</button>{/if}
-          <button type="button" onclick={() => decide(item, "deny")}>Deny request</button>
+          {:else}<button class="gp-btn" type="button" onclick={() => decide(item, "allow_once")}>Allow once</button>{/if}
+          <button class="gp-btn" type="button" onclick={() => decide(item, "deny")}>Deny request</button>
         </fieldset>
       {:else if item.state === "pending"}<p>This request expired or its target changed. Return to the provider for a current request.</p>{/if}
     </article>
   {/each}
-  {#if cursor}<button type="button" onclick={() => refresh(true)} disabled={loading || busy || !!pending || rows.length >= 180}>Load more requests</button>{/if}
+  {#if cursor}<button class="gp-btn" type="button" onclick={() => refresh(true)} disabled={loading || busy || !!pending || rows.length >= 180}>Load more requests</button>{/if}
 </section>
 
 <style>
-  .agent-decisions{margin:12px 0;padding:12px;border:1px solid rgb(var(--c-border));border-radius:8px}.heading{display:flex;align-items:center;justify-content:space-between;gap:8px}h4{margin:0}p{color:rgb(var(--c-text-muted));line-height:1.5;overflow-wrap:anywhere}article{border-top:1px solid rgb(var(--c-border));padding:12px 0}.payload{font-family:monospace;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:rgb(var(--c-bg));padding:10px;border-radius:6px;font-size:11px}button{font:inherit;padding:6px 9px;border:1px solid rgb(var(--c-border));border-radius:6px;margin:4px 6px 4px 0}button:disabled{opacity:.5}fieldset{padding:0;border:0}label{display:grid;gap:6px}textarea{font:inherit;width:100%;color:inherit;background:rgb(var(--c-bg));border:1px solid rgb(var(--c-border));border-radius:6px;padding:8px}summary{cursor:pointer}[role=alert]{color:#dc6565}
+  .agent-decisions{margin:12px 0;padding:12px;border:1px solid rgb(var(--c-border));border-radius:8px}.heading{display:flex;align-items:center;justify-content:space-between;gap:8px}h4{margin:0}p{color:rgb(var(--c-text-muted));line-height:1.5;overflow-wrap:anywhere}article{border-top:1px solid rgb(var(--c-border));padding:12px 0}.payload{font-family:monospace;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--mac-fill-bg,rgb(var(--c-bg)));padding:10px;border-radius:6px;font-size:11px}button{font:inherit;padding:6px 9px;border:1px solid rgb(var(--c-border));border-radius:6px;margin:4px 6px 4px 0}button:disabled{opacity:.5}fieldset{padding:0;border:0}label{display:grid;gap:6px}textarea{font:inherit;width:100%;color:inherit;background:var(--mac-fill-bg,rgb(var(--c-bg)));border:1px solid rgb(var(--c-border));border-radius:6px;padding:8px}summary{cursor:pointer}[role=alert]{color:#dc6565}
 </style>

@@ -64,26 +64,26 @@
     catch (cause) { error = explainError(cause); } finally { saving = false; }
   }
 </script>
-<aside class="workspace-editor gp-glass" aria-label="Workspace settings">
-  <header><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={close} disabled={saving || adding || confirming || pending !== null} type="button" aria-label="Close workspace settings">✕</button></header>
+<aside class="workspace-editor gp-glass bg-surface" aria-label="Workspace settings">
+  <header class="gp-glass shadow-float"><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={close} disabled={saving || adding || confirming || pending !== null} type="button" aria-label="Close workspace settings">✕</button></header>
   <form onsubmit={(e) => { e.preventDefault(); void save(); }}>
     <fieldset disabled={saving || adding || confirming || pending !== null}>
-      <label>Name<input bind:value={draft.name} required maxlength="300" /></label>
-      <label>Description<textarea bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
-      <label>Icon<input bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>
-      <label>Color<input bind:value={draft.color} maxlength="64" placeholder="Optional color name" /></label>
+      <label>Name<input class="gp-field" bind:value={draft.name} required maxlength="300" /></label>
+      <label>Description<textarea class="gp-field" bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
+      <label>Icon<input class="gp-field" bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>
+      <label>Color<input class="gp-field" bind:value={draft.color} maxlength="64" placeholder="Optional color name" /></label>
       <SettingToggle label="Pinned" description="Keep this workspace at the top of the navigator." checked={draft.pinned} onchange={(next) => { draft.pinned = next; }} />
       <SettingToggle label="Archived" description="Hide this workspace unless Show archived is on." checked={draft.archived} onchange={(next) => { draft.archived = next; }} />
-      <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><input type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => { draft.repository_ids = e.currentTarget.checked ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
+      <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><input class="gp-field" type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => { draft.repository_ids = e.currentTarget.checked ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
       {#if addable.length}
         <p>Open in GitPulse</p>
         {#each addable as tab (tab.path)}
           <label class="check" title={tab.path}>
-            <input type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([tab.path]); }} />
+            <input class="gp-field" type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([tab.path]); }} />
             {tab.label}<span class="open-mark">Open</span>
           </label>
         {/each}
-        {#if addable.length > 1}<button type="button" class="open-add" disabled={adding} onclick={() => void addOpenPaths(addable.map((tab) => tab.path))}>Add all open</button>{/if}
+        {#if addable.length > 1}<button type="button" class="open-add gp-btn" disabled={adding} onclick={() => void addOpenPaths(addable.map((tab) => tab.path))}>Add all open</button>{/if}
       {/if}
       {#each draft.repository_ids.filter((id) => !known.some((r) => r.id === id)) as missing (missing)}<p>Linked repository {missing} (not on this page)</p>{/each}</fieldset>
     </fieldset>
@@ -93,5 +93,7 @@
   </form>
 </aside>
 <style>
-  .workspace-editor{width:min(380px,45vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:18px;overflow:auto;background:transparent;font-size:12px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
+  form{padding:0 18px 18px}
+
+  .workspace-editor{width:min(380px,45vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:0;overflow:auto;font-size:12px}header{position:sticky;top:0;z-index:1;padding:16px 18px;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
 </style>

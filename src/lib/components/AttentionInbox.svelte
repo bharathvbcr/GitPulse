@@ -52,11 +52,11 @@
   }
 </script>
 
-<section class="inbox gp-glass" aria-label="Inbox">
+<section class="inbox gp-glass bg-surface" aria-label="Inbox">
   <header>
     <strong>Inbox</strong>
     <div class="controls">
-      <select aria-label="Inbox filter" bind:value={filter}><option value="active">Active</option><option value="unread">Unread</option><option value="all">All</option></select>
+      <select class="gp-select" aria-label="Inbox filter" bind:value={filter}><option value="active">Active</option><option value="unread">Unread</option><option value="all">All</option></select>
       <button type="button" class="gp-btn" onclick={() => load()} disabled={busy}>Refresh</button>
     </div>
   </header>
@@ -79,7 +79,7 @@
 </section>
 
 <style>
-  .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px;background:transparent;font-size:12px;color:rgb(var(--c-text))}
+  .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:12px;color:rgb(var(--c-text))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}
   .entries{max-height:280px;overflow:auto;margin-top:8px}

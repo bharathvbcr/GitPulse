@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { bounded } from "../workbench/taskActions";
   import { Clipboard } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
@@ -24,7 +24,7 @@
   const initial = untrack(() => ({ value, seed, primary, home, initialStatus }));
   let current = $state(initial.value);
   let draft = $state<TaskDraft>(initial.value ? taskDraft(initial.value) : {
-    title: "", description: "", kind: "feature", status: initial.initialStatus, priority: 1, severity: null,
+    title: "", description: "", kind: "feature", status: initial.initialStatus, priority: 2, severity: null,
     owner: null, due_at: null, labels: [], acceptance_criteria: [], repository_ids: initial.primary ? [initial.primary] : [],
     primary_repository_id: initial.primary, home_workspace_id: initial.home, position: Date.now(), locked_fields: [],
     ...initial.seed,
@@ -50,6 +50,11 @@
   let reloading = $state(false);
   let sheet: HTMLElement;
   let disposed = false;
+  onMount(() => {
+    const opener = document.activeElement;
+    if (initial.value) sheet.querySelector<HTMLInputElement>('input[name="task-title"]')?.focus();
+    return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus(); };
+  });
   onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
   const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim()));
   const id = initial.value?.id ?? newID();
@@ -110,7 +115,7 @@
       const saved = await bounded(putTask(pending));
       if (saved.id !== id || saved.revision !== Number(pending.expected_revision) + 1) throw new WorkbenchError("protocol_error", "Task update confirmation does not match the request.");
       if (disposed) return null;
-      current = saved; draft = taskDraft(saved); dirty = false; pending = null;
+      current = saved; draft = taskDraft(saved); criteria = saved.acceptance_criteria.join("\n"); labels = saved.labels.join(", "); dirty = false; pending = null;
       note = "Saved"; onSaved(saved);
       return saved;
     } catch (cause) {
@@ -216,11 +221,11 @@
       }
     }} />
 
-<aside bind:this={sheet} class="task-editor gp-glass" aria-label={current ? "Task details" : "New task"}>
-  <header>
+<aside bind:this={sheet} class="task-editor gp-glass bg-surface" aria-label={current ? "Task details" : "New task"}>
+  <header class="gp-glass shadow-float">
     <div>
       <h2>{current ? "Task details" : "New task"}</h2>
-      <small>{current ? `Revision ${current.revision}` : "Describe the work, then save."}</small>
+      <small>{dirty ? "Unsaved changes" : current ? `Revision ${current.revision}` : "Describe the work, then save."}</small>
     </div>
     <div class="header-actions">
       <button type="button" class="gp-btn" onclick={() => void copyForAgent()} disabled={!copyable || copying || saving || enhancementBusy || pending !== null} aria-label="Copy task for an AI agent" title={copyable ? "Copy a packet an AI agent can paste" : "Add a title, description, or notes first"}>
@@ -232,6 +237,7 @@
   <form
     onsubmit={(e) => { e.preventDefault(); void save(); }}
     oninput={() => { dirty = true; }}
+    onchange={() => { dirty = true; }}
 
   >
     <fieldset disabled={saving || pending !== null || pendingDelete !== null || enhancementBusy}>
@@ -299,7 +305,7 @@
     {#if pending}<p>The save result is uncertain. Retry the same write to reconcile it before editing further.</p>{/if}
     {#if pendingDelete}<p>The delete result is uncertain. Retry the same delete to reconcile it before editing further.</p>{/if}
     <footer>
-      <button class="gp-btn-primary" disabled={saving || adding || enhancementBusy || pendingDelete !== null || !draft.repository_ids.length} type="submit">{saving && !pendingDelete ? "Saving…" : pending ? "Retry save" : "Save task"}</button>
+      <button class="gp-btn-primary" disabled={saving || adding || enhancementBusy || pendingDelete !== null || !draft.repository_ids.length || (!pending && ((!draft.title.trim() && !notes.trim()) || !draft.kind.trim()))} type="submit">{saving && !pendingDelete ? "Saving…" : pending ? "Retry save" : "Save task"}</button>
       {#if current}
         <button type="button" class="gp-btn" onclick={reload} disabled={saving || enhancementBusy || pendingDelete !== null}>Reload saved</button>
         <button type="button" class="gp-btn-danger" onclick={remove} disabled={saving || adding || enhancementBusy || pending !== null}>{pendingDelete ? "Retry delete" : "Delete"}</button>
@@ -312,7 +318,9 @@
 </aside>
 
 <style>
+  form{padding:0 18px 18px}
+
   .enhancement-locks{margin:0 0 14px}
-  .task-editor{width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);background:transparent;overflow:auto;padding:18px;color:rgb(var(--c-text));display:flex;flex-direction:column}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{justify-content:space-between;margin-bottom:18px;position:sticky;top:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;flex:1;min-height:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-wrap:wrap;position:sticky;bottom:0;padding:10px 0 0;background:rgb(var(--c-surface) / 0.82);border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}
+  .task-editor{width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:auto;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;margin-bottom:18px;position:sticky;top:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;flex:1;min-height:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-wrap:wrap;position:sticky;bottom:0;padding:10px 0 0;background:rgb(var(--c-surface) / 0.82);border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}
 </style>

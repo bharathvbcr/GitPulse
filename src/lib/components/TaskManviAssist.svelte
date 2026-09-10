@@ -253,7 +253,7 @@
   {#if proposal?.rationale && ready}<p class="meta">{proposal.rationale}</p>{/if}
 
   <label class:flash={flash.includes("title")}>Title
-    <input class="gp-field" bind:value={title} required maxlength="300" placeholder="Or let Manvi draft this from your notes" />
+    <input class="gp-field" name="task-title" bind:value={title} required maxlength="300" placeholder="Or let Manvi draft this from your notes" />
   </label>
   {#if showTitleSuggestion}
     <div class="inline-suggestion">
