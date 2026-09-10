@@ -10,7 +10,7 @@ Ensure you have the following tools installed on your development machine:
 
 | Tool | Version | Why this floor |
 | --- | --- | --- |
-| **Node.js** | `22.x` or later | The version CI runs (`.github/workflows/ci.yml`). Vite 8 and Vitest 5 require modern Node releases; 22 is what release builds are verified against. |
+| **Node.js** | `22.x`, at least `22.12` | CI uses Node 22. The locked Vite/Vitest engines require at least 22.12 on that line; check `package-lock.json` before using another major. |
 | **Rust** | `stable`, edition 2021 | Needs the `clippy` and `rustfmt` components — CI fails on either. `rustup component add clippy rustfmt` |
 | **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `npm run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
 | **actionlint** | latest | Lints the GitHub Actions workflows in `npm run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
@@ -38,7 +38,7 @@ git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
 
 # 2. Install frontend dependencies
-npm install
+npm ci
 
 # 3. Point git at the repository's hooks (one-time, per clone)
 git config core.hooksPath .githooks
@@ -61,6 +61,17 @@ npm run tauri dev
 
 ---
 
+### Repository navigation
+
+From each checkout, run `devmap paths --json` and `devmap status --json`, then
+read the resolved `repo_map`. If the store or map is missing, run
+`devmap build --manifest` in that worktree and check status again. Generated
+state is not carried by Git. Follow [AGENTS.md](AGENTS.md) for DevMap and
+GitNexus navigation, impact and change checks; partial graph results do not
+replace the required verification.
+
+---
+
 ## 3. Running the Tests
 
 Agentic task brief coverage lives in `src/lib/workbench/briefs.test.ts` and the
@@ -79,7 +90,16 @@ store. Upstream `workbench_runs.rs` covers one-use claims, concurrent claim race
 capacity, uncertain lifecycle outcomes, rollback and migration. These checks do
 not launch a coding agent or qualify managed permission/recovery behavior.
 
-**One command runs everything CI runs:**
+Task organization and handoff helpers have adjacent tests under
+`src/lib/workbench/`: `taskCompose`, `taskOrganize`, `taskMenu`, `taskDelete`,
+`taskEnhance` and `taskActions.stress`. The documentation contracts can be run
+without a native build:
+
+```sh
+npm test -- scripts/architecture-docs-contract.test.ts scripts/documented-counts-contract.test.ts scripts/agent-guidance.test.ts
+```
+
+**The full local contributor gate:**
 
 ```sh
 npm run ci:local
@@ -159,7 +179,7 @@ flowchart TD
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (205 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `npm run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
-| `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so a schema-19 store cannot silently go dead again |
+| `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 54 contracts (989 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `npm run mcp:install` | Installs `gitpulse-mcp` onto PATH via `cargo install`, so the binary agent clients spawn is tracked and refreshable rather than a hand-placed copy |
@@ -261,12 +281,12 @@ GitPulse/
 
 ### Headless binaries
 
-The desktop app is not the only way into the control plane. Two binaries build
-from the same crate and share its modules, so neither can drift from what the
-app enforces:
+The desktop app is not the only way into the control plane. Three helper binaries build
+from the same crate and reuse its modules:
 
 | Binary | Shape | What it is for |
 | --- | --- | --- |
+| `gitpulse-hook` | Host hook JSON on stdin/stdout | Runs the shared hook dispatcher for agent integrations; failures yield no decision plus diagnostics, leaving the host permission flow in control. |
 | `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
 | `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
 

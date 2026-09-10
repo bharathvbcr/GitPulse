@@ -5,13 +5,13 @@ GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 own
 ```mermaid
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
-        Views["4 views + Fleet + terminal dock"]
+        Views["4 views + Tasks + Fleet + terminal dock"]
         Stores["Domain stores with injectable deps"]
         Canvas["GPU canvas graph"]
         Guards["Async cancellation guards"]
     end
     subgraph IPC["Tauri 2 IPC"]
-        Bridge["invoke('cmd_*') — 139 handlers, check:ipc"]
+        Bridge["invoke('cmd_*') — 205 handlers, check:ipc"]
     end
     subgraph Backend["Rust / Rayon"]
         Git["Git sandbox"]
@@ -30,7 +30,7 @@ flowchart TB
     Backend --> Local
 ```
 
-The 139-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `npm run check:ipc`.
+The 205-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `npm run check:ipc`.
 
 ## Layout
 
@@ -50,7 +50,7 @@ GitPulse/
     ├── harness/          MANVI policy gate
     ├── mcp/              read-only MCP surface
     ├── ledger/           durable WAL
-    └── bin/              gitpulse-mcp, gitpulsed
+    └── bin/              gitpulse-mcp, gitpulsed, gitpulse-hook
 ```
 
 There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/repos/persist.ts`, registered in `src/lib/views/viewRegistry.ts`, rendered from `App.svelte`. Adding a view means changing all three.
@@ -67,12 +67,25 @@ Fleet is swapped by **hiding, never unmounting**. Open state is a UI preference,
 | --- | --- | --- |
 | `gitpulse-mcp` | MCP JSON-RPC over stdio | **Read** the control plane. Never mutates git. |
 | `gitpulsed` | NDJSON, interval loop | **Write** attribution catch-up into the ledger when the GUI is closed. Serves no requests and never takes a lease. |
+| `gitpulse-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher; failures report no decision and leave host permissions in control. |
 
 ```sh
 gitpulsed --interval 300 /path/to/repo
 ```
 
 Catch-up is idempotent against a ledger watermark; interrupting a cycle is safe.
+
+## Profile tasks and workspaces
+
+Global, saved-workspace and repository boards share Manvi-owned task records.
+`cmd_workbench_request` bounds requests and runs storage off the UI thread; the
+`dc-store` workbench API owns schema, revisions, membership and receipts. These
+records are separate from read-only repository execution tasks and leases.
+
+Saved briefs bind revisions. Task editor copying distinguishes saved records from
+new unsaved drafts, and Manvi title/description proposals need selected acceptance.
+Terminal handoffs and managed Codex runs retain separate permission and lifecycle
+contracts. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
 ## Vendored crates
 

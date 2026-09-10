@@ -51,9 +51,9 @@ If you want a development build, see [[Development]]. Short version:
 ```sh
 git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
-npm install
+npm ci
 git config core.hooksPath .githooks
 npm run tauri dev
 ```
 
-Prerequisites: Node.js 22+, stable Rust, platform native toolchains (Xcode CLT / MSVC + WebView2 / WebKitGTK).
+Prerequisites: Node.js 22.x (22.12 or newer), stable Rust, platform native toolchains (Xcode CLT / MSVC + WebView2 / WebKitGTK).

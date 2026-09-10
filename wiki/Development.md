@@ -6,7 +6,7 @@ Canonical guide: [CONTRIBUTING.md](https://github.com/bharathvbcr/GitPulse/blob/
 
 | Tool | Version | Why |
 | --- | --- | --- |
-| Node.js | 22.x+ | What CI runs |
+| Node.js | 22.x, at least 22.12 | CI major, with the locked Vite/Vitest engine floor |
 | Rust | stable, edition 2021 | `clippy` + `rustfmt` required |
 | cargo-llvm-cov | latest | Rust LCOV for coverage floors |
 | actionlint | latest | Only local gate that reads `release.yml` before a tag |
@@ -29,7 +29,7 @@ cargo install cargo-llvm-cov --locked
 ```sh
 git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
-npm install
+npm ci
 git config core.hooksPath .githooks
 npm run tauri dev
 ```
@@ -38,13 +38,23 @@ The pre-push hook refuses a release tag that would publish the wrong tree. `rele
 
 Vite picks a free port from 5173 (then 5174–5193). Pin with `GITPULSE_DEV_PORT`.
 
+## Repository navigation
+
+Run `devmap paths --json` and `devmap status --json` from each checkout. Read the
+resolved `repo_map`; if its store or map is missing, run `devmap build --manifest`
+and check again. Generated state is local to that worktree. Follow the repository
+[agent guide](https://github.com/bharathvbcr/GitPulse/blob/main/AGENTS.md) for impact
+checks and incomplete-result handling.
+
 ## The gate
 
 ```sh
 npm run ci:local
 ```
 
-If that is green, `.github/workflows/ci.yml` and `coverage.yml` will be green on macOS, Linux, and Windows. Run it before opening a PR.
+Run it before opening a PR. It exercises this machine's toolchain; a local pass
+does not prove the macOS, Linux and Windows jobs. Check the remote CI and coverage
+results for the commit being reviewed or released.
 
 While iterating:
 
@@ -53,7 +63,7 @@ While iterating:
 | `npm test` | Vitest |
 | `npx vitest run src/lib/graph` | One directory |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust suite |
-| `npm run check` | svelte-check (TS 6) + tsgo (`tsconfig.node.json`) |
+| `npm run check` | svelte-check (TS 6 compatibility API) + stable TypeScript 7 `tsc` (`tsconfig.node.json`) |
 | `npm run check:ipc` | Rust `cmd_*` registry ↔ frontend `invoke()` |
 | `npm run check:vendor-schema` | Vendored store schema ↔ installed `devmap` CLI |
 | `npm run check:types` | serde structs ↔ TypeScript interfaces |

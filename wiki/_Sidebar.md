@@ -3,6 +3,7 @@
 * [[Installation]]
 * [[Getting Started]]
 * [[Views]]
+* [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md)
 * [[Keyboard Shortcuts]]
 * [[Troubleshooting]]
 

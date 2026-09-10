@@ -1,13 +1,15 @@
 # GitPulse Security Model & Policy
 
-GitPulse is architected from the ground up as a **100% local, zero-telemetry** developer desktop application.
+GitPulse is a **local-first, zero-telemetry** developer desktop application.
+Repository and task state stay in local stores. Git remotes, GitHub operations,
+optional tool installation and configured agent providers can use the network.
 
 ```mermaid
 flowchart TD
     subgraph Boundary["Security & Isolation Boundary"]
         Webview["Tauri Webview<br/>(Strict CSP: default-src 'self')"]
         IPCBoundary["Tauri IPC Seam<br/>(Policy-Checked Custom cmd_* Handlers)"]
-        LocalEngine["Rust Core Sandbox<br/>(Confined to Open Repository)"]
+        LocalEngine["Rust Core<br/>(Validated paths and command gates)"]
         
         Webview -->|IPC Only| IPCBoundary
         IPCBoundary --> LocalEngine
@@ -16,12 +18,13 @@ flowchart TD
     subgraph ExternalSurfaces["External Surface Isolation"]
         LocalGH["Local <code>gh</code> CLI<br/>(Uses existing local keychain)"]
         LocalAI["Local LLM Server<br/>(Loopback 127.0.0.1 / localhost Only)"]
-        PTY["User Terminal PTY<br/>(Strictly isolated from AI & scripts)"]
+        PTY["User Shell / Explicit Agent PTYs<br/>(Separate sessions)"]
     end
 
     LocalEngine --> LocalGH
     LocalEngine --> LocalAI
     LocalEngine --> PTY
+    LocalEngine --> ProfileManvi["Profile Manvi Host<br/>(Configured provider / managed runs)"]
 ```
 
 ---
@@ -30,7 +33,8 @@ flowchart TD
 
 ### Zero Telemetry & No Remote Phoning Home
 - GitPulse has no centralized backend or analytics tracking.
-- No network requests are made without explicit user action.
+- Network-capable features run through user actions or explicitly enabled settings,
+  including scheduled release checks and automatic task suggestions.
 - The webview does not load external CDN scripts, styles, or telemetry trackers.
 
 ### Local `gh` Credential Safety
@@ -38,19 +42,32 @@ flowchart TD
 - All GitHub operations (PR inspection, workflow dispatch, Dependabot and code scanning queries) delegate exclusively to your locally installed and authenticated `gh` CLI.
 
 ### Loopback-Only Local AI Transport
-- All AI completions and model probing requests are restricted to local loopback addresses (`127.0.0.1`, `localhost`, `[::1]`).
-- Any attempt to configure a remote address is rejected at the transport layer, ensuring diffs and file contents never leave your machine.
+- Built-in local AI completions (commit messages, explanations and branch names)
+  and local model probes restrict their transport to loopback addresses
+  (`127.0.0.1`, `localhost`, `[::1]`); remote base URLs are rejected on that path.
+- Task enhancement and agent execution use the separately configured profile Manvi
+  provider or agent CLI. Their network and filesystem access follow that provider
+  and the selected run settings. The local-completion transport restriction does
+  not establish containment for an explicitly launched agent.
 
 ### Terminal & Process Isolation
 - The embedded interactive terminal (`src-tauri/src/terminal/`) runs user shell processes directly via `portable-pty`.
-- AI models and the MANVI sidecar have **zero access** to the terminal PTY, its file descriptors, or keystrokes.
+- Local AI suggestions and the policy sidecar do not read/write ordinary shell
+  sessions. Explicit Claude, Manvi, Codex and task launches create dedicated PTY
+  sessions; the launched process receives that session's input.
+- Terminal handoffs remain user-controlled. Managed Codex runs use the separate
+  Manvi configuration/decision protocol. A worktree is not an OS sandbox, and
+  native launch validation alone does not prove the provider's effective policy.
+  See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the verification limits.
 - Model-assisted remediation actions (`cmd_manvi_run_action`) are restricted to a strict command allowlist and require explicit user confirmation.
 
 ### Opt-In Release Checks
-- GitPulse does not auto-update and makes zero network checks by default.
+- Automatic application release checks are off by default; GitPulse does not
+  automatically install application updates.
 - When explicitly enabled under **Settings → Updates**, GitPulse compares public release tags once a day via `git ls-remote` against the upstream repository.
 - No user tokens, repository paths, or hardware telemetry are ever sent.
-- GitPulse never downloads or installs binaries automatically; checks only notify the user with a direct link to GitHub releases.
+- Release checks only notify with a link to GitHub releases. Optional-tool setup
+  is a separate, explicitly requested install/update workflow.
 
 ### Webview Content Security Policy (CSP)
 The webview operates under a strict CSP configured in `src-tauri/tauri.conf.json`:

@@ -11,6 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Add task board/list layouts, priority/type/owner/label/due filters over loaded
+  cards, multi-selection and keyboard-accessible context menus. Actions include
+  duplication, status/priority changes, agent copying and confirmed deletion with
+  per-task outcomes and bounded delete passes.
+- Add notes-to-draft editing, inline Manvi title/description suggestions and a
+  Quick Enhance sheet for saved tasks. Proposals respect field locks and require
+  explicit acceptance against the saved revision.
+- Add agent copy for new unsaved drafts and saved task briefs. Saved copies name
+  their revision and exclude unsaved edits; board copying reports its eight-task
+  limit and partial results.
+
 ### Changed
 
 - Give the macOS status popover the app's native background blur, translucent
@@ -23,6 +36,12 @@ before that tag is pushed.
   cards, a monochrome repository header, last-fetch counts and one blue primary
   action. Keep stashes, workspace insights, the command palette and secondary
   shortcuts inside Details, with Open GitPulse, Settings and Quit in the footer.
+
+- Refresh README, feature, architecture, contributor and wiki guidance for Tasks,
+  schema-20 DevMap, current shortcuts, module ownership and verification limits.
+  Add a Tasks and workspaces guide; preserve older implementation plans as plans.
+- Resolve repository maps per worktree in both agent guides and document
+  `devmap build --manifest` for missing generated state.
 
 ## [0.1.0] - 2026-09-09
 

@@ -43,6 +43,15 @@ terminal. **View agent session** returns to that tab, including its finished
 transcript; **Rescan results** checks the artifacts after the run.
 See [coverage generation](COVERAGE.md) for details and verification.
 
+Saved tasks can also launch a dedicated terminal session from their run controls.
+GitPulse binds the launch to the saved brief, selected checkout and a single run
+attempt. Reattaching keeps the same live process and scrollback; ended attempts
+need an explicit new launch from task details. Process exit does not accept the
+task. These handoffs remain user-controlled CLI sessions; structured managed-run
+questions and approvals use the separate Manvi protocol. See
+[Tasks and workspaces](TASKS_AND_WORKSPACES.md) for copying, permissions and
+verification limits.
+
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+T / Ctrl+Shift+W | New shell / close current session |

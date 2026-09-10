@@ -14,7 +14,7 @@ Press `?` or `⌘/` for the in-app shortcuts sheet. Full list: [[Keyboard Shortc
 
 | View | Shortcut | What it is for |
 | --- | --- | --- |
-| **Work** | `F10` | What is in flight: worktrees, PRs, conflicts, stacks, policy |
+| **Work** | `F10` | What is in flight: worktrees, PRs, conflicts, stacks, policy and tasks |
 | **Code** | `⌘1` / `Ctrl+1` | Files, blame, and the code/docs Map |
 | **History** | `⌘2` / `Ctrl+2` | Graph, diff, and reflog on one selected commit |
 | **Insights** | `⌘3` / `Ctrl+3` | Pulse, coverage, health, and storage — on-demand scans |
@@ -25,8 +25,10 @@ Full catalog: [[Views]].
 
 ## Beside the views
 
-- **Terminal** (`Ctrl+\``) — native PTY docked under the current view. Hiding the dock does not kill the session; closing the repository does. AI and the policy sidecar cannot see this PTY.
-- **Fleet** (`Shift+F10`) — every open and recent repository in one grid. Not a view: it sits above the tab strip so it survives switching repos. Cells are a value, *not scanned*, or *could not read* — never a fake zero.
+- **Terminal** (`Ctrl+\``) — native PTY docked under the current view. Hiding the dock does not kill the session; closing the repository does. Local AI suggestions and the policy sidecar do not access ordinary shells; explicit agent launches use their own sessions.
+- **Fleet** (`Command/Ctrl+Shift+F`) — every open and recent repository in one grid. Not a view: it sits above the tab strip so it survives switching repos. Cells are a value, *not scanned*, or *could not read* — never a fake zero.
+
+- **Tasks** — global and saved-workspace boards over one persistent task store. **Work → Tasks** filters it to the active repository. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
 ## First useful paths
 

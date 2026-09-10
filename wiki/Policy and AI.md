@@ -31,10 +31,17 @@ Completions (commit messages, commit explanations, branch names, health/coverage
 
 Suggested remediation scripts run only through `cmd_manvi_run_action`: a purpose-limited argv allowlist (npm, cargo, pytest, go, swift, dart, …), no shell string, explicit confirmation, hard timeout and capped output.
 
-The terminal PTY is not on this path. Models cannot read keystrokes or inject into the dock.
+Ordinary shell sessions are outside this remediation path. Local AI suggestions
+and the policy sidecar do not read/write them. Explicit agent launchers and saved
+task handoffs start dedicated CLI sessions in the terminal dock, under those
+providers' permissions. Managed Codex runs use a separate Manvi protocol.
+
+Task title/description suggestions use the profile Manvi provider/model, are bound
+to saved revisions, respect field locks and require selected acceptance. See
+[Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
 ## Grants
 
 Temporary overrides are first-class and recorded. The Work view joins verdicts and grants by the `task_id` written when the gate judged — not by guessing from a branch name.
 
-Longer write-up: [docs/MANVI.md](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MANVI.md).
+Longer write-up: [policy and AI features](https://github.com/bharathvbcr/GitPulse/blob/main/docs/FEATURES.md).

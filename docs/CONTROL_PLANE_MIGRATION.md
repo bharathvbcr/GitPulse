@@ -1,5 +1,15 @@
 # Control-Plane Migration Plan
 
+> **Historical design plan.** The phase estimates, “Today” column and statements
+> about missing subsystems below describe the original planning baseline. They
+> are not the current implementation status. GitPulse now has a durable ledger,
+> schema-20 DevMap readers, a palette catalog and profile task/workspace CRUD.
+> Use [Architecture](ARCHITECTURE.md), [Module integration](MODULE_INTEGRATION.md)
+> and [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for current behavior.
+> Repository execution tasks/leases remain read-only; profile tasks use Manvi
+> storage through a separate API. Resolve current graph/map locations with
+> `devmap paths --json` rather than assuming this plan's legacy paths.
+
 **Goal:** consolidate GitPulse, DevCouncil, and Manvi into one agentic Git control plane by assigning a single owner per shared artifact and making the other two repos consumers. No rewrites; ownership decisions plus six shippable phases, each a user-visible feature on its own. Grounded in two source-level audits of all three codebases (September 2026).
 
 **The one rule:** every shared artifact (verdict schema, task store, code graph, event ledger, verification gates) gets exactly one canonical owner. Consumers link, exec, or speak a versioned contract. Parity is machine-enforced — extend the existing Manvi ↔ DevCouncil generated parity-test pattern (256 command cases, 775 fnmatch cases) to GitPulse.
