@@ -22,7 +22,7 @@ let corruptDelete = false, loseDelete = false;
 const deleted = new Set(), deleteWrites = [];
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [];
-let failConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
+let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 const page = (items, start = 0, limit = 200) => ({ ok: true, items: items.slice(start, start + limit), total: items.length, shown: items.slice(start, start + limit).length, has_more: start + limit < items.length, next_cursor: start + limit < items.length ? String(start + limit) : null });
 mockIPC(async (cmd, args) => {
   if (cmd === "cmd_workbench_register_repository") return JSON.stringify({ repository: repos.find(repo => repo.identity_key === args.repoPath) });
@@ -41,7 +41,7 @@ mockIPC(async (cmd, args) => {
     case "runs.list": return JSON.stringify(page([]));
     case "enhancements.configuration": {
       if(failConfiguration) throw {code:"worker_error",message:"Manvi temporarily unavailable"};
-      return JSON.stringify({ok:true,provider:"local",model:"quick-fixture",model_source:"fixture",providers:["local"]});
+      return JSON.stringify({ok:true,provider:"local",model:blankConfiguration ? "" : "quick-fixture",model_source:"fixture",providers:["local"]});
     }
     case "enhancements.list": return JSON.stringify(page([...proposals.values()].filter(p=>p.task_id===input.task_id)));
     case "enhancements.get": return JSON.stringify({ok:true,item:proposals.get(input.id)});
@@ -395,6 +395,10 @@ if (params.has("check")) {
     await wait(()=>[...proposals.values()].some(p=>p.source.title==="Fix notification routing" && p.state==="running"));
     const quickProposal=[...proposals.values()].find(p=>p.source.title==="Fix notification routing");
     check("inline drafting refuses duplicate generations while a worker is running", button("Improve with Manvi").matches(":disabled"));
+    const runningWrites=enhancementWrites.length;
+    for(let i=0;i<100;i++) idea.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",ctrlKey:true,bubbles:true}));
+    await settle();
+    check("a burst of keyboard shortcuts cannot start another generation", enhancementWrites.length===runningWrites);
     const formBox=editor().querySelector("form").getBoundingClientRect();
     const historyBox=editor().querySelector(".enhancements").getBoundingClientRect();
     check("task fields finish before enhancement history and agent runs", formBox.bottom<=historyBox.top+1);
@@ -420,7 +424,21 @@ if (params.has("check")) {
     await change(root.querySelector(".notes-label textarea"),"Prepare Demo for Seattle start-up event");
     await click("Save task"); await settle(100);
     check("notes-only task saves without native title validation blocking extraction", tasks.some(task=>task.title==="Prepare Demo for Seattle start-up event"));
+    const footerBackground=getComputedStyle(editor().querySelector("footer")).backgroundColor;
+    check("sticky save controls have an opaque background over scrolled fields", !footerBackground.startsWith("rgba") || footerBackground.endsWith(", 1)"));
     confirmAnswer=true; await click("Close task details");
+    failConfiguration=true; await click("New task"); await wait(()=>editor().textContent.includes("Manvi temporarily unavailable"));
+    check("inline configuration failure exposes a working retry", Boolean(button("Reload Manvi configuration")) && !button("Reload Manvi configuration").matches(":disabled"));
+    failConfiguration=false; blankConfiguration=true; await click("Reload Manvi configuration");
+    check("an unconfigured model exposes selection beside drafting", Boolean(editor().querySelector(".model-settings input")) && editor().querySelector(".model-settings").open && button("Improve with Manvi").matches(":disabled"));
+    await change(editor().querySelector(".model-settings input"),"quick-fixture");
+    await change(editor().querySelector(".notes-label textarea"),"A recoverable task");
+    check("choosing a task model recovers drafting without reopening the editor", !button("Draft with Manvi").matches(":disabled"));
+    editor().querySelectorAll(".field-picks button").forEach(el=>el.click()); await settle();
+    const emptySelectionWrites=enhancementWrites.length;
+    editor().querySelector(".notes-label textarea").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",ctrlKey:true,bubbles:true})); await settle();
+    check("empty field selection cannot widen through the keyboard shortcut", button("Draft with Manvi").matches(":disabled") && enhancementWrites.length===emptySelectionWrites);
+    blankConfiguration=false; await click("Close task details");
     check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }
   document.getElementById("verdict").textContent = JSON.stringify({results}, null, 2);

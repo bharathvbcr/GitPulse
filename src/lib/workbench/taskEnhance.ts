@@ -19,7 +19,7 @@ import { bounded } from "./taskActions";
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
   proposal !== null && ["pending", "running", "cancel_requested"].includes(proposal.state);
 
-type PendingEnhancement = { method: EnhancementMutation; input: Record<string, unknown>; result: Enhancement | null };
+type PendingEnhancement = { method: EnhancementMutation; input: Record<string, unknown>; taskID: string; result: Enhancement | null };
 
 /** One receipt per action, including retries after a committed but lost reply. */
 export class EnhancementAction {
@@ -27,12 +27,12 @@ export class EnhancementAction {
   private running = false;
   constructor(private io = { change: changeEnhancement, read: getTask }) {}
 
-  async run(method: EnhancementMutation, input: Record<string, unknown>): Promise<{ proposal: Enhancement; task: Task | null }> {
+  async run(method: EnhancementMutation, input: Record<string, unknown>, taskID: string): Promise<{ proposal: Enhancement; task: Task | null }> {
     if (this.running) throw new WorkbenchError("busy", "An enhancement action is already in progress.");
-    if (this.pending && (method !== this.pending.method || input.request_id !== this.pending.input.request_id)) {
+    if (this.pending && (method !== this.pending.method || input.request_id !== this.pending.input.request_id || taskID !== this.pending.taskID)) {
       throw new WorkbenchError("busy", "Retry the pending enhancement action first.");
     }
-    this.pending ??= { method, input: structuredClone(input), result: null };
+    this.pending ??= { method, input: structuredClone(input), taskID, result: null };
     this.running = true;
     try {
       // Creation can advance once to generation. Neither retries nor reads can
@@ -41,10 +41,14 @@ export class EnhancementAction {
         const action: PendingEnhancement | null = this.pending;
         if (!action) throw new WorkbenchError("protocol_error", "Missing enhancement action.");
         const proposal: Enhancement = action.result ?? await bounded(this.io.change(action.method, action.input));
-        if (proposal.id !== action.input.id ||
+        if (proposal.id !== action.input.id || proposal.task_id !== action.taskID ||
             (action.method === "enhancements.create" && (proposal.task_id !== action.input.task_id || proposal.source_revision !== action.input.source_revision)) ||
             proposal.revision <= Number(action.input.expected_revision)) {
           throw new WorkbenchError("protocol_error", "Enhancement confirmation does not match the request.");
+        }
+        if ((action.method === "enhancements.accept" && (proposal.state !== "accepted" || proposal.source_revision !== action.input.expected_task_revision)) ||
+            (action.method === "enhancements.undo" && proposal.state !== "undone")) {
+          throw new WorkbenchError("protocol_error", "Enhancement receipt did not confirm the requested action.");
         }
         action.result = proposal;
         let task: Task | null = null;
@@ -55,7 +59,7 @@ export class EnhancementAction {
           }
         }
         if (action.method === "enhancements.create" && proposal.state === "pending") {
-          this.pending = { method: "enhancements.generate", input: { id: proposal.id, request_id: newID(), expected_revision: proposal.revision }, result: null };
+          this.pending = { method: "enhancements.generate", input: { id: proposal.id, request_id: newID(), expected_revision: proposal.revision }, taskID, result: null };
           continue;
         }
         this.pending = null;
@@ -131,7 +135,7 @@ export async function startQuickEnhance(
     requestId: newID(),
   });
   if (!input) throw new Error("Nothing is available to enhance.");
-  const { proposal } = await action.run("enhancements.create", input);
+  const { proposal } = await action.run("enhancements.create", input, task.id);
   return { task, proposal };
 }
 

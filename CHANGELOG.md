@@ -66,6 +66,11 @@ workbench board land together on `main`.
 
 ### Fixed
 
+- Harden Manvi task drafting and review: preserve and consume extracted notes,
+  expose task model configuration, and retain mutation identities after lost
+  replies. Refuse stale or foreign proposal confirmations and unsaved-edit
+  acceptance. Keep task fields, enhancement history and runs stacked in one
+  scroller, with an opaque save bar that prevents text bleeding through controls.
 - Keep bulk staging and Quick Commit attached to their original repository
   across tab changes and dialogs. Track interactive rebase through the same
   guarded mutation owner and reject stale plans.

@@ -132,6 +132,7 @@
     try {
       const next = await bounded(getEnhancement(id));
       if (disposed || ticket !== epoch || acting || proposal?.id !== id || next.revision < proposal.revision) return;
+      if (next.id !== id || next.task_id !== task?.id) throw new Error("Suggestion does not belong to this task.");
       proposal = next;
       error = "";
     } catch (cause) {
@@ -144,7 +145,7 @@
     if (!pending || busy || disabled) return;
     busy = true; epoch++; error = "";
     try {
-      const result = await action.run(pending.method, pending.input);
+      const result = await action.run(pending.method, pending.input, pending.taskID);
       if (disposed) return;
       proposal = result.proposal;
       if (result.task) onApplied(result.task);
@@ -174,6 +175,7 @@
       const existing = page.items.find(liveEnhancement);
       if (existing) {
         const current = await bounded(getEnhancement(existing.id));
+        if (current.id !== existing.id || current.task_id !== saved.id) throw new Error("Suggestion does not belong to this task.");
         if (!disposed) { proposal = current; note = "A suggestion is already in progress."; }
         return;
       }
@@ -200,7 +202,7 @@
     if (!input) { error = "Save or reload the task, then request a fresh suggestion."; return; }
     busy = true; epoch++; error = "";
     try {
-      const result = await action.run("enhancements.accept", input);
+      const result = await action.run("enhancements.accept", input, task.id);
       if (disposed) return;
       proposal = result.proposal;
       if (result.task) onApplied(result.task);

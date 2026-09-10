@@ -10,7 +10,16 @@ const read = (name: string) => readFileSync(new URL(`../src/lib/components/${nam
 describe("Tasks material coverage", () => {
   it.each(panels)("%s participates in the shared materials, including its fields and nested panels", (name) => {
     const source = read(name);
-    const style = source.slice(source.indexOf("<style>"));
+    let style = source.slice(source.indexOf("<style>"));
+    if (name === "TaskEditor") {
+      // Sticky controls cover scrolling text. Translucency here made task
+      // content bleed through the save bar even when panel layout was correct.
+      const footer = style.match(/(?:^|})\s*footer\{([^}]*)\}/)?.[1];
+      expect(footer).toBeDefined();
+      expect(footer).toContain("position:sticky");
+      expect(footer).toContain("background:rgb(var(--c-surface))");
+      style = style.replace(/(?:^|})\s*footer\{[^}]*\}/, "}");
+    }
     expect(style).not.toMatch(/background(?:-color)?:\s*rgb\(var\(--c-(?:bg|surface|surface-hover)\)\)/);
     expect(compile(source, { generate: "client", filename: `${name}.svelte` }).warnings).toEqual([]);
   });

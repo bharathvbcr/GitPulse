@@ -65,6 +65,8 @@
     try {
       const next = await bounded(getEnhancement(id));
       if (disposed || ticket !== selecting) return;
+      if (next.id !== id || next.task_id !== task.id) throw new Error("Suggestion does not belong to this task.");
+      entries = entries.map(entry => entry.id === id ? next : entry);
       proposal = next; selected = next.fields.filter((field) => !(task.locked_fields ?? []).includes(field)); error = "";
     } catch (cause) { if (!disposed && ticket === selecting) error = explainError(cause); }
   }
@@ -98,7 +100,7 @@
     if (busy || disabled) return;
     selecting++; busy = true; error = ""; note = "";
     try {
-      const result = await actionController.run(method, input);
+      const result = await actionController.run(method, input, task.id);
       if (disposed) return;
       selecting++; proposal = result.proposal;
       selected = proposal.fields.filter((field) => !(task.locked_fields ?? []).includes(field));
