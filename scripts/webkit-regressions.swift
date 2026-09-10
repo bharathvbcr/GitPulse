@@ -6,7 +6,7 @@ import WebKit
 guard CommandLine.arguments.count == 2,
       let url = URL(string: CommandLine.arguments[1]),
       url.scheme == "http", url.host == "127.0.0.1",
-      ["/harness/diagnostics.html", "/harness/conflicts.html", "/harness/uncommitted.html", "/harness/coverage.html", "/harness/branches.html", "/harness/hygiene.html", "/harness/palette.html"].contains(url.path) else {
+      ["/harness/diagnostics.html", "/harness/conflicts.html", "/harness/uncommitted.html", "/harness/coverage.html", "/harness/branches.html", "/harness/hygiene.html", "/harness/palette.html", "/harness/task-materials.html"].contains(url.path) else {
     fputs("Expected a supported local GitPulse harness URL\n", stderr)
     exit(2)
 }

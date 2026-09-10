@@ -13,6 +13,27 @@ static hue field — four wide, saturated radial blobs spanning the whole shell
 outline and an 8px inset. Traffic-light spacing and native window dragging are
 retained.
 
+The Tasks board shares these materials in both global and repository views.
+The navigator, toolbar, columns, task and workspace editors, and inbox use the
+chrome tier. Cards, fields, notification settings, enhancement controls and
+agent run details use the shared fills. The floating tier blurs the pointer
+drag preview, automatic settings popup and sticky editor headers where they
+overlap content. Cards do not each create a filter. Scope selection uses the
+shared liquid transition, including reduced-motion preferences. Accessibility
+fallbacks override both dark and light theme tokens.
+
+Open `/harness/task-materials.html` with `npm run dev` for a disposable Tasks
+preview with in-memory transport. **Check all Tasks surfaces** exercises both
+themes, scope selection, editors, enhancements, run controls, automatic settings
+and the inbox. `?repository=1` checks the repository mount. Browser media
+emulation can exercise reduced transparency, increased contrast, forced colors
+and reduced motion; the Platform control previews standard material fills.
+The fixture does not access real task storage or launch agents.
+
+Run `npm run test:browser -- --harness task-materials` for Chromium or
+`npm run test:webkit -- --harness task-materials` for native macOS WKWebView.
+Both run the same surface and interaction checks automatically.
+
 The field sits over the real desktop rather than replacing it: window
 transparency is on (see below), so what shows through a surface is the
 blurred desktop plus this tint, not the tint alone.
@@ -42,8 +63,8 @@ gradient. Those four always-on, full-size filters were therefore paying for a
 difference nobody can point at; the saturation they applied is baked into the
 field's own colours instead, at no per-frame cost. Float surfaces do sit over
 commit rows, diffs and tables, so for them the radius is the effect, and they
-are the only tier that is filtered. Nothing is filtered until a menu, toast or
-dialog is actually on screen.
+are the only tier that is filtered. Nothing is filtered until a floating surface or sticky editor header is
+actually on screen.
 
 ### Stacking, and what is not stacking
 

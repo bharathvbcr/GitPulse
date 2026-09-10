@@ -1225,7 +1225,8 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   /* Surfaces and the graph go back to solid together; a translucent panel on
      an opaque shell is the half-finished state this preference exists to
      avoid. The renderer re-reads `--bg-main` on the next theme change. */
-  html.macos {
+  html.macos,
+  html.macos.light {
     --mac-fill-bg: rgb(var(--c-bg));
     --mac-fill-surface: rgb(var(--c-surface));
     --mac-fill-surface-hover: rgb(var(--c-surface-hover));

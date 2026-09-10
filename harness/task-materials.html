@@ -1,0 +1,143 @@
+<!doctype html>
+<html class="macos dark">
+<head>
+  <meta charset="utf-8" />
+  <title>GitPulse Tasks materials — disposable fixture</title>
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #app { height: 100vh; display: flex; flex-direction: column; }
+    #controls { display: flex; gap: 12px; align-items: center; padding: 8px 14px; font: 12px system-ui; }
+    #board { display: flex; flex: 1; min-height: 0; }
+    #result { white-space: pre-wrap; font: 11px system-ui; }
+  </style>
+</head>
+<body>
+  <div id="app" class="gp-shell bg-background">
+    <div id="controls">
+      <span>Disposable Tasks fixture</span>
+      <label>Theme <select id="theme"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+      <label>Platform <select id="platform"><option value="macos">macOS</option><option value="standard">Standard</option></select></label>
+      <button id="check" class="gp-btn">Check materials</button>
+      <button id="flows" class="gp-btn">Check all Tasks surfaces</button>
+      <span id="result" role="status">Not checked</span>
+    </div>
+    <div id="board" class="gp-workspace gp-glass"></div>
+  </div>
+  <script type="module">
+    import "../src/app.css";
+    import { mockIPC } from "@tauri-apps/api/mocks";
+    import { mount } from "svelte";
+    import TaskBoard from "../src/lib/components/TaskBoard.svelte";
+
+    const params = new URLSearchParams(location.search);
+    const repositories = [{ id: "gitpulse", revision: 1, updated_at: 1, name: "GitPulse", identity_key: "/fixture/GitPulse", remote_url: null }];
+    const workspaces = [{ id: "design", revision: 1, updated_at: 1, name: "Design", icon: "", color: "", pinned: true, archived: false, position: 0, repository_count: 1, repository_ids: ["gitpulse"], description: "Tasks appearance review" }];
+    const automation = { id: "profile", revision: 1, updated_at: 1, enabled: false, provider: null, model: null };
+    const notifications = { id: "profile", revision: 1, updated_at: 1, profile_id: "a".repeat(32), enabled: false, sound: false, background: false, after_sequence: 0, quiet_start: null, quiet_end: null, muted_workspace_ids: [], muted_repository_ids: [], muted_task_ids: [] };
+    const tasks = [
+      ["inbox", "Explore keyboard shortcuts", ["UX"], 2],
+      ["inbox", "Improve empty task states", [], 3],
+      ["ready", "Polish the Tasks glass material", ["macOS", "UI"], 1],
+      ["in_progress", "Verify repository workflows", ["Testing"], 2],
+      ["review", "Review task navigation", [], 2],
+      ["done", "Keep task cards readable", ["Accessibility"], 3],
+    ].map(([status, title, labels, priority], i) => ({
+      id: `task-${i}`, revision: 1, updated_at: 1, title, status, labels, priority,
+      kind: "task", severity: null, owner: null, due_at: null, repository_ids: ["gitpulse"],
+      primary_repository_id: "gitpulse", home_workspace_id: null, position: i * 100,
+      description: "Disposable appearance fixture", acceptance_criteria: [], locked_fields: [],
+    }));
+    const page = items => JSON.stringify({ ok: true, items, total: items.length, shown: items.length, has_more: false, next_cursor: null });
+    const record = item => JSON.stringify({ ok: true, item });
+    const errors = [];
+    addEventListener("error", event => errors.push(event.message));
+    addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+    mockIPC((command, args) => {
+      if (command === "cmd_pick_folder") return null;
+      if (command === "cmd_workbench_register_repository") return JSON.stringify({ ok: true, repository: repositories[0] });
+      if (command !== "cmd_workbench_request") throw new Error(`Unconfigured fixture command: ${command}`);
+      const input = JSON.parse(args.input);
+      switch (args.method) {
+        case "repositories.list": return page(repositories);
+        case "workspaces.list": return page(workspaces);
+        case "workspaces.get": return record(workspaces.find(group => group.id === input.id));
+        case "workspaces.put": {
+          let group = workspaces.find(group => group.id === input.id);
+          if (!group) { group = { id: input.id, revision: 0, updated_at: 1 }; workspaces.push(group); }
+          Object.assign(group, input, { revision: group.revision + 1, repository_count: input.repository_ids.length });
+          return record(group);
+        }
+        case "automation.get": return record(automation);
+        case "notifications.settings.get": return record(notifications);
+        case "notifications.native.status": return JSON.stringify({ available: false, authorization: "unavailable", error: "OS notifications are unavailable in this disposable fixture." });
+        case "automation.put": Object.assign(automation, input, { revision: automation.revision + 1 }); return record(automation);
+        case "notifications.settings.put": Object.assign(notifications, input, { revision: notifications.revision + 1 }); return record(notifications);
+        case "enhancements.configuration": return JSON.stringify({ ok: true, provider: "fixture", model: "fixture-model", model_source: "fixture", providers: ["fixture"] });
+        case "attention.list": case "automation.list": case "runs.list": case "enhancements.list": return page([]);
+        case "items.list": return page(tasks.filter(task => task.status === input.status && (!input.query || task.title.toLowerCase().includes(input.query.toLowerCase()))));
+        case "items.get": return record(tasks.find(task => task.id === input.id));
+        case "items.put": {
+          let task = tasks.find(task => task.id === input.id);
+          if (!task && input.expected_revision === 0) { task = { id: input.id, revision: 0, updated_at: 1 }; tasks.push(task); }
+          if (!task || task.revision !== input.expected_revision) throw new Error("Fixture revision mismatch");
+          Object.assign(task, input, { revision: task.revision + 1, due_at: input.due_at ?? null });
+          return record(task);
+        }
+        case "enhancements.wake": case "enhancements.worker":
+          return JSON.stringify({ ok: true, state: "disabled", reason: "", task_id: "", proposal_id: "", next_check_at: 0 });
+        default: throw new Error(`Unconfigured fixture method: ${args.method}`);
+      }
+    }, { shouldMockEvents: true });
+    mount(TaskBoard, { target: document.getElementById("board"), props: params.has("repository") ? { repositoryPath: "/fixture/GitPulse" } : {} });
+    const theme = document.getElementById("theme"), platform = document.getElementById("platform");
+    theme.onchange = () => {
+      document.documentElement.classList.toggle("light", theme.value === "light");
+      document.documentElement.classList.toggle("dark", theme.value === "dark");
+    };
+    platform.onchange = () => document.documentElement.classList.toggle("macos", platform.value === "macos");
+    const runFlows = async () => {
+      const result = document.getElementById("result"), button = document.getElementById("flows");
+      button.disabled = true;
+      try {
+        const { checkTaskMaterials } = await import("./taskMaterialChecks.ts");
+        const checks = await checkTaskMaterials(errors);
+        result.textContent = `${checks.length}/${checks.length} Tasks surface checks passed`;
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results: checks }));
+      } catch (error) {
+        result.textContent = `Tasks surface checks failed: ${error.message}`;
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results: [{ pass: false, name: error.message }] }));
+      } finally {
+        button.disabled = false;
+        if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+      }
+    };
+    document.getElementById("flows").onclick = runFlows;
+    document.getElementById("check").onclick = () => {
+      const checks = [];
+      const check = (name, passed) => checks.push({ name, pass: passed });
+      const alpha = color => color === "transparent" ? 0 : color.startsWith("rgb(") ? 1 : Number(color.match(/,\s*([\d.]+)\)$/)?.[1] ?? color.match(/\/\s*([\d.]+)\)/)?.[1] ?? 1);
+      const fallback = matchMedia("(prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active)").matches;
+      const glass = platform.value === "macos" && !fallback;
+      const elements = [".workbench", ".search", ".column-title", ".card"];
+      for (const selector of elements) {
+        const nodes = [...document.querySelectorAll(selector)];
+        check(`${selector} exists`, nodes.length > 0);
+        // The board is a nested base plate: it stays clear when its enclosing
+        // workspace already paints the opaque accessibility fallback.
+        check(`${selector} ${glass ? "translucent" : "opaque backing"}`, nodes.length > 0 && nodes.every(node => {
+          const fill = alpha(getComputedStyle(node).backgroundColor);
+          return glass ? fill < 1 : fill === 1 || (selector === ".workbench" && fill === 0 && alpha(getComputedStyle(document.getElementById("board")).backgroundColor) === 1);
+        }));
+        check(`${selector} has no persistent blur`, nodes.every(node => getComputedStyle(node).backdropFilter === "none"));
+      }
+      check("Task cards remain interactive", [...document.querySelectorAll("[data-task-card]")].every(card => !card.disabled && getComputedStyle(card).pointerEvents !== "none"));
+      check("Task columns finished loading", document.querySelector("[data-testid=task-columns]")?.getAttribute("aria-busy") === "false");
+      check("No runtime errors", errors.length === 0);
+      const result = document.getElementById("result");
+      result.textContent = `${checks.filter(check => check.pass).length}/${checks.length} passed` + checks.filter(check => !check.pass).map(check => `\nFAIL: ${check.name}`).join("");
+      result.dataset.verdict = JSON.stringify({ checks, errors });
+    };
+    if (params.has("check")) await runFlows();
+  </script>
+</body>
+</html>

@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { crossfade } from "svelte/transition";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { Inbox, Plus, RefreshCw, Search } from "@lucide/svelte";
-  import { isTauri } from "../platform";
+  import { isMacOS, isTauri } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { repoStore } from "../stores/repoStore";
   import { LAYERS } from "../ui/layers";
@@ -17,6 +19,8 @@
   import AttentionInbox from "./AttentionInbox.svelte";
 
   let { repositoryPath = null, active = true }: { repositoryPath?: string | null; active?: boolean } = $props();
+  const macos = isMacOS();
+  const [sendScope, receiveScope] = crossfade(liquidSelection());
   let scope = $state<Scope>({ kind: "global" });
   let repositories = $state<Repository[]>([]), workspaces = $state<WorkspaceCard[]>([]);
   let repositoryCursor = $state<string | null>(null), workspaceCursor = $state<string | null>(null);
@@ -303,13 +307,24 @@
   }
 </script>
 
-<div class="workbench" class:is-dragging={drag !== null} data-testid="task-board">
+{#snippet scopeSelection(selected: boolean)}
+  {#if macos && selected}
+    <span class="gp-liquid-selection gp-gpu" aria-hidden="true"
+      in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>
+  {/if}
+{/snippet}
+
+<div class="workbench bg-background" class:is-dragging={drag !== null} data-testid="task-board">
   {#if !repositoryPath}
-    <nav class="navigator" aria-label="Task scopes">
+    <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
       <div class="nav-heading">Workspaces<button type="button" class="icon" title="New workspace" aria-label="New workspace" onclick={() => { workspaceEditor = { value: null }; taskEditor = null; }}><Plus size={12} /></button></div>
-      <button type="button" class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>All</button>
+      <button type="button" class="gp-seg-btn" class:selected={scope.kind === "global"} aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>
+        {@render scopeSelection(scope.kind === "global")}<span>All</span>
+      </button>
       {#each [...workspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
-        <div class="nav-row"><button type="button" class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button type="button" class="icon" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        <div class="nav-row"><button type="button" class="gp-seg-btn" class:selected={scope.kind === "workspace" && scope.id === group.id} aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>
+          {@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</span>
+        </button><button type="button" class="icon" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
       {/each}
       {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
       <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title="Add repository" aria-label="Add repository" disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
@@ -327,15 +342,17 @@
           </div>
         {/if}
       </div>
-      {#each repositories as repo (repo.id)}<button type="button" class:selected={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>{repo.name}</button>{/each}
+      {#each repositories as repo (repo.id)}<button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>
+        {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}</span>
+      </button>{/each}
       {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
     </nav>
   {/if}
   <main class="board-main">
-    <header>
+    <header class="gp-glass">
       <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
       <div class="actions">
-        <label class="search"><Search size={12} /><input aria-label="Search tasks" type="search" bind:value={search} placeholder="Search" maxlength="512" /></label>
+        <label class="search bg-surface"><Search size={12} /><input aria-label="Search tasks" type="search" bind:value={search} placeholder="Search" maxlength="512" /></label>
         {#if initialized}<AutomaticEnhancements {active} compact />{/if}
         {#if initialized}
           <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title="Inbox" onclick={() => { showInbox = !showInbox; }}>
@@ -361,20 +378,20 @@
     <div class="columns" aria-busy={loading || moving} data-testid="task-columns">
       {#each shown as status (status)}
         <section
-          class="column"
+          class="column gp-glass bg-surface/45"
           class:drop-target={drag !== null && drag.over === status}
           data-task-column={status}
           data-testid="task-column"
           aria-label={STATUS_LABELS[status]}
         >
-          <div class="column-title"><span>{STATUS_LABELS[status]}</span><span>{columns[status]?.total ?? "—"}</span></div>
+          <div class="column-title bg-surface"><span>{STATUS_LABELS[status]}</span><span>{columns[status]?.total ?? "—"}</span></div>
           <div class="cards">
             {#each columns[status]?.items ?? [] as card (card.id)}
               {@const face = cardFace(card, repoName)}
               {#if insertBefore(status, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
               <button
                 type="button"
-                class="card"
+                class="card bg-surface"
                 class:dragging={drag?.card.id === card.id}
                 data-testid="task-card"
                 data-task-card
@@ -406,19 +423,22 @@
     </div>
   </main>
   {#if drag}
-    <div class="ghost" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
+    <div class="ghost gp-glass bg-surface shadow-float" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
   {/if}
   {#if taskEditor}{#key taskEditor}<TaskEditor {active} value={taskEditor.value} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
   {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
 <style>
-  .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));background:rgb(var(--c-bg));overflow:hidden}
+  .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
   .workbench.is-dragging{cursor:grabbing;user-select:none}
   .navigator{width:188px;flex-shrink:0;border-right:1px solid rgb(var(--c-border));padding:10px 8px;overflow:auto}
   .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
-  .navigator button:hover,button:hover{background:rgb(var(--c-surface-hover))}
+  .navigator button:hover,button:hover{background:var(--mac-fill-surface-hover,rgb(var(--c-surface-hover)))}
   .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
+  .navigator.gp-liquid-tabs{padding:10px 8px}
+  .navigator.gp-liquid-tabs button.selected{background:transparent}
+  .navigator .gp-seg-btn > span:not(:global(.gp-liquid-selection)){display:block;overflow:hidden;text-overflow:ellipsis}
   .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;color:rgb(var(--c-text-muted));font-size:10px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
   .nav-heading > button,.icon,.nav-row>button:last-child{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
   .add-menu{position:absolute;right:0;top:calc(100% + 4px);width:min(260px,70vw);max-height:min(16rem,50vh);overflow:auto}
@@ -438,15 +458,15 @@
   button,input{font-size:12px}
   button:disabled{opacity:.5}
   .hint{font-size:11px;color:rgb(var(--c-text-muted))}
-  .search{display:flex;align-items:center;gap:6px;background:rgb(var(--c-surface));border:1px solid rgb(var(--c-border));border-radius:7px;padding:0 8px;color:rgb(var(--c-text-muted))}
+  .search{display:flex;align-items:center;gap:6px;border:1px solid rgb(var(--c-border));border-radius:7px;padding:0 8px;color:rgb(var(--c-text-muted))}
   .search input{border:0;background:transparent;padding:6px 0;width:140px;color:inherit}
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
-  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;background:color-mix(in srgb,rgb(var(--c-surface)) 45%,transparent);border-radius:10px;border:1px solid rgb(var(--c-border));overflow:hidden;min-height:0}
+  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:10px;border:1px solid rgb(var(--c-border));overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent));background:color-mix(in srgb,rgb(var(--c-accent)) 10%,transparent)}
-  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;background:rgb(var(--c-surface));border-bottom:1px solid rgb(var(--c-border));padding:8px 10px}
+  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;border-bottom:1px solid rgb(var(--c-border));padding:8px 10px}
   .column-title span:last-child{color:rgb(var(--c-text-muted));font-weight:400}
   .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
-  .card{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-surface));cursor:grab;touch-action:none;user-select:none}
+  .card{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;border:1px solid rgb(var(--c-border));border-radius:8px;cursor:grab;touch-action:none;user-select:none}
   .card:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
   .card.dragging{opacity:.35;cursor:grabbing}
   .card h3{font-size:12px;line-height:1.4;font-weight:550;margin:0;overflow-wrap:anywhere;min-width:0}
@@ -461,5 +481,5 @@
   .paging button{font-size:10px;padding:3px 6px}
   .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border));display:flex;align-items:center;justify-content:space-between;gap:10px}
   .error{color:#d15a64}
-  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;border-radius:8px;background:rgb(var(--c-surface));border:1px solid rgb(var(--c-accent));font-size:12px;font-weight:550;box-shadow:0 8px 24px #00000022;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;border-radius:8px;border:1px solid rgb(var(--c-accent));font-size:12px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>

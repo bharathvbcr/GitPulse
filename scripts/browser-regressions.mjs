@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { createServer } from "vite";
 
 const run = promisify(execFile);
-export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "conflicts", "uncommitted", "coverage", "branches", "hygiene", "palette"]);
+export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "conflicts", "uncommitted", "coverage", "branches", "hygiene", "palette", "task-materials"]);
 
 /** A missing/partial verdict is a failure, even when Chrome exits normally.
  * @param {string} html

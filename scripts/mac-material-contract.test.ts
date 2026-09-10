@@ -63,6 +63,11 @@ const scrims = svelteFiles(componentsDir).flatMap((file) => {
 });
 
 describe("macOS material", () => {
+  it("restores opaque tokens in light mode as well as dark mode for accessibility preferences", () => {
+    const fallback = css.slice(css.indexOf("@media (prefers-reduced-transparency: reduce)"));
+    expect(fallback).toMatch(/html\.macos,\s*html\.macos\.light\s*\{[^}]*--mac-fill-surface: rgb\(var\(--c-surface\)\)/);
+  });
+
   it("finds the dialog scrims it is meant to be checking", () => {
     // A discovery test that discovers nothing passes every other assertion
     // below vacuously. Eight dialogs carry a scrim today.

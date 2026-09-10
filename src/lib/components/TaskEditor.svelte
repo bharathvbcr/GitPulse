@@ -111,19 +111,19 @@
   }
 </script>
 
-<aside class="task-editor" aria-label={current ? "Task details" : "New task"}>
-  <header><div><h2>{current ? "Task details" : "New task"}</h2><small>{current ? `Revision ${current.revision}` : "Link at least one repository"}</small></div><button type="button" onclick={close} disabled={enhancementBusy} aria-label="Close task details">✕</button></header>
+<aside class="task-editor gp-glass bg-surface" aria-label={current ? "Task details" : "New task"}>
+  <header class="gp-glass shadow-float"><div><h2>{current ? "Task details" : "New task"}</h2><small>{current ? `Revision ${current.revision}` : "Link at least one repository"}</small></div><button class="gp-btn" type="button" onclick={close} disabled={enhancementBusy} aria-label="Close task details">✕</button></header>
   <form onsubmit={(e) => { e.preventDefault(); void save(); }} oninput={() => { dirty = true; }}>
     <fieldset disabled={saving || pending !== null || enhancementBusy}>
-      <label>Title<input bind:value={draft.title} required maxlength="300" placeholder="Describe the result to achieve" /></label>
-      <div class="pair"><label>Type<input bind:value={draft.kind} list="task-kinds" required maxlength="64" /></label><label>Status<select bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label></div>
+      <label>Title<input class="gp-field" bind:value={draft.title} required maxlength="300" placeholder="Describe the result to achieve" /></label>
+      <div class="pair"><label>Type<input class="gp-field" bind:value={draft.kind} list="task-kinds" required maxlength="64" /></label><label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label></div>
       <datalist id="task-kinds">{#each ["issue", "bug", "feature", "improvement", "maintenance", "research", "documentation"] as kind}<option value={kind} ></option>{/each}</datalist>
-      <label>Description<textarea bind:value={draft.description} rows="8" maxlength="65536" placeholder="What happens, what should happen, evidence, and constraints" ></textarea></label>
-      <label>Acceptance criteria<textarea bind:value={criteria} rows="4" placeholder="One verifiable criterion per line" ></textarea></label>
-      <div class="pair"><label>Priority<select bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label><label>Severity<select bind:value={draft.severity}><option value={null}>None</option>{#each ["low", "medium", "high", "critical"] as severity}<option value={severity}>{severity}</option>{/each}</select></label></div>
-      <label>Owner<input value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
-      <label>Labels<input bind:value={labels} placeholder="Separate labels with commas" /></label>
-      <label>Home workspace<select bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as group (group.id)}<option value={group.id}>{group.name}{group.archived ? " (archived)" : ""}</option>{/each}</select></label>
+      <label>Description<textarea class="gp-field gp-field-multi" bind:value={draft.description} rows="8" maxlength="65536" placeholder="What happens, what should happen, evidence, and constraints" ></textarea></label>
+      <label>Acceptance criteria<textarea class="gp-field gp-field-multi" bind:value={criteria} rows="4" placeholder="One verifiable criterion per line" ></textarea></label>
+      <div class="pair"><label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label><label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each ["low", "medium", "high", "critical"] as severity}<option value={severity}>{severity}</option>{/each}</select></label></div>
+      <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
+      <label>Labels<input class="gp-field" bind:value={labels} placeholder="Separate labels with commas" /></label>
+      <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as group (group.id)}<option value={group.id}>{group.name}{group.archived ? " (archived)" : ""}</option>{/each}</select></label>
       <details>
         <summary>Details</summary>
         <fieldset class="enhancement-locks"><legend>Enhancement field locks</legend>
@@ -141,16 +141,16 @@
               {tab.label}<span class="open-mark">Open</span>
             </label>
           {/each}
-          {#if addable.length > 1}<button type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((tab) => tab.path))}>Add all open</button>{/if}
+          {#if addable.length > 1}<button class="gp-btn" type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((tab) => tab.path))}>Add all open</button>{/if}
         {/if}
         {#each draft.repository_ids.filter((id) => !known.some((r) => r.id === id)) as missing (missing)}<small>Linked repository {missing} (load more repositories to edit)</small>{/each}</fieldset>
-        <label>Primary repository<select bind:value={draft.primary_repository_id} required><option value="" disabled>Select a linked repository</option>{#each draft.repository_ids as repo (repo)}<option value={repo}>{known.find((r) => r.id === repo)?.name ?? repo}</option>{/each}</select></label>
-        {#if current}<button type="button" onclick={copy} disabled={copying || saving || enhancementBusy || pending !== null}>{copying ? "Loading brief…" : "Copy saved brief"}</button>{/if}
+        <label>Primary repository<select class="gp-select" bind:value={draft.primary_repository_id} required><option value="" disabled>Select a linked repository</option>{#each draft.repository_ids as repo (repo)}<option value={repo}>{known.find((r) => r.id === repo)?.name ?? repo}</option>{/each}</select></label>
+        {#if current}<button class="gp-btn" type="button" onclick={copy} disabled={copying || saving || enhancementBusy || pending !== null}>{copying ? "Loading brief…" : "Copy saved brief"}</button>{/if}
       </details>
     </fieldset>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
     {#if pending}<p>The save result is uncertain. Retry the same write to reconcile it before editing further.</p>{/if}
-    <footer><button class="primary" disabled={saving || adding || enhancementBusy || !draft.repository_ids.length} type="submit">{saving ? "Saving…" : pending ? "Retry save" : "Save task"}</button>{#if current}<button type="button" onclick={reload} disabled={saving || enhancementBusy}>Reload saved</button><button type="button" onclick={remove} disabled={saving || adding || enhancementBusy || pending !== null}>Delete</button>{/if}</footer>
+    <footer><button class="gp-btn-primary" disabled={saving || adding || enhancementBusy || !draft.repository_ids.length} type="submit">{saving ? "Saving…" : pending ? "Retry save" : "Save task"}</button>{#if current}<button class="gp-btn" type="button" onclick={reload} disabled={saving || enhancementBusy}>Reload saved</button><button class="gp-btn" type="button" onclick={remove} disabled={saving || adding || enhancementBusy || pending !== null}>Delete</button>{/if}</footer>
     <p role="status">{note}</p>
   </form>
   {#if current}<TaskEnhancements task={current} disabled={dirty || saving || pending !== null} onApplied={applied} onBusy={(busy) => { enhancementBusy = busy; }} />{/if}
@@ -159,6 +159,6 @@
 
 <style>
   .enhancement-locks{margin:0 0 14px}details{margin:12px 0}summary{cursor:pointer;color:rgb(var(--c-text-muted));font-size:12px}
-  .task-editor{width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border));background:rgb(var(--c-surface));overflow:auto;padding:18px;color:rgb(var(--c-text))}
-  header,footer,.pair{display:flex;gap:10px;align-items:center}header{justify-content:space-between;margin-bottom:18px}h2{font-size:16px;font-weight:650;margin:0}small,legend{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg));color:inherit;min-width:0}textarea{resize:vertical}button{padding:6px 10px;border:1px solid rgb(var(--c-border));border-radius:7px;font-size:12px}button:hover{background:rgb(var(--c-surface-hover))}button:disabled{opacity:.5}.primary{background:rgb(var(--c-accent));color:white}footer{flex-wrap:wrap}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}
+  .task-editor{width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border));overflow:auto;padding:0;color:rgb(var(--c-text))}
+  header,footer,.pair{display:flex;gap:10px;align-items:center}header{position:sticky;top:0;z-index:1;justify-content:space-between;padding:16px 18px;margin:0;border-bottom:1px solid rgb(var(--c-border))}h2{font-size:16px;font-weight:650;margin:0}small,legend{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;padding:18px}.task-editor :global(.enhancements),.task-editor :global(.task-runs){margin:0 18px 18px}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:var(--mac-fill-bg,rgb(var(--c-bg)));color:inherit;min-width:0}textarea{resize:vertical}button:hover{background:var(--mac-fill-surface-hover,rgb(var(--c-surface-hover)))}button:disabled{opacity:.5}footer{flex-wrap:wrap}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}
 </style>
