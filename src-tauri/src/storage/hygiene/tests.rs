@@ -56,9 +56,28 @@ fn age(path: &Path) {
             options.custom_flags(0x0200_0000);
         }
         options.open(path).unwrap().set_times(times).unwrap();
-        return;
     }
+    #[cfg(not(windows))]
     File::open(path).unwrap().set_times(times).unwrap();
+}
+
+#[test]
+fn age_sets_mtime_on_a_directory_and_a_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("stale");
+    fs::create_dir(&dir).unwrap();
+    let file = dir.join("output");
+    fs::write(&file, "generated").unwrap();
+    age(&dir);
+    let threshold = SystemTime::now() - Duration::from_secs(50 * 86400);
+    assert!(
+        fs::metadata(&dir).unwrap().modified().unwrap() < threshold,
+        "directory mtime must move backwards so retention checks see stale output"
+    );
+    assert!(
+        fs::metadata(&file).unwrap().modified().unwrap() < threshold,
+        "file mtime must move backwards so retention checks see stale output"
+    );
 }
 
 fn preview(repo: &Path) -> HygienePlan {

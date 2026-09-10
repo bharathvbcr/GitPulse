@@ -117,7 +117,9 @@ workbench board land together on `main`.
   the sandbox containment check and failed dozens of Windows tests.
 - Set hygiene fixture mtimes with a writable handle on Windows. Read-only
   `File::open` cannot `SetFileTime` (`ERROR_ACCESS_DENIED`), which panicked
-  the fixture and poisoned the shared test lock.
+  the fixture and poisoned the shared test lock. Compile the Unix
+  `File::open` path only off Windows so clippy `-D warnings` does not treat
+  it as unreachable after the Windows branch returns.
 - Compare shared-cache prefixes with normalized slashes, so
   `Library\Caches\go-build` on Windows is the same root as `Library/Caches/`.
 - Keep XML comments in that manifest free of `--`, which made `mt.exe` reject
