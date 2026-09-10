@@ -195,6 +195,10 @@ name = "native_menu_main_thread"
 harness = false
 
 [[test]]
+name = "native_status_material"
+harness = false
+
+[[test]]
 name = "gtk_runtime"
 harness = false
 

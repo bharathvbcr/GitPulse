@@ -11,6 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Give the macOS status popover the app's native background blur, translucent
+  surfaces and rounded material bounds. Preserve the compact layout and provide
+  opaque accessibility fallbacks. Match the native window to the panel on resize
+  and reopen; the browser fixture includes a labeled glass simulation. Select
+  the tray display using physical bounds so Retina coordinates can open the panel.
+
+- Refine the macOS status popover around three large Changed, Staged and Conflicts
+  cards, a monochrome repository header, last-fetch counts and one blue primary
+  action. Keep stashes, workspace insights, the command palette and secondary
+  shortcuts inside Details, with Open GitPulse, Settings and Quit in the footer.
+
 ## [0.1.0] - 2026-09-09
 
 First minor release after the 0.0.x desktop series. Native menus, the macOS

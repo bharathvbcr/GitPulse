@@ -161,6 +161,8 @@ The window itself is transparent and an `NSVisualEffectView`
 behind it. The blur is done by the window server, so it costs the application
 nothing per frame — unlike a CSS `backdrop-filter`, which the app pays for.
 
+The separate macOS status popover applies this material when its lazy window is built in `desktop/popover.rs`; the main-window JSON does not configure it. Its material bounds fit the 360px panel and 18px corners. `StatusPopover.svelte` uses an 80% base tint with stronger secondary-text contrast, translucent cards and a slight highlight. The native mode uses no CSS backdrop filter. The browser fixture labels its simulated backdrop and uses a 34px CSS blur instead. Reduced transparency, increased contrast and forced colors restore opaque styling in both modes. The native effect resizes with the window, including Details and short recovery states.
+
 Three settings have to be present together, and any one alone is inert:
 
 | Setting | Where | Without it |
