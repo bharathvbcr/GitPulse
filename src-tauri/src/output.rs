@@ -38,9 +38,11 @@ impl BoundedOutput {
         let (sender, receiver) = mpsc::sync_channel::<Request>(QUEUED_WRITES);
         let disabled = Arc::new(AtomicBool::new(false));
         let stopped = disabled.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
+                let _ = ready_tx.send(());
                 while let Ok(request) = receiver.recv() {
                     if stopped.load(Ordering::Acquire) {
                         break;
@@ -58,6 +60,12 @@ impl BoundedOutput {
                     }
                 }
             })?;
+        // The write deadline is I/O time, not thread-start time. Windows CI
+        // panic probes were emptying stderr because the first 100 ms write
+        // timed out before this worker was scheduled, then disabled the sink.
+        ready_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "output worker failed to start")
+        })?;
         Ok(Self {
             sender,
             disabled,
@@ -153,6 +161,22 @@ mod tests {
         );
         output.write(b"next\n").unwrap();
         assert_eq!(*bytes.lock().unwrap(), b"first record\nnext\n");
+    }
+
+    #[test]
+    fn new_does_not_return_until_the_worker_is_receiving() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let output = BoundedOutput::new(
+            PartialWriter(bytes.clone()),
+            "output-ready-test",
+            16,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        output.write(b"ready\n").unwrap();
+        assert_eq!(*bytes.lock().unwrap(), b"ready\n");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     struct StalledWriter(mpsc::Receiver<()>, Arc<Mutex<Vec<u8>>>);

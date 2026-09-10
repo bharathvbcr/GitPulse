@@ -25,9 +25,11 @@ fn main() {
 /// copy too, so the unresolved import is something else. Naming it would take
 /// another run against a Windows host; the fix is the same either way.
 ///
-/// `rustc-link-arg-tests` applies to test targets only, so the application
-/// binary keeps the manifest `tauri_build` embeds, and nothing is emitted on
-/// platforms whose linker has no such flag.
+/// `rustc-link-arg-tests` covers `--test` binaries. This package also builds a
+/// Windows `cdylib` (`crate-type` includes it for the GUI), and `cargo test
+/// --lib` loads that library: without the same manifest the lib test harness
+/// died at process start with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) while
+/// integration tests that received `-tests` flags still ran.
 fn embed_test_manifest() {
     println!("cargo:rerun-if-changed=tests.manifest");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
@@ -36,9 +38,9 @@ fn embed_test_manifest() {
         return;
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests.manifest");
-    println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
-        manifest.display()
-    );
+    let path = manifest.display();
+    for kind in ["rustc-link-arg-tests", "rustc-cdylib-link-arg"] {
+        println!("cargo:{kind}=/MANIFEST:EMBED");
+        println!("cargo:{kind}=/MANIFESTINPUT:{path}");
+    }
 }

@@ -103,18 +103,25 @@ fn pipe_output(full: bool) -> (Stdio, Option<File>) {
 fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging() {
     for full in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let (stdout, mut held_reader) = pipe_output(full);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulsed"));
+        command
             .arg("--help")
             .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
             .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        if !full {
-            held_reader.take();
-        }
+            .stderr(Stdio::null());
+        // Broken pipe: std's piped stdout keeps a reader alive through
+        // posix_spawn, then this drops it before `--help` writes. Closing the
+        // reader before spawn made macOS inherit the test harness stdout, so
+        // help exited 0. Holding a custom reader until after spawn let USAGE
+        // land in the pipe buffer and also exit 0.
+        let (mut child, held_reader) = if full {
+            let (stdout, reader) = pipe_output(true);
+            (command.stdout(stdout).spawn().unwrap(), reader)
+        } else {
+            let mut child = command.stdout(Stdio::piped()).spawn().unwrap();
+            drop(child.stdout.take());
+            (child, None)
+        };
         assert_eq!(
             wait(&mut child, Duration::from_secs(5)).code(),
             Some(1),

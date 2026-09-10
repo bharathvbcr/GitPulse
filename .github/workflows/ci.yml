@@ -43,6 +43,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # Hosted Windows images moved to VS2026; reuse of older MSVC artifacts
+          # failed `--lib` with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139).
+          prefix-key: ${{ env.ImageOS }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7

@@ -103,6 +103,15 @@ workbench board land together on `main`.
 - Keep Windows clippy from treating the unix-only hygiene worker waiter as unused.
 - Capture panic-redaction diagnostics from the child stderr pipe so Windows
   observes the hook instead of an inherited file handle that never received it.
+- Embed the Windows comctl32 v6 manifest on the `cdylib` as well as `--test`
+  binaries, so `cargo test --lib` loads instead of dying with
+  `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs.
+- Wait for the bounded-output worker to start before the first write, so a
+  100 ms stderr deadline is I/O time rather than thread-start time on Windows.
+- Close daemon `--help` stdout after spawn via std's piped reader, so a
+  buffered USAGE write cannot look like a successful broken-pipe probe.
+- Key the CI Rust cache on the runner image so Windows native artifacts are
+  not reused across Visual Studio upgrades.
 
 ### Changed
 

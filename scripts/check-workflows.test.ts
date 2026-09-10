@@ -69,4 +69,19 @@ describe("check:workflows", () => {
     expect(summary, source).toBeDefined();
     expect(summary).toContain("--no-run");
   });
+
+  it("scopes rust-cache to the runner image so native artifacts are not reused across MSVC upgrades", () => {
+    for (const name of ["ci.yml", "coverage.yml", "release.yml"]) {
+      const source = readFileSync(
+        fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)),
+        "utf8",
+      );
+      const caches = source.split("uses: Swatinem/rust-cache@v2");
+      expect(caches.length, name).toBeGreaterThan(1);
+      for (const block of caches.slice(1)) {
+        expect(block, name).toContain("prefix-key:");
+        expect(block, name).toContain("ImageOS");
+      }
+    }
+  });
 });

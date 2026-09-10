@@ -45,6 +45,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          prefix-key: ${{ env.ImageOS }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
