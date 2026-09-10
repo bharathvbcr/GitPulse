@@ -108,8 +108,9 @@ workbench board land together on `main`.
   `STATUS_ENTRYPOINT_NOT_FOUND` before any unit test runs.
 - Wait for the bounded-output worker to start before the first write, so a
   100 ms stderr deadline is I/O time rather than thread-start time on Windows.
-- Close daemon `--help` stdout after spawn via std's piped reader, so a
-  buffered USAGE write cannot look like a successful broken-pipe probe.
+- Probe daemon stdout failure by saturating the pipe. `--help` fits in an
+  empty buffer, so dropping the reader after spawn still exited 0 and hid
+  the broken-pipe path.
 - Key the CI Rust cache on the runner image so Windows native artifacts are
   not reused across Visual Studio upgrades.
 

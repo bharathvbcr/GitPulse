@@ -179,6 +179,29 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_pipe_disables_the_sink_without_retrying() {
+        use std::fs::File;
+        use std::os::fd::FromRawFd;
+        let mut descriptors = [-1; 2];
+        // SAFETY: pipe initializes two owned descriptors on success.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { File::from_raw_fd(descriptors[1]) };
+        drop(reader);
+        let output =
+            BoundedOutput::new(writer, "closed-pipe-test", 16, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            output.write(b"gone\n").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            output.write(b"never retry").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
     struct StalledWriter(mpsc::Receiver<()>, Arc<Mutex<Vec<u8>>>);
     impl Write for StalledWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {

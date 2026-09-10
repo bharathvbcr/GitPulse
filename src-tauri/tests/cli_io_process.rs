@@ -101,37 +101,25 @@ fn pipe_output(full: bool) -> (Stdio, Option<File>) {
 #[cfg(unix)]
 #[test]
 fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging() {
-    for full in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulsed"));
-        command
-            .arg("--help")
-            .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        // Broken pipe: std's piped stdout keeps a reader alive through
-        // posix_spawn, then this drops it before `--help` writes. Closing the
-        // reader before spawn made macOS inherit the test harness stdout, so
-        // help exited 0. Holding a custom reader until after spawn let USAGE
-        // land in the pipe buffer and also exit 0.
-        let (mut child, held_reader) = if full {
-            let (stdout, reader) = pipe_output(true);
-            (command.stdout(stdout).spawn().unwrap(), reader)
-        } else {
-            let mut child = command.stdout(Stdio::piped()).spawn().unwrap();
-            drop(child.stdout.take());
-            (child, None)
-        };
-        assert_eq!(
-            wait(&mut child, Duration::from_secs(5)).code(),
-            Some(1),
-            "full={full}"
-        );
-        drop(held_reader);
-        let log = fs::read_to_string(dir.path().join("gitpulsed.log")).unwrap();
-        assert!(log.contains("stdout"));
-        assert!(!log.contains("[panic]"));
-    }
+    let dir = tempfile::tempdir().unwrap();
+    // `--help` is smaller than the pipe buffer. An empty reader dropped after
+    // posix_spawn still lets USAGE land, so the child exits 0 and the probe
+    // never sees a broken pipe. Saturating the pipe is the hang/EPIPE stand-in
+    // that cannot succeed by buffering.
+    let (stdout, held_reader) = pipe_output(true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
+        .arg("--help")
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(1));
+    drop(held_reader);
+    let log = fs::read_to_string(dir.path().join("gitpulsed.log")).unwrap();
+    assert!(log.contains("stdout"));
+    assert!(!log.contains("[panic]"));
 }
 
 #[cfg(unix)]
