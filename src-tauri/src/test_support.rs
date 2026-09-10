@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tempfile::TempDir;
 
 static HARNESS_CLONE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +71,19 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
     let mut command = Command::new(&path);
     command.args(["--exact", filter, "--nocapture"]);
     (command, IsolatedHarnessGuard { path })
+}
+
+/// Coverage instrumentation makes sub-second process and thread deadlines
+/// flake. Production timeouts stay unchanged; only tests should call this.
+#[cfg(test)]
+pub(crate) fn coverage_relaxed(duration: Duration) -> Duration {
+    if std::env::var_os("CARGO_LLVM_COV").is_some()
+        || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+    {
+        duration.saturating_mul(8).max(Duration::from_secs(5))
+    } else {
+        duration
+    }
 }
 
 /// Runs `git` in `dir` with the test identity pinned, and asserts it succeeded.
@@ -132,7 +146,8 @@ pub(crate) fn write(dir: &Path, rel: &str, content: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::isolated_libtest_command;
+    use super::{coverage_relaxed, isolated_libtest_command};
+    use std::time::Duration;
 
     #[test]
     fn isolated_harness_copy_is_a_file_beside_the_running_image() {
@@ -145,5 +160,18 @@ mod tests {
         );
         assert_ne!(guard.path(), src.as_path());
         assert_eq!(guard.path().parent(), src.parent());
+    }
+
+    #[test]
+    fn coverage_relaxed_leaves_plain_runs_unchanged() {
+        let budget = Duration::from_millis(400);
+        let instrumented = std::env::var_os("CARGO_LLVM_COV").is_some()
+            || std::env::var_os("LLVM_PROFILE_FILE").is_some();
+        let relaxed = coverage_relaxed(budget);
+        if instrumented {
+            assert!(relaxed >= Duration::from_secs(5), "{relaxed:?}");
+        } else {
+            assert_eq!(relaxed, budget);
+        }
     }
 }

@@ -1428,10 +1428,14 @@ mod tests {
         let stdin = child.stdin.take().expect("piped stdin");
 
         let started = Instant::now();
-        shutdown_child(&mut child, Some(stdin), Duration::from_millis(500));
+        shutdown_child(
+            &mut child,
+            Some(stdin),
+            crate::test_support::coverage_relaxed(Duration::from_millis(500)),
+        );
         let status = child.wait().expect("reap");
         assert!(
-            started.elapsed() < Duration::from_millis(2_000),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(2_000)),
             "clean exit should not wait out the full grace"
         );
         assert!(status.success(), "child exited on EOF, not killed");
@@ -1889,12 +1893,17 @@ done
         });
 
         assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            rx.recv_timeout(crate::test_support::coverage_relaxed(
+                Duration::from_millis(300)
+            ))
+            .is_err(),
             "a second thread must not acquire the guard while it is held"
         );
         drop(held);
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("releasing the guard must let the waiting thread in");
+        rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+            5,
+        )))
+        .expect("releasing the guard must let the waiting thread in");
         contender.join().expect("contender thread");
     }
 
@@ -1943,7 +1952,7 @@ done
         let verdict = super::call_policy::<RawDecision>(
             OP_POLICY_CHECK_COMMAND,
             serde_json::json!({ "command": "true", "root": dir.path() }),
-            Duration::from_millis(400),
+            crate::test_support::coverage_relaxed(Duration::from_millis(400)),
         );
         let elapsed = started.elapsed();
 

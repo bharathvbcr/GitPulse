@@ -113,6 +113,8 @@ workbench board land together on `main`.
   the broken-pipe path.
 - Copy the libtest harness before re-executing isolated cases, so llvm-cov
   unlinking `current_exe()` cannot fail `unwatch(".")` with `NotFound`.
+- Give sidecar isolation tests coverage-relaxed deadlines so llvm-cov load
+  cannot kill an EOF child or miss a 400ms policy retry.
 - Key the CI Rust cache on the runner image so Windows native artifacts are
   not reused across Visual Studio upgrades.
 
