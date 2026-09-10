@@ -120,7 +120,7 @@ fn home_dir() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or("Home directory unavailable")?;
-    std::fs::canonicalize(home).map_err(|e| e.to_string())
+    crate::engine::git_cli::canonicalize_plain(Path::new(&home)).map_err(|e| e.to_string())
 }
 
 fn tool(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
@@ -171,7 +171,8 @@ fn cache_path(id: &str, home: &Path) -> Result<PathBuf, String> {
 }
 
 fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, String> {
-    let resolved = path.canonicalize().map_err(|e| e.to_string())?;
+    let resolved = crate::engine::git_cli::canonicalize_plain(path).map_err(|e| e.to_string())?;
+    let home = crate::engine::git_cli::canonicalize_plain(home).map_err(|e| e.to_string())?;
     // macOS aliases /var to /private/var. Resolve that platform prefix, but
     // reject a symlink at the cache itself and below the user's home.
     if std::fs::symlink_metadata(path)
@@ -182,7 +183,7 @@ fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, String> {
         return Err("Symlinked cache requires manual maintenance".into());
     }
     let relative = resolved
-        .strip_prefix(home)
+        .strip_prefix(&home)
         .map_err(|_| "Cache is outside the home directory; use its owning tool manually")?;
     let text = relative.to_string_lossy();
     let permitted = [

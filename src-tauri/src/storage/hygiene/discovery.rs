@@ -22,7 +22,8 @@ pub fn roots(values: &[String], exclusions: bool) -> Result<Vec<PathBuf>, String
         if !path.is_absolute() || value.len() > 4096 || value.chars().any(char::is_control) {
             return Err("Roots and exclusions must be absolute directory paths".into());
         }
-        let path = path.canonicalize().map_err(|e| format!("{value}: {e}"))?;
+        let path = crate::engine::git_cli::canonicalize_plain(path)
+            .map_err(|e| format!("{value}: {e}"))?;
         super::tree::no_symlinks(Path::new(value))?;
         if !path.is_dir() || path.parent().is_none() {
             return Err("Choose a project directory, not a filesystem root".into());

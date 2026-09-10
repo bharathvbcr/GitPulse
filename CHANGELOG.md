@@ -107,6 +107,10 @@ workbench board land together on `main`.
   `cargo test --lib` loads instead of dying with `STATUS_ENTRYPOINT_NOT_FOUND`
   before any unit test runs. Omit tauri-winres's default app manifest from the
   bin `.res`; a second `/MANIFEST:EMBED` on `gitpulse.exe` is CVT1100.
+- Keep Windows hygiene from stating a volume root (`C:\` / `\\?\C:\`) and
+  resolve those paths with `canonicalize_plain`. `canonicalize` plus `git init`
+  or `File::open` on a directory is os error 1, so `--lib` never checked the
+  policy once the lib harness actually loaded.
 - Keep XML comments in that manifest free of `--`, which made `mt.exe` reject
   the file with c1010070 and aborted the Windows lib link.
 - Wait for the bounded-output worker to start before the first write, so a

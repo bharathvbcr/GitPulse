@@ -70,9 +70,15 @@ pub fn no_symlinks(path: &Path) -> Result<(), String> {
         // A volume prefix is not a filesystem object. Stating `C:` or
         // `\\?\C:` is ERROR_INVALID_FUNCTION (os error 1) on Windows, which
         // made every hygiene fixture that canonicalize()'d a temp path fail
-        // before any policy ran. RootDir (`C:\`) and each Normal component
-        // are still checked.
+        // before any policy ran. The volume RootDir (`C:\`, and `\\?\C:\`
+        // after canonicalize) is the same class: it is never a user symlink
+        // and stating the verbatim form is also os error 1. Each Normal
+        // component is still checked.
         if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        #[cfg(windows)]
+        if matches!(component, Component::RootDir) {
             continue;
         }
         if fs::symlink_metadata(&current)
@@ -350,5 +356,10 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         no_symlinks(&path)
             .expect("canonical paths start with a volume prefix; that prefix is not statted");
+        let plain = crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("owned");
+        no_symlinks(&plain)
+            .expect("git-facing paths use canonicalize_plain; volume roots are still not statted");
     }
 }

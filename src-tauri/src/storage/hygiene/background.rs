@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn foreign_symlink_and_oversized_jobs_are_preserved_without_launchctl() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
         let path = root.join("job.plist");
         for text in ["foreign".to_string(), "x".repeat(16385)] {
             std::fs::write(&path, &text).unwrap();
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn registration_and_disable_use_owned_path_and_propagate_failures() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
         let path = root.join("jobs/job.plist");
         let mut calls = vec![];
         configure_at(&path, Some(&plist("app")), "gui/1", |args| {
@@ -262,7 +262,7 @@ mod tests {
     fn debug_executables_and_foreign_loaded_labels_cannot_be_scheduled() {
         assert!(app_executable(Path::new("/tmp/gitpulse")).is_err());
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
         let path = root.join("job.plist");
         assert!(
             configure_at(&path, Some(&plist("app")), "gui/1", |_| Ok(true))

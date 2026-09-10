@@ -12,7 +12,7 @@ pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().canonicalize().unwrap();
+    let repo = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
     crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
     fs::write(
         repo.join(".gitignore"),
@@ -43,10 +43,22 @@ fn age(path: &Path) {
         }
     }
     let old = SystemTime::now() - Duration::from_secs(100 * 86400);
-    File::open(path)
-        .unwrap()
-        .set_times(FileTimes::new().set_modified(old))
-        .unwrap();
+    let times = FileTimes::new().set_modified(old);
+    #[cfg(windows)]
+    if path.is_dir() {
+        // File::open on a directory is ERROR_INVALID_FUNCTION (os error 1).
+        // FILE_FLAG_BACKUP_SEMANTICS is required to set a directory mtime.
+        use std::os::windows::fs::OpenOptionsExt;
+        File::options()
+            .write(true)
+            .custom_flags(0x0200_0000)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        return;
+    }
+    File::open(path).unwrap().set_times(times).unwrap();
 }
 
 fn preview(repo: &Path) -> HygienePlan {
@@ -453,7 +465,7 @@ fn shared_cache_commands_pin_scope_and_preserve_downloads() {
         assert!(invocation(id, &path, home).is_err());
     }
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().canonicalize().unwrap();
+    let home = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
     assert!(managed_cache_path(&home, &home).is_err());
     fs::create_dir_all(home.join("Library/Caches/go-build")).unwrap();
     assert!(managed_cache_path(&home.join("Library/Caches/go-build"), &home).is_ok());

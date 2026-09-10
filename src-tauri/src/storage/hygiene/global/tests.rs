@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 fn fixture() -> (tempfile::TempDir, Arc<Cleaner>, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
+    let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
     let code = root.join("code");
     fs::create_dir(&code).unwrap();
     let cleaner = Arc::new(Cleaner::new(root.join("state")));
@@ -375,7 +375,11 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
     // service is injected at the same gate called by production.
     let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
     let (temp, _old, root) = fixture();
-    let mut service = Cleaner::new(temp.path().canonicalize().unwrap().join("execution-state"));
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("execution-state"),
+    );
     service.activity_override = Some(|_| Ok(()));
     let cleaner = Arc::new(service);
     for name in ["a", "b"] {
