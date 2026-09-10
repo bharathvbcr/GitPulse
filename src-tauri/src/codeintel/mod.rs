@@ -1379,11 +1379,10 @@ mod tests {
         }
 
         let home = tempfile::TempDir::new().expect("override");
-        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "codeintel::tests::devmap_home_override_is_observed_in_an_isolated_process",
-            ])
+        let (mut command, _harness) = crate::test_support::isolated_libtest_command(
+            "codeintel::tests::devmap_home_override_is_observed_in_an_isolated_process",
+        );
+        let status = command
             .env("DEVMAP_HOME", home.path())
             .env("GITPULSE_DEVMAP_HOME_CHILD", home.path())
             .status()

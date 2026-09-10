@@ -366,8 +366,10 @@ mod tests {
         // process. The separate retained-pipe tests cover missing EOF.
         const CHILD: &str = "GITPULSE_EOF_FIXTURE_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command.args(["--exact", "engine::git_cli::pipe_drain::tests::ready_output_is_read_even_when_the_waiter_resumes_after_its_deadline", "--test-threads=1"]);
+            let (mut command, _harness) = crate::test_support::isolated_libtest_command(
+                "engine::git_cli::pipe_drain::tests::ready_output_is_read_even_when_the_waiter_resumes_after_its_deadline",
+            );
+            command.arg("--test-threads=1");
             command.env(CHILD, "1");
             let run = crate::engine::git_cli::run_bounded_capped(
                 command,

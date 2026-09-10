@@ -1275,12 +1275,10 @@ mod tests {
             let output_path = output_dir.path().join("child-output");
             let output = std::fs::File::create(&output_path).unwrap();
             let original_cwd = std::env::current_dir().unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "watcher::tests::test_unwatch_relative_path_does_not_canonicalize_against_cwd",
-                    "--nocapture",
-                ])
+            let (mut command, _harness) = crate::test_support::isolated_libtest_command(
+                "watcher::tests::test_unwatch_relative_path_does_not_canonicalize_against_cwd",
+            );
+            let mut child = command
                 .env(CHILD, "1")
                 .stdin(std::process::Stdio::null())
                 .stderr(output.try_clone().unwrap())

@@ -111,6 +111,8 @@ workbench board land together on `main`.
 - Probe daemon stdout failure by saturating the pipe. `--help` fits in an
   empty buffer, so dropping the reader after spawn still exited 0 and hid
   the broken-pipe path.
+- Copy the libtest harness before re-executing isolated cases, so llvm-cov
+  unlinking `current_exe()` cannot fail `unwatch(".")` with `NotFound`.
 - Key the CI Rust cache on the runner image so Windows native artifacts are
   not reused across Visual Studio upgrades.
 
