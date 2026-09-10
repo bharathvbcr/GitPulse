@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
@@ -55,5 +56,17 @@ describe("check:workflows", () => {
 
     const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
     expect(workflowsMissingPermissions(dir)).toEqual([]);
+  });
+
+  it("prints the rust coverage summary without rerunning the tests", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../.github/workflows/coverage.yml", import.meta.url)),
+      "utf8",
+    );
+    const summary = source
+      .split("\n")
+      .find((line) => line.includes("--summary-only"));
+    expect(summary, source).toBeDefined();
+    expect(summary).toContain("--no-run");
   });
 });

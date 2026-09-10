@@ -57,9 +57,23 @@ fn pipe_output(full: bool) -> (Stdio, Option<File>) {
     assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
     let reader = unsafe { File::from_raw_fd(descriptors[0]) };
     let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+    // posix_spawn needs a live read end to attach the write end as stdout.
+    // The child must not inherit that reader: it would keep the pipe readable
+    // and `--help` would exit 0 instead of reporting a broken stdout.
+    let reader_flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFD) };
+    assert!(reader_flags >= 0);
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                reader.as_raw_fd(),
+                libc::F_SETFD,
+                reader_flags | libc::FD_CLOEXEC,
+            )
+        },
+        0
+    );
     if !full {
-        drop(reader);
-        return (Stdio::from(writer), None);
+        return (Stdio::from(writer), Some(reader));
     }
     let fd = writer.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -89,7 +103,7 @@ fn pipe_output(full: bool) -> (Stdio, Option<File>) {
 fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging() {
     for full in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let (stdout, held_reader) = pipe_output(full);
+        let (stdout, mut held_reader) = pipe_output(full);
         let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
             .arg("--help")
             .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
@@ -98,6 +112,9 @@ fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging()
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        if !full {
+            held_reader.take();
+        }
         assert_eq!(
             wait(&mut child, Duration::from_secs(5)).code(),
             Some(1),
@@ -118,7 +135,7 @@ fn argument_errors_keep_their_exit_contract_when_stderr_is_closed() {
         (env!("CARGO_BIN_EXE_gitpulsed"), 2),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let (stderr, _) = pipe_output(false);
+        let (stderr, reader) = pipe_output(false);
         let mut child = Command::new(binary)
             .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
             .stdin(Stdio::null())
@@ -126,6 +143,7 @@ fn argument_errors_keep_their_exit_contract_when_stderr_is_closed() {
             .stderr(stderr)
             .spawn()
             .unwrap();
+        drop(reader);
         assert_eq!(
             wait(&mut child, Duration::from_secs(5)).code(),
             Some(expected)

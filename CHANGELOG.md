@@ -94,6 +94,12 @@ workbench board land together on `main`.
 - Announce the workbench preview URL without stdio buffering, exit after SIGTERM
   closes the Vite server and Manvi child so leftover handles cannot hang coverage,
   and keep the lifecycle test's SIGKILL budget above that child's 6.5s close wait.
+- Print the GitHub coverage summary from the counters the LCOV run already
+  produced, instead of executing the Rust suite a second time with its output
+  redirected away.
+- Attach a daemon stdout pipe before closing the read end, and keep that
+  reader out of the child with `FD_CLOEXEC`, so `--help` cannot treat an
+  inherited descriptor as a successful delivery.
 
 ### Changed
 
