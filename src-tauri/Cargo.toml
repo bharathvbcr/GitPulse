@@ -248,6 +248,7 @@ javascriptcore-rs-sys = { path = "framework/javascriptcore-rs-sys" }
 libappindicator = { path = "framework/libappindicator" }
 libappindicator-sys = { path = "framework/libappindicator-sys" }
 muda = { path = "framework/muda" }
+notify = { path = "framework/notify" }
 tao = { path = "framework/tao" }
 tauri = { path = "framework/tauri" }
 tauri-runtime = { path = "framework/tauri-runtime" }
