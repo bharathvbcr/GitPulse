@@ -637,6 +637,10 @@ pub(crate) struct RingLogger {
     /// logger's lifetime; the ring and durable sink continue independently.
     stderr_failed: Arc<AtomicBool>,
     stderr: Arc<OnceLock<Result<crate::output::BoundedOutput, std::io::Error>>>,
+    /// Process-wide loggers (`build_logger`) mirror to stderr. Hand-built test
+    /// loggers must not: `--nocapture` shares a pipe with the harness, and a
+    /// timeout there injects "stderr mirror disabled" into the ring.
+    mirror_stderr: bool,
 }
 
 static LOGGER: OnceLock<RingLogger> = OnceLock::new();
@@ -649,6 +653,7 @@ impl RingLogger {
             sink: None,
             stderr_failed: Arc::new(AtomicBool::new(false)),
             stderr: Arc::new(OnceLock::new()),
+            mirror_stderr: false,
         }
     }
 
@@ -667,6 +672,9 @@ impl RingLogger {
         // from a desktop shell, and is the half that cannot be read back.
         if let Some(sink) = self.sink.as_ref() {
             sink.write_line(&line);
+        }
+        if !self.mirror_stderr {
+            return;
         }
         if self.stderr_failed.load(Ordering::Relaxed) {
             return;
@@ -744,6 +752,7 @@ fn configured_level() -> LevelFilter {
 fn build_logger() -> RingLogger {
     let mut logger = RingLogger::new(configured_level());
     logger.sink = durable_sink().map(Arc::new);
+    logger.mirror_stderr = true;
     logger
 }
 
@@ -1036,6 +1045,21 @@ mod tests {
         assert_eq!(format_utc(2_000_000_000), "2033-05-18T03:33:20Z");
         assert_eq!(format_utc(4_102_444_799), "2099-12-31T23:59:59Z");
         assert_eq!(format_utc(4_102_444_800), "2100-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn hand_built_loggers_do_not_record_harness_stderr_failures_in_the_ring() {
+        let logger = RingLogger::new(LevelFilter::Trace);
+        logger.write_entry(Level::Info, "iso", "only");
+        let queue = logger.entries.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(queue.front().unwrap().1.contains("[iso] only"));
+        assert!(
+            !queue
+                .iter()
+                .any(|(_, line)| line.contains("stderr mirror disabled")),
+            "hand-built loggers must not share the harness stderr pipe: {queue:?}"
+        );
     }
 
     #[test]

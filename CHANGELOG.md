@@ -110,6 +110,8 @@ workbench board land together on `main`.
   the file with c1010070 and aborted the Windows lib link.
 - Wait for the bounded-output worker to start before the first write, so a
   100 ms stderr deadline is I/O time rather than thread-start time on Windows.
+- Keep hand-built test loggers off the harness stderr pipe, so a `--nocapture`
+  timeout cannot inject "stderr mirror disabled" into the ring.
 - Probe daemon stdout failure by saturating the pipe. `--help` fits in an
   empty buffer, so dropping the reader after spawn still exited 0 and hid
   the broken-pipe path.
