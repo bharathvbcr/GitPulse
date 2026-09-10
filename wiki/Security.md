@@ -1,25 +1,26 @@
 # Security
 
-GitPulse is a **local, zero-telemetry** desktop app. It has no GitPulse backend and no analytics.
+GitPulse is a **local-first, zero-telemetry** desktop app. It has no GitPulse backend and no analytics.
 
 ```mermaid
 flowchart TD
     Webview["Tauri webview — CSP default-src 'self'"] --> IPC["IPC: cmd_* only"]
-    IPC --> Engine["Rust sandbox, confined to the open repository"]
+    IPC --> Engine["Rust: validated paths and command gates"]
     Engine --> Gh["gh CLI / OS keychain"]
     Engine --> AI["Local LLM on 127.0.0.1 / localhost / ::1"]
-    Engine --> PTY["User terminal PTY — isolated from AI and MANVI"]
+    Engine --> PTY["User shells and explicit agent sessions"]
+    Engine --> Manvi["Profile Manvi / configured agent provider"]
 ```
 
 ## Guarantees
 
-**No remote phoning home.** No network request without an explicit user action. The webview does not load CDN scripts or trackers.
+**No remote phoning home.** Network-capable features follow user actions or opt-in settings, including scheduled release checks and automatic task suggestions. The webview does not load CDN scripts or trackers.
 
 **GitHub credentials.** GitPulse never requests, reads, stores, or transmits GitHub tokens. PR / Actions / Dependabot features delegate to the `gh` CLI you already authenticated.
 
-**Local AI only.** Completions and model probes are restricted to loopback. A remote base URL is rejected at the transport layer so diffs and file contents do not leave the machine.
+**Local AI transport.** Built-in local completions and model probes reject remote base URLs. Profile Manvi task suggestions and explicitly launched agents use their configured provider and run settings; the loopback restriction does not apply to those separate execution paths.
 
-**Terminal isolation.** The embedded PTY (`portable-pty`) is not reachable by AI models or the MANVI sidecar. Remediation actions (`cmd_manvi_run_action`) use a command allowlist and require confirmation.
+**Terminal sessions.** Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit agent launchers and task handoffs start dedicated PTY sessions under the provider's permissions. Worktrees are not OS sandboxes. Remediation actions (`cmd_manvi_run_action`) use a command allowlist and require confirmation. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
 **Opt-in release checks.** Off by default. When enabled: `git ls-remote` against public tags, at most once a day. No tokens, repo paths, or hardware telemetry. Never downloads an installer.
 

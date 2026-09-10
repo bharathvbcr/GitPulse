@@ -13,7 +13,9 @@ the configured executable and restarting it.
 | Parse, resolve and build a code index | DevCouncil `devmap` CLI | Bounded CLI calls in `src-tauri/src/devmap/cli.rs` |
 | Read and query a persisted index | DevCouncil `devmap-store`, `devmap-query`, `devmap-resolve` | Vendored Rust path dependencies with `default-features = false` |
 | HTML map and graph projection | DevCouncil `devmap-query` | Same upstream projection; HTML assets live inside the crate |
-| Task/lease reads and credential redaction | Manvi `dc-store`, `dc-verify`, `dc-glob` | Vendored Rust libraries; task store remains read-only in GitPulse |
+| Repository execution task/lease reads and credential redaction | Manvi `dc-store`, `dc-verify`, `dc-glob` | Vendored Rust libraries; execution tasks and leases remain read-only in GitPulse |
+| Profile workspaces, tasks, briefs and run records | Manvi `dc-store` workbench API | `cmd_workbench_request` performs typed CRUD against a separate profile database; Manvi owns schemas, revisions and receipts |
+| Task suggestions and managed agent hosting | Profile Manvi host | GitPulse presents proposals and run controls; Manvi owns provider execution and request/decision delivery |
 | Policy, local-model discovery and chat preparation | Manvi `serve` | Protocol v1 in `src-tauri/src/harness/`; advertised `hello.ops` capabilities |
 | Code intelligence through a process boundary | Manvi `serve.DevmapModule` | Available to other hosts through `devmap.status` and `devmap.query`; GitPulse retains its in-process readers |
 

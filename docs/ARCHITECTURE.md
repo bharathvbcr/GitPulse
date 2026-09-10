@@ -69,7 +69,7 @@ flowchart TB
 ## 1. Frontend Architecture
 
 ### Routerless View Architecture
-GitPulse does not use a virtual DOM router. Views are members of the `ViewTab` union defined in [`src/lib/repos/persist.ts`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/repos/persist.ts).
+GitPulse does not use a virtual DOM router. Views are members of the `ViewTab` union defined in [`src/lib/repos/persist.ts`](../src/lib/repos/persist.ts).
 
 ```mermaid
 flowchart LR
@@ -80,7 +80,7 @@ flowchart LR
     ViewRegistry --> AppRender["Render Branch<br/><code>App.svelte</code>"]
 ```
 
-Every view is registered in [`src/lib/views/viewRegistry.ts`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/views/viewRegistry.ts). TypeScript enforces that adding a view requires:
+Every view is registered in [`src/lib/views/viewRegistry.ts`](../src/lib/views/viewRegistry.ts). TypeScript enforces that adding a view requires:
 1. Adding the identifier to the `ViewTab` union in `persist.ts`.
 2. Adding its metadata to `VIEW_REGISTRY` in `viewRegistry.ts`.
 3. Adding the render branch in `App.svelte`.
@@ -110,9 +110,9 @@ See [macOS menus](MACOS_MENUS.md).
 
 ### Workspace surfaces
 
-**Fleet** ([`src/lib/components/FleetView.svelte`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/components/FleetView.svelte)) is deliberately outside that registry. A `ViewTab` is stored on the *active repository's* session and its pane is rendered inside `{#key currentPath}`; Fleet answers a question about the whole workspace, so being a view would both scope it wrongly and destroy and rebuild it on every repository switch.
+**Fleet** ([`src/lib/components/FleetView.svelte`](../src/lib/components/FleetView.svelte)) is deliberately outside that registry. A `ViewTab` is stored on the *active repository's* session and its pane is rendered inside `{#key currentPath}`; Fleet answers a question about the whole workspace, so being a view would both scope it wrongly and destroy and rebuild it on every repository switch.
 
-It therefore lives beside the repository pane rather than inside it, and the two are swapped by **hiding, never unmounting** — the repository subtree holds the live terminal PTY, which dies with its pane. Its open state is a UI preference in `interfaceStore`, not part of the persisted workspace blob, so remembering it does not require a workspace schema bump (which would make an older build fall back to legacy keys and lose the user's tabs). Because none of the registry machinery covers it, [`scripts/fleet-surface-contract.test.ts`](file:///Users/bharath/Code/devtools/gitpulse/scripts/fleet-surface-contract.test.ts) pins its three entry points, its Rust/TypeScript action-id agreement, and the hide-don't-unmount rule.
+It therefore lives beside the repository pane rather than inside it, and the two are swapped by **hiding, never unmounting** — the repository subtree holds the live terminal PTY, which dies with its pane. Its open state is a UI preference in `interfaceStore`, not part of the persisted workspace blob, so remembering it does not require a workspace schema bump (which would make an older build fall back to legacy keys and lose the user's tabs). Because none of the registry machinery covers it, [`scripts/fleet-surface-contract.test.ts`](../scripts/fleet-surface-contract.test.ts) pins its three entry points, its Rust/TypeScript action-id agreement, and the hide-don't-unmount rule.
 
 Its data is tiered by cost, and the tier boundary is visible to the reader:
 
@@ -164,7 +164,7 @@ Two of these are worth stating plainly, because both were live defects:
   sample as a total.
 
 ### Async Hygiene & Cancellation Guards
-When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
+When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](../src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
 
 ---
 
@@ -316,7 +316,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `npm run check:ipc` | Verifies all 205 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 985 data fields, in 54 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 989 data fields, in 54 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree. Missing schema identity is unresponsive, never a pass. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 
@@ -465,7 +465,7 @@ QoS assignment.
 See [Performance diagnostics](PERFORMANCE.md) for capture instructions and
 verification limits.
 
-## Agentic workbench (implementation in progress)
+## Agentic workbench (implemented core; broader qualification in progress)
 
 `TaskBoard.svelte` presents global, persistent-workspace and repository scopes over
 one profile task store. `src/lib/workbench/client.ts` validates responses and sends
@@ -473,6 +473,27 @@ typed operations through `cmd_workbench_request`. The native adapter bounds requ
 admission and runs storage off the UI thread. Manvi's vendored `dc-store` owns all
 schemas, row transactions, revisions, receipts, membership and proposal lifecycle;
 these profile records are separate from repository execution tasks and leases.
+The user-facing workflow is documented in [Tasks and workspaces](TASKS_AND_WORKSPACES.md).
+
+`TaskBoard` reuses this client for board/list layouts, selection, context actions,
+status/priority edits and deletion. Full-text search goes to the store;
+`taskOrganize.ts` applies facets to loaded pages, so filtered cards and selection
+are not a complete-profile query. `taskMenu.ts` derives actions from selection.
+`taskDelete.ts` serializes at most 50 deletions, with per-attempt deadlines and
+stable request IDs for retries inside a pass; failed and skipped records remain
+visible. Bulk edits report per-task failures and are not an all-or-nothing transaction.
+
+`TaskEditor` and `TaskManviAssist` seed title/description from notes, save before
+requesting a proposal, and accept changes against task/proposal revisions.
+`QuickEnhanceSheet` presents the existing task details and proposal lifecycle
+without adding a storage or provider endpoint. Field locks exclude title and/or
+description from enhancement. Generation, acceptance and dismissal remain
+separate operations owned by Manvi.
+
+`taskCompose.ts` formats new, unsaved drafts with an explicit draft label. Saved
+tasks always copy `items.brief.get` at their saved revision; unsaved editor changes
+are excluded and named. Board copying attempts at most eight saved tasks and
+reports partial results. Neither copy path launches a process.
 
 `items.brief.get` generates the canonical task export inside the store's read
 transaction. It requires the editor's saved revision and includes the exact task

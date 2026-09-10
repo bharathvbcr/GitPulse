@@ -24,10 +24,10 @@ macOS listed first; Windows / Linux in the second column.
 | Code | `⌘1` | `Ctrl+1` |
 | History | `⌘2` | `Ctrl+2` |
 | Insights | `⌘3` | `Ctrl+3` |
-| Fleet | `⇧F10` | `Shift+F10` |
+| Fleet | `⌘⇧F` | `Ctrl+Shift+F` |
 | Terminal dock | `⌃\`` | `Ctrl+\`` |
 
-Sections (Explorer/Blame/Map, Graph/Diff/Reflog, Pulse/Coverage/Health/Storage) are switched with `⌥` + the section's digit while that view is active, or by name in the command palette.
+Sections (including Work → Tasks, Explorer/Blame/Map, Graph/Diff/Reflog and Pulse/Coverage/Health/Storage) are switched with `⌥` + the section's digit while that view is active, or by name in the command palette.
 
 ## Fleet (focus in the grid, not in a text field)
 
@@ -68,8 +68,18 @@ In **Code**, `⌘F` searches the open file (Explorer and Blame). From other view
 | Prefix | Mode |
 | --- | --- |
 | `>` | Commands (default) |
-| `#` | Jump to commit (SHA or message) |
+| `/` | Files: tracked and untracked, non-ignored paths |
+| `%` | Repositories: open tabs, closed tabs and recents |
+| `#` | Jump to commit (SHA, message or author in loaded history) |
 | `@` | Jump to branch and checkout |
 | `:` | Symbols in the active repository (DevMap) |
 | `::` | Cross-repo symbols (open tabs registered in DevMap's workspace; append `~` for TF-IDF name search) |
 | `?` | Help and shortcuts |
+
+## Task boards
+
+With focus inside a board, `/` searches, `n` creates a task, Command/Ctrl+A selects
+visible loaded cards, and Command/Ctrl+Shift+C copies selected tasks for an agent.
+On a card, Shift+F10 opens its context menu, `e` opens Quick Enhance, and Left/Right
+move to the neighboring status. Delete/Backspace asks for confirmation. These are
+scoped controls; see [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md) for the complete table.

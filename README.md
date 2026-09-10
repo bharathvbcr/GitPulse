@@ -38,7 +38,9 @@ Captured from GitPulse running on macOS against its own repository.
 
 ## Architecture at a Glance
 
-GitPulse operates completely locally on your machine with strict IPC boundaries and zero remote telemetry:
+GitPulse stores repository and task state locally, with a native IPC boundary and
+no remote telemetry. Git remotes, GitHub operations, optional tool downloads and
+explicitly configured agent providers can use the network.
 
 ```mermaid
 flowchart TB
@@ -96,8 +98,8 @@ subject as **sections** rather than as separate destinations:
 ```mermaid
 flowchart LR
     subgraph Views["🔨 The four views"]
-        WorkTab["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame"]
+        WorkTab["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy · Tasks"]
+        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage"]
     end
@@ -105,6 +107,7 @@ flowchart LR
     subgraph Docked["⚙️ Docked & Workspace Surfaces"]
         Terminal["<b>Terminal</b> (<code>⌃`</code>)<br/>Native PTY, docked under the current view"]
         Fleet["<b>Fleet</b> (<code>Cmd/Ctrl+Shift+F</code>)<br/>Every open repository at once — not a view"]
+        Tasks["<b>Tasks</b><br/>Global, saved-workspace and repository boards"]
         MCP["<b>MCP</b><br/>Read-only Agent Plugins tools"]
     end
 ```
@@ -121,6 +124,12 @@ command-palette entry, so no door was closed by the consolidation.
 > session; Fleet answers one about the whole workspace, so it lives above the
 > repository tab strip and survives switching between repositories.
 
+**Tasks**, beside Fleet, opens global and saved-workspace boards. **Work → Tasks**
+opens the same task store filtered to the active repository. A task linked to
+several repositories appears in each relevant board; edits update the shared task.
+See [Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md) for setup, keyboard controls,
+Manvi suggestions and agent handoff.
+
 ---
 
 ## Key Features
@@ -129,6 +138,7 @@ command-palette entry, so no door was closed by the consolidation.
 | Feature | Description |
 | --- | --- |
 | **Work View & Task Control Plane** | Unified dashboard (`F10`) binding DevCouncil tasks to linked worktrees, PRs, workflow runs, policy verdicts, and temporary grants. Agent activity recorded to a durable SQLite WAL ledger. |
+| **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts, search, filters over loaded cards, multi-selection, context actions, drag ordering, due dates, notes-to-draft editing, reviewed Manvi title/description suggestions and versioned agent briefs. |
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. |
 | **Precision Diff Viewer** | File, commit, and range diffs that name what they show, in a true side-by-side or unified layout sharing one row model. Syntax colouring under the intra-line word diff, find-in-diff with regex, block-to-block stepping, both line-number columns behind a pinned gutter, a filterable and resizable file rail, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging from either layout. |
@@ -140,7 +150,7 @@ command-palette entry, so no door was closed by the consolidation.
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
 | --- | --- |
-| **DevMap + MarkDev integration** | Schema-19 code map in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. Code → Map navigates `repo_map.json`, draws code/doc graphs, and searches tracked markdown. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
+| **DevMap + MarkDev integration** | Schema-20 code map in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. Code → Map navigates the resolved `repo_map.json`, draws code/doc graphs, and searches tracked markdown. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
 | **Git-Native Provenance** | `CI:local` runs recorded as verification notes under `refs/notes/gitpulse/`, with branch and PR decay freshness badges based on distance from the default branch. |
 | **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
 | **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. The status-bar mix is ordered by share of code lines; the label is the true majority among the languages drawn. |
@@ -179,7 +189,11 @@ flowchart TD
 
 ## Local CI & Release Pipeline
 
-GitPulse includes **`CI:local`** (`cmd_ci_local`), allowing you to execute the exact pre-flight test matrix locally on your machine before pushing code:
+GitPulse includes **`CI:local`** (`cmd_ci_local`), which plans checks from the active
+repository's manifests and reports passed, failed and skipped steps. Affected-test
+mode uses DevMap only when its evidence supports selection; otherwise it falls
+back to the full suite with a reason. GitPulse's own contributor gate is
+**`npm run ci:local`**, the explicit pipeline in `package.json`.
 
 ```mermaid
 flowchart LR
@@ -190,7 +204,7 @@ flowchart LR
     end
 
     subgraph ReleasePipeline["GitHub Actions Release Pipeline"]
-        TagPush["Push Tag <code>vX.Y.Z</code>"] --> VerGate["Version Gate Validation<br/>(5 manifests must match)"]
+        TagPush["Push Tag <code>vX.Y.Z</code>"] --> VerGate["Version Gate Validation<br/>(package, lockfiles, native and plugin manifests)"]
         VerGate --> Matrix["Cross-Platform Matrix<br/>(macOS, Linux, Windows)"]
         Matrix --> Verify["Draft Release Asset Verification"]
         Verify --> Publish["Draft Ready for Publishing"]
@@ -243,7 +257,7 @@ date".
 ## Quickstart & Development
 
 ### Prerequisites
-- **Node.js**: `22.x+`
+- **Node.js**: `22.x` (22.12 or newer; matches the CI major)
 - **Rust**: `stable` (edition 2021)
 - **Git**: Recent version
 - **cargo-llvm-cov**: required by `npm run ci:local` for the Rust coverage floor —
@@ -255,7 +269,7 @@ date".
 
 ```sh
 # 1. Install dependencies
-npm install
+npm ci
 
 # 2. Launch full desktop application with hot-reload
 npm run tauri dev
@@ -270,7 +284,7 @@ npm run tauri dev
 | `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
 | `npm run check:ipc` | Verify 205 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
-| `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
+| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 54 contracts (989 fields) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
 | `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |
 | `npm run mcp:doctor` | Assert the `gitpulse-mcp` on PATH is this tree's build, not a stale copy |
@@ -302,6 +316,10 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
 - **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil, devmap and Manvi modules with explicit compatibility checks.
+- **[Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md)** — Shared boards, task editing, Manvi suggestions, agent briefs and run boundaries.
+- **[Command palette](docs/COMMAND_PALETTE.md)** — Eight search modes, availability, paging and keyboard navigation.
+- **[Repository hygiene](docs/REPOSITORY_HYGIENE.md)** — Storage cleanup previews, Fleet/Settings cleanup and scheduling.
+- **[Native menus and status icon](docs/MACOS_MENUS.md)** — Menu actions, repository context and the macOS status popover.
 - **[Terminal Guide](docs/TERMINAL.md)** — Tabs, split panes, Find, shortcuts, output export, and recovery. The [terminal audit](docs/TERMINAL_AUDIT.md) records stress tests and verification limits.
 - 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 4 application views, their sections and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.

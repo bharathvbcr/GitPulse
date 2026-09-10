@@ -5,7 +5,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 15 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 16 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -21,7 +21,7 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The four views"]
-        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy"]
+        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map — file selection plus the code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog — three lenses on one commit selection"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository"]
@@ -29,6 +29,7 @@ flowchart TD
 
     subgraph NotViews["Not views — available under every view"]
         Terminal["<b>Terminal dock</b> (<code>⌃`</code>)<br/>Embedded PTY beneath the active view"]
+        Tasks["<b>Tasks</b><br/>Global and saved-workspace boards"]
         Fleet["<b>Fleet</b> (<code>⌘⇧F</code>)<br/>Every open and recent repository at once"]
     end
 ```
@@ -37,9 +38,9 @@ flowchart TD
 
 ## 1. Work (`work`)
 
-Everything in flight, and the actions that unblock it. Five lenses on the
-same worktree row: what is happening, what is stuck, what is on the remote,
-how the branches stack, and what policy allows.
+Everything in flight, and the actions that unblock it. Six sections cover
+worktree activity, conflict resolution, GitHub, branch stacks, policy and the
+repository's shared task board.
 
 ### 1.1 Overview
 
@@ -102,6 +103,28 @@ how the branches stack, and what policy allows.
 
 ---
 
+### 1.6 Tasks
+
+Work → Tasks shows tasks linked to the active repository. The **Tasks** button
+beside Fleet opens global and saved-workspace scopes over the same records.
+
+- **Organize**: Board/list layouts, full-text search, priority/type/owner/label/due
+  filters, multi-selection, context menus and drag or keyboard status moves.
+- **Know the scope**: Facets and Select all use loaded cards; column counts and
+  **Load more** reveal additional results. Due soon means the next seven days.
+- **Edit and review**: Notes can seed a draft. Manvi proposes title/description
+  changes against a saved revision; field locks and explicit acceptance apply.
+  Quick Enhance exposes details that compact cards omit.
+- **Hand off**: Copy a saved task brief or an explicitly labeled unsaved draft for
+  an agent. Task run controls prepare a saved revision before launch.
+- **Delete**: Confirm removal from every board. Partial results retain failures
+  and skipped items; the screen cannot restore the deleted task ID.
+
+See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the workflow, shortcuts,
+copy limits and the distinction between terminal handoffs and managed runs.
+
+---
+
 ## 2. Code (`code`)
 
 Three sections under one view. Explorer and Blame are two lenses on one **file**
@@ -138,7 +161,7 @@ reading of the same open file. Sections switch from the segmented control
 
 ### 2.3 Map
 
-- **Repo map navigator**: Reads `.devcouncil/repo_map.json` — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates. Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
+- **Repo map navigator**: Reads the `repo_map` path resolved by `devmap paths --json` (`.devmap/repo_map.json` by default, with legacy `.devcouncil` support) — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates. Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
 - **Code & doc graph canvas**: Renderer-agnostic payloads from DevMap viz / map-preview and the MarkDev doc graph, drawn on the shared canvas stack (not the commit-lane graph). The legend names node caps and truncation rather than implying the picture is the whole graph.
 - **Repo docs vault**: Built from `git ls-files` of markdown (git is the authority — no ignored / vendor walk). Full-text search, broken-link report, and backlinks in the markdown viewer. Caps and skips are reported on the status strip.
 - **Freshness & build**: Status strip from `devmap status --json` (generation, freshness, `schema_outdated`, coverage gaps). Build / Refresh shell out to the installed `devmap` CLI. Watcher-driven incremental refresh runs when the index is stale, one build per repo at a time.
@@ -241,7 +264,7 @@ rather than presenting a floor as a total.
   - `bundler-audit` (Ruby)
   - GitHub Dependabot alerts (via local `gh` CLI)
   - GitHub Code Scanning alerts (CodeQL / GHAS, via the same `gh` CLI)
-- **Code map status & dead symbols**: When a DevMap store is present (schema 19), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
+- **Code map status & dead symbols**: When a DevMap store is present (schema 20), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
 
 ### 4.4 Storage
@@ -272,9 +295,9 @@ like, and command output can be read *against* the thing that prompted it: a
 Health remediation plan, a failing test, the diff you are about to commit.
 
 - **Embedded PTY**: Native terminal emulator powered by `portable-pty` and `@xterm/xterm`.
-- **Strict Isolation**: AI agents and sidecars have zero access to the user terminal PTY or keystrokes.
+- **Explicit agent sessions**: Local AI suggestions and the policy sidecar do not read or write ordinary shell sessions. Choosing Claude, Manvi or Codex, or launching a saved task, starts a separate user-controlled agent session in the existing dock; that process receives input in its own PTY.
 - **Diagnostic Preservation**: Preserves command output, exit status, and failure context across builds.
-- **Lifecycle Supervision**: Clean process lifecycle teardown when closing tabs or switching repositories. Hiding the dock never ends the session — only closing the repository does.
+- **Lifecycle Supervision**: Switching views or repositories and hiding the dock preserve sessions. Closing a terminal tab or repository tab terminates the sessions it owns; failed cleanup remains visible.
 - **Resizable**: Drag the separator or nudge it with `↑`/`↓`; the height is remembered, and clamped so the dock can never grow to swallow the view above it.
 
 ### 5.2 Agents (MCP 2.0 / Codex / Agent Plugins 1.0)
@@ -432,7 +455,7 @@ Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff
 Reflog, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
-section directly, including all five Work sections.
+section directly, including all six Work sections.
 
 ### 6.3 Inside Fleet
 

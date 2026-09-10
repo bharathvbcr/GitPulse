@@ -1,6 +1,6 @@
 # Views
 
-GitPulse has **four views**. Each holds sections (lenses) on one subject. The terminal and Fleet are not views.
+GitPulse has **four views**. Each holds sections (lenses) on one subject. Tasks, Fleet and the terminal dock are workspace surfaces outside those four views.
 
 ![Files view: explorer, syntax-highlighted viewer, and uncommitted status](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-files.png)
 
@@ -17,6 +17,7 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 | **Remote** | PRs and issues in the wide column; workflows, runs, and releases in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
 | **Stack** | Branch hierarchy as a tree. Restack plans the whole subtree before the first rewrite and rebases parent-before-child. |
 | **Policy** | MANVI gate status, merged-branch cleanup, outgoing commit review, release preflight. |
+| **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, Manvi suggestions and agent handoff. |
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.
 
@@ -28,7 +29,7 @@ Explorer and Blame are two lenses on one **file** (selection survives the switch
 | --- | --- |
 | **Explorer** | File tree with live Git status, dual-backend highlighting (MarkDev tree-sitter for six languages; regex for the rest), in-file search, go-to-line, inline edit, MarkDev markdown / image / hex previews. Commit composer shows pre-commit blast radius from `devmap preview`. |
 | **Blame** | Per-line author, age heatmap, coverage gutter. Uncommitted lines render as `uncommitted`, not as a link to a fake commit. Coverage unavailable is marked separately from uncovered. |
-| **Map** | Subsystems / entry points from `.devcouncil/repo_map.json`, code and doc graph canvas, docs search and broken links, cross-repo link candidates. Build/Refresh via the `devmap` CLI; watcher refreshes a stale index. Caps, `walk_incomplete`, and schema mismatch are named. |
+| **Map** | Subsystems / entry points from the `repo_map` resolved by `devmap paths --json` (default `.devmap/repo_map.json`, legacy `.devcouncil` supported), code and doc graph canvas, docs search and broken links, cross-repo link candidates. Build/Refresh via the `devmap` CLI; watcher refreshes a stale index. Caps, `walk_incomplete`, and schema mismatch are named. |
 
 The graph filters include **Hide notes & Markdown**, off by default. It hides
 documentation nodes and their edges from the canvas, node browser, and
@@ -66,9 +67,13 @@ Four on-demand scans of **this repository**. Each must say when it was capped ra
 
 ### Terminal dock (`Ctrl+\``)
 
-Resizable PTY under whichever view is on screen. AI models and the MANVI sidecar have **zero** access to this PTY. Hiding the dock keeps the session; closing the repository ends it.
+Resizable PTY under whichever view is on screen. Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit Claude, Manvi, Codex and task launches create their own sessions. Hiding the dock keeps sessions; closing the repository ends them. See [Terminal](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL.md).
 
-### Fleet (`Shift+F10`)
+### Tasks
+
+The Tasks button beside Fleet opens global and saved-workspace scopes over the same records as Work → Tasks. Saved workspace membership survives closing repository tabs. Board/list layouts, filters over loaded cards, context actions, Quick Enhance and agent copying are described in [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
+
+### Fleet (`Command/Ctrl+Shift+F`)
 
 Workspace grid: every open repository and every recent one.
 

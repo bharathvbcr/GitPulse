@@ -13,6 +13,7 @@
 | Install a pre-built app | [[Installation]] |
 | Open a repository and find my way around | [[Getting Started]] |
 | Understand the four views | [[Views]] |
+| Organize tasks and saved workspaces | [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md) |
 | Look up a shortcut | [[Keyboard Shortcuts]] |
 | Connect an agent (MCP) | [[MCP and Agents]] |
 | Contribute or build from source | [[Development]] |
@@ -25,18 +26,19 @@ Four **views**, each a header tab. Sections inside a view are lenses on the same
 ```mermaid
 flowchart LR
     subgraph Views["The four views"]
-        Work["Work — Overview · Resolve · Remote · Stack · Policy"]
+        Work["Work — Overview · Resolve · Remote · Stack · Policy · Tasks"]
         Code["Code — Explorer · Blame · Map"]
         History["History — Graph · Diff · Reflog"]
         Insights["Insights — Pulse · Coverage · Health · Storage"]
     end
     subgraph Beside["Not views"]
+        Tasks["Tasks — global and saved-workspace boards"]
         Terminal["Terminal dock"]
         Fleet["Fleet — every open repository"]
     end
 ```
 
-**Fleet** (`Shift+F10`) and the **terminal dock** (`Ctrl+\``) are not views. Fleet is workspace-scoped; the terminal survives view switches because it is a dock, not a page.
+**Fleet** (`Command/Ctrl+Shift+F`), **Tasks** and the **terminal dock** (`Ctrl+\``) are not views. Fleet is workspace-scoped; the terminal survives view switches because it is a dock, not a page.
 
 ## Design rules you will see on screen
 
@@ -53,6 +55,7 @@ This wiki is the GitHub-facing guide. Longer technical write-ups live in the rep
 
 - [README](https://github.com/bharathvbcr/GitPulse/blob/main/README.md)
 - [Architecture](https://github.com/bharathvbcr/GitPulse/blob/main/docs/ARCHITECTURE.md)
+- [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md)
 - [Features catalog](https://github.com/bharathvbcr/GitPulse/blob/main/docs/FEATURES.md)
 - [Contributing](https://github.com/bharathvbcr/GitPulse/blob/main/CONTRIBUTING.md)
 - [Security](https://github.com/bharathvbcr/GitPulse/blob/main/docs/SECURITY.md)

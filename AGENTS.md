@@ -3,7 +3,8 @@
 Start with DevMap in this repository. From the repository root, run
 `devmap paths --json` to resolve the database and `repo_map` paths, then run
 `devmap status --json` before relying on graph answers. Read the resolved
-`repo_map` file for ownership; do not assume the legacy `.devcouncil/` location.
+`repo_map` file for ownership; do not assume the legacy
+`.devcouncil/repo_map.json` location.
 Generated state is per-worktree and is not copied by Git. If the store or map
 is missing, run `devmap build --manifest` from this worktree's root, then check
 status and read the map again. A plain build updates only the database.

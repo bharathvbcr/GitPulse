@@ -8,7 +8,17 @@ Design status: complete for the agreed scope. Implementation status: in progress
 The six required areas below remain the acceptance contract; this is not a claim
 that all planned capabilities have shipped.
 
-## Checkouts and ownership
+The current user workflow is documented in [Tasks and workspaces](TASKS_AND_WORKSPACES.md).
+The source now includes board/list layouts, filters over loaded cards, multi-selection,
+context actions, bounded task deletion, notes-to-draft editing, inline Manvi
+title/description review, Quick Enhance and saved/draft agent copy. These additions
+do not close the broader acceptance contract below. Their helper and component
+tests establish local logic and wiring, not installed-provider or physical UI proof.
+
+## Original implementation checkouts and ownership
+
+The paths and starting commits below record the original development worktrees;
+they are historical provenance, not required locations for a fresh checkout.
 
 - GitPulse: `/Users/bharath/.codex/worktrees/agentic-workspaces/GitPulse`, branch
   `codex/agentic-workspaces`, starting commit `2fb8efc`.
