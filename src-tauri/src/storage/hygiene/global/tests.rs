@@ -97,6 +97,35 @@ fn discovery_deduplicates_overlapping_roots_preserves_exclusions_and_finds_close
     assert!(!report.partial);
     assert!(discovery::discover(&roots, &[], &AtomicBool::new(true)).partial);
 }
+
+/// GitHub Windows CI 34441565936: `validate_repo` kept `\\?\`, the walk used
+/// `canonicalize_plain`, and `root == path` reported every repo as a mismatch.
+#[test]
+fn discovery_accepts_a_repo_whose_validate_repo_root_is_verbatim() {
+    let (_temp, _cleaner, root) = fixture();
+    let walked = crate::engine::git_cli::canonicalize_plain(&repo(&root, "a")).unwrap();
+    let validated = crate::engine::git_cli::validate_repo(walked.to_str().unwrap()).unwrap();
+    #[cfg(windows)]
+    {
+        assert!(
+            validated.to_string_lossy().starts_with(r"\\?\"),
+            "Windows validate_repo must keep the verbatim prefix; otherwise this no longer covers the CI failure: {validated:?}"
+        );
+        assert_ne!(validated, walked);
+    }
+    assert!(
+        discovery::same_discovered_repo(&validated, &walked),
+        "validated={validated:?} walked={walked:?}"
+    );
+    let report = discovery::discover(std::slice::from_ref(&root), &[], &AtomicBool::new(false));
+    assert!(
+        report.repos.contains(&walked),
+        "repos={:?} issues={:?} validated={validated:?}",
+        report.repos,
+        report.issues
+    );
+    assert!(!report.partial, "issues={:?}", report.issues);
+}
 #[test]
 fn depth_and_repository_caps_are_explicit_partial_results() {
     let (_temp, _cleaner, root) = fixture();

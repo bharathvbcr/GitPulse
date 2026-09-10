@@ -111,10 +111,10 @@ workbench board land together on `main`.
   resolve those paths with `canonicalize_plain`. `canonicalize` plus `git init`
   or `File::open` on a directory is os error 1, so `--lib` never checked the
   policy once the lib harness actually loaded.
-- Return repository roots from `validate_repo` in the same spelling
-  `canonicalize_plain` uses, so Windows discovery can match a found `.git`
-  against the walk. `canonicalize` kept the verbatim prefix and every repo
-  looked like a boundary mismatch.
+- Compare discovered repositories after `canonicalize_plain`, so a Windows
+  `.git` whose `validate_repo` root still carries `\\?\` matches the walk.
+  Changing `validate_repo` itself mixed verbatim and ordinary spellings in
+  the sandbox containment check and failed dozens of Windows tests.
 - Set hygiene fixture mtimes with a writable handle on Windows. Read-only
   `File::open` cannot `SetFileTime` (`ERROR_ACCESS_DENIED`), which panicked
   the fixture and poisoned the shared test lock.
