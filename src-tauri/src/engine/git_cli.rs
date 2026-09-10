@@ -52,7 +52,8 @@ pub fn validate_repo(repo_path: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err("Repository path must be absolute".into());
     }
-    let canonical = canonicalize_plain(path)
+    let canonical = path
+        .canonicalize()
         .map_err(|e| format!("Cannot access path '{}': {}", repo_path, e))?;
     if !canonical.is_dir() {
         return Err(format!("Not a directory: {}", canonical.display()));
@@ -3544,18 +3545,6 @@ mod tests {
             plain.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap(),
             "the ordinary spelling must denote the same directory"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn validate_repo_returns_a_spelling_git_accepts() {
-        let dir = tempfile::TempDir::new().unwrap();
-        git_global(&["init", "-q", dir.path().to_str().unwrap()]).unwrap();
-        let root = validate_repo(dir.path().to_str().unwrap()).unwrap();
-        assert!(
-            !root.to_string_lossy().starts_with(r"\\?\"),
-            "validate_repo still returned a verbatim path: {root:?}"
         );
     }
 

@@ -38,6 +38,17 @@ pub fn roots(values: &[String], exclusions: bool) -> Result<Vec<PathBuf>, String
         .collect())
 }
 
+/// Windows `validate_repo` returns a verbatim `\\?\` path. The walk already
+/// used `canonicalize_plain`, so `==` treats a real repository as a boundary
+/// mismatch. Compare after stripping that prefix; do not change `validate_repo`
+/// itself — the sandbox containment check depends on the verbatim spelling.
+pub(crate) fn same_discovered_repo(validated: &Path, walked: &Path) -> bool {
+    crate::engine::git_cli::canonicalize_plain(validated)
+        .ok()
+        .as_deref()
+        == Some(walked)
+}
+
 pub fn discover(roots: &[PathBuf], excludes: &[PathBuf], cancel: &AtomicBool) -> Discovery {
     let mut report = Discovery::default();
     let mut stack: Vec<_> = roots.iter().rev().map(|p| (p.clone(), 0usize)).collect();
@@ -76,7 +87,7 @@ pub fn discover(roots: &[PathBuf], excludes: &[PathBuf], cancel: &AtomicBool) ->
                 .ok_or_else(|| "Non-UTF-8 repository".to_string())
                 .and_then(crate::engine::git_cli::validate_repo)
             {
-                Ok(root) if root == path => {
+                Ok(root) if same_discovered_repo(&root, &path) => {
                     report.repos.insert(path.clone());
                 }
                 Ok(_) => {
