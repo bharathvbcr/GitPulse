@@ -240,6 +240,53 @@ fn wait(cleaner: &Cleaner) -> super::CleanerState {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+#[test]
+fn a_worker_finishing_during_a_status_read_is_never_reported_interrupted() {
+    let (_temp, worker, _root) = fixture();
+    let lease = worker.lock("run.lock").unwrap();
+    worker
+        .update(|saved| {
+            saved.history.push(CleanerRun {
+                id: "finishing-worker".into(),
+                trigger: "manual".into(),
+                started_at: 1,
+                finished_at: 0,
+                status: "running".into(),
+                repositories: 0,
+                partial: false,
+                issues: vec![],
+                items: vec![],
+            });
+            Ok(())
+        })
+        .unwrap();
+    let mut observer = Cleaner::new(worker.dir.clone());
+    let lease = std::sync::Mutex::new(Some(lease));
+    observer.state_after_read = Some(Box::new(move || {
+        // Force the real worker completion order at the stale-snapshot seam.
+        // Separate Cleaner instances also exercise cross-process lock authority.
+        if let Some(lease) = lease.lock().unwrap().take() {
+            worker
+                .update(|saved| {
+                    saved.history[0].finished_at = 2;
+                    saved.history[0].status = "completed".into();
+                    Ok(())
+                })
+                .unwrap();
+            drop(lease);
+        }
+    }));
+    let overlapping = observer.state().unwrap();
+    assert!(
+        overlapping.running || overlapping.history[0].status == "completed",
+        "a successful overlapping completion was misclassified: {overlapping:?}"
+    );
+    assert_ne!(overlapping.history[0].status, "interrupted");
+    let settled = observer.state().unwrap();
+    assert!(!settled.running);
+    assert_eq!(settled.history[0].finished_at, 2);
+    assert_eq!(settled.history[0].status, "completed");
+}
 #[cfg(unix)]
 #[test]
 fn missed_schedule_runs_once_and_advances_before_execution() {
@@ -310,7 +357,11 @@ fn manual_runs_keep_bounded_history_and_never_enable_scheduling() {
         let state = wait(&cleaner);
         assert!(!state.config.enabled);
         assert!(state.history.len() <= 20);
-        assert!(state.history.iter().all(|r| r.status == "completed"));
+        assert!(
+            state.history.iter().all(|r| r.status == "completed"),
+            "unexpected run history: {:?}",
+            state.history
+        );
     }
     assert_eq!(cleaner.state().unwrap().history.len(), 20);
 }

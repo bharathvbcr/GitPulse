@@ -21,9 +21,9 @@
 //! answered and skipped rather than fatal, each request runs on its own thread
 //! under a deadline and a panic guard, and a failed write ends the session.
 
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gitpulse_lib::mcp::{self, Accepted, Era, JsonRpcRequest, JsonRpcResponse, Ready};
@@ -69,14 +69,19 @@ fn call_budget() -> Duration {
 /// The single writer. Every response goes through here so concurrent workers
 /// cannot interleave bytes into the same line.
 struct Wire {
-    out: Mutex<io::Stdout>,
+    out: Result<gitpulse_lib::output::BoundedOutput, io::Error>,
     broken: AtomicBool,
 }
 
 impl Wire {
     fn new() -> Self {
         Self {
-            out: Mutex::new(io::stdout()),
+            out: gitpulse_lib::output::BoundedOutput::new(
+                io::stdout(),
+                "gitpulse-mcp-stdout",
+                MAX_FRAME_BYTES,
+                Duration::from_secs(1),
+            ),
             broken: AtomicBool::new(false),
         }
     }
@@ -110,16 +115,16 @@ impl Wire {
                 })
             }
         };
-        let mut out = match self.out.lock() {
+        let out = match &self.out {
             Ok(out) => out,
-            // A poisoned stdout lock means a writer panicked mid-write; the
-            // stream's framing can no longer be trusted.
-            Err(_) => {
+            Err(error) => {
+                log::error!(target: "mcp", "stdout worker could not start: {error}");
                 self.broken.store(true, Ordering::Relaxed);
                 return false;
             }
         };
-        if writeln!(out, "{line}").is_err() || out.flush().is_err() {
+        if let Err(error) = out.write(format!("{line}\n").as_bytes()) {
+            log::warn!(target: "mcp", "stdout failed: {error}; stopping without retry");
             self.broken.store(true, Ordering::Relaxed);
             return false;
         }
@@ -297,6 +302,75 @@ enum Stop {
     StreamFault(String),
 }
 
+/// One bounded reader worker lets a failed output cancel the main input loop
+/// even when the host never closes stdin. Healthy idle sessions have no idle
+/// deadline; cancellation is polled between bounded waits for input chunks.
+struct HostInput {
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    buffered: io::Cursor<Vec<u8>>,
+    wire: Arc<Wire>,
+}
+
+impl HostInput {
+    fn new(wire: Arc<Wire>) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        std::thread::Builder::new()
+            .name("gitpulse-mcp-stdin".into())
+            .spawn(move || {
+                let stdin = io::stdin();
+                let mut input = stdin.lock();
+                let mut bytes = [0; 8192];
+                loop {
+                    let (message, done) = match input.read(&mut bytes) {
+                        Ok(count) => (Ok(bytes[..count].to_vec()), count == 0),
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => (Err(error), true),
+                    };
+                    if sender.send(message).is_err() || done {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            receiver,
+            buffered: io::Cursor::new(Vec::new()),
+            wire,
+        })
+    }
+}
+
+impl Read for HostInput {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.wire.broken.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stdout unavailable; input cancelled",
+                ));
+            }
+            let count = self.buffered.read(bytes)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            match self.receiver.recv_timeout(WATCHDOG_TICK) {
+                Ok(Ok(chunk)) if chunk.is_empty() => return Ok(0),
+                Ok(Ok(chunk)) => self.buffered = io::Cursor::new(chunk),
+                Ok(Err(error)) => return Err(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "stdin worker stopped without EOF",
+                    ))
+                }
+            }
+        }
+    }
+}
+
 fn serve(wire: Arc<Wire>) -> Stop {
     let mut era = Era::Unknown;
     let budget = call_budget();
@@ -304,10 +378,16 @@ fn serve(wire: Arc<Wire>) -> Stop {
     let in_flight = Arc::new(AtomicUsize::new(0));
     spawn_watchdog(Arc::clone(&pending), Arc::clone(&wire));
 
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    let input = match HostInput::new(Arc::clone(&wire)) {
+        Ok(input) => input,
+        Err(error) => return Stop::StreamFault(format!("stdin worker could not start: {error}")),
+    };
+    let mut reader = BufReader::new(input);
 
     let stop = read_loop(&mut reader, &wire, &mut era, &pending, &in_flight, budget);
+    if wire.broken.load(Ordering::Relaxed) {
+        return Stop::ClientGone;
+    }
     // Closing stdin means "no more requests", not "discard the ones you took".
     // Exiting straight away killed every worker mid-flight, so a client that
     // pipelined a request and closed the pipe never got its answer — which the

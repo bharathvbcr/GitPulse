@@ -198,6 +198,10 @@ harness = false
 name = "gtk_runtime"
 harness = false
 
+[[test]]
+name = "native_event_unwind"
+harness = false
+
 # Wall-clock measurement, not a pass/fail gate. `test = false` keeps it out of
 # `cargo test`: a timing assertion fails on a loaded machine for reasons that
 # have nothing to do with the code, and a check that fails spuriously is worse

@@ -93,6 +93,7 @@ OUTPUT:
 
 EXIT:
     0  every cycle completed (or --once completed)
+    1  stdout could not receive a complete report
     2  the arguments could not be understood
 ";
 
@@ -274,11 +275,10 @@ fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match parse(&argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            write_output(USAGE.as_bytes());
         }
         Parsed::Error(reason) => {
-            eprintln!("gitpulsed: {reason}\n");
-            eprint!("{USAGE}");
+            log::error!(target: "gitpulsed", "{reason}; run gitpulsed --help for usage");
             gitpulse_lib::procguard::exit(2);
         }
         Parsed::Run(config) => {
@@ -288,14 +288,15 @@ fn main() {
                 for repo in &config.repos {
                     let report = run_cycle(repo, cycle);
                     match serde_json::to_string(&report) {
-                        Ok(line) => println!("{line}"),
+                        Ok(line) => write_output(format!("{line}\n").as_bytes()),
                         // Serialising our own struct cannot fail, but a panic
                         // here would take down a daemon over a log line.
-                        Err(e) => eprintln!("gitpulsed: could not report cycle: {e}"),
+                        Err(e) => {
+                            log::error!(target: "gitpulsed", "could not report cycle: {e}");
+                            gitpulse_lib::procguard::exit(1);
+                        }
                     }
                 }
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
                 if config.once {
                     break;
                 }
@@ -307,6 +308,28 @@ fn main() {
     // still being swept would otherwise exit 0 out from under the sweep, and
     // tell the supervisor a terminated run was clean.
     gitpulse_lib::procguard::exit(0);
+}
+
+fn write_output(bytes: &[u8]) {
+    static OUTPUT: std::sync::OnceLock<
+        Result<gitpulse_lib::output::BoundedOutput, std::io::Error>,
+    > = std::sync::OnceLock::new();
+    let result = OUTPUT.get_or_init(|| {
+        gitpulse_lib::output::BoundedOutput::new(
+            std::io::stdout(),
+            "gitpulsed-stdout",
+            4 * 1024 * 1024,
+            Duration::from_secs(1),
+        )
+    });
+    let error = match result {
+        Ok(output) => output.write(bytes).err().map(|e| e.to_string()),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(error) = error {
+        log::error!(target: "gitpulsed", "stdout failed: {error}; stopping without retry");
+        gitpulse_lib::procguard::exit(1);
+    }
 }
 
 #[cfg(test)]

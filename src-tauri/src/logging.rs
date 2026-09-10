@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 pub(crate) mod performance;
@@ -26,6 +27,10 @@ pub const LOG_DIR_ENV: &str = "GITPULSE_LOG_DIR";
 /// Size at which the live log rotates to `<stem>.log.1`. Two generations are
 /// kept, so the durable record is bounded at twice this on disk.
 const LOG_FILE_MAX_BYTES: u64 = 1_048_576;
+/// Independent processes can queue behind several short-lived owners during
+/// startup. Give that burst time to drain while retaining a hard I/O admission
+/// ceiling; this does not extend the separate 100 ms stderr mirror budget.
+const GENERATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The shipped binaries, each of which writes its own durable log.
 ///
@@ -93,6 +98,34 @@ struct FileSink {
     current: PathBuf,
     previous: PathBuf,
     state: Mutex<SinkState>,
+    release_error: Mutex<Option<String>>,
+}
+
+/// Unlock explicitly: closing one descriptor does not release a file lock
+/// while a fork/dup retains the same open file description. Release failures
+/// are recorded outside the sink mutex, which the owner may already hold.
+struct GenerationLock<'a> {
+    file: File,
+    release_error: &'a Mutex<Option<String>>,
+}
+
+impl std::ops::Deref for GenerationLock<'_> {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Drop for GenerationLock<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            *self
+                .release_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some(format!("log generation unlock failed: {error}"));
+        }
+    }
 }
 
 impl FileSink {
@@ -109,36 +142,21 @@ impl FileSink {
                 bytes: 0,
                 degraded: None,
             }),
+            release_error: Mutex::new(None),
         };
-        {
-            let mut state = sink.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match Self::open_append(dir, &sink.current) {
-                Ok((file, bytes)) => {
-                    state.file = Some(file);
-                    state.bytes = bytes;
-                }
-                Err(e) => state.degraded = Some(e),
-            }
-            Self::write_locked(&mut state, &session_marker(stem, "start"));
-        }
+        sink.write_line(&session_marker(stem, "start"));
         sink
     }
 
     fn open_append(dir: &Path, path: &Path) -> Result<(File, u64), String> {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        secure_directory(dir)?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
-        secure_file(path)?;
-        let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+        debug_assert_eq!(parent_of(path), dir);
+        let file =
+            open_log_file(path, true).map_err(|e| format!("open {}: {e}", path.display()))?;
+        secure_file(&file).map_err(|e| format!("secure {}: {e}", path.display()))?;
+        let bytes = file
+            .metadata()
+            .map_err(|e| format!("inspect {}: {e}", path.display()))?
+            .len();
         Ok((file, bytes))
     }
 
@@ -155,6 +173,32 @@ impl FileSink {
         // about bytes on disk, not about remembering a particular call path.
         let line = safe_log_line(line);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.file.is_none() && state.degraded.is_some() {
+            return;
+        }
+        // All cooperating processes lock the same stable sidecar, not the
+        // file being renamed. The guard explicitly releases the OS lock.
+        let _generation = match self.generation_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                state.degraded = Some(error);
+                state.file = None;
+                return;
+            }
+        };
+        // Another logger may have appended or rotated since our last entry.
+        // Reopen under the lock so neither byte counts nor inodes go stale.
+        state.file = None;
+        match Self::open_append(parent_of(&self.current), &self.current) {
+            Ok((file, bytes)) => {
+                state.file = Some(file);
+                state.bytes = bytes;
+            }
+            Err(error) => {
+                state.degraded = Some(error);
+                return;
+            }
+        }
         let projected = state
             .bytes
             .saturating_add(line.len() as u64)
@@ -163,6 +207,38 @@ impl FileSink {
             self.rotate(&mut state);
         }
         Self::write_locked(&mut state, &line);
+    }
+
+    fn generation_lock(&self) -> Result<GenerationLock<'_>, String> {
+        if let Some(error) = self
+            .release_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            return Err(error.clone());
+        }
+        let dir = parent_of(&self.current);
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        secure_directory(dir)?;
+        let path = self.current.with_extension("log.lock");
+        let file = open_log_file(&path, true).map_err(|e| format!("open log lock: {e}"))?;
+        secure_file(&file).map_err(|e| format!("secure log lock: {e}"))?;
+        let deadline = std::time::Instant::now() + GENERATION_LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    return Ok(GenerationLock {
+                        file,
+                        release_error: &self.release_error,
+                    });
+                }
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(format!("log generation lock unavailable: {error}")),
+            }
+        }
     }
 
     fn write_locked(state: &mut SinkState, line: &str) {
@@ -186,20 +262,10 @@ impl FileSink {
         state.file = None;
         let reopened = match fs::rename(&self.current, &self.previous) {
             Ok(()) => Self::open_append(parent_of(&self.current), &self.current),
-            Err(e) => {
-                // Bounded beats complete. Losing the older generation is a
-                // real loss; a log that cannot rotate and grows without end
-                // on a user's disk is a worse one, and this says which
-                // happened rather than leaving the gap to be inferred.
-                state.degraded = Some(format!("rotate failed, truncated instead: {e}"));
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&self.current)
-                    .map(|file| (file, 0))
-                    .map_err(|e| format!("truncate {}: {e}", self.current.display()))
-            }
+            // Preserve the existing record and stop disk writes. Reopening
+            // with truncate could follow a substituted link and destroy a
+            // foreign file, as well as losing the only remaining evidence.
+            Err(e) => Err(format!("rotate failed; disk log disabled: {e}")),
         };
         state.bytes = 0;
         match reopened {
@@ -219,9 +285,38 @@ impl FileSink {
         // `current` into `previous` between them and make a whole generation
         // disappear from an apparently complete response.
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let previous = read_lines(&self.previous);
-        let current = read_lines(&self.current);
+        let _generation = match self.generation_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                return PersistedLog {
+                    path: self.current.display().to_string(),
+                    lines: Vec::new(),
+                    degraded: Some(format!(
+                        "{}; {error}",
+                        state
+                            .degraded
+                            .as_deref()
+                            .unwrap_or("durable tail unavailable")
+                    )),
+                }
+            }
+        };
+        let previous = read_generation(&self.previous);
+        let current = read_generation(&self.current);
         let mut degraded = state.degraded.clone().into_iter().collect::<Vec<_>>();
+        // Only the bounded byte snapshot needs exclusion. Redacting hundreds
+        // of lines while holding this cross-process lock starved live writers
+        // past their deadline when several diagnostic readers finished at once.
+        drop(_generation);
+        drop(state);
+        degraded.extend(
+            self.release_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        );
+        let previous = read_lines(&self.previous, previous);
+        let current = read_lines(&self.current, current);
         degraded.extend(previous.degraded);
         degraded.extend(current.degraded);
         let mut lines = previous.lines;
@@ -237,26 +332,129 @@ impl FileSink {
 
 #[cfg(unix)]
 fn secure_directory(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("open log directory {}: {e}", path.display()))?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("secure {}: {e}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn secure_directory(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn secure_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| format!("inspect log directory: {e}"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err("log directory cannot be a reparse point".into());
+        }
+    }
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err("log directory must be a directory without links".into())
+    }
 }
 
 #[cfg(unix)]
-fn secure_file(path: &Path) -> Result<(), String> {
+fn secure_file(file: &File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("secure {}: {e}", path.display()))
+    file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(not(unix))]
-fn secure_file(_path: &Path) -> Result<(), String> {
+fn secure_file(_file: &File) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Both append and tail reads validate the opened object before using it.
+/// Never truncate on open: validation must precede any content mutation.
+fn open_log_file(path: &Path, append: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    if append {
+        options.create(true).append(true);
+        // Windows File::try_lock requires read or write access in addition
+        // to append; this helper also opens the generation lock sidecar.
+        #[cfg(windows)]
+        options.read(true);
+    } else {
+        options.read(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: inspect the link, never its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !log_file_is_unaliased(&file, &metadata)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log target must be a regular file without links",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn log_file_is_unaliased(_file: &File, metadata: &fs::Metadata) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(metadata.nlink() == 1)
+}
+
+#[cfg(windows)]
+fn log_file_is_unaliased(file: &File, metadata: &fs::Metadata) -> std::io::Result<bool> {
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+    // std's number_of_links remains nightly-only. Match the documented
+    // BY_HANDLE_FILE_INFORMATION ABI rather than following a pathname again.
+    #[repr(C)]
+    struct FileInformation {
+        attributes: u32,
+        creation: [u32; 2],
+        access: [u32; 2],
+        write: [u32; 2],
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            information: *mut FileInformation,
+        ) -> i32;
+    }
+    let mut information = std::mem::MaybeUninit::<FileInformation>::uninit();
+    // SAFETY: the file keeps the handle alive and the writable output buffer
+    // has the Win32 layout; it is read only after the API reports success.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(metadata.file_attributes() & 0x400 == 0 && information.links == 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn log_file_is_unaliased(_file: &File, _metadata: &fs::Metadata) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform cannot validate log file links",
+    ))
 }
 
 struct ReadLines {
@@ -264,21 +462,24 @@ struct ReadLines {
     degraded: Vec<String>,
 }
 
-/// Read one bounded generation, preserving later diagnostics across malformed
-/// legacy bytes and applying the current redaction boundary on the way out.
-fn read_lines(path: &Path) -> ReadLines {
-    let mut file = match File::open(path) {
+#[derive(Default)]
+struct ReadGeneration {
+    bytes: Vec<u8>,
+    clipped: bool,
+    degraded: Vec<String>,
+}
+
+/// Copy one bounded generation while the caller owns the rotation lock.
+fn read_generation(path: &Path) -> ReadGeneration {
+    let mut file = match open_log_file(path, false) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ReadLines {
-                lines: Vec::new(),
-                degraded: Vec::new(),
-            };
+            return ReadGeneration::default();
         }
         Err(error) => {
-            return ReadLines {
-                lines: Vec::new(),
+            return ReadGeneration {
                 degraded: vec![format!("read {} failed: {error}", path.display())],
+                ..ReadGeneration::default()
             };
         }
     };
@@ -289,9 +490,9 @@ fn read_lines(path: &Path) -> ReadLines {
     let clipped = length > read_cap;
     if clipped {
         if let Err(error) = file.seek(SeekFrom::End(-(read_cap as i64))) {
-            return ReadLines {
-                lines: Vec::new(),
+            return ReadGeneration {
                 degraded: vec![format!("seek {} failed: {error}", path.display())],
+                ..ReadGeneration::default()
             };
         }
         degraded.push(format!(
@@ -302,11 +503,26 @@ fn read_lines(path: &Path) -> ReadLines {
 
     let mut bytes = Vec::with_capacity(length.min(read_cap) as usize);
     if let Err(error) = file.take(read_cap).read_to_end(&mut bytes) {
-        return ReadLines {
-            lines: Vec::new(),
+        return ReadGeneration {
             degraded: vec![format!("read {} failed: {error}", path.display())],
+            ..ReadGeneration::default()
         };
     }
+    ReadGeneration {
+        bytes,
+        clipped,
+        degraded,
+    }
+}
+
+/// Decode and redact outside the rotation lock, preserving malformed legacy
+/// diagnostics and reporting every cap or replacement applied to the snapshot.
+fn read_lines(path: &Path, generation: ReadGeneration) -> ReadLines {
+    let ReadGeneration {
+        mut bytes,
+        clipped,
+        mut degraded,
+    } = generation;
     if clipped {
         if let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') {
             bytes.drain(..=first_newline);
@@ -323,7 +539,16 @@ fn read_lines(path: &Path) -> ReadLines {
             String::from_utf8_lossy(error.as_bytes()).into_owned()
         }
     };
-    let lines = text.lines().map(safe_log_line).collect();
+    // No caller can return more than this tail. Bound parsing/redaction too:
+    // a sub-megabyte file can otherwise contain hundreds of thousands of tiny
+    // lines, all allocated and redacted before almost all of them are dropped.
+    let mut lines: Vec<String> = text
+        .lines()
+        .rev()
+        .take(TAIL_MAX_LINES)
+        .map(safe_log_line)
+        .collect();
+    lines.reverse();
     ReadLines { lines, degraded }
 }
 
@@ -408,6 +633,10 @@ pub(crate) struct RingLogger {
     /// The durable mirror. `None` for a binary that keeps no file, and for
     /// every logger a test builds by hand.
     sink: Option<Arc<FileSink>>,
+    /// Shared with panic-hook clones. A failed mirror stays disabled for this
+    /// logger's lifetime; the ring and durable sink continue independently.
+    stderr_failed: Arc<AtomicBool>,
+    stderr: Arc<OnceLock<Result<crate::output::BoundedOutput, std::io::Error>>>,
 }
 
 static LOGGER: OnceLock<RingLogger> = OnceLock::new();
@@ -418,6 +647,8 @@ impl RingLogger {
             max_level,
             entries: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_ENTRIES))),
             sink: None,
+            stderr_failed: Arc::new(AtomicBool::new(false)),
+            stderr: Arc::new(OnceLock::new()),
         }
     }
 
@@ -437,7 +668,39 @@ impl RingLogger {
         if let Some(sink) = self.sink.as_ref() {
             sink.write_line(&line);
         }
-        eprintln!("{line}");
+        if self.stderr_failed.load(Ordering::Relaxed) {
+            return;
+        }
+        // A blocking pipe can remain open forever without a reader draining
+        // it. Only the bounded worker touches stderr or its global lock.
+        let output = self.stderr.get_or_init(|| {
+            crate::output::BoundedOutput::new(
+                std::io::stderr(),
+                "gitpulse-stderr",
+                MAX_LOG_ENTRY_BYTES + 1,
+                std::time::Duration::from_millis(100),
+            )
+        });
+        let result = match output {
+            Ok(output) => output
+                .write(format!("{line}\n").as_bytes())
+                .map_err(|e| e.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = result {
+            if !self.stderr_failed.swap(true, Ordering::Relaxed) {
+                let warning = format_entry(
+                    now_epoch_secs(),
+                    Level::Warn,
+                    "logging",
+                    &format!("stderr mirror disabled: {error}; continuing with ring and configured disk log"),
+                );
+                self.push(Level::Warn, warning.clone());
+                if let Some(sink) = self.sink.as_ref() {
+                    sink.write_line(&warning);
+                }
+            }
+        }
     }
 
     fn snapshot_tail(&self, max_lines: usize) -> Vec<String> {
@@ -550,7 +813,8 @@ pub fn install_panic_hook() {
 /// test can point it at its own ring without polluting the global one. Still
 /// global process state — callers must serialize and restore the prior hook.
 pub(crate) fn install_panic_hook_for(logger: Arc<RingLogger>) {
-    let original = std::panic::take_hook();
+    // Own the complete diagnostic route. Chaining the default hook prints
+    // the raw payload again, bypassing redaction and the stderr deadline.
     std::panic::set_hook(Box::new(move |info| {
         let payload = info
             .payload()
@@ -574,7 +838,6 @@ pub(crate) fn install_panic_hook_for(logger: Arc<RingLogger>) {
         for line in backtrace_lines(PANIC_BACKTRACE_LINES) {
             logger.write_entry(Level::Error, "panic", &line);
         }
-        original(info);
     }));
 }
 
@@ -1014,7 +1277,7 @@ mod tests {
     }
 
     fn file_lines(path: &std::path::Path) -> Vec<String> {
-        read_lines(path).lines
+        read_lines(path, read_generation(path)).lines
     }
 
     #[test]
@@ -1261,6 +1524,146 @@ mod tests {
             live.iter().any(|l| l.contains("rotated pid")),
             "the rotation announces itself so a gap is never silent: {live:?}"
         );
+    }
+
+    #[test]
+    fn independent_loggers_share_the_generation_byte_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = FileSink::open_in(dir.path(), "shared");
+        let second = FileSink::open_in(dir.path(), "shared");
+        for sink in [&first, &second, &first, &second] {
+            for _ in 0..20 {
+                sink.write_line(&"x".repeat(MAX_LOG_ENTRY_BYTES));
+                assert!(
+                    fs::metadata(dir.path().join("shared.log")).unwrap().len()
+                        <= LOG_FILE_MAX_BYTES,
+                    "active generation exceeded the byte bound between rotations"
+                );
+            }
+        }
+        for name in ["shared.log", "shared.log.1"] {
+            assert!(
+                fs::metadata(dir.path().join(name)).unwrap().len() <= LOG_FILE_MAX_BYTES,
+                "independent writers exceeded the shared generation bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_generation_lock_degrades_within_a_bounded_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        let held = sink.generation_lock().unwrap();
+        let started = std::time::Instant::now();
+        sink.write_line("cannot acquire generation lock");
+        let tail = sink.tail(10);
+        // Both append and tail attempt the one-second admission deadline.
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(tail.degraded.unwrap().contains("lock unavailable"));
+        drop(held);
+        sink.write_line("disabled writes are not retried");
+        let tail = sink.tail(10);
+        assert!(tail.degraded.is_some());
+        assert!(!tail
+            .lines
+            .iter()
+            .any(|line| line.contains("disabled writes")));
+    }
+
+    #[test]
+    fn a_duplicated_descriptor_cannot_extend_the_generation_lock_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        let generation = sink.generation_lock().unwrap();
+        // A duplicated descriptor retains the same OS file description, just
+        // as a forked child does before closing inherited handles during exec.
+        let inherited = generation.try_clone().unwrap();
+        drop(generation);
+        sink.write_line("the owner released its generation");
+        let tail = sink.tail(10);
+        assert!(tail.degraded.is_none(), "{tail:?}");
+        assert!(tail
+            .lines
+            .iter()
+            .any(|line| line.contains("owner released its generation")));
+        drop(inherited);
+    }
+
+    #[test]
+    fn transient_generation_contention_does_not_disable_a_healthy_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        let path = sink.current.with_extension("log.lock");
+        let held = open_log_file(&path, true).unwrap();
+        held.try_lock().unwrap();
+        let release = std::thread::spawn(move || {
+            // Loaded eight-process startup bursts exceeded the original
+            // 100 ms wait. A short, healthy owner must be allowed to finish.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            held.unlock().unwrap();
+        });
+        sink.write_line("accepted after transient contention");
+        release.join().unwrap();
+        let tail = sink.tail(10);
+        assert!(tail.degraded.is_none(), "{tail:?}");
+        assert!(tail
+            .lines
+            .iter()
+            .any(|line| line.contains("accepted after transient contention")));
+    }
+
+    #[test]
+    fn dense_generations_only_decode_the_requested_tail_capacity() {
+        let mut bytes = b"secret=x\n".repeat(100_000);
+        bytes.extend_from_slice(b"newest diagnostic\n");
+        assert!(bytes.len() < LOG_FILE_MAX_BYTES as usize);
+        let decoded = read_lines(
+            Path::new("history.log"),
+            ReadGeneration {
+                bytes,
+                ..ReadGeneration::default()
+            },
+        );
+        assert_eq!(decoded.lines.len(), TAIL_MAX_LINES);
+        assert_eq!(decoded.lines.last().unwrap(), "newest diagnostic");
+        assert!(decoded.lines.iter().all(|line| !line.contains("secret=x")));
+        assert!(decoded.degraded.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_directory_alias_does_not_change_foreign_permissions_or_contents() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o750)).unwrap();
+        let alias = dir.path().join("logs");
+        symlink(&foreign, &alias).unwrap();
+        let sink = FileSink::open_in(&alias, "gitpulse");
+        sink.write_line("must not land in foreign directory");
+        assert_eq!(
+            fs::metadata(&foreign).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 0);
+        assert!(sink.tail(10).degraded.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rotation_preserves_existing_bytes_and_refuses_a_substituted_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        let foreign = dir.path().join("foreign");
+        fs::write(&foreign, "private sentinel").unwrap();
+        fs::remove_file(&sink.current).unwrap();
+        symlink(&foreign, &sink.current).unwrap();
+        fs::create_dir(&sink.previous).unwrap();
+        sink.rotate(&mut sink.state.lock().unwrap());
+        assert_eq!(fs::read_to_string(foreign).unwrap(), "private sentinel");
+        assert!(sink.tail(10).degraded.is_some());
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod markdown;
 pub mod mcp;
 pub mod ndjson;
 pub mod ops;
+pub mod output;
 pub mod procguard;
 pub mod stack;
 pub mod storage;

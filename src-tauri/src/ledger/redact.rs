@@ -34,6 +34,24 @@ fn compiled(slot: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
     slot.get_or_init(|| Regex::new(pattern).expect("static credential regex must compile"))
 }
 
+fn compiled_named(slot: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
+    slot.get_or_init(|| {
+        // These three names have distinct header value grammars above.
+        // Every ordinary assignment uses the same credential-name owner as
+        // JSON fields and CLI flags, including vendor-prefixed suffixes.
+        let mut names: Vec<String> = SECRET_FIELD_NAMES
+            .iter()
+            .chain(SECRET_FIELD_SUFFIXES.iter())
+            .filter(|name| !matches!(**name, "authorization" | "cookie" | "set_cookie"))
+            .map(|name| regex::escape(name).replace('_', "[_. -]?"))
+            .collect();
+        names.sort();
+        names.dedup();
+        Regex::new(&pattern.replace("{names}", &names.join("|")))
+            .expect("canonical credential-name regex must compile")
+    })
+}
+
 fn redacted_assignment(captures: &Captures<'_>) -> String {
     let prefix = captures.get(1).map_or("", |value| value.as_str());
     let raw = captures.get(2).map_or("", |value| value.as_str());
@@ -143,17 +161,17 @@ fn redact_contextual(value: &str) -> String {
         &URL_PASSWORD,
         r"(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/?#]+@",
     );
-    let named_secret = compiled(
+    let named_secret = compiled_named(
         &NAMED_SECRET,
-        r#"(?i)(["']?(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|aws[_-]?access[_-]?key[_-]?id)["']?\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\\"'\]]+)"#,
+        r#"(?i)(["']?(?:{names})["']?\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\\"'\]]+)"#,
     );
-    let embedded_named_secret = compiled(
+    let embedded_named_secret = compiled_named(
         &EMBEDDED_NAMED_SECRET,
-        r#"(?i)((?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|aws[_-]?access[_-]?key[_-]?id)\s*[:=]\s*)([^"'\\\r\n]+?)(\\?["'])"#,
+        r#"(?i)((?:{names})\s*[:=]\s*)([^"'\\\r\n]+?)(\\?["'])"#,
     );
-    let double_quoted_named_secret = compiled(
+    let double_quoted_named_secret = compiled_named(
         &DOUBLE_QUOTED_NAMED_SECRET,
-        r#"(?i)((?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|aws[_-]?access[_-]?key[_-]?id)\s*[:=]\s*)((?:\\.|[^"\\\r\n])+?)(")"#,
+        r#"(?i)((?:{names})\s*[:=]\s*)((?:\\.|[^"\\\r\n])+?)(")"#,
     );
     let shell_secret_flag = compiled(
         &SHELL_SECRET_FLAG,
@@ -821,6 +839,39 @@ mod tests {
         assert!(out.contains("api_key=<redacted>"));
         assert!(out.contains("<private key redacted>"));
         assert_eq!(text(&out), out, "contextual redaction must be idempotent");
+    }
+
+    #[test]
+    fn plain_assignments_use_the_same_credential_names_as_structured_data() {
+        for name in SECRET_FIELD_NAMES
+            .iter()
+            .chain(SECRET_FIELD_SUFFIXES.iter())
+        {
+            // Headers have their own value syntax, covered by the existing
+            // header tests rather than assignment matching.
+            if matches!(*name, "authorization" | "cookie" | "set_cookie") {
+                continue;
+            }
+            for input in [
+                format!("{name}=synthetic-credential-value"),
+                format!("request failed: {name}='synthetic-credential-value' next=keep"),
+                format!("message=\"{name}=synthetic-credential-value\" next=keep"),
+            ] {
+                let output = text(&input);
+                assert!(
+                    !output.contains("synthetic-credential-value"),
+                    "{name}: {output}"
+                );
+                assert_eq!(text(&output), output);
+                if input.contains("next=keep") {
+                    assert!(output.contains("next=keep"));
+                }
+            }
+        }
+        assert_eq!(
+            text("token_count=5 tokenizer=word public_key=visible"),
+            "token_count=5 tokenizer=word public_key=visible"
+        );
     }
 
     #[test]

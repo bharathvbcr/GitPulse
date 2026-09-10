@@ -506,7 +506,7 @@
         "src/platform_impl/linux/x11/ffi.rs": "629a5aaf4973a8b7295623582b8c2c21ee1b13b8b5454f4e3c7a7de1be115f76",
         "src/platform_impl/linux/x11/mod.rs": "8f576518fe12bb21c7ac3db0e75b969babc1035288bfd618cc85d354b362f964",
         "src/platform_impl/linux/x11/xdisplay.rs": "fb64d39a851557b5f6a6e3e54c510473d62d13d3afd18c7be4d6f592824e9591",
-        "src/platform_impl/macos/app.rs": "102c21b90c4d09a8c1831d47b8b4418b2844e1c758c159db11ae14d9921cfd43",
+        "src/platform_impl/macos/app.rs": "aeb85caa9147860cda08d6392b68e2a25e4570c72298282f6791ca8e1d6676b5",
         "src/platform_impl/macos/app_delegate.rs": "a66447b76f880b559042133ca939305df8a3dd71b1e5a30f530a2d0cb8d16da4",
         "src/platform_impl/macos/app_state.rs": "493be209ef786af3e1d25d3631d18a3faaf96be210f83da2980a14dadfd60a7f",
         "src/platform_impl/macos/badge.rs": "41943ee395e667104594d1e8c79515689e938a0b1dd0abdb7c4a8fe0d2dfc9ce",
@@ -524,7 +524,7 @@
         "src/platform_impl/macos/util/cursor.rs": "481fe6a34e1547449d8ee7b1a8a1cd93c304f15c2b62f6a6a71aba6d995b903d",
         "src/platform_impl/macos/util/mod.rs": "e8df577333134debdc0731a5198f5876ffb41a70df75b10f1f732874daa8cc1a",
         "src/platform_impl/macos/view.rs": "42b961529295790e6e9084c5a910c4116d1b6ac5f8f2af96a893b722d9dc59b2",
-        "src/platform_impl/macos/window.rs": "d299bf58c503715c6aab15aee48194f566385e652b0003511ae34f7d5d60e0b0",
+        "src/platform_impl/macos/window.rs": "eb254ae034462b4ab42c463b095ba667efce0a6162ae68b0ddd1f7a979fa4bb5",
         "src/platform_impl/macos/window_delegate.rs": "e03fdcefe8962a5f64147325782bb6ca1d0aaf51c239453d527a1c4a07a902b8",
         "src/platform_impl/mod.rs": "50486214dc0ed94d7b3e9e9b13016af8cdae8e2069f081081b2926602a99a81e",
         "src/platform_impl/windows/dark_mode.rs": "820f7708dd7c853036d20a6f7f9b6abeb85ea8eb9837cca88fc3025f02595527",
@@ -582,6 +582,14 @@
         "src/platform_impl/linux/window.rs": {
           "upstream": "0532977ea20321f19e205f7c58d51077995b4f52878ca4979c5865c517625092",
           "patched": "8566db23a604555c54ae2f10186139a5d00d6ee80b460074901b4cce3d10d0b3"
+        },
+        "src/platform_impl/macos/app.rs": {
+          "upstream": "102c21b90c4d09a8c1831d47b8b4418b2844e1c758c159db11ae14d9921cfd43",
+          "patched": "aeb85caa9147860cda08d6392b68e2a25e4570c72298282f6791ca8e1d6676b5"
+        },
+        "src/platform_impl/macos/window.rs": {
+          "upstream": "d299bf58c503715c6aab15aee48194f566385e652b0003511ae34f7d5d60e0b0",
+          "patched": "eb254ae034462b4ab42c463b095ba667efce0a6162ae68b0ddd1f7a979fa4bb5"
         }
       }
     },

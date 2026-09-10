@@ -1266,6 +1266,45 @@ mod tests {
 
     #[test]
     fn test_unwatch_relative_path_does_not_canonicalize_against_cwd() {
+        const CHILD: &str = "GITPULSE_WATCHER_CWD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Cwd is process-wide: a concurrent Git child can inherit this
+            // temporary directory and outlive it even after RestoreCwd runs.
+            // Keep every original assertion in an isolated, bounded process.
+            let output_dir = TempDir::new().unwrap();
+            let output_path = output_dir.path().join("child-output");
+            let output = std::fs::File::create(&output_path).unwrap();
+            let original_cwd = std::env::current_dir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "watcher::tests::test_unwatch_relative_path_does_not_canonicalize_against_cwd",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .stderr(output.try_clone().unwrap())
+                .stdout(output)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("isolated cwd test exceeded its deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let report = std::fs::read_to_string(output_path).unwrap();
+            assert!(status.success(), "isolated cwd test failed: {report}");
+            assert!(report.contains("1 passed; 0 failed"), "{report}");
+            assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+            return;
+        }
         let dir = TempDir::new().unwrap();
         git_init(dir.path(), false);
         let state = WatcherState::default();

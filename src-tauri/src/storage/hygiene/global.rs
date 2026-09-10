@@ -143,6 +143,8 @@ pub struct Cleaner {
     current: Mutex<Option<(String, String)>>,
     #[cfg(test)]
     activity_override: Option<ActivityCheck>,
+    #[cfg(test)]
+    state_after_read: Option<Box<dyn Fn() + Send + Sync>>,
 }
 // Explicit unlock matters after fork/dup: closing only the owner's descriptor
 // can leave a shared file description locked until a child reaches exec.
@@ -183,6 +185,8 @@ impl Cleaner {
             current: Mutex::new(None),
             #[cfg(test)]
             activity_override: None,
+            #[cfg(test)]
+            state_after_read: None,
         }
     }
     fn activity(&self, path: &Path) -> Result<(), String> {
@@ -227,19 +231,6 @@ impl Cleaner {
         file.try_lock()
             .map_err(|e| format!("Cleaner is busy or its lock is unavailable: {e}"))?;
         Ok(CleanerLock(file))
-    }
-    fn run_busy(&self) -> Result<bool, String> {
-        let file = self.open_lock("run.lock")?;
-        match file.try_lock() {
-            Ok(()) => {
-                file.unlock().map_err(|e| e.to_string())?;
-                Ok(false)
-            }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
-            Err(std::fs::TryLockError::Error(error)) => {
-                Err(format!("Run lock is unavailable: {error}"))
-            }
-        }
     }
     fn read(&self) -> Result<Saved, String> {
         let path = self.dir.join("state.json");
@@ -287,8 +278,28 @@ impl Cleaner {
         Ok(result)
     }
     pub fn state(&self) -> Result<CleanerState, String> {
+        // Establish run ownership before reading history. An idle observation
+        // holds the lease through the snapshot so a worker cannot start behind
+        // it. A busy observation may briefly show a just-completed run as busy,
+        // but can never label its stale unfinished history as interrupted.
+        let run_lease = if self.active.load(Ordering::SeqCst) {
+            None
+        } else {
+            let file = self.open_lock("run.lock")?;
+            match file.try_lock() {
+                Ok(()) => Some(CleanerLock(file)),
+                Err(std::fs::TryLockError::WouldBlock) => None,
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(format!("Run lock is unavailable: {error}"));
+                }
+            }
+        };
+        let running = run_lease.is_none();
         let mut saved = self.read()?;
-        let running = self.active.load(Ordering::SeqCst) || self.run_busy()?;
+        #[cfg(test)]
+        if let Some(after_read) = &self.state_after_read {
+            after_read();
+        }
         if !running {
             for run in saved.history.iter_mut().filter(|r| r.finished_at == 0) {
                 run.status = "interrupted".into();

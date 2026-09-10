@@ -26,6 +26,11 @@ not published upstream releases.
 - The five Tauri crates that need no GTK changes remain at the original
   `406feea75283545496ef7398c5e2f0fb9b306b64` revision. Cargo patches both the
   registry and Git source so registry plugins share the same runtime types.
+- On macOS, TAO's application and window `sendEvent:` overrides use the
+  `C-unwind` ABI so native AppKit exceptions can reach AppKit's event handler.
+  `native_event_unwind` exercises both real callbacks with injected Objective-C
+  exceptions, normal forwarding, and subsequent dispatch. See
+  `../../docs/DIAGNOSTICS_HARDENING.md` for the crash evidence and limits.
 
 The GTK bindings require Rust 1.92 or later. No new native system library is
 required by this migration. Ubuntu 22.04 is the native build baseline under
