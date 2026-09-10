@@ -85,8 +85,12 @@ workbench board land together on `main`.
   declared coverage script or runner instead of inventing `npx` commands.
 - Identify a GitHub release draft by its tag and release ID. GitHub often
   rewrites `target_commitish` to a branch name after associating an existing
-  tag, which aborted v0.0.9 after every installer had uploaded. A SHA in that
-  field must still match the pinned commit; a ref name is not a second pin.
+  tag, which aborted v0.0.9 after every installer had uploaded. After those
+  uploads it can also rewrite `tag_name` to `untagged-<hex>`, which aborted
+  v0.1.0 with every installer already on the draft. A SHA in `target_commitish`
+  must still match the pinned commit; a ref name is not a second pin. An
+  `untagged-` placeholder is accepted only in GitHub's hex form, and finalize
+  writes the intended tag name back with the notes.
   Platform builds upload by release ID only so tauri-action cannot retarget
   the draft.
 - Keep Linux and Windows clippy from treating macOS notification activation as

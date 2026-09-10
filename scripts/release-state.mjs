@@ -66,12 +66,18 @@ export function runReleaseStage(options, run = runCommand) {
   /** @param {Record<string, unknown> | null} release */
   function checkDraft(release) {
     if (!release || release.draft !== true || release.prerelease !== false || release.immutable === true || release.published_at !== null) throw new Error("Release is not a mutable unpublished draft");
-    if (release.tag_name !== tag) throw new Error(`Draft tag differs from preflight (${String(release.tag_name)})`);
     // GitHub keeps the SHA we POST, then often echoes a branch or tag name once
     // the existing git tag is associated. v0.0.9's finalize died on that rewrite
     // after every installer had uploaded. The remote tag peel is the pin;
     // a 40-character SHA here must still be this commit or the annotated tag
     // object, and a ref name is not a second pin.
+    //
+    // After those uploads GitHub can also detach the git tag from the draft and
+    // rewrite tag_name to untagged-<hex>. v0.1.0 died on that. The peel is the
+    // pin; finalize writes the intended tag name back with the notes.
+    if (typeof release.tag_name !== "string" || (release.tag_name !== tag && !/^untagged-[0-9a-f]+$/i.test(release.tag_name))) {
+      throw new Error(`Draft tag differs from preflight (${String(release.tag_name)})`);
+    }
     if (typeof release.target_commitish !== "string" || !release.target_commitish) throw new Error("Draft commitish is missing");
     if (/^[a-f0-9]{7,40}$/i.test(release.target_commitish)) {
       const sha = release.target_commitish.toLowerCase();
@@ -121,7 +127,7 @@ export function runReleaseStage(options, run = runCommand) {
     const assets = assetSnapshot(release);
     checkTag();
     checkDraft(api(`releases/${releaseId}`));
-    checkDraft(api(`releases/${releaseId}`, "PATCH", { body: notes }));
+    checkDraft(api(`releases/${releaseId}`, "PATCH", { tag_name: tag, body: notes }));
     const confirmed = checkDraft(api(`releases/${releaseId}`));
     if (confirmed.body !== notes) throw new Error("Release notes round trip differs from changelog");
     if (assetSnapshot(confirmed) !== assets) throw new Error("Release assets changed during finalization");

@@ -25,6 +25,7 @@ function fixture(change: {
 } = {}) {
   let release = change.release === undefined ? draft() : change.release;
   const calls: string[][] = [];
+  const patches: string[] = [];
   let patched = false;
   const run: Runner = (program, args, input) => {
     calls.push([program, ...args]);
@@ -37,6 +38,7 @@ function fixture(change: {
     if (args[3] === "POST") { release = {...draft(), ...JSON.parse(input ?? "{}")}; return change.uncertainPost ? {status: null, failed: true, stdout: ""} : respond(release, 201); }
     if (args[3] === "PATCH") {
       patched = true;
+      patches.push(input ?? "");
       release = {...release, ...JSON.parse(input ?? "{}")};
       if (change.corruptNotes && release) release.body = "damaged";
       if (change.publishAfterPatch && release) release.draft = false;
@@ -46,7 +48,7 @@ function fixture(change: {
     if (patched && change.downloadDuringFinalize && release) release.assets = draft().assets.map(asset => ({...asset, download_count: 1})).reverse();
     return release ? respond(release) : respond({message: "Not Found"}, 404);
   };
-  return {run, calls};
+  return {run, calls, patches};
 }
 
 describe("remote release lifecycle", () => {
@@ -102,6 +104,16 @@ describe("remote release lifecycle", () => {
     expect(runReleaseStage(options, run).release_id).toBe("42");
     expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
   });
+  it("accepts GitHub detaching the git tag as untagged-hex after uploads", () => {
+    const {run, calls} = fixture({release: {...draft(), tag_name: "untagged-f782e62dab083869a408"}});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
+  });
+  it.each(["untagged", "untagged-", "untagged-not-hex", "latest", "v0.0.8"])("refuses a tag name that is not this release or GitHub's untagged hex form: %s", tag_name => {
+    const {run, calls} = fixture({release: {...draft(), tag_name}});
+    expect(() => runReleaseStage(options, run)).toThrow(/Draft tag/);
+    expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
+  });
   it("accepts an annotated tag object's SHA as target_commitish", () => {
     const object = "c".repeat(40);
     const {run} = fixture({
@@ -136,6 +148,11 @@ describe("remote release lifecycle", () => {
   const finalize = {...options, stage: "finalize", releaseId: "42", notes: "notes\n".repeat(9_000)};
   it("round trips large notes without environment variables and leaves a draft", () => {
     expect(runReleaseStage(finalize, fixture().run).stage).toBe("finalize");
+  });
+  it("writes the intended tag name back when GitHub left the draft untagged", () => {
+    const {run, patches} = fixture({release: {...draft(), tag_name: "untagged-f782e62dab083869a408"}});
+    expect(runReleaseStage(finalize, run).stage).toBe("finalize");
+    expect(patches.some(body => JSON.parse(body).tag_name === tag && JSON.parse(body).body === finalize.notes)).toBe(true);
   });
   it("ignores download counters and API ordering when verifying stable asset identity", () => {
     expect(runReleaseStage(finalize, fixture({downloadDuringFinalize: true}).run).stage).toBe("finalize");
