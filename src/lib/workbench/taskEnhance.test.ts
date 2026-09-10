@@ -30,7 +30,7 @@ describe("reviewable", () => {
 
 describe("acceptEnhancementInput", () => {
   it("accepts only ready, unlocked, proposed fields with a real request identity", () => {
-    const ready = { id: "e", revision: 3, state: "ready", fields: ["title", "description"] } as never;
+    const ready = { id: "e", task_id: "t1", source_revision: 4, revision: 3, state: "ready", fields: ["title", "description"] } as never;
     expect(acceptEnhancementInput(ready, task, ["title", "description"], "r")).toMatchObject({
       fields: ["description"],
       expected_task_revision: 4,

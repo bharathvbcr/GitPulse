@@ -122,6 +122,7 @@ const settle = async (ms = 30) => {
   const prompt = pendingPrompt ? [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === pendingPrompt.options.title).at(-1) : null;
   if (prompt && pendingPrompt.options.title.startsWith("Delete")) { button(pendingPrompt.options.confirmLabel, prompt)?.click(); await new Promise(resolve => setTimeout(resolve, 0)); await tick(); }
   if (prompt && pendingPrompt.options.title.startsWith("Discard")) { confirmations++; [...prompt.querySelectorAll("button")].find(button => button.textContent.trim() === (confirmAnswer ? "Discard edits" : "Keep editing"))?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
+  if (prompt && pendingPrompt.options.title === "Reload saved task?") { button("Reload", prompt)?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
 const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error("Timed out waiting for task UI"); };
 const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete"};
@@ -186,7 +187,9 @@ if (params.has("check")) {
     check("the primary repository is available without expanding settings", field("Primary repository").getClientRects().length > 0 && !field("Primary repository").closest("details"));
     check("linked repositories remain intact in the draft", field("Primary repository").value === "repo-0" && editor().textContent.includes("Linked repositories"));
     check("optional Manvi history and advanced details are folded initially", editor().querySelector('.enhancements .heading').getAttribute("aria-expanded") === "false" && button("More details").getAttribute("aria-checked") === "false");
-    editor().scrollTop = 900; await settle();
+    const stacked = (a, b) => a && b && a.getBoundingClientRect().bottom <= b.getBoundingClientRect().top + 2;
+    check("saved-task sheet stacks assist, enhancements, and runs", stacked(editor().querySelector('[aria-label="Manvi task assist"]'), editor().querySelector('[aria-label="Manvi task enhancements"]')) && stacked(editor().querySelector('[aria-label="Manvi task enhancements"]'), editor().querySelector('[aria-label="Task agent runs"]')));
+    editor().querySelector(".sheet-body").scrollTop = 900; await settle();
     const saveRect = button("Save task").getBoundingClientRect();
     check("save remains visible while the sheet scrolls", saveRect.top >= 0 && saveRect.bottom < innerHeight);
     await click("Close task details");
@@ -360,7 +363,7 @@ if (params.has("check")) {
     failConfiguration=true;
     await openMenu("task-2"); button("Quick Enhance",menu()).click(); await wait(()=>button("Close Quick Enhance",document)); await settle(100);
     check("Quick Enhance surfaces saved description and hidden task context", document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("GitPulse") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Manvi") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Bharath"));
-    button("Open full editor",document).click(); await wait(editor); editor().querySelector(".enhancements .heading").click(); await settle();
+    button("Open full editor",document).click(); await wait(editor); await wait(()=>!document.querySelector('[aria-labelledby="quick-enhance-title"]')); editor().querySelector(".enhancements .heading").click(); await settle();
     check("Manvi configuration failure has an explicit retry", Boolean(button("Retry Manvi configuration")));
     failConfiguration=false; await click("Retry Manvi configuration");
     await wait(() => { const el = button("Generate suggestion"); return Boolean(el) && !el.matches(":disabled"); });
@@ -387,16 +390,37 @@ if (params.has("check")) {
     const idea=root.querySelector(".notes-label textarea");
     check("Quick Enhance starts with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Improve with Manvi")) && !editor().querySelector('.sheet-tabs'));
     await change(idea,"Fix notification routing\nKeep saved task evidence and explain recovery steps.");
+    await wait(() => button("Draft with Manvi") && !button("Draft with Manvi").disabled);
     await click("Draft with Manvi");
     await wait(()=>[...proposals.values()].some(p=>p.source.title==="Fix notification routing" && p.state==="running"));
     const quickProposal=[...proposals.values()].find(p=>p.source.title==="Fix notification routing");
+    check("inline drafting refuses duplicate generations while a worker is running", button("Improve with Manvi").matches(":disabled"));
+    const formBox=editor().querySelector("form").getBoundingClientRect();
+    const historyBox=editor().querySelector(".enhancements").getBoundingClientRect();
+    check("task fields finish before enhancement history and agent runs", formBox.bottom<=historyBox.top+1);
     check("one click saves the rough idea and starts Manvi with both fields", quickProposal.fields.length===2 && quickProposal.source.description.includes("explain recovery steps") && quickProposal.source.repository_ids[0]==="repo-0");
+    check("Draft with Manvi consumes notes after extract", idea.value.trim() === "");
+    check("drafted sheet still stacks assist above enhancements", stacked(editor().querySelector('[aria-label="Manvi task assist"]'), editor().querySelector('[aria-label="Manvi task enhancements"]')));
     check("Quick Enhance requires no visible field-selection step", [...editor().querySelectorAll('.enhancements input[type="checkbox"]')].every(input=>input.getClientRects().length===0));
     proposals.set(quickProposal.id,{...quickProposal,revision:quickProposal.revision+1,state:"ready",proposed:{title:"Reliable task notifications",description:"Preserve saved evidence, route notifications to the correct task, and verify recovery."}});
-    await wait(()=>button("Use both")); await click("Use both");
+    await wait(()=>button("Use both"));
+    await change(field("Description"),"Unsaved evidence that must survive");
+    check("inline acceptance refuses to overwrite unsaved task edits", button("Use both").matches(":disabled"));
+    await change(field("Description"),quickProposal.source.description);
+    // Reload the saved revision so this acceptance starts from clean state.
+    await click("Reload saved"); await settle(100);
+    loseEnhancement=true; await click("Use both");
+    const retryInline=button("Retry pending action");
+    check("lost inline acceptance retains a retry and blocks closing", Boolean(retryInline) && button("Close task details").disabled);
+    if(retryInline) await click("Retry pending action");
     await wait(()=>tasks.find(task=>task.id===quickProposal.task_id)?.title==="Reliable task notifications");
     check("applying the default quick enhancement updates title and description together", tasks.find(task=>task.id===quickProposal.task_id).description.includes("verify recovery"));
     await click("Close task details");
+    await click("New task");
+    await change(root.querySelector(".notes-label textarea"),"Prepare Demo for Seattle start-up event");
+    await click("Save task"); await settle(100);
+    check("notes-only task saves without native title validation blocking extraction", tasks.some(task=>task.title==="Prepare Demo for Seattle start-up event"));
+    confirmAnswer=true; await click("Close task details");
     check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }
   document.getElementById("verdict").textContent = JSON.stringify({results}, null, 2);

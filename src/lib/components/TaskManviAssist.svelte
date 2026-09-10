@@ -2,20 +2,18 @@
   import { onMount } from "svelte";
   import { Sparkles } from "@lucide/svelte";
   import {
-    changeEnhancement,
     enhancementConfiguration,
     explainError,
     getEnhancement,
-    getTask,
     listEnhancements,
     newID,
-    WorkbenchError,
     type Enhancement,
     type EnhancementConfiguration,
     type EnhancementField,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, startQuickEnhance } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, startQuickEnhance, EnhancementAction, liveEnhancement } from "../workbench/taskEnhance";
+  import { bounded } from "../workbench/taskActions";
   import { canAskManvi, suggestionDiffers } from "../workbench/taskCompose";
   import { canQuickEnhance } from "../workbench/taskOrganize";
 
@@ -31,6 +29,8 @@
     onApplied,
     onBusy,
     disabled = false,
+    dirty = false,
+    active = true,
     autofocus = false,
   }: {
     task: Task | null;
@@ -44,6 +44,8 @@
     onApplied: (task: Task) => void;
     onBusy: (busy: boolean) => void;
     disabled?: boolean;
+    dirty?: boolean;
+    active?: boolean;
     autofocus?: boolean;
   } = $props();
 
@@ -57,6 +59,13 @@
   let now = $state(Date.now() / 1000);
   let disposed = false;
   let polling = false;
+  let epoch = 0;
+  const action = new EnhancementAction();
+  let needsReconcile = $state(false);
+  const acting = $derived(busy || needsReconcile);
+  const liveAttempt = $derived(liveEnhancement(proposal));
+  const stale = $derived(Boolean(proposal && task && proposal.source_revision !== task.revision));
+  const acceptDisabled = $derived(acting || disabled || dirty || stale);
   let flash = $state<EnhancementField[]>([]);
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   let notesEl: HTMLTextAreaElement | undefined = $state();
@@ -70,10 +79,21 @@
   const manviGate = $derived(task ? canQuickEnhance(task, configuration, configurationError) : { ok: false as const, reason: configurationError ?? "Save a draft for Manvi to read." });
   const available = $derived(requested.filter((field) => !lockedFields.includes(field)));
   const askLabel = $derived(busy ? "Asking Manvi…" : notes.trim() ? "Draft with Manvi" : "Improve with Manvi");
-  const askDisabled = $derived(disabled || busy || available.length === 0 || Boolean(gate));
+  const manviReady = $derived(Boolean(configuration?.provider.trim() && configuration?.model.trim()) && !configurationError);
+  let configPending = $state(false);
+  const fieldReason = $derived(
+    lockedFields.includes("title") && lockedFields.includes("description")
+      ? "Title and description are locked"
+      : available.length === 0
+        ? "Choose title, description, or both"
+        : !manviReady
+          ? (configurationError ?? "Manvi has no provider and model selected.")
+          : undefined,
+  );
+  const askDisabled = $derived(disabled || acting || liveAttempt || configPending || available.length === 0 || Boolean(gate) || !manviReady);
 
   function toggleField(field: EnhancementField, on: boolean) {
-    if (busy || lockedFields.includes(field)) return;
+    if (acting || disabled || lockedFields.includes(field)) return;
     requested = on ? [...new Set([...requested, field])] : requested.filter((value) => value !== field);
   }
 
@@ -84,45 +104,58 @@
     return () => { disposed = true; window.clearInterval(tick); if (flashTimer) clearTimeout(flashTimer); };
   });
 
-  $effect(() => { onBusy(busy); });
+  $effect(() => { onBusy(acting); });
   $effect(() => {
-    if (!proposal || !["pending", "running", "cancel_requested"].includes(proposal.state)) return;
+    if (!active || !proposal || !liveEnhancement(proposal)) return;
     const id = proposal.id;
     const timer = window.setInterval(() => { void poll(id); }, 1000);
     return () => window.clearInterval(timer);
   });
 
   async function loadConfig() {
+    if (configPending || acting || disabled) return;
+    configPending = true;
     try {
-      const config = await enhancementConfiguration();
+      const config = await bounded(enhancementConfiguration());
       if (disposed) return;
       configuration = config;
       configurationError = null;
     } catch (cause) {
       if (!disposed) configurationError = explainError(cause);
-    }
+    } finally { if (!disposed) configPending = false; }
   }
 
   async function poll(id: string) {
-    if (polling || busy || disposed || !task) return;
+    if (polling || acting || disposed || !active || document.visibilityState === "hidden") return;
     polling = true;
+    const ticket = epoch;
     try {
-      const page = await listEnhancements(task.id);
-      if (disposed || proposal?.id !== id) return;
-      const summary = page.items.find((item) => item.id === id);
-      if (summary && summary.revision !== proposal.revision) {
-        proposal = await getEnhancement(id);
-      }
+      const next = await bounded(getEnhancement(id));
+      if (disposed || ticket !== epoch || acting || proposal?.id !== id || next.revision < proposal.revision) return;
+      proposal = next;
+      error = "";
     } catch (cause) {
-      if (!disposed) error = `Status refresh failed: ${explainError(cause)}`;
-    } finally {
-      polling = false;
-    }
+      if (!disposed && ticket === epoch) error = `Status refresh failed: ${explainError(cause)}`;
+    } finally { polling = false; }
+  }
+
+  async function retry() {
+    const pending = action.pending;
+    if (!pending || busy || disabled) return;
+    busy = true; epoch++; error = "";
+    try {
+      const result = await action.run(pending.method, pending.input);
+      if (disposed) return;
+      proposal = result.proposal;
+      if (result.task) onApplied(result.task);
+      note = "Enhancement action confirmed.";
+    } catch (cause) { if (!disposed) error = explainError(cause); }
+    finally { if (!disposed) { needsReconcile = action.pending !== null; busy = false; } }
   }
 
   async function generate() {
-    if (busy || disabled) return;
-    busy = true; error = ""; note = "";
+    if (askDisabled) return;
+    busy = true; epoch++; error = ""; note = "";
     try {
       const saved = await prepareTask();
       if (disposed) return;
@@ -134,7 +167,17 @@
         error = configurationError ?? "Manvi configuration has not been loaded.";
         return;
       }
-      const started = await startQuickEnhance(saved, available, configuration);
+      // Inspect saved history before spending another model call, including
+      // proposals started from another enhancement surface.
+      const page = await bounded(listEnhancements(saved.id));
+      if (disposed) return;
+      const existing = page.items.find(liveEnhancement);
+      if (existing) {
+        const current = await bounded(getEnhancement(existing.id));
+        if (!disposed) { proposal = current; note = "A suggestion is already in progress."; }
+        return;
+      }
+      const started = await startQuickEnhance(saved, available, configuration, action);
       if (disposed) return;
       proposal = started.proposal;
       const changed = started.proposal.state === "ready" && (
@@ -147,37 +190,28 @@
     } catch (cause) {
       if (!disposed) error = explainError(cause);
     } finally {
-      if (!disposed) busy = false;
+      if (!disposed) { needsReconcile = action.pending !== null; busy = false; }
     }
   }
 
   async function accept(fields: EnhancementField[]) {
-    if (!task || !proposal || busy || disabled) return;
+    if (!task || !proposal || acceptDisabled) return;
     const input = acceptEnhancementInput(proposal, task, fields, newID());
-    if (!input) return;
-    busy = true; error = "";
+    if (!input) { error = "Save or reload the task, then request a fresh suggestion."; return; }
+    busy = true; epoch++; error = "";
     try {
-      proposal = await changeEnhancement("enhancements.accept", input);
-      const saved = await getTask(task.id);
+      const result = await action.run("enhancements.accept", input);
       if (disposed) return;
-      onApplied(saved);
-      note = fields.length === 1
-        ? `Saved the suggested ${fields[0]}.`
-        : "Saved the suggested title and description.";
+      proposal = result.proposal;
+      if (result.task) onApplied(result.task);
+      note = fields.length === 1 ? `Saved the suggested ${fields[0]}.` : "Saved the suggested title and description.";
       flash = [...fields];
       if (flashTimer) clearTimeout(flashTimer);
       flashTimer = setTimeout(() => { flash = []; }, 1600);
-    } catch (cause) {
-      if (!disposed) {
-        error = explainError(cause);
-        if (cause instanceof WorkbenchError && ["transport_error", "worker_error", "store_error", "protocol_error"].includes(cause.code)) {
-          note = "The result needs reconciliation. Retry accept if this stays uncertain.";
-        }
-      }
-    } finally {
-      if (!disposed) busy = false;
-    }
+    } catch (cause) { if (!disposed) error = explainError(cause); }
+    finally { if (!disposed) { needsReconcile = action.pending !== null; busy = false; } }
   }
+
 </script>
 
 <section class="manvi-assist" aria-label="Manvi task assist">
@@ -197,7 +231,7 @@
       maxlength="65536"
       rows="4"
       placeholder="Keep the original E42 across both repository links, and say how to reproduce it."
-      disabled={disabled || busy}
+      disabled={disabled || acting}
       oninput={(event) => onNotes(event.currentTarget.value)}
       onkeydown={(event) => {
         if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -213,7 +247,7 @@
       class="gp-seg-btn"
       data-active={available.includes("title")}
       aria-pressed={available.includes("title")}
-      disabled={busy || lockedFields.includes("title")}
+      disabled={disabled || acting || lockedFields.includes("title")}
       title={lockedFields.includes("title") ? "Title is locked against enhancement" : "Include title"}
       onclick={() => toggleField("title", !available.includes("title"))}
     >Title</button>
@@ -222,20 +256,30 @@
       class="gp-seg-btn"
       data-active={available.includes("description")}
       aria-pressed={available.includes("description")}
-      disabled={busy || lockedFields.includes("description")}
+      disabled={disabled || acting || lockedFields.includes("description")}
       title={lockedFields.includes("description") ? "Description is locked against enhancement" : "Include description"}
       onclick={() => toggleField("description", !available.includes("description"))}
     >Description</button>
   </div>
-  {#if configuration}<p class="meta">{configuration.provider} / {configuration.model}</p>{/if}
+  <details class="model-settings" open={!manviReady && !configPending}>
+    <summary>Task model settings</summary>
+    {#if configuration}
+      <label>Provider<select class="gp-field" bind:value={configuration.provider} disabled={disabled || acting || configPending}>{#each configuration.providers as provider}<option value={provider}>{provider}</option>{/each}</select></label>
+      <label>Model<input class="gp-field" bind:value={configuration.model} disabled={disabled || acting || configPending} maxlength="512" placeholder="Model name served by this provider" /></label>
+      <p class="meta">Task suggestions use Manvi’s provider configuration. Choose a model here when none is configured.</p>
+    {/if}
+    <button type="button" class="gp-btn" disabled={disabled || acting || configPending} onclick={() => void loadConfig()}>{configPending ? "Loading Manvi configuration…" : "Reload Manvi configuration"}</button>
+  </details>
+  {#if configuration?.provider.trim() && configuration?.model.trim()}<p class="meta">{configuration.provider} / {configuration.model}</p>{/if}
   {#if configurationError}<p class="warn">{configurationError}</p>{/if}
+  {#if !manviReady && !configPending && !configurationError}<p class="warn">Manvi has no provider and model selected.</p>{/if}
   {#if gate && (notes.trim() || title.trim() || task)}<p class="meta">{gate}</p>{/if}
-  {#if task && !manviGate.ok && !gate}<p class="warn">{manviGate.reason}</p>{/if}
+  {#if task && !manviGate.ok && manviReady && !gate}<p class="warn">{manviGate.reason}</p>{/if}
   <button
     type="button"
     class="gp-btn-primary ask"
     disabled={askDisabled}
-    title={gate ?? (available.length === 0 ? "Title and description are locked" : undefined)}
+    title={gate ?? fieldReason}
     onclick={() => void generate()}
   >
     <Sparkles size={12} />
@@ -244,6 +288,8 @@
   {#if askDisabled && !notes.trim() && !title.trim() && !task}
     <p class="meta">Type a few sentences, then draft. Or fill a title to improve an existing one.</p>
   {/if}
+  {#if needsReconcile}<p class="warn">The result is uncertain. Retry the same action before editing or closing.</p><button type="button" class="gp-btn" disabled={busy || disabled} onclick={() => void retry()}>Retry pending action</button>{/if}
+  {#if ready && (dirty || stale)}<p class="warn">{dirty ? "Save or reload your edits before accepting a suggestion." : "This suggestion is for an older task revision. Request a fresh suggestion."}</p>{/if}
   {#if error}<p role="alert" class="error">{error}</p>{/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
   {#if proposal && ["pending", "running", "cancel_requested"].includes(proposal.state)}
@@ -253,32 +299,32 @@
   {#if proposal?.rationale && ready}<p class="meta">{proposal.rationale}</p>{/if}
 
   <label class:flash={flash.includes("title")}>Title
-    <input class="gp-field" name="task-title" bind:value={title} required maxlength="300" placeholder="Or let Manvi draft this from your notes" />
+    <input class="gp-field" name="task-title" bind:value={title} disabled={disabled || acting} required maxlength="300" placeholder="Or let Manvi draft this from your notes" />
   </label>
   {#if showTitleSuggestion}
     <div class="inline-suggestion">
       <p class="meta">Manvi title</p>
       <p class="suggestion-body suggested">{titleSuggestion}</p>
-      <button type="button" class="gp-btn" disabled={busy || disabled} onclick={() => void accept(["title"])}>Use this title</button>
+      <button type="button" class="gp-btn" disabled={acceptDisabled} onclick={() => void accept(["title"])}>Use this title</button>
     </div>
   {/if}
 
   <label class:flash={flash.includes("description")}>Description
-    <textarea class="gp-field" bind:value={description} rows="6" maxlength="65536" placeholder="Or let Manvi draft this from your notes"></textarea>
+    <textarea class="gp-field" bind:value={description} disabled={disabled || acting} rows="6" maxlength="65536" placeholder="Or let Manvi draft this from your notes"></textarea>
   </label>
   {#if showDescriptionSuggestion}
     <div class="inline-suggestion">
       <p class="meta">Manvi description</p>
       <pre class="suggestion-body suggested">{descriptionSuggestion}</pre>
-      <button type="button" class="gp-btn" disabled={busy || disabled} onclick={() => void accept(["description"])}>Use this description</button>
+      <button type="button" class="gp-btn" disabled={acceptDisabled} onclick={() => void accept(["description"])}>Use this description</button>
     </div>
   {/if}
   {#if showTitleSuggestion || showDescriptionSuggestion}
     <div class="review-actions">
       {#if showTitleSuggestion && showDescriptionSuggestion}
-        <button type="button" class="gp-btn-primary" disabled={busy || disabled} onclick={() => void accept(["title", "description"])}>Use both</button>
+        <button type="button" class="gp-btn-primary" disabled={acceptDisabled} onclick={() => void accept(["title", "description"])}>Use both</button>
       {/if}
-      <button type="button" class="gp-btn" disabled={busy} onclick={() => { proposal = null; note = "Suggestion hidden. It stays in Manvi history."; }}>Not now</button>
+      <button type="button" class="gp-btn" disabled={acting || disabled} onclick={() => { epoch++; proposal = null; note = "Suggestion hidden. It stays in Manvi history."; }}>Not now</button>
     </div>
   {/if}
 </section>

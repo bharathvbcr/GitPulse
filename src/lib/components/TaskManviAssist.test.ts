@@ -23,6 +23,8 @@ describe("TaskManviAssist", () => {
     expect(source).toContain("bind:value={description}");
     expect(source).toContain("Type a few sentences");
     expect(source).toContain('aria-label="Fields Manvi may change"');
+    expect(source).toContain("manviReady");
+    expect(source).toContain("Boolean(gate) || !manviReady");
     expect(source).not.toMatch(/\bbackdrop-blur-/);
   });
 });

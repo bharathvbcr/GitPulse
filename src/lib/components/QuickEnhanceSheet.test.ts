@@ -14,11 +14,11 @@ describe("QuickEnhanceSheet", () => {
     expect(source).toContain("gp-scrim");
     expect(source).toContain("shadow-float");
     expect(source).toContain("hiddenTaskDetails");
-    expect(source).toContain("startQuickEnhance");
+    expect(source).toContain("TaskEnhancements");
     expect(source).toContain("quick-enhance-title");
     expect(source).toContain("aria-labelledby=\"quick-enhance-title\"");
     expect(source).not.toMatch(/\bbackdrop-blur-/);
-    expect(source).toContain("Generate suggestion");
+    expect(source).toContain("onBusy=");
     expect(source).toContain("Open full editor");
     expect(source).toContain("SettingToggle");
     expect(source).toContain("visibleHiddenDetails");

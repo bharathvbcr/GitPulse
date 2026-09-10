@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { EnhancementAction, createEnhancementInput, acceptEnhancementInput } from "../workbench/taskEnhance";
   import { bounded } from "../workbench/taskActions";
   import { askConfirm } from "../stores/modalStore";
   import { onMount, untrack } from "svelte";
-  import { automaticUpdates, changeEnhancement, enhancementConfiguration, explainError, getEnhancement, getTask, listEnhancements, newID, WorkbenchError, type Enhancement, type EnhancementField, type EnhancementMutation, type EnhancementSummary, type Task } from "../workbench/client";
+  import { automaticUpdates, enhancementConfiguration, explainError, getEnhancement, listEnhancements, newID, type Enhancement, type EnhancementField, type EnhancementMutation, type EnhancementSummary, type Task } from "../workbench/client";
 
   let { task, disabled, active = true, quick = false, startRequest = 0, onApplied, onBusy }: { task: Task; disabled: boolean; active?: boolean; quick?: boolean; startRequest?: number; onApplied: (task: Task) => void; onBusy: (busy: boolean) => void } = $props();
   let opened = $state(false), loading = $state(false), busy = $state(false), preparing = $state(false), chooseFields = $state(false);
@@ -17,6 +18,7 @@
   let editing = $state(false);
   let revisionDraft = $state<Partial<Record<EnhancementField, string>>>({});
   type Pending = { method: EnhancementMutation; input: Record<string, unknown>; result: Enhancement | null };
+  const actionController = new EnhancementAction();
   let pending = $state<Pending | null>(null);
   let visible = $state(true), now = $state(Date.now() / 1000);
   let disposed = false, selecting = 0, polling = false;
@@ -83,11 +85,7 @@
     if (polling || acting || disposed) return;
     polling = true;
     try {
-      const result = await bounded(listEnhancements(task.id));
-      if (disposed || proposal?.id !== id) return;
-      const summary = result.items.find((item) => item.id === id);
-      entries = [...result.items, ...entries.filter((entry) => !result.items.some((fresh) => fresh.id === entry.id))]; total = result.total;
-      if (summary && summary.revision !== proposal.revision) await choose(id);
+      await choose(id);
     } catch (cause) { if (!disposed) error = `Status refresh failed: ${explainError(cause)}`; }
     finally { polling = false; }
   }
@@ -98,38 +96,21 @@
   }
   async function mutate(method: EnhancementMutation, input: Record<string, unknown>) {
     if (busy || disabled) return;
-    if (!pending) pending = { method, input, result: null };
     selecting++; busy = true; error = ""; note = "";
     try {
-      // A confirmed receipt followed by a failed refresh needs only a read.
-      // Uncertain transport retries retain the exact original mutation identity.
-      const action = pending;
-      const result = action.result ?? await bounded(changeEnhancement(action.method, action.input));
-      action.result = result;
+      const result = await actionController.run(method, input);
       if (disposed) return;
-      selecting++; proposal = result; selected = result.fields.filter((field) => !(task.locked_fields ?? []).includes(field));
-      if (action.method === "enhancements.revise") { editing = false; revisionDraft = {}; }
-      if (action.method === "enhancements.accept" || action.method === "enhancements.undo") {
-        const saved = await bounded(getTask(task.id));
-        if (disposed) return;
-        onApplied(saved);
-      }
+      selecting++; proposal = result.proposal;
+      selected = proposal.fields.filter((field) => !(task.locked_fields ?? []).includes(field));
+      if (method === "enhancements.revise") { editing = false; revisionDraft = {}; }
+      if (result.task) onApplied(result.task);
       pending = null;
-      if (action.method === "enhancements.create" && result.state === "pending") {
-        const next = { id: result.id, request_id: newID(), expected_revision: result.revision };
-        pending = { method: "enhancements.generate", input: next, result: null };
-        const running = await bounded(changeEnhancement("enhancements.generate", next));
-        if (disposed) return;
-        proposal = running; pending = null;
-      }
-      note = action.method === "enhancements.revise" ? "Suggestion saved. The task has not changed." : proposal ? labels[proposal.state] : "Saved";
+      note = method === "enhancements.revise" ? "Suggestion saved. The task has not changed." : labels[proposal.state];
       await history();
-    } catch (cause) {
-      if (disposed) return;
-      error = explainError(cause);
-      if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error", "protocol_error"].includes(cause.code)) pending = null;
-    } finally { if (!disposed) busy = false; }
+    } catch (cause) { if (!disposed) error = explainError(cause); }
+    finally { if (!disposed) { pending = actionController.pending; busy = false; } }
   }
+
   async function startEnhancement() {
     if (preparing || disabled || acting || editing) return;
     opened = true; preparing = true;
@@ -140,7 +121,9 @@
   }
   function generate() {
     if (liveAttempt || disabled || controlsLocked || !provider.trim() || !model.trim() || !availableFields.length) return;
-    void mutate("enhancements.create", { id: newID(), request_id: newID(), expected_revision: 0, task_id: task.id, source_revision: task.revision, fields: [...availableFields], provider: provider.trim(), model: model.trim() });
+    const input = createEnhancementInput(task, availableFields, provider, model, {id: newID(), requestId: newID()});
+    if (!input) { error = "Choose valid fields, provider and model before generating."; return; }
+    void mutate("enhancements.create", input);
   }
   function editSuggestion() {
     if (!proposal || proposal.state !== "ready" || disabled || acting) return;
@@ -158,7 +141,11 @@
     if (!proposal) return;
     const input: Record<string, unknown> = { id: proposal.id, request_id: newID(), expected_revision: proposal.revision };
     if (method === "enhancements.accept" || method === "enhancements.undo") input.expected_task_revision = task.revision;
-    if (method === "enhancements.accept") input.fields = [...selected];
+    if (method === "enhancements.accept") {
+      const accepted = acceptEnhancementInput(proposal, task, selected, String(input.request_id));
+      if (!accepted) { error = "This suggestion no longer matches the saved task. Request a fresh suggestion."; return; }
+      Object.assign(input, accepted);
+    }
     if (method === "enhancements.recover") {
       if (!await askConfirm({
         title: "Release this expired attempt?",

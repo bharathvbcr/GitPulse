@@ -38,6 +38,10 @@ describe("TaskEditor", () => {
     expect(before).not.toContain("setFieldLock");
     expect(source).toContain("SettingToggle");
     expect(source).toContain("seed");
+    expect(source).toContain('class="sheet-body"');
+    expect(source).toContain("consumeNotes");
+    expect(source).toContain("applyExtractedNotes");
+    expect(source).not.toMatch(/form\{[^}]*flex:1/);
     expect(source).not.toContain("<details");
     expect(source).not.toContain("onclick={copy}");
   });

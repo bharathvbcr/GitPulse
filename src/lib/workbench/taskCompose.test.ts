@@ -3,6 +3,7 @@ import {
   AGENT_COPY_PREAMBLE,
   applyNotesToDraft,
   canAskManvi,
+  consumeNotes,
   formatDraftAgentCopy,
   joinAgentCopies,
   MAX_AGENT_COPY_TASKS,
@@ -38,10 +39,40 @@ describe("applyNotesToDraft", () => {
     });
     expect(applyNotesToDraft({ title: "Keep E42", description: "old" }, "New notes about E42")).toEqual({
       title: "Keep E42",
-      description: "New notes about E42",
+      description: "old\n\nNew notes about E42",
       extracted: true,
     });
     expect(applyNotesToDraft({ title: "", description: "" }, "   \n  ")).toMatchObject({ extracted: false });
+  });
+
+  it("does not silently discard notes beyond the save limit", () => {
+    const notes = "x".repeat(65_537);
+    expect(applyNotesToDraft({ title: "Keep", description: "" }, notes).description).toBe(notes);
+    expect(canAskManvi({ title: "Keep", repository_ids: ["r"] }, notes)).toMatch(/64 KB/);
+    expect(canAskManvi({ title: "Keep", repository_ids: ["r"] }, "界".repeat(22_000))).toMatch(/64 KB/);
+  });
+
+  it("does not split Unicode code points when deriving a title", () => {
+    const title = titleFromNotes("😀".repeat(301));
+    expect(title.isWellFormed()).toBe(true);
+    expect([...title]).toHaveLength(300);
+  });
+
+  it("consumes notes into the draft once so they cannot be re-applied", () => {
+    const first = consumeNotes({ title: "", description: "" }, "Fix notification routing\nKeep saved evidence.");
+    expect(first).toEqual({
+      title: "Fix notification routing",
+      description: "Fix notification routing\nKeep saved evidence.",
+      notes: "",
+      extracted: true,
+    });
+    expect(consumeNotes({ title: first.title, description: first.description }, first.notes).extracted).toBe(false);
+    const leftover = consumeNotes(
+      { title: "Prepare Demo for Seattle start-up event", description: "Prepare Demo for Seattle start-up event" },
+      "Prepare Demo for Seattle start-up event",
+    );
+    expect(leftover.extracted).toBe(true);
+    expect(leftover.notes).toBe("");
   });
 });
 

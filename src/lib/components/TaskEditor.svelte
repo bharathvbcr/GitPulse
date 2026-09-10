@@ -14,7 +14,7 @@
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
   import { addableOpenTabs, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
   import { dueInputValue, parseDueInput } from "../workbench/taskOrganize";
-  import { applyNotesToDraft, canAskManvi, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   let { value, seed = null, repositories, workspaces, openTabs = [], primary = "", home = null, active = true, initialStatus = "inbox", onSaved, onClose }: {
     value: Task | null; seed?: Partial<TaskDraft> | null; repositories: Repository[]; workspaces: WorkspaceCard[]; openTabs?: OpenTabRef[];
     primary?: string; home?: string | null; active?: boolean; initialStatus?: TaskStatus;
@@ -37,7 +37,9 @@
   let pending = $state<Record<string, unknown> | null>(null);
   let pendingDelete = $state<{ id: string; request_id: string; expected_revision: number } | null>(null);
   let dirty = $state(false);
-  let enhancementBusy = $state(false);
+  let assistBusy = $state(false);
+  let historyBusy = $state(false);
+  const enhancementBusy = $derived(assistBusy || historyBusy);
   let copying = $state(false);
   let extras = $state<Repository[]>([]);
   let adding = $state(false);
@@ -97,17 +99,27 @@
     if (!draft.repository_ids.includes(draft.primary_repository_id)) draft.primary_repository_id = draft.repository_ids[0] ?? "";
     dirty = true;
   }
-  async function save(): Promise<Task | null> {
-    if (saving || adding || reloading || confirming || pendingDelete) return null;
+  function applyExtractedNotes(): boolean {
+    const next = consumeNotes(draft, notes);
+    if (!next.extracted) return true;
+    if (new TextEncoder().encode(next.description).length > 65_536) {
+      error = "Description is too long. Keep it below 64 KB.";
+      return false;
+    }
+    draft.title = next.title;
+    draft.description = next.description;
+    notes = next.notes;
+    dirty = true;
+    return true;
+  }
+  async function save(fromManvi = false): Promise<Task | null> {
+    if (saving || adding || reloading || confirming || pendingDelete || (enhancementBusy && (!fromManvi || historyBusy))) return null;
+    if (!pending && !applyExtractedNotes()) return null;
+    if (!pending && (!draft.title.trim() || !draft.kind.trim())) { error = "Add a title and task type before saving."; return null; }
     if (!pending && new TextEncoder().encode(draft.description).length > 65_536) { error = "Description is too long. Keep it below 64 KB."; return null; }
     saving = true; error = ""; note = "";
     try {
       if (!pending) {
-        const extracted = applyNotesToDraft(draft, notes);
-        if (extracted.extracted) {
-          if (!draft.title.trim()) draft.title = extracted.title;
-          if (!draft.description.trim()) draft.description = extracted.description;
-        }
         draft.acceptance_criteria = criteria.split("\n").map((s) => s.trim()).filter(Boolean);
         draft.labels = labels.split(",").map((s) => s.trim()).filter(Boolean);
         pending = taskWrite(id, current?.revision ?? 0, draft);
@@ -125,16 +137,19 @@
     } finally { saving = false; }
   }
   async function prepareForManvi(): Promise<Task | null> {
-    if (saving || adding || enhancementBusy || pendingDelete !== null) return null;
-    const next = applyNotesToDraft(draft, notes);
-    if (next.extracted) {
-      draft.title = next.title;
-      draft.description = next.description;
-      dirty = true;
+    if (saving || adding || reloading || confirming || historyBusy || pendingDelete !== null) {
+      error = "Wait for the current task action to finish.";
+      throw new Error(error);
     }
+    if (!applyExtractedNotes()) throw new Error(error || "Could not use these notes.");
     const blocked = canAskManvi(draft, notes);
-    if (blocked) { error = blocked; return null; }
-    if (!current || dirty || pending) return await save();
+    if (blocked) { error = blocked; throw new Error(blocked); }
+    if (!current || dirty || pending) {
+      const saved = await save(true);
+      if (disposed) return null;
+      if (!saved) throw new Error(error || "Could not save a draft for Manvi.");
+      return saved;
+    }
     return current;
   }
   function markCopied(message: string) {
@@ -156,9 +171,10 @@
         if (packet && await copyText(packet)) markCopied(`Copied saved revision ${revision} for an agent${dirty ? "; unsaved edits are not included" : ""}`);
         else error = "Clipboard unavailable";
       } else {
+        const extracted = applyNotesToDraft(draft, notes);
         const packet = formatDraftAgentCopy({
-          title: draft.title,
-          description: draft.description,
+          title: extracted.title,
+          description: extracted.description,
           kind: draft.kind,
           status: draft.status,
           priority: draft.priority,
@@ -174,14 +190,16 @@
     finally { copying = false; }
   }
   async function reload() {
-    if (!current || !await askConfirm({
-      title: "Reload saved task?",
-      message: "Replace your unsaved edits with the latest saved revision?",
-      confirmLabel: "Reload",
-      cancelLabel: "Keep editing",
-    })) return;
-    try { const latest = await getTask(id); current = latest; draft = taskDraft(latest); criteria = latest.acceptance_criteria.join("\n"); labels = latest.labels.join(", "); pending = null; dirty = false; error = ""; }
-    catch (cause) { error = explainError(cause); }
+    if (!current || saving || adding || enhancementBusy || reloading || confirming || pendingDelete) return;
+    reloading = true;
+    try {
+      if (!await askConfirm({title: "Reload saved task?", message: "Replace your unsaved edits with the latest saved revision?", confirmLabel: "Reload", cancelLabel: "Keep editing"}) || disposed) return;
+      const latest = await bounded(getTask(id));
+      if (disposed) return;
+      if (latest.id !== id) throw new WorkbenchError("protocol_error", "Loaded task does not match this editor.");
+      current = latest; draft = taskDraft(latest); criteria = latest.acceptance_criteria.join("\n"); labels = latest.labels.join(", "); notes = ""; pending = null; dirty = false; error = "";
+    } catch (cause) { if (!disposed) error = explainError(cause); }
+    finally { if (!disposed) reloading = false; }
   }
   async function remove() {
     if (!current || saving || adding || enhancementBusy) return;
@@ -234,16 +252,19 @@
       <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementBusy || saving || adding || reloading || confirming || pending !== null || pendingDelete !== null} aria-label="Close task details">✕</button>
     </div>
   </header>
-  <form
+  <div class="sheet-body">
+  <form novalidate
     onsubmit={(e) => { e.preventDefault(); void save(); }}
     oninput={() => { dirty = true; }}
     onchange={() => { dirty = true; }}
 
   >
-    <fieldset disabled={saving || pending !== null || pendingDelete !== null || enhancementBusy}>
+    <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
       <TaskManviAssist
         task={current}
         {notes}
+        {dirty}
+        {active}
         onNotes={(value) => { notes = value; dirty = true; }}
         bind:title={draft.title}
         bind:description={draft.description}
@@ -251,10 +272,11 @@
         lockedFields={draft.locked_fields ?? []}
         prepareTask={prepareForManvi}
         onApplied={applied}
-        onBusy={(busy) => { enhancementBusy = busy; }}
-        disabled={saving || pending !== null || pendingDelete !== null}
+        onBusy={(busy) => { assistBusy = busy; }}
+        disabled={saving || reloading || historyBusy || pending !== null || pendingDelete !== null}
         autofocus={!current}
       />
+      <fieldset disabled={enhancementBusy}>
       <div class="pair"><label>Type<input class="gp-field" bind:value={draft.kind} list="task-kinds" required maxlength="64" /></label><label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label></div>
       <datalist id="task-kinds">{#each ["issue", "bug", "feature", "improvement", "maintenance", "research", "documentation"] as kind}<option value={kind} ></option>{/each}</datalist>
       <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" placeholder="One verifiable criterion per line" ></textarea></label>
@@ -300,6 +322,7 @@
         </fieldset>
         {#if current}<NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />{/if}
       {/if}
+      </fieldset>
     </fieldset>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
     {#if pending}<p>The save result is uncertain. Retry the same write to reconcile it before editing further.</p>{/if}
@@ -313,14 +336,14 @@
       {#if note}<p role="status" class="footer-note">{note}</p>{/if}
     </footer>
   </form>
-  {#if current}<TaskEnhancements task={current} disabled={dirty || saving || pending !== null || pendingDelete !== null} onApplied={applied} onBusy={(busy) => { enhancementBusy = busy; }} />{/if}
+  {#if current}<TaskEnhancements task={current} {active} disabled={dirty || saving || reloading || assistBusy || pending !== null || pendingDelete !== null} onApplied={applied} onBusy={(busy) => { historyBusy = busy; }} />{/if}
   {#if current}<TaskRuns task={current} {repositories} {active} disabled={dirty || saving || pending !== null || pendingDelete !== null || enhancementBusy} />{/if}
+  </div>
 </aside>
 
 <style>
-  form{padding:0 18px 18px}
-
   .enhancement-locks{margin:0 0 14px}
-  .task-editor{width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:auto;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;margin-bottom:18px;position:sticky;top:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;flex:1;min-height:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-wrap:wrap;position:sticky;bottom:0;padding:10px 0 0;background:rgb(var(--c-surface) / 0.82);border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}
+  .task-editor{width:min(430px,48vw);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
+  .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-wrap:wrap;position:sticky;bottom:0;z-index:1;padding:10px 0 0;background:rgb(var(--c-surface) / 0.82);border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}
 </style>

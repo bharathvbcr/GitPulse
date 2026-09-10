@@ -14,7 +14,7 @@ export function sanitizeNotes(value: unknown, cap = NOTES_CAP): string {
   const cleaned = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").trim();
   if (!cleaned) return "";
   const limit = Number.isSafeInteger(cap) && cap >= 32 ? cap : NOTES_CAP;
-  return cleaned.length > limit ? cleaned.slice(0, limit) : cleaned;
+  return [...cleaned].slice(0, limit).join("");
 }
 
 /** First line or sentence of notes, capped for `items.put`. */
@@ -25,14 +25,16 @@ export function titleFromNotes(notes: unknown, cap = TITLE_CAP): string {
   const line = (text.split(/\n/)[0] ?? text).trim();
   const sentence = (line.split(/(?<=[.!?])\s+/)[0] ?? line).trim();
   const source = sentence || line || text;
-  return displayTitle(source, limit) === "(untitled)" ? "" : displayTitle(source, limit);
+  const characters = [...source];
+  return characters.length > limit ? characters.slice(0, limit - 1).join("") + "…" : source;
 }
 
 export function applyNotesToDraft(
   draft: Pick<TaskDraft, "title" | "description">,
   notes: unknown,
 ): { title: string; description: string; extracted: boolean } {
-  const text = sanitizeNotes(notes);
+  // Preserve all entered evidence; the save boundary reports oversized input.
+  const text = sanitizeNotes(notes, typeof notes === "string" ? Math.max(NOTES_CAP, notes.length) : NOTES_CAP);
   if (!text) {
     return {
       title: typeof draft.title === "string" ? draft.title : "",
@@ -42,7 +44,25 @@ export function applyNotesToDraft(
   }
   const existingTitle = typeof draft.title === "string" ? draft.title.trim() : "";
   const title = existingTitle || titleFromNotes(text) || "Draft from notes";
-  return { title, description: text, extracted: true };
+  const description = typeof draft.description === "string" ? draft.description : "";
+  return { title, description: description.trim() && description.trim() !== text ? `${description}\n\n${text}` : text, extracted: true };
+}
+
+/** Apply notes once, then clear them so a later save cannot overwrite Manvi’s result. */
+export function consumeNotes(
+  draft: Pick<TaskDraft, "title" | "description">,
+  notes: unknown,
+): { title: string; description: string; notes: string; extracted: boolean } {
+  const applied = applyNotesToDraft(draft, notes);
+  if (!applied.extracted) {
+    return {
+      title: typeof draft.title === "string" ? draft.title : "",
+      description: typeof draft.description === "string" ? draft.description : "",
+      notes: sanitizeNotes(notes),
+      extracted: false,
+    };
+  }
+  return { title: applied.title, description: applied.description, notes: "", extracted: true };
 }
 
 export function canAskManvi(draft: {
@@ -62,6 +82,7 @@ export function canAskManvi(draft: {
     notes,
   );
   if (!next.title.trim()) return "Add a title, or describe what you need, before asking Manvi.";
+  if (new TextEncoder().encode(next.description).length > NOTES_CAP) return "Description and notes exceed 64 KB. Shorten them before saving or asking Manvi.";
   return null;
 }
 

@@ -76,7 +76,8 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     material(`${mode} suggestions`, ".enhancements .gp-field");
     material(`${mode} agent run controls`, ".task-runs .gp-field,.task-runs select");
     const editor = find(".task-editor");
-    editor.scrollTop = 200;
+    const body = find(".task-editor .sheet-body");
+    body.scrollTop = 200;
     await new Promise(resolve => requestAnimationFrame(resolve));
     check(`${mode}: header remains over scrolling content`, Math.abs(find(".task-editor > header").getBoundingClientRect().top - editor.getBoundingClientRect().top) < 2);
     click('[aria-label="Close task details"]');

@@ -5,23 +5,10 @@
   import { LAYERS } from "../ui/layers";
   import { cardScale, backdropFade, backdropFadeOut } from "../ui/transitions";
   import { fade, scale } from "svelte/transition";
-  import {
-    changeEnhancement,
-    enhancementConfiguration,
-    explainError,
-    getEnhancement,
-    getTask,
-    listEnhancements,
-    newID,
-    WorkbenchError,
-    type Enhancement,
-    type EnhancementConfiguration,
-    type EnhancementField,
-    type EnhancementSummary,
-    type Task,
-  } from "../workbench/client";
-  import { canQuickEnhance, hiddenTaskDetails, visibleHiddenDetails } from "../workbench/taskOrganize";
-  import { startQuickEnhance } from "../workbench/taskEnhance";
+  import { getTask, explainError, type Task } from "../workbench/client";
+  import { hiddenTaskDetails, visibleHiddenDetails } from "../workbench/taskOrganize";
+  import { bounded } from "../workbench/taskActions";
+  import TaskEnhancements from "./TaskEnhancements.svelte";
   import SettingToggle from "./SettingToggle.svelte";
 
   let {
@@ -39,144 +26,21 @@
   } = $props();
 
   let task = $state<Task | null>(null);
-  let configuration = $state<EnhancementConfiguration | null>(null);
-  let configurationError = $state<string | null>(null);
-  let proposal = $state<Enhancement | null>(null);
-  let entries = $state<EnhancementSummary[]>([]);
-  let requested = $state<EnhancementField[]>(["title", "description"]);
-  let selected = $state<EnhancementField[]>([]);
   let loading = $state(true);
   let busy = $state(false);
   let error = $state("");
-  let note = $state("");
-  let now = $state(Date.now() / 1000);
   let showEmpty = $state(false);
   let disposed = false;
-  let polling = false;
-
   const details = $derived(task ? hiddenTaskDetails(task, repoName) : []);
   const visibleDetails = $derived(visibleHiddenDetails(details, showEmpty));
-  const gate = $derived(task ? canQuickEnhance(task, configuration, configurationError) : { ok: false as const, reason: "Loading task…" });
-  const available = $derived.by(() => {
-    const current = task;
-    if (!current) return [];
-    return requested.filter((field) => !(current.locked_fields ?? []).includes(field));
-  });
-
-  onMount(() => {
-    void load();
-    const tick = window.setInterval(() => { now = Date.now() / 1000; }, 1000);
-    return () => { disposed = true; window.clearInterval(tick); };
-  });
-
-  $effect(() => {
-    if (!proposal || !["pending", "running", "cancel_requested"].includes(proposal.state)) return;
-    const id = proposal.id;
-    const timer = window.setInterval(() => { void poll(id); }, 1000);
-    return () => window.clearInterval(timer);
-  });
-
+  onMount(() => { void load(); return () => { disposed = true; }; });
   async function load() {
     loading = true; error = "";
     try {
-      const [loaded, config] = await Promise.all([
-        getTask(taskId),
-        enhancementConfiguration().catch((cause) => {
-          configurationError = explainError(cause);
-          return null;
-        }),
-      ]);
-      if (disposed) return;
-      task = loaded;
-      if (config) { configuration = config; configurationError = null; }
-      requested = (["title", "description"] as EnhancementField[]).filter((field) => !(loaded.locked_fields ?? []).includes(field));
-      const page = await listEnhancements(taskId);
-      if (disposed) return;
-      entries = page.items;
-      if (page.items[0]) {
-        proposal = await getEnhancement(page.items[0].id);
-        if (proposal) selected = proposal.fields.filter((field) => !(loaded.locked_fields ?? []).includes(field));
-      }
-    } catch (cause) {
-      if (!disposed) error = explainError(cause);
-    } finally {
-      if (!disposed) loading = false;
-    }
-  }
-
-  async function poll(id: string) {
-    if (polling || busy || disposed) return;
-    polling = true;
-    try {
-      const page = await listEnhancements(taskId);
-      if (disposed || proposal?.id !== id) return;
-      entries = page.items;
-      const summary = page.items.find((item) => item.id === id);
-      if (summary && summary.revision !== proposal.revision) {
-        proposal = await getEnhancement(id);
-        const current = task;
-        if (proposal && current) selected = proposal.fields.filter((field) => !(current.locked_fields ?? []).includes(field));
-      }
-    } catch (cause) {
-      if (!disposed) error = `Status refresh failed: ${explainError(cause)}`;
-    } finally {
-      polling = false;
-    }
-  }
-
-  async function generate() {
-    const current = task;
-    if (!current || !configuration || busy || !gate.ok) return;
-    busy = true; error = ""; note = "";
-    try {
-      const started = await startQuickEnhance(current, available, configuration);
-      if (disposed) return;
-      proposal = started.proposal;
-      selected = started.proposal.fields.filter((field) => !(current.locked_fields ?? []).includes(field));
-      note = started.proposal.state === "ready" ? "Ready for review" : "Generating";
-      const page = await listEnhancements(taskId);
-      if (!disposed) entries = page.items;
-    } catch (cause) {
-      if (!disposed) error = explainError(cause);
-    } finally {
-      if (!disposed) busy = false;
-    }
-  }
-
-  async function accept() {
-    if (!task || !proposal || proposal.state !== "ready" || !selected.length || busy) return;
-    busy = true; error = "";
-    const input = { id: proposal.id, request_id: newID(), expected_revision: proposal.revision, expected_task_revision: task.revision, fields: [...selected] };
-    try {
-      proposal = await changeEnhancement("enhancements.accept", input);
-      const saved = await getTask(task.id);
-      if (disposed) return;
-      task = saved;
-      onApplied(saved);
-      note = "Accepted into the saved task.";
-    } catch (cause) {
-      if (!disposed) {
-        error = explainError(cause);
-        if (cause instanceof WorkbenchError && ["transport_error", "worker_error", "store_error", "protocol_error"].includes(cause.code)) {
-          note = "The result needs reconciliation. Retry accept from the full editor if this stays uncertain.";
-        }
-      }
-    } finally {
-      if (!disposed) busy = false;
-    }
-  }
-
-  async function dismiss() {
-    if (!proposal || busy) return;
-    busy = true; error = "";
-    try {
-      proposal = await changeEnhancement("enhancements.dismiss", { id: proposal.id, request_id: newID(), expected_revision: proposal.revision });
-      note = proposal.state === "running" || proposal.state === "cancel_requested" ? "Cancellation requested." : "Dismissed.";
-    } catch (cause) {
-      if (!disposed) error = explainError(cause);
-    } finally {
-      if (!disposed) busy = false;
-    }
+      const loaded = await bounded(getTask(taskId));
+      if (!disposed) task = loaded;
+    } catch (cause) { if (!disposed) error = explainError(cause); }
+    finally { if (!disposed) loading = false; }
   }
 
   function onKey(event: KeyboardEvent) {
@@ -245,68 +109,12 @@
           {/each}
           {#if visibleDetails.length === 0}<p class="text-textMuted">No extra fields are filled in. Toggle empty fields to inspect them.</p>{/if}
         </div>
-        <div class="space-y-2">
-          <h3 class="text-[11px] font-semibold uppercase tracking-wide text-textMuted">Manvi</h3>
-          {#if !gate.ok}<p class="text-textMuted">{gate.reason}</p>{/if}
-          {#if configuration}<p class="text-textMuted">{configuration.provider} / {configuration.model}</p>{/if}
-          {#each ["title", "description"] as field}
-            {@const target: EnhancementField = field === "title" ? "title" : "description"}
-            {@const locked = (task.locked_fields ?? []).includes(target)}
-            <SettingToggle
-              label={`Rewrite ${field}`}
-              description={locked ? "Locked on this task. Unlock it in the editor to include it." : `Manvi may replace the saved ${field}.`}
-              checked={available.includes(target)}
-              ariaLabel={`Rewrite ${field}`}
-              onchange={(next) => {
-                if (busy || locked) return;
-                requested = next ? [...new Set([...requested, target])] : requested.filter((value) => value !== target);
-              }}
-            />
-          {/each}
-          <button type="button" class="gp-btn-primary" disabled={busy || !gate.ok || available.length === 0} onclick={() => void generate()}>
-            {busy ? "Working…" : "Generate suggestion"}
-          </button>
-        </div>
-        {#if proposal}
-          <article class="space-y-2" aria-label="Enhancement review">
-            <h3 class="font-semibold">{proposal.state.replace("_", " ")}</h3>
-            {#if proposal.failure}<p class="text-rose-400">{proposal.failure}</p>{/if}
-            {#if proposal.rationale}<p class="text-textMuted leading-relaxed">{proposal.rationale}</p>{/if}
-            {#if proposal.state === "ready"}
-              {#each proposal.fields as field}
-                <SettingToggle
-                  label={field === "title" ? "Accept title" : "Accept description"}
-                  checked={selected.includes(field)}
-                  onchange={(next) => {
-                    if (busy) return;
-                    selected = next ? [...new Set([...selected, field])] : selected.filter((value) => value !== field);
-                  }}
-                />
-                <p class="text-[11px] text-textMuted">Original</p>
-                <pre class="whitespace-pre-wrap wrap-break-word max-h-28 overflow-auto rounded-lg border border-border/60 bg-background/50 px-2 py-1.5">{proposal.source[field]}</pre>
-                <p class="text-[11px] text-textMuted">Suggestion</p>
-                <pre class="whitespace-pre-wrap wrap-break-word max-h-28 overflow-auto rounded-lg border border-accent/40 bg-background/50 px-2 py-1.5">{proposal.proposed[field]}</pre>
-              {/each}
-              <div class="flex flex-wrap gap-2">
-                <button type="button" class="gp-btn-primary" disabled={busy || !selected.length} onclick={() => void accept()}>Accept selected</button>
-                <button type="button" class="gp-btn" disabled={busy} onclick={() => void dismiss()}>Dismiss</button>
-              </div>
-            {:else if ["pending", "running", "failed"].includes(proposal.state)}
-              <button type="button" class="gp-btn" disabled={busy} onclick={() => void dismiss()}>{proposal.state === "running" ? "Request cancellation" : "Dismiss"}</button>
-              {#if ["running", "cancel_requested"].includes(proposal.state) && now >= proposal.expires_at}
-                <p class="text-textMuted">The deadline passed. Provider termination has not been confirmed.</p>
-              {/if}
-            {/if}
-          </article>
-        {:else if !loading}
-          <p class="text-textMuted">No suggestions for this task yet.</p>
-        {/if}
-        {#if note}<p role="status" class="text-textMuted">{note}</p>{/if}
+        <TaskEnhancements {task} disabled={loading} quick onApplied={(saved) => { task = saved; onApplied(saved); }} onBusy={(value) => { busy = value; }} />
       {/if}
     </div>
     <footer class="p-3 border-t border-border/60 gp-section-edge flex justify-between gap-2">
       <button type="button" class="gp-btn" disabled={!task || busy} onclick={() => { if (task) onOpenEditor(task); }}>Open full editor</button>
-      <span class="text-[11px] text-textMuted self-center">{entries.length ? `${entries.length} saved suggestion${entries.length === 1 ? "" : "s"}` : ""}</span>
+
     </footer>
   </div>
 </div>
