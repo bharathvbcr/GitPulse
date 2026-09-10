@@ -11,6 +11,11 @@ describe("disposable Manvi preview lifecycle", () => {
   it("announces the listen URL without stdio buffering", () => {
     expect(readFileSync(new URL("./workbench-preview.mjs", import.meta.url), "utf8")).toContain("writeSync(1,");
   });
+  it("exits after SIGTERM cleanup instead of leaving handles open", () => {
+    const source = readFileSync(new URL("./workbench-preview.mjs", import.meta.url), "utf8");
+    expect(source).toContain("process.exit(0)");
+    expect(source).toContain('process.on("SIGTERM", stop)');
+  });
   it.skipIf(process.platform === "win32")("owns SIGTERM cleanup after Vite begins listening", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "gitpulse-preview-signal-"));
     const store = join(fixture, "dcstore");
@@ -41,22 +46,24 @@ lines.on('close', () => setTimeout(() => process.exit(0), 250));
       root = output.split("Disposable fixture directory: ")[1]?.split("\n")[0] ?? "";
       expect(root).not.toBe("");
       child.kill("SIGTERM");
-      const timeout = setTimeout(() => child.kill("SIGKILL"), 3000);
+      // The fixture waits up to 6.5s for the Manvi child before SIGKILL; this
+      // budget must stay strictly above that or CI reports null instead of 0.
+      const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
       const code = await done;
       clearTimeout(timeout);
-      expect(code, diagnostics).toBe(0);
+      expect(code, `${diagnostics}\nsignal=${child.signalCode}`).toBe(0);
       await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGTERM");
-        const kill = setTimeout(() => child.kill("SIGKILL"), 3000);
+        const kill = setTimeout(() => child.kill("SIGKILL"), 10_000);
         await done;
         clearTimeout(kill);
       }
       if (root) await rm(root, { recursive: true, force: true });
       await rm(fixture, { recursive: true, force: true });
     }
-  }, 45_000);
+  }, 60_000);
   it("removes the disposable profile when the host cannot start", async () => {
     const script = fileURLToPath(new URL("./workbench-preview.mjs", import.meta.url));
     let output = "";

@@ -61,7 +61,12 @@ async function close() {
 }
 function stop() {
   stopRequested = true;
-  if (!starting) void close().catch((error) => { console.error(error); process.exitCode = 1; });
+  if (!starting) {
+    void close().then(
+      () => process.exit(0),
+      (error) => { console.error(error); process.exit(1); },
+    );
+  }
 }
 function requireRunning() { if (stopRequested) throw new Error("Preview stopped during startup"); }
 process.on("SIGINT", stop);
@@ -126,4 +131,9 @@ if (!address || typeof address === "string") throw new Error("Preview has no TCP
 allowedHost = `127.0.0.1:${address.port}`;
 announce(`Disposable profile: ${db}\nPreview: http://${allowedHost}/harness/workbench.html`);
 starting = false;
-} catch (error) { starting = false; await close(); if (!stopRequested) throw error; }
+} catch (error) {
+  starting = false;
+  await close();
+  if (stopRequested) process.exit(0);
+  throw error;
+}

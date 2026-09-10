@@ -91,8 +91,9 @@ workbench board land together on `main`.
   the draft.
 - Keep Linux and Windows clippy from treating macOS notification activation as
   unused. The worker still matches that event so the protocol stays one type.
-- Announce the workbench preview URL without stdio buffering and give CI enough
-  time for Vite to listen so the lifecycle test is not a 5-second race.
+- Announce the workbench preview URL without stdio buffering, exit after SIGTERM
+  closes the Vite server and Manvi child so leftover handles cannot hang coverage,
+  and keep the lifecycle test's SIGKILL budget above that child's 6.5s close wait.
 
 ### Changed
 
