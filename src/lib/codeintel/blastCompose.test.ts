@@ -25,6 +25,7 @@ function layered(opts: {
     available,
     reason: opts.reason ?? null,
     edges: {
+      source_freshness: { fresh: true },
       available,
       reason: opts.reason ?? null,
       items: [],
@@ -42,8 +43,10 @@ function layered(opts: {
       unmatched_targets: opts.unmatched ?? [],
       total_impacted: available ? opts.node_count : 0,
       layers: {
+        source_freshness: { fresh: true },
         available,
         reason: opts.reason ?? null,
+
         items: available
           ? [
               {

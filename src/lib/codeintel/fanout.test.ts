@@ -35,6 +35,7 @@ describe("omittedLayeredImpact", () => {
           available: true,
           reason: null,
           edges: {
+            source_freshness: { fresh: true },
             available: true,
             items: [],
             total: 0,
@@ -46,6 +47,7 @@ describe("omittedLayeredImpact", () => {
             unmatched_targets: [],
             total_impacted: 2,
             layers: {
+              source_freshness: { fresh: true },
               available: true,
               items: [{ depth: 1, nodes: ["Foo"], node_count: 2, nodes_omitted: 0 }],
               total: 1,
@@ -53,6 +55,7 @@ describe("omittedLayeredImpact", () => {
               truncated: false,
             },
           },
+
         },
         omittedLayeredImpact("late.ts"),
       ],

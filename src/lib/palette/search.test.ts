@@ -8,7 +8,8 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-const symbols = (name: string): CodeintelResponse<CodeintelSymbolHit> => ({ available: true, items: [{ symbol_name: name, file_path: "test.ts", kind: "Function", span_start_line: 1, span_end_line: 2, source_span: "function test() {}", score: 1 }], shown: 1, total: 1, truncated: false });
+const symbols = (name: string): CodeintelResponse<CodeintelSymbolHit> => ({ source_freshness: { fresh: true }, available: true, items: [{ symbol_name: name, file_path: "test.ts", kind: "Function", span_start_line: 1, span_end_line: 2, source_span: "function test() {}", score: 1 }], shown: 1, total: 1, truncated: false });
+
 const request: SearchRequest = { mode: "symbols", repoPath: "/repo", text: "test", semantic: false };
 const workspace: WorkspaceSearchResult = { items: [], repos_queried: 1, unavailable: [], total: 0, shown: 0, hidden: 0, truncated: false, semantic: false };
 function dependencies() {
@@ -66,7 +67,8 @@ describe("palette search lifecycle", () => {
     deps.symbols.mockResolvedValueOnce({ ...symbols("part"), truncated: true, total: 200 });
     scheduleSearch(request, publish, deps); await vi.runAllTimersAsync();
     expect(publish.mock.lastCall?.[0]).toMatchObject({ failed: false, note: "1 of 200 symbol matches returned. Refine your search for more." });
-    deps.symbols.mockResolvedValueOnce({ available: true, items: [], total: 0, shown: 0, truncated: false });
+    deps.symbols.mockResolvedValueOnce({ source_freshness: { fresh: true }, available: true, items: [], total: 0, shown: 0, truncated: false });
+
     scheduleSearch(request, publish, deps); await vi.runAllTimersAsync();
     expect(publish.mock.lastCall?.[0]).toEqual(emptySearch());
   });

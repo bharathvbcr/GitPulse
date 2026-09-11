@@ -108,6 +108,7 @@ describe("previewSummary honesty", () => {
         bodies_not_compared: 0,
         ambiguous_callers: 0,
         broken_callers: {
+          source_freshness: { fresh: true },
           available: true,
           reason: null,
           items: [],
@@ -115,6 +116,7 @@ describe("previewSummary honesty", () => {
           shown: 0,
           truncated: false,
         },
+
       },
     };
     const h = fileHonesty(file);
@@ -150,6 +152,7 @@ describe("previewSummary honesty", () => {
         bodies_not_compared: 0,
         ambiguous_callers: 0,
         broken_callers: {
+          source_freshness: { fresh: true },
           available: true,
           reason: null,
           items: [],
@@ -158,6 +161,7 @@ describe("previewSummary honesty", () => {
           truncated: false,
           walk_incomplete: walk,
         },
+
       },
     };
     const marker = markersByPath([file]).get("src/a.ts");
@@ -181,6 +185,7 @@ describe("previewSummary honesty", () => {
         bodies_not_compared: 0,
         ambiguous_callers: 0,
         broken_callers: {
+          source_freshness: { fresh: true },
           available: true,
           reason: null,
           items: [{ source_symbol: "x" }],
@@ -189,6 +194,7 @@ describe("previewSummary honesty", () => {
           truncated: true,
           walk_incomplete: "partial",
         },
+
       },
     };
     const summary = summarizePreview([file]);
@@ -214,6 +220,7 @@ describe("previewSummary honesty", () => {
         bodies_not_compared: 0,
         ambiguous_callers: 0,
         broken_callers: {
+          source_freshness: { fresh: true },
           available: true,
           reason: null,
           items: [],
@@ -221,6 +228,7 @@ describe("previewSummary honesty", () => {
           shown: 0,
           truncated: false,
         },
+
       },
     };
     const summary = summarizePreview([file], { filesOmitted: 4, filesTotal: 20 });

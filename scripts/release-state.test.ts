@@ -79,8 +79,9 @@ describe("remote release lifecycle", () => {
     expect(calls.filter(call => call.includes("POST"))).toHaveLength(0);
   });
   it("resumes a still-tagged draft that /releases/tags/ cannot see even when the display name is missing", () => {
-    const nameless = {...draft()};
+    const nameless: Record<string, unknown> = {...draft()};
     delete nameless.name;
+
     const {run, calls} = fixture({release: nameless, list: [nameless]});
     expect(runReleaseStage(options, run).release_id).toBe("42");
     expect(calls.filter(call => call.includes("POST"))).toHaveLength(0);
