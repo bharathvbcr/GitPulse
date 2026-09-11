@@ -4109,7 +4109,15 @@ mod tests {
             .any(|b| matches!(b, b'*' | b'?' | b'"' | b':' | b'<' | b'>' | b'|'))
     }
 
-    fn add_blob_via_index(dir: &Path, rel: &str, body: &[u8]) {
+    /// Git for Windows treats `X:rest` as a drive when the path is an
+    /// `update-index` argument, even for a digit, and drops it with exit 0.
+    /// Tree objects still hold the name; stage those through mktree.
+    fn path_is_dos_drive_shaped(rel: &str) -> bool {
+        let bytes = rel.as_bytes();
+        bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphanumeric()
+    }
+
+    fn hash_blob_oid(dir: &Path, body: &[u8]) -> String {
         use std::io::Write;
         let mut hash = std::process::Command::new("git")
             .args(["hash-object", "-w", "--stdin"])
@@ -4130,8 +4138,90 @@ mod tests {
             "git hash-object failed: {}",
             String::from_utf8_lossy(&hashed.stderr)
         );
-        let oid = String::from_utf8(hashed.stdout).unwrap();
-        let oid = oid.trim();
+        String::from_utf8(hashed.stdout).unwrap().trim().to_string()
+    }
+
+    fn mktree_z(dir: &Path, records: &[u8]) -> String {
+        use std::io::Write;
+        let mut tree = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.protectNTFS=false",
+                "-c",
+                "core.protectHFS=false",
+                "mktree",
+                "-z",
+            ])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git mktree");
+        tree.stdin
+            .take()
+            .expect("mktree stdin")
+            .write_all(records)
+            .unwrap();
+        let treed = tree.wait_with_output().expect("mktree wait");
+        assert!(
+            treed.status.success(),
+            "git mktree failed: {}",
+            String::from_utf8_lossy(&treed.stderr)
+        );
+        String::from_utf8(treed.stdout).unwrap().trim().to_string()
+    }
+
+    fn stage_blob_via_tree_union(dir: &Path, path: &str, oid: &str) {
+        let mut extra = format!("100644 blob {oid}\t{path}").into_bytes();
+        extra.push(0);
+        let extra_tree = mktree_z(dir, &extra);
+        let base = git_output(
+            dir,
+            &[
+                "-c",
+                "core.protectNTFS=false",
+                "-c",
+                "core.protectHFS=false",
+                "write-tree",
+            ],
+        );
+        let union = if base.status.success() {
+            let base_oid = String::from_utf8_lossy(&base.stdout).trim().to_string();
+            let listed = git_output(dir, &["ls-tree", "-z", "--full-tree", base_oid.as_str()]);
+            assert!(
+                listed.status.success(),
+                "ls-tree base failed: {}",
+                String::from_utf8_lossy(&listed.stderr)
+            );
+            let extra_list =
+                git_output(dir, &["ls-tree", "-z", "--full-tree", extra_tree.as_str()]);
+            assert!(
+                extra_list.status.success(),
+                "ls-tree extra failed: {}",
+                String::from_utf8_lossy(&extra_list.stderr)
+            );
+            let mut combined = listed.stdout;
+            combined.extend(extra_list.stdout);
+            mktree_z(dir, &combined)
+        } else {
+            extra_tree
+        };
+        git_in(dir, &["read-tree", union.as_str()]);
+    }
+
+    fn add_blob_via_index(dir: &Path, rel: &str, body: &[u8]) {
+        use std::io::Write;
+        let oid = hash_blob_oid(dir, body);
+        if path_is_dos_drive_shaped(rel) {
+            stage_blob_via_tree_union(dir, rel, &oid);
+            assert!(
+                staged_paths(dir).iter().any(|p| p == rel),
+                "index missing {rel} after read-tree: {:?}",
+                staged_paths(dir)
+            );
+            return;
+        }
         let mut index = std::process::Command::new("git")
             .args([
                 "-c",
@@ -4148,9 +4238,6 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn git update-index");
-        // Two-field form (`mode SP oid TAB path`). The three-field form
-        // writes `0\t0:foo.py`, which Git for Windows can parse as stage
-        // syntax rather than a path named `0:foo.py`.
         writeln!(
             index.stdin.take().expect("update-index stdin"),
             "100644 {oid}\t{rel}"
@@ -4212,50 +4299,11 @@ mod tests {
     /// `mktree` writes the path into a tree object without `write-tree`, so
     /// ADS-shaped names cannot be dropped by NTFS path verification.
     fn commit_root_blob_via_mktree(dir: &Path, path: &str, body: &[u8]) {
-        use std::io::Write;
-        let mut hash = std::process::Command::new("git")
-            .args(["hash-object", "-w", "--stdin"])
-            .current_dir(dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn git hash-object");
-        hash.stdin
-            .take()
-            .expect("hash-object stdin")
-            .write_all(body)
-            .unwrap();
-        let hashed = hash.wait_with_output().expect("hash-object wait");
-        assert!(
-            hashed.status.success(),
-            "git hash-object failed: {}",
-            String::from_utf8_lossy(&hashed.stderr)
-        );
-        let oid = String::from_utf8(hashed.stdout).unwrap();
-        let oid = oid.trim();
-        let mut tree = std::process::Command::new("git")
-            .args(["-c", "core.protectNTFS=false", "mktree", "-z"])
-            .current_dir(dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn git mktree");
-        {
-            let mut stdin = tree.stdin.take().expect("mktree stdin");
-            write!(stdin, "100644 blob {oid}\t{path}").unwrap();
-            stdin.write_all(&[0]).unwrap();
-        }
-        let treed = tree.wait_with_output().expect("mktree wait");
-        assert!(
-            treed.status.success(),
-            "git mktree {path:?} failed: {}",
-            String::from_utf8_lossy(&treed.stderr)
-        );
-        let tree_oid = String::from_utf8(treed.stdout).unwrap();
-        let tree_oid = tree_oid.trim();
-        let commit = git_stdout(dir, &["commit-tree", tree_oid, "-m", "mktree"]);
+        let oid = hash_blob_oid(dir, body);
+        let mut records = format!("100644 blob {oid}\t{path}").into_bytes();
+        records.push(0);
+        let tree_oid = mktree_z(dir, &records);
+        let commit = git_stdout(dir, &["commit-tree", tree_oid.as_str(), "-m", "mktree"]);
         git_in(dir, &["update-ref", "HEAD", commit.as_str()]);
     }
 
@@ -4265,6 +4313,10 @@ mod tests {
         assert!(path_must_enter_index_directly("foo*.py"));
         assert!(path_must_enter_index_directly(":colon.py"));
         assert!(path_must_enter_index_directly("foo:bar.py"));
+        assert!(path_is_dos_drive_shaped("0:foo.py"));
+        assert!(path_is_dos_drive_shaped("C:foo.py"));
+        assert!(!path_is_dos_drive_shaped("foo:bar.py"));
+        assert!(!path_is_dos_drive_shaped(":colon.py"));
         assert!(!path_must_enter_index_directly("keep.txt"));
         assert!(!path_must_enter_index_directly("pkg/__main__.py"));
         assert!(!path_must_enter_index_directly("__main__.py"));
@@ -5037,6 +5089,14 @@ mod tests {
         assert_eq!(
             GitReader::get_file_blob(&repo, "0:foo.py", Some("HEAD"))
                 .expect("mktree ADS name")
+                .text
+                .as_deref(),
+            Some("ads-head\n")
+        );
+        git_in(dir.path(), &["read-tree", "HEAD"]);
+        assert_eq!(
+            GitReader::get_file_blob(&repo, "0:foo.py", None)
+                .expect("read-tree ADS name")
                 .text
                 .as_deref(),
             Some("ads-head\n")
