@@ -79,12 +79,26 @@ describe("check:workflows", () => {
       .split("\n")
       .find((line) => line.includes("--lcov") && line.includes("output-path lcov.info"));
     expect(lcov, coverage).toBeDefined();
-    expect(lcov).toContain("--test-threads=");
+    expect(lcov).toContain("--test-threads=1");
     expect(lcov).not.toContain("--no-run");
     const pkg = JSON.parse(
       readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
     );
-    expect(pkg.scripts["ci:local"]).toContain("--test-threads=");
+    expect(pkg.scripts["ci:local"]).toContain("--test-threads=1");
+  });
+
+  it("caps uninstrumented cargo test threads so sidecar hello fixtures are not starved", () => {
+    for (const name of ["ci.yml", "release.yml"]) {
+      const source = readFileSync(
+        fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)),
+        "utf8",
+      );
+      const lines = source.split("\n").filter((line) => line.includes("cargo test --manifest-path"));
+      expect(lines.length, name).toBeGreaterThan(0);
+      for (const line of lines) {
+        expect(line, name).toContain("--test-threads=1");
+      }
+    }
   });
 
   it("scopes rust-cache to the runner image so native artifacts are not reused across MSVC upgrades", () => {

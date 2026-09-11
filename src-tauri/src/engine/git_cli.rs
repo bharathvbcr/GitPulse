@@ -4283,7 +4283,7 @@ mod tests {
     ///
     /// The gate is private. 64 waiters on the process-wide `spawn_gate()`
     /// starve every other short-deadline `run_bounded` test in the same
-    /// binary — llvm-cov's `--test-threads=4` still shares one gate, and a
+    /// binary — llvm-cov still shares one gate even with a thread cap, and a
     /// 5s slot wait then fails as "timed out waiting for a process slot"
     /// even though the drain under test is fine. Production `run_observed`
     /// always passes `spawn_gate()`; this test pins that `run_with_gate`

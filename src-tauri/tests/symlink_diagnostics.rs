@@ -46,7 +46,24 @@ fn diff_links_as_git_objects_without_reading_their_targets() {
             diff.text.as_bytes(),
         )
         .unwrap();
-        assert!(GitReader::get_file_content(path, name, None).is_err());
+        match GitReader::get_file_content(path, name, None) {
+            Ok(content) => {
+                assert!(
+                    !content.contains("PRIVATE CONTENT"),
+                    "{name}: followed the target: {content}"
+                );
+                assert!(
+                    content.contains(target.to_str().unwrap()),
+                    "{name}: link text should be the target path: {content}"
+                );
+            }
+            Err(err) => {
+                assert!(
+                    !err.contains("PRIVATE CONTENT"),
+                    "{name}: error followed the target: {err}"
+                );
+            }
+        }
     }
     run_git(root, &["add", "--all"]);
     for name in [

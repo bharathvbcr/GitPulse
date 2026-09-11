@@ -108,7 +108,10 @@ fn symlink_at_spec_path_is_reported_as_escape() {
 // REGRESSION GUARD: suffix resolution used Path::is_file, which follows a
 // repository symlink outside the checkout. An artifact could therefore make an
 // external source path appear in the report even though source loading later
-// refused it. Discovery and detail lookup must share canonical containment.
+// refused it. Discovery still uses canonical containment, so the foreign SF
+// path cannot mint a `src/leak.rs` row. Detail lookup annotates the symlink
+// *entry* without following the target — the same contract as a Git-tracked
+// vendor crate — rather than treating the sandbox refusal as a panel error.
 #[cfg(unix)]
 #[test]
 fn source_symlink_escape_never_enters_report_or_detail() {
@@ -126,8 +129,32 @@ fn source_symlink_escape_never_enters_report_or_detail() {
     );
 
     let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
-    assert!(report.files.iter().all(|file| file.path != "src/leak.rs"));
-    assert!(CoverageScanner::file_coverage(repo.path().to_str().unwrap(), "src/leak.rs").is_err());
+    assert!(
+        report.files.iter().all(|file| file.path != "src/leak.rs"),
+        "suffix fallback must not attach foreign LCOV to an outbound symlink: {:?}",
+        report
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>()
+    );
+    let detail = CoverageScanner::file_coverage(repo.path().to_str().unwrap(), "src/leak.rs")
+        .expect("an outbound source symlink is the coverage entry, not a failure");
+    assert_eq!(detail.path, "src/leak.rs");
+    assert!(
+        detail.lines.is_empty(),
+        "foreign LCOV must not leak onto the symlink entry: {:?}",
+        detail.lines
+    );
+    assert_eq!(
+        fs::read_to_string(&secret).unwrap(),
+        "pub const SECRET: &str = \"outside\";\n",
+        "coverage must not follow the link to succeed"
+    );
+    assert!(
+        CoverageScanner::file_coverage(repo.path().to_str().unwrap(), "../outside").is_err(),
+        "lexical escapes stay errors"
+    );
 }
 
 // REGRESSION GUARD: command planning read a root package.json through an

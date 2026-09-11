@@ -46,7 +46,11 @@ draft tag.
   wall-clock window so coverage instrumentation cannot starve the bound.
   Isolate spawn-limit fan-out onto a private gate, and give a command its full
   timeout after it acquires a process slot so queue wait cannot report a
-  timeout for work that never started.
+  timeout for work that never started. Run instrumented Rust coverage on one
+  test thread so pipe and shebang fixtures are not starved. Cap uninstrumented
+  CI and release `cargo test` at one thread so sidecar hello fixtures stay
+  inside their 20s window. Coverage detail and working-tree reads for an
+  outbound source symlink annotate the entry without following the target.
 
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.

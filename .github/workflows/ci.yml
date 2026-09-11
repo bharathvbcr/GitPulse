@@ -151,10 +151,13 @@ jobs:
         # BINARY, so every later one -- the whole tests/ directory -- is
         # skipped and the job reports one failure when there may be several.
         # A suite that never ran must not read like a suite that passed.
+        # --test-threads=1: sidecar hello is a 20s window and shebang/stub
+        # fixtures time out under even four-way contention. GitHub runners
+        # are 2–4 cores; this is slower and deterministic.
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
+            xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           else
-            cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi

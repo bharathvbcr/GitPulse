@@ -2023,8 +2023,11 @@ done
             "a second thread must not acquire the guard while it is held"
         );
         drop(held);
+        // Other tests also take this lock. After we drop, a sibling can
+        // acquire it before the contender; wait out a full sidecar hello
+        // rather than assuming we are next in line.
         rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
-            5,
+            30,
         )))
         .expect("releasing the guard must let the waiting thread in");
         contender.join().expect("contender thread");

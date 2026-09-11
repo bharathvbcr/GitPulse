@@ -79,7 +79,10 @@ jobs:
 
       - name: Generate Rust Coverage (LCOV + summary)
         run: |
-          xvfb-run -a dbus-run-session -- cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info -- --test-threads=4
+          # One thread: instrumented pipe/shebang/stub-devmap fixtures time out
+          # under 4-way contention even after isolating fan-out and giving the
+          # child its full timeout after a process slot.
+          xvfb-run -a dbus-run-session -- cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info -- --test-threads=1
           # Reuse the counters from the lcov run. A second test execution hid
           # its failures behind `> rust-coverage-summary.txt` and could fail
           # the job minutes after `lcov.info` had already been written.

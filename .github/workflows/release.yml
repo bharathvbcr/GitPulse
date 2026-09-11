@@ -134,8 +134,10 @@ jobs:
       - name: Rust Unit & Integration Tests
         # Match ci.yml: --locked refuses a lockfile the tree would rewrite,
         # --no-fail-fast reports every failing binary rather than stopping at
-        # the first, and --nocapture keeps panic text on the job log.
-        run: xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
+        # the first, --nocapture keeps panic text on the job log, and
+        # --test-threads=1 keeps sidecar hello and shebang fixtures inside
+        # their deadlines. Four-way fan-out still starves them locally.
+        run: xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
 
   prepare:
     name: Prepare Verified Draft
