@@ -13,7 +13,7 @@ flowchart TB
         Guards["Async cancellation guards"]
     end
     subgraph IPC["Tauri 2 IPC"]
-        Bridge["invoke('cmd_*') — 207 handlers, check:ipc"]
+        Bridge["invoke('cmd_*') — 209 handlers, check:ipc"]
     end
     subgraph Backend["Rust / Rayon"]
         Git["Git sandbox"]
@@ -33,7 +33,7 @@ flowchart TB
     Backend --> Local
 ```
 
-The 207-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `npm run check:ipc`.
+The 209-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `npm run check:ipc`.
 
 ## Layout
 

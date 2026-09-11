@@ -27,11 +27,8 @@ import {
   type WorkspaceUnregisterResult,
 } from "./types";
 
-function invokeResponse<T>(
-  command: string,
-  args: Record<string, unknown>,
-): Promise<CodeintelResponse<T>> {
-  return invoke(command, args).then((raw) => parseCodeintelResponse<T>(raw, command));
+function asResponse<T>(command: string) {
+  return (raw: unknown) => parseCodeintelResponse<T>(raw, command);
 }
 
 export async function getCodeintelStatus(repoPath: string): Promise<CodeintelStatus> {
@@ -46,11 +43,11 @@ export async function searchSymbols(
   query: string,
   tokenBudget?: number,
 ): Promise<CodeintelResponse<CodeintelSymbolHit>> {
-  return invokeResponse<CodeintelSymbolHit>("cmd_codeintel_search", {
+  return invoke("cmd_codeintel_search", {
     repoPath,
     query,
     tokenBudget,
-  });
+  }).then(asResponse("cmd_codeintel_search"));
 }
 
 export async function getImpact(
@@ -59,12 +56,12 @@ export async function getImpact(
   tokenBudget?: number,
   cancelToken?: string,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invokeResponse<CodeintelEdge>("cmd_codeintel_impact", {
+  return invoke("cmd_codeintel_impact", {
     repoPath,
     target,
     tokenBudget,
     ...(cancelToken ? { cancelToken } : {}),
-  });
+  }).then(asResponse("cmd_codeintel_impact"));
 }
 
 export async function getImpactAtRung(
@@ -74,23 +71,23 @@ export async function getImpactAtRung(
   minRung?: CodeintelRung,
   cancelToken?: string,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invokeResponse<CodeintelEdge>("cmd_codeintel_impact_at_rung", {
+  return invoke("cmd_codeintel_impact_at_rung", {
     repoPath,
     target,
     tokenBudget,
     minRung,
     ...(cancelToken ? { cancelToken } : {}),
-  });
+  }).then(asResponse("cmd_codeintel_impact_at_rung"));
 }
 
 export async function getDeadSymbols(
   repoPath: string,
   tokenBudget?: number,
 ): Promise<CodeintelResponse<CodeintelDeadSymbol>> {
-  return invokeResponse<CodeintelDeadSymbol>("cmd_codeintel_dead_symbols", {
+  return invoke("cmd_codeintel_dead_symbols", {
     repoPath,
     tokenBudget,
-  });
+  }).then(asResponse("cmd_codeintel_dead_symbols"));
 }
 
 export async function getDependencies(
@@ -99,12 +96,12 @@ export async function getDependencies(
   tokenBudget?: number,
   minRung?: CodeintelRung,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invokeResponse<CodeintelEdge>("cmd_codeintel_dependencies", {
+  return invoke("cmd_codeintel_dependencies", {
     repoPath,
     filePath,
     tokenBudget,
     minRung,
-  });
+  }).then(asResponse("cmd_codeintel_dependencies"));
 }
 
 export async function traceBetween(
@@ -114,13 +111,13 @@ export async function traceBetween(
   tokenBudget?: number,
   minRung?: CodeintelRung,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invokeResponse<CodeintelEdge>("cmd_codeintel_trace", {
+  return invoke("cmd_codeintel_trace", {
     repoPath,
     from,
     to,
     tokenBudget,
     minRung,
-  });
+  }).then(asResponse("cmd_codeintel_trace"));
 }
 
 export async function getNeighbors(

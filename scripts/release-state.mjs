@@ -48,7 +48,7 @@ export function runReleaseStage(options, run = runCommand) {
     const status = Number(match[1]);
     if (status === 404 && allowMissing && result.status === 1) return null;
     if (result.status !== 0 || status < 200 || status >= 300) throw new Error(`GitHub ${method} ${endpoint}: HTTP ${status}`);
-    return record(JSON.parse(match[2]));
+    return JSON.parse(match[2]);
   }
   function checkTag() {
     const local = run("git", ["rev-parse", "HEAD"]);
@@ -104,32 +104,60 @@ export function runReleaseStage(options, run = runCommand) {
     if (new Set(assets.map(asset => asset.id)).size !== assets.length) throw new Error("Duplicate release asset IDs");
     return JSON.stringify(assets);
   }
+  /**
+   * `/releases/tags/{tag}` only returns published releases. A draft created for
+   * this tag is invisible there, and after installer uploads GitHub can also
+   * rewrite `tag_name` to `untagged-<hex>`. Looking up only by tag then POSTs
+   * a second draft while the complete asset set sits on the first. List
+   * drafts by the name we POST; refuse when the page is full rather than
+   * treating a truncated view as "no matching draft".
+   */
+  function findExistingDraft() {
+    const byTag = api(`releases/tags/${tag}`, "GET", undefined, true);
+    if (byTag) return record(byTag);
+    const listed = api("releases?per_page=100");
+    if (!Array.isArray(listed)) throw new Error("Release list is not an array");
+    if (listed.length >= 100) throw new Error("Release list was capped at 100; cannot prove a matching draft is absent or unique");
+    const matches = [];
+    for (const entry of listed) {
+      const candidate = record(entry);
+      if (candidate.draft !== true) continue;
+      // `/releases/tags/{tag}` never returns drafts, even while tag_name is
+      // still this tag. Resume those by tag_name. After uploads GitHub may
+      // rewrite tag_name to untagged-<hex>; those are the ones we POST as
+      // `GitPulse ${tag}` and can only match by that name.
+      if (candidate.name !== `GitPulse ${tag}` && candidate.tag_name !== tag) continue;
+      matches.push(candidate);
+    }
+    if (matches.length > 1) throw new Error(`Multiple matching drafts for ${tag}`);
+    return matches[0] ?? null;
+  }
   let release;
   if (stage === "prepare") {
     // The newest run must have completed successfully, including every matrix
     // leg. An older successful attempt cannot hide a newer failure/cancellation.
     for (const workflow of ["ci.yml", "coverage.yml"]) {
-      const runs = api(`actions/workflows/${workflow}/runs?head_sha=${commit}&event=push&per_page=1`);
-      const entries = runs?.workflow_runs;
+      const runs = record(api(`actions/workflows/${workflow}/runs?head_sha=${commit}&event=push&per_page=1`));
+      const entries = runs.workflow_runs;
       const latest = Array.isArray(entries) && entries.length === 1 ? record(entries[0]) : null;
       if (!latest || latest.head_sha !== commit || latest.event !== "push" || latest.status !== "completed" || latest.conclusion !== "success") throw new Error(`${workflow} has no successful latest push run for the preflight commit`);
     }
-    release = api(`releases/tags/${tag}`, "GET", undefined, true);
+    release = findExistingDraft();
     if (!release) {
       // Do not automatically retry a POST whose outcome is unknown. A rerun
       // reads the existing draft before deciding whether creation is necessary.
-      release = api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}`, draft: true, prerelease: false, body: "Draft — platform builds and verification are pending." });
+      release = record(api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}`, draft: true, prerelease: false, body: "Draft — platform builds and verification are pending." }));
     }
   } else {
-    release = api(`releases/${releaseId}`);
+    release = record(api(`releases/${releaseId}`));
   }
   release = checkDraft(release);
   if (stage === "finalize") {
     const assets = assetSnapshot(release);
     checkTag();
-    checkDraft(api(`releases/${releaseId}`));
-    checkDraft(api(`releases/${releaseId}`, "PATCH", { tag_name: tag, body: notes }));
-    const confirmed = checkDraft(api(`releases/${releaseId}`));
+    checkDraft(record(api(`releases/${releaseId}`)));
+    checkDraft(record(api(`releases/${releaseId}`, "PATCH", { tag_name: tag, body: notes })));
+    const confirmed = checkDraft(record(api(`releases/${releaseId}`)));
     if (confirmed.body !== notes) throw new Error("Release notes round trip differs from changelog");
     if (assetSnapshot(confirmed) !== assets) throw new Error("Release assets changed during finalization");
     checkTag();

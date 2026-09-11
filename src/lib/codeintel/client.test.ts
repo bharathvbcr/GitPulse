@@ -37,6 +37,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+const sourceFreshness = { fresh: true as const, generation_id: 1 };
+
 describe("codeintel client", () => {
   it("queries codeintel status", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
@@ -57,6 +59,7 @@ describe("codeintel client", () => {
 
   it("searches symbols with budget", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
+      source_freshness: sourceFreshness,
       available: true,
       reason: null,
       items: [
@@ -87,6 +90,7 @@ describe("codeintel client", () => {
 
   it("computes impact and callers", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
+      source_freshness: sourceFreshness,
       available: true,
       reason: null,
       items: [
@@ -114,6 +118,7 @@ describe("codeintel client", () => {
 
   it("queries dead symbols", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
+      source_freshness: sourceFreshness,
       available: true,
       reason: null,
       items: [
@@ -140,6 +145,7 @@ describe("codeintel client", () => {
 
   it("queries impact at rung and layered impact for many targets", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
+      source_freshness: sourceFreshness,
       available: true,
       reason: null,
       items: [],
@@ -264,6 +270,7 @@ describe("codeintel client", () => {
 
   it("covers the remaining codeintel and digmap IPC wrappers", async () => {
     const envelope = {
+      source_freshness: sourceFreshness,
       available: true,
       reason: null,
       items: [],
@@ -376,6 +383,7 @@ describe("codeintel client", () => {
 
   it("keeps an unavailable dead-symbol query as unavailable, not a crash", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
+      source_freshness: { fresh: null, reason: "index missing" },
       available: false,
       reason: "index missing",
     });

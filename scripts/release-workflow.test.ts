@@ -56,6 +56,7 @@ it("pins all build and verification jobs to the preflight commit", () => {
 
 it("guards draft identity before uploads and verifies the notes round trip", () => {
   expect(workflow).toContain("node scripts/release-state.mjs prepare");
+  expect(stateScript).toContain("releases?per_page=100");
   expect(workflow).toContain("node scripts/release-state.mjs check");
   expect(workflow).toContain("node scripts/release-state.mjs finalize");
 });

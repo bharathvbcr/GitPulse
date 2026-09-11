@@ -10,7 +10,11 @@
  * `MAX_PREVIEW_FILES` in src-tauri.
  */
 
-import type { CodeintelLayeredImpact, DevmapPreviewFileResult } from "./types";
+import {
+  unverifiedSourceFreshness,
+  type CodeintelLayeredImpact,
+  type DevmapPreviewFileResult,
+} from "./types";
 
 export const CODEINTEL_FANOUT_CAP = 16;
 
@@ -48,6 +52,7 @@ export function omittedLayeredImpact(seed: string): CodeintelLayeredImpact {
     available: false,
     reason: FANOUT_OMITTED_REASON,
     edges: {
+      source_freshness: unverifiedSourceFreshness(FANOUT_OMITTED_REASON),
       available: false,
       reason: FANOUT_OMITTED_REASON,
       items: [],
@@ -59,6 +64,7 @@ export function omittedLayeredImpact(seed: string): CodeintelLayeredImpact {
       seeds: [seed],
       unmatched_targets: [],
       layers: {
+        source_freshness: unverifiedSourceFreshness(FANOUT_OMITTED_REASON),
         available: false,
         reason: FANOUT_OMITTED_REASON,
         items: [],

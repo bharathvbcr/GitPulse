@@ -43,9 +43,19 @@ export interface CodeintelRungHistogram {
   filtered_out: number;
 }
 
+/**
+ * Whole-tree freshness on a query envelope. `fresh: null` plus a reason means
+ * the check did not run — never the same as a verified true/false.
+ */
+export interface SourceFreshness {
+  fresh: boolean | null;
+  generation_id?: number;
+  reason?: string;
+}
+
 export interface CodeintelResponse<T> {
-  /** Null (or absent on older hosts): this query did not verify the current tree. */
-  source_freshness?: boolean | null;
+  /** Always an object: never infer freshness from an empty result. */
+  source_freshness: SourceFreshness;
   available: boolean;
   reason?: string | null;
   items: T[];
@@ -98,6 +108,39 @@ function optionalString(value: unknown): string | null | undefined {
   if (value === null) return null;
   if (typeof value === "string") return value;
   throw new Error("codeintel: expected a string");
+}
+
+export function unverifiedSourceFreshness(
+  reason = "this query did not verify whole-tree freshness",
+): SourceFreshness {
+  return { fresh: null, reason };
+}
+
+/**
+ * A boolean here used to mean "verified fresh/stale". The wire is now an
+ * object whose `fresh: null` is "unverified" — coercing a leftover boolean
+ * would make an unverified envelope look like a completed check.
+ */
+export function parseSourceFreshness(value: unknown, command = "codeintel"): SourceFreshness {
+  if (!isRecord(value)) {
+    throw new Error(`${command} source_freshness must be an object`);
+  }
+  if (value.fresh !== null && typeof value.fresh !== "boolean") {
+    throw new Error(`${command} returned a corrupt source_freshness`);
+  }
+  const generation = value.generation_id;
+  if (generation !== undefined && (typeof generation !== "number" || !Number.isFinite(generation))) {
+    throw new Error(`${command} returned a corrupt source_freshness`);
+  }
+  const reason = value.reason;
+  if (reason !== undefined && typeof reason !== "string") {
+    throw new Error(`${command} returned a corrupt source_freshness`);
+  }
+  return {
+    fresh: value.fresh,
+    ...(typeof generation === "number" ? { generation_id: generation } : {}),
+    ...(typeof reason === "string" ? { reason } : {}),
+  };
 }
 
 /**
@@ -160,7 +203,7 @@ export function parseCodeintelResponse<T>(
     throw new Error(`${command} returned a corrupt walk_incomplete`);
   }
   return {
-    source_freshness: optionalBoolean(value.source_freshness),
+    source_freshness: parseSourceFreshness(value.source_freshness, command),
     available: value.available,
     reason: optionalString(value.reason) ?? null,
     items,

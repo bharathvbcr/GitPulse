@@ -11,30 +11,18 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-11
+
+First major GitPulse release: core Git workflow improvements, DevMap/code-intel
+hardening, and a release pipeline that can finish after GitHub detaches a
+draft tag.
+
 ### Added
 
 - Modular DevCouncil install in Setup: DevMap only (default), analysis suite, or
   full host. Copy the documented command or run it in Terminal → Console.
   Settings can disable or uninstall a GitPulse-owned binary without going
   through `cargo uninstall`. There is no uv / Python install path.
-
-### Changed
-
-- Named GitPulse as the successor to the deprecated LiquiTask workbench in the
-  README, wiki home, and Tasks documentation.
-- Document DevCouncil as independently selectable components and modules, Manvi
-  as the wrap around them, and GitPulse as the host that uses each for its
-  respective job.
-- Re-vendor DevCouncil analysis crates at v0.2.0 (`devcouncil@a31918e2`).
-  GitPulse itself stays 1.0.0.
-
-## [1.0.0] - 2026-09-11
-
-Local release candidate: core Git workflow improvements and reliability fixes.
-Publication and cross-platform qualification remain separate release gates.
-
-### Added
-
 - Save named stashes from the existing repository panel, with controls for
   including untracked files and keeping staged changes. Preview entries inline
   in the read-only code viewer before applying, popping, or dropping them.
@@ -43,6 +31,16 @@ Publication and cross-platform qualification remain separate release gates.
   hold one repository mutation lock, and report partial Git failures explicitly.
 
 ### Fixed
+
+- Resume a GitHub draft whose `tag_name` became `untagged-<hex>` after
+  installer uploads, instead of posting a second draft. `/releases/tags/{tag}`
+  does not return drafts, even while the tag is still attached; prepare lists
+  drafts by that tag or by the name it POSTs, and refuses a truncated page
+  rather than treating it as "no draft".
+- Parse code-intel query envelopes with the `SourceFreshness` object the
+  native side actually sends. A leftover boolean would have made an unverified
+  tree look like a completed freshness check, and the IPC scanner now sees the
+  six codeintel commands that a helper had been hiding.
 
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.
@@ -104,6 +102,13 @@ Publication and cross-platform qualification remain separate release gates.
   Autostart IPC is limited to the main window capability.
 
 ### Changed
+
+- Named GitPulse as the successor to the deprecated LiquiTask workbench in the
+  README, wiki home, and Tasks documentation.
+- Document DevCouncil as independently selectable components and modules, Manvi
+  as the wrap around them, and GitPulse as the host that uses each for its
+  respective job.
+- Re-vendor DevCouncil analysis crates at v0.2.0 (`devcouncil@a31918e2`).
 
 - Fix macOS status-icon left click: do not keep an `NSMenu` attached at rest so
   clicks open the popover instead of the native menu (verified on macOS 27).

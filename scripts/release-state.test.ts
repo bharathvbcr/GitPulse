@@ -6,7 +6,7 @@ const commit = "a".repeat(40);
 const tag = "v1.2.3";
 const options = { stage: "prepare", repo: "owner/repo", tag, commit };
 function draft() {
-  return {id: 42, tag_name: tag, target_commitish: commit, draft: true, prerelease: false,
+  return {id: 42, tag_name: tag, name: `GitPulse ${tag}`, target_commitish: commit, draft: true, prerelease: false,
     immutable: false, published_at: null, body: "pending", assets: expectedAssetNames("1.2.3")
       .map((name, index) => ({id: index + 1, name, size: 123, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}))};
 }
@@ -22,6 +22,7 @@ function fixture(change: {
   apiStatus?: number;
   uncertainPost?: boolean;
   downloadDuringFinalize?: boolean;
+  list?: unknown[];
 } = {}) {
   let release = change.release === undefined ? draft() : change.release;
   const calls: string[][] = [];
@@ -33,7 +34,12 @@ function fixture(change: {
     const endpoint = args[4];
     if (change.fail && endpoint.includes(change.fail)) return {status: null, failed: true, stdout: ""};
     const respond = (value: unknown, status = 200) => ({status: status >= 400 ? 1 : 0, failed: false, stdout: `HTTP/2.0 ${status} Status\nContent-Type: application/json\r\n\r\n${JSON.stringify(value)}`});
-    if (change.apiStatus && endpoint.includes("releases/tags/")) return respond({message: "unavailable"}, change.apiStatus);
+    if (endpoint.includes("releases/tags/")) {
+      if (change.apiStatus) return respond({message: "unavailable"}, change.apiStatus);
+      const wanted = endpoint.slice(endpoint.indexOf("releases/tags/") + "releases/tags/".length);
+      if (release && release.draft !== true && release.tag_name === wanted) return respond(release);
+      return respond({message: "Not Found"}, 404);
+    }
     if (endpoint.includes("actions/workflows/")) return respond({workflow_runs: [change.ci ?? {head_sha: commit, event: "push", status: "completed", conclusion: "success"}]});
     if (args[3] === "POST") { release = {...draft(), ...JSON.parse(input ?? "{}")}; return change.uncertainPost ? {status: null, failed: true, stdout: ""} : respond(release, 201); }
     if (args[3] === "PATCH") {
@@ -43,6 +49,9 @@ function fixture(change: {
       if (change.corruptNotes && release) release.body = "damaged";
       if (change.publishAfterPatch && release) release.draft = false;
       return respond(release);
+    }
+    if (String(args[4] ?? "").includes("releases?per_page=")) {
+      return respond(change.list ?? (release ? [release] : []));
     }
     if (patched && change.changeAssets && release) release.assets = [];
     if (patched && change.downloadDuringFinalize && release) release.assets = draft().assets.map(asset => ({...asset, download_count: 1})).reverse();
@@ -61,6 +70,38 @@ describe("remote release lifecycle", () => {
   it("resumes an existing matching draft without duplicate creation", () => {
     const {run, calls} = fixture();
     expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.some(call => call.includes("POST"))).toBe(false);
+  });
+  it("resumes a draft GitHub detached from the git tag instead of creating a second one", () => {
+    const untagged = {...draft(), tag_name: "untagged-f782e62dab083869a408"};
+    const {run, calls} = fixture({release: untagged, list: [untagged]});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.filter(call => call.includes("POST"))).toHaveLength(0);
+  });
+  it("resumes a still-tagged draft that /releases/tags/ cannot see even when the display name is missing", () => {
+    const nameless = {...draft()};
+    delete nameless.name;
+    const {run, calls} = fixture({release: nameless, list: [nameless]});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.filter(call => call.includes("POST"))).toHaveLength(0);
+  });
+  it("ignores a published untagged release when looking for this draft", () => {
+    const published = {...draft(), draft: false, published_at: "2026-09-09T06:46:15Z", tag_name: "untagged-2db6b2cc5c3ed181b405"};
+    const {run, calls} = fixture({apiStatus: 404, release: null, list: [published]});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.filter(call => call.includes("POST"))).toHaveLength(1);
+  });
+  it("refuses a truncated release list rather than posting a duplicate", () => {
+    const list = Array.from({length: 100}, (_, index) => ({...draft(), id: index + 1, name: `Other ${index}`}));
+    const {run, calls} = fixture({apiStatus: 404, release: null, list});
+    expect(() => runReleaseStage(options, run)).toThrow(/capped at 100/);
+    expect(calls.some(call => call.includes("POST"))).toBe(false);
+  });
+  it("refuses multiple drafts that share this release name", () => {
+    const {run, calls} = fixture({
+      list: [draft(), {...draft(), id: 43, tag_name: "untagged-abc"}],
+    });
+    expect(() => runReleaseStage(options, run)).toThrow(/Multiple matching drafts/);
     expect(calls.some(call => call.includes("POST"))).toBe(false);
   });
   it("recovers an uncertain create on rerun without issuing a second POST", () => {

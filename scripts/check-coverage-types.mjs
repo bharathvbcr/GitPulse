@@ -176,6 +176,10 @@ export const CONTRACTS = Object.freeze([
   { label: "native-menu-state", rustPath: rust("desktop", "state.rs"), tsPath: ts("desktop", "menuState.ts"), structs: ["MenuState", "MenuLabel", "MenuRepository", "StatusCard"] },
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },
+  // The query envelope's freshness object lives in the vendored query model
+  // and is serialized as-is. Listing it here is what stops a field rename
+  // from looking like a verified bool on the TypeScript side.
+  { label: "codeintel-freshness", rustPath: path.join(REPO_ROOT, "src-tauri", "vendored", "devmap-query", "src", "model.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["SourceFreshness"] },
   { label: "provenance", rustPath: rust("engine", "provenance.rs"), tsPath: ts("provenance", "types.ts"), structs: ["VerificationNote", "SessionEpisodeNote", "ProvenanceFreshness"] },
   // The durable log's self-report. `degraded` is the field that must not
   // drift: drop it and an incomplete log renders as a complete one.

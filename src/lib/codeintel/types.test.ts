@@ -22,10 +22,40 @@ describe("parseCodeintelResponse", () => {
     const parsed = parseCodeintelResponse<{ n: string }>({
       available: false,
       reason: "stale",
+      source_freshness: { fresh: null, reason: "this query did not verify whole-tree freshness" },
     });
     expect(parsed.available).toBe(false);
     expect(parsed.items).toEqual([]);
     expect(parsed.truncated).toBe(false);
+    expect(parsed.source_freshness).toEqual({
+      fresh: null,
+      reason: "this query did not verify whole-tree freshness",
+    });
+  });
+
+  it("refuses an unavailable payload that omitted source_freshness", () => {
+    expect(() => parseCodeintelResponse({ available: false, reason: "stale" })).toThrow(
+      /source_freshness must be an object/,
+    );
+  });
+
+  it("refuses a boolean source_freshness, which would collapse unverified into verified", () => {
+    expect(() =>
+      parseCodeintelResponse({
+        available: false,
+        source_freshness: true,
+      }),
+    ).toThrow(/source_freshness must be an object/);
+  });
+
+  it("keeps a verified freshness object, including generation", () => {
+    const parsed = parseCodeintelResponse<{ n: string }>({
+      available: true,
+      items: [],
+      truncated: false,
+      source_freshness: { fresh: true, generation_id: 12 },
+    });
+    expect(parsed.source_freshness).toEqual({ fresh: true, generation_id: 12 });
   });
 });
 

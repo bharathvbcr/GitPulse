@@ -7,11 +7,13 @@
  * not treat the raw object as already typed.
  */
 
-import type {
-  CodeintelResponse,
-  DevmapPreviewCaller,
-  DevmapPreviewFileResult,
-  DevmapPreviewReport,
+import {
+  parseSourceFreshness,
+  unverifiedSourceFreshness,
+  type CodeintelResponse,
+  type DevmapPreviewCaller,
+  type DevmapPreviewFileResult,
+  type DevmapPreviewReport,
 } from "./types";
 import { summarizeWalkIncomplete } from "./walkIncomplete";
 
@@ -39,6 +41,7 @@ function normalizeBrokenCallers(
   const rec = asRecord(raw);
   if (!rec) {
     return {
+      source_freshness: unverifiedSourceFreshness("broken_callers missing from preview report"),
       available: false,
       reason: "broken_callers missing from preview report",
       items: [],
@@ -71,7 +74,11 @@ function normalizeBrokenCallers(
     typeof rec.walk_incomplete === "string"
       ? summarizeWalkIncomplete([rec.walk_incomplete])
       : null;
+  const source_freshness = rec.source_freshness
+    ? parseSourceFreshness(rec.source_freshness, "preview")
+    : unverifiedSourceFreshness();
   return {
+    source_freshness,
     available,
     reason,
     items,
