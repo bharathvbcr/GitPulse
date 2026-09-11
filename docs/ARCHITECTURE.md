@@ -278,7 +278,7 @@ for contracts, regression evidence and platform verification limits.
 
 ---
 
-### Core Git mutation contracts (0.2.0)
+### Core Git mutation contracts (1.0.0)
 
 `repoStore` captures the originating repository and selection. Bulk staging
 uses `cmd_change_index` and `GitWriter::change_index_with`, which validates literal

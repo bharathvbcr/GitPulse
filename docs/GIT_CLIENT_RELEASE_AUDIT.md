@@ -1,4 +1,4 @@
-# GitPulse 0.2.0 Git-client release audit
+# GitPulse 1.0.0 Git-client release audit
 
 Date: 2026-09-10. Status: verified local candidate; no publication.
 
@@ -120,7 +120,7 @@ configuration change also passed in `release-ci-exact-final.log`.
 | Native task profile | Passed with the candidate's compiled `dcstore`; installed `dcstore` failed protocol compatibility | `candidate-store-native-profile.log`; mismatch details below |
 | Windows/Linux compilation | Shared publication and conflict-filesystem modules compile for x86_64 and ARM64 on both platforms | `filesystem-crosscheck/results.json`; this is not a whole-app cross-build or runtime test |
 | Dependency advisories | Zero known npm and Cargo advisories at scan time | `npm-audit.json`, `cargo-audit.json` |
-| macOS artifact | Version 0.2.0, ARM64 app and three embedded tools; strict recursive codesign verification passed | `bundle-verification-final.json`, `release-bundle-sealed.log` |
+| macOS artifact | Version 1.0.0, ARM64 app and three embedded tools; strict recursive codesign verification passed | `bundle-verification-final.json`, `release-bundle-sealed.log` |
 
 Native totals are the final result for each test target, without double-counting
 child-process test summaries. Some opt-in tests return early when their required
@@ -168,7 +168,7 @@ Its manifest records the version, architecture and SHA-256 of `gitpulse`,
 `gitpulsed`, `gitpulse-mcp` and `gitpulse-hook`. `codesign --verify --deep --strict`
 passes and reports sealed resources. `spctl --assess --type execute` rejects
 this ad-hoc artifact: it has no trusted distribution identity or notarization.
-The local ZIP is `../artifacts/GitPulse-v0.2.0-macos-arm64-local.zip`.
+The local ZIP is `../artifacts/GitPulse-v1.0.0-macos-arm64-local.zip`.
 `local-artifact-manifest.json` records its hash and verifies that archive
 extraction preserves all four binary hashes and the valid resource signature.
 

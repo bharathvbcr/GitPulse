@@ -11,7 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-09-10
+## [1.0.0] - 2026-09-10
 
 Local release candidate: core Git workflow improvements and reliability fixes.
 Publication and cross-platform qualification remain separate release gates.
@@ -1104,7 +1104,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.8
