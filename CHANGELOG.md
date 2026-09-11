@@ -11,7 +11,57 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
+Local release candidate: core Git workflow improvements and reliability fixes.
+Publication and cross-platform qualification remain separate release gates.
+
 ### Added
+
+- Save named stashes from the existing repository panel, with controls for
+  including untracked files and keeping staged changes. Preview entries inline
+  in the read-only code viewer before applying, popping, or dropping them.
+- Stage or unstage a selection in one native request. Bound path counts, bytes,
+  and argument chunks; evaluate every planned command before the first write,
+  hold one repository mutation lock, and report partial Git failures explicitly.
+
+### Fixed
+
+- Keep unmerged index entries in conflict review instead of reporting them
+  as staged and ready to commit.
+- Keep partially staged files visible on both sides in the sidebar and diff
+  rail, with separate churn counts. Stage-all, native menu enablement, explorer
+  actions, filters and previews include their remaining working edits.
+- Unstage files before the first commit without losing working content. Include
+  both sides when unstaging a rename so its old path is not left staged for deletion.
+- Commit selected files without including unrelated staged changes. Treat glob
+  characters as literal filenames, and allow amend with the existing message.
+- Refuse a missing branch without checking out a same-named working file.
+- Clone into a private staging directory, then publish without replacing any
+  existing destination. Concurrent attempts cannot delete another clone's data;
+  failed cleanup identifies the retained staging directory.
+- Preserve stash-list and diff truncation across IPC and show limits in the UI.
+  Distinguish repeated stash OIDs by stack position and discard late previews
+  after repository switches or panel disposal.
+- Reload task assistance when the shared model selection changes; ignore stale
+  responses and recover without reopening the editor.
+- Keep bulk mutation activity visible through recovery refresh after failure.
+
+- Seal macOS app bundles with an ad-hoc signature by default, avoiding invalid
+  linker-only signatures. A configured Apple signing identity can override this;
+  trusted distribution and notarization remain separate checks.
+
+### Verification
+
+- Add real Git regressions, Tauri IPC round trips, clone races, bounded batch
+  stress, and stash overflow tests. Gate the expanded Git-client browser harness
+  in local CI and the Chrome/WebKit workflow.
+- See [the release audit](docs/GIT_CLIENT_RELEASE_AUDIT.md) for measured results,
+  inherited work, security impact, evidence limits, and remaining release gates.
+
+### Included prior unreleased changes
+
+
 
 - Scan GitHub Dependabot and code scanning alerts when a repository opens, and
   warn when critical or high findings are open. Turn off under Settings →

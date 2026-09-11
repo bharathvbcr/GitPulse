@@ -1,6 +1,9 @@
 /**
  * Scan-based markup helpers for tests and source contracts.
  *
+ * devcouncil: allow-unwired — imported by tests and source contracts only;
+ * production UI does not load this module.
+ *
  * These exist because a regex that "strips tags" or "strips comments" is both
  * a CodeQL finding and an incomplete filter: `/<!--.*?-->/` misses comments
  * that contain newlines, `/<script>/` misses `SCRIPT`, and one pass of

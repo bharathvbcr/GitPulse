@@ -66,7 +66,10 @@ use std::time::Instant;
 use tree_sitter::Node;
 
 use crate::languages::LANGUAGE_SPECS;
-use crate::model::{Extraction, ParseOutcome, Span, SymbolKind, TextRange};
+use crate::model::{
+    ExtractedCall, ExtractedReference, Extraction, ParseOutcome, ReferenceKind, Span, SymbolKind,
+    TextRange,
+};
 
 /// Most embedded regions read from one file.
 ///
@@ -344,6 +347,129 @@ fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
         .children(&mut cursor)
         .find(|child| child.kind() == kind);
     found
+}
+
+/// Template expressions the outer grammar keeps as unparsed text.
+///
+/// A lone identifier (`onclick={publishRelease}`) is a Call. Anything else
+/// that is still JavaScript — `onclick={() => copyText(name)}` — is parsed
+/// with the same embedded language the `<script>` block uses, so the inner
+/// call is visible to liveness. Svelte `{#if}` / `{@html}` blocks are not JS
+/// and are skipped.
+fn absorb_template_expressions(
+    extraction: &mut Extraction,
+    root: Node,
+    source: &str,
+    language: &str,
+    deadline: Instant,
+) {
+    let file_path = extraction.file_path.clone();
+    let mut stack: Vec<Node> = vec![root];
+    let mut parsed = 0usize;
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "script_element" | "style_element" | "frontmatter" => continue,
+            "expression" | "raw_text_expr" | "svelte_raw_text" => {
+                if let Some(expr) = js_expression_body(node, source) {
+                    if let Some(name) = lone_js_identifier(&expr.body) {
+                        let span = span_of(node);
+                        extraction.calls.push(ExtractedCall {
+                            caller_symbol: Some(file_path.clone()),
+                            callee_name: name.clone(),
+                            receiver_expr: None,
+                            span: span.clone(),
+                        });
+                        extraction.references.push(ExtractedReference {
+                            name,
+                            kind: ReferenceKind::Call,
+                            span,
+                            enclosing_symbol: Some(file_path.clone()),
+                            assigned_to: None,
+                            receiver_expr: None,
+                        });
+                    } else if parsed < MAX_EMBEDDED_REGIONS {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let inner = crate::treesitter::extract_treesitter_with_budget(
+                            &file_path, language, &expr.body, remaining,
+                        );
+                        if !matches!(inner.parse_outcome, ParseOutcome::Failed { .. }) {
+                            absorb(extraction, inner, expr.offset);
+                            parsed += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+struct JsExpr {
+    offset: usize,
+    body: String,
+}
+
+fn js_expression_body(node: Node, source: &str) -> Option<JsExpr> {
+    let raw = text_of(node, source);
+    let start = node.start_byte();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut j = bytes.len();
+    while j > i && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    if i < j && bytes[i] == b'{' && bytes[j - 1] == b'}' {
+        i += 1;
+        j -= 1;
+        while i < j && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while j > i && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+    }
+    if i >= j {
+        return None;
+    }
+    let body = raw.get(i..j)?.to_string();
+    if body.starts_with('#') || body.starts_with('@') || body.starts_with(':') {
+        return None;
+    }
+    Some(JsExpr {
+        offset: start + i,
+        body,
+    })
+}
+
+fn lone_js_identifier(text: &str) -> Option<String> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn span_of(node: Node) -> Span {
@@ -769,6 +895,7 @@ pub(crate) fn merge_embedded_scripts(
 
     extraction.diagnostics.extend(diagnostics);
     fold_unparsed_ranges(&mut extraction.parse_outcome, unparsed);
+    absorb_template_expressions(extraction, root, source, default, deadline);
     reorder_after_merge(extraction);
 }
 

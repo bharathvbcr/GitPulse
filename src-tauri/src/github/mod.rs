@@ -144,6 +144,24 @@ pub struct DependabotAlertInfo {
     pub created_at: String,
 }
 
+/// Why a Dependabot / code-scanning fetch could not run.
+///
+/// Decided next to HTTP-status parsing so the UI never has to match English
+/// fragments of GitHub error prose. `product_disabled` covers "not enabled" /
+/// GHAS-off explanations; `forbidden` is a 403 that is not that explanation
+/// (typically a missing `security_events` scope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubUnavailableReason {
+    NotGithubRemote,
+    CliMissing,
+    ProductDisabled,
+    Forbidden,
+    RateLimited,
+    Transport,
+    Unknown,
+}
+
 /// Result of fetching Dependabot alerts for the opened repository.
 ///
 /// Like [`GitHubContext`], a fetch that could not run is reported as such:
@@ -161,6 +179,9 @@ pub struct DependabotReport {
     pub alerts: Vec<DependabotAlertInfo>,
     pub truncated: bool,
     pub error: Option<String>,
+    /// Set when `available` is false. Absent on a successful fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<GithubUnavailableReason>,
 }
 
 /// One open GitHub code scanning alert (CodeQL / GHAS), shaped for Health.
@@ -201,6 +222,9 @@ pub struct CodeScanningReport {
     pub alerts: Vec<CodeScanningAlertInfo>,
     pub truncated: bool,
     pub error: Option<String>,
+    /// Set when `available` is false. Absent on a successful fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<GithubUnavailableReason>,
 }
 
 /// Drops a trailing `.git` the way git itself does: case-insensitively
@@ -899,6 +923,7 @@ pub fn load_dependabot_alerts(repo_path: &str) -> DependabotReport {
             alerts,
             truncated,
             error: None,
+            unavailable_reason: None,
         },
         Err(e) => unavailable_dependabot(true, true, remote.slug(), Some(e)),
     }
@@ -910,6 +935,11 @@ fn unavailable_dependabot(
     slug: String,
     error: Option<String>,
 ) -> DependabotReport {
+    let unavailable_reason = Some(classify_github_unavailable(
+        is_github_remote,
+        cli_present,
+        error.as_deref(),
+    ));
     DependabotReport {
         available: false,
         cli_present,
@@ -918,6 +948,7 @@ fn unavailable_dependabot(
         alerts: Vec::new(),
         truncated: false,
         error,
+        unavailable_reason,
     }
 }
 
@@ -958,16 +989,141 @@ fn capture_gh_api(remote: &GitHubRepoRef, endpoint: &str) -> Result<CapturedOutp
     capture_command("gh", &refs, None, Duration::from_secs(45), &[])
 }
 
+/// HTTP status printed by `gh` (`gh: HTTP 404`), never the process exit code.
+///
+/// `CapturedOutput.status_code` is `gh`'s exit status. A missing CodeQL setup
+/// is HTTP 404 with exit 1; splicing the exit onto the JSON `message` reported
+/// `(HTTP 1)` for a successful explanation of repository settings.
+pub(crate) fn http_status_from_gh_text(text: &str) -> Option<u16> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i..i + 4].eq_ignore_ascii_case(b"HTTP") {
+            let mut j = i + 4;
+            if j < bytes.len() && bytes[j] == b'/' {
+                j += 1;
+                while j < bytes.len() && bytes[j] != b' ' && bytes[j] != b'\t' {
+                    j += 1;
+                }
+            }
+            let mut skipped = false;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+                skipped = true;
+            }
+            // `HTTP` must be a token (`HTTP 404` / `HTTP/1.1 404`), not a
+            // prefix of `HTTPS` or `http://`.
+            if skipped {
+                if let Some(code) = parse_http_status_digits(&bytes[j..]) {
+                    return Some(code);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_http_status_digits(digits: &[u8]) -> Option<u16> {
+    if digits.len() >= 3
+        && digits[0].is_ascii_digit()
+        && digits[1].is_ascii_digit()
+        && digits[2].is_ascii_digit()
+        && !digits.get(3).is_some_and(u8::is_ascii_digit)
+    {
+        let code = u16::from(digits[0] - b'0') * 100
+            + u16::from(digits[1] - b'0') * 10
+            + u16::from(digits[2] - b'0');
+        (100..=599).contains(&code).then_some(code)
+    } else {
+        None
+    }
+}
+
+/// GitHub error objects carry `"status": "404"` (string or number). Arrays of
+/// alerts must not yield a status — that field is a check run state there.
+fn json_http_status(value: &Value) -> Option<u16> {
+    if !value.is_object() {
+        return None;
+    }
+    let status = value.get("status")?;
+    let code = match status {
+        Value::Number(n) => n.as_u64()?,
+        Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    u16::try_from(code).ok().filter(|c| (100..=599).contains(c))
+}
+
+fn http_status_from_gh_output(output: &CapturedOutput) -> Option<u16> {
+    http_status_from_gh_text(&output.stderr_text())
+        .or_else(|| http_status_from_gh_text(&output.stdout_text()))
+}
+
+/// True when GitHub's own message says the security product is off — not a
+/// missing scope, not a transport failure.
+fn is_product_disabled_message(message: &str) -> bool {
+    let text = message.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+    text.contains("code scanning is not enabled")
+        || text.contains("code scanning is disabled")
+        || text.contains("advanced security must be enabled")
+        || text.contains("dependabot alerts are disabled")
+        || text.contains("dependabot alerts are not enabled")
+        || text.contains("dependabot is not enabled")
+        || text.contains("dependabot is not currently enabled")
+}
+
+/// Classify why a Dependabot / code-scanning report is unavailable.
+///
+/// Order: remote → CLI → HTTP status (+ product-disabled prose for 403/404)
+/// → unknown. The HTTP code is taken from the already-formatted error string
+/// (see [`gh_api_error_message`]), never from the process exit status.
+pub(crate) fn classify_github_unavailable(
+    is_github_remote: bool,
+    cli_present: bool,
+    error: Option<&str>,
+) -> GithubUnavailableReason {
+    if !is_github_remote {
+        return GithubUnavailableReason::NotGithubRemote;
+    }
+    if !cli_present {
+        return GithubUnavailableReason::CliMissing;
+    }
+    let Some(error) = error.map(str::trim).filter(|s| !s.is_empty()) else {
+        return GithubUnavailableReason::Unknown;
+    };
+    let status = http_status_from_gh_text(error);
+    let product_disabled = is_product_disabled_message(error);
+    match status {
+        Some(429) => GithubUnavailableReason::RateLimited,
+        Some(403) if product_disabled => GithubUnavailableReason::ProductDisabled,
+        Some(404) if product_disabled => GithubUnavailableReason::ProductDisabled,
+        Some(403) => GithubUnavailableReason::Forbidden,
+        Some(_) => GithubUnavailableReason::Transport,
+        None if product_disabled => GithubUnavailableReason::ProductDisabled,
+        None => GithubUnavailableReason::Unknown,
+    }
+}
+
 /// Shapes a failing `gh api` invocation into its most useful message: the
 /// API's JSON `message` body says *why* Dependabot data is unavailable
 /// (missing permission, alerts disabled), while gh's stderr often only names
 /// the HTTP status. Both channels are tail-capped so a chatty failure cannot
 /// ship megabytes of stderr into a report.
 fn gh_api_error_message(output: &CapturedOutput) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(output.stdout_text().trim()) {
+    let parsed = serde_json::from_str::<Value>(output.stdout_text().trim());
+    let http = http_status_from_gh_output(output)
+        .or_else(|| parsed.as_ref().ok().and_then(json_http_status));
+    if let Ok(value) = parsed {
         if let Some(message) = value.get("message").and_then(Value::as_str) {
             if !message.is_empty() {
-                return format!("{message} (HTTP {})", output.status_code);
+                return match http {
+                    Some(code) => format!("{message} (HTTP {code})"),
+                    None => message.to_string(),
+                };
             }
         }
     }
@@ -1088,6 +1244,7 @@ pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
             alerts,
             truncated,
             error: None,
+            unavailable_reason: None,
         },
         Err(e) => unavailable_code_scanning(true, true, remote.slug(), Some(e)),
     }
@@ -1099,6 +1256,11 @@ fn unavailable_code_scanning(
     slug: String,
     error: Option<String>,
 ) -> CodeScanningReport {
+    let unavailable_reason = Some(classify_github_unavailable(
+        is_github_remote,
+        cli_present,
+        error.as_deref(),
+    ));
     CodeScanningReport {
         available: false,
         cli_present,
@@ -1107,6 +1269,7 @@ fn unavailable_code_scanning(
         alerts: Vec::new(),
         truncated: false,
         error,
+        unavailable_reason,
     }
 }
 
@@ -2436,6 +2599,240 @@ mod tests {
             "got {message}"
         );
         assert!(message.contains("HTTP 403"), "got {message}");
+    }
+
+    #[test]
+    fn code_scanning_disabled_uses_http_status_not_process_exit() {
+        let output = CapturedOutput {
+            stdout: br#"{"message":"Code scanning is not enabled for this repository. Please enable code scanning in the repository settings.","documentation_url":"https://docs.github.com/rest"}"#
+                .to_vec(),
+            stderr: b"gh: HTTP 404".to_vec(),
+            success: false,
+            status_code: 1,
+        };
+        let message = gh_api_error_message(&output);
+        assert!(
+            message.contains("Code scanning is not enabled"),
+            "got {message}"
+        );
+        assert!(
+            message.contains("(HTTP 404)"),
+            "HTTP 404 must be reported as itself, got {message}"
+        );
+        assert_eq!(
+            http_status_from_gh_text(&message),
+            Some(404),
+            "the formatted line must not parse as HTTP 1, got {message}"
+        );
+        assert!(
+            !message.contains("(HTTP 1)"),
+            "process exit must not be reported as HTTP status, got {message}"
+        );
+    }
+
+    #[test]
+    fn json_api_message_omits_http_suffix_when_stderr_has_no_status() {
+        let output = CapturedOutput {
+            stdout: br#"{"message":"Code scanning is not enabled for this repository."}"#.to_vec(),
+            stderr: b"gh: failed to parse".to_vec(),
+            success: false,
+            status_code: 1,
+        };
+        let message = gh_api_error_message(&output);
+        assert_eq!(message, "Code scanning is not enabled for this repository.");
+        assert!(
+            !message.contains("(HTTP 1)"),
+            "absent HTTP status must not fall back to the process exit, got {message}"
+        );
+    }
+
+    #[test]
+    fn http_status_from_gh_text_rejects_process_exit_and_protocol_lookalikes() {
+        let cases: &[(&str, Option<u16>)] = &[
+            ("gh: HTTP 404", Some(404)),
+            ("http 403", Some(403)),
+            ("GH: HTTP 429 rate limit", Some(429)),
+            ("HTTP 500 trailing", Some(500)),
+            ("HTTP 1.1", None),
+            ("HTTP 4040", None),
+            ("HTTP 000", None),
+            ("HTTP 099", None),
+            ("HTTP 600", None),
+            ("HTTP 42", None),
+            ("HTTPS 443", None),
+            ("http://example.com/404", None),
+            ("https://docs.github.com/rest", None),
+            ("", None),
+            ("exit 1", None),
+            ("gh: HTTP/1.1 404", Some(404)),
+            ("HTTP/2 403", Some(403)),
+            ("HTTP/1.0 429 rate limit", Some(429)),
+            ("HTTP  404", Some(404)),
+            ("HTTP\t503", Some(503)),
+            ("HTTP/3  502", Some(502)),
+            ("HTTP 1", None),
+            ("(HTTP 1)", None),
+            ("failed (HTTP 1)", None),
+            ("HTTP 1)", None),
+            ("not enabled (HTTP 404)", Some(404)),
+            ("(HTTP 404)", Some(404)),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                http_status_from_gh_text(text),
+                *expected,
+                "http_status_from_gh_text({text:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn http_status_from_gh_text_fuzz_never_panics_or_invents_codes() {
+        // Simple LCG — deterministic, no extra deps, covers binary noise.
+        let mut state: u64 = 0xC0FFEE_u64;
+        for _ in 0..10_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = (state % 257) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bytes.push((state >> 33) as u8);
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            if let Some(code) = http_status_from_gh_text(&text) {
+                assert!(
+                    (100..=599).contains(&code),
+                    "invented HTTP status {code} from {bytes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_reason_matrix_covers_status_and_product_disabled() {
+        use GithubUnavailableReason::*;
+        let cases: &[(&str, bool, bool, Option<&str>, GithubUnavailableReason)] = &[
+            ("local-only", false, true, None, NotGithubRemote),
+            ("no-cli", true, false, Some("gh missing"), CliMissing),
+            (
+                "ghas-403",
+                true,
+                true,
+                Some("Advanced Security must be enabled for this repository to use code scanning. (HTTP 403)"),
+                ProductDisabled,
+            ),
+            (
+                "scope-403",
+                true,
+                true,
+                Some("Resource not accessible by integration (HTTP 403)"),
+                Forbidden,
+            ),
+            (
+                "code-scanning-404",
+                true,
+                true,
+                Some("Code scanning is not enabled for this repository. (HTTP 404)"),
+                ProductDisabled,
+            ),
+            (
+                "rate-limit",
+                true,
+                true,
+                Some("API rate limit exceeded (HTTP 429)"),
+                RateLimited,
+            ),
+            (
+                "empty-stderr",
+                true,
+                true,
+                Some(""),
+                Unknown,
+            ),
+            (
+                "no-error",
+                true,
+                true,
+                None,
+                Unknown,
+            ),
+            (
+                "dependabot-disabled",
+                true,
+                true,
+                Some("Dependabot alerts are disabled (HTTP 403)"),
+                ProductDisabled,
+            ),
+            (
+                "transport-502",
+                true,
+                true,
+                Some("Bad Gateway (HTTP 502)"),
+                Transport,
+            ),
+        ];
+        for (label, is_remote, cli, error, expected) in cases {
+            assert_eq!(
+                classify_github_unavailable(*is_remote, *cli, *error),
+                *expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_status_prefers_stderr_and_never_uses_process_exit() {
+        let output = CapturedOutput {
+            stdout: b"HTTP 500 in a comment".to_vec(),
+            stderr: b"gh: HTTP 404".to_vec(),
+            success: false,
+            status_code: 1,
+        };
+        assert_eq!(http_status_from_gh_output(&output), Some(404));
+        let exit_only = CapturedOutput {
+            stdout: Vec::new(),
+            stderr: b"gh: failed".to_vec(),
+            success: false,
+            status_code: 1,
+        };
+        assert_eq!(http_status_from_gh_output(&exit_only), None);
+    }
+
+    #[test]
+    fn json_status_field_is_used_when_stderr_has_no_http() {
+        let output = CapturedOutput {
+            stdout: br#"{"message":"Code scanning is not enabled for this repository.","documentation_url":"https://docs.github.com/rest","status":"404"}"#
+                .to_vec(),
+            stderr: b"gh: failed to parse".to_vec(),
+            success: false,
+            status_code: 1,
+        };
+        let message = gh_api_error_message(&output);
+        assert_eq!(
+            message,
+            "Code scanning is not enabled for this repository. (HTTP 404)"
+        );
+        let numeric = CapturedOutput {
+            stdout: br#"{"message":"Not Found","status":404}"#.to_vec(),
+            stderr: Vec::new(),
+            success: false,
+            status_code: 1,
+        };
+        assert_eq!(gh_api_error_message(&numeric), "Not Found (HTTP 404)");
+        let process_exit_status = CapturedOutput {
+            stdout: br#"{"message":"boom","status":1}"#.to_vec(),
+            stderr: Vec::new(),
+            success: false,
+            status_code: 1,
+        };
+        assert_eq!(gh_api_error_message(&process_exit_status), "boom");
+        let alerts = CapturedOutput {
+            stdout: br#"[{"status":"404","message":"not an error object"}]"#.to_vec(),
+            stderr: b"gh: failed".to_vec(),
+            success: false,
+            status_code: 1,
+        };
+        assert_eq!(gh_api_error_message(&alerts), "gh: failed");
     }
 
     /// Error text surfaced from gh is tail-capped: a chatty failure cannot

@@ -163,6 +163,14 @@ pub struct FileStatus {
     pub is_conflicted: bool,
     pub additions: usize,
     pub deletions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_additions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_deletions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged_additions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged_deletions: Option<usize>,
     /// Why this row's additions/deletions may understate reality (its numstat
     /// record could not be parsed). Absent from the JSON entirely while empty,
     /// so existing consumers see no shape change.
@@ -883,7 +891,7 @@ impl GitReader {
                 || work_status == 'U'
                 || (index_status == 'A' && work_status == 'A')
                 || (index_status == 'D' && work_status == 'D');
-            let is_staged = index_status != ' ' && index_status != '?';
+            let is_staged = !is_conflicted && index_status != ' ' && index_status != '?';
             let is_untracked = index_status == '?' && work_status == '?';
 
             // Staged churn from numstat_index (for files with changes staged in index)
@@ -943,6 +951,10 @@ impl GitReader {
                 is_conflicted,
                 additions,
                 deletions,
+                staged_additions: Some(staged_add),
+                staged_deletions: Some(staged_del),
+                unstaged_additions: Some(work_add),
+                unstaged_deletions: Some(work_del),
                 warnings,
             });
         }
@@ -4411,6 +4423,10 @@ mod tests {
             is_conflicted: false,
             additions: 1,
             deletions: 2,
+            staged_additions: Some(1),
+            staged_deletions: Some(2),
+            unstaged_additions: Some(0),
+            unstaged_deletions: Some(0),
             warnings: Vec::new(),
         };
         let value = serde_json::to_value(&clean).unwrap();
@@ -4437,6 +4453,12 @@ mod tests {
         }))
         .unwrap();
         assert!(back.warnings.is_empty());
+        assert!(back.staged_additions.is_none());
+        assert!(back.unstaged_additions.is_none());
+        assert!(serde_json::to_value(&back)
+            .unwrap()
+            .get("staged_additions")
+            .is_none());
     }
 
     fn blame_block(oid: &str, content: &str) -> String {

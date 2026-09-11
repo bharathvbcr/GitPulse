@@ -19,6 +19,7 @@
  */
 
 /** Where a rail's entries came from. `none` renders no rail at all. */
+import { hasUnstagedChanges, statusForSide } from "../files/fileStatus";
 export type RailSource = "commit" | "worktree" | "none";
 
 export interface RailEntry {
@@ -67,6 +68,10 @@ export interface WorktreeFileLike {
   is_staged: boolean;
   additions: number;
   deletions: number;
+  staged_additions?: number;
+  staged_deletions?: number;
+  unstaged_additions?: number;
+  unstaged_deletions?: number;
 }
 
 export interface RailInput {
@@ -121,7 +126,10 @@ export function buildFileRail(input: RailInput): FileRail {
   }
 
   if (input.selectionKind === "file") {
-    const entries = input.statuses.map((file) => ({
+    const sides = input.statuses.flatMap((file) => file.is_staged && hasUnstagedChanges(file)
+      ? [statusForSide(file, true), statusForSide(file, false)]
+      : [statusForSide(file, file.is_staged)]);
+    const entries = sides.map((file) => ({
       path: file.path,
       oldPath: file.old_path ?? undefined,
       statusCode: file.status_code,

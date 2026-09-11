@@ -5,7 +5,6 @@ use super::Worktree;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
@@ -46,7 +45,6 @@ unsafe extern "system" {
         exclude: *mut c_void,
         reserved: *mut c_void,
     ) -> i32;
-    fn MoveFileExW(source: *const u16, target: *const u16, flags: u32) -> i32;
 }
 
 type Identity = (u32, u32, u32);
@@ -61,21 +59,7 @@ fn identity(file: &File) -> Result<Identity, String> {
 }
 
 fn wide(path: &Path) -> Result<Vec<u16>, String> {
-    // Repo roots are simplified for Git, but a descendant or recovery path
-    // can cross MAX_PATH. Canonicalize only its pinned parent to recover the
-    // verbatim Windows namespace without following or requiring the final file.
-    let parent = path
-        .parent()
-        .ok_or("Missing conflict parent")?
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    let absolute = parent.join(path.file_name().ok_or("Missing conflict filename")?);
-    let mut value: Vec<_> = absolute.as_os_str().encode_wide().collect();
-    if value.contains(&0) || value.len() >= 32_767 {
-        return Err("Conflict path contains NUL or exceeds the Windows path limit".into());
-    }
-    value.push(0);
-    Ok(value)
+    crate::fs_entry::windows_path(path).map_err(|error| error.to_string())
 }
 
 fn pin_directory(path: &Path) -> Result<File, String> {
@@ -257,14 +241,7 @@ impl Drop for Recovery {
 }
 
 fn move_new(source: &Path, target: &Path) -> Result<(), String> {
-    let source = wide(source)?;
-    let target = wide(target)?;
-    // SAFETY: both buffers are valid, terminated UTF-16 paths. No overwrite,
-    // cross-volume copy, delayed operation, or metadata-error bypass is allowed.
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 8) } == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok(())
+    crate::fs_entry::rename_noreplace(source, target).map_err(|error| error.to_string())
 }
 
 pub(in crate::diff) fn replace(

@@ -3,7 +3,7 @@ use crate::engine::git_cli::{
     resolve_git_common_dir, sandbox_join, validate_repo, NETWORK_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -28,6 +28,86 @@ pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
 /// click would park the repository in a sequencer thousands of steps deep with
 /// no realistic way back out.
 const MAX_REPLAY_COMMITS: usize = 200;
+
+/// Validate selection bounds before planning policy checks or Git commands.
+const MAX_INDEX_PATHS: usize = 20_000;
+const MAX_INDEX_PATH_BYTES: usize = 4 * 1024 * 1024;
+/// Leave room for Git's executable and quoting within Windows' command limit.
+const MAX_INDEX_ARGV_BYTES: usize = 12 * 1024;
+const MAX_INDEX_CHUNK_PATHS: usize = 128;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexAction {
+    Stage,
+    Unstage,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StashSaveOptions {
+    pub include_untracked: bool,
+    pub keep_index: bool,
+}
+
+impl Default for StashSaveOptions {
+    fn default() -> Self {
+        Self {
+            include_untracked: true,
+            keep_index: false,
+        }
+    }
+}
+
+impl StashSaveOptions {
+    pub fn argv<'a>(&self, message: Option<&'a str>) -> Vec<&'a str> {
+        let mut argv = vec!["git", "stash", "push"];
+        if self.include_untracked {
+            argv.push("-u");
+        }
+        if self.keep_index {
+            argv.push("--keep-index");
+        }
+        if let Some(message) = message {
+            argv.extend(["-m", message]);
+        }
+        argv
+    }
+}
+
+impl IndexAction {
+    fn argv(self) -> Vec<String> {
+        match self {
+            Self::Stage => vec!["git".into(), "add".into(), "--".into()],
+            // Path-limited reset only changes the index and also works on an
+            // unborn branch. `restore --staged` requires an existing HEAD.
+            Self::Unstage => vec!["git".into(), "reset".into(), "--quiet".into(), "--".into()],
+        }
+    }
+}
+
+fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, String> {
+    if files.is_empty() || files.len() > MAX_INDEX_PATHS {
+        return Err(format!("Select between 1 and {MAX_INDEX_PATHS} paths"));
+    }
+    let mut bytes = 0usize;
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for file in files {
+        sandbox_join(repo, file)?;
+        if file.len() > 4096 {
+            return Err("A selected path exceeds 4096 bytes".into());
+        }
+        bytes = bytes.saturating_add(file.len() + 16);
+        if bytes > MAX_INDEX_PATH_BYTES {
+            return Err("Selected paths exceed the 4 MiB request limit".into());
+        }
+        if seen.insert(file) {
+            paths.push(format!(":(literal){file}"));
+        }
+    }
+    Ok(paths)
+}
 
 /// How much of the working state a reset discards.
 ///
@@ -85,36 +165,71 @@ pub struct GitWriter;
 
 impl GitWriter {
     pub fn stage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
-        let repo = validate_repo(repo_path)?;
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = sandbox_join(&repo, file_path)?;
-        // `:(literal)` disables pathspec globbing so a user path can never
-        // widen its own blast radius ("*" must match a file named "*", never
-        // the whole tree). Same convention as the reader side.
-        git_text(&repo, &["add", "--", &format!(":(literal){file_path}")])?;
-        Ok(())
+        Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Stage, |_| {
+            Ok(())
+        })
+        .map(|_| ())
     }
 
     pub fn unstage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
+        Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Unstage, |_| {
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// One native request and lock for a selection. All paths and all policy
+    /// verdicts are checked before the first write. Bounded argv chunks avoid
+    /// platform command-length limits. A later Git failure names the completed
+    /// prefix; it is never presented as an atomic rollback or as success.
+    pub fn change_index_with<J, V>(
+        repo_path: &str,
+        files: &[String],
+        action: IndexAction,
+        mut judge: J,
+    ) -> Result<(Vec<V>, usize), String>
+    where
+        J: FnMut(&[&str]) -> Result<V, String>,
+    {
         let repo = validate_repo(repo_path)?;
+        let paths = literal_paths(&repo, files)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = sandbox_join(&repo, file_path)?;
-        git_text(
-            &repo,
-            &[
-                "restore",
-                "--staged",
-                "--",
-                &format!(":(literal){file_path}"),
-            ],
-        )?;
-        Ok(())
+        let prefix = action.argv();
+        let mut plans = Vec::new();
+        let mut argv = prefix.clone();
+        let mut bytes = 128usize;
+        for path in &paths {
+            // At most two bytes of escaping/UTF-16 storage per UTF-8 byte.
+            let cost = path.len() * 2 + 4;
+            if argv.len() > prefix.len()
+                && (bytes + cost > MAX_INDEX_ARGV_BYTES
+                    || argv.len() - prefix.len() >= MAX_INDEX_CHUNK_PATHS)
+            {
+                plans.push(argv);
+                argv = prefix.clone();
+                bytes = 128;
+            }
+            bytes += cost;
+            argv.push(path.clone());
+        }
+        plans.push(argv);
+        let mut verdicts = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            let args: Vec<&str> = plan.iter().map(String::as_str).collect();
+            verdicts.push(judge(&args)?);
+        }
+        let mut completed = 0;
+        for plan in &plans {
+            let args: Vec<&str> = plan.iter().skip(1).map(String::as_str).collect();
+            git_text(&repo, &args).map_err(|error| format!(
+                "Index update stopped after {completed} of {} selected paths: {error}. Refresh to review the current index.", paths.len()
+            ))?;
+            completed += plan.len() - prefix.len();
+        }
+        Ok((verdicts, completed))
     }
 
     /// Moves a tracked file with `git mv` and stages the rename.
@@ -144,7 +259,7 @@ impl GitWriter {
 
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
-        if message.trim().is_empty() {
+        if message.trim().is_empty() && !(amend && message.is_empty()) {
             return Err("Commit message must not be empty".into());
         }
         let _repo_lock = repo_mutation_lock(&repo);
@@ -202,8 +317,8 @@ impl GitWriter {
         Self::commit_inner(repo, message, false)
     }
 
-    /// Stage exactly `files` and commit them under a single mutation-lock
-    /// acquisition.
+    /// Commit exactly `files`, preserving unrelated staged and unstaged work,
+    /// under a single mutation-lock acquisition.
     ///
     /// `stage_file()` followed by `commit()` spans two lock acquisitions, so a
     /// concurrent writer can commit the shared index in between and absorb the
@@ -220,25 +335,35 @@ impl GitWriter {
         if message.trim().is_empty() {
             return Err("Commit message must not be empty".into());
         }
-        if files.is_empty() {
-            return Err("commit_files requires at least one path".into());
-        }
-        for file in files {
-            if file.is_empty() {
-                return Err("commit_files requires non-empty paths".into());
-            }
-            sandbox_join(&repo, file)?;
-        }
+        let paths = literal_paths(&repo, files)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut add_args: Vec<&str> = Vec::with_capacity(files.len() + 2);
-        add_args.push("add");
-        add_args.push("--");
-        add_args.extend(files.iter().map(String::as_str));
-        git_text(&repo, &add_args)?;
-        Self::commit_inner(&repo, message, false)
+        Self::refuse_if_parked(&repo, "commit selected files")?;
+        let mut input = Vec::new();
+        for path in &paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        git_with_stdin(
+            &repo,
+            &["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            &input,
+        )?;
+        git_with_stdin(
+            &repo,
+            &[
+                "commit",
+                "--only",
+                "-m",
+                message,
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &input,
+        )
+        .map(|output| String::from_utf8_lossy(&output).into_owned())
     }
 
     pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
@@ -248,15 +373,15 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch_name)?;
-        // Two strategies, no more: `switch --guess` covers creating a local
-        // branch from a remote twin (git >= 2.23), plain `checkout` covers
+        // Two strategies: `switch --guess` covers creating a local
+        // branch from a remote twin (git >= 2.23), revision-only `checkout` covers
         // everything older. The former middle attempt (`checkout --guess`)
         // added a third executable spelling without covering any state the
         // other two miss — and every extra strategy is another argv the
         // policy gate must judge identically.
         let attempts: [&[&str]; 2] = [
             &["switch", "--guess", branch_name],
-            &["checkout", branch_name],
+            &["checkout", branch_name, "--"],
         ];
         let mut first_err = None;
         for attempt in attempts {
@@ -884,16 +1009,22 @@ impl GitWriter {
     }
 
     pub fn stash_save(repo_path: &str, message: Option<&str>) -> Result<String, String> {
+        Self::stash_save_with(repo_path, message, StashSaveOptions::default())
+    }
+
+    pub fn stash_save_with(
+        repo_path: &str,
+        message: Option<&str>,
+        options: StashSaveOptions,
+    ) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(msg) = message {
-            git_text(&repo, &["stash", "push", "-u", "-m", msg])
-        } else {
-            git_text(&repo, &["stash", "push", "-u"])
-        }
+        Self::refuse_if_parked(&repo, "stash")?;
+        let argv = options.argv(message);
+        git_text(&repo, &argv[1..])
     }
 
     pub fn stash_pop(repo_path: &str) -> Result<String, String> {
@@ -1035,10 +1166,11 @@ impl GitWriter {
         validate_clone_url(url)?;
         let requested = Path::new(target_dir);
         let dest = resolve_clone_destination(requested)?;
+        let is_parent_directory = dest.is_dir();
         if dest.join(".git").exists() {
             return Err("Destination is already a Git repository".into());
         }
-        let clone_path = if dest.is_dir() {
+        let clone_path = if is_parent_directory {
             resolve_clone_destination(&dest.join(crate::engine::git_cli::repo_name_from_url(url)))?
         } else {
             dest
@@ -1047,43 +1179,78 @@ impl GitWriter {
             return Err(format!("Already cloned at {}", clone_path.display()));
         }
         let clone_str = clone_path.to_string_lossy().into_owned();
-        if let Err(clone_err) =
-            git_global_with_timeout(&["clone", "--", url, &clone_str], NETWORK_TIMEOUT)
-        {
-            // git materializes <dest>/.git before transferring objects, so a
-            // failed or timed-out clone leaves a skeleton behind that blocks
-            // every retry ("already exists"). Its absence was verified just
-            // above, so anything present now came from our own attempt:
-            // remove it best-effort so a retry starts clean.
-            let leftover = clone_path.join(".git");
-            if leftover.is_dir() {
-                let removal = std::fs::remove_dir_all(&leftover);
-                return Err(partial_clone_message(&clone_err, &leftover, removal));
-            }
-            return Err(clone_err);
+        let staging = allocate_clone_staging(
+            clone_path
+                .parent()
+                .ok_or("Clone destination has no parent")?,
+        )?;
+        let result = git_global_with_timeout(
+            &["clone", "--", url, &staging.to_string_lossy()],
+            NETWORK_TIMEOUT,
+        )
+        .and_then(|_| {
+            crate::fs_entry::rename_noreplace(&staging, &clone_path).map_err(|error| {
+                format!(
+                    "Cannot publish clone at {} without replacing an existing entry: {error}",
+                    clone_path.display()
+                )
+            })
+        });
+        if let Err(clone_err) = result {
+            // This attempt exclusively created staging. Never remove `.git`
+            // at the requested destination: another client may own it now.
+            let removal = match std::fs::remove_dir_all(&staging) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            };
+            return Err(partial_clone_message(&clone_err, &staging, removal));
         }
         Ok(clone_str)
     }
 }
 
+fn allocate_clone_staging(parent: &Path) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Cannot allocate clone staging directory: {error}"))?
+        .as_nanos();
+    for _ in 0..32 {
+        let next = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".gitpulse-clone-{}-{timestamp}-{next}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot create clone staging directory: {error}")),
+        }
+    }
+    Err("Could not allocate a unique clone staging directory after 32 attempts".into())
+}
+
 /// Composes the user-facing error for a clone that failed and left a partial
-/// `.git` behind, reporting the cleanup that *happened*.
+/// private staging directory behind, reporting the cleanup that happened.
 ///
-/// Claiming a removal that failed is worse than not attempting one: the user
-/// retries on the strength of it and the retry dies at the `.git` existence
-/// check with "Already cloned at ...", having just been told the path was
-/// clear. Taking the removal's own result as an argument is what makes the
-/// failing branch reachable from a test — in place it needs a filesystem that
-/// refuses to delete a directory git created moments earlier.
+/// Cleanup failure preserves both the primary error and the retained path.
+/// Taking the removal result makes that failure branch independently testable.
 fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Result<()>) -> String {
     match removal {
         Ok(()) => format!(
-            "clone failed ({clone_err}); removed the partial '.git' left at {}",
+            "clone failed ({clone_err}); removed this attempt's staging directory at {}",
             leftover.display()
         ),
         Err(rm_err) => format!(
-            "clone failed ({clone_err}); the partial '.git' at {} could not be removed \
-             ({rm_err}) and will block a retry until it is deleted",
+            "clone failed ({clone_err}); this attempt's staging directory at {} could not be removed \
+             ({rm_err}); it is retained for manual recovery",
             leftover.display()
         ),
     }
@@ -1182,7 +1349,13 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
         // Not yet present: the remaining components stay purely lexical,
         // which is safe because `..`/relative forms were refused above and
         // the parent was resolved through every existing link.
-        Err(_) => Ok(parent_canonical.join(name)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(parent_canonical.join(name))
+        }
+        Err(error) => Err(format!(
+            "Cannot inspect clone destination '{}': {error}",
+            dest.display()
+        )),
     }
 }
 
@@ -2225,16 +2398,17 @@ mod tests {
         );
     }
 
-    /// A cleanup that could not run must never report what a cleanup that ran
-    /// and succeeded reports: the user retries on the strength of the message
-    /// and hits "Already cloned at ..." at the existence check.
+    /// Failed cleanup must identify retained data without claiming removal.
     #[test]
     fn a_failed_cleanup_is_never_reported_as_a_removal() {
-        let leftover = Path::new("/repos/demo/.git");
+        let leftover = Path::new("/repos/.gitpulse-clone-test");
 
         let removed = partial_clone_message("timeout", leftover, Ok(()));
-        assert!(removed.contains("removed the partial '.git'"), "{removed}");
-        assert!(removed.contains("/repos/demo/.git"), "{removed}");
+        assert!(
+            removed.contains("removed this attempt's staging directory"),
+            "{removed}"
+        );
+        assert!(removed.contains("/repos/.gitpulse-clone-test"), "{removed}");
 
         let kept = partial_clone_message(
             "timeout",
@@ -2245,13 +2419,13 @@ mod tests {
             )),
         );
         assert!(
-            !kept.contains("removed the partial"),
+            !kept.contains("removed this attempt"),
             "a failed removal must not claim to have removed anything: {kept}"
         );
         assert!(kept.contains("could not be removed"), "{kept}");
         assert!(kept.contains("denied"), "the reason must survive: {kept}");
         assert!(
-            kept.contains("block a retry"),
+            kept.contains("retained for manual recovery"),
             "the consequence must be stated, not left to be discovered: {kept}"
         );
 

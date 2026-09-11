@@ -167,7 +167,8 @@ export const CONTRACTS = Object.freeze([
   // Rust field would otherwise surface as a silently `undefined` property in
   // the operation banner, the stash list, or the remotes panel.
   { label: "repo-operation", rustPath: rust("engine", "repo_op.rs"), tsPath: ts("repos", "operation.ts"), structs: ["RepoOperation"] },
-  { label: "stash", rustPath: rust("engine", "stash.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashEntry"] },
+  { label: "stash-options", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashSaveOptions"] },
+  { label: "stash", rustPath: rust("engine", "stash.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashEntry", "StashList"] },
   { label: "remotes", rustPath: rust("engine", "remotes.rs"), tsPath: ts("repos", "remotes.ts"), structs: ["RemoteInfo", "RemoteList"] },
   { label: "submodules", rustPath: rust("engine", "submodules.rs"), tsPath: ts("repos", "submodules.ts"), structs: ["SubmoduleInfo", "SubmoduleList"] },
   // Events are a second wire surface: emitted payloads, not command returns.

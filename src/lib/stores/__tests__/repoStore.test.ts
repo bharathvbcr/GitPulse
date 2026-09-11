@@ -161,7 +161,7 @@ function makeInvoke(overrides: Partial<Record<string, InvokeFn>> = {}): InvokeFn
     if (cmd === "cmd_list_tags") return { tags: [], truncated: false } as never;
     // Idle by default; suites that care park an operation via overrides.
     if (cmd === "cmd_repo_operation") return null as never;
-    if (cmd === "cmd_stash_list") return [] as never;
+    if (cmd === "cmd_stash_list") return { entries: [], truncated: false } as never;
     if (cmd === "cmd_branch_stats") return statsFor(String(args?.repoPath)) as never;
     if (cmd === "cmd_watch_repo") return String(args?.repoPath) as never;
     if (cmd === "cmd_unwatch_repo") return undefined as never;
@@ -1444,18 +1444,17 @@ describe("repoStore diff selection", () => {
       cmd_get_status: async () => ["a.ts", "b.ts"].map((path) => ({
         path, status_code: "M", is_staged, is_conflicted: false, additions: 1, deletions: 0,
       })) as never,
-      cmd_stage_file: mutate,
-      cmd_unstage_file: mutate,
+      cmd_change_index: mutate,
     }));
     await store.openRepo("/r/origin");
     const batch = is_staged ? store.unstageAll() : store.stageAll();
     await store.openRepo("/r/other");
     first.resolve(undefined);
     expect((await batch).ok).toBe(true);
-    expect(paths).toEqual(["/r/origin", "/r/origin"]);
+    expect(paths).toEqual(["/r/origin"]);
   });
 
-  it("stageAll and unstageAll walk the current status lists", async () => {
+  it("stageAll and unstageAll send the exact current selection in one native request", async () => {
     const staged: string[] = [];
     const unstaged: string[] = [];
     const invoke = makeInvoke({
@@ -1464,13 +1463,11 @@ describe("repoStore diff selection", () => {
           { path: "a.ts", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 },
           { path: "b.ts", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 },
         ] as never,
-      cmd_stage_file: async (_cmd, args) => {
-        staged.push(String(args?.filePath));
-        return undefined as never;
-      },
-      cmd_unstage_file: async (_cmd, args) => {
-        unstaged.push(String(args?.filePath));
-        return undefined as never;
+      cmd_change_index: async (_cmd, args) => {
+        const selected = args?.filePaths;
+        if (!Array.isArray(selected) || !selected.every((p: unknown) => typeof p === "string")) throw new Error("Invalid selection");
+        (args?.action === "stage" ? staged : unstaged).push(...selected);
+        return selected.length as never;
       },
     });
     const { store } = makeStore(invoke);
@@ -1481,11 +1478,64 @@ describe("repoStore diff selection", () => {
     expect(unstaged).toEqual(["b.ts"]);
   });
 
+  it.each([false, true])("unstaging a rename includes both index paths (all=%s)", async (all) => {
+    const calls: unknown[] = [];
+    const { store } = makeStore(makeInvoke({
+      cmd_get_status: async () => [{ path: "new.txt", old_path: "old.txt", status_code: "R ", is_staged: true, is_conflicted: false, additions: 0, deletions: 0 }] as never,
+      cmd_unstage_file: async (_cmd, args) => { calls.push(args); return undefined as never; },
+      cmd_change_index: async (_cmd, args) => { calls.push(args); return undefined as never; },
+    }));
+    await store.openRepo("/r/rename");
+    expect((await (all ? store.unstageAll() : store.unstageFile("new.txt"))).ok).toBe(true);
+    expect(calls).toEqual([{ repoPath: "/r/rename", filePaths: ["new.txt", "old.txt"], action: "unstage" }]);
+  });
+
+  it("failed bulk activity lasts through recovery refresh and preserves the failure", async () => {
+    const refreshed = deferred<unknown>();
+    const refreshStarted = deferred<unknown>();
+    let mutated = false;
+    const { store } = makeStore(makeInvoke({
+      cmd_change_index: async () => { mutated = true; throw new Error("Index update stopped after 128 of 129 selected paths: index.lock"); },
+      cmd_get_status: async () => {
+        if (mutated) { refreshStarted.resolve(undefined); await refreshed.promise; }
+        return snapshotFor("/r/batch").statuses as never;
+      },
+    }));
+    await store.openRepo("/r/batch");
+    const work = store.stageAll();
+    await refreshStarted.promise;
+    expect(get(store.mutationActivity)).toEqual({ "/r/batch": ["stage-all"] });
+    refreshed.resolve(undefined);
+    expect(await work).toMatchObject({ ok: false, error: expect.stringContaining("128 of 129") });
+    expect(get(store).error).toContain("128 of 129");
+    expect(get(store.mutationActivity)).toEqual({});
+  });
+
+  it("stageAll includes remaining working edits of a partially staged file", async () => {
+    const calls: unknown[] = [];
+    const { store } = makeStore(makeInvoke({
+      cmd_get_status: async () => [{ path: "mixed.txt", status_code: "MM", is_staged: true, is_conflicted: false, additions: 3, deletions: 2 }] as never,
+      cmd_change_index: async (_cmd, args) => { calls.push(args); return undefined as never; },
+    }));
+    await store.openRepo("/r/partial");
+    expect((await store.stageAll()).ok).toBe(true);
+    expect(calls).toEqual([{ repoPath: "/r/partial", filePaths: ["mixed.txt"], action: "stage" }]);
+  });
+
+  it("an empty bulk selection succeeds without invoking a mutation", async () => {
+    const mutation = vi.fn(async () => undefined as never);
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async () => [] as never, cmd_change_index: mutation }));
+    await store.openRepo("/r/empty");
+    expect(await store.stageAll()).toEqual({ ok: true });
+    expect(await store.unstageAll()).toEqual({ ok: true });
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
   it("bulk activity lasts through the final refresh and is counted once", async () => {
     const refreshed = deferred<unknown>();
     let mutated = false;
     const { store } = makeStore(makeInvoke({
-      cmd_stage_file: async () => { mutated = true; return undefined as never; },
+      cmd_change_index: async () => { mutated = true; return undefined as never; },
       cmd_get_status: async () => {
         if (mutated) await refreshed.promise;
         return snapshotFor("/r/batch").statuses as never;
@@ -2374,7 +2424,7 @@ describe("repoStore workspace work-in-progress", () => {
       makeInvoke({
         cmd_get_status: async () => [] as never,
         cmd_stash_list: async () =>
-          [
+          ({ entries: [
             {
               index: 0,
               selector: "stash@{0}",
@@ -2384,7 +2434,7 @@ describe("repoStore workspace work-in-progress", () => {
               branch: "main",
               timestamp: 1,
             },
-          ] as never,
+          ], truncated: false }) as never,
       }),
     );
     await store.openRepo("/r/stashed");
@@ -2568,7 +2618,7 @@ describe("repoStore stash actions", () => {
     const { store } = makeStore(
       makeInvoke({
         cmd_stash_list: async () =>
-          [
+          ({ entries: [
             {
               index: 0,
               selector: "stash@{0}",
@@ -2578,7 +2628,7 @@ describe("repoStore stash actions", () => {
               branch: "main",
               timestamp: 1,
             },
-          ] as never,
+          ], truncated: false }) as never,
         cmd_stash_action: async (_cmd, args) => {
           calls.push(args ?? {});
           return { policy: null, output: "Dropped refs/stash@{0}" } as never;

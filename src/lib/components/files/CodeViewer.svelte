@@ -39,6 +39,7 @@
   let {
     filePath,
     content,
+    readOnly = false,
     draftContent = null,
     dirty = false,
     onSave,
@@ -47,6 +48,7 @@
   }: {
     filePath: string;
     content: string;
+    readOnly?: boolean;
     draftContent?: string | null;
     dirty?: boolean;
     onSave?: (newContent: string) => Promise<void>;
@@ -223,6 +225,7 @@
   }
 
   function startEdit() {
+    if (readOnly) return;
     editDraft = draftContent ?? content;
     isEditing = true;
   }
@@ -252,7 +255,7 @@
   }
 
   async function saveChanges() {
-    if (!isEditing || isSaving) return;
+    if (readOnly || !isEditing || isSaving) return;
     const path = filePath;
     const generation = editorGeneration;
     const contentToSave = editDraft;
@@ -446,7 +449,7 @@
       <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1" aria-hidden="true"></div>
 
       <!-- Edit & Save Controls -->
-      {#if !isEditing}
+      {#if !isEditing && !readOnly}
         <button
           type="button"
           onclick={startEdit}
@@ -455,7 +458,7 @@
           <Edit3 size={12} class="text-accent" />
           <span>Edit</span>
         </button>
-      {:else}
+      {:else if isEditing && !readOnly}
         <button
           type="button"
           onclick={cancelEdit}

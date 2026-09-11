@@ -12,18 +12,26 @@ window.addEventListener("unhandledrejection",event=>crashes.push(String(event.re
 const root="/workspace/alpha", other="/workspace/beta";
 const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_code,is_conflicted:false,additions:1,deletions:1});
 let files=[status("src/shared.ts",true),status("src/shared.ts"),status("notes.md",false,"??")];
+let stashEntries=[], stashTruncated=false, stashPreviewPending=null;
+const stashWrites=[], indexWrites=[];
 const worktrees=[root,other].map((path,i)=>({path,name:path.split("/").pop(),branch:i?"feature":"main",head:"a".repeat(40),is_main:i===0,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:3}));
 const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
 const fixtures={
  cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
  cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),
- cmd_repo_operation:()=>null,cmd_stash_list:()=>[],cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
+ cmd_repo_operation:()=>null,cmd_stash_list: () => ({ entries: stashEntries, truncated: stashTruncated }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
+ cmd_list_remotes:()=>({remotes:[],truncated:false}),cmd_list_submodules:()=>({submodules:[],truncated:false}),
+ cmd_stash_show:()=>stashPreviewPending??({text:patch("stash-file.txt","stashed modification"),truncated:true,truncation_reason:"Fixture byte limit"}),
+ cmd_stash_save:a=>{stashWrites.push(a);return {policy:null,output:"Saved stash"};},
+ cmd_stash_action:a=>{stashWrites.push(a);return {policy:null,output:"Applied stash"};},
+ cmd_change_index:a=>{indexWrites.push(a);return {policy:null,output:a.filePaths.length};},
  cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
  cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),cmd_workspace_sync:()=>({repos:[]}),
  cmd_get_file_diff:a=>{calls.push(a);return {text:patch(a.filePath,`${a.repoPath} ${a.isStaged?"staged":"unstaged"} modification`),truncated:false};},
  cmd_get_commit_diff:()=>({text:patch("old.ts","old commit content"),truncated:false}),
  cmd_get_commit_files:()=>[{path:"old.ts",status_code:"M",additions:1,deletions:1}],
  cmd_get_language_stats:()=>({stats:[],truncated:false}),
+ cmd_last_fetch_at:()=>null,
  cmd_get_file_content:()=>"fixture content",
  cmd_codeintel_impact_at_rung:()=>({available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
  cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
@@ -40,7 +48,7 @@ const {get}=await import("svelte/store");
 const {repoStore}=await import("../src/lib/stores/repoStore.ts");
 const {layoutStore}=await import("../src/lib/sidebar/layoutStore.ts");
 const {interfaceStore}=await import("../src/lib/stores/interfaceStore.ts");
-const components=Object.fromEntries(await Promise.all(["StatusBar","Sidebar","ViewTabBar","RepoTabBar","WorkspaceActions","WorkView","WorktreesPanel","FleetView","DiffViewer"].map(async name=>[name,(await import(`../src/lib/components/${name}.svelte`)).default])));
+const components=Object.fromEntries(await Promise.all(["StatusBar","Sidebar","ViewTabBar","RepoTabBar","WorkspaceActions","WorkView","WorktreesPanel","FleetView","DiffViewer","RepoPanel"].map(async name=>[name,(await import(`../src/lib/components/${name}.svelte`)).default])));
 await repoStore.openRepo(other);await repoStore.openRepo(root);
 const surface=document.getElementById("surface"),preview=document.getElementById("preview");
 mount(components.DiffViewer,{target:preview});
@@ -97,6 +105,56 @@ async function run(){
   [...preview.querySelectorAll('button')].find(button=>button.textContent.includes("Uncommitted changes")&&button.title!=="Show recent commits").click();
   await until(()=>!get(repoStore).selectedCommitId&&!get(repoStore).selectedDiffPending,"diff picker");
   check("Diff picker reuses uncommitted preview",preview.textContent.includes(`${other} staged modification`));
+  const stash=(index)=>({index,selector:`stash@{${index}}`,oid:"a".repeat(40),subject:"On main: saved work",message:"saved work",branch:"main",timestamp:1700000000});
+  stashEntries=[stash(0),stash(1)];stashTruncated=true;
+  await repoStore.refresh();await show("RepoPanel");
+  const button=(name)=>[...surface.querySelectorAll("button")].find(b=>b.textContent.trim()===name);
+  check("duplicate stash objects render as distinct stack entries",surface.querySelectorAll('button[aria-expanded="false"]').length===2);
+  check("stash listing identifies a limited result",surface.textContent.includes("limited stash list"));
+  button("Preview").click();
+  await until(()=>surface.textContent.includes("stashed modification"),"stash preview");
+  check("stash preview reports the byte limit",surface.textContent.includes("Preview is incomplete")&&surface.textContent.includes("Fixture byte limit"));
+  check("stash preview reuses a read-only searchable code viewer",!!surface.querySelector('[aria-readonly="true"]')&&!button("Edit"));
+  button("Close preview").click();await tick();
+  check("closing a stash preview releases its content",!surface.querySelector('[aria-label="Stash preview"]'));
+  const message=surface.querySelector('input[placeholder="What are you setting aside?"]');
+  message.value="focused work";message.dispatchEvent(new Event("input",{bubbles:true}));
+  const toggles=[...surface.querySelectorAll('input[type="checkbox"]')];
+  toggles[0].click();toggles[1].click();await tick();
+  button("Save stash").click();
+  await until(()=>stashWrites.length===1&&!button("Save stash").disabled,"stash save");
+  check("stash save sends both scope choices",stashWrites[0].options.include_untracked===false&&stashWrites[0].options.keep_index===true);
+  check("stash save retains the intended message and repository",stashWrites[0].message==="focused work"&&stashWrites[0].repoPath===other);
+  check("successful stash save clears its message",message.value==="");
+  // The UI label intentionally says what the action does; read its own label.
+  const destructive=[...surface.querySelectorAll("button")].filter(b=>b.title.includes("not recoverable"));
+  destructive[0].click();await tick();
+  check("duplicate object IDs do not arm another stash entry",[...surface.querySelectorAll("button")].filter(b=>b.textContent.trim().startsWith("Confirm:")).length===1);
+  button("Cancel").click();await tick();
+  let settlePreview;stashPreviewPending=new Promise(resolve=>{settlePreview=resolve;});
+  button("Preview").click();await tick();
+  await repoStore.openRepo(root);await tick();
+  settlePreview({text:"stale stash response",truncated:false});await tick();await step();
+  check("a delayed stash preview cannot leak into another repository",!surface.textContent.includes("stale stash response")&&!surface.querySelector('[aria-label="Stash preview"]'));
+  stashPreviewPending=null;
+  await repoStore.stageAll();
+  check("stage all issues one native batch with the exact selection",indexWrites.length===1&&indexWrites[0].action==="stage"&&JSON.stringify(indexWrites[0].filePaths)===JSON.stringify(["src/shared.ts","notes.md"]));
+  await repoStore.unstageAll();
+  check("unstage all targets only staged paths",indexWrites.length===2&&indexWrites[1].action==="unstage"&&JSON.stringify(indexWrites[1].filePaths)===JSON.stringify(["src/shared.ts"]));
+  files=[{...status("mixed.txt",true,"MM"),additions:3,deletions:2,staged_additions:1,staged_deletions:1,unstaged_additions:2,unstaged_deletions:1}];
+  await repoStore.refresh();await show("Sidebar");
+  check("a partially staged file is visible on both sidebar sides",surface.querySelectorAll('button[title="mixed.txt"]').length===2);
+  surface.querySelectorAll('button[title="mixed.txt"]')[1].click();
+  await until(()=>!get(repoStore).selectedDiffPending,"mixed working diff");
+  check("the mixed file working row selects unstaged content",get(repoStore).selectedIsStaged===false&&get(repoStore).selectedFilePath==="mixed.txt");
+  const mixedRows=[...preview.querySelectorAll('button[title="mixed.txt"]')];
+  check("the mixed file rail exposes staged and unstaged rows",mixedRows.length===2&&mixedRows[0].textContent.includes("staged")&&!mixedRows[1].textContent.includes("staged"));
+  mixedRows[0].click();await until(()=>get(repoStore).selectedIsStaged&&!get(repoStore).selectedDiffPending,"mixed staged diff");
+  check("the mixed staged row loads index content",preview.textContent.includes(`${root} staged modification`));
+  await repoStore.previewUncommitted(undefined,false);
+  check("unstaged preview keeps the working side of mixed files",get(repoStore).selectedIsStaged===false);
+  await repoStore.stageAll();
+  check("stage all includes remaining edits in a partially staged file",JSON.stringify(indexWrites.at(-1).filePaths)===JSON.stringify(["mixed.txt"]));
   check("No unexpected commands",unexpected.length===0);
   check("No runtime errors",crashes.length===0);
  }catch(error){results.push({name:String(error),pass:false});}

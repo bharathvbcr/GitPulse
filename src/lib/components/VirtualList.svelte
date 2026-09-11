@@ -5,6 +5,7 @@
     computeWindow,
     ensureNonEmptyWindow,
   } from "../dom/virtualWindow";
+  import { observeResize } from "../dom/observeResize";
   import ScrollCue from "./ScrollCue.svelte";
 
   interface Props {
@@ -93,15 +94,13 @@
   $effect(() => {
     const el = scroller;
     if (!el) return;
-    const observer = new ResizeObserver((entries) => {
+    return observeResize(el, (entries) => {
       // A bogus measurement (NaN / ±Infinity / negative) collapses to 0,
       // exactly how computeWindow treats degenerate viewports — it must not
       // poison the window math.
       const measured = entries[0]?.contentRect.height;
       viewportHeight = Number.isFinite(measured) && measured > 0 ? measured : 0;
     });
-    observer.observe(el);
-    return () => observer.disconnect();
   });
 
   // Honor an externally written scroll position (split-pane sync). The guard

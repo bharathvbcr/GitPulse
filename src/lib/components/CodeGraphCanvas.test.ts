@@ -25,6 +25,7 @@ describe("CodeGraphCanvas", () => {
     expect(source).toContain("paintCodeGraph");
     expect(source).toContain("acquireGpu2dContext");
     expect(source).toContain("createFrameScheduler");
+    expect(source).toContain("observeResize");
     expect(source).not.toMatch(/from ["'].*\/GraphRenderer["']/);
     expect(source).not.toContain("VisualCommitRow");
   });

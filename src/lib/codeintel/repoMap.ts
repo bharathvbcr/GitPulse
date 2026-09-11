@@ -5,7 +5,12 @@
  * pairs shown length with `liveness_meta` / `role_file_counts` totals.
  */
 
-import type { DevmapStatusPayload, RepoMapDocument, RepoMapSubsystem } from "./types";
+import type {
+  DevmapStatusPayload,
+  RepoMapDocument,
+  RepoMapSubsystem,
+  RepoMapUnwiredMeta,
+} from "./types";
 import { dedupePreserveOrder } from "../ui/eachKeys";
 
 export function formatCap(shown: number, total: number, truncated: boolean): string {
@@ -83,4 +88,39 @@ export function preferredDeadLists(map: RepoMapDocument): {
       : dedupePreserveOrder(map.unreachable_files ?? []),
     unreachableSuppressed,
   };
+}
+
+/**
+ * The "Excluded:" line under the unwired list, as `label count` phrases.
+ *
+ * Every counter is optional and every one means something different when it is
+ * missing rather than zero: a map written before the kernel gained the
+ * file-liveness rule carries no `excluded_not_code` key at all, and rendering
+ * that as `not code 0` would claim the producer looked and found none. An
+ * absent counter contributes no phrase; a present zero contributes none either,
+ * because "excluded nothing" is what an empty line already says.
+ *
+ * `excluded_directory_unit` is deliberately rendered *inside* the exempt
+ * phrase rather than beside it. It is a subset of `excluded_exempt`, and two
+ * numbers side by side in one list read as two populations — a reader adding
+ * them up would double-count every Terraform file in the repository.
+ */
+export function unwiredExclusionSummary(meta: RepoMapUnwiredMeta): string[] {
+  const phrases: string[] = [];
+  const push = (label: string, count: number | undefined, suffix = "") => {
+    if (!isCount(count) || count === 0) return;
+    phrases.push(`${label} ${count}${suffix}`);
+  };
+  push("coverage loss", meta.excluded_coverage_loss);
+  push("import-blind", meta.excluded_import_blind);
+  push("not code", meta.excluded_not_code);
+  const directoryUnit = meta.excluded_directory_unit;
+  push(
+    "exempt",
+    meta.excluded_exempt,
+    isCount(directoryUnit) && directoryUnit > 0
+      ? ` (${directoryUnit} whose unit is a directory)`
+      : "",
+  );
+  return phrases;
 }

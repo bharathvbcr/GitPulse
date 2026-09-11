@@ -15,11 +15,12 @@ use crate::engine::git_reader::{
     LanguageStatsReport, PulseReport, ReflogEntry,
 };
 use crate::engine::git_writer::{
-    reworded_message, validate_oid_or_revision, validate_ref_name, RebaseStep,
+    reworded_message, validate_oid_or_revision, validate_ref_name, IndexAction, RebaseStep,
+    StashSaveOptions,
 };
 use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, OperationAction, RemoteChange,
-    RemoteList, RepoOperation, ResetMode, StashAction, StashEntry, SubmoduleChange, SubmoduleList,
+    RemoteList, RepoOperation, ResetMode, StashAction, SubmoduleChange, SubmoduleList,
     WorktreeInfo,
 };
 use crate::github::{
@@ -670,12 +671,14 @@ pub async fn cmd_syntax_highlight(
 #[tauri::command(async)]
 pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        // GitWriter uses this literal pathspec, so the harness judges the
-        // command that will actually reach Git rather than a paraphrase.
-        let spec = format!(":(literal){file_path}");
-        let argv = ["git", "add", "--", spec.as_str()];
-        let policy = guard(&repo_path, &argv)?;
-        GitWriter::stage_file(&repo_path, &file_path)?;
+        let (verdicts, _) =
+            GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Stage, |argv| {
+                guard(&repo_path, argv)
+            })?;
+        let policy = verdicts
+            .into_iter()
+            .reduce(strictest_verdict)
+            .ok_or("No index commands were evaluated")?;
         Ok(Guarded { policy, output: () })
     })
     .await
@@ -684,11 +687,36 @@ pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guar
 #[tauri::command(async)]
 pub async fn cmd_unstage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let spec = format!(":(literal){file_path}");
-        let argv = ["git", "restore", "--staged", "--", spec.as_str()];
-        let policy = guard(&repo_path, &argv)?;
-        GitWriter::unstage_file(&repo_path, &file_path)?;
+        let (verdicts, _) =
+            GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Unstage, |argv| {
+                guard(&repo_path, argv)
+            })?;
+        let policy = verdicts
+            .into_iter()
+            .reduce(strictest_verdict)
+            .ok_or("No index commands were evaluated")?;
         Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+/// Batch stage/unstage uses the same literal-path executor as single-file actions.
+#[tauri::command(async)]
+pub async fn cmd_change_index(
+    repo_path: String,
+    file_paths: Vec<String>,
+    action: IndexAction,
+) -> Result<Guarded<usize>, String> {
+    off_thread(move || {
+        let (verdicts, output) =
+            GitWriter::change_index_with(&repo_path, &file_paths, action, |argv| {
+                guard(&repo_path, argv)
+            })?;
+        let policy = verdicts
+            .into_iter()
+            .reduce(strictest_verdict)
+            .ok_or("No index commands were evaluated")?;
+        Ok(Guarded { policy, output })
     })
     .await
 }
@@ -810,7 +838,7 @@ pub async fn cmd_checkout_branch(
     branch_name: String,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        // checkout_branch tries `switch --guess`, then plain `checkout`,
+        // checkout_branch tries `switch --guess`, then revision-only `checkout`,
         // falling through on failure. Both can execute, so both are judged;
         // a refusal of either refuses the action (a policy denying
         // `git checkout X` must not be routed around by running
@@ -822,7 +850,12 @@ pub async fn cmd_checkout_branch(
                 "--guess".into(),
                 branch_name.clone(),
             ],
-            vec!["git".into(), "checkout".into(), branch_name.clone()],
+            vec![
+                "git".into(),
+                "checkout".into(),
+                branch_name.clone(),
+                "--".into(),
+            ],
         ];
         let mut representative: Option<crate::harness::PolicyVerdict> = None;
         for argv in &attempts {
@@ -1414,14 +1447,13 @@ pub async fn cmd_restack(
 pub async fn cmd_stash_save(
     repo_path: String,
     message: Option<String>,
+    options: Option<StashSaveOptions>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        let mut argv = vec!["git", "stash", "push", "-u"];
-        if message.is_some() {
-            argv.extend(["-m", message.as_deref().unwrap_or_default()]);
-        }
+        let options = options.unwrap_or_default();
+        let argv = options.argv(message.as_deref());
         let policy = guard(&repo_path, &argv)?;
-        let output = GitWriter::stash_save(&repo_path, message.as_deref())?;
+        let output = GitWriter::stash_save_with(&repo_path, message.as_deref(), options)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -1441,13 +1473,13 @@ pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, String>
 
 /// Lists the stash stack. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_stash_list(repo_path: String) -> Result<Vec<StashEntry>, String> {
+pub async fn cmd_stash_list(repo_path: String) -> Result<crate::engine::stash::StashList, String> {
     off_thread(move || crate::engine::stash::list(&repo_path)).await
 }
 
 /// Renders the diff a stash entry holds, addressed by object id.
 #[tauri::command(async)]
-pub async fn cmd_stash_show(repo_path: String, oid: String) -> Result<String, String> {
+pub async fn cmd_stash_show(repo_path: String, oid: String) -> Result<DiffPayload, String> {
     off_thread(move || crate::engine::stash::show(&repo_path, &oid)).await
 }
 
@@ -1741,6 +1773,7 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
             alerts: Vec::new(),
             truncated: false,
             error: Some(e),
+            unavailable_reason: Some(crate::github::GithubUnavailableReason::Transport),
         })
 }
 
@@ -1759,6 +1792,7 @@ pub async fn cmd_github_code_scanning_alerts(repo_path: String) -> CodeScanningR
             alerts: Vec::new(),
             truncated: false,
             error: Some(e),
+            unavailable_reason: Some(crate::github::GithubUnavailableReason::Transport),
         })
 }
 
@@ -3532,13 +3566,21 @@ pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, String> 
 /// Build the code map via the installed `devmap` CLI.
 #[tauri::command(async)]
 pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
-    off_thread(move || crate::devmap::build(&repo_path)).await
+    off_thread(move || {
+        crate::devmap::clear_live_echo_cooldown(&repo_path);
+        crate::devmap::build(&repo_path)
+    })
+    .await
 }
 
 /// Incremental refresh via the installed `devmap` CLI.
 #[tauri::command(async)]
 pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
-    off_thread(move || crate::devmap::refresh(&repo_path)).await
+    off_thread(move || {
+        crate::devmap::clear_live_echo_cooldown(&repo_path);
+        crate::devmap::refresh(&repo_path)
+    })
+    .await
 }
 
 /// Watcher-driven live index: refresh only when stale, schema-ok, and idle.

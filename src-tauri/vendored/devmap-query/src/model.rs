@@ -577,9 +577,11 @@ impl FreshnessInfo {
     /// The kernel's `head_sha` is the head of the last generation actually
     /// persisted; a consumer's staleness check asks whether the artifact
     /// describes the tree at the *current* `git rev-parse HEAD`. An incremental
-    /// build that finds nothing changed persists no generation, so after a
-    /// commit touching nothing indexed the kernel value points at the previous
-    /// commit and the map reads stale the moment it is written.
+    /// build that finds nothing changed used to persist no generation, so after
+    /// a commit touching nothing indexed the kernel value pointed at the
+    /// previous commit and the map read stale the moment it was written. The
+    /// skip path now restamps that generation's `head_sha` once file hashes
+    /// have proved the tree unchanged, so the two agree.
     pub fn generated_head(&self) -> &str {
         self.stamped
             .generated_head

@@ -6,7 +6,8 @@ import { statusFixture } from "../../../harness/statusFixtures";
 describe("status window connection", () => {
   it("retries a failed subscription before loading the snapshot", async () => {
     const stop = vi.fn();
-    const read = vi.fn().mockResolvedValue(statusFixture("changes"));
+    const snapshot = statusFixture("changes");
+    const read = vi.fn().mockResolvedValue(snapshot);
     const subscribe = vi.fn().mockRejectedValueOnce(new Error("bridge starting"))
       .mockResolvedValue(stop);
     const apply = vi.fn();
@@ -17,7 +18,7 @@ describe("status window connection", () => {
     expect(failed).toHaveBeenCalledTimes(1);
     await connection.connect();
     expect(subscribe).toHaveBeenCalledTimes(2);
-    expect(apply).toHaveBeenCalledWith(statusFixture("changes"));
+    expect(apply).toHaveBeenCalledWith(snapshot);
     connection.dispose();
     expect(stop).toHaveBeenCalledTimes(1);
   });
@@ -26,6 +27,8 @@ describe("status window connection", () => {
     let receive: ((snapshot: MenuState) => void) | undefined;
     let resolve: ((snapshot: MenuState) => void) | undefined;
     let reject: ((error: Error) => void) | undefined;
+    const conflicts = statusFixture("conflicts");
+    const clean = statusFixture("clean");
     const read = vi.fn(() => new Promise<MenuState>((yes, no) => { resolve = yes; reject = no; }));
     const subscribe = vi.fn(async (callback: (snapshot: MenuState) => void) => { receive = callback; return vi.fn(); });
     const apply = vi.fn();
@@ -34,11 +37,11 @@ describe("status window connection", () => {
     const loading = connection.connect();
     expect(connection.connect()).toBe(loading);
     await Promise.resolve();
-    receive!(statusFixture("conflicts"));
+    receive!(conflicts);
     if (fails) reject!(new Error("stale request failed"));
-    else resolve!(statusFixture("clean"));
+    else resolve!(clean);
     await loading;
-    expect(apply.mock.calls).toEqual([[statusFixture("conflicts")]]);
+    expect(apply.mock.calls).toEqual([[conflicts]]);
     expect(failed).not.toHaveBeenCalled();
     connection.dispose();
   });

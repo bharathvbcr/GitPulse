@@ -646,37 +646,37 @@
                       checked={$interfaceStore.showStatusIcon}
                       onchange={(next) => interfaceStore.setShowStatusIcon(next)}
                     />
-                    {#if $interfaceStore.showStatusIcon}
-                      <div class="mt-3 space-y-3 pl-1">
-                        <div data-setting="hide-dock">
-                          <SettingToggle
-                            label="Hide Dock icon while closed"
-                            description="Keep GitPulse in the menu bar only after you close the window. Opening GitPulse from the status panel restores the Dock."
-                            ariaLabel="Hide Dock icon while the main window is closed"
-                            checked={$interfaceStore.hideDockWhenClosed}
-                            onchange={(next) => interfaceStore.setHideDockWhenClosed(next)}
-                          />
-                        </div>
-                        <div data-setting="status-icon-counts">
-                          <SettingToggle
-                            label="Show counts beside the icon"
-                            description="Optional changed and conflict counts next to the menu bar glyph. Off by default."
-                            ariaLabel="Show counts beside the menu bar status icon"
-                            checked={$interfaceStore.statusIconCounts}
-                            onchange={(next) => interfaceStore.setStatusIconCounts(next)}
-                          />
-                        </div>
-                        <div data-setting="launch-at-login">
-                          <SettingToggle
-                            label="Launch at login"
-                            description="Start GitPulse when you sign in. Uses a per-user LaunchAgent; the operating system is the source of truth."
-                            ariaLabel="Launch GitPulse at login"
-                            checked={launchAtLogin}
-                            onchange={(next) => void setLaunchAtLogin(next)}
-                          />
-                        </div>
-                      </div>
-                    {/if}
+                  </div>
+                  <div class="space-y-3 pl-1">
+                    <div data-setting="hide-dock" hidden={!shown("hide-dock")}>
+                      <SettingToggle
+                        label="Hide Dock icon while closed"
+                        description="Keep GitPulse in the menu bar only after you close the window. Opening GitPulse from the status panel restores the Dock."
+                        ariaLabel="Hide Dock icon while the main window is closed"
+                        checked={$interfaceStore.hideDockWhenClosed}
+                        disabled={!$interfaceStore.showStatusIcon}
+                        onchange={(next) => interfaceStore.setHideDockWhenClosed(next)}
+                      />
+                    </div>
+                    <div data-setting="status-icon-counts" hidden={!shown("status-icon-counts")}>
+                      <SettingToggle
+                        label="Show counts beside the icon"
+                        description="Optional changed and conflict counts next to the menu bar glyph. Off by default."
+                        ariaLabel="Show counts beside the menu bar status icon"
+                        checked={$interfaceStore.statusIconCounts}
+                        disabled={!$interfaceStore.showStatusIcon}
+                        onchange={(next) => interfaceStore.setStatusIconCounts(next)}
+                      />
+                    </div>
+                    <div data-setting="launch-at-login" hidden={!shown("launch-at-login")}>
+                      <SettingToggle
+                        label="Launch at login"
+                        description="Start GitPulse when you sign in. Uses a per-user LaunchAgent; the operating system is the source of truth."
+                        ariaLabel="Launch GitPulse at login"
+                        checked={launchAtLogin}
+                        onchange={(next) => void setLaunchAtLogin(next)}
+                      />
+                    </div>
                   </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>
                     <div class="text-textMuted text-[10px] mb-1.5">Status bar</div>

@@ -196,3 +196,11 @@ required-features = ["parse"]
 [[test]]
 name = "impact_layers_come_from_the_kernel"
 required-features = ["parse"]
+
+[[test]]
+name = "file_liveness_characterization"
+required-features = ["parse"]
+
+[[test]]
+name = "unwired_never_names_a_non_code_file"
+required-features = ["parse"]

@@ -61,7 +61,7 @@ fn a_deep_stash_stack_lists_coherently() {
         push_stash(dir, &format!("wip {i}"), &format!("content {i}\n"));
     }
 
-    let entries = stash::list(&dir.to_string_lossy()).unwrap();
+    let entries = stash::list(&dir.to_string_lossy()).unwrap().entries;
     assert_eq!(entries.len(), DEPTH);
 
     let mut indices = HashSet::new();
@@ -99,7 +99,7 @@ fn concurrent_drops_never_destroy_an_unselected_entry() {
         push_stash(dir, &format!("wip {i}"), &format!("content {i}\n"));
     }
 
-    let snapshot = stash::list(&dir.to_string_lossy()).unwrap();
+    let snapshot = stash::list(&dir.to_string_lossy()).unwrap().entries;
     let path = dir.to_string_lossy().into_owned();
     // Every thread targets a DIFFERENT index from the same snapshot. Only the
     // ones whose index still holds their oid may succeed.
@@ -126,7 +126,7 @@ fn concurrent_drops_never_destroy_an_unselected_entry() {
         .filter_map(|r| r.as_ref().ok())
         .cloned()
         .collect();
-    let remaining = stash::list(&dir.to_string_lossy()).unwrap();
+    let remaining = stash::list(&dir.to_string_lossy()).unwrap().entries;
     let remaining_oids: HashSet<String> = remaining.iter().map(|e| e.oid.clone()).collect();
 
     // Conservation: every original entry is either dropped or still present,
@@ -170,10 +170,10 @@ fn repeated_push_and_pop_cycles_return_to_an_empty_stack() {
             &format!("round {round}"),
             &format!("content {round}\n"),
         );
-        let entry = stash::list(&path).unwrap()[0].clone();
+        let entry = stash::list(&path).unwrap().entries[0].clone();
         stash::run_action_with(&path, StashAction::Pop, entry.index, &entry.oid, allow).unwrap();
         assert!(
-            stash::list(&path).unwrap().is_empty(),
+            stash::list(&path).unwrap().entries.is_empty(),
             "round {round}: pop left an entry behind"
         );
         // The popped content is back in the working tree; reset for the next
@@ -190,7 +190,7 @@ fn concurrent_listing_is_consistent_and_side_effect_free() {
     for i in 0..8 {
         push_stash(dir, &format!("wip {i}"), &format!("content {i}\n"));
     }
-    let expected = stash::list(&dir.to_string_lossy()).unwrap();
+    let expected = stash::list(&dir.to_string_lossy()).unwrap().entries;
     let path = dir.to_string_lossy().into_owned();
 
     let handles: Vec<_> = (0..10)
@@ -199,7 +199,7 @@ fn concurrent_listing_is_consistent_and_side_effect_free() {
             let expected = expected.clone();
             std::thread::spawn(move || {
                 for _ in 0..20 {
-                    assert_eq!(stash::list(&path).unwrap(), expected);
+                    assert_eq!(stash::list(&path).unwrap().entries, expected);
                 }
             })
         })
@@ -207,7 +207,7 @@ fn concurrent_listing_is_consistent_and_side_effect_free() {
     for handle in handles {
         handle.join().expect("no listing thread may panic");
     }
-    assert_eq!(stash::list(&path).unwrap(), expected);
+    assert_eq!(stash::list(&path).unwrap().entries, expected);
 }
 
 /// Messages that break naive parsing must survive listing intact.
@@ -228,7 +228,7 @@ fn adversarial_stash_messages_survive_listing() {
         push_stash(dir, message, &format!("content {i}\n"));
     }
 
-    let entries = stash::list(&dir.to_string_lossy()).unwrap();
+    let entries = stash::list(&dir.to_string_lossy()).unwrap().entries;
     assert_eq!(entries.len(), messages.len());
     // Every entry keeps a non-empty message and a distinct object id; none
     // collapsed into another's identity.
@@ -249,7 +249,7 @@ fn a_branch_name_with_separators_is_attributed_correctly() {
     run_git(dir, &["checkout", "-b", "feature/auth.v2/oauth"]);
     push_stash(dir, "half-done", "x\n");
 
-    let entries = stash::list(&dir.to_string_lossy()).unwrap();
+    let entries = stash::list(&dir.to_string_lossy()).unwrap().entries;
     assert_eq!(entries[0].branch.as_deref(), Some("feature/auth.v2/oauth"));
     assert_eq!(entries[0].message, "half-done");
 }

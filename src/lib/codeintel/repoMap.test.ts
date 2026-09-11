@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { coverageGapSummary, formatCap, preferredDeadLists, roleSample } from "./repoMap";
+import {
+  coverageGapSummary,
+  formatCap,
+  preferredDeadLists,
+  roleSample,
+  unwiredExclusionSummary,
+} from "./repoMap";
 import type { RepoMapDocument, RepoMapSubsystem } from "./types";
 
 function emptyMeta() {
@@ -206,5 +212,72 @@ describe("repoMap honesty helpers", () => {
     expect(lists.unwired).toEqual(["a.rs", "b.rs"]);
     expect(lists.deadSymbols).toEqual(["a.rs::f", "b.rs::g"]);
     expect(lists.unreachable).toEqual(["x.rs"]);
+  });
+});
+
+describe("unwiredExclusionSummary", () => {
+  it("omits a counter the producer never wrote, and one that is zero", () => {
+    // A map from a kernel older than the file-liveness rule carries neither
+    // `excluded_not_code` nor `excluded_exempt`. Rendering `not code 0` there
+    // would claim the producer looked and found none, which is the exact
+    // "a check that could not run reports what a passing check reports"
+    // failure the honesty helpers in this module exist to prevent.
+    expect(
+      unwiredExclusionSummary({
+        shown: 0,
+        total: 0,
+        truncated: false,
+        excluded_coverage_loss: 0,
+        excluded_import_blind: 0,
+      }),
+    ).toEqual([]);
+
+    expect(
+      unwiredExclusionSummary({
+        shown: 1,
+        total: 1,
+        truncated: false,
+        excluded_coverage_loss: 0,
+        excluded_import_blind: 3,
+        excluded_not_code: 0,
+        excluded_exempt: 0,
+      }),
+    ).toEqual(["import-blind 3"]);
+  });
+
+  it("renders the directory-unit count inside the exempt phrase, never beside it", () => {
+    // It is a *subset* of `excluded_exempt`. Two numbers side by side in one
+    // list read as two populations, and a reader adding them up double-counts
+    // every Terraform file in the repository.
+    const phrases = unwiredExclusionSummary({
+      shown: 2,
+      total: 2,
+      truncated: false,
+      excluded_coverage_loss: 1,
+      excluded_import_blind: 2,
+      excluded_not_code: 40,
+      excluded_exempt: 12,
+      excluded_directory_unit: 4,
+    });
+    expect(phrases).toEqual([
+      "coverage loss 1",
+      "import-blind 2",
+      "not code 40",
+      "exempt 12 (4 whose unit is a directory)",
+    ]);
+    expect(phrases.some((phrase) => phrase === "directory unit 4")).toBe(false);
+  });
+
+  it("refuses a malformed count rather than rendering it", () => {
+    const phrases = unwiredExclusionSummary({
+      shown: 0,
+      total: 0,
+      truncated: false,
+      excluded_coverage_loss: 0,
+      excluded_import_blind: 0,
+      excluded_not_code: Number.NaN as unknown as number,
+      excluded_exempt: -1 as unknown as number,
+    });
+    expect(phrases).toEqual([]);
   });
 });

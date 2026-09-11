@@ -87,6 +87,11 @@ pub fn is_vendored_path(path: &str) -> bool {
     {
         return true;
     }
+    // Tauri apps vendor tao/wry/webkit under `src-tauri/framework/`. A bare
+    // `framework` segment would swallow `src/framework/app.ts`.
+    if norm.starts_with("src-tauri/framework/") || norm.contains("/src-tauri/framework/") {
+        return true;
+    }
     is_minified_bundle(&norm)
 }
 
@@ -273,6 +278,326 @@ pub fn rust_attribute_entry_reason(attribute_path: &str) -> Option<&'static str>
 ///
 /// `rust_path_declares_main` answers the narrower symbol-level question and
 /// delegates here, so the two cannot disagree about what `examples/` means.
+/// Why a JS/TS/HTML file is a toolchain root, if it is.
+///
+/// Python `structural_exemptions` already treated these as wired-by-convention
+/// so they would not be proposed for deletion. The kernel's `unwired_candidates`
+/// never asked that question, so a Vite config, a `src/main.ts` HTML entry,
+/// a `scripts/` CLI, and an ambient `.d.ts` were reported as stranded modules
+/// even though nothing in the source is supposed to import them.
+///
+/// A `TargetRoot`, not a `ScriptEntry`: the file is reachable and its unused
+/// helpers are still dead, the same split `rust_target_root_reason` already
+/// owns for Cargo.
+///
+/// Two arms this function used to own have moved out, and neither is a
+/// behaviour change to *this* predicate's callers so much as a correction to
+/// what the annotation says. `*.d.ts` is [`WiringKind::AmbientDeclaration`]
+/// now, because a declaration file is not a place execution starts and
+/// `is_entry_root` is read by `subsystem_map.is_entry_root` as exactly that
+/// claim; `*.config.*` is [`WiringKind::ToolConfig`], which stays an entry
+/// root and joins the rest of the by-convention table in
+/// [`tool_config_reason`] rather than being the one member of it that lives
+/// somewhere else.
+pub fn js_target_root_reason(path: &str) -> Option<&'static str> {
+    let norm = path.replace('\\', "/");
+    let name = norm.rsplit('/').next().unwrap_or(&norm);
+    if name.contains(".stories.")
+        || name.ends_with(".stories.ts")
+        || name.ends_with(".stories.tsx")
+        || name.ends_with(".stories.js")
+        || name.ends_with(".stories.jsx")
+    {
+        return Some("Component storybook file");
+    }
+    let suffix = file_suffix(&norm).to_ascii_lowercase();
+    let parents: Vec<&str> = norm.split('/').rev().skip(1).collect();
+    if parents
+        .iter()
+        .any(|dir| matches!(*dir, "scripts" | "bin" | "benchmarks"))
+    {
+        return Some("CLI / script directory");
+    }
+    // Mirrors `_JS_MAIN_SEED_RE`: `src/main.ts`, `src/index.tsx`, a top-level
+    // `App.tsx`, and a service `index` module. These are the files an HTML
+    // `<script type="module">` or a bundler names, and they have no importer.
+    let stem_path = norm.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&norm);
+    if matches!(suffix.as_str(), "ts" | "tsx" | "js" | "jsx" | "mjs")
+        && (stem_path.ends_with("/src/main")
+            || stem_path.ends_with("/src/index")
+            || stem_path == "src/main"
+            || stem_path == "src/index"
+            || name == "App.ts"
+            || name == "App.tsx"
+            || name == "App.js"
+            || name == "App.jsx"
+            || name == "App.mjs"
+            || stem_path.ends_with("/server/index")
+            || stem_path.ends_with("/api/index")
+            || stem_path.ends_with("/backend/index")
+            || stem_path.ends_with("/worker/index")
+            || stem_path.ends_with("/functions/index")
+            || stem_path.ends_with("/lambda/index"))
+    {
+        return Some("JavaScript/TypeScript application entry");
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// File-level rules for code nothing imports and nothing should.
+//
+// Each answers "who reaches this file, if not an importer". They feed
+// `FileLiveness::Exempt` through an annotation, so a rule here removes a path
+// from every file-level verdict at once — `unwired_candidates`,
+// `unreachable_files`, and the dead-cluster file roll-up. That is the reason
+// each one is keyed on something a toolchain reserves rather than on a
+// suggestive substring.
+// ---------------------------------------------------------------------------
+
+/// Whether the file opens with a `#!` interpreter line.
+///
+/// The most reliable "somebody runs this" signal there is, and the kernel had
+/// no rule for it at all: measured, 10+ shell scripts in this repository and
+/// 40+ in another local tree were reported as stranded modules. Universal
+/// across languages, because the kernel is what the operating system reads and
+/// it does not care what the extension says.
+///
+/// A UTF-8 BOM is skipped — editors write one and the two bytes in front of
+/// `#!` would otherwise hide the line — and a CRLF file is unaffected, because
+/// the marker is a prefix and the `\r` sits at the other end. The line number
+/// is not negotiable: `#!` on line 2 is a comment, and `exec(2)` agrees.
+pub fn has_shebang(source: &str) -> bool {
+    let first = source.split('\n').next().unwrap_or("");
+    first
+        .strip_prefix('\u{feff}')
+        .unwrap_or(first)
+        .starts_with("#!")
+}
+
+/// Directory names that hold test data rather than program text.
+///
+/// Kept apart from [`is_test_path`], which is pinned equal to
+/// `devcouncil.indexing.wiring.is_test_path` by a parity test — widening that
+/// one would break the parity rather than fix the finding.
+const FIXTURE_DIR_SEGMENTS: &[&str] = &[
+    "testdata",
+    "test-data",
+    "test_data",
+    "fixtures",
+    "__fixtures__",
+    "__snapshots__",
+    "golden",
+    "examples",
+    "example",
+];
+
+/// Whether `path` sits inside a fixture, snapshot or example tree.
+///
+/// Matched on **directory segments only**. A file *named* `testdata` — a Go
+/// project checking one in at the root is ordinary — is program text sitting
+/// beside the fixtures, not a fixture, and the same trap
+/// `a_file_named_like_the_jvm_test_directory_is_not_a_test_path` already
+/// documents for `src/test`.
+///
+/// Case-insensitive, because `Fixtures/` and `TestData/` are what a JVM or
+/// .NET tree calls the same directory.
+pub fn is_fixture_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/").to_lowercase();
+    norm.split('/')
+        .rev()
+        .skip(1)
+        .any(|segment| FIXTURE_DIR_SEGMENTS.contains(&segment))
+}
+
+/// Basenames a toolchain finds by convention, and the tool that finds them.
+///
+/// Exact names, matched case-sensitively where the ecosystem writes them
+/// case-sensitively. The reason string names the tool because it is what a
+/// reader checks the exemption against: "Bundler / test-runner config" is
+/// auditable, "tool config" is not.
+const TOOL_CONFIG_BASENAMES: &[(&str, &str)] = &[
+    ("build.gradle", "Gradle build script"),
+    ("build.gradle.kts", "Gradle build script"),
+    ("settings.gradle", "Gradle settings script"),
+    ("settings.gradle.kts", "Gradle settings script"),
+    ("Package.swift", "Swift package manifest"),
+    ("Podfile", "CocoaPods manifest"),
+    ("Fastfile", "fastlane lane definitions"),
+    ("Gemfile", "Bundler manifest"),
+    ("Rakefile", "Rake task definitions"),
+    ("Brewfile", "Homebrew bundle manifest"),
+    ("Vagrantfile", "Vagrant machine definition"),
+    ("Jenkinsfile", "Jenkins pipeline definition"),
+    ("Snakefile", "Snakemake workflow"),
+    ("setup.py", "setuptools build script"),
+    ("noxfile.py", "nox session definitions"),
+    ("fabfile.py", "Fabric task definitions"),
+    ("manage.py", "Django management entry point"),
+    (
+        "wsgi.py",
+        "WSGI application object a server imports by path",
+    ),
+    (
+        "asgi.py",
+        "ASGI application object a server imports by path",
+    ),
+    ("gunicorn.conf.py", "gunicorn configuration"),
+    ("locustfile.py", "Locust load-test definitions"),
+];
+
+/// Basenames a tool finds by convention only inside one directory.
+///
+/// `conf.py` is Sphinx's *and* an ordinary module name, and `env.py` is
+/// Alembic's *and* the name half the world gives a settings module. Neither is
+/// safe as a bare basename: the exemption would clear a real finding every
+/// time somebody wrote `app/conf.py`. Keyed on `(parent directory, basename)`
+/// so the claim is as narrow as the convention is.
+const TOOL_CONFIG_IN_DIRECTORY: &[(&str, &str, &str)] = &[
+    ("docs", "conf.py", "Sphinx configuration"),
+    ("alembic", "env.py", "Alembic migration environment"),
+    ("migrations", "env.py", "Alembic migration environment"),
+];
+
+/// Why a toolchain reads `path` because of what it is called, or `None`.
+///
+/// The measured false-positive class this exists for: `vite.config.ts`,
+/// `vitest.setup.ts`, `playwright.config.ts`, `postcss.config.js`,
+/// `tailwind.config.js`, `eslint.config.js`, `build.gradle.kts`,
+/// `Package.swift`, `noxfile.py`, `docs/conf.py`. Nothing in a repository
+/// imports one, nothing should, and every one of them was a delete-this
+/// suggestion.
+///
+/// A [`WiringKind::ToolConfig`], which `is_entry_root` treats as an entry
+/// root — which is what it is. It does not exempt the file's *symbols*: a
+/// helper nobody calls inside a `noxfile.py` is as dead as one anywhere else,
+/// the same split [`rust_target_root_reason`] already owns.
+pub fn tool_config_reason(path: &str) -> Option<&'static str> {
+    let norm = path.replace('\\', "/");
+    let name = norm.rsplit('/').next().unwrap_or(&norm);
+    if let Some((_, reason)) = TOOL_CONFIG_BASENAMES
+        .iter()
+        .find(|(basename, _)| *basename == name)
+    {
+        return Some(reason);
+    }
+    let parent = norm.rsplit('/').nth(1).unwrap_or("");
+    if let Some((_, _, reason)) = TOOL_CONFIG_IN_DIRECTORY
+        .iter()
+        .find(|(directory, basename, _)| *directory == parent && *basename == name)
+    {
+        return Some(reason);
+    }
+    // `<anything>.config.<ext>` / `.conf.` / `.setup.`, which is how the
+    // JS ecosystem spells the same convention. Anchored on the *compound*
+    // suffix rather than on a substring, so `src/configure.ts` and
+    // `src/setupNetwork.ts` stay ordinary code.
+    let suffix = file_suffix(&norm).to_ascii_lowercase();
+    let is_js_suffix = matches!(
+        suffix.as_str(),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts"
+    );
+    if is_js_suffix {
+        let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+        if let Some(marker) = stem.rsplit_once('.').map(|(_, marker)| marker) {
+            match marker {
+                "config" => return Some("Bundler / test-runner config"),
+                "conf" => return Some("Tool configuration read by name"),
+                "setup" => return Some("Test-runner setup file loaded by the harness"),
+                _ => {}
+            }
+        }
+        // Jest and CRA's spelling, which has no dot before the marker.
+        if stem == "setupTests" || stem == "setupTest" {
+            return Some("Test-runner setup file loaded by the harness");
+        }
+    }
+    None
+}
+
+/// Whether `path` is a TypeScript ambient declaration.
+///
+/// `foo.d.ts`, and not a directory called `d.ts` nor a file called `d.ts`
+/// itself — the marker is the compound suffix on a name that has a stem.
+pub fn is_ambient_declaration(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    let name = norm.rsplit('/').next().unwrap_or(&norm);
+    name.len() > ".d.ts".len() && name.ends_with(".d.ts")
+}
+
+/// Barrel-module basenames: a file whose job is to re-export its directory.
+const BARREL_BASENAMES: &[&str] = &[
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+    "index.mts",
+    "index.cts",
+];
+
+/// Why `path` is a package marker rather than a module somebody imports, or
+/// `None`.
+///
+/// `__init__.py` is the measured case: 35 of them were unwired candidates here,
+/// because [`looks_like_reexport_init`] clears only the *re-export-only* ones
+/// and an empty or docstring-only marker is the commoner shape. Every
+/// `import pkg.sub` in the tree runs the package's `__init__.py`, and not one
+/// of them names it.
+///
+/// A barrel `index.ts` earns the same verdict only when it really is one:
+/// every meaningful line re-exports, and at least one does. A file that
+/// happens to be called `index.ts` and holds real code is ordinary product
+/// code, and clearing it would hide a stranded module behind a filename.
+pub fn package_marker_reason(path: &str, source: &str) -> Option<&'static str> {
+    let norm = path.replace('\\', "/");
+    let name = norm.rsplit('/').next().unwrap_or(&norm);
+    if name == "__init__.py" {
+        return Some("Python package marker: every submodule import runs it, and none names it");
+    }
+    if name == "package-info.java" {
+        return Some("Java package declaration file read by the compiler");
+    }
+    if BARREL_BASENAMES.contains(&name) && looks_like_reexport_barrel(source) {
+        return Some("Re-export barrel: it names its directory's modules and nothing names it");
+    }
+    None
+}
+
+/// Whether a JS/TS module's whole body is re-exports.
+///
+/// Line-based, like [`looks_like_reexport_init`], and refuses on anything it
+/// does not recognise — a multi-line `export { … } from` falls through to
+/// "not a barrel". That is the fail-open direction for this rule: the file
+/// stays a candidate, so a reader sees one finding too many rather than one
+/// too few.
+fn looks_like_reexport_barrel(source: &str) -> bool {
+    let mut has_reexport = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+        {
+            continue;
+        }
+        let is_reexport = (trimmed.starts_with("export ") || trimmed.starts_with("export{"))
+            && trimmed.contains(" from ")
+            && trimmed.ends_with(';');
+        if is_reexport {
+            has_reexport = true;
+            continue;
+        }
+        if trimmed.starts_with("import ") {
+            continue;
+        }
+        return false;
+    }
+    has_reexport
+}
+
 pub fn rust_target_root_reason(path: &str) -> Option<&'static str> {
     let norm = path.replace('\\', "/");
     let name = norm.rsplit('/').next().unwrap_or(&norm);
@@ -508,6 +833,28 @@ pub fn js_lifecycle_hook_reason(name: &str) -> Option<&'static str> {
         | "disconnectedCallback"
         | "adoptedCallback"
         | "attributeChangedCallback" => "custom-element lifecycle hook called by the DOM",
+        _ => return None,
+    })
+}
+
+/// Object methods a bundler invokes by name on a plugin it constructed.
+///
+/// Restricted to `method_definition` at the call site (same gate as
+/// [`js_lifecycle_hook_reason`]): `generateBundle` as a free function is an
+/// ordinary name. Vite/Rollup look these up on the plugin object, so they
+/// have no in-repo caller and otherwise become extracted-dead.
+pub fn js_bundler_plugin_hook_reason(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // Distinctive Rollup/Vite names only. `transform`, `load`, `options`,
+        // and `config` are ordinary methods on application objects.
+        "generateBundle" | "writeBundle" | "closeBundle" | "renderChunk" => {
+            "Rollup plugin hook invoked by the bundler"
+        }
+        "configureServer"
+        | "configurePreviewServer"
+        | "transformIndexHtml"
+        | "handleHotUpdate"
+        | "hotUpdate" => "Vite plugin hook invoked by the bundler",
         _ => return None,
     })
 }
@@ -798,6 +1145,14 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
         });
     }
 
+    if is_fixture_path(path) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::Fixture,
+            target_symbol: path.to_string(),
+            details: "Fixture, snapshot or example tree".to_string(),
+        });
+    }
+
     if is_generated_path(path) || source_has_generated_header(source) {
         annotations.push(WiringAnnotation {
             kind: WiringKind::GeneratedFile,
@@ -853,6 +1208,65 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
         });
     }
 
+    // The operating system's own answer to "who runs this". Checked on the
+    // file's first line rather than on its extension, because that is what
+    // `exec(2)` reads — and `__main__.py`, which `python -m pkg` runs by name
+    // and which carries no shebang.
+    //
+    // A `ScriptEntry`, so it exempts the file's symbols too: a function
+    // declared in a script is called by the script, and there is no other
+    // place for it to be called from.
+    if !matches!(
+        crate::languages::liveness_unit_for_language(&crate::languages::detect_language(
+            std::path::Path::new(path)
+        )),
+        crate::languages::LivenessUnit::Data
+    ) {
+        let script_reason = if has_shebang(source) {
+            Some("Executable script (shebang)")
+        } else if path
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == "__main__.py")
+        {
+            Some("Python module entry point run by `python -m`")
+        } else {
+            None
+        };
+        if let Some(reason) = script_reason {
+            annotations.push(WiringAnnotation {
+                kind: WiringKind::ScriptEntry,
+                target_symbol: path.to_string(),
+                details: reason.to_string(),
+            });
+        }
+    }
+
+    if let Some(reason) = package_marker_reason(path, source) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::PackageMarker,
+            target_symbol: path.to_string(),
+            details: reason.to_string(),
+        });
+    }
+
+    if let Some(reason) = tool_config_reason(path) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::ToolConfig,
+            target_symbol: path.to_string(),
+            details: reason.to_string(),
+        });
+    }
+
+    if is_ambient_declaration(path) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::AmbientDeclaration,
+            target_symbol: path.to_string(),
+            details: "TypeScript ambient declaration file".to_string(),
+        });
+    }
+
     // The symbol half of the same declaration. `ScriptEntry` above is a claim
     // about the manifest *file*, and a manifest declares no symbols — so on its
     // own it left the function a console script actually names as a dead-symbol
@@ -877,6 +1291,12 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
                 details: reason.to_string(),
             });
         }
+    } else if let Some(reason) = js_target_root_reason(path) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::TargetRoot,
+            target_symbol: path.to_string(),
+            details: reason.to_string(),
+        });
     }
 
     for line in source.lines() {
@@ -910,12 +1330,28 @@ pub const ALLOW_UNWIRED: &str = "devcouncil: allow-unwired";
 /// Mirrors `_CODE_CONFIG_SUFFIXES`. Config formats are in the list because
 /// `pyproject.toml`, `package.json` and friends name entry points that no
 /// import edge records.
+///
+/// `cfg` and `ini` were in the Python list and are gone from this one. Neither
+/// is reachable: `detect_language` names no `.cfg` or `.ini` arm, so both
+/// answer `"generic"`, `is_indexable_source` refuses them, and no `Extraction`
+/// for one ever exists to be scanned. A suffix listed here that discovery
+/// never yields reads as coverage this build does not have —
+/// `every_scanned_suffix_is_a_suffix_discovery_yields` is what keeps the list
+/// honest about that.
 const CODE_CONFIG_SUFFIXES: &[&str] = &[
-    "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "toml", "json", "yaml", "yml", "cfg", "ini",
+    "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "svelte", "vue", "astro", "html", "htm", "toml",
+    "json", "yaml", "yml",
 ];
 
 /// Extensions a relative JS specifier resolves through. Mirrors `_JS_RESOLVE_EXTS`.
-const JS_RESOLVE_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+///
+/// `.svelte` / `.vue` / `.astro` belong here because a bundler resolves
+/// `import('./Panel.svelte')` to that file, and until they were listed the
+/// kernel scanned every `.ts` lazy import and skipped the `.svelte` file that
+/// actually wrote `import('./CloneModal.svelte')`.
+const JS_RESOLVE_EXTS: &[&str] = &[
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".svelte", ".vue", ".astro",
+];
 
 fn dynamic_reference_patterns() -> &'static [regex::Regex] {
     use std::sync::OnceLock;
@@ -959,6 +1395,81 @@ fn normalize_rel_path(target: &str) -> String {
     parts.join("/")
 }
 
+/// HTML-only specifiers. Kept off the shared pattern list because
+/// `from 'react'` is an ordinary static import in `.ts` and must not become a
+/// DynamicImport form — `ordinary_source_produces_no_dynamic_forms` exists to
+/// refuse that. An HTML file has no import extractor, so the same syntax is
+/// the only record that `index.html` reaches `src/main.ts`.
+fn html_reference_patterns() -> &'static [regex::Regex] {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            r#"from\s+['"]([^'"]+)['"]"#,
+            r#"src\s*=\s*['"]([^'"]+)['"]"#,
+        ]
+        .iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("html-reference pattern compiles"))
+        .collect()
+    })
+}
+
+/// Path-like tokens in a launcher or `package.json` script. Mirrors
+/// `_LAUNCHER_PATH_REF_RE` without lookbehind (Rust's `regex` has none).
+fn launcher_path_ref_pattern() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:^|[^\w.-])((?:[\w.-]+/)*[\w-]+\.(?:mjs|cjs|jsx|tsx|py|js|ts|sh|go|rb))\b",
+        )
+        .expect("launcher path-ref pattern compiles")
+    })
+}
+
+/// Specs a `package.json` `scripts` table names. Python
+/// `_package_json_script_keys` already did this; the kernel never scanned the
+/// table, so every `node scripts/vite-dev.mjs` CLI was an unwired candidate.
+fn package_json_script_specs(path: &str, source: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(source) else {
+        return Vec::new();
+    };
+    let Some(scripts) = value.get("scripts").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let text = scripts
+        .values()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let parent = match normalize_path(path).rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    };
+    let mut specs = Vec::new();
+    for capture in launcher_path_ref_pattern().captures_iter(&text) {
+        let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let spec = normalize_rel_path(spec);
+        if spec.is_empty() {
+            continue;
+        }
+        specs.push(spec.clone());
+        if parent.is_empty() {
+            continue;
+        }
+        let joined = normalize_rel_path(&format!("{parent}/{spec}"));
+        if !joined.is_empty() {
+            specs.push(joined);
+        }
+    }
+    specs
+}
+
 /// Comparable dotted + slash forms, extensions stripped, for boundary matching.
 ///
 /// A verbatim port of `wiring._module_forms`. The set it produces is
@@ -996,7 +1507,9 @@ fn module_forms(value: &str) -> Vec<String> {
 
 /// Extensions `module_forms` strips. Mirrors the tuple inlined in `_module_forms`,
 /// which is `_JS_RESOLVE_EXTS` with `.py` in front.
-const MODULE_FORM_EXTS: &[&str] = &[".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+const MODULE_FORM_EXTS: &[&str] = &[
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".svelte", ".vue", ".astro",
+];
 
 /// `wiring._norm`: forward slashes, no leading `./`.
 fn normalize_path(value: &str) -> String {
@@ -1014,6 +1527,17 @@ fn normalize_path(value: &str) -> String {
 /// and `import('./App.tsx')` each reach `App.tsx`. A bare specifier contributes
 /// itself.
 fn specs_for(referrer: &str, spec: &str) -> Vec<String> {
+    let spec = spec.trim();
+    // Vite/HTML root-absolute URLs: `src="/src/main.ts"` and `src="/theme-boot.js"`
+    // (the latter is served from `public/`). A protocol-relative `//cdn` is not
+    // a project path.
+    if spec.starts_with('/') && !spec.starts_with("//") {
+        let relative = spec.trim_start_matches('/');
+        if relative.is_empty() {
+            return Vec::new();
+        }
+        return vec![relative.to_string(), format!("public/{relative}")];
+    }
     if !spec.starts_with('.') {
         return vec![spec.to_string()];
     }
@@ -1070,6 +1594,31 @@ pub fn dynamic_reference_forms(path: &str, source: &str) -> Vec<String> {
             specs.extend(specs_for(path, spec));
         }
     }
+    if suffix == "html" || suffix == "htm" {
+        for pattern in html_reference_patterns() {
+            for capture in pattern.captures_iter(source) {
+                let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+                    continue;
+                };
+                if spec.is_empty() {
+                    continue;
+                }
+                specs.extend(specs_for(path, spec));
+            }
+        }
+    }
+    // Python `wiring._package_json_script_keys`: npm script values name CLI
+    // files no import edge records. The kernel never scanned them, so every
+    // `scripts/*.mjs` in a Node project was an unwired candidate.
+    if file_suffix(path).eq_ignore_ascii_case("json")
+        && path
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == "package.json")
+    {
+        specs.extend(package_json_script_specs(path, source));
+    }
     let mut forms: Vec<String> = specs.iter().flat_map(|spec| module_forms(spec)).collect();
     forms.sort();
     forms.dedup();
@@ -1125,10 +1674,16 @@ mod tests {
             "third_party/lib/a.py",
             "vendor/github.com/x/y.go",
             "web/static/jquery.min.js",
+            "src-tauri/framework/tao/src/lib.rs",
+            "src-tauri/framework/wry/src/android/kotlin/Ipc.kt",
         ] {
             assert!(is_vendored_path(path), "{path} should be vendored");
         }
-        for path in ["src/vendoring.py", "src/node_modules_helper.ts"] {
+        for path in [
+            "src/vendoring.py",
+            "src/node_modules_helper.ts",
+            "src/framework/app.ts",
+        ] {
             assert!(!is_vendored_path(path), "{path} must not be vendored");
         }
     }
@@ -1313,6 +1868,39 @@ mod tests {
             assert!(
                 js_lifecycle_hook_reason(name).is_none(),
                 "{name} must not be a lifecycle hook"
+            );
+        }
+    }
+
+    #[test]
+    fn js_bundler_plugin_hooks_are_an_exact_name_list() {
+        for name in [
+            "generateBundle",
+            "writeBundle",
+            "closeBundle",
+            "renderChunk",
+            "configureServer",
+            "configurePreviewServer",
+            "transformIndexHtml",
+            "handleHotUpdate",
+            "hotUpdate",
+        ] {
+            assert!(
+                js_bundler_plugin_hook_reason(name).is_some(),
+                "{name} should be a bundler plugin hook"
+            );
+        }
+        for name in [
+            "transform",
+            "load",
+            "options",
+            "config",
+            "handler",
+            "buildStart",
+        ] {
+            assert!(
+                js_bundler_plugin_hook_reason(name).is_none(),
+                "{name} must not be a bundler plugin hook"
             );
         }
     }
@@ -1641,6 +2229,130 @@ u = \"pkg.b:run [fast]\"
             !targets.iter().any(|t| t.starts_with("pkg/")),
             "a nested manifest must not claim a root-level module of the same \
              name — that is another package's code: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn a_svelte_lazy_import_names_the_component() {
+        let forms = dynamic_reference_forms(
+            "src/App.svelte",
+            "const loadCloneModal = () => import('./lib/components/CloneModal.svelte');\n",
+        );
+        assert!(
+            forms
+                .iter()
+                .any(|form| form == "src/lib/components/CloneModal"
+                    || form == "src/lib/components/CloneModal.svelte"),
+            "a Svelte lazy import must name the component it loads: {forms:?}"
+        );
+    }
+
+    #[test]
+    fn an_html_script_src_names_the_module_entry() {
+        let forms = dynamic_reference_forms(
+            "index.html",
+            "<script type=\"module\" src=\"/src/status.ts\"></script>\n",
+        );
+        assert!(
+            forms
+                .iter()
+                .any(|form| form == "src/status" || form == "src/status.ts"),
+            "an HTML script src must name the module it boots: {forms:?}"
+        );
+        let public =
+            dynamic_reference_forms("index.html", "<script src=\"/theme-boot.js\"></script>\n");
+        assert!(
+            public
+                .iter()
+                .any(|form| form == "public/theme-boot.js" || form == "public/theme-boot"),
+            "a root-absolute public asset must also resolve under public/: {public:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_json_script_names_the_cli_it_runs() {
+        let forms = dynamic_reference_forms(
+            "package.json",
+            r#"{"name":"x","scripts":{"dev":"node scripts/vite-dev.mjs"}}"#,
+        );
+        assert!(
+            forms
+                .iter()
+                .any(|form| form == "scripts/vite-dev.mjs" || form == "scripts/vite-dev"),
+            "an npm script must name the CLI it launches: {forms:?}"
+        );
+    }
+
+    /// Python's `structural_exemptions` still hold, whichever kind now carries
+    /// them.
+    ///
+    /// The claim this test has always made is "must not be unwired", and that
+    /// is a claim about the *annotation set*, not about which predicate
+    /// produced it. Two of the paths moved: `vite.config.ts` is a
+    /// [`WiringKind::ToolConfig`] now, so it joins the rest of the
+    /// by-convention table in [`tool_config_reason`] instead of being the one
+    /// member of it that lived somewhere else, and `src/globals.d.ts` is an
+    /// [`WiringKind::AmbientDeclaration`], which is exempt without also
+    /// claiming to be a place execution starts.
+    ///
+    /// So the loop asserts the exemption rather than the function, and
+    /// `js_target_root_reason`'s own narrowed surface is pinned beneath it —
+    /// both directions, or moving a rule out could be spelled as deleting it.
+    #[test]
+    fn js_target_roots_match_the_python_structural_exemptions() {
+        for path in [
+            "src/main.ts",
+            "src/index.tsx",
+            "vite.config.ts",
+            "vite.harness.config.ts",
+            "svelte.config.js",
+            "src/globals.d.ts",
+            "scripts/vite-dev.mjs",
+            "src/Button.stories.ts",
+        ] {
+            let annotations = extract_wiring_annotations(path, "export const x = 1;\n");
+            assert!(
+                annotations.iter().any(|a| a.target_symbol == path
+                    && matches!(
+                        a.kind,
+                        WiringKind::TargetRoot
+                            | WiringKind::ToolConfig
+                            | WiringKind::AmbientDeclaration
+                    )),
+                "{path} is a JS/TS toolchain file and must not be unwired: {annotations:?}"
+            );
+        }
+        // Still a `TargetRoot` specifically, so "the exemption survived" cannot
+        // be satisfied by relabelling everything as one kind.
+        for path in ["src/main.ts", "src/index.tsx", "scripts/vite-dev.mjs"] {
+            assert!(
+                js_target_root_reason(path).is_some(),
+                "{path} is a bundler entry, which is a target root"
+            );
+        }
+        for path in ["vite.config.ts", "src/globals.d.ts"] {
+            assert!(
+                js_target_root_reason(path).is_none(),
+                "{path} moved to its own kind, and two predicates claiming it \
+                 is how they come to disagree"
+            );
+        }
+        for path in ["src/lib/foo.ts", "src/status.ts", "src/App.svelte"] {
+            assert!(
+                js_target_root_reason(path).is_none(),
+                "{path} is ordinary product code, not a toolchain root"
+            );
+            assert!(
+                extract_wiring_annotations(path, "export const x = 1;\n")
+                    .iter()
+                    .all(|a| a.target_symbol != path),
+                "{path} must carry no file-scoped exemption at all"
+            );
+        }
+        assert!(
+            extract_wiring_annotations("src/main.ts", "export const boot = 1;\n")
+                .iter()
+                .any(|a| a.kind == WiringKind::TargetRoot)
         );
     }
 

@@ -60,6 +60,7 @@
   import ScrollCue from "./ScrollCue.svelte";
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
+  import { observeResize } from "../dom/observeResize";
   import { resolveFilePaneLayout } from "../files/filePaneLayout";
   import {
     activateEditorTab,
@@ -518,19 +519,20 @@
 
   onMount(() => {
     window.addEventListener("keydown", handleWindowKeydown);
-    const observer = new ResizeObserver((entries) => {
-      const measured = entries.find((entry) => entry.target === fileViewRoot)?.contentRect.width;
-      fileViewWidth = typeof measured === "number" && Number.isFinite(measured) && measured > 0
-        ? measured
-        : 0;
-    });
+    const stopResize = fileViewRoot
+      ? observeResize(fileViewRoot, (entries) => {
+          const measured = entries.find((entry) => entry.target === fileViewRoot)?.contentRect.width;
+          fileViewWidth = typeof measured === "number" && Number.isFinite(measured) && measured > 0
+            ? measured
+            : 0;
+        })
+      : () => {};
     if (fileViewRoot) {
       fileViewWidth = fileViewRoot.clientWidth || 0;
-      observer.observe(fileViewRoot);
     }
     return () => {
       window.removeEventListener("keydown", handleWindowKeydown);
-      observer.disconnect();
+      stopResize();
     };
   });
 </script>

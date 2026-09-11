@@ -179,3 +179,9 @@ describe("native menu projection", () => {
     ]);
   });
 });
+
+
+it("keeps stage-all available for the remaining edits of a partially staged file", () => {
+  const state = model({ ...loaded(), statuses: [{ path: "mixed", status_code: "MM", is_staged: true, is_conflicted: false, additions: 3, deletions: 2 }] });
+  expect(menuActionEnabled(state, "stage-all")).toBe(true);
+});

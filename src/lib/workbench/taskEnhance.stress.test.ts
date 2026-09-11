@@ -128,7 +128,7 @@ describe("enhancement transaction adversarial boundaries", () => {
     await action.run("enhancements.create", {
       id: "e", request_id: "create", expected_revision: 0, task_id: "t", source_revision: 4,
       fields: ["title"], provider: "local", model: "qwen",
-    });
+    }, task.id);
     const generateCall = change.mock.calls.find(([method]) => method === "enhancements.generate");
     expect(generateCall?.[1]).toMatchObject({
       id: "e",
@@ -151,10 +151,10 @@ describe("enhancement transaction adversarial boundaries", () => {
     const started = await action.run("enhancements.create", {
       id: "e", request_id: "c", expected_revision: 0, task_id: "t", source_revision: 4,
       fields: ["title"], provider: "local", model: "first",
-    });
+    }, task.id);
     selection = { base_url: "http://127.0.0.1:11434/v1", model: "second" };
     expect(started.proposal.state).toBe("ready");
-    await action.run("enhancements.accept", input);
+    await action.run("enhancements.accept", input, task.id);
     expect(change.mock.calls.filter(([method]) => method === "enhancements.generate")).toHaveLength(1);
   });
 
@@ -162,7 +162,7 @@ describe("enhancement transaction adversarial boundaries", () => {
     for (let i = 0; i < 40; i++) {
       const change = vi.fn().mockResolvedValue(accepted);
       const action = new EnhancementAction({ change, read: vi.fn().mockResolvedValue(saved) });
-      const burst = await Promise.allSettled(Array.from({ length: 5 }, () => action.run("enhancements.accept", input)));
+      const burst = await Promise.allSettled(Array.from({ length: 5 }, () => action.run("enhancements.accept", input, task.id)));
       const ok = burst.filter((result) => result.status === "fulfilled");
       expect(ok).toHaveLength(1);
       expect(change).toHaveBeenCalledTimes(1);

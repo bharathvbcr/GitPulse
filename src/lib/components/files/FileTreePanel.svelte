@@ -38,6 +38,7 @@
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
   import {
     classifyFileChange,
+    hasUnstagedChanges,
     dirtyAncestorCounts,
     mergeListedAndStatusPaths,
     statusBadgeClass,
@@ -1154,7 +1155,8 @@
             <Undo2 size={13} />
             <span>Unstage Changes</span>
           </button>
-        {:else}
+        {/if}
+        {#if hasUnstagedChanges(status)}
           <button type="button" role="menuitem" class="gp-menu-item text-emerald-300" onclick={() => stageFile(row.path)}>
             <Check size={13} />
             <span>Stage File</span>

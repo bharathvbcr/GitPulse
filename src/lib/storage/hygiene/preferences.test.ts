@@ -42,6 +42,7 @@ describe("literal ignore rules", () => {
   });
   it("doubles backslash in the sanitizer so a crafted \\* cannot undo a meta escape", () => {
     expect(escapeGitignoreLiteral("cache\\*.tmp")).toBe("cache\\\\\\*.tmp");
+    expect(escapeGitignoreLiteral("*cache\\")).toBe("\\*cache\\\\");
     expect(escapeGitignoreLiteral("a\\b")).toBe("a\\\\b");
     expect(ignoreRule("cache\\*.tmp")).toBeNull();
     expect(ignoreRule("a\\b")).toBeNull();

@@ -1,10 +1,14 @@
 /**
- * Live index: incremental `devmap` refresh off watcher `repo-changed`.
+ * Live index: `devmap` refresh off watcher `repo-changed` and repo activation.
  *
  * Mirrors the metric freshness pattern — debounce change storms, one in-flight
  * attempt globally, surface state for the Map status strip. The Rust gate
  * (`decide_live_refresh`) owns stale→refresh / fresh→skip / in-flight→skip;
  * this module only schedules and publishes outcomes.
+ *
+ * Watcher ticks pass `repoChanged: true`. Becoming the visible repository
+ * passes `false` so an obsolete or source-stale map can heal without treating
+ * focus as a working-tree edit.
  */
 
 import { writable } from "svelte/store";
@@ -74,6 +78,8 @@ export function createLiveIndex(opts?: {
   const snapshots = writable<Record<string, LiveIndexSnapshot>>({});
   const retained = new Set<string>();
   const busyRetries = new Map<string, number>();
+  /** Keys whose pending/running attempt came from a watcher tick. */
+  const dirty = new Set<string>();
   let revision = 0;
   const queue = createPacedQueue({
     debounceMs,
@@ -102,13 +108,17 @@ export function createLiveIndex(opts?: {
 
   async function run(repoPath: string, isCurrent: () => boolean) {
     patch(repoPath, { phase: "running", refreshing: true, reason: null });
-    const outcome = await maybeRefresh(repoPath, true);
+    const repoChanged = dirty.has(repoPath);
+    const outcome = await maybeRefresh(repoPath, repoChanged);
     if (!isCurrent()) return;
     if (outcome.decision === "skip_building") {
       const retries = busyRetries.get(repoPath) ?? 0;
       const retrying = retries < LIVE_INDEX_BUSY_RETRIES && queue.enqueue(repoPath);
       if (retrying) busyRetries.set(repoPath, retries + 1);
-      else busyRetries.delete(repoPath);
+      else {
+        busyRetries.delete(repoPath);
+        dirty.delete(repoPath);
+      }
       patch(repoPath, {
         phase: retrying ? "scheduled" : "failed",
         decision: outcome.decision,
@@ -119,7 +129,23 @@ export function createLiveIndex(opts?: {
       });
       return;
     }
+    if (outcome.decision === "skip_cooldown") {
+      // Watcher echo backoff: keep the strip on "scheduled" so a storm does
+      // not look like a hard failure. The next repo-changed tick re-enters
+      // maybe_refresh; do not busy-spin like skip_building.
+      busyRetries.delete(repoPath);
+      dirty.delete(repoPath);
+      patch(repoPath, {
+        phase: "scheduled",
+        decision: outcome.decision,
+        reason: outcome.reason,
+        refreshing: false,
+        updatedAt: Date.now(),
+      });
+      return;
+    }
     busyRetries.delete(repoPath);
+    dirty.delete(repoPath);
     const failed =
       outcome.decision === "refresh" && outcome.build?.ok !== true;
     patch(repoPath, {
@@ -143,12 +169,26 @@ export function createLiveIndex(opts?: {
         const closed = Object.keys(map).filter((key) => !open.has(key));
         if (!closed.length) return map;
         const next = { ...map };
-        for (const key of closed) { delete next[key]; retained.delete(key); busyRetries.delete(key); }
+        for (const key of closed) {
+          delete next[key];
+          retained.delete(key);
+          busyRetries.delete(key);
+          dirty.delete(key);
+        }
         return next;
       });
+      if (scope.visible && scope.activeKey && queue.enqueue(scope.activeKey)) {
+        const active = scope.activeKey;
+        snapshots.update((map) => {
+          const prev = snapshotFor(map, active);
+          if (prev.phase === "running" || prev.phase === "scheduled") return map;
+          return { ...map, [active]: { ...prev, phase: "scheduled" } };
+        });
+      }
     },
     onRepoChanged(repoPath: string) {
       if (!queue.enqueue(repoPath)) return;
+      dirty.add(repoPath);
       retained.delete(repoPath);
       retained.add(repoPath);
       // Retain queued/running states; evict only settled states. At most 64
@@ -158,6 +198,7 @@ export function createLiveIndex(opts?: {
         if (queue.has(key)) continue;
         retained.delete(key);
         busyRetries.delete(key);
+        dirty.delete(key);
         snapshots.update((map) => {
           const next = { ...map };
           delete next[key];
@@ -181,6 +222,7 @@ export function createLiveIndex(opts?: {
       queue.reset();
       retained.clear();
       busyRetries.clear();
+      dirty.clear();
       snapshots.set({});
     },
   };

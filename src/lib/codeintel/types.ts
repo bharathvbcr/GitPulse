@@ -192,6 +192,26 @@ export interface RepoMapCapMeta {
 export interface RepoMapUnwiredMeta extends RepoMapCapMeta {
   excluded_coverage_loss: number;
   excluded_import_blind: number;
+  /**
+   * Files that were never liveness candidates: prose, data, configuration,
+   * lockfiles, environment files.
+   *
+   * Optional because a map written by a kernel older than the file-liveness
+   * rule carries neither this key nor the two below, and an older map must
+   * keep loading. `undefined` means "this producer did not say", which is a
+   * different fact from `0` and is what the panel renders.
+   */
+  excluded_not_code?: number;
+  /** How many of each, keyed by the reason the kernel recorded. */
+  excluded_not_code_reasons?: Record<string, number>;
+  /** Code reached by something no import edge records. */
+  excluded_exempt?: number;
+  /**
+   * The subset of `excluded_exempt` whose language puts the unit of use at the
+   * directory — a Terraform `.tf` file. A sub-count, never a peer: adding it to
+   * `excluded_exempt` double-counts.
+   */
+  excluded_directory_unit?: number;
 }
 
 export interface RepoMapDeadSymbolMeta extends RepoMapCapMeta {
@@ -315,7 +335,8 @@ export type LiveRefreshDecision =
   | "skip_fresh"
   | "skip_building"
   | "skip_schema_outdated"
-  | "skip_unavailable";
+  | "skip_unavailable"
+  | "skip_cooldown";
 
 export interface LiveRefreshFacts {
   available: boolean;
@@ -329,6 +350,8 @@ export interface LiveRefreshOutcome {
   facts: LiveRefreshFacts;
   build?: DevmapBuildOutcome | null;
   reason?: string | null;
+  /** Remaining echo/failure backoff when `decision` is `skip_cooldown`. */
+  cooldown_remaining_ms?: number | null;
 }
 
 /** Envelope from `cmd_devmap_viz` / `cmd_devmap_map_preview` / docs graph. */

@@ -10,6 +10,8 @@
    */
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
+  import type { DiffPayload } from "../stores/repoStore";
+  import CodeViewer from "./files/CodeViewer.svelte";
 
   let { embedded = false }: { embedded?: boolean } = $props();
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -63,6 +65,7 @@
     stashEmptyMessage,
     stashSubtitle,
     stashTitle,
+    stashEntryKey,
     STASH_ACTIONS,
     type StashAction,
     type StashEntry,
@@ -79,6 +82,13 @@
   let submodulesTruncated = $state(false);
 
   let busy = $state<string | null>(null);
+  let stashMessage = $state("");
+  let includeUntracked = $state(true);
+  let keepIndex = $state(false);
+  let previewKey = $state<string | null>(null);
+  let preview = $state<DiffPayload | null>(null);
+  let previewError = $state<string | null>(null);
+  let previewGuard: AsyncGuard | null = null;
   /**
    * Two-stage confirm for the actions that can lose work.
    *
@@ -88,7 +98,7 @@
    * a decode step that can silently disagree with what was encoded.
    */
   type Armed =
-    | { kind: "stash"; key: string; action: StashAction; oid: string }
+    | { kind: "stash"; key: string; action: StashAction; entryKey: string }
     | { kind: "remote"; key: string; change: RemoteChange }
     | { kind: "submodule"; key: string; change: SubmoduleChange };
   let armed = $state<Armed | null>(null);
@@ -116,6 +126,13 @@
     if (path === loadedPath) return;
     loadedPath = path;
     armed = null;
+    previewGuard?.cancel();
+    previewKey = null;
+    preview = null;
+    previewError = null;
+    stashMessage = "";
+    includeUntracked = true;
+    keepIndex = false;
     if (!path) {
       guard?.cancel();
       remotes = [];
@@ -133,7 +150,36 @@
     void load();
   });
 
-  $effect(() => () => guard?.cancel());
+  $effect(() => () => { guard?.cancel(); previewGuard?.cancel(); });
+
+  async function previewStash(entry: StashEntry) {
+    const key = stashEntryKey(entry);
+    previewGuard?.cancel();
+    preview = null;
+    previewError = null;
+    if (previewKey === key) { previewKey = null; return; }
+    previewKey = key;
+    const active = createAsyncGuard();
+    previewGuard = active;
+    try {
+      const payload = await repoStore.stashShow(entry.oid);
+      if (active.isLive()) preview = payload;
+    } catch (error) {
+      if (active.isLive()) previewError = formatError(error);
+    }
+  }
+
+  async function saveStash() {
+    const path = repoPath;
+    const message = stashMessage;
+    await run("stash-save", async () => {
+      const outcome = await repoStore.stashSave(message.trim() || undefined, {
+        include_untracked: includeUntracked, keep_index: keepIndex,
+      });
+      if (outcome.ok && repoPath === path && stashMessage === message) stashMessage = "";
+      return outcome;
+    });
+  }
 
   async function load() {
     guard?.cancel();
@@ -203,9 +249,10 @@
 
   /** Stash actions arm first when they can lose work. */
   function activateStash(entry: StashEntry, action: StashAction) {
-    const key = `stash-${action}-${entry.oid}`;
+    const entryKey = stashEntryKey(entry);
+    const key = `stash-${action}-${entryKey}`;
     if (isDestructiveStashAction(action) && armed?.key !== key) {
-      armed = { kind: "stash", key, action, oid: entry.oid };
+      armed = { kind: "stash", key, action, entryKey };
       return;
     }
     void run(key, () => repoStore.stashAction(action, entry));
@@ -645,6 +692,21 @@
         </span>
       </header>
 
+      <form class="mb-3 space-y-2" onsubmit={(event) => { event.preventDefault(); void saveStash(); }}>
+        <label class="block text-[11px] text-textSecondary">
+          Stash message
+          <input class="gp-input mt-1 w-full" bind:value={stashMessage} maxlength={4096} placeholder="What are you setting aside?" disabled={busy !== null} />
+        </label>
+        <div class="flex flex-wrap gap-3 text-[11px] text-textSecondary">
+          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={includeUntracked} disabled={busy !== null} />Include untracked files</label>
+          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={keepIndex} disabled={busy !== null} />Keep staged changes</label>
+        </div>
+        <p class="text-[11px] text-textMuted">{keepIndex ? "Staged changes remain ready to commit. " : ""}Ignored files stay in the working tree.</p>
+        <button type="submit" class="gp-btn" disabled={busy !== null || !$repoStore.statuses.length || $repoStore.isBare}>Save stash</button>
+      </form>
+      {#if $repoStore.stashTruncated}
+        <p class="mb-2 text-[11px] text-amber-600 dark:text-amber-400">Showing {stashEntries.length} entries from a limited stash list. Older or incomplete entries are not shown.</p>
+      {/if}
       {#if stashFailed}
         <!-- An unreadable stack must not render as an empty one: a forgotten
              stash is work that exists nowhere else. -->
@@ -656,13 +718,14 @@
         <p class="text-[11px] text-textMuted">{stashEmptyMessage(true)}</p>
       {:else}
         <ul class="space-y-2">
-          {#each stashEntries as entry (entry.oid)}
+          {#each stashEntries as entry (stashEntryKey(entry))}
             <li class="rounded-xl border border-border/50 px-3 py-2">
               <p class="truncate font-medium text-textPrimary">{stashTitle(entry)}</p>
               <p class="mt-0.5 font-mono text-[11px] text-textMuted">{stashSubtitle(entry)}</p>
               <div class="mt-2 flex flex-wrap items-center gap-1.5">
+                <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" aria-expanded={previewKey === stashEntryKey(entry)} onclick={() => void previewStash(entry)}>{previewKey === stashEntryKey(entry) ? "Close preview" : "Preview"}</button>
                 {#each STASH_ACTIONS as action (action)}
-                  {@const key = `stash-${action}-${entry.oid}`}
+                  {@const key = `stash-${action}-${stashEntryKey(entry)}`}
                   {@const isArmed = armed?.kind === "stash" && armed.key === key}
                   <button
                     type="button"
@@ -674,22 +737,31 @@
                     onclick={() =>
                       // The entry travels whole, so its object id can never be
                       // separated from its index.
-                      activateStash(entry as StashEntry, action)}
+                      activateStash(entry, action)}
                   >
                     {#if busy === key}<Loader2 size={11} class="animate-spin" />{/if}
                     <span>{isArmed ? `Confirm: ${stashActionLabel(action)}` : stashActionLabel(action)}</span>
                   </button>
                 {/each}
-                {#if armed?.kind === "stash" && armed.oid === entry.oid}
+                {#if armed?.kind === "stash" && armed.entryKey === stashEntryKey(entry)}
                   <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}
               </div>
-              {#if armed?.kind === "stash" && armed.oid === entry.oid}
+              {#if armed?.kind === "stash" && armed.entryKey === stashEntryKey(entry)}
                 <p class="mt-1.5 text-[11px] leading-relaxed text-red-600 dark:text-red-400">
                   {stashActionConsequence(armed.action)}
                 </p>
+              {/if}
+              {#if previewKey === stashEntryKey(entry)}
+                <div class="mt-3" aria-label="Stash preview">
+                  {#if previewError}<p role="alert" class="text-[11px] text-red-600 dark:text-red-400">{previewError}</p>
+                  {:else if preview}
+                    {#if preview.truncated}<p class="mb-2 text-[11px] text-amber-600 dark:text-amber-400">Preview is incomplete. {preview.truncation_reason ?? "The diff exceeds the display limit."}</p>{/if}
+                    <div class="h-80 overflow-hidden rounded-lg border border-border/50"><CodeViewer filePath={`stash-${entry.index}.diff`} content={preview.text} readOnly /></div>
+                  {:else}<p role="status" class="text-[11px] text-textMuted">Loading stash preview…</p>{/if}
+                </div>
               {/if}
             </li>
           {/each}

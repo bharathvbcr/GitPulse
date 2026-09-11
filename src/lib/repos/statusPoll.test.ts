@@ -156,3 +156,11 @@ describe("shallowRecordListEqual", () => {
     expect(shallowRecordListEqual(a, b, fields)).toBe(true);
   });
 });
+
+
+it("publishes side churn changes even when total churn and porcelain are unchanged", () => {
+  const before = status({ path: "mixed", status_code: "MM", is_staged: true, additions: 3, staged_additions: 1, unstaged_additions: 2 });
+  const after = { ...before, staged_additions: 2, unstaged_additions: 1 };
+  expect(statusesEqual([before], [after])).toBe(false);
+  expect(statusesEqual([after], [{ ...after }])).toBe(true);
+});

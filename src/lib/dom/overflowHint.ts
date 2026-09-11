@@ -9,6 +9,8 @@
  * chevron on the overflowing edge is the other.
  */
 
+import { createResizeObservation } from "./observeResize";
+
 export type OverflowAxis = "x" | "y";
 
 export interface OverflowHint {
@@ -110,7 +112,8 @@ export function scrollOverflowBy(
  * Live overflow for a DOM scroller. Resize of the scroller or its direct
  * children, plus childList mutations (virtual-list spacers), all retrigger
  * the same read. Scroll is coalesced to animation frames so a trackpad
- * fling is one hint update, not one per event.
+ * fling is one hint update, not one per event. Resize deliveries go through
+ * observeResize so they never write during the browser's observer turn.
  */
 export function observeOverflow(
   el: HTMLElement,
@@ -127,11 +130,13 @@ export function observeOverflow(
   };
   notify();
   el.addEventListener("scroll", notify, { passive: true });
-  const ro = new ResizeObserver(notify);
-  ro.observe(el);
+  const resize = createResizeObservation(() => {
+    onChange(readOverflowHint(el, axis));
+  });
+  resize.observe(el);
   const watchChildren = () => {
     for (const child of el.children) {
-      ro.observe(child);
+      resize.observe(child);
     }
   };
   watchChildren();
@@ -143,7 +148,7 @@ export function observeOverflow(
   return () => {
     if (frame) cancelAnimationFrame(frame);
     el.removeEventListener("scroll", notify);
-    ro.disconnect();
+    resize.disconnect();
     mo.disconnect();
   };
 }

@@ -21,13 +21,15 @@
 <script type="module">
   await import("../src/app.css");
   const results = [], crashes = [], reports = [], unexpected = new Set();
+  const genuineShapes = [];
   const calls = new Map();
   const requests = [];
   const defer = (kind, args) => new Promise((resolve, reject) => requests.push({kind,args,resolve,reject}));
   const fixture = {
     cmd_resolve_repo: a => ({path:a.path,name:"diagnostics",is_bare:false}),
     cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({tags:[],truncated:false}),
-    cmd_repo_operation: () => null, cmd_stash_list: () => [], cmd_watch_repo: () => null,
+    cmd_repo_operation: () => null, cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_watch_repo: () => null,
+    cmd_last_fetch_at: () => null,
     cmd_unwatch_repo: () => null, cmd_list_repo_files: () => ["A.md", "B.md"],
     cmd_get_commit_graph: () => ({nodes:[],edges:[],total_commits:0,truncated:false}),
     cmd_get_file_blame: a => defer("blame",a),
@@ -58,7 +60,10 @@
       throw new Error(`Unconfigured harness command: ${cmd}`);
     }, transformCallback: cb => cb,
   };
-  window.addEventListener("error", e => crashes.push(e.message));
+  window.addEventListener("error", e => {
+    if (/^ResizeObserver loop (?:limit exceeded|completed with undelivered notifications)\.?$/.test(String(e.message || "").trim())) return;
+    crashes.push(e.message);
+  });
   window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
   const {mount, tick, unmount} = await import("svelte");
   const {repoStore} = await import("../src/lib/stores/repoStore.ts");
@@ -182,6 +187,80 @@
     } finally {Storage.prototype.setItem=originalSetItem;}
     await click("Retry saving");
     check("diagnostics retry restores saved status",target.textContent.includes("App diagnostics saved locally")&&!target.textContent.includes("Retry saving"));
+    // Capture the platform's real ResizeObserver loop ErrorEvent before
+    // installing the classifier, so filename/lineno/error are not filtered.
+    const captureGenuine = event => {
+      genuineShapes.push({
+        message: event.message,
+        filename: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+        errorName: event.error && event.error.name,
+        errorMessage: event.error && typeof event.error.message === "string" ? event.error.message : null,
+        errorIsError: event.error instanceof Error,
+      });
+    };
+    window.addEventListener("error", captureGenuine);
+    const loopBox = document.createElement("div");
+    loopBox.style.cssText = "position:absolute;left:0;top:0;width:8px;height:8px;";
+    document.body.appendChild(loopBox);
+    let grow = 0;
+    const looping = new ResizeObserver(() => {
+      grow += 1;
+      if (grow < 50) loopBox.style.width = `${8 + grow}px`;
+    });
+    looping.observe(loopBox);
+    await sleep(250);
+    looping.disconnect();
+    loopBox.remove();
+    window.removeEventListener("error", captureGenuine);
+    check("genuine ResizeObserver loop emitted a window error", genuineShapes.length > 0, JSON.stringify(genuineShapes.slice(0, 3)));
+    const genuine = genuineShapes[0] || null;
+    check("recorded genuine observer ErrorEvent shape", !!genuine, JSON.stringify(genuine));
+    const {installGlobalDiagnostics} = await import("../src/lib/diagnostics/diagnostics.ts");
+    const observerEvents = new EventTarget();
+    const uninstall = installGlobalDiagnostics(diagnostics, {target:observerEvents,console:{error(){},warn(){}}});
+    try {
+      for(let i=0;i<1000;i++) observerEvents.dispatchEvent(new ErrorEvent("error",{message:"ResizeObserver loop limit exceeded"}));
+      await settle();
+      check("browser notification count is visible without claiming development reloads",target.textContent.includes("1000 runtime notifications suppressed this session"));
+      observerEvents.dispatchEvent(new ErrorEvent("error",{message:"ResizeObserver loop limit exceeded",error:new Error("Observer application failure")}));
+      await settle();
+      check("an application exception survives browser notification suppression",target.textContent.includes("Observer application failure"));
+      if (genuine) {
+        const init = {
+          message: genuine.message,
+          filename: genuine.filename,
+          lineno: genuine.lineno,
+          colno: genuine.colno,
+        };
+        if (genuine.errorIsError && genuine.errorMessage) {
+          init.error = new Error(genuine.errorMessage);
+          if (genuine.errorName) Object.defineProperty(init.error, "name", { value: genuine.errorName });
+        }
+        observerEvents.dispatchEvent(new ErrorEvent("error", init));
+        await settle();
+        host.show("diagnostics"); await settle();
+        check(
+          "classifier suppresses the genuine browser ErrorEvent shape",
+          target.textContent.includes("1001 runtime notifications suppressed this session"),
+          JSON.stringify({genuine, snippet: target.textContent.slice(0, 400)}),
+        );
+        observerEvents.dispatchEvent(new ErrorEvent("error", {
+          message: genuine.message,
+          filename: genuine.filename,
+          lineno: genuine.lineno,
+          colno: genuine.colno,
+          error: new TypeError(genuine.message),
+        }));
+        await settle();
+        check(
+          "TypeError on an observer message remains an application exception",
+          target.textContent.includes("TypeError"),
+          target.textContent.slice(0, 400),
+        );
+      }
+    } finally {uninstall();}
     host.show("keys");await settle();
     const rows=Array.from({length:2000},(_,i)=>i%3===0?"a":i%3===1?"a#1":"");
     for(let i=0;i<200;i++){host.setRows(i%2?[...rows].reverse():rows);await tick();}
@@ -194,5 +273,5 @@
   } catch(error){check("harness completed",false,String(error));}
   if(host)await unmount(host);
   check("all invoked commands have explicit fixtures",unexpected.size===0,JSON.stringify([...unexpected]));
-  window.__finishDiagnostics({results,passed:results.filter(r=>r.pass).length,total:results.length,unexpectedCommands:[...unexpected],crashes,reports});
+  window.__finishDiagnostics({results,passed:results.filter(r=>r.pass).length,total:results.length,unexpectedCommands:[...unexpected],crashes,reports,genuineObserverShapes:genuineShapes.slice(0,3)});
 </script></body></html>

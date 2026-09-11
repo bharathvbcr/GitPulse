@@ -2517,6 +2517,10 @@ mod tests {
             is_conflicted: false,
             additions,
             deletions: 0,
+            staged_additions: Some(0),
+            staged_deletions: Some(0),
+            unstaged_additions: Some(additions),
+            unstaged_deletions: Some(0),
             warnings,
         }
     }

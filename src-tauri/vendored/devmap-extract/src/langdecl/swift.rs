@@ -62,7 +62,15 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
             // An enum case belongs to its enum by that enum's *full* identity.
             // Swift nests `enum CodingKeys` inside each Codable type, so the
             // bare enum name is not unique within a file.
-            let owner = if declared_kind == SymbolKind::Field {
+            //
+            // A nested *enum* is the same shape one level up: `class Workspace
+            // { class ActiveSaveRequest { enum CancellationDisposition } }`
+            // must be `Workspace.ActiveSaveRequest.CancellationDisposition`,
+            // not `ActiveSaveRequest.CancellationDisposition`. The latter
+            // cannot join a reference attributed to the nested class — the
+            // enclosing symbol is `Workspace.ActiveSaveRequest` — so a field
+            // typed as the nested enum was confident-dead on a live save path.
+            let owner = if matches!(declared_kind, SymbolKind::Field | SymbolKind::Enum) {
                 super::enclosing_owner_path(node, source, declaration)
             } else {
                 enclosing_owner(node, source, owner_identity)

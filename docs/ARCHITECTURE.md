@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (205 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (207 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -173,7 +173,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +205 Registered Handlers
+        +207 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -278,6 +278,43 @@ for contracts, regression evidence and platform verification limits.
 
 ---
 
+### Core Git mutation contracts (0.2.0)
+
+`repoStore` captures the originating repository and selection. Bulk staging
+uses `cmd_change_index` and `GitWriter::change_index_with`, which validates literal
+paths, holds the shared repository mutation lock, judges every command plan,
+and executes the same argv. Requests are limited to 20,000 paths, 4 MiB of path
+bytes and 4,096 bytes per path; chunks contain at most 128 paths and a 12 KiB
+argument estimate. All policy checks precede writes. A later Git failure names
+the completed prefix, and the frontend refreshes under the same activity owner.
+This is bounded sequential execution, not rollback across chunks.
+
+`FileStatus` remains one record per path for repository totals. Its two
+porcelain columns are independent. Native status includes staged and unstaged
+churn separately; `fileStatus.ts` projects either side for sidebar/diff rows,
+filters, staging, explorer actions and native menu availability. Status polling
+compares each side's counts so redistributing edits across the index refreshes
+views even when aggregate churn stays the same.
+
+Selected-file commits use Git's `--only` and NUL-delimited literal pathspecs so
+unrelated staged work stays in the index. Path-limited unstaging changes only the
+index and supports unborn branches. The UI expands staged renames to both paths.
+
+Clone attempts allocate a private sibling directory. `fs_entry` owns atomic
+publication without replacement, shared with conflict recovery. Unix conflict
+recovery retains its pinned parent descriptors; Windows retains its pinned
+ancestors and verbatim path conversion. macOS and Linux use exclusive rename
+syscalls; Windows uses `MoveFileExW` without replacement. Unsupported platforms
+or filesystems return an error. Cleanup removes only the calling attempt's
+staging directory, with retained paths reported when cleanup fails.
+
+The stash list returns `{ entries, truncated }` with a 500-entry/2 MiB cap.
+Previews return `DiffPayload` with an 8 MiB cap and truncation reason. The UI
+validates listing records, keys entries by position plus OID, guards async
+previews against repository changes, and uses the existing read-only CodeViewer.
+Stash creation defaults to including untracked files and not keeping the index;
+explicit options are shared by policy evaluation and Git execution.
+
 ## 3. High-Performance Commit Graph Renderer
 
 The commit graph utilizes a GPU-accelerated HTML5 Canvas with custom paint scheduling:
@@ -315,8 +352,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 205 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 989 data fields, in 54 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 207 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1006 data fields, in 55 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree. Missing schema identity is unresponsive, never a pass. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 

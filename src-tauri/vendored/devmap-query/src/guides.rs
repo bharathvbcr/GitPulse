@@ -150,7 +150,7 @@ list."
     } else {
         "5. `role_files` in `subsystems` was NOT computed by the writer that produced this map \
 — an empty bucket there is the producer declining to answer, not a subsystem without roles. Use \
-`files` (filtered by `area`) instead, and re-run `devmap build` with a current kernel to get the \
+`files` (filtered by `area`) instead, and re-run `devmap build --manifest` with a current kernel to get the \
 buckets."
             .to_string()
     }
@@ -166,7 +166,7 @@ are capped, and `liveness_meta.subsystems` reports what was cut."
     } else {
         "6. Use `neighbors` in `subsystems` to follow cross-subsystem flow. `handoff_paths` was \
 NOT computed by the writer that produced this map — an empty list there is the producer declining \
-to answer, not evidence that nothing crosses. Re-run `devmap build` with a current kernel to get \
+to answer, not evidence that nothing crosses. Re-run `devmap build --manifest` with a current kernel to get \
 it."
         .to_string()
     }
@@ -222,7 +222,7 @@ pub fn agent_guide_text(map: &Value, map_rel: &str, graph_rel: &str, store_rel: 
         format!("Code graph: `{graph_rel}` (symbol-level; query with `devmap`)."),
         String::new(),
         "Workflow for agents:".to_string(),
-        format!("1. Open `{map_rel}` before guessing at file locations."),
+        format!("1. Run `devmap paths --json` and `devmap status --json` first. Generated state is per-worktree and is not copied by Git. Read `{map_rel}` when present; if its location differs in this checkout, use the resolved `repo_map` path. If the store or map is missing, run `devmap build --manifest` from this worktree's root, then check status again. Never copy a sibling worktree's database."),
         "2. Use the `files` list to resolve module ownership and nearby siblings.".to_string(),
         "3. Use `subsystems` for subsystem-level navigation.".to_string(),
         "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting \
@@ -239,17 +239,19 @@ dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unr
 ignore `unreachable_files` entirely. Check `unwired_candidates` before creating a new module — \
 wire what you create into a real caller."
             .to_string(),
-        "8. Use `devmap explore <name>` for a symbol's whole neighbourhood in one call; \
-`devmap search`, `devmap impact`, `devmap trace <a> <b>`, `devmap dead` for the individual \
-questions; `devmap affected <target>` for the tests a change reaches. Read the `truncated` and \
-`total` on every envelope before treating a list as complete."
+        "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) over \
+GitNexus. CLI equivalents: `devmap explore <name>`, `devmap search`, `devmap impact`, \
+`devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. Read `truncated` and \
+`total` on every envelope before treating a list as complete. When DevMap cannot answer, \
+record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` — do not switch indexes."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \
 `{graph_rel}` is missing or a size-capped stub. `devmap preview` asks what an unsaved edit would \
 break before it is written."
         ),
-        "10. Run `devmap build` after large refactors, or `devmap serve` to keep the index warm; \
+        "10. Run `devmap build --manifest` after large refactors to refresh the database and exported maps, or `devmap serve` to keep the index warm; \
 `devmap status` reports generation, counts and freshness."
             .to_string(),
         String::new(),
@@ -260,7 +262,8 @@ break before it is written."
     lines.push(crate::hygiene::AGENT_RULES.to_owned());
     lines.push(String::new());
     lines.push(
-        "If the map and source disagree, trust the source and re-run `devmap build`.".to_string(),
+        "If the map and source disagree, trust the source and re-run `devmap build --manifest`."
+            .to_string(),
     );
     lines.join("\n")
 }
@@ -491,6 +494,18 @@ mod tests {
         assert!(
             !text.contains("devcouncil_"),
             "the standalone guide must not name DevCouncil MCP tools: {text}"
+        );
+    }
+
+    #[test]
+    fn a_guide_can_bootstrap_a_new_worktree_and_refresh_its_exported_map() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(text.contains("devmap paths --json"), "{text}");
+        assert!(text.contains("devmap build --manifest"), "{text}");
+        assert!(text.contains("per-worktree"), "{text}");
+        assert!(
+            !text.contains("re-run `devmap build`"),
+            "a database-only build cannot repair an exported map: {text}"
         );
     }
 }

@@ -16,6 +16,7 @@
   import { buildGraphIndex, filterGraphNodes, fitGraphView, graphNodeOpenPath, traceGraph, type TraceDirection } from "../codeintel/graphNavigation";
   import type { GraphVizLoad } from "../codeintel/types";
   import { createFrameScheduler } from "../motion/frameScheduler";
+  import { observeResize } from "../dom/observeResize";
   import { themeStore } from "../stores/themeStore";
   import { getLanguageIconColor, type LanguageIconKey } from "../language/languageLogos";
 
@@ -65,9 +66,8 @@
   let lastPointer = { x: 0, y: 0 };
 
   const scheduler = createFrameScheduler();
-  const resizeScheduler = createFrameScheduler();
   let gpuCtx: CanvasRenderingContext2D | null = null;
-  let resizeObserver: ResizeObserver | null = null;
+  let stopResize: (() => void) | null = null;
 
   const payload = $derived(
     load?.available ? load.payload ?? null : null,
@@ -277,14 +277,13 @@
     measure();
     // Updating responsive classes inside an observer delivery can resize the
     // observed stage again. Defer and coalesce writes outside that delivery.
-    resizeObserver = new ResizeObserver(() => resizeScheduler.schedule(measure));
-    if (hostEl) resizeObserver.observe(hostEl);
+    if (hostEl) stopResize = observeResize(hostEl, () => measure());
   });
 
   onDestroy(() => {
     scheduler.cancel();
-    resizeScheduler.cancel();
-    resizeObserver?.disconnect();
+    stopResize?.();
+    stopResize = null;
     gpuCtx = null;
   });
 

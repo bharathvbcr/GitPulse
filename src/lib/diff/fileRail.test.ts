@@ -198,3 +198,13 @@ describe("labels", () => {
   });
 
 });
+
+
+it("a native mixed status exposes both sides with separate churn", () => {
+  const rail = buildFileRail(input({ selectionKind: "file", statuses: [worktreeFile("mixed.txt", true, {
+    status_code: "MM", additions: 3, deletions: 2,
+    staged_additions: 1, staged_deletions: 1, unstaged_additions: 2, unstaged_deletions: 1,
+  })] }));
+  expect(rail.entries.map(e => [e.isStaged, e.additions, e.deletions])).toEqual([[true, 1, 1], [false, 2, 1]]);
+  expect(new Set(rail.entries.map(entryKey)).size).toBe(2);
+});

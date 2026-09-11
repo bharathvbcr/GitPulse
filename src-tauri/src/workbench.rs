@@ -622,8 +622,8 @@ mod tests {
             r#"{"model":{"base_url":"http://example.com/v1","model":"x"}}"#,
             r#"{"model":{"base_url":"http://127.0.0.1:11434/v1","model":""}}"#,
             &format!(
-                r#"{{"model":{{"base_url":"{}","model":"x"}}}}"#,
-                format!("http://127.0.0.1:11434/{}", "a".repeat(500))
+                r#"{{"model":{{"base_url":"http://127.0.0.1:11434/{}","model":"x"}}}}"#,
+                "a".repeat(500)
             ),
         ] {
             assert_eq!(

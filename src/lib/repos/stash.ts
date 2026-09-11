@@ -23,6 +23,45 @@ export interface StashEntry {
   timestamp: number;
 }
 
+export interface StashList {
+  entries: StashEntry[];
+  truncated: boolean;
+}
+
+export interface StashSaveOptions {
+  include_untracked: boolean;
+  keep_index: boolean;
+}
+
+/** A stack can legally contain the same object more than once. */
+export function stashEntryKey(entry: StashEntry): string {
+  return `${entry.index}:${entry.oid}`;
+}
+
+/** Refuse malformed IPC rather than turning an unavailable stack into empty. */
+export function parseStashList(value: unknown): StashList {
+  if (!value || typeof value !== "object" || !("entries" in value) || !Array.isArray(value.entries)
+      || value.entries.length > 500 || !("truncated" in value) || typeof value.truncated !== "boolean") {
+    throw new Error("Invalid stash listing");
+  }
+  const indices = new Set<number>();
+  const entries = value.entries.map((entry: unknown): StashEntry => {
+    if (!entry || typeof entry !== "object"
+        || !("index" in entry) || typeof entry.index !== "number" || !Number.isSafeInteger(entry.index) || entry.index < 0
+        || !("selector" in entry) || entry.selector !== `stash@{${entry.index}}`
+        || !("oid" in entry) || typeof entry.oid !== "string" || !/^[a-f0-9]{4,64}$/i.test(entry.oid)
+        || !("subject" in entry) || typeof entry.subject !== "string"
+        || !("message" in entry) || typeof entry.message !== "string"
+        || !("branch" in entry) || (entry.branch !== null && typeof entry.branch !== "string")
+        || !("timestamp" in entry) || typeof entry.timestamp !== "number" || !Number.isSafeInteger(entry.timestamp)
+        || indices.has(entry.index)) throw new Error("Invalid stash entry");
+    indices.add(entry.index);
+    return { index: entry.index, selector: entry.selector, oid: entry.oid, subject: entry.subject,
+      message: entry.message, branch: entry.branch, timestamp: entry.timestamp };
+  });
+  return { entries, truncated: value.truncated };
+}
+
 /** Mirrors the Rust `StashAction` under `rename_all = "lowercase"`. */
 export type StashAction = "apply" | "pop" | "drop";
 

@@ -17,9 +17,8 @@
  *   though it had been. This is the rule that a check which could not run must
  *   not report the same result as a check that ran and passed.
  *
- * Aggregation deliberately mirrors {@link summarizeBulkOutcome}, which already
- * enforces the same honesty for per-file batches; this is its per-repository
- * counterpart rather than a second, divergent convention.
+ * Aggregation reports one outcome for the workspace while retaining each
+ * repository's success, failure or skipped state.
  */
 
 import { mapWithConcurrency } from "../async/pool";

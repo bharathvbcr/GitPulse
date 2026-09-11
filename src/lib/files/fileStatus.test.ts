@@ -157,3 +157,12 @@ describe("statusBadgeClass and statusBadgeLabel", () => {
   });
 });
 
+
+
+it("partial staging remains visible in both status scopes and counts the file once", () => {
+  const mixed = status({ path: "mixed.txt", status_code: "MM", is_staged: true, additions: 3, deletions: 2 });
+  expect(statusMatchesScope(mixed, "staged")).toBe(true);
+  expect(statusMatchesScope(mixed, "unstaged")).toBe(true);
+  expect(statusMatchesScope(mixed, "modified")).toBe(true);
+  expect(summarizeStatuses([mixed])).toMatchObject({ staged: 1, unstaged: 1, dirty: 1, additions: 3, deletions: 2 });
+});

@@ -1429,6 +1429,10 @@ mod tests {
             is_conflicted: false,
             additions: 1,
             deletions: 1,
+            staged_additions: Some(1),
+            staged_deletions: Some(1),
+            unstaged_additions: Some(0),
+            unstaged_deletions: Some(0),
             warnings: Vec::new(),
         }];
         let seeds = seed_paths_from_statuses(&statuses);

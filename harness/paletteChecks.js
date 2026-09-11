@@ -20,7 +20,7 @@ let files = ["src/App.svelte", "src/lib/components/CommandPalette.svelte", "READ
 const fixture = {
  cmd_resolve_repo: a => { if(failedRepo) throw Error("Repository missing"); return { path: a.path, name: "GitPulse", is_bare: false }; },
  cmd_list_branches: () => [branch("main", true), branch("feature/palette")],
- cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }), cmd_stash_list: () => [],
+ cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }), cmd_stash_list: () => ({ entries: [], truncated: false }),
  cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
  cmd_repo_operation: () => null,
  cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
