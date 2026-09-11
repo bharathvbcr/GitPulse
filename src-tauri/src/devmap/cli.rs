@@ -1107,14 +1107,11 @@ exit 2
         assert_eq!(available, ["src/lib.rs"], "{available:?}");
         assert_eq!(out.files_total, 21);
         assert!(
-            out.files
-                .iter()
-                .filter(|file| !file.available)
-                .all(|file| {
-                    file.reason
-                        .as_deref()
-                        .is_some_and(|reason| reason.contains("non-source") || reason.contains("testdata"))
-                }),
+            out.files.iter().filter(|file| !file.available).all(|file| {
+                file.reason.as_deref().is_some_and(|reason| {
+                    reason.contains("non-source") || reason.contains("testdata")
+                })
+            }),
             "ineligible paths must name the skip reason"
         );
     }
