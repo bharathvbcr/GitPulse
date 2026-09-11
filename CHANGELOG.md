@@ -53,11 +53,12 @@ draft tag.
   outbound source symlink annotate the entry without following the target.
 - Look up index and commit blobs named `0:foo.py` or `foo*.py` on Windows
   without trusting Git-for-Windows pathspec: match those names against the
-  listing, and seed them through the index when Win32 cannot store them. Pin
-  `core.autocrlf=false` on stash fixtures so checkout does not rewrite LF.
-  Classify relative `.devcouncil/` watcher events against an absolute
-  worktree. Clippy `-D warnings` no longer fails the Windows job on an unused
-  `mut` DirBuilder or a unix-only live-echo cooldown helper.
+  listing (`ls-tree --full-tree`), seed them through the index when Win32
+  cannot store them, and keep ADS-shaped names in the tree when committing
+  without checkout. Pin `core.autocrlf=false` on stash fixtures so checkout
+  does not rewrite LF. Classify relative `.devcouncil/` watcher events against
+  an absolute worktree. Clippy `-D warnings` no longer fails the Windows job
+  on an unused `mut` DirBuilder or a unix-only live-echo cooldown helper.
 
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.

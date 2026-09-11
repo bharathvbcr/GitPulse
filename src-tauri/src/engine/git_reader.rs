@@ -2901,20 +2901,47 @@ fn ls_files_stage_records(repo: &Path, file_path: &str) -> Result<Vec<IndexStage
     }
 }
 
+/// Peels `rev` to a tree object so `ls-tree` never sees a symbolic name that
+/// could collide with a blob named `HEAD` / `@`.
+fn peel_revision_to_tree(repo: &Path, rev: &str) -> Result<String, String> {
+    let spec = format!("{rev}^{{tree}}");
+    let oid = git_text(repo, &["rev-parse", "--verify", spec.as_str()])?;
+    let oid = oid.trim();
+    validate_oid(oid).map_err(|_| format!("Invalid tree for revision '{rev}'"))?;
+    Ok(oid.to_string())
+}
+
+/// Full recursive listing. `--full-tree` is required: without it Git for
+/// Windows treats `0:foo.py` as a drive-relative path and omits it from a
+/// cwd-scoped listing even when the tree object contains that name.
+fn ls_tree_full_z(repo: &Path, tree: &str) -> Result<Vec<u8>, String> {
+    git(
+        repo,
+        &["ls-tree", "-z", "--full-tree", "--full-name", "-r", tree],
+    )
+}
+
 fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEntry>, String> {
+    let tree = peel_revision_to_tree(repo, rev)?;
     if listing_must_match_path_exactly(file_path) {
-        let raw = git(repo, &["ls-tree", "-z", "--full-name", "-r", rev])?;
-        return tree_entries_named(&raw, file_path);
+        return tree_entries_named(&ls_tree_full_z(repo, &tree)?, file_path);
     }
     let spec = literal_pathspec(file_path);
     match git(
         repo,
-        &["ls-tree", "-z", "--full-name", rev, "--", spec.as_str()],
+        &[
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            "--full-name",
+            tree.as_str(),
+            "--",
+            spec.as_str(),
+        ],
     ) {
         Ok(raw) => parse_ls_tree_z(&raw),
         Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
-            let raw = git(repo, &["ls-tree", "-z", "--full-name", "-r", rev])?;
-            tree_entries_named(&raw, file_path)
+            tree_entries_named(&ls_tree_full_z(repo, &tree)?, file_path)
         }
         Err(err) => Err(err),
     }
@@ -4037,8 +4064,19 @@ mod tests {
 
     /// `git commit` checks the tree out; Win32 cannot store glob/colon names.
     /// commit-tree + update-ref records HEAD without touching the working tree.
+    /// `core.protectNTFS=false` is required: Git for Windows otherwise omits
+    /// ADS-shaped names (`0:foo.py`) from the tree even when they are in the index.
     fn commit_index_without_checkout(dir: &Path, message: &str) {
-        let tree = git_stdout(dir, &["write-tree"]);
+        let tree = git_stdout(
+            dir,
+            &[
+                "-c",
+                "core.protectNTFS=false",
+                "-c",
+                "core.protectHFS=false",
+                "write-tree",
+            ],
+        );
         let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
         let parent = git_output(dir, &["rev-parse", "--verify", "-q", "HEAD"]);
         let parent_oid = parent
@@ -4057,6 +4095,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         git_in(dir.path(), &["init", "-q", "-b", "main"]);
         git_in(dir.path(), &["config", "core.autocrlf", "false"]);
+        git_in(dir.path(), &["config", "core.protectNTFS", "false"]);
+        git_in(dir.path(), &["config", "core.protectHFS", "false"]);
         dir
     }
 
@@ -4096,6 +4136,8 @@ mod tests {
             .args([
                 "-c",
                 "core.protectNTFS=false",
+                "-c",
+                "core.protectHFS=false",
                 "update-index",
                 "--add",
                 "--index-info",
@@ -4106,9 +4148,12 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn git update-index");
+        // Two-field form (`mode SP oid TAB path`). The three-field form
+        // writes `0\t0:foo.py`, which Git for Windows can parse as stage
+        // syntax rather than a path named `0:foo.py`.
         writeln!(
             index.stdin.take().expect("update-index stdin"),
-            "100644 {oid} 0\t{rel}"
+            "100644 {oid}\t{rel}"
         )
         .unwrap();
         let indexed = index.wait_with_output().expect("update-index wait");
@@ -4131,6 +4176,87 @@ mod tests {
         std::fs::write(&dest, body).unwrap();
         let spec = format!(":(literal){rel}");
         git_in(dir, &["add", "--", spec.as_str()]);
+    }
+
+    fn z_split_strings(raw: &[u8]) -> Vec<String> {
+        raw.split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect()
+    }
+
+    fn staged_paths(dir: &Path) -> Vec<String> {
+        let out = git_output(dir, &["ls-files", "-z"]);
+        assert!(
+            out.status.success(),
+            "ls-files failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        z_split_strings(&out.stdout)
+    }
+
+    fn head_tree_paths(dir: &Path) -> Vec<String> {
+        let out = git_output(
+            dir,
+            &["ls-tree", "-z", "--full-tree", "--name-only", "-r", "HEAD"],
+        );
+        assert!(
+            out.status.success(),
+            "ls-tree failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        z_split_strings(&out.stdout)
+    }
+
+    /// `mktree` writes the path into a tree object without `write-tree`, so
+    /// ADS-shaped names cannot be dropped by NTFS path verification.
+    fn commit_root_blob_via_mktree(dir: &Path, path: &str, body: &[u8]) {
+        use std::io::Write;
+        let mut hash = std::process::Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git hash-object");
+        hash.stdin
+            .take()
+            .expect("hash-object stdin")
+            .write_all(body)
+            .unwrap();
+        let hashed = hash.wait_with_output().expect("hash-object wait");
+        assert!(
+            hashed.status.success(),
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&hashed.stderr)
+        );
+        let oid = String::from_utf8(hashed.stdout).unwrap();
+        let oid = oid.trim();
+        let mut tree = std::process::Command::new("git")
+            .args(["-c", "core.protectNTFS=false", "mktree", "-z"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git mktree");
+        {
+            let mut stdin = tree.stdin.take().expect("mktree stdin");
+            write!(stdin, "100644 blob {oid}\t{path}").unwrap();
+            stdin.write_all(&[0]).unwrap();
+        }
+        let treed = tree.wait_with_output().expect("mktree wait");
+        assert!(
+            treed.status.success(),
+            "git mktree {path:?} failed: {}",
+            String::from_utf8_lossy(&treed.stderr)
+        );
+        let tree_oid = String::from_utf8(treed.stdout).unwrap();
+        let tree_oid = tree_oid.trim();
+        let commit = git_stdout(dir, &["commit-tree", tree_oid, "-m", "mktree"]);
+        git_in(dir, &["update-ref", "HEAD", commit.as_str()]);
     }
 
     #[test]
@@ -4865,13 +4991,27 @@ mod tests {
         for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
             write_and_add_literal(dir.path(), path, format!("body-{i}\n").as_bytes());
         }
+        let staged = staged_paths(dir.path());
+        for path in BLOB_DWIM_PATHS {
+            assert!(
+                staged.iter().any(|p| p == path),
+                "index missing {path}: {staged:?}"
+            );
+        }
         commit_index_without_checkout(dir.path(), "all names");
+        let trees = head_tree_paths(dir.path());
+        for path in BLOB_DWIM_PATHS {
+            assert!(
+                trees.iter().any(|p| p == path),
+                "tree missing {path}: {trees:?}"
+            );
+        }
         let repo = dir.path().to_string_lossy();
         for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
             let want = format!("body-{i}\n");
             assert_eq!(
                 GitReader::get_file_blob(&repo, path, Some("HEAD"))
-                    .unwrap_or_else(|e| panic!("HEAD {path}: {e}"))
+                    .unwrap_or_else(|e| panic!("HEAD {path}: {e}; tree={trees:?}"))
                     .text
                     .as_deref(),
                 Some(want.as_str()),
@@ -4887,6 +5027,28 @@ mod tests {
                 "index {path}"
             );
         }
+    }
+
+    #[test]
+    fn get_file_blob_reads_ads_shaped_commit_path_from_mktree() {
+        let dir = init_git_repo();
+        commit_root_blob_via_mktree(dir.path(), "0:foo.py", b"ads-head\n");
+        let repo = dir.path().to_string_lossy();
+        assert_eq!(
+            GitReader::get_file_blob(&repo, "0:foo.py", Some("HEAD"))
+                .expect("mktree ADS name")
+                .text
+                .as_deref(),
+            Some("ads-head\n")
+        );
+        commit_root_blob_via_mktree(dir.path(), "foo:bar.py", b"stream-head\n");
+        assert_eq!(
+            GitReader::get_file_blob(&repo, "foo:bar.py", Some("HEAD"))
+                .expect("mktree stream name")
+                .text
+                .as_deref(),
+            Some("stream-head\n")
+        );
     }
 
     #[test]
