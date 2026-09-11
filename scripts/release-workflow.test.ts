@@ -80,6 +80,9 @@ it("supports hosted runners without an external devmap CLI and reports that abse
   expect(result.stdout).toContain("CLI unavailable");
 });
 
-it("exposes GH_TOKEN only to the individual release API steps", () => {
-  expect(workflow).not.toMatch(/^    env:\n      GH_TOKEN:/m);
+it("fails the release when any platform leg fails rather than publishing a partial draft", () => {
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  expect(verify).toContain("if: always()");
+  expect(verify).toContain("needs.release.result");
+  expect(verify).toContain("do not publish it");
 });

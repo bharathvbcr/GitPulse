@@ -4065,18 +4065,59 @@ mod tests {
     /// `git commit` checks the tree out; Win32 cannot store glob/colon names.
     /// commit-tree + update-ref records HEAD without touching the working tree.
     /// `core.protectNTFS=false` is required: Git for Windows otherwise omits
-    /// ADS-shaped names (`0:foo.py`) from the tree even when they are in the index.
+    /// ADS-shaped names (`foo:bar.py`) from the tree even when they are in the index.
     fn commit_index_without_checkout(dir: &Path, message: &str) {
-        let tree = git_stdout(
-            dir,
-            &[
-                "-c",
-                "core.protectNTFS=false",
-                "-c",
-                "core.protectHFS=false",
-                "write-tree",
-            ],
-        );
+        commit_index_union_mktree(dir, &[], message);
+    }
+
+    /// Write the current index to a tree, then `mktree` any extra blobs that
+    /// Git for Windows cannot stage (`0:foo.py`) into the same commit. Never
+    /// `read-tree` those extras: that command still dies with `invalid path`
+    /// even when `core.protectNTFS=false` is set in the repo and on the
+    /// command line. Measured on windows-latest (Git 2.55).
+    fn commit_index_union_mktree(dir: &Path, extras: &[(&str, Vec<u8>)], message: &str) {
+        let tree = if extras.is_empty() {
+            git_stdout(
+                dir,
+                &[
+                    "-c",
+                    "core.protectNTFS=false",
+                    "-c",
+                    "core.protectHFS=false",
+                    "write-tree",
+                ],
+            )
+        } else {
+            let base = git_output(
+                dir,
+                &[
+                    "-c",
+                    "core.protectNTFS=false",
+                    "-c",
+                    "core.protectHFS=false",
+                    "write-tree",
+                ],
+            );
+            let mut records = if base.status.success() {
+                let base_oid = String::from_utf8_lossy(&base.stdout).trim().to_string();
+                let listed = git_output(dir, &["ls-tree", "-z", "--full-tree", base_oid.as_str()]);
+                assert!(
+                    listed.status.success(),
+                    "ls-tree base failed: {}",
+                    String::from_utf8_lossy(&listed.stderr)
+                );
+                listed.stdout
+            } else {
+                Vec::new()
+            };
+            for (path, body) in extras {
+                let oid = hash_blob_oid(dir, body);
+                let mut rec = format!("100644 blob {oid}\t{path}").into_bytes();
+                rec.push(0);
+                records.extend(rec);
+            }
+            mktree_z(dir, &records)
+        };
         let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
         let parent = git_output(dir, &["rev-parse", "--verify", "-q", "HEAD"]);
         let parent_oid = parent
@@ -4109,12 +4150,19 @@ mod tests {
             .any(|b| matches!(b, b'*' | b'?' | b'"' | b':' | b'<' | b'>' | b'|'))
     }
 
-    /// Git for Windows treats `X:rest` as a drive when the path is an
-    /// `update-index` argument, even for a digit, and drops it with exit 0.
-    /// Tree objects still hold the name; stage those through mktree.
+    /// Git for Windows treats `X:rest` as a drive-shaped / ADS name when the
+    /// colon is the second byte, even for a digit. `update-index --index-info`
+    /// drops it with exit 0; `read-tree` dies with `invalid path`.
     fn path_is_dos_drive_shaped(rel: &str) -> bool {
         let bytes = rel.as_bytes();
         bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphanumeric()
+    }
+
+    /// Git for Windows cannot hold these names in the index at all. Product
+    /// lookup of a commit blob uses `ls-tree` + `cat-file` and does not need
+    /// the index; tests must seed those names with `mktree`, never `read-tree`.
+    fn index_can_store_path(rel: &str) -> bool {
+        !(cfg!(windows) && path_is_dos_drive_shaped(rel))
     }
 
     fn hash_blob_oid(dir: &Path, body: &[u8]) -> String {
@@ -4172,56 +4220,13 @@ mod tests {
         String::from_utf8(treed.stdout).unwrap().trim().to_string()
     }
 
-    fn stage_blob_via_tree_union(dir: &Path, path: &str, oid: &str) {
-        let mut extra = format!("100644 blob {oid}\t{path}").into_bytes();
-        extra.push(0);
-        let extra_tree = mktree_z(dir, &extra);
-        let base = git_output(
-            dir,
-            &[
-                "-c",
-                "core.protectNTFS=false",
-                "-c",
-                "core.protectHFS=false",
-                "write-tree",
-            ],
-        );
-        let union = if base.status.success() {
-            let base_oid = String::from_utf8_lossy(&base.stdout).trim().to_string();
-            let listed = git_output(dir, &["ls-tree", "-z", "--full-tree", base_oid.as_str()]);
-            assert!(
-                listed.status.success(),
-                "ls-tree base failed: {}",
-                String::from_utf8_lossy(&listed.stderr)
-            );
-            let extra_list =
-                git_output(dir, &["ls-tree", "-z", "--full-tree", extra_tree.as_str()]);
-            assert!(
-                extra_list.status.success(),
-                "ls-tree extra failed: {}",
-                String::from_utf8_lossy(&extra_list.stderr)
-            );
-            let mut combined = listed.stdout;
-            combined.extend(extra_list.stdout);
-            mktree_z(dir, &combined)
-        } else {
-            extra_tree
-        };
-        git_in(dir, &["read-tree", union.as_str()]);
-    }
-
     fn add_blob_via_index(dir: &Path, rel: &str, body: &[u8]) {
         use std::io::Write;
+        assert!(
+            index_can_store_path(rel),
+            "Git for Windows cannot store {rel:?} in the index; seed the commit with mktree"
+        );
         let oid = hash_blob_oid(dir, body);
-        if path_is_dos_drive_shaped(rel) {
-            stage_blob_via_tree_union(dir, rel, &oid);
-            assert!(
-                staged_paths(dir).iter().any(|p| p == rel),
-                "index missing {rel} after read-tree: {:?}",
-                staged_paths(dir)
-            );
-            return;
-        }
         let mut index = std::process::Command::new("git")
             .args([
                 "-c",
@@ -4308,7 +4313,7 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_blob_names_that_win32_cannot_store_enter_the_index_directly() {
+    fn adversarial_blob_names_that_win32_cannot_store_are_classified() {
         assert!(path_must_enter_index_directly("0:foo.py"));
         assert!(path_must_enter_index_directly("foo*.py"));
         assert!(path_must_enter_index_directly(":colon.py"));
@@ -4320,6 +4325,11 @@ mod tests {
         assert!(!path_must_enter_index_directly("keep.txt"));
         assert!(!path_must_enter_index_directly("pkg/__main__.py"));
         assert!(!path_must_enter_index_directly("__main__.py"));
+        assert_eq!(index_can_store_path("0:foo.py"), !cfg!(windows));
+        assert_eq!(index_can_store_path("C:foo.py"), !cfg!(windows));
+        assert!(index_can_store_path("foo:bar.py"));
+        assert!(index_can_store_path(":colon.py"));
+        assert!(index_can_store_path("foo*.py"));
     }
 
     fn unlink_if_present(dir: &Path, rel: &str) {
@@ -5040,17 +5050,30 @@ mod tests {
     #[test]
     fn get_file_blob_roundtrips_every_adversarial_name_through_index_and_head() {
         let dir = init_git_repo();
+        let mut extras: Vec<(&str, Vec<u8>)> = Vec::new();
         for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
-            write_and_add_literal(dir.path(), path, format!("body-{i}\n").as_bytes());
+            let body = format!("body-{i}\n").into_bytes();
+            if index_can_store_path(path) {
+                write_and_add_literal(dir.path(), path, &body);
+            } else {
+                extras.push((*path, body));
+            }
         }
         let staged = staged_paths(dir.path());
         for path in BLOB_DWIM_PATHS {
-            assert!(
-                staged.iter().any(|p| p == path),
-                "index missing {path}: {staged:?}"
-            );
+            if index_can_store_path(path) {
+                assert!(
+                    staged.iter().any(|p| p == path),
+                    "index missing {path}: {staged:?}"
+                );
+            } else {
+                assert!(
+                    staged.iter().all(|p| p != path),
+                    "Git for Windows must not hold drive-shaped {path} in the index: {staged:?}"
+                );
+            }
         }
-        commit_index_without_checkout(dir.path(), "all names");
+        commit_index_union_mktree(dir.path(), &extras, "all names");
         let trees = head_tree_paths(dir.path());
         for path in BLOB_DWIM_PATHS {
             assert!(
@@ -5069,15 +5092,19 @@ mod tests {
                 Some(want.as_str()),
                 "HEAD {path}"
             );
-            unlink_if_present(dir.path(), path);
-            assert_eq!(
-                GitReader::get_file_blob(&repo, path, None)
-                    .unwrap_or_else(|e| panic!("index {path}: {e}"))
-                    .text
-                    .as_deref(),
-                Some(want.as_str()),
-                "index {path}"
-            );
+            if index_can_store_path(path) {
+                unlink_if_present(dir.path(), path);
+                assert_eq!(
+                    GitReader::get_file_blob(&repo, path, None)
+                        .unwrap_or_else(|e| panic!("index {path}: {e}"))
+                        .text
+                        .as_deref(),
+                    Some(want.as_str()),
+                    "index {path}"
+                );
+            } else {
+                assert_blob_missing(dir.path(), path, None);
+            }
         }
     }
 
@@ -5093,14 +5120,51 @@ mod tests {
                 .as_deref(),
             Some("ads-head\n")
         );
-        git_in(dir.path(), &["read-tree", "HEAD"]);
-        assert_eq!(
-            GitReader::get_file_blob(&repo, "0:foo.py", None)
-                .expect("read-tree ADS name")
-                .text
-                .as_deref(),
-            Some("ads-head\n")
+        let installed = git_output(
+            dir.path(),
+            &[
+                "-c",
+                "core.protectNTFS=false",
+                "-c",
+                "core.protectHFS=false",
+                "read-tree",
+                "HEAD",
+            ],
         );
+        if cfg!(windows) {
+            assert!(
+                !installed.status.success(),
+                "Git for Windows must still refuse to install 0:foo.py into the index; stderr={}",
+                String::from_utf8_lossy(&installed.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&installed.stderr);
+            assert!(
+                stderr.to_ascii_lowercase().contains("invalid path"),
+                "expected invalid path from read-tree, got: {stderr}"
+            );
+            assert_eq!(
+                GitReader::get_file_blob(&repo, "0:foo.py", Some("HEAD"))
+                    .expect("commit lookup must not depend on read-tree")
+                    .text
+                    .as_deref(),
+                Some("ads-head\n")
+            );
+            assert_blob_missing(dir.path(), "0:foo.py", None);
+        } else {
+            assert!(
+                installed.status.success(),
+                "read-tree HEAD failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&installed.stdout),
+                String::from_utf8_lossy(&installed.stderr)
+            );
+            assert_eq!(
+                GitReader::get_file_blob(&repo, "0:foo.py", None)
+                    .expect("read-tree ADS name")
+                    .text
+                    .as_deref(),
+                Some("ads-head\n")
+            );
+        }
         commit_root_blob_via_mktree(dir.path(), "foo:bar.py", b"stream-head\n");
         assert_eq!(
             GitReader::get_file_blob(&repo, "foo:bar.py", Some("HEAD"))
@@ -5499,6 +5563,20 @@ mod tests {
         assert_eq!(literal_pathspec(":3:lockfile"), ":(literal):3:lockfile");
         assert_eq!(literal_pathspec("plain.txt"), ":(literal)plain.txt");
         assert_eq!(literal_pathspec("0:foo.py"), ":(literal)0:foo.py");
+    }
+
+    #[test]
+    fn tests_do_not_seed_drive_shaped_names_through_read_tree() {
+        let src = include_str!("git_reader.rs");
+        let forbidden_cwd = ["git_in(dir, &[\"", "read-tree"].concat();
+        let forbidden_path = ["git_in(dir.path(), &[\"", "read-tree"].concat();
+        assert!(
+            !src.contains(&forbidden_cwd),
+            "read-tree cannot install 0:foo.py into a Git for Windows index; use mktree for the commit and git_output if the refusal itself is the assertion"
+        );
+        assert!(!src.contains(&forbidden_path));
+        assert!(src.contains("commit_index_union_mktree"));
+        assert!(src.contains("index_can_store_path"));
     }
 
     #[test]

@@ -13,12 +13,63 @@ before that tag is pushed.
 
 ## [1.0.0] - 2026-09-11
 
-First major GitPulse release: core Git workflow improvements, DevMap/code-intel
-hardening, and a release pipeline that can finish after GitHub detaches a
-draft tag.
+First major GitPulse release. The `v0.1.0` tag was cut the day before, but
+GitHub never published it: installer uploads rewrote the draft's `tag_name`
+to `untagged-<hex>` and finalize aborted with every installer already on the
+draft. That desktop work — native menus, the macOS status popover, repository
+hygiene, the rebuilt command palette, and the workbench — ships here together
+with core Git workflow improvements, DevMap / code-intel hardening, and a
+release pipeline that can finish after GitHub detaches a draft tag.
 
 ### Added
 
+- Expand the native application menu with Go submenus for all 16 view sections,
+  zoom controls, and Help entries for documentation, shortcuts, diagnostics,
+  optional-tool setup, release notes and issue reporting. Section navigation
+  reveals the repository pane from Fleet. Repository commands disable when unavailable.
+- Add live menu checkmarks and progress labels, an open-repository switcher,
+  clear-recents, staging and branch actions, parked-operation controls,
+  copy/reveal/remote utilities and manual update checks.
+- Add an optional icon-only macOS status item opening a compact light/dark
+  popover: repository switching, changed/staged/conflict/stash cards, last-fetch
+  sync counts, parked-operation and busy-work chips, History/Pulse/Fleet/Terminal
+  shortcuts, copy/reveal/remote/appearance utilities, expandable details and
+  contextual review/recovery actions. Refresh and appearance stay in the panel.
+  Open GitPulse restores the main window; closing the main window while enabled
+  preserves its session. Copy, refresh and appearance stay in the popover; Reveal
+  and Remote dismiss it without bringing GitPulse forward. Right-click retains
+  native app controls and adds the current primary action and Refresh when
+  available. Escape collapses the switcher or details first; `R` refreshes and
+  `1`–`4` open a nonzero metric. The status window still cannot mutate Git.
+- Menu bar status enhancements: attention-dot glyph, optional tray title counts,
+  per-repo switcher badges, real `FETCH_HEAD` age, hide-Dock-while-closed, and
+  Launch at login (LaunchAgent with `--background`).
+- Add a global build cleaner to Fleet and Settings, with selected roots,
+  exclusions, retention and run budgets, opt-in native scheduling, closed-repo
+  discovery, durable history and an optional macOS headless LaunchAgent.
+- Reuse DevCouncil's Rust hygiene policy and generated agent guidance. Harden
+  traversal, case-insensitive preservation, partial scans, revision revocation,
+  lock release, registration failures and Git filesystem-monitor suppression.
+- Add Repository hygiene to Storage: stale-output previews across supported
+  language ecosystems, shared-cache inspection and tool-owned maintenance,
+  saved retention/weekly-review preferences, cancellation and explicit outcomes.
+- Drag task cards across Kanban columns with a movement threshold, mid-card
+  insertion, and neighbor-column keyboard moves. Positions stay strictly between
+  neighbors instead of appending `Date.now()` in the middle of a column.
+- Add currently open GitPulse tabs as workspace or task members from the board
+  and workspace editor, registering a path only when it is not already linked.
+- Keep selected task title and description locked while automatic enhancements
+  run.
+- Add task board/list layouts, priority/type/owner/label/due filters over loaded
+  cards, multi-selection and keyboard-accessible context menus. Actions include
+  duplication, status/priority changes, agent copying and confirmed deletion with
+  per-task outcomes and bounded delete passes.
+- Add notes-to-draft editing, inline Manvi title/description suggestions and a
+  Quick Enhance sheet for saved tasks. Proposals respect field locks and require
+  explicit acceptance against the saved revision.
+- Add agent copy for new unsaved drafts and saved task briefs. Saved copies name
+  their revision and exclude unsaved edits; board copying reports its eight-task
+  limit and partial results.
 - Modular DevCouncil install in Setup: DevMap only (default), analysis suite, or
   full host. Copy the documented command or run it in Terminal → Console.
   Settings can disable or uninstall a GitPulse-owned binary without going
@@ -29,6 +80,50 @@ draft tag.
 - Stage or unstage a selection in one native request. Bound path counts, bytes,
   and argument chunks; evaluate every planned command before the first write,
   hold one repository mutation lock, and report partial Git failures explicitly.
+- Scan GitHub Dependabot and code scanning alerts when a repository opens, and
+  warn when critical or high findings are open. Turn off under Settings →
+  Analysis. Failures stay in Health and diagnostics, not as an all-clear toast.
+
+### Changed
+
+- Rebuild the command palette with eight discoverable search modes, fuzzy ranked
+  commands, file and repository search, complete view/section navigation, Clone and
+  Rebase dialog entry points, contextual availability, result paging and accessible
+  keyboard/focus behavior. Successful-use history is validated and bounded.
+- Keep palette searches current across query/mode/repository changes; show loading,
+  deadlines, failures, retry and partial coverage. Resolve cross-repository symbols
+  through the workspace registry before opening files, preserve help-mode transitions,
+  and make the status-bar palette entry work before its first lazy load.
+- Compact the Work inbox to open-and-read, fold notification settings, and give
+  automatic suggestions a board-sized control. Fold task enhancement locks and
+  repository membership into editor details.
+- Give the macOS status popover the app's native background blur, translucent
+  surfaces and rounded material bounds. Preserve the compact layout and provide
+  opaque accessibility fallbacks. Match the native window to the panel on resize
+  and reopen; the browser fixture includes a labeled glass simulation. Select
+  the tray display using physical bounds so Retina coordinates can open the panel.
+- Refine the macOS status popover around three large Changed, Staged and Conflicts
+  cards, a monochrome repository header, last-fetch counts and one blue primary
+  action. Keep stashes, workspace insights, the command palette and secondary
+  shortcuts inside Details, with Open GitPulse, Settings and Quit in the footer.
+- Named GitPulse as the successor to the deprecated LiquiTask workbench in the
+  README, wiki home, and Tasks documentation.
+- Document DevCouncil as independently selectable components and modules, Manvi
+  as the wrap around them, and GitPulse as the host that uses each for its
+  respective job.
+- Refresh README, feature, architecture, contributor and wiki guidance for Tasks,
+  schema-20 DevMap, current shortcuts, module ownership and verification limits.
+  Add a Tasks and workspaces guide; preserve older implementation plans as plans.
+- Resolve repository maps per worktree in both agent guides and document
+  `devmap build --manifest` for missing generated state.
+- Re-vendor DevCouncil analysis crates at v0.2.0 (`devcouncil@a31918e2`) from
+  `rust/` after that workspace flattened out of `rust-port/crates`. Include
+  `dc-evidence` so `dc-verify` can link. Re-vendor `dc-verify` so ledger writes
+  keep using `rigor::redact_secrets`.
+- Add a CodeQL config that excludes `src-tauri/framework/**`. Bindgen
+  offsetof tests and WRY cookie conversion in those ports are not GitPulse
+  sinks. Attach the file to default setup in GitHub Settings.
+- Refresh `@lucide/svelte` 1.44.0, Vite 8.3.0, and `@types/node` 26.5.1.
 
 ### Fixed
 
@@ -36,30 +131,13 @@ draft tag.
   installer uploads, instead of posting a second draft. `/releases/tags/{tag}`
   does not return drafts, even while the tag is still attached; prepare lists
   drafts by that tag or by the name it POSTs, and refuses a truncated page
-  rather than treating it as "no draft".
-- Parse code-intel query envelopes with the `SourceFreshness` object the
-  native side actually sends. A leftover boolean would have made an unverified
-  tree look like a completed freshness check, and the IPC scanner now sees the
-  six codeintel commands that a helper had been hiding.
-- Treat `fresh: null` on advertised MCP output as an unverified check, not as
-  a missing required field. Count the live-echo cooldown storm instead of a
-  wall-clock window so coverage instrumentation cannot starve the bound.
-  Isolate spawn-limit fan-out onto a private gate, and give a command its full
-  timeout after it acquires a process slot so queue wait cannot report a
-  timeout for work that never started. Run instrumented Rust coverage on one
-  test thread so pipe and shebang fixtures are not starved. Cap uninstrumented
-  CI and release `cargo test` at one thread so sidecar hello fixtures stay
-  inside their 20s window. Coverage detail and working-tree reads for an
-  outbound source symlink annotate the entry without following the target.
-- Look up index and commit blobs named `0:foo.py` or `foo*.py` on Windows
-  without trusting Git-for-Windows pathspec: match those names against the
-  listing (`ls-tree --full-tree`), seed them through the index when Win32
-  cannot store them, and keep ADS-shaped names in the tree when committing
-  without checkout. Pin `core.autocrlf=false` on stash fixtures so checkout
-  does not rewrite LF. Classify relative `.devcouncil/` watcher events against
-  an absolute worktree. Clippy `-D warnings` no longer fails the Windows job
-  on an unused `mut` DirBuilder or a unix-only live-echo cooldown helper.
-
+  rather than treating it as "no draft". Identify a draft by its tag and
+  release ID. GitHub often rewrites `target_commitish` to a branch name after
+  associating an existing tag; a SHA in `target_commitish` must still match the
+  pinned commit, and a ref name is not a second pin. An `untagged-` placeholder
+  is accepted only in GitHub's hex form, and finalize writes the intended tag
+  name back with the notes. Platform builds upload by release ID only so
+  tauri-action cannot retarget the draft.
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.
 - Keep partially staged files visible on both sides in the sidebar and diff
@@ -76,10 +154,63 @@ draft tag.
 - Preserve stash-list and diff truncation across IPC and show limits in the UI.
   Distinguish repeated stash OIDs by stack position and discard late previews
   after repository switches or panel disposal.
+- Keep bulk staging and Quick Commit attached to their original repository
+  across tab changes and dialogs. Track interactive rebase through the same
+  guarded mutation owner and reject stale plans.
+- Keep bulk mutation activity visible through recovery refresh after failure.
 - Reload task assistance when the shared model selection changes; ignore stale
   responses and recover without reopening the editor.
-- Keep bulk mutation activity visible through recovery refresh after failure.
-
+- Harden Manvi task drafting and review: preserve and consume extracted notes,
+  expose task model configuration, and retain mutation identities after lost
+  replies. Refuse stale or foreign proposal confirmations and unsaved-edit
+  acceptance. Keep task fields, enhancement history and runs stacked in one
+  scroller, with an opaque save bar that prevents text bleeding through controls.
+- Preserve the latest native menu update through transient bridge failures.
+- Keep native menu shortcuts from also executing in the webview. Match the
+  platform's Command/Control binding so alternate webview shortcuts still work.
+- Fix macOS status-icon left click: do not keep an `NSMenu` attached at rest so
+  clicks open the popover instead of the native menu (verified on macOS 27).
+- Stop labeling untracked environments, agent state, dependency stores, logs
+  and scratch directories as automatically safe to reclaim. Cleanup previews
+  validate ignored paths, tracked content, activity and file identities, and
+  refuse stale, repeated or incomplete plans.
+- Ignore in-app HTML5 and pointer drags on the native window drop path, so
+  moving a Kanban card or tab no longer paints "Drop a Git repository to open".
+- Treat an unborn HEAD (empty or orphan branch) as a graph notice, not a
+  diagnostics fault.
+- Keep Swift coverage `--package-path` inside the repository. Plan Go coverage
+  from a root `go.work` or each nested module, and prefer a JavaScript project's
+  declared coverage script or runner instead of inventing `npx` commands.
+- Parse code-intel query envelopes with the `SourceFreshness` object the
+  native side actually sends. A leftover boolean would have made an unverified
+  tree look like a completed freshness check, and the IPC scanner now sees the
+  six codeintel commands that a helper had been hiding.
+- Treat `fresh: null` on advertised MCP output as an unverified check, not as
+  a missing required field. Count the live-echo cooldown storm instead of a
+  wall-clock window so coverage instrumentation cannot starve the bound.
+  Isolate spawn-limit fan-out onto a private gate, and give a command its full
+  timeout after it acquires a process slot so queue wait cannot report a
+  timeout for work that never started. Run instrumented Rust coverage on one
+  test thread so pipe and shebang fixtures are not starved. Cap uninstrumented
+  CI and release `cargo test` at one thread so sidecar hello fixtures stay
+  inside their 20s window. Coverage detail and working-tree reads for an
+  outbound source symlink annotate the entry without following the target.
+- Look up commit blobs named `0:foo.py` or `foo*.py` on Windows without
+  trusting Git-for-Windows pathspec: match those names against
+  `ls-tree --full-tree` and read them with `cat-file`. Git for Windows
+  `read-tree` still refuses drive-shaped names (`invalid path '0:foo.py'`)
+  even with `core.protectNTFS=false`, so tests seed those commits with
+  `mktree` and never install them into the index. Other glob and colon
+  names still enter the index through `update-index --index-info`. Pin
+  `core.autocrlf=false` on stash fixtures so checkout does not rewrite LF.
+  Classify relative `.devcouncil/` watcher events against an absolute
+  worktree. Clippy `-D warnings` no longer fails the Windows job on an unused
+  `mut` DirBuilder or a unix-only live-echo cooldown helper.
+- Keep Windows `--lib`, hygiene, clippy, llvm-cov, and CI cache prefixes
+  completing: volume-root canonicalize, comctl32 v6 manifest, writable fixture
+  mtimes, ImageOS cache keys, coverage-relaxed sidecar deadlines, and
+  filesystem-monitor / shared-cache slash normalization. Detail remains under
+  [0.1.0].
 - Seal macOS app bundles with an ad-hoc signature by default, avoiding invalid
   linker-only signatures. A configured Apple signing identity can override this;
   trusted distribution and notarization remain separate checks.
@@ -91,25 +222,6 @@ draft tag.
   (`checkout.defaultRemote`, then `origin`, then a lone remote). Refuse when
   none of those exist rather than inventing `origin`.
 
-### Verification
-
-- Add real Git regressions, Tauri IPC round trips, clone races, bounded batch
-  stress, and stash overflow tests. Gate the expanded Git-client browser harness
-  in local CI and the Chrome/WebKit workflow.
-- See [the release audit](docs/GIT_CLIENT_RELEASE_AUDIT.md) for measured results,
-  inherited work, security impact, evidence limits, and remaining release gates.
-
-### Included prior unreleased changes
-
-
-
-- Scan GitHub Dependabot and code scanning alerts when a repository opens, and
-  warn when critical or high findings are open. Turn off under Settings →
-  Analysis. Failures stay in Health and diagnostics, not as an all-clear toast.
-- Menu bar status enhancements: attention-dot glyph, optional tray title counts,
-  per-repo switcher badges, real `FETCH_HEAD` age, hide-Dock-while-closed, and
-  Launch at login (LaunchAgent with `--background`).
-
 ### Security
 
 - Complete gitignore-literal escaping for copied hygiene ignore rules so a
@@ -119,31 +231,22 @@ draft tag.
   `--background` and does not add network access or broaden filesystem rights.
   Autostart IPC is limited to the main window capability.
 
-### Changed
+### Verification
 
-- Named GitPulse as the successor to the deprecated LiquiTask workbench in the
-  README, wiki home, and Tasks documentation.
-- Document DevCouncil as independently selectable components and modules, Manvi
-  as the wrap around them, and GitPulse as the host that uses each for its
-  respective job.
-- Re-vendor DevCouncil analysis crates at v0.2.0 (`devcouncil@a31918e2`).
-
-- Fix macOS status-icon left click: do not keep an `NSMenu` attached at rest so
-  clicks open the popover instead of the native menu (verified on macOS 27).
-- Add a CodeQL config that excludes `src-tauri/framework/**`. Bindgen
-  offsetof tests and WRY cookie conversion in those ports are not GitPulse
-  sinks. Attach the file to default setup in GitHub Settings.
-- Refresh `@lucide/svelte` 1.44.0, Vite 8.3.0, and `@types/node` 26.5.1.
-- Vendor DevCouncil analysis crates from `rust/` after that workspace flattened
-  out of `rust-port/crates`. Include `dc-evidence` so `dc-verify` can link.
-  Re-vendor `dc-verify` so ledger writes keep using `rigor::redact_secrets`.
-- Document GitPulse as the successor to the deprecated LiquiTask workbench.
+- Add real Git regressions, Tauri IPC round trips, clone races, bounded batch
+  stress, and stash overflow tests. Gate the expanded Git-client browser harness
+  in local CI and the Chrome/WebKit workflow.
+- See [the release audit](docs/archive/GIT_CLIENT_RELEASE_AUDIT.md) for measured
+  results, inherited work, security impact, evidence limits, and remaining
+  release gates.
 
 ## [0.1.0] - 2026-09-10
 
-First minor release after the 0.0.x desktop series. Native menus, the macOS
-status popover, repository hygiene, the rebuilt command palette, and the
-workbench board land together on `main`.
+Tagged as the first minor release after the 0.0.x desktop series. GitHub never
+published this tag: after installer uploads the draft's `tag_name` became
+`untagged-<hex>`, and finalize aborted with every installer already on the
+draft. That work is included in [1.0.0] as the first major release rather than
+as a separate 0.1.x product line. The original notes for this tag follow.
 
 ### Added
 
@@ -1156,7 +1259,7 @@ Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the com
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
 [Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.1.0...v1.0.0
+[1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
 [0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.8
