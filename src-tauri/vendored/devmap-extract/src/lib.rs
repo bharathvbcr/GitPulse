@@ -790,7 +790,15 @@ pub fn collect_sources_with_report(
 /// before this returns, exactly as they were when the reads were inline.
 /// Read one discovered source. The reader is shared with source verification.
 pub fn read_source(path: &Path) -> std::io::Result<String> {
+    read_source_with_limit(path, MAX_SOURCE_BYTES)
+}
+
+/// Read a regular UTF-8 file with a caller's tighter byte ceiling. The source
+/// ceiling remains an upper bound; source and manifest readers share the same
+/// nonblocking open, descriptor checks and replacement detection.
+pub fn read_source_with_limit(path: &Path, byte_limit: u64) -> std::io::Result<String> {
     use std::io::Read;
+    let byte_limit = byte_limit.min(MAX_SOURCE_BYTES);
     let refused = |reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -806,16 +814,18 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
     if !before.is_file() {
         return Err(refused("source is not a regular file"));
     }
-    if before.len() > MAX_SOURCE_BYTES {
-        return Err(refused("source changed or exceeds the 1 MiB read ceiling"));
+    if before.len() > byte_limit {
+        return Err(refused(&format!(
+            "source changed or exceeds the {byte_limit} byte read ceiling"
+        )));
     }
     let modified = before.modified()?;
     let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
-        .take(MAX_SOURCE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SOURCE_BYTES {
-        return Err(refused("source changed or exceeds the 1 MiB read ceiling"));
+    file.by_ref().take(byte_limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > byte_limit {
+        return Err(refused(&format!(
+            "source changed or exceeds the {byte_limit} byte read ceiling"
+        )));
     }
     let after = file.metadata()?;
     let current = fs::metadata(path)?;

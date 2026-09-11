@@ -1,6 +1,6 @@
 use crate::Store;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 fn store_at(epoch: i64) -> (Store, Arc<AtomicI64>) {
     let clock = Arc::new(AtomicI64::new(epoch));

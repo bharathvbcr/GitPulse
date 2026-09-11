@@ -843,6 +843,11 @@ fn consumer_manifest_json(
                 // out. `true` makes both lists a lower bound rather than the
                 // repository's full set.
                 "inventory_walk_truncated": inventory.walk_truncated,
+            "inventory_complete": inventory.is_complete(),
+            "inventory_source": inventory.source,
+            "inventory_entries_examined": inventory.entries_examined,
+            "inventory_files_total": inventory.files_total,
+            "inventory_unreadable_count": inventory.unreadable_count,
                 "inventory_directories_visited": inventory.directories_visited,
                 "inventory_unavailable_reason": inventory.unavailable_reason,
                 // Goal-dependent; `dev map --goal` fills it downstream.

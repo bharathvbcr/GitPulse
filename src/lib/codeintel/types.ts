@@ -63,6 +63,9 @@ export interface CodeintelStatus {
   /** A stale generation can remain available for navigation. */
   is_fresh?: boolean | null;
   freshness_reason?: string | null;
+  /** Independent evidence; null or absent means unverified. */
+  source_freshness?: boolean | null;
+  analyzer_freshness?: boolean | null;
   pending_count?: number | null;
   db_path: string;
   generation_id?: number | null;

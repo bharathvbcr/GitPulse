@@ -1244,7 +1244,7 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
     ) -> anyhow::Result<BlastWalk> {
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
-        let depth_cap = max_depth.clamp(1, MAX_TRAVERSAL_DEPTH);
+        let depth_cap = max_depth.min(MAX_TRAVERSAL_DEPTH);
         let mut seed_set: BTreeSet<(String, String)> = BTreeSet::new();
         let mut unmatched: Vec<String> = Vec::new();
         for target in targets {
@@ -1256,13 +1256,17 @@ impl<'a> StoreQueryEngine<'a> {
             }
             seed_set.extend(matched);
         }
-        let seeds: Vec<(String, String)> = seed_set.into_iter().collect();
+        let starts_dropped = seed_set.len().saturating_sub(TRAVERSAL_MAX_NODES);
+        let seeds: Vec<(String, String)> = seed_set.into_iter().take(TRAVERSAL_MAX_NODES).collect();
         let mut walk = BlastWalk {
             seeds,
             unmatched,
             bands: Vec::new(),
             total_impacted: 0,
-            stop: TraversalStop::default(),
+            stop: TraversalStop {
+                starts_dropped,
+                ..TraversalStop::default()
+            },
             depth_cap,
             unresolved_seeds: false,
             coverage_gap: analysis_coverage_gap(index.analysis()),
@@ -1279,11 +1283,8 @@ impl<'a> StoreQueryEngine<'a> {
         // walk applied before an index existed, and an edge can pass one and
         // fail the other. The whole-generation `BTreeMap` this replaced was
         // rebuilt per call, which is the cost the index exists to remove.
-        let inbound = |node: &str| {
-            index.into_target_symbol(node).iter().copied().filter(|id| {
-                index.admits(*id, min_confidence) && index.confidence(*id) >= min_confidence
-            })
-        };
+        let admits =
+            |id| index.admits(id, min_confidence) && index.confidence(id) >= min_confidence;
 
         let mut visited: BTreeSet<String> = walk
             .seeds
@@ -1291,13 +1292,19 @@ impl<'a> StoreQueryEngine<'a> {
             .map(|(symbol, _)| symbol.clone())
             .collect();
         let mut frontier: Vec<String> = visited.iter().cloned().collect();
+        let mut checked = 0usize;
         for depth in 1..=depth_cap {
             self.cancel.check()?;
             let mut members: BTreeSet<(String, String)> = BTreeSet::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut lowest: Option<f32> = None;
             for node in &frontier {
-                for id in inbound(node.as_str()) {
+                for id in index.into_target_symbol(node).iter().copied() {
+                    self.cancel.check_every(checked)?;
+                    checked = checked.wrapping_add(1);
+                    if !admits(id) {
+                        continue;
+                    }
                     let source_symbol = index.source_symbol(id);
                     if visited.contains(source_symbol) || seen.contains(source_symbol) {
                         continue;
@@ -1337,12 +1344,18 @@ impl<'a> StoreQueryEngine<'a> {
             });
             visited.extend(seen.iter().cloned());
             frontier = seen.into_iter().collect();
-            if depth == depth_cap {
-                // Something was still expanding when the depth bound stopped
-                // it. Left unsaid, a capped radius reads as a complete one.
-                walk.stop.depth_capped = frontier.iter().any(|node| {
-                    inbound(node.as_str()).any(|id| !visited.contains(index.source_symbol(id)))
-                });
+        }
+        // Also inspect the seed frontier at depth zero. No hops were requested,
+        // but a caller must still know whether further reachability was withheld.
+        'probe: for node in &frontier {
+            self.cancel.check()?;
+            for id in index.into_target_symbol(node).iter().copied() {
+                self.cancel.check_every(checked)?;
+                checked = checked.wrapping_add(1);
+                if admits(id) && !visited.contains(index.source_symbol(id)) {
+                    walk.stop.depth_capped = walk.bands.len() == depth_cap;
+                    break 'probe;
+                }
             }
         }
         Ok(walk)
@@ -3172,9 +3185,9 @@ fn indexed_traversed_edges(
 /// Traversal starts, found through the index rather than by scanning.
 ///
 /// Identical to the [`traversal_starts`] scan it replaced — same pairs, same
-/// order, same duplicates, because `traverse_indexed` counts the raw start
-/// list when it reports `starts_dropped` and a deduplicated one would change
-/// the answer. What changes is the cost: a symbol query tests the distinct
+/// order and duplicates. The traversal admits distinct seeds before applying
+/// its node cap, so repeated edge endpoints cannot consume that capacity.
+/// What changes is the cost: a symbol query tests the distinct
 /// symbols (41,276 on the ScholarLM corpus) and a path query the distinct
 /// files (4,499), instead of testing every one of 271,543 edges.
 ///
@@ -5279,6 +5292,66 @@ mod indexed_start_equivalence_tests {
             .reason(64, TRAVERSAL_MAX_NODES)
             .expect("an incomplete walk needs a reason");
         assert!(reason.contains("lower bound"), "{reason}");
+    }
+
+    #[test]
+    fn affected_seed_expansion_obeys_the_same_node_bound_as_its_frontier() {
+        let rows = (0..TRAVERSAL_MAX_NODES + 10)
+            .map(|i| {
+                stored(
+                    "caller",
+                    "caller.py",
+                    &format!("wide.py::seed{i}"),
+                    "wide.py",
+                    EdgeKind::Calls,
+                    1.0,
+                )
+            })
+            .collect();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows), None).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let walk = StoreQueryEngine::new(&store)
+            .blast_walk(&index, &["wide.py".into()], 0, 0.0)
+            .unwrap();
+        assert_eq!(walk.seeds.len(), TRAVERSAL_MAX_NODES);
+        assert_eq!(walk.stop.starts_dropped, 10);
+        assert!(walk
+            .incomplete_reason()
+            .unwrap()
+            .contains("start nodes dropped"));
+    }
+
+    #[test]
+    fn affected_cancellation_is_checked_inside_a_single_large_band() {
+        let rows = (0..10_000)
+            .map(|i| {
+                stored(
+                    &format!("caller{i}"),
+                    "caller.py",
+                    "hub",
+                    "hub.py",
+                    EdgeKind::Calls,
+                    1.0,
+                )
+            })
+            .collect();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows), None).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let cancel = Cancel::new();
+        let flipper = cancel.clone();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = cancel.with_check_probe(move || {
+            if checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 2 {
+                flipper.cancel();
+            }
+        });
+        let outcome = StoreQueryEngine::new(&store)
+            .with_cancel(cancel)
+            .blast_walk(&index, &["hub".into()], 1, 0.0);
+        assert!(
+            outcome.is_err(),
+            "a 10,000-edge band must consult cancellation more than once"
+        );
     }
 
     /// A cancelled walk stops rather than finishing the fan-out.

@@ -141,6 +141,11 @@ pub struct CodeintelStatus {
     pub is_fresh: Option<bool>,
     #[serde(default)]
     pub freshness_reason: Option<String>,
+    /// Independent checks; null means this reader could not verify that facet.
+    #[serde(default)]
+    pub source_freshness: Option<bool>,
+    #[serde(default)]
+    pub analyzer_freshness: Option<bool>,
     #[serde(default)]
     pub pending_count: Option<usize>,
     pub db_path: String,
@@ -391,6 +396,8 @@ fn status_unavailable(db_path: String, reason: String) -> CodeintelStatus {
         available: false,
         is_fresh: None,
         freshness_reason: Some(reason.clone()),
+        source_freshness: None,
+        analyzer_freshness: None,
         pending_count: None,
         db_path,
         generation_id: None,
@@ -439,6 +446,8 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
         available: true,
         is_fresh: Some(summary.is_fresh()),
         freshness_reason: summary.freshness_reason(),
+        source_freshness: summary.source_freshness,
+        analyzer_freshness: summary.analyzer_freshness,
         pending_count: Some(summary.pending_count),
         db_path: db_str,
         generation_id: Some(gen_id),
@@ -2124,6 +2133,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_depth_affected_results_keep_the_limit_and_fail_closed() {
+        let repo = repo_with_one_generation();
+        let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
+        conn.execute(
+            "UPDATE paths SET path = 'tests/probe_test.rs' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_read_only(map_path(repo.path())).unwrap();
+        let report = affected_tests_from_store(&store, &["probe_callee".into()], 2000, 0);
+        assert!(report.tests.available);
+        assert!(report.tests.items.is_empty());
+        assert!(report.blast_radius.layers.items.is_empty());
+        assert!(report
+            .tests
+            .walk_incomplete
+            .as_deref()
+            .unwrap()
+            .contains("depth 0"));
+        assert!(report.fail_closed);
+        assert!(report
+            .fail_closed_reason
+            .as_deref()
+            .unwrap()
+            .contains("depth 0"));
+    }
+
+    #[test]
     fn affected_test_batches_share_budget_and_disclose_overlap() {
         let repo = repo_with_one_generation();
         let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
@@ -2688,6 +2726,78 @@ mod tests {
                     .expect("budget omission must be preserved") as usize,
             CALLER_SOURCE.len()
         );
+    }
+
+    fn freshness_audit_matching_source_fixture() -> tempfile::TempDir {
+        let repo = repo_with_one_generation();
+        let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
+        conn.execute("DELETE FROM generation_file_rows WHERE file_id <> 1", [])
+            .unwrap();
+        repo
+    }
+
+    #[test]
+    fn freshness_audit_matching_bytes_do_not_certify_analyzer_identity() {
+        let repo = freshness_audit_matching_source_fixture();
+        let response = status(repo.path().to_str().unwrap());
+        assert_eq!(response.source_freshness, Some(true), "{response:?}");
+        assert_eq!(response.analyzer_freshness, None);
+        assert_eq!(response.is_fresh, Some(false));
+        assert!(response
+            .freshness_reason
+            .unwrap()
+            .contains("analyzer freshness unverified"));
+    }
+
+    #[test]
+    fn freshness_audit_pending_and_absent_generation_are_unverified() {
+        let repo = freshness_audit_matching_source_fixture();
+        let store = Store::open(map_path(repo.path())).unwrap();
+        store
+            .enqueue_pending_paths(&["src/caller.rs".to_string()])
+            .unwrap();
+        let response = status(repo.path().to_str().unwrap());
+        assert_eq!(response.source_freshness, None);
+        assert_eq!(response.analyzer_freshness, None);
+        assert_eq!(response.is_fresh, Some(false));
+        assert!(response.freshness_reason.unwrap().contains("pending"));
+        let empty = status(git_repo().path().to_str().unwrap());
+        assert_eq!(empty.source_freshness, None);
+        assert_eq!(empty.analyzer_freshness, None);
+        assert!(!empty.available);
+    }
+
+    #[test]
+    fn freshness_audit_repeated_edits_additions_and_deletions_never_look_current() {
+        let repo = freshness_audit_matching_source_fixture();
+        let root = repo.path().to_str().unwrap();
+        let path = repo.path().join("src/caller.rs");
+        for iteration in 0..100 {
+            std::fs::write(&path, format!("fn changed_{iteration}() {{}}\n")).unwrap();
+            assert_eq!(status(root).source_freshness, Some(false));
+            std::fs::write(&path, CALLER_SOURCE).unwrap();
+            assert_eq!(status(root).source_freshness, Some(true));
+            let new_path = repo.path().join("src/additional.rs");
+            std::fs::write(&new_path, "fn added() {}\n").unwrap();
+            assert_eq!(status(root).source_freshness, Some(false));
+            std::fs::remove_file(new_path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(status(root).source_freshness, Some(false));
+            std::fs::write(&path, CALLER_SOURCE).unwrap();
+            let current = status(root);
+            assert_eq!(current.source_freshness, Some(true));
+            assert_eq!(current.analyzer_freshness, None);
+            assert_eq!(current.is_fresh, Some(false));
+        }
+    }
+
+    #[test]
+    fn freshness_audit_parser_uncertainty_cannot_hide_missing_source_files() {
+        let repo = repo_with_one_generation();
+        let response = status(repo.path().to_str().unwrap());
+        assert_eq!(response.is_fresh, Some(false));
+        assert!(response.freshness_reason.as_deref().is_some_and(|reason| reason.contains("source tree differs")),
+            "the fixture has missing source files, but parser uncertainty hid the source check: {response:?}");
     }
 
     #[test]

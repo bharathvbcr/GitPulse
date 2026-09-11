@@ -146,7 +146,12 @@ pub(super) fn mutate(
             }
             input.conn.query_row("SELECT json_set(?1,'$.state','interrupted','$.outcome_uncertain',json('true'),'$.failure','The previous provider outcome is unknown; a new attempt may incur another model call.')", [&body], |r|r.get(0))?
         }
-        "enhancements.dismiss" if matches!(state.as_str(), "pending" | "ready" | "failed" | "interrupted") => {
+        "enhancements.dismiss"
+            if matches!(
+                state.as_str(),
+                "pending" | "ready" | "failed" | "interrupted"
+            ) =>
+        {
             input.fields(&["id", "request_id", "expected_revision"])?;
             input
                 .conn
