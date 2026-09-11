@@ -1,6 +1,6 @@
 [package]
 name = "dc-glob"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Python fnmatch semantics, shared by the harness's analysis plane"

@@ -289,8 +289,8 @@ pub struct ArtifactStamp {
 
 /// `path:len:mtime_ns` of the running binary.
 ///
-/// Two builds of this workspace both report `devmap 0.1.0`, so the version
-/// string is not an identity. The executable's own stat is: same bytes on disk,
+/// Two builds of this workspace can share a package version, so that string
+/// is not an identity. The executable's own stat is: same bytes on disk,
 /// same emitter. Unreadable — a binary deleted or replaced under a running
 /// process — yields a value that matches nothing, so the artifacts regenerate
 /// rather than being trusted to a writer that cannot be identified.

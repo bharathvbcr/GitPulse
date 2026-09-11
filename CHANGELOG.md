@@ -15,6 +15,8 @@ before that tag is pushed.
 
 - Named GitPulse as the successor to the deprecated LiquiTask workbench in the
   README, wiki home, and Tasks documentation.
+- Re-vendor DevCouncil analysis crates at v0.2.0 (`devcouncil@a31918e2`).
+  GitPulse itself stays 1.0.0.
 
 ## [1.0.0] - 2026-09-11
 
