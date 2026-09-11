@@ -5162,10 +5162,12 @@ mod tests {
             path: "foo.py".into(),
         };
         assert_eq!(
-            stage0_blob(&[blob.clone()], "foo.py").unwrap().oid,
+            stage0_blob(std::slice::from_ref(&blob), "foo.py")
+                .unwrap()
+                .oid,
             STAGE_OID
         );
-        assert!(stage0_blob(&[blob.clone()], "other.py")
+        assert!(stage0_blob(std::slice::from_ref(&blob), "other.py")
             .unwrap_err()
             .contains("path other than the requested file"));
         assert_eq!(

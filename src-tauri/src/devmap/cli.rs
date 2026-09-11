@@ -726,7 +726,7 @@ pub fn preview_many(
     let cap = MAX_PREVIEW_FILES.min(eligible.len());
     let (walk, omitted) = eligible.split_at(cap);
     let files_omitted = omitted.len() + ineligible.len();
-    let truncated = omitted.len() > 0;
+    let truncated = !omitted.is_empty();
     let mut out = Vec::with_capacity(files.len());
     for (path, content) in walk {
         if cancel() {

@@ -18,9 +18,11 @@ use std::sync::{Mutex, OnceLock};
 pub const CONFIG_VERSION: u32 = 1;
 pub const TOOL_CONFIG_ENV: &str = "GITPULSE_TOOL_CONFIG";
 
+#[cfg(test)]
 static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Serialize tests (and any other callers) that mutate [`TOOL_CONFIG_ENV`].
+/// Serialize tests that mutate [`TOOL_CONFIG_ENV`].
+#[cfg(test)]
 pub(crate) fn lock_config_env() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_ENV_LOCK
         .lock()
