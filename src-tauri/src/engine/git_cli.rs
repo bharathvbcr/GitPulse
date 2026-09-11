@@ -1604,7 +1604,6 @@ fn run_with_gate(
     observer: &mut dyn ProcessObserver,
     gate: &'static SpawnGate,
 ) -> Result<BoundedRun, String> {
-    let start = Instant::now();
     if timeout > NETWORK_TIMEOUT {
         return Err(format!(
             "{label} deadline exceeds {}s",
@@ -1625,7 +1624,7 @@ fn run_with_gate(
             "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
         ));
     }
-    let deadline = start + timeout;
+    let queue_deadline = Instant::now() + timeout;
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -1637,7 +1636,7 @@ fn run_with_gate(
     // output buffers and fallback reader threads -- see [`SpawnGate`] for why an
     // unbounded fan-out here exhausted the process descriptor table.
     let _permit = Arc::new(
-        gate.acquire_until(deadline, &|| observer.cancelled())
+        gate.acquire_until(queue_deadline, &|| observer.cancelled())
             .ok_or_else(|| {
                 if observer.cancelled() {
                     return format!("{label} cancelled before spawn");
@@ -1648,6 +1647,13 @@ fn run_with_gate(
                 )
             })?,
     );
+
+    // Slot wait is already bounded by `queue_deadline`. The child then gets
+    // the full requested runtime: a 5s git call that spent 4.9s queued must
+    // not be reported as "timed out" after 100ms of actual work. Under
+    // llvm-cov that is how shebang and stub-devmap tests failed a 5s/30s
+    // deadline they would have met once they started.
+    let deadline = Instant::now() + timeout;
 
     // Spawned into a process group of its own and registered, so a SIGTERM to
     // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
@@ -4142,6 +4148,52 @@ mod tests {
             .expect_err("the queued command must not start");
         assert!(error.contains("waiting for a process slot"), "{error}");
         assert!(error.contains(TIMEOUT_MARKER), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_queued_command_still_gets_its_full_runtime_after_a_slot() {
+        // The queue wait is bounded by `timeout`, but spending that budget
+        // in the gate used to leave the child with leftover milliseconds and
+        // report "timed out" for work that had not started. Hold the only
+        // slot long enough that the leftover would be less than `sleep`,
+        // then prove the child still finishes.
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(1)));
+        let holder = gate
+            .acquire(Instant::now() + Duration::from_secs(10))
+            .expect("holder");
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 0.4; echo queued-ok"]);
+            let result = run_with_gate(
+                &mut cmd,
+                "queued-run",
+                Duration::from_millis(600),
+                None,
+                MAX_OUTPUT_BYTES,
+                &mut (),
+                gate,
+            );
+            tx.send(result).unwrap();
+        });
+        thread::sleep(Duration::from_millis(350));
+        drop(holder);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("queued command must start after the slot is freed")
+            .expect("a command that waited in the gate must still get its full runtime");
+        worker.join().unwrap();
+        assert!(
+            result.success,
+            "stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("queued-ok"),
+            "stdout: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
     }
 
     #[cfg(unix)]
