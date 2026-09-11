@@ -312,6 +312,28 @@ describe("ConflictEditor custom draft lifecycle", () => {
   });
 });
 
+describe("ConflictEditor materials", () => {
+  it("lets the shared material system paint the page instead of covering it with an opaque local fill", () => {
+    const rule = source.match(/\.resolve-page\s*\{([^}]*)\}/)?.[1];
+    expect(rule, "missing .resolve-page rule").toBeDefined();
+    expect(rule, ".resolve-page covers the shared material").not.toMatch(
+      /(?:^|;)\s*background(?:-color)?:/,
+    );
+    expect(source).toContain('class="resolve-page bg-background"');
+  });
+
+  it("routes the bulk menu and fields through glass fills instead of opaque --c-surface/--c-bg", () => {
+    expect(source).toContain('class="bulk-menu gp-menu"');
+    const menu = source.match(/\.bulk-menu \{([^}]*)\}/)?.[1];
+    expect(menu).toBeDefined();
+    expect(menu).not.toMatch(/(?:^|;)\s*background(?:-color)?:\s*rgb\(\s*var\(--c-/);
+    expect(source).toMatch(/textarea \{[^}]*background:\s*var\(--mac-fill-bg,\s*rgb\(var\(--c-bg\)\)\)/);
+    expect(source).toMatch(
+      /\.mobile-file-select \{[^}]*background-color:\s*var\(--mac-fill-surface,\s*rgb\(var\(--c-surface\)\)\)/,
+    );
+  });
+});
+
 describe("ConflictEditor rendering", () => {
   it("renders the empty state when no conflicts exist", () => {
     const { body } = render(ConflictEditor);

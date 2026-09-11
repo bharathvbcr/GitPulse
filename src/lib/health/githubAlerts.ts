@@ -69,6 +69,7 @@ function githubUnavailableEnvelope(error: string) {
     slug: "",
     truncated: false,
     error,
+    unavailable_reason: "transport" as const,
   };
 }
 
@@ -251,28 +252,48 @@ export function seriousGithubFingerprint(snapshot: GithubAlertsSnapshot): string
   return `${ids.join(",")}|${truncated}`;
 }
 
+/**
+ * GitHub explaining that a security product is off for this repository is
+ * not a GitPulse check failure. The Health panel still receives
+ * `available: false` plus the error; launch diagnostics must not treat the
+ * explanation as a warning. Classification is owned by Rust
+ * (`unavailable_reason`); this layer only consumes the enum.
+ */
+function checkFailureMessage(
+  available: boolean,
+  requestFailed: boolean,
+  error: string | null | undefined,
+  unavailableReason: string | null | undefined,
+): string | null {
+  if (requestFailed) {
+    return error?.trim() ? error : error || "GitHub request failed.";
+  }
+  if (available !== false) return null;
+  // Local-only / never-ran payloads use null. An empty or whitespace error is a
+  // check that produced no explanation, which must not look like expected-unavailable.
+  if (error == null) return null;
+  if (!error.trim()) return error || "GitHub check returned no explanation.";
+  if (unavailableReason === "product_disabled" || unavailableReason === "not_github_remote") {
+    return null;
+  }
+  return error;
+}
+
 function githubCheckFailed(snapshot: GithubAlertsSnapshot): string | null {
-  if (snapshot.dependabotRequestFailed && snapshot.dependabot.error) {
-    return snapshot.dependabot.error;
-  }
-  if (snapshot.codeScanningRequestFailed && snapshot.codeScanning.error) {
-    return snapshot.codeScanning.error;
-  }
-  if (
-    snapshot.dependabot.available === false &&
-    snapshot.dependabot.error &&
-    snapshot.codeScanning.available === false &&
-    snapshot.codeScanning.error
-  ) {
-    return snapshot.dependabot.error || snapshot.codeScanning.error;
-  }
-  if (snapshot.dependabot.available === false && snapshot.dependabot.error) {
-    return snapshot.dependabot.error;
-  }
-  if (snapshot.codeScanning.available === false && snapshot.codeScanning.error) {
-    return snapshot.codeScanning.error;
-  }
-  return null;
+  return (
+    checkFailureMessage(
+      snapshot.dependabot.available,
+      snapshot.dependabotRequestFailed,
+      snapshot.dependabot.error,
+      snapshot.dependabot.unavailable_reason,
+    ) ??
+    checkFailureMessage(
+      snapshot.codeScanning.available,
+      snapshot.codeScanningRequestFailed,
+      snapshot.codeScanning.error,
+      snapshot.codeScanning.unavailable_reason,
+    )
+  );
 }
 
 export type GithubNotifyOutcome =

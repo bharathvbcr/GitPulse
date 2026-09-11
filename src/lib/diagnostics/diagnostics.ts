@@ -812,6 +812,140 @@ export function isHostRuntimeNoise(message: string, development = import.meta.en
   return false;
 }
 
+/**
+ * Exact browser delivery-limit messages. They do not prove layout convergence.
+ * Only delivery notices without an application exception may be classified this
+ * way; TypeError/DOMException and explicit console/store errors remain errors.
+ */
+export function isBrowserObserverNoise(message: string): boolean {
+  const text = message.trim();
+  return /^ResizeObserver loop (?:limit exceeded|completed with undelivered notifications)\.?$/.test(text);
+}
+
+/** Document URLs Chromium stamps on ResizeObserver delivery ErrorEvents. */
+function isDocumentUrlFilename(filename: string): boolean {
+  return /^(?:https?:|file:|about:)/i.test(filename.trim());
+}
+
+/**
+ * True when the event carries a real script frame. Chromium fills `filename`
+ * with the document URL and leaves lineno/colno at 0 for ResizeObserver
+ * delivery notices — that stamp is not a script location.
+ */
+function isScriptLocatedDiagnosticEvent(event: DiagnosticEventLike): boolean {
+  const hasLine = typeof event.lineno === "number" && event.lineno !== 0;
+  const hasCol = typeof event.colno === "number" && event.colno !== 0;
+  if (hasLine || hasCol) return true;
+  if (typeof event.filename === "string" && event.filename.trim() !== "") {
+    if (isDocumentUrlFilename(event.filename)) return false;
+    return true;
+  }
+  return false;
+}
+
+function exceptionName(detail: unknown): string | null {
+  if (detail == null || typeof detail !== "object") return null;
+  try {
+    const name = (detail as { name?: unknown }).name;
+    return typeof name === "string" && name ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+/** TypeError / DOMException / etc. — never the Resize Observer delivery ErrorEvent. */
+function isNamedApplicationException(detail: unknown): boolean {
+  const name = exceptionName(detail);
+  return name !== null && name !== "Error";
+}
+
+function observerNoiseFromValue(value: unknown): string | null {
+  if (typeof value === "string") {
+    return isBrowserObserverNoise(value) ? value.trim() : null;
+  }
+  if (isNamedApplicationException(value)) return null;
+  if (value && typeof value === "object") {
+    try {
+      const message = (value as { message?: unknown }).message;
+      if (typeof message === "string" && isBrowserObserverNoise(message)) return message.trim();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Chromium/WKWebView fires an ErrorEvent whose `message` is the spec text.
+ * Chromium stamps the document URL into `filename` with lineno/colno 0 and
+ * often leaves `error` null (WKWebView may attach a same-text `Error`, or wrap
+ * `message` as `Uncaught Error: …`). That is not an application exception.
+ * A TypeError, a prefixed message with no such Error, or a real script frame
+ * (module path, or non-zero line/column) still is.
+ */
+function browserObserverDeliveryText(event: DiagnosticEventLike): string | null {
+  if (isScriptLocatedDiagnosticEvent(event)) return null;
+  if (event.error == null) {
+    return typeof event.message === "string" && isBrowserObserverNoise(event.message)
+      ? event.message.trim()
+      : null;
+  }
+  return observerNoiseFromValue(event.error);
+}
+
+function scriptLocationLabel(event: DiagnosticEventLike): string {
+  const file =
+    typeof event.filename === "string" && event.filename.trim() ? event.filename.trim() : "?";
+  const line = typeof event.lineno === "number" ? event.lineno : 0;
+  const column = typeof event.colno === "number" ? event.colno : 0;
+  return `${file}:${line}:${column}`;
+}
+
+function uncaughtEventDetail(event: DiagnosticEventLike): unknown {
+  if (isNamedApplicationException(event.error)) {
+    const name = exceptionName(event.error);
+    try {
+      const message = (event.error as { message?: unknown }).message;
+      if (name && typeof message === "string" && message.trim()) {
+        return `${name}: ${message.trim()}`;
+      }
+    } catch {
+      return event.error ?? event.message;
+    }
+  }
+  const base = event.error ?? event.message;
+  if (
+    isScriptLocatedDiagnosticEvent(event) &&
+    isBrowserObserverNoise(formatDiagnosticFailure(base))
+  ) {
+    return `${formatDiagnosticFailure(base)} (${scriptLocationLabel(event)})`;
+  }
+  return base;
+}
+
+function namedObserverMessage(detail: unknown, formatted: string): string {
+  if (!isNamedApplicationException(detail) || !isBrowserObserverNoise(formatted)) return formatted;
+  const name = exceptionName(detail);
+  return name ? clampMessage(`${name}: ${formatted}`) : formatted;
+}
+
+function isSuppressedObserverRecord(
+  severity: DiagnosticSeverity,
+  source: string,
+  message: string,
+  detail: unknown,
+): boolean {
+  if (!isBrowserObserverNoise(message) || isNamedApplicationException(detail)) return false;
+  if (source === "browser-resize-observer" && severity === "warning") return true;
+  // Chromium dump: installer used to record this as uncaught-error ERROR.
+  return source === "uncaught-error";
+}
+
+function isRestoredObserverDump(entry: DiagnosticEntry): boolean {
+  if (!isBrowserObserverNoise(entry.message)) return false;
+  return entry.source === "browser-resize-observer" || entry.source === "uncaught-error";
+}
+
 function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
@@ -879,6 +1013,7 @@ function loadPersisted(storage: StorageLike | null, development: boolean): {
     .filter((entry): entry is DiagnosticEntry => entry !== null);
   let entries = sanitized
     .filter((entry) => !isHostRuntimeNoise(entry.message, development))
+    .filter((entry) => !isRestoredObserverDump(entry))
     // Newest first regardless of how the blob was written.
     .sort((a, b) => b.id - a.id)
     .slice(0, MAX_DIAGNOSTIC_ENTRIES);
@@ -944,8 +1079,11 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
 
   function record(severity: DiagnosticSeverity, source: string, detail: unknown) {
     const safeSource = clampMessage(redactDiagnosticText(source));
-    const message = clampMessage(formatDiagnosticFailure(detail));
-    if (isHostRuntimeNoise(message, development)) {
+    const message = namedObserverMessage(detail, clampMessage(formatDiagnosticFailure(detail)));
+    if (
+      isHostRuntimeNoise(message, development) ||
+      isSuppressedObserverRecord(severity, safeSource, message, detail)
+    ) {
       health.update(state => ({ ...state, suppressedRuntimeEvents: Math.min(Number.MAX_SAFE_INTEGER, state.suppressedRuntimeEvents + 1) }));
       return;
     }
@@ -1057,7 +1195,7 @@ export function formatDiagnosticReport(
     diagnosticPersistenceLabel(health),
     ...(health.persistenceError ? [`Saving unavailable: ${formatDiagnosticFailure(health.persistenceError)}`] : []),
     ...(health.restorationError ? [`Saved history incomplete: ${formatDiagnosticFailure(health.restorationError)}`] : []),
-    ...(health.suppressedRuntimeEvents ? [`Development reload messages suppressed this session: ${health.suppressedRuntimeEvents}`] : []),
+    ...(health.suppressedRuntimeEvents ? [`Runtime messages suppressed this session: ${health.suppressedRuntimeEvents}`] : []),
   ] : [];
   const occurrences = (severity: DiagnosticSeverity) =>
     entries.reduce((total, entry) => (entry.severity === severity ? total + entry.count : total), 0);
@@ -1109,6 +1247,9 @@ interface DiagnosticEventLike {
   reason?: unknown;
   error?: unknown;
   message?: unknown;
+  filename?: unknown;
+  lineno?: unknown;
+  colno?: unknown;
 }
 interface DiagnosticEventTarget {
   addEventListener(type: string, listener: (event: DiagnosticEventLike) => void): void;
@@ -1166,9 +1307,18 @@ export function installGlobalDiagnostics(
     originalError(`[gitpulse] unhandled promise rejection: ${detail}`);
   };
   const onUncaughtError = (event: DiagnosticEventLike) => {
-    const detail = formatDiagnosticFailure(event.error ?? event.message);
+    // Delivery-limit ErrorEvents are not application exceptions. Chromium often
+    // attaches a same-text `Error` (and wraps `message` as `Uncaught Error: …`).
+    // A TypeError, a prefixed-only message, or a script location still is.
+    // https://drafts.csswg.org/resize-observer/#deliver-resize-loop-error
+    const observerText = browserObserverDeliveryText(event);
+    if (observerText !== null) {
+      note("warning", "browser-resize-observer", [observerText]);
+      return;
+    }
+    const detail = uncaughtEventDetail(event);
     note("error", "uncaught-error", [detail]);
-    originalError(`[gitpulse] uncaught error: ${detail}`);
+    originalError(`[gitpulse] uncaught error: ${formatDiagnosticFailure(detail)}`);
   };
 
   con.error = wrappedError;

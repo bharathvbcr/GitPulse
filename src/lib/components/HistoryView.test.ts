@@ -65,6 +65,12 @@ describe("ViewSectionBar", () => {
     expect(sectionBar).toContain('aria-controls={props["aria-controls"]}');
   });
 
+  it("uses liquid tabs so the section strip matches the header", () => {
+    expect(sectionBar).toContain("class:gp-liquid-tabs={macos}");
+    expect(sectionBar).toContain("gp-liquid-selection");
+    expect(sectionBar).toContain("<span>{section.label}</span>");
+  });
+
   it("ships a destination guide instead of a label-only title", () => {
     expect(sectionBar).toContain("data-tip-guide={guideKey}");
     expect(sectionBar).not.toContain('title="{section.label}');

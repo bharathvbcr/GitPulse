@@ -54,4 +54,11 @@ describe("CommandPalette", () => {
     expect(source).toContain("help_map_docs");
     expect(source).toContain("cross-repo link candidates");
   });
+
+  it("keeps the hint footer unpainted so glass cannot composite a black bar", () => {
+    const footer = source.match(/\.palette-footer \{([^}]*)\}/)?.[1];
+    expect(footer).toBeDefined();
+    expect(footer).not.toMatch(/background(?:-color)?:/);
+    expect(source).not.toMatch(/background:\s*var\(--color-background\)/);
+  });
 });

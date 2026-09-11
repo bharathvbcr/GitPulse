@@ -7,6 +7,10 @@ use super::{
 };
 use rusqlite::{OptionalExtension, params};
 
+/// Create/claim lease for an enhancement attempt, in seconds.
+/// Must stay above Manvi's enhancement job timeout (150s) plus settle margin.
+const ENHANCEMENT_LEASE_SECONDS: i64 = 180;
+
 pub(super) fn fields(input: &Input<'_>, key: &str, required: bool) -> Result<Vec<String>> {
     let fields = input.strings(key, 2, 32, required)?;
     if (required && fields.is_empty())
@@ -105,7 +109,7 @@ pub(super) fn mutate(
                     "the source task changed before generation began",
                 ));
             }
-            input.conn.query_row("SELECT json_set(?1,'$.state','running','$.worker_id',?2,'$.started_at',?3,'$.expires_at',?4)", params![body,worker,now,now.saturating_add(180)], |r|r.get(0))?
+            input.conn.query_row("SELECT json_set(?1,'$.state','running','$.worker_id',?2,'$.started_at',?3,'$.expires_at',?4)", params![body,worker,now,now.saturating_add(ENHANCEMENT_LEASE_SECONDS)], |r|r.get(0))?
         }
         "enhancements.complete"
             if matches!(state.as_str(), "pending" | "running" | "cancel_requested") =>
@@ -291,7 +295,7 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             "the profile has reached 20 automatic enhancements in the last hour",
         ));
     }
-    let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',1,'task_id',?2,'source_revision',?3,'source',json(?4),'fields',json(json_extract(?5,'$.fields')),'provider',?6,'model',?7,'automatic',json(CASE WHEN ?8 THEN 'true' ELSE 'false' END),'state','pending','created_at',?9,'updated_at',?9,'expires_at',?10)", params![id,task_id,source_revision,source,input.raw,provider,model,automatic,now,now.saturating_add(180)], |r|r.get(0))?;
+    let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',1,'task_id',?2,'source_revision',?3,'source',json(?4),'fields',json(json_extract(?5,'$.fields')),'provider',?6,'model',?7,'automatic',json(CASE WHEN ?8 THEN 'true' ELSE 'false' END),'state','pending','created_at',?9,'updated_at',?9,'expires_at',?10)", params![id,task_id,source_revision,source,input.raw,provider,model,automatic,now,now.saturating_add(ENHANCEMENT_LEASE_SECONDS)], |r|r.get(0))?;
     let body = if let Some(settings_revision) = settings_revision {
         input.conn.query_row(
             "SELECT json_set(?1,'$.automation_settings_revision',?2)",

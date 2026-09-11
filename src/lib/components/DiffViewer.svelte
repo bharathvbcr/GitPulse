@@ -144,11 +144,13 @@
     type ComposedBlastRadius,
   } from "../codeintel/blastCompose";
   import { rungParam } from "../codeintel/rungFilter";
+  import { boundText, summarizeWalkIncomplete, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
   import type { CodeintelRung, CodeintelRungHistogram } from "../codeintel/types";
   import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
   import RungFilterControl from "./RungFilterControl.svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  import { observeResize } from "../dom/observeResize";
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.
@@ -232,6 +234,17 @@
   let changeSetBlast = $state<ComposedBlastRadius | null>(null);
   let changeSetBlastLoading = $state(false);
   let changeSetBlastGuard: AsyncGuard | null = null;
+  let impactWalkTitle = $derived(tooltipWalkIncomplete([impactWalkIncomplete]));
+  let impactUnavailableTitle = $derived(
+    tooltipWalkIncomplete([impactReason, impactWalkIncomplete]) ?? "impact unavailable",
+  );
+  let impactEdgesTitle = $derived(
+    boundText(
+      `${impactEdges} downstream callers/dependencies affected by this file in devmap${
+        impactWalkTitle ? ` · walk incomplete: ${impactWalkTitle}` : ""
+      }`,
+    ),
+  );
 
   $effect(() => {
     const repoPath = $repoStore.currentPath;
@@ -262,9 +275,9 @@
       .then((res) => {
         if (!guard.isLive()) return;
         impactAvailable = res.available;
-        impactReason = res.reason ?? null;
+        impactReason = summarizeWalkIncomplete([res.reason]) ?? res.reason ?? null;
         impactEdges = res.available ? res.total : 0;
-        impactWalkIncomplete = res.walk_incomplete ?? null;
+        impactWalkIncomplete = summarizeWalkIncomplete([res.walk_incomplete]);
         impactRungs = res.rungs ?? null;
       })
       .catch(() => {
@@ -514,12 +527,10 @@
   $effect(() => {
     const el = bodyEl;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver((entries) => {
+    return observeResize(el, (entries) => {
       const measured = entries[0]?.contentRect.height;
       viewportHeight = Number.isFinite(measured) && measured > 0 ? measured : 0;
     });
-    observer.observe(el);
-    return () => observer.disconnect();
   });
 
   // --- context strip -------------------------------------------------------
@@ -1102,24 +1113,24 @@
     {#if !impactAvailable}
       <span
         class="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 dark:text-amber-400"
-        title={impactReason ?? "impact unavailable"}
+        title={impactUnavailableTitle}
       >
         impact unavailable
       </span>
     {:else if impactEdges > 0}
       <span
         class="shrink-0 rounded-full border border-accent/30 bg-accent/15 px-2 py-0.5 text-[10px] text-accent"
-        title={`${impactEdges} downstream callers/dependencies affected by this file in devmap${
-          impactWalkIncomplete ? ` · walk incomplete: ${impactWalkIncomplete}` : ""
-        }`}
+        title={impactEdgesTitle}
       >
         {impactEdges} {impactEdges === 1 ? "affected caller" : "affected callers"}
       </span>
     {/if}
-    {#if impactWalkIncomplete}
-      <span class="shrink-0 text-[9px] text-amber-500" title={impactWalkIncomplete}>walk incomplete</span>
+    {#if impactAvailable && impactWalkIncomplete}
+      <span class="shrink-0 text-[9px] text-amber-500" title={impactWalkTitle}>walk incomplete</span>
     {/if}
-    <RungFilterControl bind:minRung histogram={impactRungs} layeredImpactActive={false} />
+    {#if impactAvailable}
+      <RungFilterControl bind:minRung histogram={impactRungs} layeredImpactActive={false} />
+    {/if}
 
     <div class="ml-auto flex shrink-0 items-center gap-2">
       <!-- Step between the files of this commit (or of the working tree)

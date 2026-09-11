@@ -57,6 +57,18 @@ describe("focus is visible when the system paints the colours", () => {
   });
 });
 
+describe("native fields keep theme ink in WKWebView", () => {
+  it("sets -webkit-text-fill-color on shared field chrome so transparent glass cannot revert to black", () => {
+    // `color` is ignored by WebKit form controls when the page background is
+    // transparent (macOSPrivateApi). The fill colour is what actually paints.
+    const field = block("@utility gp-field {");
+    expect(field).toContain("-webkit-text-fill-color: rgb(var(--c-text))");
+    expect(field).toMatch(/::placeholder[\s\S]*-webkit-text-fill-color:\s*rgb\(var\(--c-text-muted\)/);
+    const select = block("@utility gp-select {");
+    expect(select).toContain("-webkit-text-fill-color: rgb(var(--c-text))");
+  });
+});
+
 describe("stylesheet carries no rules the shipped webviews cannot reach", () => {
   it("has no Gecko-only pseudo-elements", () => {
     // Every GitPulse target is WebKit (macOS, Linux) or Chromium (Windows).

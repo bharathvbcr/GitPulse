@@ -48,6 +48,12 @@ pub const LEGACY_AGENT_GUIDE_MARKER: &str =
 /// The guide filenames, in the order they are written.
 pub const GUIDE_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
+/// Cursor always-apply rule emitted beside the guides.
+///
+/// Owned by path: `devmap.mdc` is DevMap's claim. A hand-written rule that
+/// wants a different name is left alone; this file is rewritten idempotently.
+pub const CURSOR_RULE_REL: &str = ".cursor/rules/devmap.mdc";
+
 /// One guide file the writer considered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuideOutcome {
@@ -150,7 +156,7 @@ list."
     } else {
         "5. `role_files` in `subsystems` was NOT computed by the writer that produced this map \
 — an empty bucket there is the producer declining to answer, not a subsystem without roles. Use \
-`files` (filtered by `area`) instead, and re-run `devmap build` with a current kernel to get the \
+`files` (filtered by `area`) instead, and re-run `devmap build --manifest` with a current kernel to get the \
 buckets."
             .to_string()
     }
@@ -166,7 +172,7 @@ are capped, and `liveness_meta.subsystems` reports what was cut."
     } else {
         "6. Use `neighbors` in `subsystems` to follow cross-subsystem flow. `handoff_paths` was \
 NOT computed by the writer that produced this map — an empty list there is the producer declining \
-to answer, not evidence that nothing crosses. Re-run `devmap build` with a current kernel to get \
+to answer, not evidence that nothing crosses. Re-run `devmap build --manifest` with a current kernel to get \
 it."
         .to_string()
     }
@@ -222,7 +228,7 @@ pub fn agent_guide_text(map: &Value, map_rel: &str, graph_rel: &str, store_rel: 
         format!("Code graph: `{graph_rel}` (symbol-level; query with `devmap`)."),
         String::new(),
         "Workflow for agents:".to_string(),
-        format!("1. Open `{map_rel}` before guessing at file locations."),
+        format!("1. Run `devmap paths --json` and `devmap status --json` first. Generated state is per-worktree and is not copied by Git. Read `{map_rel}` when present; if its location differs in this checkout, use the resolved `repo_map` path. If the store or map is missing, run `devmap build --manifest` from this worktree's root, then check status again. Never copy a sibling worktree's database."),
         "2. Use the `files` list to resolve module ownership and nearby siblings.".to_string(),
         "3. Use `subsystems` for subsystem-level navigation.".to_string(),
         "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting \
@@ -237,19 +243,24 @@ unattributed calls mean the list is a lower bound. Prefer `unwired_candidates` /
 `dead_symbol_candidates` in the map over `unreachable_files` (static BFS is noisy for routers, \
 dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unreliable` is set, \
 ignore `unreachable_files` entirely. Check `unwired_candidates` before creating a new module — \
-wire what you create into a real caller."
+wire what you create into a real caller. Neither list can ever name prose, data, a lockfile, an \
+environment file, a Terraform file, a package marker, a fixture tree, a shebang script or a \
+tool config; how many were left out, and why, is in `liveness_meta.unwired.excluded_*`, so an \
+empty list means nothing is unwired rather than that the filter swallowed the repository."
             .to_string(),
-        "8. Use `devmap explore <name>` for a symbol's whole neighbourhood in one call; \
-`devmap search`, `devmap impact`, `devmap trace <a> <b>`, `devmap dead` for the individual \
-questions; `devmap affected <target>` for the tests a change reaches. Read the `truncated` and \
-`total` on every envelope before treating a list as complete."
+        "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) over \
+GitNexus. CLI equivalents: `devmap explore <name>`, `devmap search`, `devmap impact`, \
+`devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. Read `truncated` and \
+`total` on every envelope before treating a list as complete. When DevMap cannot answer, \
+record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` — do not switch indexes."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \
 `{graph_rel}` is missing or a size-capped stub. `devmap preview` asks what an unsaved edit would \
 break before it is written."
         ),
-        "10. Run `devmap build` after large refactors, or `devmap serve` to keep the index warm; \
+        "10. Run `devmap build --manifest` after large refactors to refresh the database and exported maps, or `devmap serve` to keep the index warm; \
 `devmap status` reports generation, counts and freshness."
             .to_string(),
         String::new(),
@@ -260,12 +271,63 @@ break before it is written."
     lines.push(crate::hygiene::AGENT_RULES.to_owned());
     lines.push(String::new());
     lines.push(
-        "If the map and source disagree, trust the source and re-run `devmap build`.".to_string(),
+        "If the map and source disagree, trust the source and re-run `devmap build --manifest`."
+            .to_string(),
     );
     lines.join("\n")
 }
 
-/// Write the marker-guarded guides under `repo_root`.
+/// Cursor rule body: workflow summary plus the canonical hygiene rules.
+///
+/// Frontmatter sets `alwaysApply: true` so every Cursor session gets DevMap
+/// navigation without depending on a skill being selected.
+pub fn cursor_rule_text(map_rel: &str) -> String {
+    format!(
+        "---\n\
+description: DevMap navigation and repository hygiene\n\
+alwaysApply: true\n\
+---\n\
+\n\
+# DevMap\n\
+\n\
+Use `{map_rel}` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.\n\
+\n\
+Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.\n\
+\n\
+Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.\n\
+\n\
+{rules}\n",
+        map_rel = map_rel,
+        rules = crate::hygiene::AGENT_RULES
+    )
+}
+
+fn write_marked_file(path: &Path, text: &str, ours: impl Fn(&str) -> bool) -> std::io::Result<GuideDisposition> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            if !ours(&existing) {
+                Ok(GuideDisposition::NotOurs)
+            } else if existing == text {
+                Ok(GuideDisposition::Unchanged)
+            } else {
+                std::fs::write(path, text)?;
+                Ok(GuideDisposition::Updated)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+            Ok(GuideDisposition::Created)
+        }
+        // Unreadable is not the same as absent: leave somebody's file alone.
+        Err(_) => Ok(GuideDisposition::NotOurs),
+    }
+}
+
+/// Write the marker-guarded guides and the Cursor always-apply rule under
+/// `repo_root`.
 ///
 /// Every file is reported, including the ones left alone, so a caller can say
 /// *why* a guide was not refreshed rather than reporting silence as success.
@@ -277,37 +339,24 @@ pub fn write_agent_guides(
     store_rel: &str,
 ) -> std::io::Result<Vec<GuideOutcome>> {
     let text = agent_guide_text(map, map_rel, graph_rel, store_rel) + "\n";
-    let mut outcomes = Vec::with_capacity(GUIDE_FILENAMES.len());
+    let mut outcomes = Vec::with_capacity(GUIDE_FILENAMES.len() + 1);
 
     for filename in GUIDE_FILENAMES {
         let path = repo_root.join(filename);
-        let disposition = match std::fs::read_to_string(&path) {
-            Ok(existing) => {
-                if !existing.contains(AGENT_GUIDE_MARKER)
-                    && !existing.contains(LEGACY_AGENT_GUIDE_MARKER)
-                {
-                    GuideDisposition::NotOurs
-                } else if existing == text {
-                    GuideDisposition::Unchanged
-                } else {
-                    std::fs::write(&path, &text)?;
-                    GuideDisposition::Updated
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&path, &text)?;
-                GuideDisposition::Created
-            }
-            // A guide that cannot be read is left alone rather than replaced.
-            // Unreadable is not the same as absent, and the difference is
-            // somebody's file.
-            Err(_) => GuideDisposition::NotOurs,
-        };
+        let disposition = write_marked_file(&path, &text, |existing| {
+            existing.contains(AGENT_GUIDE_MARKER) || existing.contains(LEGACY_AGENT_GUIDE_MARKER)
+        })?;
         outcomes.push(GuideOutcome { path, disposition });
     }
+
+    let rule_path = repo_root.join(CURSOR_RULE_REL);
+    let rule_text = cursor_rule_text(map_rel);
+    // Owned by path: this exact relative name is DevMap's. Idempotent rewrite.
+    let disposition = write_marked_file(&rule_path, &rule_text, |_| true)?;
+    outcomes.push(GuideOutcome {
+        path: rule_path,
+        disposition,
+    });
     Ok(outcomes)
 }
 
@@ -481,6 +530,38 @@ mod tests {
     }
 
     #[test]
+    fn write_agent_guides_also_emits_the_cursor_always_apply_rule() {
+        let dir = scratch("cursor-rule");
+        let outcomes =
+            write_agent_guides(&dir, &computed_map(), "m.json", "g.json", "s.sqlite").unwrap();
+        let rule = dir.join(CURSOR_RULE_REL);
+        let outcome = outcomes.iter().find(|o| o.path == rule).unwrap();
+        assert_eq!(outcome.disposition, GuideDisposition::Created);
+        let text = std::fs::read_to_string(&rule).unwrap();
+        assert!(text.contains("alwaysApply: true"), "{text}");
+        assert!(text.contains("## Repository hygiene"), "{text}");
+        assert!(text.contains("`m.json`"), "{text}");
+        assert!(text.contains("devmap paths --json"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_rule_is_owned_by_path_and_rewritten_idempotently() {
+        let dir = scratch("cursor-rule-owned");
+        let rule = dir.join(CURSOR_RULE_REL);
+        std::fs::create_dir_all(rule.parent().unwrap()).unwrap();
+        std::fs::write(&rule, "stale rule body\n").unwrap();
+        let outcomes =
+            write_agent_guides(&dir, &computed_map(), "m.json", "g.json", "s.sqlite").unwrap();
+        let outcome = outcomes.iter().find(|o| o.path == rule).unwrap();
+        assert_eq!(outcome.disposition, GuideDisposition::Updated);
+        assert!(std::fs::read_to_string(&rule)
+            .unwrap()
+            .contains("alwaysApply: true"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_guide_names_devmap_commands_and_not_the_orchestrators() {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
         assert!(text.contains("devmap explore"), "{text}");
@@ -491,6 +572,18 @@ mod tests {
         assert!(
             !text.contains("devcouncil_"),
             "the standalone guide must not name DevCouncil MCP tools: {text}"
+        );
+    }
+
+    #[test]
+    fn a_guide_can_bootstrap_a_new_worktree_and_refresh_its_exported_map() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(text.contains("devmap paths --json"), "{text}");
+        assert!(text.contains("devmap build --manifest"), "{text}");
+        assert!(text.contains("per-worktree"), "{text}");
+        assert!(
+            !text.contains("re-run `devmap build`"),
+            "a database-only build cannot repair an exported map: {text}"
         );
     }
 }

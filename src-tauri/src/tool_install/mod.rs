@@ -226,6 +226,58 @@ fn install_guard() -> &'static Mutex<Option<ExternalTool>> {
     GUARD.get_or_init(|| Mutex::new(None))
 }
 
+/// How long a network ladder probe stays valid for wizard/install callers.
+///
+/// Status (`cmd_external_tools_status`) never uses this cache: it assesses
+/// without a release HEAD so app mount does not wait on curl.
+const LADDER_CACHE_TTL: Duration = Duration::from_secs(60);
+
+struct LadderCacheEntry {
+    at: Instant,
+    assessment: LadderAssessment,
+}
+
+fn ladder_cache() -> &'static Mutex<[Option<LadderCacheEntry>; 2]> {
+    static CACHE: OnceLock<Mutex<[Option<LadderCacheEntry>; 2]>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new([None, None]))
+}
+
+fn tool_slot(tool: ExternalTool) -> usize {
+    match tool {
+        ExternalTool::Devmap => 0,
+        ExternalTool::Manvi => 1,
+    }
+}
+
+/// Drop memoized ladder assessments (call after install / PATH changes).
+pub fn invalidate_ladder_cache() {
+    let mut guard = ladder_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = [None, None];
+}
+
+fn cached_network_ladder(tool: ExternalTool) -> Option<LadderAssessment> {
+    let guard = ladder_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = guard[tool_slot(tool)].as_ref()?;
+    if entry.at.elapsed() > LADDER_CACHE_TTL {
+        return None;
+    }
+    Some(entry.assessment.clone())
+}
+
+fn store_network_ladder(tool: ExternalTool, assessment: LadderAssessment) {
+    let mut guard = ladder_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard[tool_slot(tool)] = Some(LadderCacheEntry {
+        at: Instant::now(),
+        assessment,
+    });
+}
+
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 static PROGRESS_LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -424,8 +476,34 @@ fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
     Some(line.trim().chars().take(120).collect())
 }
 
-/// Assess every rung; pick the first available actionable install rung.
+/// Whether the prebuilt rung may hit the network for a release HEAD probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseProbe {
+    /// Platform + URL only. Used on the app-mount status path.
+    UrlsOnly,
+    /// `curl -I` against the release asset. Wizard / install only.
+    Network,
+}
+
+/// Assess every rung with a live release HEAD probe (memoized per process).
+///
+/// Used by the setup wizard and install path. App-mount status goes through
+/// [`assess_ladder_for_status`] so a cold start never waits on curl.
 pub fn assess_ladder(tool: ExternalTool) -> LadderAssessment {
+    if let Some(cached) = cached_network_ladder(tool) {
+        return cached;
+    }
+    let assessment = assess_ladder_with(tool, ReleaseProbe::Network);
+    store_network_ladder(tool, assessment.clone());
+    assessment
+}
+
+/// Ladder for `cmd_external_tools_status`: no release HEAD, no network.
+pub fn assess_ladder_for_status(tool: ExternalTool) -> LadderAssessment {
+    assess_ladder_with(tool, ReleaseProbe::UrlsOnly)
+}
+
+fn assess_ladder_with(tool: ExternalTool, probe: ReleaseProbe) -> LadderAssessment {
     let on_path = match tool {
         ExternalTool::Devmap => crate::devmap::cli::resolve_binary().ok().map(|r| r.path),
         ExternalTool::Manvi => crate::harness::sidecar::resolve_binary(),
@@ -455,8 +533,11 @@ pub fn assess_ladder(tool: ExternalTool) -> LadderAssessment {
         }
     });
 
-    // Rung 2 — prebuilt
-    let release = release::probe_release(tool);
+    // Rung 2 — prebuilt. Status uses URLs only; wizard/install HEAD-probes.
+    let release = match probe {
+        ReleaseProbe::UrlsOnly => release::release_urls(tool),
+        ReleaseProbe::Network => release::probe_release(tool),
+    };
     rungs.push(match release {
         release::ReleaseAvailability::Available { ref asset_name, .. } => RungStatus {
             rung: InstallRung::PrebuiltRelease,
@@ -570,7 +651,7 @@ pub fn assess_ladder(tool: ExternalTool) -> LadderAssessment {
 }
 
 pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
-    let ladder = assess_ladder(tool);
+    let ladder = assess_ladder_for_status(tool);
     let source = resolve_source_root(tool).ok();
     let target = source
         .as_ref()
@@ -723,10 +804,20 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
 }
 
 pub fn status_all() -> ToolsStatus {
-    ToolsStatus {
-        devmap: resolve_status(ExternalTool::Devmap),
-        manvi: resolve_status(ExternalTool::Manvi),
-    }
+    // Probe both tools concurrently: each resolve is independent (PATH lookups
+    // + local rung assessment). Serial was ~2× the wall time of the slower tool.
+    std::thread::scope(|scope| {
+        let devmap = scope.spawn(|| resolve_status(ExternalTool::Devmap));
+        let manvi = scope.spawn(|| resolve_status(ExternalTool::Manvi));
+        ToolsStatus {
+            devmap: devmap
+                .join()
+                .unwrap_or_else(|_| panic!("devmap status thread panicked")),
+            manvi: manvi
+                .join()
+                .unwrap_or_else(|_| panic!("manvi status thread panicked")),
+        }
+    })
 }
 
 fn bytes_to_string(bytes: Vec<u8>) -> String {
@@ -816,6 +907,7 @@ pub fn install(tool: ExternalTool) -> InstallOutcome {
 pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallOutcome {
     clear_cancel();
     tool_capability::invalidate(tool);
+    invalidate_ladder_cache();
 
     {
         let mut guard = install_guard()
@@ -849,6 +941,7 @@ pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> 
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     clear_cancel();
     tool_capability::invalidate(tool);
+    invalidate_ladder_cache();
     outcome
 }
 
@@ -2040,6 +2133,57 @@ mod tests {
         assert!(!all.devmap.install_command.is_empty());
         assert!(!all.manvi.install_command.is_empty());
         assert!(!all.devmap.ladder.is_empty());
+    }
+
+    #[test]
+    fn status_ladder_does_not_surface_release_network_errors() {
+        // App-mount status uses release_urls, never curl HEAD. A network
+        // failure reason would mean the status path regressed onto probe_release.
+        for tool in [ExternalTool::Devmap, ExternalTool::Manvi] {
+            let ladder = assess_ladder_for_status(tool);
+            let prebuilt = ladder
+                .rungs
+                .iter()
+                .find(|r| r.rung == InstallRung::PrebuiltRelease)
+                .expect("prebuilt rung");
+            if let Some(block) = &prebuilt.block {
+                assert!(
+                    !block.contains("could not check releases"),
+                    "status ladder hit the network for {tool:?}: {block}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ladder_cache_invalidates_after_clear() {
+        invalidate_ladder_cache();
+        let first = assess_ladder(ExternalTool::Devmap);
+        let second = assess_ladder(ExternalTool::Devmap);
+        assert_eq!(first.tool, second.tool);
+        invalidate_ladder_cache();
+        let third = assess_ladder(ExternalTool::Devmap);
+        assert_eq!(third.tool, ExternalTool::Devmap);
+    }
+
+    #[test]
+    fn status_all_attribution_is_local_work() {
+        // Measured wall time for both tools in parallel without release HEAD.
+        // Attribution: PATH/env resolve + cargo/go presence + local checkout
+        // discovery. Network probe is owned by assess_ladder (wizard) only.
+        let started = Instant::now();
+        let _ = status_all();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "attribution cmd_external_tools_status/status_all: {:?} (no release HEAD)",
+            elapsed
+        );
+        // Generous ceiling: a quiet machine is tens of ms; CI under load can
+        // be slower. A multi-second result means a network probe crept back.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "status_all took {elapsed:?}; expected sub-second local work"
+        );
     }
 
     #[test]

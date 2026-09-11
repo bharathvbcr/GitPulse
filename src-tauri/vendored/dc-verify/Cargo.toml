@@ -8,8 +8,3 @@ description = "Deterministic verifier core: diff parsing and planned-scope class
 [dependencies]
 dc-glob = { path = "../dc-glob" }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = "warn"

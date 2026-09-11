@@ -280,11 +280,11 @@ unsafe_code = "forbid"
 describe("the source table", () => {
   it("lets both upstream roots be overridden", () => {
     const configured = sources({
-      GITPULSE_MANVI_ROOT: "/a",
       GITPULSE_DEVCOUNCIL_ROOT: "/b",
       GITPULSE_MARKDEV_ROOT: "/c",
     });
-    expect(configured.map((s) => s.root)).toEqual(["/a", "/b", "/c"]);
+    // Manvi is no longer a vendor origin (dc-* live in DevCouncil rust-port).
+    expect(configured.map((s) => s.root)).toEqual(["/b", "/c"]);
   });
 
   it("covers every crate that is vendored", () => {

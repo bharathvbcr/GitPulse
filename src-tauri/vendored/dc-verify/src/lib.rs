@@ -17,6 +17,7 @@
 //! for a diff that touched the whole repository.
 
 pub mod coverage;
+pub mod dead;
 pub mod rigor;
 
 use std::fmt;

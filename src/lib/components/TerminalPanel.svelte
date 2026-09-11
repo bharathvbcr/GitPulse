@@ -540,7 +540,7 @@
   </div>
 
   {#if sessionListOpen}
-    <div class="terminal-popover px-3 py-2 overflow-auto border border-border rounded-lg bg-surface shadow-lg text-[11px]" aria-label="Sessions across repositories">
+    <div class="terminal-popover px-3 py-2 overflow-auto border-b border-border/60 gp-section-edge bg-surface text-[11px]" aria-label="Sessions across repositories">
       {#each $terminalSessions as session (session.key)}
         <div class="flex gap-2 items-center py-0.5">
           <span class="flex-1 min-w-0 truncate" title={session.repoPath}>{session.repoPath.split(/[\\/]/).pop()} · {session.label} · {session.status}</span>
@@ -551,7 +551,7 @@
     </div>
   {/if}
   {#if shortcutsOpen}
-    <div class="terminal-popover px-3 py-2 flex flex-wrap gap-x-5 gap-y-1 text-[10px] text-textMuted bg-surface border border-border rounded-lg shadow-lg" aria-label="Terminal keyboard shortcuts">
+    <div class="terminal-popover px-3 py-2 flex flex-wrap gap-x-5 gap-y-1 text-[10px] text-textMuted bg-surface border-b border-border/60 gp-section-edge" aria-label="Terminal keyboard shortcuts">
       <span><kbd>Ctrl+Shift+T</kbd> New shell</span>
       <span><kbd>Ctrl+Shift+W</kbd> Close session</span>
       <span><kbd>Ctrl+Tab / Ctrl+Shift+Tab</kbd> Next / previous tab</span>
@@ -631,7 +631,7 @@
     </div>
 
     {#if tabOptions && mode === "shell" && activeId}
-      <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 border border-border rounded-lg bg-surface shadow-lg" onsubmit={saveTabName}>
+      <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 border-b border-border/60 gp-section-edge bg-surface" onsubmit={saveTabName}>
         <input aria-label="Terminal tab name" bind:value={renameValue} maxlength="64" placeholder="Use automatic title" class="min-w-0 w-36 bg-surface rounded px-2 py-1 border border-border text-xs" />
         <button type="submit" class="gp-btn py-1!">Rename</button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={tabState.tabs[0]?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, -1))}><ChevronLeft size={13} /></button>
@@ -876,10 +876,15 @@
 </div>
 
 <style>
-  .terminal-popover { position: absolute; inset: 82px 8px auto; max-height: calc(100% - 90px); overflow: auto; z-index: 20; }
+  /* Chrome in the column, never an overlay. On macOS `bg-surface` is
+     translucent and xterm paints an opaque grid, so a guessed `inset` over
+     the panes made the prompt and these bars share pixels. Find already
+     takes a row; shortcuts, sessions, and tab options do the same. */
+  .terminal-popover { flex-shrink: 0; max-height: 40%; overflow: auto; }
   .terminal-panes { container-type: inline-size; overflow: auto; }
-  /* Keep a readable grid after Find, warnings, and the footer take their
-     space. Short docks scroll their panes instead of crushing them to zero. */
+  /* Keep a readable grid after Find, warnings, popovers, and the footer
+     take their space. Short docks scroll their panes instead of crushing
+     them to zero. */
   .terminal-pane { min-height: 180px; }
   .terminal-pane[data-position="left"] { right: 50%; border-right: 1px solid var(--color-border); }
   .terminal-pane[data-position="right"] { left: 50%; }

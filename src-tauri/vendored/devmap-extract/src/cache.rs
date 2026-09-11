@@ -281,7 +281,65 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// they change an *exemption*, so a reused row either hides a real finding or
 /// publishes a delete-this verdict about code a framework reaches, and nothing
 /// about the row looks old.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "38";
+///
+/// v39 adds Swift `import` (including `@testable` and kinded
+/// `import struct Foundation.Date`) and shell `source` / `.` whose specifier
+/// is a word that names a file. v33 covered nineteen grammar keys and did not
+/// include either language, so a v38 row for a `.swift` file still carries an
+/// **empty** import list — the same worst shape v33 named. The capability bit
+/// moved in the same change, so `unwired_candidates` no longer charges the
+/// file import-blind: it looks examined and is blind. `classify_unresolved`
+/// cannot mark Foundation / XCTest names External without the import, so
+/// `devmap dead` sets `walk_incomplete` over tens of thousands of SDK sites
+/// that mean "the file imported Foundation", not "the graph is incomplete".
+/// Measured on MarkDev against a warm v38 cache: 288 files reused, status
+/// still reported `swift has no import extractor` for 219 files, and 28,207
+/// of 39,870 unresolved sites stayed unexplained.
+///
+/// v39 also refuses `defer { }` as a callee. A v38 Swift row records those as
+/// unresolved sites named `defer`, which is "the file uses defer", not a
+/// missing function.
+///
+/// v40 changes two Swift identities a v39 row asserts as complete. A nested
+/// enum's qualified name is now the full owner path
+/// (`Workspace.ActiveSaveRequest.CancellationDisposition`), not the shallow
+/// parent (`ActiveSaveRequest.CancellationDisposition`) — a v39 row cannot
+/// join a Type reference attributed to the nested class, so a live field type
+/// is confident-dead. And a Swift parameter's Type reference now carries
+/// `assigned_to` for the parameter name (`reader: Reader` binds `reader`). A
+/// v39 row leaves that empty, so `reader.read()` cannot dispatch on `Reader`
+/// and falls to AmbiguousGlobal the moment a second type also declares `read`
+/// — the MarkDev save/highlight shape, reported as examined and empty.
+/// v41 records Svelte/Vue/HTML dynamic wiring the v40 row never saw:
+/// `import('./CloneModal.svelte')` as an Import, HTML `src=` / `from` as
+/// DynamicImport forms, `package.json` script CLIs, JS/TS TargetRoot for
+/// `src/main.ts` / Vite configs / `scripts/`, and template `{handler}` as a
+/// Call. A warm v40 cache keeps those files unwired and those handlers
+/// confident-dead.
+///
+/// v42 parses non-identifier template expressions as the embedded script
+/// language, so `onclick={() => copyText(name)}` is a Call to `copyText`
+/// rather than opaque text. A v41 row still reports those handlers dead.
+///
+/// v43 publishes methods on objects an exported factory returns, treats
+/// Vite/Rollup plugin methods as RuntimeEntryPoints, and vendors
+/// `src-tauri/framework/`. A v42 row still reports `createPacedQueue.has` dead
+/// and Tauri's copied tao/wry sources as unwired first-party files.
+///
+/// v44 carries the file-liveness annotations: `ScriptEntry` from a shebang,
+/// `PackageMarker`, `ToolConfig`, `AmbientDeclaration` and `Fixture`, and it
+/// moves `*.d.ts` and `*.config.*` off `TargetRoot`. A warm v43 row has none of
+/// them, so every `__init__.py`, every shebang script, every `testdata/**` file
+/// and every tool config in it stays an unwired candidate — which is exactly
+/// the finding this version exists to withdraw.
+///
+/// v45 records `Foo<T>` as a Type use of `Foo`. A v44 row still reports a
+/// type alias used only as a generic constructor confidently dead.
+///
+/// v46 records the enclosing callable as `parent_symbol` of a nested
+/// `const walk = () => {}`. A v45 row parents those arrows on the file, so
+/// `walk()` inside `collapseAll` cannot join to `collapseAll.walk`.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "46";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

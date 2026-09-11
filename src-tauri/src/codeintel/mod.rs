@@ -295,7 +295,9 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
             truncated,
         ),
     };
-    out.walk_incomplete = walk_incomplete;
+    out.walk_incomplete = walk_incomplete.and_then(|reason| {
+        fold_qualification_reason(std::iter::once(reason), QUALIFICATION_MAX_CHARS)
+    });
     out.rungs = rungs.map(CodeintelRungHistogram::from);
     out.source_freshness = source_freshness;
     out
@@ -839,7 +841,10 @@ pub fn impact_layered_with_cancel(
     }
 }
 
-/// Compose layered impact over a changed-file set, chunked at 16 targets.
+/// Compose layered impact over a changed-file set. Each seed is one
+/// `impact_layered` call — unlike [`neighbors`], there is no kernel fan-out
+/// cap to chunk. Cancellation is checked between targets so a dismissed pane
+/// cannot finish the whole set.
 pub fn impact_layered_many(
     repo_path: &str,
     targets: &[String],
@@ -860,17 +865,7 @@ pub fn impact_layered_many_with_cancel(
         .map(|t| {
             if let Some(cancel) = cancel.as_ref() {
                 if cancel.is_cancelled() {
-                    return CodeintelLayeredImpact {
-                        available: false,
-                        reason: Some("query cancelled".into()),
-                        edges: CodeintelResponse::unavailable("query cancelled"),
-                        blast_radius: CodeintelBlastRadius {
-                            seeds: Vec::new(),
-                            unmatched_targets: vec![t.clone()],
-                            layers: CodeintelResponse::unavailable("query cancelled"),
-                            total_impacted: 0,
-                        },
-                    };
+                    return cancelled_layered_impact(t);
                 }
             }
             impact_layered_with_cancel(repo_path, t, token_budget, cancel.clone())
@@ -1106,17 +1101,352 @@ fn affected_tests_from_store(
     }
 }
 
+const QUALIFICATION_MAX_CHARS: usize = 720;
+const QUERY_CANCELLED_REASON: &str = "query cancelled";
+
+fn cancelled_layered_impact(target: &str) -> CodeintelLayeredImpact {
+    CodeintelLayeredImpact {
+        available: false,
+        reason: Some(QUERY_CANCELLED_REASON.into()),
+        edges: CodeintelResponse::unavailable(QUERY_CANCELLED_REASON),
+        blast_radius: CodeintelBlastRadius {
+            seeds: vec![target.to_string()],
+            unmatched_targets: Vec::new(),
+            layers: CodeintelResponse::unavailable(QUERY_CANCELLED_REASON),
+            total_impacted: 0,
+        },
+    }
+}
+
 fn append_affected_reason(target: &mut Option<String>, incoming: Option<String>) {
-    if let Some(incoming) = incoming {
-        match target {
-            Some(existing) if *existing != incoming => {
-                existing.push_str("; ");
-                existing.push_str(&incoming);
+    *target = fold_qualification_reason(
+        [target.take(), incoming].into_iter().flatten(),
+        QUALIFICATION_MAX_CHARS,
+    );
+}
+
+/// Fold walk_incomplete-style qualifications the way the UI composer does:
+/// split on kernel joiners, fingerprint by stripping digits, merge numeric
+/// slots into a range. Exact-string concat repeats the corpus disclaimer once
+/// per seed whose unrecorded-edge count differs. Already-folded text (en-dash
+/// ranges, "(N seeds)") is normalized so incremental appends keep merging.
+fn fold_qualification_reason(
+    parts: impl IntoIterator<Item = String>,
+    max_chars: usize,
+) -> Option<String> {
+    let mut clauses = Vec::new();
+    for part in parts {
+        for chunk in part.split('·') {
+            for clause in chunk.split("; ") {
+                let item = clause.trim();
+                if !item.is_empty() && item.chars().any(|c| c.is_alphanumeric()) {
+                    clauses.push(item.to_string());
+                }
             }
-            None => *target = Some(incoming),
-            _ => {}
         }
     }
+    if clauses.is_empty() {
+        return None;
+    }
+
+    #[derive(Clone)]
+    struct Slot {
+        min: i64,
+        max: i64,
+    }
+    struct Group {
+        first: String,
+        count: usize,
+        template: String,
+        slots: Vec<Slot>,
+        mergeable: bool,
+        identical: bool,
+    }
+
+    fn strip_suffix(clause: &str) -> &str {
+        let trimmed = clause.trim();
+        if let Some(at) = trimmed.rfind(" (") {
+            let rest = &trimmed[at + 2..];
+            if rest.ends_with(" seeds)") || rest.ends_with(" similar)") {
+                return trimmed[..at].trim_end();
+            }
+        }
+        trimmed
+    }
+
+    fn seed_weight(clause: &str) -> usize {
+        const JS_SAFE: i64 = 9_007_199_254_740_991;
+        let trimmed = clause.trim();
+        let Some(at) = trimmed.rfind(" (") else {
+            return 1;
+        };
+        let rest = &trimmed[at + 2..];
+        let digits = rest
+            .strip_suffix(" seeds)")
+            .or_else(|| rest.strip_suffix(" similar)"));
+        let Some(digits) = digits else {
+            return 1;
+        };
+        digits
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n > 0 && *n <= JS_SAFE)
+            .map(|n| n as usize)
+            .unwrap_or(1)
+    }
+
+    fn fingerprint(clause: &str) -> String {
+        let mut out = String::new();
+        let mut chars = strip_suffix(clause).chars().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() {
+                while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\u{2013}') {
+                    chars.next();
+                    while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+                out.push('#');
+            } else {
+                out.push(c);
+            }
+        }
+        out.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    }
+
+    fn template(clause: &str) -> String {
+        let mut out = String::new();
+        let mut chars = strip_suffix(clause).chars().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() {
+                while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'\u{2013}') {
+                    chars.next();
+                    while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+                out.push('\0');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn parse_slots(clause: &str) -> Option<Vec<Slot>> {
+        const JS_SAFE: i64 = 9_007_199_254_740_991;
+        fn parse_slot(digits: &str) -> Option<i64> {
+            let n: i64 = digits.parse().ok()?;
+            (-JS_SAFE..=JS_SAFE).contains(&n).then_some(n)
+        }
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut chars = strip_suffix(clause).chars().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() {
+                current.push(c);
+            } else if c == '\u{2013}' && !current.is_empty() {
+                let min = parse_slot(&current)?;
+                current.clear();
+                while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                    current.push(chars.next().unwrap());
+                }
+                let max = parse_slot(&current)?;
+                current.clear();
+                out.push(Slot {
+                    min: min.min(max),
+                    max: min.max(max),
+                });
+            } else if !current.is_empty() {
+                let n = parse_slot(&current)?;
+                current.clear();
+                out.push(Slot { min: n, max: n });
+                if c.is_ascii_digit() {
+                    current.push(c);
+                }
+            }
+        }
+        if !current.is_empty() {
+            let n = parse_slot(&current)?;
+            out.push(Slot { min: n, max: n });
+        }
+        Some(out)
+    }
+
+    let mut groups: Vec<Group> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for clause in clauses {
+        let key = fingerprint(&clause);
+        if let Some(&at) = index.get(&key) {
+            let group = &mut groups[at];
+            if clause == group.first || strip_suffix(&clause) == strip_suffix(&group.first) {
+                group.count = group.count.max(seed_weight(&clause));
+                continue;
+            }
+            group.count = group.count.saturating_add(seed_weight(&clause));
+            group.identical = false;
+            match parse_slots(&clause) {
+                Some(slots)
+                    if group.mergeable
+                        && template(&clause) == group.template
+                        && slots.len() == group.slots.len() =>
+                {
+                    for (i, slot) in slots.iter().enumerate() {
+                        group.slots[i].min = group.slots[i].min.min(slot.min);
+                        group.slots[i].max = group.slots[i].max.max(slot.max);
+                    }
+                }
+                _ => group.mergeable = false,
+            }
+        } else {
+            let slots = parse_slots(&clause);
+            let mergeable = slots.is_some();
+            index.insert(key, groups.len());
+            groups.push(Group {
+                first: clause.clone(),
+                count: seed_weight(&clause),
+                template: template(&clause),
+                slots: slots.unwrap_or_default(),
+                mergeable,
+                identical: true,
+            });
+        }
+    }
+
+    let merged: Vec<String> = groups
+        .into_iter()
+        .map(|group| {
+            if group.identical {
+                let weight = seed_weight(&group.first);
+                if group.count > 1 && weight != group.count {
+                    return format!("{} ({} seeds)", strip_suffix(&group.first), group.count);
+                }
+                return group.first;
+            }
+            let base = strip_suffix(&group.first).to_string();
+            if !group.mergeable {
+                return if group.count > 1 {
+                    format!("{base} ({} similar)", group.count)
+                } else {
+                    base
+                };
+            }
+            let mut slot = 0;
+            let mut out = String::new();
+            let mut current = String::new();
+            let mut chars = base.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    current.push(c);
+                } else if c == '\u{2013}' && !current.is_empty() {
+                    while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    current.clear();
+                    let s = &group.slots[slot];
+                    slot += 1;
+                    if s.min == s.max {
+                        out.push_str(&s.min.to_string());
+                    } else {
+                        out.push_str(&format!("{}\u{2013}{}", s.min, s.max));
+                    }
+                } else {
+                    if !current.is_empty() {
+                        let s = &group.slots[slot];
+                        slot += 1;
+                        if s.min == s.max {
+                            out.push_str(&s.min.to_string());
+                        } else {
+                            out.push_str(&format!("{}\u{2013}{}", s.min, s.max));
+                        }
+                        current.clear();
+                    }
+                    out.push(c);
+                }
+            }
+            if !current.is_empty() {
+                let s = &group.slots[slot];
+                if s.min == s.max {
+                    out.push_str(&s.min.to_string());
+                } else {
+                    out.push_str(&format!("{}\u{2013}{}", s.min, s.max));
+                }
+            }
+            if group.count > 1 {
+                format!("{out} ({} seeds)", group.count)
+            } else {
+                out
+            }
+        })
+        .collect();
+
+    Some(bound_joined(&merged, max_chars.max(1)))
+}
+
+fn bound_joined(parts: &[String], max_chars: usize) -> String {
+    let full = parts.join("; ");
+    if full.chars().count() <= max_chars {
+        return full;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let omitted = parts.len() - i - 1;
+        let suffix = if omitted > 0 {
+            format!("; {omitted} more distinct qualification(s) omitted")
+        } else {
+            String::new()
+        };
+        let candidate = if kept.is_empty() {
+            part.clone()
+        } else {
+            format!("{}; {part}", kept.join("; "))
+        };
+        if candidate.chars().count() + suffix.chars().count() <= max_chars {
+            kept.push(part);
+            continue;
+        }
+        if kept.is_empty() {
+            let room = max_chars.saturating_sub(suffix.chars().count()).max(1);
+            return clip_text(&(clip_text(part, room) + &suffix), max_chars);
+        }
+        return clip_text(
+            &format!(
+                "{}; {} more distinct qualification(s) omitted",
+                kept.join("; "),
+                parts.len() - i
+            ),
+            max_chars,
+        );
+    }
+    clip_text(&kept.join("; "), max_chars)
+}
+
+fn clip_text(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".into();
+    }
+    let mut out = String::new();
+    for (i, c) in text.chars().enumerate() {
+        if i >= max_chars - 1 {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
 }
 
 /// Both lists in an affected-test answer retain the same envelope semantics.
@@ -1296,6 +1626,40 @@ pub fn clones(repo_path: &str, token_budget: Option<u32>) -> CodeintelClones {
             signed_symbols: 0,
             unsigned_symbols: 0,
         },
+    }
+}
+
+/// Speculative edit preview.
+///
+/// GitPulse links `devmap-query` with `default-features = false` so it never
+/// pulls tree-sitter grammars into the desktop binary. Preview needs that
+/// parse frontend; reporting unavailable (with a reason naming the CLI /
+/// global `devmap mcp`) is honest. An empty breakage list must never mean
+/// "the edit is safe" when the check could not run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelPreview {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub file_path: String,
+    pub delta_available: bool,
+}
+
+pub fn preview(
+    repo_path: &str,
+    file: &str,
+    content: &str,
+    _token_budget: Option<u32>,
+) -> CodeintelPreview {
+    let _ = (repo_path, content);
+    CodeintelPreview {
+        available: false,
+        reason: Some(
+            "preview requires the parse frontend; gitpulse-mcp is parser-free. \
+             Use `devmap preview` or the global `devmap mcp` server."
+                .into(),
+        ),
+        file_path: file.to_string(),
+        delta_available: false,
     }
 }
 
@@ -1812,6 +2176,203 @@ mod tests {
         assert_eq!(result.source_freshness, Some(false));
         let reason = result.walk_incomplete.unwrap();
         assert!(reason.contains("parse loss") && reason.contains("depth capped"));
+    }
+
+    #[test]
+    fn qualification_fold_collapses_numeric_walk_variants() {
+        let coverage = "28637 of 69195 unresolved attribution site(s) have no indexed target after excluding 40548 known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies";
+        let mut folded = None;
+        for i in 0..25u32 {
+            let unrecorded = 700 + i * 500;
+            append_affected_reason(
+                &mut folded,
+                Some(format!(
+                    "the walk did not complete: stopped at depth 10, {unrecorded} traversed edges unrecorded; the result is a lower bound, not the full blast radius; {coverage}"
+                )),
+            );
+        }
+        let text = folded.expect("folded");
+        assert!(
+            text.len() < 1200,
+            "folded walk_incomplete stayed huge: {} chars",
+            text.len()
+        );
+        assert_eq!(text.matches("repository-wide counts").count(), 1);
+        assert_eq!(text.matches("the walk did not complete").count(), 1);
+        assert!(text.contains("25 seeds"), "{text}");
+        assert!(text.contains('\u{2013}'), "{text}");
+    }
+
+    #[test]
+    fn qualification_fold_keeps_merging_a_prior_summary() {
+        let coverage = "these repository-wide counts are not specific to this target";
+        let mut folded = None;
+        for i in 0..10u32 {
+            append_affected_reason(
+                &mut folded,
+                Some(format!(
+                    "the walk did not complete: stopped at depth 10, {} traversed edges unrecorded; {coverage}",
+                    100 + i
+                )),
+            );
+        }
+        append_affected_reason(
+            &mut folded,
+            Some(format!(
+                "the walk did not complete: stopped at depth 10, 5000 traversed edges unrecorded; {coverage}"
+            )),
+        );
+        let text = folded.expect("folded");
+        assert!(text.contains("11 seeds"), "{text}");
+        assert!(text.contains("5000") || text.contains('\u{2013}'), "{text}");
+        assert_eq!(text.matches("repository-wide counts").count(), 1);
+    }
+
+    #[test]
+    fn qualification_fold_does_not_suffix_identical_copies() {
+        let mut folded = None;
+        for _ in 0..179 {
+            append_affected_reason(
+                &mut folded,
+                Some("repository-wide counts are not specific to this target".into()),
+            );
+        }
+        let text = folded.expect("folded");
+        assert_eq!(
+            text,
+            "repository-wide counts are not specific to this target"
+        );
+        assert!(!text.contains("seeds"));
+    }
+
+    #[test]
+    fn qualification_fold_counts_similar_suffix_weight() {
+        let mut folded = None;
+        append_affected_reason(
+            &mut folded,
+            Some("overflow 9007199254740993 traversed".into()),
+        );
+        append_affected_reason(
+            &mut folded,
+            Some("overflow 9007199254740994 traversed".into()),
+        );
+        append_affected_reason(
+            &mut folded,
+            Some("overflow 9007199254740995 traversed".into()),
+        );
+        let text = folded.expect("folded");
+        assert!(text.contains("3 similar"), "{text}");
+        assert!(!text.contains('\u{2013}'), "{text}");
+    }
+
+    #[test]
+    fn qualification_fold_never_exceeds_a_budget_smaller_than_the_omit_suffix() {
+        let parts = (0..20u8)
+            .map(|i| format!("unique{}", (b'A' + i) as char))
+            .collect::<Vec<_>>();
+        let text = fold_qualification_reason(parts, 25).expect("folded");
+        assert!(
+            text.chars().count() <= 25,
+            "fold exceeded budget: {} chars ({text:?})",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn qualification_fold_keeps_prior_seed_weight() {
+        let text = fold_qualification_reason(
+            ["depth capped".into(), "depth capped (10 seeds)".into()],
+            720,
+        )
+        .expect("folded");
+        assert!(text.contains("10 seeds"), "{text}");
+        assert_eq!(text.matches("depth capped").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn qualification_fold_does_not_double_a_summary() {
+        let coverage = "these repository-wide counts are not specific to this target";
+        let mut folded = None;
+        for i in 0..8u32 {
+            append_affected_reason(
+                &mut folded,
+                Some(format!(
+                    "the walk did not complete: stopped at depth 10, {} traversed edges unrecorded; {coverage}",
+                    80 + i
+                )),
+            );
+        }
+        let first = folded.clone().expect("folded");
+        assert!(first.contains("8 seeds"), "{first}");
+        append_affected_reason(&mut folded, Some(first.clone()));
+        let twice = folded.expect("twice");
+        assert_eq!(twice, first);
+        assert!(twice.contains("8 seeds"), "{twice}");
+        assert!(!twice.contains("16 seeds"), "{twice}");
+    }
+
+    #[test]
+    fn clip_text_cuts_on_a_unicode_scalar_boundary() {
+        let text = clip_text(&format!("😀{}", "x".repeat(20)), 3);
+        assert!(text.chars().count() <= 3);
+        assert!(text.starts_with('😀'), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn cancelled_layered_many_does_not_mark_seeds_unmatched() {
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let out = impact_layered_many_with_cancel(
+            "/tmp/not-a-repo",
+            &["a.ts".into(), "b.ts".into()],
+            Some(50),
+            Some(cancel),
+        );
+        assert_eq!(out.len(), 2);
+        for item in &out {
+            assert!(!item.available);
+            assert_eq!(item.reason.as_deref(), Some(QUERY_CANCELLED_REASON));
+            assert!(
+                item.blast_radius.unmatched_targets.is_empty(),
+                "{:?}",
+                item.blast_radius.unmatched_targets
+            );
+            assert_eq!(item.blast_radius.seeds.len(), 1);
+        }
+    }
+
+    #[test]
+    fn from_engine_folds_concatenated_walk_incomplete() {
+        let store = Store::open_in_memory().unwrap();
+        let coverage = "28637 of 69195 unresolved attribution site(s) have no indexed target after excluding 40548 known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies";
+        let blob = (0..25u32)
+            .map(|i| {
+                let unrecorded = 700 + i * 500;
+                format!(
+                    "the walk did not complete: stopped at depth 10, {unrecorded} traversed edges unrecorded; the result is a lower bound, not the full blast radius; {coverage}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut response = StoreQueryEngine::new(&store)
+            .impact(Request {
+                query: "missing".into(),
+                token_budget: 2000,
+                min_confidence: 0.0,
+                max_depth: 3,
+            })
+            .unwrap();
+        response.walk_incomplete = Some(blob);
+        let mapped = from_engine(response, |edge| edge.source_symbol);
+        let text = mapped.walk_incomplete.expect("folded");
+        assert!(
+            text.len() < 1200,
+            "from_engine left walk_incomplete huge: {} chars",
+            text.len()
+        );
+        assert_eq!(text.matches("repository-wide counts").count(), 1);
+        assert!(text.contains("25 seeds"), "{text}");
     }
 
     #[test]

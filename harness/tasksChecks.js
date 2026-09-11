@@ -459,8 +459,10 @@ if (params.has("check")) {
     await change(root.querySelector(".notes-label textarea"),"Prepare Demo for Seattle start-up event");
     await click("Save task"); await settle(100);
     check("notes-only task saves without native title validation blocking extraction", tasks.some(task=>task.title==="Prepare Demo for Seattle start-up event"));
-    const footerBackground=getComputedStyle(editor().querySelector("footer")).backgroundColor;
-    check("sticky save controls have an opaque background over scrolled fields", !footerBackground.startsWith("rgba") || footerBackground.endsWith(", 1)"));
+    const saveBar=editor().querySelector(".task-editor > footer") ?? editor().querySelector("footer");
+    const footerBackground=getComputedStyle(saveBar).backgroundColor;
+    const footerAlpha=footerBackground === "transparent" ? 0 : footerBackground.startsWith("rgba") && !footerBackground.endsWith(", 1)") ? 0 : 1;
+    check("save bar is not an opaque slab", saveBar.parentElement === editor() && footerAlpha < 1);
     confirmAnswer=true; await click("Close task details");
     failConfiguration=true; await click("New task"); await wait(()=>editor().textContent.includes("Manvi temporarily unavailable"));
     check("inline configuration failure exposes a working retry", Boolean(button("Reload Manvi configuration")) && !button("Reload Manvi configuration").matches(":disabled"));

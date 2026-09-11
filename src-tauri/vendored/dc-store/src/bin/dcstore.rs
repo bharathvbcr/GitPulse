@@ -118,6 +118,21 @@ const KNOWN_FLAGS: &[&str] = &[
     "appended",
     "method",
     "input",
+    "type",
+    "requirement-id",
+    "acceptance-criterion-id",
+    "data",
+    "id",
+    "from-agent",
+    "to-agent",
+    "manifest-path",
+    "status",
+    "sandbox",
+    "environment",
+    "commands",
+    "started-at",
+    "finished-at",
+    "created-at",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -518,8 +533,178 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        "evidence-append" => {
+            let id = store
+                .evidence_append(
+                    required("type")?,
+                    flag("task"),
+                    flag("requirement-id"),
+                    flag("acceptance-criterion-id"),
+                    required("data")?,
+                )
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("id", &id.to_string()),
+            ]))
+        }
+
+        "evidence-list" => {
+            let (rows, truncated) = store
+                .evidence_list(flag("task"))
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let items: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    object(&[
+                        ("id", &r.id.to_string()),
+                        ("type", &quote(&r.kind)),
+                        (
+                            "task_id",
+                            &r.task_id
+                                .as_deref()
+                                .map(quote)
+                                .unwrap_or_else(|| "null".into()),
+                        ),
+                        (
+                            "requirement_id",
+                            &r.requirement_id
+                                .as_deref()
+                                .map(quote)
+                                .unwrap_or_else(|| "null".into()),
+                        ),
+                        (
+                            "acceptance_criterion_id",
+                            &r.acceptance_criterion_id
+                                .as_deref()
+                                .map(quote)
+                                .unwrap_or_else(|| "null".into()),
+                        ),
+                        ("data_json", &r.data_json),
+                    ])
+                })
+                .collect();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("evidence", &format!("[{}]", items.join(","))),
+                ("truncated", &json_bool(truncated)),
+                ("shown", &rows.len().to_string()),
+            ]))
+        }
+
+        "gaps" => {
+            let (rows, truncated) = store
+                .gaps_list(flag("task"))
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let items: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    object(&[
+                        ("id", &quote(&r.id)),
+                        ("severity", &quote(&r.severity)),
+                        ("gap_type", &quote(&r.gap_type)),
+                        (
+                            "task_id",
+                            &r.task_id
+                                .as_deref()
+                                .map(quote)
+                                .unwrap_or_else(|| "null".into()),
+                        ),
+                        ("description", &quote(&r.description)),
+                        ("recommended_fix", &quote(&r.recommended_fix)),
+                        ("blocking", &json_bool(r.blocking)),
+                        ("evidence_json", &r.evidence_json),
+                    ])
+                })
+                .collect();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("gaps", &format!("[{}]", items.join(","))),
+                ("truncated", &json_bool(truncated)),
+                ("shown", &rows.len().to_string()),
+            ]))
+        }
+
+        "gaps-clear" => {
+            let task = required("task")?.to_string();
+            store
+                .gaps_replace(&task, &[])
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let zero = String::from("0");
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("task_id", &quote(&task)),
+                ("count", &zero),
+            ]))
+        }
+
+        "gap-upsert" => {
+            let blocking = matches!(
+                flag("blocking").unwrap_or("false"),
+                "1" | "true" | "True" | "yes"
+            );
+            let gap = dc_store::records::GapRow {
+                id: required("id")?.to_string(),
+                severity: flag("severity").unwrap_or("medium").to_string(),
+                gap_type: required("gap-type")?.to_string(),
+                requirement_id: flag("requirement-id").map(str::to_string),
+                task_id: flag("task").map(str::to_string),
+                description: required("description")?.to_string(),
+                evidence_json: flag("evidence").unwrap_or("[]").to_string(),
+                recommended_fix: flag("recommended-fix").unwrap_or("").to_string(),
+                blocking,
+                file: flag("file").map(str::to_string),
+                line: flag("line").and_then(|s| s.parse().ok()),
+                suggested_command: flag("suggested-command").map(str::to_string),
+                acceptance_criterion_id: flag("acceptance-criterion-id").map(str::to_string),
+                expected_verification_method: flag("expected-verification-method")
+                    .map(str::to_string),
+            };
+            store
+                .gap_upsert(&gap)
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            Ok(object(&[("ok", &json_bool(true)), ("id", &quote(&gap.id))]))
+        }
+
+        "run-record" => {
+            let run = dc_store::records::VerificationRun {
+                id: required("id")?.to_string(),
+                task_id: required("task")?.to_string(),
+                sandbox: required("sandbox")?.to_string(),
+                environment_json: flag("environment").unwrap_or("{}").to_string(),
+                commands_json: flag("commands").unwrap_or("[]").to_string(),
+                status: required("status")?.to_string(),
+                started_at: required("started-at")?.to_string(),
+                finished_at: flag("finished-at").map(str::to_string),
+            };
+            store
+                .run_record(&run)
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            Ok(object(&[("ok", &json_bool(true)), ("id", &quote(&run.id))]))
+        }
+
+        "handoff" => {
+            let handoff = dc_store::records::AgentHandoff {
+                id: required("id")?.to_string(),
+                task_id: required("task")?.to_string(),
+                from_agent: required("from-agent")?.to_string(),
+                to_agent: required("to-agent")?.to_string(),
+                run_id: required("run-id")?.to_string(),
+                manifest_path: required("manifest-path")?.to_string(),
+                status: required("status")?.to_string(),
+                created_at: required("created-at")?.to_string(),
+            };
+            store
+                .handoff_record(&handoff)
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("id", &quote(&handoff.id)),
+            ]))
+        }
+
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gap-upsert, run-record, handoff, work)"
         ))),
     }
 }

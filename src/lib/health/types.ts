@@ -119,6 +119,20 @@ export interface DependabotAlertInfo {
 }
 
 /**
+ * Why a Dependabot / code-scanning fetch could not run. Mirrors the Rust
+ * `GithubUnavailableReason` enum — decided next to HTTP-status parsing so the
+ * UI never matches English fragments of GitHub error prose.
+ */
+export type GithubUnavailableReason =
+  | "not_github_remote"
+  | "cli_missing"
+  | "product_disabled"
+  | "forbidden"
+  | "rate_limited"
+  | "transport"
+  | "unknown";
+
+/**
  * Result of fetching Dependabot alerts for the opened repository.
  * `available: false` with an `error` means "could not check" — distinct from
  * an empty `alerts` list, which only ever means "no open alerts".
@@ -131,6 +145,8 @@ export interface DependabotReport {
   alerts: DependabotAlertInfo[];
   truncated: boolean;
   error?: string | null;
+  /** Present only when `available` is false; omitted on success (serde skip). */
+  unavailable_reason?: GithubUnavailableReason;
 }
 
 /** One open GitHub code scanning alert. Mirrors `CodeScanningAlertInfo`. */
@@ -166,6 +182,8 @@ export interface CodeScanningReport {
   alerts: CodeScanningAlertInfo[];
   truncated: boolean;
   error?: string | null;
+  /** Present only when `available` is false; omitted on success (serde skip). */
+  unavailable_reason?: GithubUnavailableReason;
 }
 
 /**

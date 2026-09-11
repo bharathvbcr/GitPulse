@@ -12,7 +12,7 @@
   import { formatError } from "../ui/formatError";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { previewStore, previewSummary } from "../codeintel/previewStore";
-  import { getImpactLayeredMany } from "../codeintel/client";
+  import { getImpactLayeredMany, cancelCodeintelQuery, newCodeintelCancelToken } from "../codeintel/client";
   import {
     composeLayeredImpacts,
     emptyComposedBlast,
@@ -20,6 +20,7 @@
   } from "../codeintel/blastCompose";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
+  import { tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let dirtyCount = $derived($repoStore.statuses.length);
@@ -68,9 +69,16 @@
       return;
     }
     const guard = createAsyncGuard();
-    blastGuard = guard;
+    const cancelToken = newCodeintelCancelToken();
+    blastGuard = {
+      isLive: () => guard.isLive(),
+      cancel: () => {
+        guard.cancel();
+        void cancelCodeintelQuery(cancelToken);
+      },
+    };
     blastLoading = true;
-    void getImpactLayeredMany(repo, paths, 800)
+    void getImpactLayeredMany(repo, paths, 800, cancelToken)
       .then((results) => {
         if (!guard.isLive()) return;
         blast = composeLayeredImpacts(results, paths);
@@ -219,7 +227,10 @@
                   : ""}
               </div>
               {#if file.walk_incomplete}
-                <div class="text-amber-500">walk_incomplete: {file.walk_incomplete}</div>
+                {@const walk = tooltipWalkIncomplete([file.walk_incomplete])}
+                <div class="line-clamp-2 text-amber-500" title={walk}>
+                  walk incomplete: {walk}
+                </div>
               {/if}
               {#if !file.available}
                 <div class="text-amber-500">unavailable: {file.reason}</div>

@@ -11,6 +11,7 @@
     fitTerminalDockHeight,
   } from "../terminal/dockMetrics";
   import { nextHostedTerminals } from "../terminal/repoHosts";
+  import { observeResize } from "../dom/observeResize";
 
   /**
    * The terminal, docked beneath the active view.
@@ -90,11 +91,9 @@
   $effect(() => {
     const parent = host?.parentElement;
     if (!parent || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(([entry]) => {
+    return observeResize(parent, ([entry]) => {
       containerHeight = entry.contentRect.height;
     });
-    observer.observe(parent);
-    return () => observer.disconnect();
   });
 
   function startDrag(event: PointerEvent) {

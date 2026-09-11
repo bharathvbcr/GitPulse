@@ -347,6 +347,21 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
             if entry_roots.contains(path) || entry_roots.contains(id) {
                 flags.push(json!({"flag": "entry"}));
             }
+            // The producer's own three-valued answer, carried through rather
+            // than re-derived from the flag lists. An isolated `.yaml` has no
+            // flags and no edges, and a reader told this picture shows dead and
+            // unwired code reads a lone dot as one of those. `""` for a symbol
+            // node, which the detail panel's `row` helper then omits — a symbol
+            // has no file-level liveness and must not be shown a blank one.
+            let extras = node.get("extras");
+            let liveness = extras
+                .and_then(|extras| extras.get("liveness"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let liveness_reason = extras
+                .and_then(|extras| extras.get("liveness_reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             json!({
                 "id": id,
                 "name": node.get("name").and_then(Value::as_str).unwrap_or(id),
@@ -355,6 +370,8 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
                 "area": node.get("area").and_then(Value::as_str).unwrap_or(""),
                 "community": node.get("community").and_then(Value::as_str).unwrap_or(""),
                 "language": node.get("language").and_then(Value::as_str).unwrap_or(""),
+                "liveness": liveness,
+                "liveness_reason": liveness_reason,
                 "documentation": is_documentation(node),
                 "line": node.get("line").and_then(Value::as_u64).unwrap_or(0),
                 "degree": degree.get(id).copied().unwrap_or(0),
@@ -461,11 +478,19 @@ pub fn render_html(graph: &Value, options: &VizOptions) -> String {
         "detail_fields": [
             ["Path", "path"], ["Kind", "kind"], ["Area", "area"],
             ["Community", "community"], ["Language", "language"],
+            ["Liveness", "liveness"], ["Why", "liveness_reason"],
         ],
         "flag_filters": [["dead", "Dead candidates only"]],
         "legend": [
             ["#3d8bfd", "reached"], ["#e35d6a", "dead candidate"],
             ["#34d399", "entry point"], ["#f0ad4e", "unwired"],
+            // A colour of its own, because the alternative is to paint a
+            // README the same blue as reached code or leave it grey and
+            // unexplained. Every isolated config file is its own singleton
+            // community and draws as a lone dot; in a picture whose legend
+            // names "dead" and "unwired", an unlabelled dot is read as one of
+            // them.
+            ["#8b9bb4", "data — not a liveness candidate"],
         ],
     });
     render_page(&payload)
@@ -560,11 +585,18 @@ const flagsOf = n => (n.flags || []).map(f => f.flag);
 // one colour; `entry` outranks `unwired` because nothing calling an entry point
 // is what an entry point *is*, and painting one as a defect is a false alarm an
 // operator acts on. Every flag still shows as a tag in the detail panel.
+// `not_applicable` sits below the three findings and above the default. Below,
+// because a data file that somehow carried a finding should still show the
+// finding rather than hide behind its category. Above the default, because
+// "reached" is a claim about code and a README is not code — painting it the
+// same blue as a live module is the quieter half of the same mistake as
+// painting it red.
 const colorFor = n => {{
   const f = flagsOf(n);
   if (f.includes('dead')) return '#e35d6a';
   if (f.includes('entry')) return '#34d399';
   if (f.includes('unwired')) return '#f0ad4e';
+  if (n.liveness === 'not_applicable') return '#8b9bb4';
   return '#3d8bfd';
 }};
 

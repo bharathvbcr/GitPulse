@@ -16,6 +16,7 @@
   import { buildGraphIndex, filterGraphNodes, fitGraphView, graphNodeOpenPath, traceGraph, type TraceDirection } from "../codeintel/graphNavigation";
   import type { GraphVizLoad } from "../codeintel/types";
   import { createFrameScheduler } from "../motion/frameScheduler";
+  import { observeResize } from "../dom/observeResize";
   import { themeStore } from "../stores/themeStore";
   import { getLanguageIconColor, type LanguageIconKey } from "../language/languageLogos";
 
@@ -65,9 +66,8 @@
   let lastPointer = { x: 0, y: 0 };
 
   const scheduler = createFrameScheduler();
-  const resizeScheduler = createFrameScheduler();
   let gpuCtx: CanvasRenderingContext2D | null = null;
-  let resizeObserver: ResizeObserver | null = null;
+  let stopResize: (() => void) | null = null;
 
   const payload = $derived(
     load?.available ? load.payload ?? null : null,
@@ -277,14 +277,13 @@
     measure();
     // Updating responsive classes inside an observer delivery can resize the
     // observed stage again. Defer and coalesce writes outside that delivery.
-    resizeObserver = new ResizeObserver(() => resizeScheduler.schedule(measure));
-    if (hostEl) resizeObserver.observe(hostEl);
+    if (hostEl) stopResize = observeResize(hostEl, () => measure());
   });
 
   onDestroy(() => {
     scheduler.cancel();
-    resizeScheduler.cancel();
-    resizeObserver?.disconnect();
+    stopResize?.();
+    stopResize = null;
     gpuCtx = null;
   });
 
@@ -339,7 +338,7 @@
   });
 </script>
 
-<div class="code-map flex flex-col min-h-0 flex-1" class:light class:narrow={width <= 760}>
+<div class="code-map bg-background flex flex-col min-h-0 flex-1" class:narrow={width <= 760}>
   <div class="map-toolbar">
     <div class="map-heading">
       <span class="map-eyebrow">DEPENDENCY MAP</span>
@@ -509,16 +508,11 @@
 </div>
 
 <style>
-  .code-map { min-width: 0; color: #c8d2e1; background: #141a25;
-    --map-panel: #1b2331;
-    --map-border: #ffffff0e;
-    --map-muted: #8d9bb0;
-    --map-hover: #ffffff0b; }
-  .code-map.light { color: #374151; background: #f8fafc;
-    --map-panel: #ffffff;
-    --map-border: #172b4d12;
-    --map-muted: #64748b;
-    --map-hover: #172b4d08; }
+  .code-map { min-width: 0; color: rgb(var(--c-text));
+    --map-panel: var(--mac-fill-surface, rgb(var(--c-surface)));
+    --map-border: rgb(var(--c-border) / 0.45);
+    --map-muted: rgb(var(--c-text-muted));
+    --map-hover: rgb(var(--c-surface-hover) / 0.55); }
   .map-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px 12px; }
   .map-eyebrow { font-size: 10px; font-weight: 650; letter-spacing: .13em; color: var(--map-muted); }
   .map-counts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; font-size: 11px; }
@@ -530,8 +524,7 @@
   button:focus-visible, canvas:focus-visible, .map-search:focus-within { outline: 2px solid #79a7ed; outline-offset: 2px; }
   .map-button { border: 1px solid var(--map-border); border-radius: 7px; padding: 6px 10px; font-size: 11px; white-space: nowrap; background: var(--map-panel); }
   .map-button:hover, .map-button[aria-pressed=true] { background: var(--map-hover); color: #79a7ed; }
-  .map-honesty { margin: 0; padding: 0 20px 10px; color: #c99756; font-size: 11px; }
-  .light .map-honesty { color: #936016; }
+  .map-honesty { margin: 0; padding: 0 20px 10px; color: light-dark(#936016, #c99756); font-size: 11px; }
   .map-group-row { display: flex; min-width: 0; }
   .group-pages { display: flex; flex: none; align-items: center; gap: 4px; padding: 0 12px 12px 0; font-size: 10px; color: var(--map-muted); }
   .group-pages button { padding: 5px; }

@@ -90,6 +90,23 @@ describe("palette search lifecycle", () => {
     expect(result.note).toContain("TF-IDF");
     expect(deps.workspace).toHaveBeenCalledWith("/repo", "test", 8000, true);
   });
+  it("bounds a long workspace unavailable list instead of joining every repo", async () => {
+    vi.useFakeTimers();
+    const deps = dependencies();
+    const publish = vi.fn();
+    deps.workspace.mockResolvedValueOnce({
+      ...workspace,
+      unavailable: Array.from({ length: 179 }, (_, i) => ({
+        repo: `repo-${i}`,
+        reason: `missing index ${i}`,
+      })),
+    });
+    scheduleSearch({ ...request, mode: "workspace" }, publish, deps);
+    await vi.runAllTimersAsync();
+    const note = publish.mock.lastCall?.[0].note ?? "";
+    expect(note.length).toBeLessThanOrEqual(480);
+    expect(note).toContain("179 total");
+  });
   it("reports an empty or unreadable workspace registry", async () => {
     vi.useFakeTimers(); const deps = dependencies(); const publish = vi.fn();
     deps.workspace.mockResolvedValueOnce({ ...workspace, repos_queried: 0 });
@@ -98,6 +115,23 @@ describe("palette search lifecycle", () => {
     deps.repos.mockRejectedValueOnce(Error("Registry unreadable"));
     scheduleSearch({ ...request, mode: "workspace" }, publish, deps); await vi.runAllTimersAsync();
     expect(publish.mock.lastCall?.[0]).toMatchObject({ failed: true, workspace: [], note: "Search failed: Registry unreadable" });
+  });
+  it("folds a repeated walk_incomplete essay in the symbol note", async () => {
+    vi.useFakeTimers();
+    const deps = dependencies();
+    const publish = vi.fn();
+    const coverage =
+      "28637 of 69195 unresolved attribution site(s) have no indexed target after excluding 40548 known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies";
+    const blob = Array.from({ length: 12 }, (_, i) =>
+      `the walk did not complete: stopped at depth 10, ${i + 1} traversed edges unrecorded; the result is a lower bound, not the full blast radius; ${coverage}`,
+    ).join(" · ");
+    deps.symbols.mockResolvedValueOnce({ ...symbols("walk"), walk_incomplete: blob });
+    scheduleSearch(request, publish, deps);
+    await vi.runAllTimersAsync();
+    const note = publish.mock.lastCall?.[0].note ?? "";
+    expect(note.length).toBeLessThan(800);
+    expect(note.split("repository-wide counts").length - 1).toBe(1);
+    expect(note).toContain("12 seeds");
   });
   it("requires a unique exact registry name instead of guessing a matching tab", () => {
     const repo = { name: "apps/GitPulse", root: "/source/one", db: "", db_path: "" };

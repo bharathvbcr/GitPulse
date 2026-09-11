@@ -77,6 +77,12 @@
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
+  import { crossfade } from "svelte/transition";
+  import { isMacOS } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
+
+  const macos = isMacOS();
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   let ctx = $state<GitHubContext | null>(null);
 
@@ -742,7 +748,7 @@
             <!-- The queue's own counts, as the way into it. "4 awaiting
                  review" used to be a number the reader then had to go find. -->
             <div class="mb-2 flex flex-wrap items-center gap-2">
-              <div class="gp-segmented" role="tablist" aria-label="Pull request filter">
+              <div class="gp-segmented" class:gp-liquid-tabs={macos} role="tablist" aria-label="Pull request filter">
                 {#each PR_FACETS as candidate (candidate)}
                   <button
                     type="button"
@@ -753,8 +759,15 @@
                     onclick={() => (prFacet = candidate)}
                     class="gp-seg-btn text-[11px]! py-0.5! disabled:opacity-40 disabled:cursor-default"
                   >
-                    {PR_FACET_LABELS[candidate]}
-                    <span class="ml-1 font-mono text-[10px] opacity-70">{prCounts[candidate]}</span>
+                    {#if macos && prFacet === candidate}
+                      <span
+                        class="gp-liquid-selection gp-gpu"
+                        aria-hidden="true"
+                        in:receiveSelection={{ key: "pr-facet" }}
+                        out:sendSelection={{ key: "pr-facet" }}
+                      ></span>
+                    {/if}
+                    <span>{PR_FACET_LABELS[candidate]}<span class="ml-1 font-mono text-[10px] opacity-70">{prCounts[candidate]}</span></span>
                   </button>
                 {/each}
               </div>

@@ -61,7 +61,7 @@ fn claim_after_expiry_is_refused() {
     seed_task(&store);
     create(&store, "e1", false);
     assert_eq!(state_of(&store, "e1"), "pending");
-    clock.store(1_700_000_000 + 121, Ordering::SeqCst);
+    clock.store(1_700_000_000 + 181, Ordering::SeqCst);
     assert_eq!(
         err_code(
             &store,
@@ -93,7 +93,7 @@ fn recover_before_lease_is_busy_and_after_lease_interrupts() {
         ),
         "busy"
     );
-    clock.store(1_700_000_000 + 121, Ordering::SeqCst);
+    clock.store(1_700_000_000 + 181, Ordering::SeqCst);
     store
         .workbench_request(
             "enhancements.recover",
@@ -158,7 +158,7 @@ fn interrupted_rows_can_be_dismissed() {
             r#"{"id":"e4","request_id":"claim","expected_revision":1,"worker_id":"w1"}"#,
         )
         .unwrap();
-    clock.store(1_700_000_000 + 121, Ordering::SeqCst);
+    clock.store(1_700_000_000 + 181, Ordering::SeqCst);
     store
         .workbench_request(
             "enhancements.recover",

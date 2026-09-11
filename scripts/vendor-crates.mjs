@@ -83,18 +83,21 @@ export const MANIFEST = path.join(VENDOR_DIR, "VENDOR.json");
 export function sources(env = process.env, from = REPO) {
   return [
     {
-      id: "manvi",
-      root: env.GITPULSE_MANVI_ROOT ?? findSibling("Manvi", from),
-      // The workspace root inside that repository, whose inheritance applies.
-      workspace: "crates",
-      crates: ["dc-glob", "dc-store", "dc-verify"],
-      crateDir: (/** @type {string} */ name) => path.join("crates", name),
-    },
-    {
+      // dc-* crates live in DevCouncil rust-port (Phase 3). Manvi's crates/
+      // directory only keeps symlinks for local builds — do not vendor from there.
       id: "devcouncil",
       root: env.GITPULSE_DEVCOUNCIL_ROOT ?? findSibling("DevCouncil", from),
       workspace: "rust-port",
-      crates: ["devmap-analyze", "devmap-extract", "devmap-query", "devmap-resolve", "devmap-store"],
+      crates: [
+        "dc-glob",
+        "dc-store",
+        "dc-verify",
+        "devmap-analyze",
+        "devmap-extract",
+        "devmap-query",
+        "devmap-resolve",
+        "devmap-store",
+      ],
       crateDir: (/** @type {string} */ name) => path.join("rust-port", "crates", name),
     },
     {

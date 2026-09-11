@@ -176,6 +176,24 @@ describe("liveIndex controller", () => {
     expect(index.get("/repo").revision).toBe(0);
     index.reset();
   });
+
+  it("surfaces skip_cooldown as scheduled without busy-retrying", async () => {
+    const maybeRefresh = vi.fn(async () =>
+      outcome("skip_cooldown", {
+        reason: "live index cooldown active; retry in 1000ms",
+        cooldown_remaining_ms: 1000,
+      }),
+    );
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("scheduled");
+    expect(index.get("/repo").decision).toBe("skip_cooldown");
+    expect(index.get("/repo").reason).toContain("cooldown");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    index.reset();
+  });
   beforeEach(() => {
     vi.useFakeTimers();
     warnings.mockClear();
@@ -322,7 +340,7 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
-  it("coalesces a watcher storm into one maybeRefresh", async () => {
+    it("coalesces a watcher storm into one maybeRefresh", async () => {
     const maybeRefresh = vi.fn(async () => outcome("refresh"));
     const index = createLiveIndex({ debounceMs: 40, maybeRefresh });
     index.onRepoChanged("/repo/d");
@@ -331,6 +349,40 @@ describe("liveIndex controller", () => {
     await vi.advanceTimersByTimeAsync(40);
     await Promise.resolve();
     expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    index.reset();
+  });
+
+  it("asks a status-only refresh when a repository becomes visible without a watcher event", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/repo", false);
+    expect(index.get("/repo").phase).toBe("skipped");
+    index.reset();
+  });
+
+  it("a watcher tick still reports repoChanged even when activation is also pending", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/repo", true);
+    index.reset();
+  });
+
+  it("activation never reports a dirty tree, including across a storm of focus changes", async () => {
+    const maybeRefresh = vi.fn(async (_repo: string, _repoChanged: boolean) => outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    for (let i = 0; i < 64; i++) {
+      index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+      index.setScope({ activeKey: "/other", retainedKeys: ["/other"], visible: true });
+    }
+    index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(maybeRefresh.mock.calls.length).toBeGreaterThan(0);
+    expect(maybeRefresh.mock.calls.every((call) => call[1] === false)).toBe(true);
     index.reset();
   });
 });

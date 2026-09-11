@@ -63,6 +63,14 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
       await wait(() => !!document.querySelector(".workspace-editor"));
       material(`${mode} workspace`, ".workspace-editor,.workspace-editor input:not([type=checkbox]),.workspace-editor textarea");
       floating(`${mode} workspace header`, ".workspace-editor > header");
+      const workspace = find(".workspace-editor");
+      const workspaceBody = find(".workspace-editor .sheet-body");
+      const workspaceSave = find(".workspace-editor footer");
+      workspaceBody.scrollTop = 200;
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      check(`${mode}: workspace header remains over scrolling content`, Math.abs(find(".workspace-editor > header").getBoundingClientRect().top - workspace.getBoundingClientRect().top) < 2);
+      check(`${mode}: workspace save bar stays in the sheet chrome`, Math.abs(workspaceSave.getBoundingClientRect().bottom - workspace.getBoundingClientRect().bottom) < 2);
+      check(`${mode}: workspace save bar is not an opaque slab`, alpha(getComputedStyle(workspaceSave).backgroundColor) < 1);
       click('[aria-label="Close workspace settings"]');
       await closed(".workspace-editor");
     }
@@ -80,9 +88,12 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     const editor = find(".task-editor");
     check(`${mode}: task revision attribute is present`, editor.hasAttribute("data-task-revision"));
     const body = find(".task-editor .sheet-body");
+    const saveBar = find(".task-editor > footer");
     body.scrollTop = 200;
     await new Promise(resolve => requestAnimationFrame(resolve));
     check(`${mode}: header remains over scrolling content`, Math.abs(find(".task-editor > header").getBoundingClientRect().top - editor.getBoundingClientRect().top) < 2);
+    check(`${mode}: save bar stays in the sheet chrome`, Math.abs(saveBar.getBoundingClientRect().bottom - editor.getBoundingClientRect().bottom) < 2);
+    check(`${mode}: save bar is not an opaque slab`, alpha(getComputedStyle(saveBar).backgroundColor) < 1);
     click('[aria-label="Close task details"]');
     await closed(".task-editor");
 

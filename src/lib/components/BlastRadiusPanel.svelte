@@ -6,7 +6,8 @@
    * plus unmatched_targets and walk_incomplete. No min_rung control: layered
    * impact cannot combine with a rung filter.
    */
-  import type { ComposedBlastRadius } from "../codeintel/blastCompose";
+  import { isCancelledReason, type ComposedBlastRadius } from "../codeintel/blastCompose";
+  import { boundedJoin, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
   import { Loader2 } from "@lucide/svelte";
 
   let {
@@ -40,8 +41,9 @@
     </div>
 
     {#if !blast.available}
-      <p class="text-[10px] text-amber-500">
-        Blast radius unavailable{blast.reason ? `: ${blast.reason}` : ""} — not the same as zero impact.
+      {@const reasonTitle = tooltipWalkIncomplete([blast.reason])}
+      <p class="min-w-0 line-clamp-3 text-[10px] text-amber-500" title={reasonTitle}>
+        Blast radius unavailable{reasonTitle ? `: ${reasonTitle}` : ""} — not the same as zero impact.
       </p>
     {:else}
       <ul class="flex flex-col gap-0.5">
@@ -57,7 +59,7 @@
               </span>
             {/if}
             {#if layer.nodes.length > 0}
-              <span class="min-w-0 truncate text-textMuted" title={layer.nodes.join(", ")}>
+              <span class="min-w-0 truncate text-textMuted" title={boundedJoin(layer.nodes, 8)}>
                 · {layer.nodes.slice(0, 3).join(", ")}{layer.nodes.length > 3 ? "…" : ""}
               </span>
             {/if}
@@ -70,19 +72,41 @@
     {/if}
 
     {#if blast.unmatched_targets.length > 0}
-      <p class="text-[10px] text-amber-500" title={blast.unmatched_targets.join(", ")}>
+      <p class="text-[10px] text-amber-500" title={boundedJoin(blast.unmatched_targets, 12)}>
         Unmatched seeds ({blast.unmatched_targets.length}): {blast.unmatched_targets.slice(0, 4).join(", ")}{blast.unmatched_targets.length > 4 ? "…" : ""}
       </p>
     {/if}
     {#if blast.walk_incomplete}
-      <p class="text-[10px] text-amber-500">Walk incomplete: {blast.walk_incomplete}</p>
+      {@const walkTitle = tooltipWalkIncomplete([blast.walk_incomplete])}
+      <p class="min-w-0 line-clamp-3 text-[10px] text-amber-500" title={walkTitle}>
+        Walk incomplete: {blast.walk_incomplete}
+      </p>
     {/if}
     {#if blast.layers_truncated}
       <p class="text-[10px] text-amber-500">Layer list truncated by token budget.</p>
     {/if}
-    {#if blast.unavailable_seeds.length > 0}
-      <p class="text-[10px] text-textMuted" title={blast.unavailable_seeds.map((s) => `${s.seed}: ${s.reason}`).join("\n")}>
-        {blast.unavailable_seeds.length} seed(s) refused layered impact
+    {#if blast.cancelled_seeds > 0}
+      <p
+        class="text-[10px] text-amber-500"
+        title={boundedJoin(
+          blast.unavailable_seeds.filter((s) => isCancelledReason(s.reason)).map((s) => s.seed),
+          12,
+        )}
+      >
+        {blast.cancelled_seeds} seed(s) cancelled before the walk finished — hops below are a partial answer, not an unindexed map.
+      </p>
+    {/if}
+    {#if blast.unavailable_seeds.length - blast.cancelled_seeds > 0}
+      <p
+        class="text-[10px] text-textMuted"
+        title={boundedJoin(
+          blast.unavailable_seeds
+            .filter((s) => !isCancelledReason(s.reason))
+            .map((s) => `${s.seed}: ${s.reason}`),
+          8,
+        )}
+      >
+        {blast.unavailable_seeds.length - blast.cancelled_seeds} seed(s) refused layered impact
       </p>
     {/if}
   </div>

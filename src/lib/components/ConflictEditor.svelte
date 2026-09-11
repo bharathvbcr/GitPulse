@@ -455,7 +455,7 @@
 </script>
 
 <svelte:window onkeydown={handleKeys} />
-<div class="resolve-page" bind:this={pageRoot}>
+<div class="resolve-page bg-background" bind:this={pageRoot}>
   <header class="page-heading">
     <div class="heading-copy">
       <span class="heading-icon"><GitMerge size={19} /></span>
@@ -566,7 +566,7 @@
             </div>
             <button class="text-action" disabled={isSaving || !draft?.undo.length} onclick={() => travel("undo")}>Undo</button>
             <button class="text-action" disabled={isSaving || !draft?.redo.length} onclick={() => travel("redo")}>Redo</button>
-            <details class="bulk-actions"><summary>Resolve all…</summary><div class="bulk-menu">
+            <details class="bulk-actions"><summary>Resolve all…</summary><div class="bulk-menu gp-menu">
               <p>Applies to unresolved blocks. Existing choices are preserved.</p>
               <button disabled={isSaving} onclick={() => resolveAll("AcceptOurs")}>Accept All Current (Ours)</button>
               <button disabled={isSaving} onclick={() => resolveAll("AcceptTheirs")}>Accept All Incoming (Theirs)</button>
@@ -624,7 +624,7 @@
 </div>
 
 <style>
-  .resolve-page { container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; background: rgb(var(--c-bg)); color: rgb(var(--c-text)); font-size: 12px; }
+  .resolve-page { container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; color: rgb(var(--c-text)); font-size: 12px; }
   .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px 16px; flex-shrink: 0; }
   .heading-copy { display: flex; align-items: center; gap: 12px; min-width: 0; }
   .heading-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .1); }
@@ -680,7 +680,7 @@
   .bulk-actions { margin-left: auto; position: relative; }
   summary { cursor: pointer; color: rgb(var(--c-text-muted)); font-size: 11px; }
   .bulk-actions > summary { padding: 5px 7px; border-radius: 6px; }
-  .bulk-menu { position: absolute; right: 0; top: 30px; z-index: 5; width: 230px; background: rgb(var(--c-surface)); border: 1px solid rgb(var(--c-border)); border-radius: 10px; padding: 7px; box-shadow: 0 10px 30px #0003; }
+  .bulk-menu { position: absolute; right: 0; top: 30px; z-index: 5; width: 230px; padding: 7px; }
   .bulk-menu p { margin: 5px 7px; font-size: 10px; color: rgb(var(--c-text-muted)); }
   .bulk-menu button { display: block; width: 100%; padding: 9px 7px; text-align: left; border-radius: 6px; font-size: 11px; }
   .editor-panes { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(260px, 1fr); flex: 1; min-height: 0; }
@@ -699,7 +699,7 @@
   .custom-resolution > summary, .base-context > summary { padding: 11px 12px; }
   .custom-resolution summary span { margin-left: 8px; font-size: 10px; opacity: .8; }
   .custom-body { padding: 0 12px 10px; }
-  textarea { width: 100%; resize: vertical; min-height: 78px; border: 1px solid rgb(var(--c-border) / .7); border-radius: 7px; background: rgb(var(--c-bg)); padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.7; user-select: text; }
+  textarea { width: 100%; resize: vertical; min-height: 78px; border: 1px solid rgb(var(--c-border) / .7); border-radius: 7px; background: var(--mac-fill-bg, rgb(var(--c-bg))); padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.7; user-select: text; }
   .custom-footer { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: center; gap: 6px; color: rgb(var(--c-text-muted)); font-size: 10px; margin-top: 5px; }
   .unchanged-context { margin: 0 0 14px; }
   .unchanged-context summary { padding: 5px 2px; font-size: 10px; }
@@ -734,7 +734,7 @@
   @container (max-width: 760px) {
     .file-rail { display: none; }
     .file-title { display: none; }
-    .mobile-file-select { display: block; min-width: 0; flex: 1; max-width: 100%; padding: 7px 24px 7px 9px; border: 1px solid rgb(var(--c-border) / .6); border-radius: 7px; background-color: rgb(var(--c-surface)); font-size: 11px; }
+    .mobile-file-select { display: block; min-width: 0; flex: 1; max-width: 100%; padding: 7px 24px 7px 9px; border: 1px solid rgb(var(--c-border) / .6); border-radius: 7px; background-color: var(--mac-fill-surface, rgb(var(--c-surface))); font-size: 11px; }
     .page-heading { padding: 14px; }
     .heading-copy p { display: none; }
     .heading-icon { width: 30px; height: 30px; }

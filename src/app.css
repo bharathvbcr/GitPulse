@@ -286,9 +286,16 @@
 @utility gp-field {
   /* Rounded input field. */
   @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 transition-colors duration-150;
+  /* WKWebView ignores `color` on form controls when the page is a transparent
+     window (macOSPrivateApi). The fill colour is what actually paints, so a
+     missing plate cannot revert typed text and placeholders to black. */
+  -webkit-text-fill-color: rgb(var(--c-text));
   &:focus {
     @apply outline-hidden border-accent/60;
     box-shadow: var(--ring-focus);
+  }
+  &::placeholder {
+    -webkit-text-fill-color: rgb(var(--c-text-muted) / 0.6);
   }
 }
 
@@ -325,6 +332,7 @@
    * back as a background chevron and room is reserved for it on the right.
    */
   @apply cursor-pointer truncate rounded-lg border border-border/70 bg-background py-0.5 pl-2 pr-6 text-textPrimary;
+  -webkit-text-fill-color: rgb(var(--c-text));
   appearance: none;
   background-image:
     linear-gradient(45deg, transparent 50%, rgb(var(--c-text-muted)) 50%),

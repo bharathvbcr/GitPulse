@@ -524,16 +524,19 @@ impl DiscoverySkipReason {
     /// pick — "not a refusal" — is the one that loses coverage silently.
     pub fn is_refusal(&self) -> bool {
         match self {
-            DiscoverySkipReason::NonSource => false,
-            DiscoverySkipReason::Oversized { .. }
-            | DiscoverySkipReason::NonUtf8Path
-            | DiscoverySkipReason::Unreadable { .. }
+            // NonSource: README, build cache, default index excludes.
+            // Oversized: past the 1 MiB ceiling. Charging every fixture /
+            // vendored grammar as coverage loss left repositories permanently
+            // `partial`; extraction can never succeed on these bytes, so they
+            // are an ordinary skip — not a hole in the graph.
+            DiscoverySkipReason::NonSource | DiscoverySkipReason::Oversized { .. } => false,
+            DiscoverySkipReason::NonUtf8Path | DiscoverySkipReason::Unreadable { .. } => true,
             // A refusal, not an ordinary pass-over: unlike a symlink to a file
             // inside the tree — which the walk reaches under its real name
             // anyway — nothing else in the graph accounts for these bytes. The
             // path was a source this indexer was pointed at and declined to
             // read, which is the definition on this side of the line.
-            | DiscoverySkipReason::EscapesRoot { .. } => true,
+            DiscoverySkipReason::EscapesRoot { .. } => true,
         }
     }
 
@@ -1031,7 +1034,149 @@ pub enum WiringKind {
     /// function a console script names stayed a dead-symbol candidate at the
     /// tier agents are told to act on.
     ConfigEntryPoint,
+    /// A file whose presence is what makes a *package* importable, rather than
+    /// something another file names: `__init__.py`, `package-info.java`, a
+    /// re-export barrel `index.ts`.
+    ///
+    /// Every `import pkg.sub` goes through `pkg/__init__.py`, and no import
+    /// statement anywhere names it. Measured on this repository: 35
+    /// `__init__.py` files were unwired candidates, because
+    /// `looks_like_reexport_init` clears only the re-export-*only* ones and an
+    /// empty or docstring-only marker is the commoner shape.
+    ///
+    /// A claim about the *file*, like [`WiringKind::TargetRoot`] and for the
+    /// same reason: the marker is reachable, and an unused helper somebody
+    /// tucked into it is exactly as dead as one anywhere else.
+    PackageMarker,
+    /// A file a toolchain reads because of what it is *called*.
+    ///
+    /// `vite.config.ts`, `noxfile.py`, `build.gradle.kts`, `Package.swift`,
+    /// `docs/conf.py`. Nothing in the repository imports one and nothing
+    /// should; the tool finds it by convention. Treated as an entry root
+    /// ([`crate::wiring::tool_config_reason`] names the tool for each), which
+    /// is what it is: execution starts there.
+    ToolConfig,
+    /// A TypeScript ambient declaration (`*.d.ts`).
+    ///
+    /// It is consulted by the compiler and never imported by path, so an
+    /// inbound-edge question about it has no answer. Distinct from
+    /// [`Self::ToolConfig`] because it is *not* an entry root — nothing
+    /// executes a declaration file — and reporting one as a place execution
+    /// starts is a claim `subsystem_map.is_entry_root` passes on to a reader.
+    AmbientDeclaration,
+    /// Test data, golden output, or an example: a file under `testdata/`,
+    /// `fixtures/`, `__snapshots__/`, `examples/` and their spellings.
+    ///
+    /// Treated as [`Self::TestFile`] is, for both the file and its symbols.
+    /// `is_test_path` does not know these directories — it is pinned equal to
+    /// the Python rule by a parity test — so 60 of this repository's 138
+    /// unwired candidates were `rust-port/testdata/**`.
+    Fixture,
+    /// The language's unit of use is the *directory*, and nothing in this build
+    /// resolves one.
+    ///
+    /// Derived from [`crate::languages::LivenessUnit`] rather than from a
+    /// source scan, which is why no rule in [`crate::wiring`] emits it: it is a
+    /// property of the language, and putting a second path-shaped rule beside
+    /// the table is how the two come to disagree about `.tf`.
+    DirectoryUnit,
 }
+
+/// Whether a file can be the subject of a liveness verdict at all, and if not,
+/// why not.
+///
+/// The single owner. Before it, three surfaces decided separately —
+/// `unwired_candidates` in `devmap-query`, `files_wholly_inside_clusters` in
+/// `devmap-analyze`, and `analyze_liveness` beside it — and the first of them
+/// decided by asking [`Extraction::grammar_read_this_file`], which answers
+/// *which engine ran*. The two questions coincided only because no grammar is
+/// linked for prose, and the code comment beside that gate admitted as much:
+/// the exclusion "predates the reason given for it". Link a YAML grammar and
+/// every `.yaml` in every repository becomes a delete-this suggestion again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLiveness {
+    /// Not code in the sense liveness means. It declares nothing that could be
+    /// stranded, so it is not in the population — neither reported, nor
+    /// charged against a coverage or capability gap.
+    NotCode { reason: &'static str },
+    /// Code, reached by something no import edge records.
+    Exempt {
+        kind: WiringKind,
+        /// What the annotation said, or what the language table says for a
+        /// [`WiringKind::DirectoryUnit`]. Carried so a reader can audit the
+        /// exemption rather than take it on trust.
+        reason: String,
+    },
+    /// A file whose absence from the import graph is a fact about the code.
+    Candidate,
+}
+
+impl FileLiveness {
+    /// The three-valued label the artifacts publish on a file node.
+    ///
+    /// `not_applicable` rather than `not_code`, because that is what the value
+    /// means to a reader of the picture: the question does not apply. A lone
+    /// config dot in the visualizer has to read as "data" and never as "dead".
+    pub fn label(&self) -> &'static str {
+        match self {
+            FileLiveness::NotCode { .. } => "not_applicable",
+            FileLiveness::Exempt { .. } => "exempt",
+            FileLiveness::Candidate => "candidate",
+        }
+    }
+
+    /// Whether a file-level finding may name this file.
+    pub fn is_candidate(&self) -> bool {
+        matches!(self, FileLiveness::Candidate)
+    }
+}
+
+/// Wiring kinds that clear a file from every *file-level* liveness verdict,
+/// **in precedence order**.
+///
+/// A strictly wider set than the symbol-level one in
+/// `devmap_analyze::analyze_liveness`, and the difference is load-bearing:
+/// [`WiringKind::TargetRoot`], [`WiringKind::ToolConfig`] and
+/// [`WiringKind::PackageMarker`] say the *file* is reached, and say nothing
+/// about an unused helper somebody left inside it.
+///
+/// The order is a decision, not the order the rules happen to run in. A file
+/// routinely earns several — `manage.py` is a Django entry point *and* has a
+/// `__main__` guard, a `__init__.py` full of re-exports is both a package
+/// marker and a re-export package, a vendored bundle is also a minified one —
+/// and exactly one of them is reported as the reason. Reading them in
+/// `Extraction::wiring` order would make that reason depend on the sequence of
+/// `push` calls in `extract_wiring_annotations`, so moving a rule up that
+/// function would silently change what every artifact says about a file.
+///
+/// The order is: the author's own declaration first, then whose code it is,
+/// then what it is for, then who runs it. Most specific wins within each
+/// group, which is the same rule `analyze_liveness` applies to its exemption
+/// reasons.
+///
+/// [`WiringKind::DynamicImport`] and [`WiringKind::ConfigEntryPoint`] are
+/// absent by construction rather than by omission: their `target_symbol` names
+/// something *else*, and the caller filters on `target_symbol == file_path`
+/// before consulting this list.
+const FILE_SCOPED_EXEMPT_KINDS: &[WiringKind] = &[
+    // An explicit human declaration outranks every static inference.
+    WiringKind::AllowUnwired,
+    // Whose code it is.
+    WiringKind::Vendored,
+    WiringKind::GeneratedFile,
+    // What it is for.
+    WiringKind::TestFile,
+    WiringKind::Fixture,
+    WiringKind::ReExportPackage,
+    WiringKind::PackageMarker,
+    WiringKind::ToolConfig,
+    WiringKind::AmbientDeclaration,
+    // Who runs it.
+    WiringKind::Launcher,
+    WiringKind::ScriptEntry,
+    WiringKind::TargetRoot,
+    WiringKind::FrameworkDecorator,
+];
 
 /// One `m(...)` entry of a `type X interface { ... }` declaration.
 ///
@@ -1243,6 +1388,72 @@ impl Extraction {
             self.parse_outcome,
             ParseOutcome::Clean | ParseOutcome::Partial { .. }
         )
+    }
+
+    /// Whether this file can be the subject of a liveness verdict, and if not,
+    /// why not. See [`FileLiveness`].
+    ///
+    /// Three questions in a fixed order, and the order is the rule:
+    ///
+    /// 1. **Does the path say it is data**, whatever grammar read it? A
+    ///    `.terraform.lock.hcl` parses as HCL and declares `provider` blocks;
+    ///    asking the engine gets the wrong answer with full confidence.
+    /// 2. **Does the language say it is data, or that the unit is a
+    ///    directory?** Read from [`crate::languages::LivenessUnit`], not from
+    ///    the engine — see that type for why the two are not the same question.
+    /// 3. **Does a file-scoped wiring annotation clear it?**
+    ///
+    /// Only annotations targeting *this file* are consulted.
+    /// [`WiringKind::DynamicImport`] records what this file reaches and
+    /// [`WiringKind::ConfigEntryPoint`] names a symbol in another file
+    /// entirely; reading either as a claim about the annotated file would
+    /// exempt every module that lazily imports anything.
+    pub fn file_liveness(&self) -> FileLiveness {
+        if let Some(reason) = crate::languages::non_code_path_reason(&self.file_path) {
+            return FileLiveness::NotCode { reason };
+        }
+        match crate::languages::liveness_unit_for_language(&self.language) {
+            crate::languages::LivenessUnit::Data => {
+                return FileLiveness::NotCode {
+                    // `expect` over a fallback string: `Data` is the one unit
+                    // that has a reason, and a silent default here would put a
+                    // blank cell in the published histogram.
+                    reason: crate::languages::LivenessUnit::Data
+                        .not_code_reason()
+                        .expect("the data unit declares a reason"),
+                };
+            }
+            crate::languages::LivenessUnit::Directory => {
+                return FileLiveness::Exempt {
+                    kind: WiringKind::DirectoryUnit,
+                    reason: format!(
+                        "`{}` is the unit of use for {}, and no statement names one file in it",
+                        self.file_path
+                            .replace('\\', "/")
+                            .rsplit_once('/')
+                            .map(|(directory, _)| directory.to_string())
+                            .unwrap_or_else(|| ".".to_string()),
+                        self.language
+                    ),
+                };
+            }
+            crate::languages::LivenessUnit::Module => {}
+        }
+        // By declared precedence, not by the order the rules happened to push.
+        // See [`FILE_SCOPED_EXEMPT_KINDS`].
+        for kind in FILE_SCOPED_EXEMPT_KINDS {
+            if let Some(annotation) = self
+                .wiring
+                .iter()
+                .find(|a| a.kind == *kind && a.target_symbol == self.file_path)
+            {
+                return FileLiveness::Exempt {
+                    kind: annotation.kind,
+                    reason: annotation.details.clone(),
+                };
+            }
+        }
+        FileLiveness::Candidate
     }
 
     /// What the extractor could observe **in this file**, as opposed to in a

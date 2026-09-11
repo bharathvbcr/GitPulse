@@ -27,7 +27,7 @@ use std::path::Path;
 
 use crate::artifacts::write_atomic;
 use crate::engine::{byte_span_to_line_range_in, resolve_source_path};
-use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
+use crate::manifest::{entry_root_paths, CONSUMER_MAP_ENGINE, UNWIRED_CANDIDATE_CAP};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
 use devmap_extract::languages::Capability;
@@ -303,6 +303,44 @@ pub(crate) struct UnwiredScan {
     /// file this run could not read and a re-index might, the other is a
     /// language this build cannot read imports for and no re-run will change.
     pub(crate) excluded_import_blind: usize,
+    /// Paths dropped by the import-blind gate, sorted.
+    ///
+    /// The count above is what a reader used to have, and a count of 61 with
+    /// no names is how "we excluded these files from unwired" came to read as
+    /// "there is no work". The list is the work: languages this build still
+    /// cannot see imports for, named, so they can be scheduled rather than
+    /// silently subtracted.
+    pub(crate) excluded_import_blind_paths: Vec<String>,
+    /// Files that were never in the population: prose, data, configuration,
+    /// lockfiles, environment files.
+    ///
+    /// Excluded before this work too, and by accident — the gate was
+    /// `Extraction::grammar_read_this_file()`, which answers *which engine
+    /// ran*. The two questions coincided only because no grammar is linked for
+    /// Markdown or YAML, and the comment beside that gate said so: the
+    /// exclusion "predates the reason given for it". They are excluded on
+    /// their own grounds now, by `Extraction::file_liveness()`, and counted
+    /// rather than dropped silently.
+    pub(crate) excluded_not_code: usize,
+    /// How many of each kind, keyed by the reason `FileLiveness::NotCode`
+    /// carries.
+    ///
+    /// A bare count cannot distinguish "this repository is mostly
+    /// documentation" from "a lockfile is being parsed as code", and those
+    /// have different remedies.
+    pub(crate) excluded_not_code_reasons: BTreeMap<&'static str, usize>,
+    /// Files that are code, reached by something no import edge records: an
+    /// entry root, a test, a fixture, a package marker, a tool config, an
+    /// ambient declaration, a vendored or generated file.
+    pub(crate) excluded_exempt: usize,
+    /// The subset of the above whose *language* puts the unit of use at the
+    /// directory: a Terraform `.tf` file.
+    ///
+    /// Counted apart because the remedy differs. Every other exemption is a
+    /// fact about one file that a reader could in principle argue with;
+    /// this one says no statement in the language could ever name the file,
+    /// so no amount of re-indexing will produce an answer.
+    pub(crate) excluded_directory_unit: usize,
 }
 
 /// Whether any dynamic reference in the corpus names this file.
@@ -483,6 +521,14 @@ pub(crate) fn unwired_candidates(
             }
             continue;
         }
+        // A Swift `import Kit` lands on `module:Kit`. That names the module,
+        // not every file in it: a sibling production never mentions is still
+        // unwired, the same way a Python module imported only by its test is.
+        // Skipping the node here keeps `is_wiring_evidence` edges (calls,
+        // type uses) as the file-level answer.
+        if edge.target_file.starts_with("module:") {
+            continue;
+        }
         depended_on_by_production.insert(edge.target_file.as_str());
     }
 
@@ -504,26 +550,51 @@ pub(crate) fn unwired_candidates(
 
     let mut excluded_coverage_loss = 0usize;
     let mut excluded_import_blind = 0usize;
+    let mut excluded_import_blind_paths: Vec<String> = Vec::new();
+    let mut excluded_not_code = 0usize;
+    let mut excluded_not_code_reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut excluded_exempt = 0usize;
+    let mut excluded_directory_unit = 0usize;
     let mut candidates: Vec<String> = extractions
         .iter()
         .filter(|ext| {
-            if is_entry_root(ext)
-                || ext.wiring.iter().any(|w| {
-                    matches!(
-                        w.kind,
-                        WiringKind::TestFile
-                            | WiringKind::Vendored
-                            | WiringKind::GeneratedFile
-                            | WiringKind::ReExportPackage
-                            | WiringKind::Launcher
-                            | WiringKind::AllowUnwired
-                    )
-                })
-                || depended_on_by_production.contains(ext.file_path.as_str())
+            // Wiring evidence first, and uncounted: a file something depends on
+            // is not *excluded* from the finding, it simply is not one.
+            if depended_on_by_production.contains(ext.file_path.as_str())
                 || file_is_in_imported_go_package(ext, &imported_go_packages)
                 || reached_dynamically(&ext.file_path, &dynamic_forms)
             {
                 return false;
+            }
+            // The one predicate that decides whether a file can be named by a
+            // file-level finding at all.
+            //
+            // This replaces three separate gates that stood here — an
+            // `is_entry_root` call, a hand-written list of wiring kinds, and
+            // `!ext.grammar_read_this_file()` — of which the third was
+            // answering a question about *which engine ran*. Prose was kept out
+            // of this list only because no grammar is linked for it, and the
+            // comment that used to sit here admitted the exclusion "predates
+            // the reason given for it": link a YAML grammar and every `.yaml`
+            // in every repository becomes a delete-this suggestion again.
+            //
+            // `dead_clusters::files_wholly_inside_clusters` and
+            // `analyze_liveness` ask the same function, so the three surfaces
+            // can no longer disagree about a README.
+            match ext.file_liveness() {
+                devmap_extract::model::FileLiveness::NotCode { reason } => {
+                    excluded_not_code += 1;
+                    *excluded_not_code_reasons.entry(reason).or_default() += 1;
+                    return false;
+                }
+                devmap_extract::model::FileLiveness::Exempt { kind, .. } => {
+                    excluded_exempt += 1;
+                    if kind == WiringKind::DirectoryUnit {
+                        excluded_directory_unit += 1;
+                    }
+                    return false;
+                }
+                devmap_extract::model::FileLiveness::Candidate => {}
             }
             // Counted only among files that would otherwise have been reported,
             // so the number answers "how much did this filter remove from the
@@ -533,26 +604,6 @@ pub(crate) fn unwired_candidates(
             if ext.is_parse_failure() || matches!(ext.parse_outcome, ParseOutcome::Fallback { .. })
             {
                 excluded_coverage_loss += 1;
-                return false;
-            }
-            // A file no grammar read is not a candidate for anything.
-            //
-            // Prose and data formats have no imports because they are prose,
-            // which is a different fact from a source language whose imports
-            // this build cannot read — and charging them to the capability
-            // counter below made `unwired_excluded_import_blind` disagree with
-            // `coverage_gaps.import_blind` by five times on this repository,
-            // 355 against 71, for one question with one answer.
-            //
-            // The exclusion itself is load-bearing and predates the reason
-            // given for it: before the capability gate landed, every `.md`,
-            // `.json` and `.yaml` in every repository was an unwired candidate,
-            // and the gate swept them up by accident. They are excluded here on
-            // their own grounds — nothing read them, they declare nothing to
-            // strand — and counted in neither number, exactly as
-            // `extraction_coverage` already keeps them out of both sides of its
-            // own ratio.
-            if !ext.grammar_read_this_file() {
                 return false;
             }
             // The kernel never looked for an import of this file, so its
@@ -567,6 +618,7 @@ pub(crate) fn unwired_candidates(
             // both holes is charged once, to the more specific of the two.
             if !ext.capabilities().contains(Capability::Imports) {
                 excluded_import_blind += 1;
+                excluded_import_blind_paths.push(ext.file_path.clone());
                 return false;
             }
             true
@@ -575,10 +627,16 @@ pub(crate) fn unwired_candidates(
         .collect();
     candidates.sort();
     candidates.dedup();
+    excluded_import_blind_paths.sort();
     UnwiredScan {
         paths: candidates,
         excluded_coverage_loss,
         excluded_import_blind,
+        excluded_import_blind_paths,
+        excluded_not_code,
+        excluded_not_code_reasons,
+        excluded_exempt,
+        excluded_directory_unit,
     }
 }
 
@@ -627,6 +685,16 @@ struct GraphProvenance {
     /// Files excluded because their language has no import extractor. See
     /// `UnwiredScan::excluded_import_blind`.
     unwired_excluded_import_blind: usize,
+    unwired_excluded_import_blind_files: Vec<String>,
+    /// Files that were never in the liveness population. See
+    /// `UnwiredScan::excluded_not_code`.
+    unwired_excluded_not_code: usize,
+    unwired_excluded_not_code_reasons: BTreeMap<&'static str, usize>,
+    /// Files that are code, reached by something no import edge records.
+    unwired_excluded_exempt: usize,
+    /// The subset of the above excluded because the language's unit of use is
+    /// the directory.
+    unwired_excluded_directory_unit: usize,
 }
 
 /// Render `code_graph.json` from a committed generation.
@@ -722,6 +790,13 @@ fn graph_core(
             .get(ext.file_path.as_str())
             .copied()
             .unwrap_or_default();
+        // Published on the file node so the picture can say what the lists
+        // already say. Every isolated config file becomes its own singleton
+        // community and is drawn as an unexplained lone dot; a reader who has
+        // been told the graph shows dead and unwired code reads a dot with no
+        // edges as one of those. It is neither, and the node now carries the
+        // reason.
+        let liveness = ext.file_liveness();
 
         let mut symbols: Vec<&ExtractedSymbol> = ext.symbols.iter().collect();
         symbols.sort_by(|left, right| {
@@ -770,6 +845,28 @@ fn graph_core(
                     "qualname".to_string(),
                     Value::String(relative_qualname(symbol, &ext.file_path)),
                 );
+            } else {
+                // In `extras` rather than as a top-level node key: `GraphNode`
+                // in `schema.py` is a pydantic model and `extras` is its
+                // free-form map, so this is additive for every consumer that
+                // predates it. A symbol node carries no liveness — the
+                // question is about files.
+                extras.insert(
+                    "liveness".to_string(),
+                    Value::String(liveness.label().to_string()),
+                );
+                let why = match &liveness {
+                    devmap_extract::model::FileLiveness::NotCode { reason } => {
+                        Some((*reason).to_string())
+                    }
+                    devmap_extract::model::FileLiveness::Exempt { kind, reason } => {
+                        Some(format!("{kind:?}: {reason}"))
+                    }
+                    devmap_extract::model::FileLiveness::Candidate => None,
+                };
+                if let Some(why) = why {
+                    extras.insert("liveness_reason".to_string(), Value::String(why));
+                }
             }
 
             let kind = node_kind_label(symbol.kind);
@@ -1017,6 +1114,11 @@ pub fn build_code_graph_value(
     let unwired = unwired_candidates(extractions, edges);
     provenance.unwired_excluded_coverage_loss = unwired.excluded_coverage_loss;
     provenance.unwired_excluded_import_blind = unwired.excluded_import_blind;
+    provenance.unwired_excluded_import_blind_files = unwired.excluded_import_blind_paths;
+    provenance.unwired_excluded_not_code = unwired.excluded_not_code;
+    provenance.unwired_excluded_not_code_reasons = unwired.excluded_not_code_reasons;
+    provenance.unwired_excluded_exempt = unwired.excluded_exempt;
+    provenance.unwired_excluded_directory_unit = unwired.excluded_directory_unit;
 
     let analysis_status = match &analysis.status {
         AnalysisStatus::Ok => "ok".to_string(),
@@ -1213,6 +1315,30 @@ pub fn build_code_graph_value(
                 // Reported beside it rather than summed into it: a re-index can
                 // fix the first number and can never fix this one.
                 "unwired_excluded_import_blind": provenance.unwired_excluded_import_blind,
+                // Files that were never in the population, and files that are
+                // code something outside the import graph reaches. Both were
+                // excluded before and neither was counted, so an empty
+                // `unwired_candidates` list could not be told from a filter
+                // that had swallowed the repository.
+                //
+                // The reason histogram is what makes the first number
+                // actionable: "412 data files" is a repository that is mostly
+                // documentation, and "412 lockfiles" is a bug.
+                "unwired_excluded_not_code": provenance.unwired_excluded_not_code,
+                "unwired_excluded_not_code_reasons": provenance
+                    .unwired_excluded_not_code_reasons
+                    .iter()
+                    .map(|(reason, count)| (reason.to_string(), json!(count)))
+                    .collect::<Map<String, Value>>(),
+                "unwired_excluded_exempt": provenance.unwired_excluded_exempt,
+                // A sub-count of the line above, not a peer of it.
+                "unwired_excluded_directory_unit": provenance.unwired_excluded_directory_unit,
+                "unwired_excluded_import_blind_files": provenance
+                    .unwired_excluded_import_blind_files
+                    .iter()
+                    .take(UNWIRED_CANDIDATE_CAP)
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 // Provenance for the intel panels above. `god_nodes: []` from
                 // a pass that ran and `god_nodes: []` from a pass that never
                 // happened were the same bytes for the whole life of the

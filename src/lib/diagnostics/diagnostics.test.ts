@@ -11,6 +11,7 @@ import {
   installGlobalDiagnostics,
   diagnosticFingerprint,
   isHostRuntimeNoise,
+  isBrowserObserverNoise,
   redactDiagnosticText,
   isSecretFieldName,
   normalizeFieldName,
@@ -413,6 +414,51 @@ describe("createDiagnostics", () => {
     ]);
   });
 
+  it("drops a persisted Chromium observer dump without dropping runtime observer errors", () => {
+    const exact = "ResizeObserver loop completed with undelivered notifications.";
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        {
+          id: 4,
+          at: 4,
+          severity: "error",
+          source: "uncaught-error",
+          message: exact,
+          count: 1,
+        },
+        {
+          id: 3,
+          at: 3,
+          severity: "warning",
+          source: "browser-resize-observer",
+          message: "ResizeObserver loop limit exceeded",
+          count: 8,
+        },
+        {
+          id: 2,
+          at: 2,
+          severity: "error",
+          source: "uncaught-error",
+          message: `TypeError: ${exact}`,
+          count: 1,
+        },
+        {
+          id: 1,
+          at: 1,
+          severity: "error",
+          source: "runtime",
+          message: exact,
+          count: 1,
+        },
+      ]),
+    });
+    const store = createDiagnostics({ storage, development: false });
+    expect(get(store).map((entry) => ({ source: entry.source, message: entry.message }))).toEqual([
+      { source: "uncaught-error", message: `TypeError: ${exact}` },
+      { source: "runtime", message: exact },
+    ]);
+  });
+
   it("compacts consecutive fingerprint matches already in the persisted blob", () => {
     // Live coalescing only folds the head, and only after fingerprint masking
     // exists. Overnight UI-timer warnings written before that masking stay as
@@ -428,7 +474,7 @@ describe("createDiagnostics", () => {
           source: "coverage",
           message: "Coverage command failed (exit 4)",
           count: 1,
-          version: "0.1.0",
+          version: APP_VERSION,
           buildId: "current",
         },
         {
@@ -438,7 +484,7 @@ describe("createDiagnostics", () => {
           source: "performance:ui",
           message: ui(22, 629),
           count: 1,
-          version: "0.1.0",
+          version: APP_VERSION,
           buildId: "old",
         },
         {
@@ -448,7 +494,7 @@ describe("createDiagnostics", () => {
           source: "performance:ui",
           message: ui(31, 684),
           count: 1,
-          version: "0.1.0",
+          version: APP_VERSION,
           buildId: "old",
         },
         {
@@ -458,7 +504,7 @@ describe("createDiagnostics", () => {
           source: "performance:ui",
           message: ui(30, 652),
           count: 1,
-          version: "0.1.0",
+          version: APP_VERSION,
           buildId: "old",
         },
       ]),
@@ -482,19 +528,19 @@ describe("createDiagnostics", () => {
       [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
         {
           id: 4, at: 4, severity: "warning", source: "performance:ui",
-          message: ui(629), count: 1, version: "0.1.0", buildId: "a",
+          message: ui(629), count: 1, version: APP_VERSION, buildId: "a",
         },
         {
           id: 3, at: 3, severity: "warning", source: "performance:ui",
-          message: ui(684), count: 1, version: "0.1.0", buildId: "b",
+          message: ui(684), count: 1, version: APP_VERSION, buildId: "b",
         },
         {
           id: 2, at: 2, severity: "warning", source: "console",
-          message: "unrelated", count: 1, version: "0.1.0", buildId: "a",
+          message: "unrelated", count: 1, version: APP_VERSION, buildId: "a",
         },
         {
           id: 1, at: 1, severity: "warning", source: "performance:ui",
-          message: ui(652), count: 1, version: "0.1.0", buildId: "a",
+          message: ui(652), count: 1, version: APP_VERSION, buildId: "a",
         },
       ]),
     });
@@ -523,6 +569,48 @@ describe("isHostRuntimeNoise", () => {
     ];
     for (const message of keep) {
       expect(isHostRuntimeNoise(message), message).toBe(false);
+    }
+  });
+
+  it("does not classify ResizeObserver loop messages as host-runtime noise", () => {
+    expect(isHostRuntimeNoise("ResizeObserver loop limit exceeded", false)).toBe(false);
+    expect(
+      isHostRuntimeNoise(
+        "ResizeObserver loop completed with undelivered notifications.",
+        false,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("isBrowserObserverNoise", () => {
+  it("matches only the browser delivery-limit spellings", () => {
+    const noise = [
+      "ResizeObserver loop completed with undelivered notifications.",
+      "ResizeObserver loop limit exceeded",
+      "  ResizeObserver loop completed with undelivered notifications.  ",
+      "ResizeObserver loop completed with undelivered notifications",
+    ];
+    for (const message of noise) {
+      expect(isBrowserObserverNoise(message), message).toBe(true);
+    }
+  });
+
+  it("does not swallow application errors that mention observers or loops", () => {
+    const keep = [
+      "Uncaught Error: ResizeObserver loop completed with undelivered notifications.",
+      "Uncaught Error: ResizeObserver loop limit exceeded",
+      "Error: ResizeObserver loop completed with undelivered notifications.",
+      "syntax goop",
+      "observer callback threw",
+      "loop completed with a panic",
+      "ResizeObserver is not defined",
+      "MutationObserver loop",
+      "Application failed: ResizeObserver loop limit exceeded",
+      "ResizeObserver loop limit exceeded: callback crashed",
+    ];
+    for (const message of keep) {
+      expect(isBrowserObserverNoise(message), message).toBe(false);
     }
   });
 });
@@ -578,7 +666,7 @@ describe("formatDiagnosticTime", () => {
 });
 
 describe("installGlobalDiagnostics", () => {
-  type FailureEvent = { reason?: unknown; error?: unknown; message?: unknown };
+  type FailureEvent = { reason?: unknown; error?: unknown; message?: unknown; filename?: unknown; lineno?: unknown; colno?: unknown };
   interface FakeTarget {
     addEventListener(type: string, listener: (event: FailureEvent) => void): void;
     removeEventListener(type: string, listener: (event: FailureEvent) => void): void;
@@ -647,6 +735,144 @@ describe("installGlobalDiagnostics", () => {
     expect(recorded[0].message).toContain("promise died");
     expect(recorded[1].message).toBe("syntax goop");
     expect(recorded[2].message).toContain("typed badly");
+    uninstall();
+  });
+
+  it("does not record ResizeObserver loop window errors as uncaught failures", () => {
+    const { recorded, originalError, target, uninstall } = setup();
+    const exact = "ResizeObserver loop completed with undelivered notifications.";
+    target.emit("error", { message: exact });
+    target.emit("error", { message: "ResizeObserver loop limit exceeded" });
+    // Chromium/WKWebView ErrorEvent often carries both the spec message and an
+    // Error whose .message is the same exact text (dump source: uncaught-error).
+    target.emit("error", { message: exact, error: new Error(exact) });
+    target.emit("error", { error: new Error(exact), filename: "", lineno: 0, colno: 0 });
+    target.emit("error", { error: exact });
+    target.emit("error", {
+      message: `Uncaught Error: ${exact}`,
+      error: new Error(exact),
+    });
+    // Chromium stamps the document URL into filename with lineno/colno 0 and
+    // leaves error null — verified against a genuine observer-loop fixture.
+    target.emit("error", {
+      message: exact,
+      filename: "http://127.0.0.1:58430/harness/diagnostics.html?check=1",
+      lineno: 0,
+      colno: 0,
+      error: null,
+    });
+    target.emit("error", {
+      message: "Uncaught Error: ResizeObserver loop limit exceeded",
+    });
+    target.emit("error", { message: "syntax goop" });
+    expect(recorded.map((entry) => entry.source)).toEqual([
+      "browser-resize-observer",
+      "browser-resize-observer",
+      "browser-resize-observer",
+      "browser-resize-observer",
+      "browser-resize-observer",
+      "browser-resize-observer",
+      "browser-resize-observer",
+      "uncaught-error",
+      "uncaught-error",
+    ]);
+    expect(recorded[7].message).toBe("Uncaught Error: ResizeObserver loop limit exceeded");
+    expect(recorded[8].message).toBe("syntax goop");
+    expect(originalError).toHaveBeenCalledTimes(2);
+    expect(originalError).toHaveBeenCalledWith("[gitpulse] uncaught error: syntax goop");
+    uninstall();
+  });
+
+  it("retains exceptions and near-matches mentioning browser resize notifications", () => {
+    const { recorded, target, con, uninstall } = setup();
+    const message = "ResizeObserver loop limit exceeded";
+    const events = [
+      { message: `Application failed: ${message}` },
+      { message: `${message}: callback crashed` },
+      { message, error: new TypeError(message) },
+      { message, filename: "app.js" },
+      { message, lineno: 12 },
+      { message, colno: 3 },
+      { message: `${message}\nTypeError at render` },
+    ];
+    for (const event of events) target.emit("error", event);
+    target.emit("unhandledrejection", { reason: message });
+    con.error(message);
+    expect(recorded).toHaveLength(events.length + 2);
+    expect(recorded.every(entry => entry.severity === "error")).toBe(true);
+    expect(recorded.map(entry => entry.source)).toEqual([
+      "uncaught-error",
+      "uncaught-error",
+      "uncaught-error",
+      "uncaught-error",
+      "uncaught-error",
+      "uncaught-error",
+      "uncaught-error",
+      "unhandled-rejection",
+      "console",
+    ]);
+    uninstall();
+  });
+
+  it("counts 10000 browser notifications without persistence or losing later failures", () => {
+    const storage = { getItem: () => null, setItem: vi.fn(), removeItem: vi.fn() };
+    const store = createDiagnostics({ storage, development: false });
+    const target = makeTarget();
+    const con = { error: vi.fn(), warn: vi.fn() };
+    const uninstall = installGlobalDiagnostics(store, { target, console: con });
+    const exact = "ResizeObserver loop completed with undelivered notifications.";
+    const limit = "ResizeObserver loop limit exceeded";
+    for (let i = 0; i < 10_000; i++) {
+      const message = i % 2 ? limit : exact;
+      if (i % 3 === 0) {
+        target.emit("error", { message, error: new Error(message), filename: "", lineno: 0, colno: 0 });
+      } else if (i % 3 === 1) {
+        target.emit("error", { message: `Uncaught Error: ${message}`, error: new Error(message) });
+      } else {
+        target.emit("error", { message });
+      }
+    }
+    expect(get(store.health).suppressedRuntimeEvents).toBe(10_000);
+    expect(get(store)).toEqual([]);
+    expect(storage.setItem).not.toHaveBeenCalled();
+    target.emit("error", { message: "real failure after storm" });
+    expect(get(store)[0].message).toBe("real failure after storm");
+    expect(get(store)[0].severity).toBe("error");
+    expect(storage.setItem).toHaveBeenCalledTimes(1);
+    uninstall();
+    target.emit("error", { message: limit, error: new Error(limit) });
+    expect(get(store.health).suppressedRuntimeEvents).toBe(10_000);
+    expect(get(store)).toHaveLength(1);
+  });
+
+  it("does not persist an uncaught-error dump of the exact observer text", () => {
+    const storage = { getItem: () => null, setItem: vi.fn(), removeItem: vi.fn() };
+    const store = createDiagnostics({ storage, development: false });
+    const exact = "ResizeObserver loop completed with undelivered notifications.";
+    store.error("uncaught-error", exact);
+    expect(get(store)).toEqual([]);
+    expect(get(store.health).suppressedRuntimeEvents).toBe(1);
+    expect(storage.setItem).not.toHaveBeenCalled();
+    store.error("uncaught-error", `Uncaught Error: ${exact}`);
+    store.error("uncaught-error", new TypeError(exact));
+    expect(get(store)).toHaveLength(2);
+    expect(get(store).every(entry => entry.severity === "error")).toBe(true);
+    expect(get(store.health).suppressedRuntimeEvents).toBe(1);
+  });
+
+  it("still persists a script-located observer ErrorEvent as an uncaught error", () => {
+    const storage = { getItem: () => null, setItem: vi.fn(), removeItem: vi.fn() };
+    const store = createDiagnostics({ storage, development: false });
+    const target = makeTarget();
+    const uninstall = installGlobalDiagnostics(store, { target, console: { error: vi.fn(), warn: vi.fn() } });
+    const exact = "ResizeObserver loop completed with undelivered notifications.";
+    target.emit("error", { message: exact, filename: "app.js", lineno: 0, colno: 0 });
+    target.emit("error", { message: exact, error: new Error(exact), lineno: 12 });
+    expect(get(store)).toHaveLength(2);
+    expect(get(store).every((entry) => entry.source === "uncaught-error" && entry.severity === "error")).toBe(true);
+    expect(get(store).some((entry) => entry.message.includes("app.js"))).toBe(true);
+    expect(get(store).some((entry) => entry.message.includes(":12:"))).toBe(true);
+    expect(storage.setItem).toHaveBeenCalled();
     uninstall();
   });
 

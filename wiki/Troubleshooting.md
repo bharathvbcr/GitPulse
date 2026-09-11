@@ -39,7 +39,7 @@ Same honesty rule. Click the cell to scan that repository for that column. A tot
 
 ## Code map / Map panel says unavailable
 
-DevMap answers from `.devcouncil/codeintel/devmap.sqlite` (store schema **19**). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
+DevMap answers from the store resolved by `devmap paths --json` (store schema **20**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
 
 Use **Code → Map → Copy DevMap logs** to copy the current Map status, binary
 lookup, build/background-refresh state, visible errors, and recent DevMap entries

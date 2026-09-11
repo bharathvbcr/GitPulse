@@ -2,7 +2,7 @@
 
 **Canonical owner:** Manvi — `crates/dc-store/src/schema.rs` owns the DDL.
 **Store location:** `.devcouncil/state.sqlite`, per repository.
-**Consumers:** DevCouncil (Python, SQLModel), GitPulse (links `dc-store` directly).
+**Consumers:** DevCouncil and Manvi (`dc-store`), GitPulse (links `dc-store` directly).
 
 This document describes the tables as *implemented*, not as intended. Where a
 consumer's model disagrees with what follows, `schema.rs` wins and the consumer
@@ -116,9 +116,8 @@ like one that holds.
 ### Timestamps are strings, and `expires_at` may be NULL
 
 `created_at`, `expires_at` and `released_at` are `VARCHAR`, not SQLite date
-types, because the Python writer stores ISO-8601 strings. Compare them as
-strings only in UTC ISO-8601 form, where lexical order matches chronological
-order; parse before comparing anything else.
+types. Compare them as strings only in UTC ISO-8601 form, where lexical
+order matches chronological order; parse before comparing anything else.
 
 A NULL `expires_at` means **this lease does not expire**, not "expired" and not
 "unknown". A consumer computing "safe to reclaim" from lease expiry must treat
@@ -131,8 +130,7 @@ release.
 
 | Process | Access |
 |---|---|
-| DevCouncil (Python/SQLModel) | read + write |
-| Manvi (`dc-store`) | read + write |
+| DevCouncil / Manvi (`dc-store`) | read + write |
 | **GitPulse** | **read only** |
 
 GitPulse links `dc-store` to *read* leases and planned files. It must never
@@ -141,5 +139,4 @@ never acquire or release a lease: those contend with an active agent's writer
 lease. A UI process that takes a lease can strand a task when the window
 closes.
 
-Migrations are owned by `dc-store`. The Python side is a consumer of the
-schema, not a co-owner of it; new columns land in `schema.rs` first.
+Migrations are owned by `dc-store`. New columns land in `schema.rs` first.

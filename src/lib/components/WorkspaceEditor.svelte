@@ -67,6 +67,7 @@
 <aside class="workspace-editor gp-glass bg-surface" aria-label="Workspace settings">
   <header class="gp-glass shadow-float"><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={close} disabled={saving || adding || confirming || pending !== null} type="button" aria-label="Close workspace settings">✕</button></header>
   <form onsubmit={(e) => { e.preventDefault(); void save(); }}>
+    <div class="sheet-body">
     <fieldset disabled={saving || adding || confirming || pending !== null}>
       <label>Name<input class="gp-field" bind:value={draft.name} required maxlength="300" /></label>
       <label>Description<textarea class="gp-field" bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
@@ -89,11 +90,10 @@
     </fieldset>
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#if pending}<p>Retry this save to reconcile the uncertain result.</p>{/if}
+    </div>
     <footer><button disabled={saving || adding} class="gp-btn-primary" type="submit">{saving ? "Saving…" : pending ? "Retry save" : "Save workspace"}</button>{#if value}<button type="button" class="gp-btn-danger" onclick={remove} disabled={saving || adding || pending !== null}>Delete workspace</button>{/if}</footer>
   </form>
 </aside>
 <style>
-  form{padding:0 18px 18px}
-
-  .workspace-editor{width:min(380px,45vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:0;overflow:auto;font-size:12px}header{position:sticky;top:0;z-index:1;padding:16px 18px;display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
+  .workspace-editor{width:min(380px,45vw);flex-shrink:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:0;overflow:hidden;font-size:12px;display:flex;flex-direction:column}form{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}.sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}header{padding:16px 18px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
 </style>

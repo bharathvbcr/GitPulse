@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gitpulse": {
+      "command": "gitpulse-mcp",
+      "args": [],
+      "type": "stdio"
+    }
+  }
+}

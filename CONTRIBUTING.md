@@ -66,8 +66,8 @@ npm run tauri dev
 From each checkout, run `devmap paths --json` and `devmap status --json`, then
 read the resolved `repo_map`. If the store or map is missing, run
 `devmap build --manifest` in that worktree and check status again. Generated
-state is not carried by Git. Follow [AGENTS.md](AGENTS.md) for DevMap and
-GitNexus navigation, impact and change checks; partial graph results do not
+state is not carried by Git. Follow [AGENTS.md](AGENTS.md) for DevMap
+navigation, impact and change checks; partial graph results do not
 replace the required verification.
 
 ---
@@ -177,10 +177,10 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` (TypeScript 6 compatibility API for Svelte) and stable TypeScript 7 `tsc` type validation on `tsconfig.node.json` |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (205 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (206 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `npm run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 54 contracts (989 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 54 contracts (998 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `npm run mcp:install` | Installs `gitpulse-mcp` onto PATH via `cargo install`, so the binary agent clients spawn is tracked and refreshable rather than a hand-placed copy |
 | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asserts it reports this tree's version. Distinguishes *absent*, *unresponsive*, and *stale* from *matching* — a missing server must never read the same as a current one. Not in `ci:local`: CI does not install the server, and a check that cannot run must not look like one that passed |
@@ -190,6 +190,8 @@ flowchart TD
 | `npm run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
+
+For the DevMap watcher/diagnostics boundary, run `npm test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `npm run test:browser` and `npm run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in `docs/DEVMAP_AUDIT.md`.
 
 ### Contracts enforced by tests rather than scripts
 
@@ -237,7 +239,7 @@ several were added after the drift had already happened.
 | `health-failure-codes-contract` | The Health view saying "Local audit incomplete" and naming no cause. `audit_is_complete` in `analyzer/deps.rs` disqualifies a scan on a fixed list of failure issue codes, and the frontend maps the same codes to scanner names so it can say WHICH audit failed — two hand-kept copies of one list, where drift is silent: a newly added scanner would clear `audit_complete` while the UI stayed mute about it. The Rust array is parsed from source rather than restated. |
 | `cli-help-contract`, `cli-json-contract` | A script entry point losing `--help` or `--json`, or their exit codes diverging. |
 | `release-workflow` | Release preflight losing a gate, or the release body reverting to a literal block. |
-| `agent-guidance` | Both agent guides expose DevMap before the generated GitNexus block and state how to handle unavailable or truncated results. |
+| `agent-guidance` | Both guides give DevMap precedence, omit generated GitNexus rule blocks, and link five installed DevMap skills; Git ignore rules preserve those skills and the plugin marketplace while excluding local agent state. |
 | `devmap-html` | Embedded DevMap HTML retains keyboard, filtering, focus, and offline behavior. |
 | `vendor-crates-isolated` | Scoped and atomic vendoring, bounded manifest reads, and sibling discovery from linked worktrees. |
 | `version-source-contract` | The app version being retyped anywhere outside a manifest. `codex-plugin-contract` asserted `manifest.version === "0.0.5"` against the real tree: correct the day it was written, which is why it passed review, and broken by the next `chore(release)` bump. The silent half is worse — `release-notes.test.ts` went on calling an 0.0.5 section "the current" one and passing. A hardcoded version is only catchable at the moment it is typed, because at that moment it equals `package.json`'s; the scan therefore looks for the *current* version across `scripts/`, `src/`, `src-tauri/src/` and `.github/`, and points you at `appVersion()`. It also runs `check-release-version.mjs`'s own discovery against this repository — every one of that script's tests builds a synthetic scratch tree, so the gate that stops a mismatched release had no coverage over the tree it gates. |
@@ -266,7 +268,7 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (205 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (206 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health

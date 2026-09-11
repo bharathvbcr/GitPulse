@@ -22,6 +22,7 @@
     formatCap,
     preferredDeadLists,
     roleSample,
+    unwiredExclusionSummary,
   } from "../codeintel/repoMap";
   import type {
     DevmapCliStatus,
@@ -990,10 +991,9 @@
                   {/each}
                 </ul>
               {/if}
-              {#if doc.liveness_meta.unwired.excluded_coverage_loss > 0 || doc.liveness_meta.unwired.excluded_import_blind > 0}
+              {#if unwiredExclusionSummary(doc.liveness_meta.unwired).length > 0}
                 <p class="mt-1 text-[10px] text-textMuted">
-                  Excluded: coverage loss {doc.liveness_meta.unwired.excluded_coverage_loss},
-                  import-blind {doc.liveness_meta.unwired.excluded_import_blind}
+                  Excluded: {unwiredExclusionSummary(doc.liveness_meta.unwired).join(", ")}
                 </p>
               {/if}
             </div>

@@ -177,6 +177,7 @@ describe("ManviHarnessPane capability truth", () => {
         transcripts: 1,
         skipped_lines: 0,
         reflog_entries: 1,
+        truncated: false,
         error: "",
       }),
     ).toEqual(
@@ -195,6 +196,7 @@ describe("ManviHarnessPane capability truth", () => {
           transcripts: 0,
           skipped_lines: 4,
           reflog_entries: 0,
+          truncated: false,
           error: "transcript unreadable",
         },
       ),

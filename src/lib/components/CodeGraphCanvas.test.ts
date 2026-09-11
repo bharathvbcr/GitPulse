@@ -25,8 +25,19 @@ describe("CodeGraphCanvas", () => {
     expect(source).toContain("paintCodeGraph");
     expect(source).toContain("acquireGpu2dContext");
     expect(source).toContain("createFrameScheduler");
+    expect(source).toContain("observeResize");
     expect(source).not.toMatch(/from ["'].*\/GraphRenderer["']/);
     expect(source).not.toContain("VisualCommitRow");
+  });
+
+  it("lets the shared material system paint the pane instead of covering it with an opaque hex plate", () => {
+    const rule = source.match(/\.code-map\s*\{([^}]*)\}/)?.[1];
+    expect(rule, "missing .code-map rule").toBeDefined();
+    expect(rule, ".code-map covers the shared material").not.toMatch(
+      /(?:^|;)\s*background(?:-color)?:/,
+    );
+    expect(source).not.toMatch(/\.code-map\.light\s*\{[^}]*background(?:-color)?:/);
+    expect(source).toContain('class="code-map bg-background');
   });
 
   it("offers accessible search and keyboard navigation without compiler warnings", () => {

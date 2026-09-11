@@ -47,7 +47,10 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 pub use gomod::{collect_go_modules, git_worktree_root, parse_go_mod, GoModule};
-pub use languages::{declared_language_ids, detect_language, is_ignored_path, is_indexable_source};
+pub use languages::{
+    declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
+    is_indexable_source, DEFAULT_INDEX_EXCLUDE_PREFIXES, INDEX_EXCLUDES_ENV,
+};
 pub use model::*;
 pub use paths::{
     code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,

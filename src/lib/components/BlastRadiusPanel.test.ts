@@ -13,6 +13,14 @@ describe("BlastRadiusPanel", () => {
     expect(blast).toContain("nodes_omitted");
     expect(blast).toContain("unmatched_targets");
     expect(blast).toContain("walk_incomplete");
+    expect(blast).toContain("line-clamp-3");
+    expect(blast).toContain("tooltipWalkIncomplete");
+    expect(blast).toContain("boundedJoin(layer.nodes");
+    expect(blast).toContain("cancelled_seeds");
+    expect(blast).toContain("isCancelledReason");
+    expect(blast).toContain("partial answer");
+    expect(blast).not.toContain("title={blast.walk_incomplete}");
+    expect(blast).not.toContain("title={layer.nodes.join");
     expect(blast).not.toContain("minRung");
     expect(blast).not.toContain("RungFilter");
   });

@@ -763,7 +763,7 @@
       <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></div>
       <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
       {#each [...visibleWorkspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
-        <div class="nav-row"><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        <div class="nav-row"><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</span></button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
       {/each}
       {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
       {#if workspaces.some((group) => group.archived)}
@@ -1138,7 +1138,7 @@
   .tab-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
   .tab-pip{width:6px;height:6px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
   .tab-close{width:18px;height:18px;padding:0;border:0;background:transparent;color:rgb(var(--c-text-muted));display:inline-flex;align-items:center;justify-content:center;border-radius:5px;flex-shrink:0}
-  .tab-close:hover{color:#e11d48;background:rgb(var(--c-surface-hover))}
+  .tab-close:hover{color:#e11d48;background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)))}
   .task-panel{flex:1;min-height:0;display:flex}
   .task-panel :global(.task-editor){flex:1}
   .card h3,.row-title{font-size:12px;line-height:1.4;font-weight:550;margin:0;overflow-wrap:anywhere;min-width:0}

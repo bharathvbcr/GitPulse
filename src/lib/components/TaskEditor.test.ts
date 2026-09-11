@@ -14,6 +14,16 @@ describe("TaskEditor", () => {
     expect(source).toContain("data-task-revision={current?.revision");
   });
 
+  it("keeps Save task in unpainted sheet chrome so glass cannot composite a black bar", () => {
+    const footer = source.slice(source.indexOf("<style>")).match(/(?:^|})\s*footer\{([^}]*)\}/)?.[1];
+    expect(footer).toBeDefined();
+    expect(footer).toContain("flex-shrink:0");
+    expect(footer).not.toContain("position:sticky");
+    expect(footer).not.toMatch(/background(?:-color)?:/);
+    expect(source).toContain('form="task-editor-form-{id}"');
+    expect(source).toMatch(/\{#if current\}<TaskRuns[\s\S]*?<\/div>\s*<footer>/);
+  });
+
   it("guards dispose, reload confirm, and enhancement-busy shortcuts", () => {
     expect(source).toContain("if (disposed) return");
     expect(source).toMatch(/confirming = true[\s\S]*askConfirm\(\{title: "Reload saved task\?/);

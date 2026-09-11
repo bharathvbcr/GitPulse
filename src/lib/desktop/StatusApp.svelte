@@ -4,8 +4,8 @@
   import { listen } from "@tauri-apps/api/event";
   import StatusPopover from "./StatusPopover.svelte";
   import type { MenuState } from "./menuState";
-  import { createMenuSync } from "./menuSync";
   import { createStatusConnection } from "./statusConnection";
+  import { mountStatusResize } from "./statusResize";
   import { isMacOS, isTauri } from "../platform";
   import { formatError } from "../ui/formatError";
   let snapshot = $state<MenuState | null>(null);
@@ -35,11 +35,16 @@
   onMount(() => {
     if (!isTauri()) { error = "Open this panel from the GitPulse menu bar icon."; return; }
     void connection.connect();
-    const resize = createMenuSync<number>((height) => invoke("cmd_resize_status", { height }),
-      (cause) => { if (!disposed) error = formatError(cause); });
-    const observer = new ResizeObserver(() => resize.update(Math.min(640, Math.max(100, Math.ceil(host.getBoundingClientRect().height)))));
-    observer.observe(host);
-    return () => { disposed = true; connection.dispose(); observer.disconnect(); resize.dispose(); };
+    const stopResize = mountStatusResize(host, {
+      send: (height) => invoke("cmd_resize_status", { height }),
+      failed: (cause) => { if (!disposed) error = formatError(cause); },
+      isDisposed: () => disposed,
+    });
+    return () => {
+      disposed = true;
+      connection.dispose();
+      stopResize();
+    };
   });
 </script>
 <div bind:this={host}><StatusPopover {snapshot} {error} {pending}

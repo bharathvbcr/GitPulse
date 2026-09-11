@@ -4,6 +4,12 @@
   import { activeSectionFor, sectionsFor, VIEW_REGISTRY } from "../views/viewRegistry";
   import { destinationGuide, tipGuideDescId, tipGuideKey } from "../views/viewGuide";
   import { focusTabAt, handleTablistKeydown, tabProps } from "../dom/tablist";
+  import { crossfade } from "svelte/transition";
+  import { isMacOS } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
+
+  const macos = isMacOS();
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   /**
    * A view's own lens switcher.
@@ -68,6 +74,7 @@
     <div
       bind:this={list}
       class="gp-segmented"
+      class:gp-liquid-tabs={macos}
       role="tablist"
       aria-label="{groupLabel} sections"
       tabindex="-1"
@@ -92,7 +99,15 @@
           onclick={() => repoStore.setViewSection(view, section.id)}
           class="gp-seg-btn text-[11px]! py-1!"
         >
-          {section.label}
+          {#if macos && isActive}
+            <span
+              class="gp-liquid-selection gp-gpu"
+              aria-hidden="true"
+              in:receiveSelection={{ key: `active-section-${view}` }}
+              out:sendSelection={{ key: `active-section-${view}` }}
+            ></span>
+          {/if}
+          <span>{section.label}</span>
         </button>
       {/each}
     </div>

@@ -30,11 +30,11 @@ export function reviewDue(preferences: HygienePreferences, now: number): boolean
 }
 
 /**
- * Gitignore-literal escape. Backslash is in the set so a later `\` cannot
- * undo an earlier meta escape (CodeQL `js/incomplete-sanitization`).
+ * Gitignore-literal escape. Backslashes are doubled first so a crafted `\*`
+ * cannot undo a later meta escape (CodeQL `js/incomplete-sanitization`).
  */
 export function escapeGitignoreLiteral(value: string): string {
-  return value.replace(/[\\!*?\[\]# ]/g, "\\$&");
+  return value.replace(/\\/g, "\\\\").replace(/[!*?\[\]# ]/g, "\\$&");
 }
 
 /** One anchored literal directory rule, never a broad glob or an index edit. */

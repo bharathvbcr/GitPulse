@@ -50,12 +50,15 @@ describe("CommitComposer", () => {
     expect(source).toContain("What this commit breaks");
     expect(source).toContain("parse=");
     expect(source).toContain("bodies_not_compared=");
-    expect(source).toContain("walk_incomplete");
+    expect(source).toContain("walk incomplete:");
+    expect(source).toContain("tooltipWalkIncomplete");
     expect(source).toContain('data-testid="commit-preview-breaks"');
   });
 
   it("composes staged blast radius with layered impact (no min_rung)", () => {
     expect(source).toContain("getImpactLayeredMany");
+    expect(source).toContain("cancelCodeintelQuery");
+    expect(source).toContain("newCodeintelCancelToken");
     expect(source).toContain("BlastRadiusPanel");
     expect(source).not.toContain("minRung");
   });

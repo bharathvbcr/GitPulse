@@ -179,3 +179,33 @@ describe("TerminalPanel truncation disclosure", () => {
     expect(source).toContain('"reason unavailable"');
   });
 });
+
+describe("TerminalPanel chrome popovers", () => {
+  it("keeps shortcuts, sessions, and tab options in the column instead of overlaying the grid", () => {
+    // On macOS `bg-surface` is translucent. An absolutely positioned bar at a
+    // guessed header+tabs offset paints over xterm, so the prompt, the
+    // session badge, and the shortcut legend occupy the same pixels.
+    // Find already takes a row in the session; these three must too.
+    const ruleStart = source.indexOf(".terminal-popover {");
+    expect(ruleStart).toBeGreaterThan(-1);
+    const rule = source.slice(ruleStart, source.indexOf("}", ruleStart) + 1);
+    expect(rule).toContain("flex-shrink: 0");
+    expect(rule).not.toMatch(/position:\s*absolute/);
+    expect(rule).not.toMatch(/inset:/);
+    expect(source).not.toContain("rounded-lg bg-surface shadow-lg");
+    const panesIdx = source.indexOf('class="terminal-panes');
+    expect(panesIdx).toBeGreaterThan(-1);
+    const marks = [...source.matchAll(/class="terminal-popover/g)];
+    expect(marks).toHaveLength(3);
+    for (const mark of marks) {
+      expect(mark.index).toBeLessThan(panesIdx);
+    }
+    const harness = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../../harness/terminal.html"),
+      "utf8",
+    );
+    expect(harness).toContain('check("shortcuts sit above the grid instead of overlapping it"');
+    expect(harness).toContain('check("tab options sit above the grid instead of overlapping it"');
+    expect(harness).toContain('check("session list sits above the grid instead of overlapping it"');
+  });
+});

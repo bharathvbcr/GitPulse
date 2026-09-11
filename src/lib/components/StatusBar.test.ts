@@ -45,6 +45,21 @@ describe("StatusBar", () => {
     expect(bar()).not.toContain('role="status"');
   });
 
+  it("uses the same liquid-blur chrome as the title bar, not a covering slab", () => {
+    // Native under-window blur is the macOS material. Chrome shows it by
+    // staying translucent (`gp-glass` + bare `bg-surface`). `bg-surface/95`
+    // keeps its author alpha and paints over that material; `gp-gpu` is
+    // `translateZ(0)`, which promotes a WKWebView layer that no longer
+    // composites with the NSVisualEffectView behind it. The title bar has
+    // neither, which is why it reads as glass and this strip did not.
+    const footer = source.match(/<footer[\s\S]*?class="([^"]+)"/)?.[1];
+    const tokens = footer?.split(/\s+/) ?? [];
+    expect(tokens).toContain("gp-glass");
+    expect(tokens).toContain("bg-surface");
+    expect(tokens.some((token) => token.startsWith("bg-surface/"))).toBe(false);
+    expect(tokens).not.toContain("gp-gpu");
+  });
+
   it("feeds all three override signals to the visibility rule", () => {
     // The rule itself is covered in ui/statusBarMode.test.ts. What cannot be
     // reached from a server render — repoStore state arrives from Tauri — is

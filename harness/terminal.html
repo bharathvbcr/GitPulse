@@ -157,8 +157,17 @@
           const beforeClear = report.spawned;
           button("Clear scrollback").click(); await wait();
           check("clear keeps the prompt and running session", visible('[role="tabpanel"]')[0].textContent.includes("/fixture/GitPulse $") && report.spawned === beforeClear && report.killed === 0);
+          const aboveGrid = (el) => {
+            const chrome = el.getBoundingClientRect();
+            const grid = visible("[data-terminal-session]")[0].getBoundingClientRect();
+            return chrome.bottom <= grid.top + 1;
+          };
+          button("Terminal shortcuts").click(); await wait();
+          check("shortcuts sit above the grid instead of overlapping it", aboveGrid(label("Terminal keyboard shortcuts")));
+          button("Terminal shortcuts").click(); await wait();
           const beforeOptions = report.spawned;
           button("Terminal tab options").click(); await wait();
+          check("tab options sit above the grid instead of overlapping it", aboveGrid(label("Terminal tab name").closest("form")));
           const name = label("Terminal tab name"); name.value = "Build logs"; name.dispatchEvent(new Event("input", { bubbles: true }));
           button("Rename").click(); await wait();
           check("custom tab names survive program titles", visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
@@ -180,6 +189,7 @@
           button("Close split view").click(); await wait();
           check("closing split preserves both sessions", visible('[role="tabpanel"]').length === 1 && report.killed === 0);
           button("All terminal sessions").click(); await wait();
+          check("session list sits above the grid instead of overlapping it", aboveGrid(label("Sessions across repositories")));
           check("session manager includes both repositories", label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
           button("All terminal sessions").click(); await wait();
           for (let i = 0; i < 14; i++) { button("New Shell session").click(); await wait(); }

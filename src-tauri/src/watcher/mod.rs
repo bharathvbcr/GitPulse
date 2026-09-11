@@ -6,7 +6,8 @@ use crate::engine::git_cli::{resolve_git_common_dir, resolve_git_dir, validate_r
 use notify::Event;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -132,20 +133,148 @@ const DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 /// True when `event` carries at least one path that can move repository state.
 ///
 /// Events whose every path is git-internal refresh noise (see
-/// [`is_git_internal_noise`]) are dropped before they enter the debounce
+/// [`is_git_internal_noise`]) or generated-state noise (see
+/// [`is_generated_state_noise_in`]) are dropped before they enter the debounce
 /// accumulation. Without this gate, editors/build tools churning `.lock`
 /// transients or `COMMIT_EDITMSG` force a full app refresh every
 /// [`DEBOUNCE_MAX_WAIT`] indefinitely — the anti-starvation bound turns pure
-/// noise into a constant refresh loop. Events without any path cannot be
-/// classified, so they count as signal (fail open toward refreshing).
-fn event_has_signal(event: &Event, internal_roots: &[std::path::PathBuf]) -> bool {
+/// noise into a constant refresh loop. The same loop appears when the live
+/// index vacuums `.devcouncil` sqlite: that write is not git-internal, so it
+/// used to emit `repo-changed`, which rebuilt the index, which vacuumed again.
+/// Events without any path cannot be classified, so they count as signal
+/// (fail open toward refreshing).
+///
+/// `worktree_canonical` is resolved once per debounce batch so a linked
+/// worktree's `internal_roots` storm never pays `realpath` per event. Paths
+/// under `internal_roots` are never generated-state noise (they are either
+/// git noise or signal by construction), so the alias walk is skipped for
+/// them entirely.
+fn event_has_signal(
+    event: &Event,
+    internal_roots: &[PathBuf],
+    worktree: &Path,
+    worktree_canonical: Option<&Path>,
+) -> bool {
     if event.paths.is_empty() {
         return true;
     }
-    event
-        .paths
-        .iter()
-        .any(|path| !is_git_internal_noise(path, internal_roots))
+    event.paths.iter().any(|path| {
+        if is_git_internal_noise(path, internal_roots) {
+            return false;
+        }
+        // Linked-worktree ref/object writes live under the common git dir,
+        // outside the worktree checkout. They are never `.devcouncil` noise
+        // and must not trigger the path-alias canonicalize walk.
+        if internal_roots.iter().any(|root| path.starts_with(root)) {
+            return true;
+        }
+        !is_generated_state_noise_cached(path, worktree, worktree_canonical)
+    })
+}
+
+/// True when `path` is generated per-worktree state that GitPulse (or a
+/// sibling indexer) writes as a *consequence* of a refresh, never as the
+/// worktree change that should start one.
+///
+/// Live index vacuums, DevCouncil ledgers, and GitNexus indexes live under
+/// `.devcouncil`, `.devmap`, and `.gitnexus`. A worktree watch is
+/// non-recursive, but those top-level directories still fire, and nested
+/// writes can leak through FSEvents. Ledger appends already have their own
+/// `ledger-appended` event; ignoring `.devcouncil` here does not drop that
+/// channel.
+///
+/// Only the first path component *inside* the worktree counts. Scanning the
+/// absolute path would freeze live refresh for a worktree whose own path
+/// contains `.devcouncil` (legal, if unusual): every event would match. Nested
+/// lookalikes such as `src/.gitnexus/` or a branch named `.devcouncil/topic`
+/// stay signal.
+///
+/// Tracked edits under `.devcouncil/config.yaml` therefore no longer fire
+/// `repo-changed` until the commit moves `.git/index` — the state-dir gate
+/// owns the top-level name, and git's index event carries the commit signal.
+///
+/// `strip_prefix` is not enough on its own. macOS FSEvents often spell `/var`
+/// as `/private/var`, and some backends emit a relative `.devcouncil/...`.
+/// Those must still classify against the worktree-relative first component,
+/// or live-index vacuums reopen the refresh loop.
+#[cfg(test)]
+pub(crate) fn is_generated_state_noise_in(path: &Path, worktree: &Path) -> bool {
+    let canonical = worktree.canonicalize().ok();
+    is_generated_state_noise_cached(path, worktree, canonical.as_deref())
+}
+
+fn is_generated_state_noise_cached(
+    path: &Path,
+    worktree: &Path,
+    worktree_canonical: Option<&Path>,
+) -> bool {
+    first_worktree_relative_component(path, worktree, worktree_canonical)
+        .is_some_and(|name| is_generated_state_dir(&name))
+}
+
+fn path_has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+fn first_worktree_relative_component(
+    path: &Path,
+    worktree: &Path,
+    worktree_canonical: Option<&Path>,
+) -> Option<OsString> {
+    // Resolve no lexical escape as noise, including paths whose prefix matches.
+    if path_has_parent_dir(path) || path_has_parent_dir(worktree) {
+        return None;
+    }
+    if let Ok(relative) = path.strip_prefix(worktree) {
+        return relative
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_os_string());
+    }
+    if path.is_relative() && worktree.is_absolute() {
+        return path
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_os_string());
+    }
+    // A shared suffix is not proof of repository identity. Only filesystem
+    // identity can establish an alias. Canonicalize the worktree once (caller)
+    // and probe only the first *existing* ancestor of the event path — deleted
+    // leaves still resolve through a live parent. The first remaining
+    // component may live in the canonicalized ancestor, so it is owned.
+    let canonical = worktree_canonical?;
+    let existing = path
+        .ancestors()
+        .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.exists())?;
+    let existing_canon = existing.canonicalize().ok()?;
+    {
+        let relative_from_wt = existing_canon.strip_prefix(canonical).ok()?;
+        if let Some(component) = relative_from_wt.components().next() {
+            return Some(component.as_os_str().to_os_string());
+        }
+    }
+    path.strip_prefix(existing)
+        .ok()?
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_os_string())
+}
+
+/// GitPulse-owned indexer state beside DevMap's [`devmap_query::paths::STATE_DIR_NAMES`].
+const GITNEXUS_STATE_DIR: &str = ".gitnexus";
+
+fn is_generated_state_dir(name: &OsStr) -> bool {
+    // Windows and some macOS volumes fold case; FSEvents can spell the same
+    // directory `.DevCouncil`. Canonical names in `devmap_query::paths` are
+    // lowercase, so fold here before consulting them.
+    let Some(raw) = name.to_str() else {
+        return false;
+    };
+    let folded = raw.to_ascii_lowercase();
+    if devmap_query::paths::is_state_dir_name(&folded) {
+        return true;
+    }
+    folded == GITNEXUS_STATE_DIR
 }
 
 /// True when `path` sits inside one of the watched git directories (the
@@ -306,10 +435,23 @@ where
                 // lost. Backend errors carry no classifiable path and count
                 // as signal (fail open toward refreshing), preserving the
                 // pre-filter treatment.
-                let mut significant = event_has_signal(&event, &internal_roots);
+                let worktree = Path::new(&path);
+                // One canonicalize per batch — never per drained leftover.
+                let worktree_canonical = worktree.canonicalize().ok();
+                let mut significant = event_has_signal(
+                    &event,
+                    &internal_roots,
+                    worktree,
+                    worktree_canonical.as_deref(),
+                );
                 for leftover in watcher.receiver.try_iter() {
                     significant |= match leftover {
-                        Ok(event) => event_has_signal(&event, &internal_roots),
+                        Ok(event) => event_has_signal(
+                            &event,
+                            &internal_roots,
+                            worktree,
+                            worktree_canonical.as_deref(),
+                        ),
                         Err(_) => true,
                     };
                 }
@@ -1957,6 +2099,396 @@ mod tests {
         let worktree_lock = tmp.path().join("Cargo.lock");
         std::fs::write(&worktree_lock, b"x").unwrap();
         assert!(!is_git_internal_noise(&worktree_lock, &roots));
+    }
+
+    /// Live-index vacuums, ledgers, and sibling indexer writes under these
+    /// directory names must not open the debounce window. Source files and
+    /// dependency lockfiles still count as signal.
+    #[test]
+    fn noise_predicate_drops_generated_state_directories() {
+        let tmp = TempDir::new().unwrap();
+        let roots = internal_roots_for(tmp.path());
+        let noisy = [
+            tmp.path().join(".devcouncil"),
+            tmp.path()
+                .join(".devcouncil")
+                .join("codeintel")
+                .join("devmap.sqlite"),
+            tmp.path().join(".devmap").join("store.sqlite"),
+            tmp.path().join(".gitnexus").join("graph.json"),
+        ];
+        for path in noisy {
+            assert!(
+                is_generated_state_noise_in(&path, tmp.path()),
+                "{} must be generated-state noise",
+                path.display()
+            );
+            let event = notify::Event::new(notify::EventKind::Any).add_path(path);
+            assert!(
+                !event_has_signal(&event, &roots, tmp.path(), None),
+                "generated-state-only events must not count as signal"
+            );
+        }
+
+        let signal = [
+            tmp.path().join("src").join("foo.rs"),
+            tmp.path().join("Cargo.lock"),
+        ];
+        for path in signal {
+            assert!(
+                !is_generated_state_noise_in(&path, tmp.path()),
+                "{}",
+                path.display()
+            );
+            let event = notify::Event::new(notify::EventKind::Any).add_path(path);
+            assert!(
+                event_has_signal(&event, &roots, tmp.path(), None),
+                "worktree content must still count as signal"
+            );
+        }
+
+        let mixed = notify::Event::new(notify::EventKind::Any)
+            .add_path(tmp.path().join(".devcouncil").join("codeintel"))
+            .add_path(tmp.path().join("src").join("lib.rs"));
+        assert!(
+            event_has_signal(&mixed, &roots, tmp.path(), None),
+            "a real worktree path in a mixed event must keep the signal"
+        );
+
+        let empty = notify::Event::new(notify::EventKind::Any);
+        assert!(
+            event_has_signal(&empty, &roots, tmp.path(), None),
+            "unclassifiable empty-path events must fail open as signal"
+        );
+
+        let named = tmp.path().join(".devcouncil");
+        let named_source = named.join("src").join("lib.rs");
+        let named_store = named
+            .join(".devcouncil")
+            .join("codeintel")
+            .join("devmap.sqlite");
+        assert!(
+            !is_generated_state_noise_in(&named_source, &named),
+            "source inside a worktree named .devcouncil must stay signal"
+        );
+        assert!(
+            is_generated_state_noise_in(&named_store, &named),
+            "nested generated-state under that worktree must stay noise"
+        );
+        let named_source_event = notify::Event::new(notify::EventKind::Any).add_path(named_source);
+        assert!(
+            event_has_signal(&named_source_event, &roots, &named, None),
+            "a worktree named .devcouncil must still refresh on source edits"
+        );
+
+        let folded = [
+            tmp.path()
+                .join(".DevCouncil")
+                .join("codeintel")
+                .join("devmap.sqlite"),
+            tmp.path().join(".GITNEXUS").join("graph.json"),
+            tmp.path().join(".DevMap").join("store.sqlite"),
+        ];
+        for path in folded {
+            assert!(
+                is_generated_state_noise_in(&path, tmp.path()),
+                "case-folded generated-state spelling must stay noise: {}",
+                path.display()
+            );
+        }
+
+        let not_generated = [
+            tmp.path().join("notes.devcouncil.md"),
+            tmp.path().join("devcouncil").join("src.rs"),
+            tmp.path().join(".devcouncil.bak"),
+        ];
+        for path in not_generated {
+            assert!(
+                !is_generated_state_noise_in(&path, tmp.path()),
+                "lookalike path must still count as signal: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_noise_does_not_hide_source_under_named_ancestors() {
+        let repo = Path::new("/workspace/.devmap/project");
+        for path in [
+            repo.join("src/lib.rs"),
+            repo.join("src/.gitnexus/fixture.json"),
+            repo.join(".git/refs/heads/.devcouncil/topic"),
+        ] {
+            assert!(
+                !is_generated_state_noise_in(&path, repo),
+                "source/ref was hidden: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_noise_never_infers_identity_from_an_arbitrary_prefix_or_parent_escape() {
+        let repo = Path::new("/workspace/repo");
+        for path in [
+            Path::new("/unrelated/workspace/repo/.devcouncil/index"),
+            Path::new("/workspace/repo/.devcouncil/../src/lib.rs"),
+            Path::new("/workspace/repo/.devmap/../../outside"),
+        ] {
+            assert!(
+                !is_generated_state_noise_in(path, repo),
+                "unexamined path hidden: {}",
+                path.display()
+            );
+        }
+    }
+
+    // Real aliases must be established on disk. Arbitrary prepended path
+    // components (for example /private/var/var) are not aliases of /var.
+    #[test]
+    #[cfg(unix)]
+    fn generated_state_noise_survives_path_aliasing() {
+        let temp = TempDir::new().unwrap();
+        let worktree = temp.path().join(".devcouncil/project");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+        for (relative, noise) in [
+            (".devcouncil/codeintel/deleted.sqlite", true),
+            (".DevCouncil", true),
+            (".devmap/store", true),
+            ("src/lib.rs", false),
+            ("src/.gitnexus/fixture.json", false),
+        ] {
+            assert_eq!(
+                is_generated_state_noise_in(&alias.join(relative), &worktree),
+                noise,
+                "{relative}"
+            );
+            assert_eq!(
+                is_generated_state_noise_in(&worktree.join(relative), &alias),
+                noise,
+                "reverse {relative}"
+            );
+        }
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::create_dir(&alias).unwrap();
+        assert!(
+            !is_generated_state_noise_in(&alias.join(".devcouncil/store"), &worktree),
+            "a replaced alias must not retain stale identity"
+        );
+    }
+
+    #[test]
+    fn generated_state_alias_storm_keeps_source_signal() {
+        let worktree = Path::new("/workspace/repo");
+        for i in 0..1_000 {
+            assert!(is_generated_state_noise_in(
+                &worktree.join(format!(".devcouncil/n{i}.sqlite")),
+                worktree
+            ));
+            assert!(is_generated_state_noise_in(
+                Path::new(".devcouncil/deleted.sqlite"),
+                worktree
+            ));
+            assert!(!is_generated_state_noise_in(
+                &worktree.join(format!("src/n{i}.rs")),
+                worktree
+            ));
+            assert!(!is_generated_state_noise_in(
+                &PathBuf::from(format!("/unrelated/workspace/repo/.devcouncil/n{i}.sqlite")),
+                worktree
+            ));
+        }
+    }
+
+    /// Symlinked worktree: FSEvents may deliver the physical path while the
+    /// watch key is the canonical one (or the reverse). Classification must
+    /// still agree after one existing-ancestor canonicalize.
+    #[test]
+    #[cfg(unix)]
+    fn generated_state_noise_matches_symlinked_worktree_alias() {
+        let temp = TempDir::new().unwrap();
+        let physical = temp.path().join("physical-repo");
+        std::fs::create_dir_all(physical.join(".devcouncil")).unwrap();
+        let link = temp.path().join("linked-repo");
+        std::os::unix::fs::symlink(&physical, &link).unwrap();
+        let canonical = physical.canonicalize().unwrap();
+        let via_link = link.join(".devcouncil").join("devmap.sqlite");
+        assert!(
+            is_generated_state_noise_cached(&via_link, &canonical, Some(&canonical)),
+            "state under a symlink spelling of the worktree must stay noise"
+        );
+        assert!(
+            !is_generated_state_noise_cached(
+                &link.join("src").join("main.rs"),
+                &canonical,
+                Some(&canonical)
+            ),
+            "source under the symlink spelling must stay signal"
+        );
+    }
+
+    /// `$DEVMAP_HOME` outside the worktree is not watched as a top-level
+    /// state dir name. Writes there must not be classified as worktree noise
+    /// via a shared suffix, and in-tree `.devcouncil` still is.
+    #[test]
+    fn generated_state_noise_ignores_external_devmap_home_suffix() {
+        let temp = TempDir::new().unwrap();
+        let worktree = temp.path().join("repo");
+        let home = temp.path().join("devmap-home");
+        std::fs::create_dir_all(worktree.join(".devcouncil")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let external = home.join("codeintel").join("devmap.sqlite");
+        assert!(
+            !is_generated_state_noise_in(&external, &worktree),
+            "DEVMAP_HOME outside the worktree must not be inferred as noise"
+        );
+        assert!(is_generated_state_noise_in(
+            &worktree.join(".devcouncil").join("store.sqlite"),
+            &worktree
+        ));
+    }
+
+    #[test]
+    fn generated_state_mixed_case_storm_stays_noise() {
+        let worktree = Path::new("/workspace/repo");
+        let spellings = [
+            ".devcouncil",
+            ".DevCouncil",
+            ".DEVCOUNCIL",
+            ".devmap",
+            ".DevMap",
+            ".gitnexus",
+            ".GITNEXUS",
+        ];
+        for i in 0..10_000 {
+            let name = spellings[i % spellings.len()];
+            assert!(
+                is_generated_state_noise_in(
+                    &worktree.join(format!("{name}/n{i}.sqlite")),
+                    worktree
+                ),
+                "{name} at {i}"
+            );
+        }
+    }
+
+    /// Linked-worktree internal-root storms used to pay up to 65 realpath
+    /// calls per event. Classification of 10k common-dir paths must stay
+    /// cheap, and a `refs/heads` write must still count as signal.
+    #[test]
+    #[cfg(unix)]
+    fn linked_worktree_internal_root_storm_is_cheap_and_refs_still_signal() {
+        let (_main, _work_parent, work_path) = init_linked_worktree();
+        let worktree = work_path.canonicalize().unwrap();
+        let gitfile = std::fs::read_to_string(work_path.join(".git")).unwrap();
+        let work_git = gitfile
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir: "))
+            .expect("gitfile gitdir line")
+            .trim()
+            .to_string();
+        let work_git_path = PathBuf::from(&work_git);
+        let common = work_git_path
+            .ancestors()
+            .nth(2)
+            .expect("common dir above worktrees/<name>")
+            .to_path_buf();
+        let internal_roots = vec![work_git_path, common.clone()];
+        let worktree_canonical = worktree.clone();
+
+        let started = Instant::now();
+        for i in 0..10_000 {
+            let path = common.join(format!("objects/pack/tmp-{i}.pack"));
+            let event = notify::Event::new(notify::EventKind::Any).add_path(path);
+            // Pack files are not leaf-noise names and sit under internal_roots,
+            // so they are signal — the point is the classification stays cheap.
+            let _ = event_has_signal(
+                &event,
+                &internal_roots,
+                &worktree,
+                Some(&worktree_canonical),
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "10k linked-worktree internal-root classifications took {elapsed:?} (alias walk regression)"
+        );
+
+        let refs_event = notify::Event::new(notify::EventKind::Any)
+            .add_path(common.join("refs").join("heads").join("feature"));
+        assert!(
+            event_has_signal(
+                &refs_event,
+                &internal_roots,
+                &worktree,
+                Some(&worktree_canonical),
+            ),
+            "refs/heads under the common dir must still emit for a linked worktree"
+        );
+        let lock_event =
+            notify::Event::new(notify::EventKind::Any).add_path(common.join("index.lock"));
+        assert!(
+            !event_has_signal(
+                &lock_event,
+                &internal_roots,
+                &worktree,
+                Some(&worktree_canonical),
+            ),
+            "index.lock under the common dir must remain git-internal noise"
+        );
+    }
+
+    #[test]
+    fn generated_state_storm_is_quiet_but_source_edits_still_emit() {
+        let dir = TempDir::new().unwrap();
+        for name in [".devcouncil", ".devmap", ".gitnexus"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let (rx, stop, canonical) = spawn_loop(dir.path());
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _stop = StopOnDrop(stop);
+        prime_watcher(&rx, &canonical, PRIME_DEADLINE);
+        await_watcher_quiescence(&rx);
+        for i in 0..120 {
+            for name in [".devcouncil", ".devmap", ".gitnexus"] {
+                std::fs::write(canonical.join(name).join("index.tmp"), i.to_string()).unwrap();
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            rx.recv_timeout(DEBOUNCE_MAX_WAIT + Duration::from_secs(1))
+                .is_err(),
+            "generated index writes fed back into repo-changed"
+        );
+        await_watcher_quiescence(&rx);
+        let alive_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(
+                canonical.join(format!("after-generated-storm-{n}.rs")),
+                "fn x() {}",
+            )
+            .unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < alive_deadline,
+                "a real worktree file must still emit after the generated-state storm ({n} probes)"
+            );
+        }
     }
 
     /// Regression (audit A): a continuous stream of pure git-internals noise

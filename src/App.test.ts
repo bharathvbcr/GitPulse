@@ -291,6 +291,20 @@ describe("App chrome preferences", () => {
     );
   });
 
+  it("plates Tasks on the shared workspace surface so macOS glass does not drop field text to black", () => {
+    // The repository pane carries gp-workspace; that plate is the contrast
+    // floor under translucent chrome. Tasks sat on the transparent shell, so
+    // WKWebView painted native fields (search, task editor, workspace editor)
+    // with light-scheme black text on the dark hue field.
+    const start = source.indexOf('paneCrashes.report("tasks"');
+    const end = source.indexOf('paneCrashes.report("fleet"');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const tasks = source.slice(start, end);
+    expect(tasks).toContain("gp-workspace");
+    expect(tasks).toContain("bg-background");
+  });
+
   it("hides the repository tab strip only while a single repository is open", () => {
     // Hiding it with several tabs open would strand the other repositories.
     const idx = source.indexOf("<RepoTabBar");

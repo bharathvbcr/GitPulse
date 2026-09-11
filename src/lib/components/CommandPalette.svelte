@@ -295,13 +295,13 @@
   input::placeholder { color:var(--color-textMuted); font-size:14px; }
   .palette-modes { display:flex; gap:3px; overflow-x:auto; padding-bottom:12px; }
   .palette-modes button { display:flex; align-items:center; gap:5px; padding:5px 7px; font-size:10px; white-space:nowrap; border-radius:6px; color:var(--color-textMuted); }
-  .palette-modes button[aria-pressed="true"] { background:var(--color-surfaceHover); color:var(--color-accent); }
+  .palette-modes button[aria-pressed="true"] { background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover))); color:var(--color-accent); }
   .palette-modes kbd { opacity:.65; font-size:9px; }
   .palette-meta { justify-content:space-between; padding:10px 18px 7px; border-top:1px solid var(--color-border); font-size:10px; color:var(--color-textMuted); }
   .palette-results { min-height:130px; max-height:390px; overflow-y:auto; overscroll-behavior:contain; padding:0 8px 8px; }
   .palette-option { display:flex; align-items:center; gap:11px; text-align:left; width:100%; padding:10px; border-radius:9px; color:var(--color-textPrimary); }
-  .palette-option[data-highlighted="true"] { background:var(--color-surfaceHover); box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--color-accent) 24%, transparent); }
-  .palette-icon { display:flex; align-items:center; justify-content:center; flex-shrink:0; width:29px; height:29px; border-radius:8px; background:var(--color-background); color:var(--color-textMuted); }
+  .palette-option[data-highlighted="true"] { background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover))); box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--color-accent) 24%, transparent); }
+  .palette-icon { display:flex; align-items:center; justify-content:center; flex-shrink:0; width:29px; height:29px; border-radius:8px; background:var(--mac-fill-bg, rgb(var(--c-bg))); color:var(--color-textMuted); }
   .palette-option[data-highlighted="true"] .palette-icon { color:var(--color-accent); }
   .palette-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:3px; }
   .palette-label { font-size:12px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
@@ -314,9 +314,9 @@
   .palette-notice { padding:9px 18px; color:var(--color-textMuted); font-size:11px; overflow-wrap:anywhere; max-height:110px; overflow-y:auto; flex-shrink:0; }
   .palette-notice p { margin:0 0 6px; }
   .palette-notice button { margin:2px 6px 0 0; font-size:10px; }
-  .palette-warning { color:var(--color-textPrimary); border-left:3px solid var(--color-accent); background:var(--color-background); }
+  .palette-warning { color:var(--color-textPrimary); border-left:3px solid var(--color-accent); background:var(--mac-fill-bg, rgb(var(--c-bg))); }
   .palette-detail { padding:9px 18px; min-height:34px; font-size:10px; color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
-  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; background:var(--color-background); font-size:10px; color:var(--color-textMuted); gap:8px; }
+  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; font-size:10px; color:var(--color-textMuted); gap:8px; }
   .palette-footer kbd { margin:0 3px 0 6px; font-size:10px; }
   .palette-pages { gap:8px; }
   .palette-pages button { padding:0 6px; }

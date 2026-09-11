@@ -1,0 +1,21 @@
+---
+description: DevMap navigation and repository hygiene
+alwaysApply: true
+---
+
+# DevMap
+
+Use `.devcouncil/repo_map.json` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.
+
+Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.
+
+Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.
+
+## Repository hygiene
+
+- Keep generated output in ignored, producer-owned directories. Use per-workspace Cargo targets and the native Go build cache; reuse valid caches instead of clearing them after every build.
+- Before cleanup, measure the exact paths and check producer markers, the Git index, ignore rules, nested repositories, symlinks, active tasks, open files and retention. An unavailable or partial check is a refusal, not approval.
+- Preserve source, uncommitted work, secrets, environments, dependencies, models, datasets, agent state and Git history. Never use home-wide rm sweeps or git clean -X as routine hygiene.
+- Prefer Cargo automatic GC, Go automatic expiry, npm cache verify, uv cache prune and pnpm store prune for shared caches. Explain download and rebuild costs; never silently change global target/cache configuration.
+- Agents must not enable or widen cleanup schedules. Only execute a user's saved scope and limits, with fresh checks immediately before mutation; stop when files, policy or activity change.
+- Record what was measured, removed, skipped and failed, including incomplete scans and logical versus physical bytes. Cancellation does not restore entries already removed.

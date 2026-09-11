@@ -11,8 +11,3 @@ description = "DevCouncil state store: tasks and the lease that makes concurrent
 # source, which keeps the store independent of whatever libsqlite3 the host has.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = "warn"

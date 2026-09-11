@@ -18,6 +18,7 @@
 //! `harness::guard_command` and must update the test that pins that.
 
 pub mod complete;
+pub mod devmap_parity;
 pub mod page;
 pub mod prompts;
 pub mod resources;
@@ -55,7 +56,7 @@ pub const CHANGES_MAX_LIMIT: u32 = 500;
 pub const BUDGET_MAX: u32 = 200_000;
 /// Longest `repo_path` / symbol argument accepted. Well past any real path,
 /// short enough that a megabyte of `A`s is refused before it reaches git.
-const MAX_ARG_CHARS: u32 = 4_096;
+pub(crate) const MAX_ARG_CHARS: u32 = 4_096;
 
 pub fn server_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -185,7 +186,7 @@ fn tool_annotations() -> Value {
     })
 }
 
-fn tool(
+pub(crate) fn tool(
     name: &str,
     title: &str,
     description: &str,
@@ -208,7 +209,7 @@ fn tool(
     })
 }
 
-fn repo_prop() -> Value {
+pub(crate) fn repo_prop() -> Value {
     json!({
         "type": "string",
         "description": "Absolute path to a git repository",
@@ -217,7 +218,7 @@ fn repo_prop() -> Value {
     })
 }
 
-fn path_prop(description: &str) -> Value {
+pub(crate) fn path_prop(description: &str) -> Value {
     json!({
         "type": "string",
         "description": description,
@@ -226,7 +227,7 @@ fn path_prop(description: &str) -> Value {
     })
 }
 
-fn budget_prop() -> Value {
+pub(crate) fn budget_prop() -> Value {
     json!({
         "type": "integer",
         "description": "Maximum tokens of results",
@@ -293,7 +294,7 @@ fn catalog() -> &'static [Value] {
 }
 
 fn build_tools() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         tool(
             "gitpulse_insights",
             "Repository insights",
@@ -433,8 +434,11 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_task_view",
             "Task view",
-            "Read task details, leases, and worktree binding from dc-store",
-            json!({ "repo_path": repo_prop() }),
+            "Read task leases plus evidence, gaps, and verification runs from dc-store. Never acquires a lease.",
+            json!({
+                "repo_path": repo_prop(),
+                "task_id": path_prop("Optional task id to filter evidence, gaps, and runs")
+            }),
             &["repo_path"],
             json!({ "type": "object" }),
         ),
@@ -510,7 +514,9 @@ fn build_tools() -> Vec<Value> {
             &["repo_path", "commit_sha"],
             json!({ "type": "object" }),
         ),
-    ]
+    ];
+    tools.extend(devmap_parity::tool_definitions());
+    tools
 }
 
 pub fn tool_catalog() -> Vec<McpToolInfo> {
@@ -693,9 +699,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
             let address = crate::ledger::bindings::repository_address(repo)
                 .map_err(|error| error.to_string())?;
-            let view = crate::tasks::view(&address.anchor);
+            let task_id = arguments["task_id"].as_str();
+            let view = crate::tasks::view_filtered(&address.anchor, task_id);
             Ok(json!(view))
         }
+        name if name.starts_with("devmap_") => devmap_parity::handle(name, arguments),
         "gitpulse_codeintel_search" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
             let query = arguments["query"].as_str().ok_or("missing query")?;
@@ -1212,24 +1220,46 @@ mod tests {
             .into_iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        let dispatched: std::collections::BTreeSet<String> = source
+        let mut dispatched: std::collections::BTreeSet<String> = source
             .lines()
             .filter_map(|line| {
                 let t = line.trim();
                 let rest = t.strip_prefix('"')?;
                 let (name, tail) = rest.split_once('"')?;
-                if !tail.trim_start().starts_with("=>") || !name.starts_with("gitpulse_") {
+                if !tail.trim_start().starts_with("=>")
+                    || !(name.starts_with("gitpulse_") || name.starts_with("devmap_"))
+                {
                     return None;
                 }
                 Some(name.to_string())
             })
             .collect();
+        // DevMap-parity tools share one prefix arm; count them as dispatched.
+        if source.contains("name if name.starts_with(\"devmap_\")") {
+            for name in devmap_parity::TOOL_NAMES {
+                dispatched.insert((*name).to_string());
+            }
+        }
         assert!(
             advertised.len() >= 8,
             "scan found only {}",
             advertised.len()
         );
         assert_eq!(advertised, dispatched);
+    }
+
+    #[test]
+    fn tools_list_covers_every_devmap_tool_name() {
+        let listed: std::collections::BTreeSet<String> = tools()
+            .into_iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for name in devmap_parity::TOOL_NAMES {
+            assert!(
+                listed.contains(*name),
+                "tools/list is missing {name}; parity with devmap_serve::mcp::TOOL_NAMES"
+            );
+        }
     }
 
     #[test]

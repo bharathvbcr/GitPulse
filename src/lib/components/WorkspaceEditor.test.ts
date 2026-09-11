@@ -30,4 +30,14 @@ describe("WorkspaceEditor", () => {
     expect(source).toContain("SettingToggle");
     expect(source).not.toContain("window.confirm");
   });
+
+  it("keeps Save workspace in unpainted sheet chrome so glass cannot composite a black bar", () => {
+    const header = source.slice(source.indexOf("<style>")).match(/(?:^|})\s*header\{([^}]*)\}/)?.[1];
+    const footer = source.slice(source.indexOf("<style>")).match(/(?:^|})\s*footer\{([^}]*)\}/)?.[1];
+    expect(header).toBeDefined();
+    expect(footer).toBeDefined();
+    expect(header).not.toContain("position:sticky");
+    expect(footer).not.toMatch(/background(?:-color)?:/);
+    expect(source).toContain('class="sheet-body"');
+  });
 });

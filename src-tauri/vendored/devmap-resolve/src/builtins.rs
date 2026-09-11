@@ -772,6 +772,7 @@ pub fn is_reserved_module_root(family: LangFamily, root: &str) -> bool {
 pub fn is_prelude_type(family: LangFamily, name: &str) -> bool {
     match family {
         LangFamily::Rust => RUST_PRELUDE_TYPES.binary_search(&name).is_ok(),
+        LangFamily::Swift => SWIFT_PRELUDE_TYPES.binary_search(&name).is_ok(),
         _ => false,
     }
 }
@@ -810,6 +811,214 @@ pub const SWIFT_BUILTINS: &[&str] = &[
     "withUnsafePointer",
     "withVaList",
 ];
+
+/// Swift standard-library types available without any `import`.
+///
+/// Constructors (`String("x")`, `Int(n)`) parse as calls whose callee is the
+/// type. They are not in [`SWIFT_BUILTINS`] — that table is free functions —
+/// and without this list every `String` annotation and every `Int(...)` in a
+/// Swift file landed in `Unresolved`, the tier that means "possible defect".
+///
+/// `View` is **not** here: it belongs to SwiftUI and is only in scope after
+/// `import SwiftUI`. `URL` / `Data` / `UUID` belong to Foundation the same way.
+/// A name the repository might declare (`Result`, `Task`, `Error`) stays
+/// behind [`Resolver::family_declares`] at the call site, the SC30 rule.
+///
+/// Sorted for [`is_prelude_type`]'s `binary_search`.
+pub const SWIFT_PRELUDE_TYPES: &[&str] = &[
+    "Any",
+    "AnyHashable",
+    "AnyObject",
+    "Array",
+    "AsyncStream",
+    "AsyncThrowingStream",
+    "Bool",
+    "CancellationError",
+    "CaseIterable",
+    "Character",
+    "ClosedRange",
+    "Codable",
+    "Collection",
+    "CommandLine",
+    "Comparable",
+    "CustomStringConvertible",
+    "Decodable",
+    "Dictionary",
+    "Double",
+    "Duration",
+    "Encodable",
+    "Equatable",
+    "Error",
+    "Float",
+    "Hashable",
+    "Identifiable",
+    "Int",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Int8",
+    "IteratorProtocol",
+    "KeyPath",
+    "MainActor",
+    "Never",
+    "ObjectIdentifier",
+    "OpaquePointer",
+    "Optional",
+    "Range",
+    "RawRepresentable",
+    "Result",
+    "Sendable",
+    "Sequence",
+    "Set",
+    "String",
+    "Task",
+    "TaskGroup",
+    "TaskPriority",
+    "UInt",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "UInt8",
+    "UnsafeMutablePointer",
+    "UnsafeMutableRawPointer",
+    "UnsafePointer",
+    "UnsafeRawPointer",
+    "Void",
+];
+
+/// Unprefixed types that belong to a specific Apple / Swift SDK module.
+///
+/// Consulted only when the file imported that module, and only when the
+/// corpus does not declare the name. Prefix rules (`XCT*`, `NS*`, `CG*`,
+/// `UI*`) live beside this table in [`swift_sdk_module`] so a local type
+/// named `NSCache` in a file that never imported Foundation stays unresolved.
+///
+/// Sorted by name for `binary_search_by_key`.
+pub const SWIFT_SDK_TYPES: &[(&str, &str)] = &[
+    ("AnyCancellable", "Combine"),
+    ("AnyPublisher", "Combine"),
+    ("AppKit", "AppKit"),
+    ("AttributedString", "Foundation"),
+    ("Binding", "SwiftUI"),
+    ("Bundle", "Foundation"),
+    ("Button", "SwiftUI"),
+    ("CGAffineTransform", "CoreGraphics"),
+    ("CGFloat", "CoreGraphics"),
+    ("CGPoint", "CoreGraphics"),
+    ("CGRect", "CoreGraphics"),
+    ("CGSize", "CoreGraphics"),
+    ("CGVector", "CoreGraphics"),
+    ("Calendar", "Foundation"),
+    ("Color", "SwiftUI"),
+    ("Combine", "Combine"),
+    ("CurrentValueSubject", "Combine"),
+    ("Data", "Foundation"),
+    ("Date", "Foundation"),
+    ("DateFormatter", "Foundation"),
+    ("Decimal", "Foundation"),
+    ("DispatchGroup", "Dispatch"),
+    ("DispatchQueue", "Dispatch"),
+    ("DispatchTime", "Dispatch"),
+    ("Environment", "SwiftUI"),
+    ("EnvironmentObject", "SwiftUI"),
+    ("FileManager", "Foundation"),
+    ("Font", "SwiftUI"),
+    ("ForEach", "SwiftUI"),
+    ("Form", "SwiftUI"),
+    ("Foundation", "Foundation"),
+    ("HStack", "SwiftUI"),
+    ("HTTPURLResponse", "Foundation"),
+    ("Image", "SwiftUI"),
+    ("IndexPath", "Foundation"),
+    ("IndexSet", "Foundation"),
+    ("JSONDecoder", "Foundation"),
+    ("JSONEncoder", "Foundation"),
+    ("LazyHStack", "SwiftUI"),
+    ("LazyVStack", "SwiftUI"),
+    ("List", "SwiftUI"),
+    ("Locale", "Foundation"),
+    ("Measurement", "Foundation"),
+    ("NSRange", "Foundation"),
+    ("NavigationLink", "SwiftUI"),
+    ("NavigationStack", "SwiftUI"),
+    ("Notification", "Foundation"),
+    ("NotificationCenter", "Foundation"),
+    ("ObservedObject", "SwiftUI"),
+    ("PassthroughSubject", "Combine"),
+    ("PersonNameComponents", "Foundation"),
+    ("ProcessInfo", "Foundation"),
+    ("Published", "Combine"),
+    ("ScrollView", "SwiftUI"),
+    ("Spacer", "SwiftUI"),
+    ("State", "SwiftUI"),
+    ("StateObject", "SwiftUI"),
+    ("SwiftUI", "SwiftUI"),
+    ("Text", "SwiftUI"),
+    ("TimeZone", "Foundation"),
+    ("URL", "Foundation"),
+    ("URLQueryItem", "Foundation"),
+    ("URLRequest", "Foundation"),
+    ("URLSession", "Foundation"),
+    ("UUID", "Foundation"),
+    ("UserDefaults", "Foundation"),
+    ("VStack", "SwiftUI"),
+    ("View", "SwiftUI"),
+    ("WindowGroup", "SwiftUI"),
+    ("ZStack", "SwiftUI"),
+];
+
+/// XCTest types that do not start with `XCT`.
+///
+/// `XCTAssertEqual` and friends match the prefix rule; `XCTestCase` does not.
+pub const SWIFT_XCTEST_TYPES: &[&str] = &[
+    "XCTest",
+    "XCTestCase",
+    "XCTestExpectation",
+    "XCTestObservationCenter",
+];
+
+/// The SDK module that owns `name` in this file, if the file imported it.
+///
+/// File-specific: `View` is SwiftUI only in a file that imported SwiftUI, and
+/// a repository that declares its own `View` is not classified here — the
+/// caller applies the corpus veto (SC30) before treating the answer as final.
+pub fn swift_sdk_module<'a>(
+    imported_modules: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> Option<&'static str> {
+    let imported: Vec<&str> = imported_modules.into_iter().collect();
+    let imported = |module: &str| imported.contains(&module);
+
+    if name.starts_with("XCT") || SWIFT_XCTEST_TYPES.binary_search(&name).is_ok() {
+        return imported("XCTest").then_some("XCTest");
+    }
+    if let Ok(index) = SWIFT_SDK_TYPES.binary_search_by_key(&name, |(n, _)| *n) {
+        let module = SWIFT_SDK_TYPES[index].1;
+        return imported(module).then_some(module);
+    }
+    if name.starts_with("NS") && name.len() > 2 {
+        for module in ["Foundation", "AppKit", "UIKit"] {
+            if imported(module) {
+                return Some(module);
+            }
+        }
+    }
+    if name.starts_with("CG") && name.len() > 2 {
+        for module in ["CoreGraphics", "Foundation", "AppKit", "UIKit", "SwiftUI"] {
+            if imported(module) {
+                return Some(module);
+            }
+        }
+    }
+    if name.starts_with("UI")
+        && name.len() > 2
+        && name.as_bytes()[2].is_ascii_uppercase()
+        && imported("UIKit")
+    {
+        return Some("UIKit");
+    }
+    None
+}
 
 /// Kotlin top-level functions from the auto-imported `kotlin` package. Kotlin
 /// is a primary language for this repository.
@@ -999,6 +1208,8 @@ mod tests {
             ("rust", RUST_BUILTINS),
             ("js", JS_BUILTINS),
             ("swift", SWIFT_BUILTINS),
+            ("swift prelude types", SWIFT_PRELUDE_TYPES),
+            ("swift xctest types", SWIFT_XCTEST_TYPES),
             ("kotlin", KOTLIN_BUILTINS),
             ("ruby", RUBY_BUILTINS),
             ("php", PHP_BUILTINS),
@@ -1015,6 +1226,14 @@ mod tests {
                  binary_search to find its entries"
             );
         }
+        let sdk_names: Vec<&str> = SWIFT_SDK_TYPES.iter().map(|(name, _)| *name).collect();
+        let mut sdk_sorted = sdk_names.clone();
+        sdk_sorted.sort_unstable();
+        sdk_sorted.dedup();
+        assert_eq!(
+            sdk_sorted, sdk_names,
+            "SWIFT_SDK_TYPES must be sorted by name and duplicate-free"
+        );
     }
 
     /// The same guard as above, for the table `host_global_environment`
@@ -1337,5 +1556,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn swift_sdk_module_requires_the_file_to_have_imported_it() {
+        assert_eq!(swift_sdk_module(["Foundation"], "URL"), Some("Foundation"));
+        assert_eq!(swift_sdk_module(["Foundation"], "String"), None);
+        assert_eq!(swift_sdk_module(["SwiftUI"], "URL"), None);
+        assert_eq!(
+            swift_sdk_module(["XCTest"], "XCTAssertEqual"),
+            Some("XCTest")
+        );
+        assert_eq!(swift_sdk_module(["XCTest"], "XCTestCase"), Some("XCTest"));
+        assert_eq!(swift_sdk_module(["Foundation"], "XCTAssertEqual"), None);
+        assert_eq!(swift_sdk_module(["AppKit"], "NSView"), Some("AppKit"));
+        assert_eq!(swift_sdk_module(["UIKit"], "UIView"), Some("UIKit"));
+        assert_eq!(swift_sdk_module(["SwiftUI"], "View"), Some("SwiftUI"));
+        assert_eq!(swift_sdk_module(std::iter::empty::<&str>(), "URL"), None);
     }
 }

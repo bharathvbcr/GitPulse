@@ -32,17 +32,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub mod json;
+pub mod records;
 pub mod schema;
 pub mod workbench;
 
-/// The lease-schema revision this build understands.
+/// The state-schema revision this build understands.
 ///
-/// It is asserted by the Go client's health check rather than merely reported.
-/// A harness binary and a store binary that disagree about the schema is the
-/// failure that produces a confident wrong answer — a lease read through the
-/// wrong column layout — so the mismatch is caught at the boundary instead of
-/// surfacing later as data that looks valid.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Aligned with Python `storage/db.py` (`SCHEMA_VERSION = 9`) so a store
+/// written by either side reports one number. It is asserted by the Go
+/// client's health check rather than merely reported. A harness binary and a
+/// store binary that disagree about the schema is the failure that produces a
+/// confident wrong answer — a lease read through the wrong column layout — so
+/// the mismatch is caught at the boundary instead of surfacing later as data
+/// that looks valid. Opening a database whose `schema_version` row is *newer*
+/// than this constant fails closed.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The ceiling on one task's agent-appended scope.
 ///
@@ -112,6 +116,13 @@ pub enum StoreError {
     /// believes it holds a task it does not — and an unbounded one walks the
     /// epoch arithmetic off i64.
     BadTtl { ttl_seconds: i64 },
+    /// The database's `schema_version` is newer than this binary knows. Fail
+    /// closed rather than inventing columns: a newer writer may have laid out
+    /// tables this build cannot read correctly.
+    SchemaTooNew { found: u32, known: u32 },
+    /// `schema_version` could not be read or written. Distinct from Sql so a
+    /// caller sees the precondition failure rather than a generic SQLite line.
+    SchemaVersion { detail: String },
 }
 
 /// The longest TTL this store will mint, in seconds. Long enough for any real
@@ -149,6 +160,13 @@ impl std::fmt::Display for StoreError {
                 f,
                 "unusable ttl {ttl_seconds}s: must be between 1 and {MAX_TTL_SECONDS} seconds"
             ),
+            StoreError::SchemaTooNew { found, known } => write!(
+                f,
+                "unsupported DevCouncil schema version {found}; this binary knows {known}"
+            ),
+            StoreError::SchemaVersion { detail } => {
+                write!(f, "schema_version precondition failed: {detail}")
+            },
         }
     }
 }
@@ -304,6 +322,21 @@ impl Store {
         // comment into a precondition.
         schema::verify_exclusion_index(&conn)
             .map_err(|detail| StoreError::ExclusionIndex { detail })?;
+        schema::ensure_schema_version(&conn, SCHEMA_VERSION).map_err(|detail| {
+            if let Some(rest) = detail.strip_prefix("unsupported DevCouncil schema version ") {
+                let found = rest
+                    .split(';')
+                    .next()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                StoreError::SchemaTooNew {
+                    found,
+                    known: SCHEMA_VERSION,
+                }
+            } else {
+                StoreError::SchemaVersion { detail }
+            }
+        })?;
         Ok(Store { conn, now_fn: None })
     }
 
@@ -826,6 +859,76 @@ impl Store {
         Ok(out)
     }
 
+    /// Appends one evidence row. See [`records::evidence_append`].
+    pub fn evidence_append(
+        &self,
+        kind: &str,
+        task_id: Option<&str>,
+        requirement_id: Option<&str>,
+        acceptance_criterion_id: Option<&str>,
+        data_json: &str,
+    ) -> Result<i64> {
+        records::evidence_append(
+            &self.conn,
+            kind,
+            task_id,
+            requirement_id,
+            acceptance_criterion_id,
+            data_json,
+        )
+    }
+
+    /// Lists evidence rows (newest first). See [`records::evidence_list`].
+    pub fn evidence_list(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<(Vec<records::EvidenceRow>, bool)> {
+        records::evidence_list(&self.conn, task_id)
+    }
+
+    /// Lists gaps. See [`records::gaps_list`].
+    pub fn gaps_list(&self, task_id: Option<&str>) -> Result<(Vec<records::GapRow>, bool)> {
+        records::gaps_list(&self.conn, task_id)
+    }
+
+    /// Upserts one gap. See [`records::gap_upsert`].
+    pub fn gap_upsert(&self, gap: &records::GapRow) -> Result<()> {
+        records::gap_upsert(&self.conn, gap)
+    }
+
+    /// Replaces every gap for a task. See [`records::gaps_replace`].
+    pub fn gaps_replace(&self, task_id: &str, gaps: &[records::GapRow]) -> Result<()> {
+        records::gaps_replace(&self.conn, task_id, gaps)
+    }
+
+    /// Records a verification run. See [`records::run_record`].
+    pub fn run_record(&self, run: &records::VerificationRun) -> Result<()> {
+        records::run_record(&self.conn, run)
+    }
+
+    /// Reads a verification run by id.
+    pub fn run_get(&self, id: &str) -> Result<Option<records::VerificationRun>> {
+        records::run_get(&self.conn, id)
+    }
+
+    /// Lists verification runs (newest first). See [`records::runs_list`].
+    pub fn runs_list(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<(Vec<records::VerificationRun>, bool)> {
+        records::runs_list(&self.conn, task_id)
+    }
+
+    /// Records an agent handoff. See [`records::handoff_record`].
+    pub fn handoff_record(&self, handoff: &records::AgentHandoff) -> Result<()> {
+        records::handoff_record(&self.conn, handoff)
+    }
+
+    /// Reads an agent handoff by id.
+    pub fn handoff_get(&self, id: &str) -> Result<Option<records::AgentHandoff>> {
+        records::handoff_get(&self.conn, id)
+    }
+
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
@@ -1147,7 +1250,7 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     #[test]

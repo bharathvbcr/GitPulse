@@ -208,6 +208,54 @@ pub const IMPORTS: u8 = Capability::Imports as u8;
 pub const REFERENCES: u8 = Capability::References as u8;
 pub const HERITAGE: u8 = Capability::Heritage as u8;
 
+/// What a file-level liveness question is asked *about* in this language.
+///
+/// "Nothing imports this file" is a finding in Python and a category error in
+/// Markdown, and until this column existed the difference was decided by
+/// [`crate::model::Extraction::grammar_read_this_file`] — a question about
+/// which engine ran. That worked only by coincidence: prose is excluded from
+/// `unwired_candidates` because no grammar reads it, so the day a YAML or JSON
+/// grammar is linked, every `.md`-adjacent data file in every repository
+/// becomes a delete-this suggestion again. Which engine ran and whether the
+/// file can be stranded are different questions, and this is the second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LivenessUnit {
+    /// One file is one module: another file can name it, so "nothing names it"
+    /// is a question with an answer.
+    Module,
+    /// The directory is the unit the toolchain uses, and **this build resolves
+    /// nothing at that level**. No statement an author could write names one
+    /// `.tf` file, and no synthetic directory node stands in for it, so a
+    /// per-file verdict is vacuous however the graph turns out.
+    ///
+    /// Go is deliberately *not* here even though a Go package is a directory,
+    /// and the difference is that the resolver does emit a
+    /// `package:<dir>/<pkg>` node for it: `unwired_candidates` reads that node
+    /// back, so a file in an imported package is cleared and a package nothing
+    /// imports is still reported. Marking Go `Directory` would blanket-exempt
+    /// every Go file and delete that second finding, which
+    /// `a_go_package_nothing_imports_is_still_a_candidate` refuses.
+    Directory,
+    /// Prose, data or configuration. It declares nothing that could be
+    /// stranded, and nothing imports it because there is nothing to import.
+    Data,
+}
+
+impl LivenessUnit {
+    /// The wording a `NotCode` verdict carries for this unit.
+    ///
+    /// Only `Data` has one — the other two are not exclusions — so this
+    /// returns `None` rather than a placeholder sentence for them.
+    pub fn not_code_reason(self) -> Option<&'static str> {
+        match self {
+            LivenessUnit::Data => {
+                Some("prose, data or configuration: it declares nothing that could be stranded")
+            }
+            LivenessUnit::Module | LivenessUnit::Directory => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LanguageSpec {
     pub name: &'static str,
@@ -225,6 +273,11 @@ pub struct LanguageSpec {
     /// and the parity test compares field by field, so this one is invisible
     /// to it by construction rather than by an exemption.
     pub capabilities: Capabilities,
+    /// What a file-level liveness verdict means here. See [`LivenessUnit`].
+    ///
+    /// Invisible to the frozen-registry parity test for the same reason
+    /// `capabilities` is: Python declared no such thing.
+    pub liveness_unit: LivenessUnit,
 }
 
 pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
@@ -237,6 +290,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "typescript",
         viz_color: "#3178c6",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "TSX",
@@ -247,6 +301,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "typescript",
         viz_color: "#3178c6",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "JavaScript",
@@ -257,6 +312,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "javascript",
         viz_color: "#f7df1e",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "ArkTS",
@@ -267,6 +323,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "typescript",
         viz_color: "#002b36",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Python",
@@ -277,6 +334,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "python",
         viz_color: "#3572A5",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Go",
@@ -287,6 +345,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "gopls",
         viz_color: "#00ADD8",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Rust",
@@ -297,6 +356,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "rust-analyzer",
         viz_color: "#dea584",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Java",
@@ -307,6 +367,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "jdtls",
         viz_color: "#b07219",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "C#",
@@ -317,6 +378,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "omnisharp",
         viz_color: "#178600",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "VB.NET",
@@ -327,6 +389,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "vbnet",
         viz_color: "#945db7",
         capabilities: Capabilities::NONE,
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "PHP",
@@ -337,6 +400,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "intelephense",
         viz_color: "#4F5D95",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Ruby",
@@ -347,6 +411,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "solargraph",
         viz_color: "#701516",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "C",
@@ -357,6 +422,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "clangd",
         viz_color: "#555555",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "C++",
@@ -367,6 +433,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "clangd",
         viz_color: "#f34b7d",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Objective-C",
@@ -377,6 +444,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "clangd",
         viz_color: "#438eff",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Metal",
@@ -387,6 +455,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "clangd",
         viz_color: "#8f14e9",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "CUDA",
@@ -397,6 +466,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "clangd",
         viz_color: "#3A4E3A",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Swift",
@@ -406,7 +476,8 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Swift,
         lsp_id: "sourcekit-lsp",
         viz_color: "#F05138",
-        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Kotlin",
@@ -417,6 +488,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "kotlin-language-server",
         viz_color: "#A97BFF",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Scala",
@@ -427,6 +499,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "metals",
         viz_color: "#c22d40",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Dart",
@@ -437,6 +510,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "dart-analysis-server",
         viz_color: "#00B4AB",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Svelte",
@@ -447,6 +521,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "svelte-language-server",
         viz_color: "#ff3e00",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Vue",
@@ -465,6 +540,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "volar",
         viz_color: "#41b883",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Astro",
@@ -475,6 +551,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "astro-ls",
         viz_color: "#ff5a03",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Liquid",
@@ -485,6 +562,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "theme-check",
         viz_color: "#67b8de",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Pascal/Delphi",
@@ -495,6 +573,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "pascal-lsp",
         viz_color: "#E3F171",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Lua",
@@ -505,6 +584,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "lua-language-server",
         viz_color: "#000080",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Luau",
@@ -515,6 +595,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "luau-lsp",
         viz_color: "#00A2FF",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "R",
@@ -525,6 +606,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "r-languageserver",
         viz_color: "#198CE7",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "CFML",
@@ -535,6 +617,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "cfls",
         viz_color: "#224f80",
         capabilities: Capabilities::new(IMPORTS),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "COBOL",
@@ -545,6 +628,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "cobol-ls",
         viz_color: "#005ca5",
         capabilities: Capabilities::NONE,
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Erlang",
@@ -555,6 +639,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "erlang-ls",
         viz_color: "#B83998",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Solidity",
@@ -565,6 +650,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "solc",
         viz_color: "#AA6746",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
+        liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
         name: "Terraform/OpenTofu",
@@ -575,6 +661,12 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "terraform-ls",
         viz_color: "#5C4EE5",
         capabilities: Capabilities::new(IMPORTS | REFERENCES),
+        // A Terraform *directory* is the module. `terraform apply` reads every
+        // `.tf` in one folder as one body, and there is no statement an author
+        // could write that names a single file in it — so "nothing imports
+        // `main.tf`" is true of every well-formed Terraform repository and is
+        // never a finding.
+        liveness_unit: LivenessUnit::Directory,
     },
     LanguageSpec {
         name: "Nix",
@@ -585,6 +677,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         lsp_id: "nil",
         viz_color: "#7e71de",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        liveness_unit: LivenessUnit::Module,
     },
 ];
 
@@ -680,25 +773,52 @@ pub fn detect_language(path: &Path) -> &'static str {
 /// Public so `language_capabilities.rs` can require a probe for each, the way it
 /// already does for the registry. It could not before, and the notebook row was
 /// wrong for as long as nothing looked at it.
-pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
-    ("shell", Capabilities::new(CALLS | REFERENCES)),
-    ("sql", Capabilities::new(CALLS | REFERENCES)),
+/// One row carries both facts on purpose. A second table keyed on the same
+/// grammar names is a second place to forget a row, and the two would then
+/// disagree about a language rather than about a field —
+/// `every_reachable_grammar_declares_capabilities` can only catch the one it
+/// iterates.
+pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities, LivenessUnit)] = &[
+    (
+        "shell",
+        Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        LivenessUnit::Module,
+    ),
+    // A `.sql` file is code: a grammar reads it, it declares views and
+    // procedures, and a migration runner or an application names it. It has no
+    // *import* extractor, which is a capability gap and is charged as one —
+    // deliberately not folded in here, because "we cannot see imports in SQL"
+    // and "SQL cannot be stranded" are different claims with different
+    // remedies, and `only_source_files_are_charged_as_import_blind` pins the
+    // first.
+    (
+        "sql",
+        Capabilities::new(CALLS | REFERENCES),
+        LivenessUnit::Module,
+    ),
     // No linked grammar. Both reach `crate::fallback`, which recovers
     // declarations by line pattern and by construction extracts nothing else —
     // already charged to coverage as `PatternRecovered`.
-    ("protobuf", Capabilities::NONE),
-    ("powershell", Capabilities::NONE),
+    ("protobuf", Capabilities::NONE, LivenessUnit::Module),
+    ("powershell", Capabilities::NONE, LivenessUnit::Module),
     // Prose, data and config. No grammar is wanted and none will come; these
     // report `ExtractionEngine::NotApplicable` and are excluded from coverage
     // by `Extraction::is_parse_failure`.
-    ("markdown", Capabilities::NONE),
-    ("json", Capabilities::NONE),
-    ("yaml", Capabilities::NONE),
-    ("toml", Capabilities::NONE),
-    ("html", Capabilities::NONE),
-    ("css", Capabilities::NONE),
-    ("config", Capabilities::NONE),
-    ("generic", Capabilities::NONE),
+    //
+    // `LivenessUnit::Data` is what keeps them out of `unwired_candidates`, and
+    // it is a claim about the *format* rather than about which engine ran. The
+    // exclusion used to ride on `grammar_read_this_file()`, so linking a YAML
+    // or JSON grammar would have re-created the historical bug in which every
+    // `.md`, `.json` and `.yaml` in every repository was a delete-this
+    // suggestion.
+    ("markdown", Capabilities::NONE, LivenessUnit::Data),
+    ("json", Capabilities::NONE, LivenessUnit::Data),
+    ("yaml", Capabilities::NONE, LivenessUnit::Data),
+    ("toml", Capabilities::NONE, LivenessUnit::Data),
+    ("html", Capabilities::NONE, LivenessUnit::Data),
+    ("css", Capabilities::NONE, LivenessUnit::Data),
+    ("config", Capabilities::NONE, LivenessUnit::Data),
+    ("generic", Capabilities::NONE, LivenessUnit::Data),
     // A notebook is re-parsed with its kernel's grammar, so its capabilities
     // are that grammar's, resolved per file rather than declared here.
     //
@@ -717,7 +837,7 @@ pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
     // [`crate::model::Extraction::capabilities`] is the resolver this comment
     // always described, and every production charge site asks it. This row is
     // the fail-closed answer for a caller holding only the string.
-    ("notebook", Capabilities::NONE),
+    ("notebook", Capabilities::NONE, LivenessUnit::Module),
 ];
 
 /// What the extractor can observe in `language`, where `language` is the
@@ -737,9 +857,88 @@ pub fn capabilities_for_language(language: &str) -> Capabilities {
     }
     NON_REGISTRY_CAPABILITIES
         .iter()
-        .find(|(name, _)| *name == language)
-        .map(|(_, caps)| *caps)
+        .find(|(name, _, _)| *name == language)
+        .map(|(_, caps, _)| *caps)
         .unwrap_or(Capabilities::NONE)
+}
+
+/// What a file-level liveness verdict means for `language`, where `language`
+/// is the **grammar** string `detect_language` returns.
+///
+/// The canonical owner, for the same reason [`capabilities_for_language`] is
+/// one: `unwired_candidates`, `files_wholly_inside_clusters` and
+/// `analyze_liveness` each used to decide separately which files could be
+/// called dead, and three copies of a rule are three chances to disagree about
+/// a README.
+///
+/// An unrecognised language is [`LivenessUnit::Module`], which is fail-*open*
+/// for this rule and deliberately so: the cost of a wrong `Module` is one more
+/// finding a reader can dismiss, and the cost of a wrong `Data` is a finding
+/// that is never shown. `wiring::config_entry_point_symbols` takes the same
+/// direction for the same reason.
+pub fn liveness_unit_for_language(language: &str) -> LivenessUnit {
+    if let Some(spec) = LANGUAGE_SPECS.iter().find(|s| s.grammar == language) {
+        return spec.liveness_unit;
+    }
+    NON_REGISTRY_CAPABILITIES
+        .iter()
+        .find(|(name, _, _)| *name == language)
+        .map(|(_, _, unit)| *unit)
+        .unwrap_or(LivenessUnit::Module)
+}
+
+/// Why this path is data whatever grammar reads it, or `None`.
+///
+/// The language table answers for a *format*; this answers for the handful of
+/// paths whose format lies about them. `infra/.terraform.lock.hcl` parses as
+/// HCL and declares `provider` blocks, so every gate that asks the engine says
+/// "a grammar read this" and reports a lockfile as a stranded module. The same
+/// shape covers `package-lock.json` — excluded today only because no JSON
+/// grammar is linked — and every `.env`, which is credentials rather than
+/// code.
+///
+/// Matched on the **basename**, lowercased, so `Config/.ENV.Production` is the
+/// same file as `config/.env.production`. Directory position is not consulted:
+/// a lockfile is a lockfile wherever it is checked in.
+///
+/// Deliberately narrow. Each arm names a file kind whose whole purpose is to
+/// be machine-written or machine-read, because the verdict it produces —
+/// `FileLiveness::NotCode` — takes the path out of every liveness answer at
+/// once. A suffix that is merely *suggestive* of data would hide real findings.
+pub fn non_code_path_reason(path: &str) -> Option<&'static str> {
+    let normalized = path.replace('\\', "/");
+    let name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    // `.env`, `.env.production`, `.envrc` — and `prod.env` / `x.env`, which is
+    // the same file under the other naming convention. A file merely *named*
+    // `env` is not one: without the dot there is no delimiter, and
+    // `environment.ts` must stay code.
+    if name.starts_with(".env") || name.ends_with(".env") {
+        return Some("an environment file: values a process reads, never code");
+    }
+    // `Cargo.lock`, `flake.lock`, `poetry.lock`, `.terraform.lock.hcl`,
+    // `package-lock.json`. The `-lock.<ext>` spelling is npm's and pnpm's; the
+    // `.lock.<ext>` one is Terraform's.
+    if name.ends_with(".lock")
+        || name.contains(".lock.")
+        || name.contains("-lock.")
+        || name == "gemfile.lock"
+    {
+        return Some("a lockfile: resolved dependency versions written by a tool");
+    }
+    // Terraform variable *values*. The `.tf` files in the directory read them;
+    // nothing imports one, and unlike a `.tf` file it declares no resources at
+    // all, so it is data rather than a directory unit.
+    if name.ends_with(".tfvars") || name.ends_with(".tfvars.json") {
+        return Some("Terraform variable values: data the directory's modules read");
+    }
+    None
 }
 
 /// Whether `language` is one this build has a capability row for at all.
@@ -752,7 +951,7 @@ pub fn language_capability_is_declared(language: &str) -> bool {
     LANGUAGE_SPECS.iter().any(|s| s.grammar == language)
         || NON_REGISTRY_CAPABILITIES
             .iter()
-            .any(|(name, _)| *name == language)
+            .any(|(name, _, _)| *name == language)
 }
 
 /// Every language id this build declares, deduplicated and sorted.
@@ -767,7 +966,7 @@ pub fn declared_language_ids() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = LANGUAGE_SPECS
         .iter()
         .map(|spec| spec.grammar)
-        .chain(NON_REGISTRY_CAPABILITIES.iter().map(|(name, _)| *name))
+        .chain(NON_REGISTRY_CAPABILITIES.iter().map(|(name, _, _)| *name))
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -777,6 +976,11 @@ pub fn declared_language_ids() -> Vec<&'static str> {
 /// Whether a relative path is inside a VCS, build, environment, or devmap-owned
 /// namespace. This is the shared admission boundary for cold walks and live
 /// watcher events.
+///
+/// Also applies [`is_default_index_excluded`] — fixtures under `testdata/` and
+/// vendored grammar C under `vendor/grammars/` are not program text this index
+/// should charge as coverage loss. Override or extend via
+/// [`INDEX_EXCLUDES_ENV`].
 pub fn is_ignored_path(rel_path: &str) -> bool {
     let norm = rel_path.replace('\\', "/");
     if norm.is_empty() {
@@ -815,7 +1019,125 @@ pub fn is_ignored_path(rel_path: &str) -> bool {
             return true;
         }
     }
+    if is_default_index_excluded(&norm) {
+        return true;
+    }
     false
+}
+
+/// Environment variable naming extra path prefixes to exclude from discovery.
+///
+/// Comma-separated repo-relative prefixes (forward slashes). Empty components
+/// are ignored. Documented so hosts can widen the default without patching the
+/// binary; the defaults themselves are [`DEFAULT_INDEX_EXCLUDE_PREFIXES`] and
+/// the `testdata` directory-segment rule.
+pub const INDEX_EXCLUDES_ENV: &str = "DEVMAP_INDEX_EXCLUDES";
+
+/// Built-in path prefixes excluded from indexing (in addition to a `testdata`
+/// directory segment anywhere in the path).
+///
+/// `vendor/grammars` holds tree-sitter C sources — including multi-megabyte
+/// generated parsers — that are build inputs for this tool, not corpus for it.
+pub const DEFAULT_INDEX_EXCLUDE_PREFIXES: &[&str] = &["vendor/grammars"];
+
+/// Whether `rel_path` matches the default (or env-extended) index exclusions.
+///
+/// A `testdata` *directory* segment is always excluded — fixtures are not
+/// coverage. A file *named* `testdata` at the leaves is not, matching the
+/// fixture-path rule elsewhere.
+pub fn is_default_index_excluded(rel_path: &str) -> bool {
+    let norm = rel_path.replace('\\', "/").to_lowercase();
+    let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() >= 2 && segments[..segments.len() - 1].iter().any(|s| *s == "testdata") {
+        return true;
+    }
+    for prefix in DEFAULT_INDEX_EXCLUDE_PREFIXES {
+        if norm == *prefix || norm.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+    }
+    if let Ok(extra) = std::env::var(INDEX_EXCLUDES_ENV) {
+        for raw in extra.split(',') {
+            let prefix = raw.trim().trim_matches('/').to_lowercase();
+            if prefix.is_empty() {
+                continue;
+            }
+            if norm == prefix || norm.starts_with(&format!("{prefix}/")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The Swift *module* a file belongs to, derived from its path.
+///
+/// A Swift target is a module: every file under it shares one unqualified
+/// namespace, and `import MarkDevKit` names that module, not a file. Same-module
+/// files import each other not at all — the Java-package / Go-package shape.
+///
+/// Derived from the path, not from a build graph this kernel does not read:
+///
+/// * `Sources/<Name>/…` and `Tests/<Name>/…` (Swift Package Manager) → `Name`
+/// * otherwise skip generic containers (`app`, `src`, `lib`, platform folders)
+///   and take the next directory (`app/MarkDevKit/Editor/Foo.swift` → `MarkDevKit`)
+///
+/// The container list is a *path convention*, not a reserved module name.
+/// SPM packages routinely call the target `App` or `Lib`; those sit in
+/// `Sources/App` and `Sources/Lib`, and treating them as the same `app`/`lib`
+/// folders the fallback skips left every file in those modules without a
+/// module identity. Same-module lookup then never fired, and a bare `run()`
+/// fell through to AmbiguousGlobal against every other `run` in the corpus.
+///
+/// `Package.swift` is a manifest, not a module member. A `.swift` file with no
+/// remaining directory after those rules belongs to no module this function
+/// can name, and same-module lookup simply does not fire for it.
+pub fn swift_module_of(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    if !path.ends_with(".swift") {
+        return None;
+    }
+    let filename = path.rsplit('/').next().unwrap_or(&path);
+    if filename == "Package.swift" {
+        return None;
+    }
+    let mut dirs: Vec<&str> = path.split('/').collect();
+    dirs.pop();
+    for (index, segment) in dirs.iter().enumerate() {
+        if matches!(*segment, "Sources" | "Tests") {
+            if let Some(name) = dirs.get(index + 1).copied().filter(|name| !name.is_empty()) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    let remaining: Vec<&str> = dirs
+        .into_iter()
+        .filter(|segment| !is_swift_generic_container(segment))
+        .collect();
+    remaining
+        .first()
+        .copied()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn is_swift_generic_container(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "app"
+            | "src"
+            | "lib"
+            | "ios"
+            | "macos"
+            | "osx"
+            | "watchos"
+            | "tvos"
+            | "ipados"
+            | "visionos"
+            | "catalyst"
+            | "tests"
+            | "sources"
+    )
 }
 
 /// Whether a relative path should be indexed as source (not binary / build noise).
@@ -1056,5 +1378,33 @@ mod tests {
                 "{path} must reach extraction to be recoverable by tier 2"
             );
         }
+    }
+
+    #[test]
+    fn swift_module_of_follows_spm_then_the_target_directory() {
+        assert_eq!(
+            swift_module_of("Sources/App/main.swift").as_deref(),
+            Some("App")
+        );
+        assert_eq!(
+            swift_module_of("Sources/Lib/Core.swift").as_deref(),
+            Some("Lib"),
+            "SPM module names are not the app/src/lib path convention"
+        );
+        assert_eq!(
+            swift_module_of("Tests/AppTests/AppTests.swift").as_deref(),
+            Some("AppTests")
+        );
+        assert_eq!(
+            swift_module_of("app/MarkDevKit/Editor/Foo.swift").as_deref(),
+            Some("MarkDevKit")
+        );
+        assert_eq!(
+            swift_module_of("desktop/Sources/Tauri/Host.swift").as_deref(),
+            Some("Tauri")
+        );
+        assert_eq!(swift_module_of("Package.swift"), None);
+        assert_eq!(swift_module_of("Main.swift"), None);
+        assert_eq!(swift_module_of("src/lib.rs"), None);
     }
 }

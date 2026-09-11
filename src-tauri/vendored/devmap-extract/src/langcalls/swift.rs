@@ -114,6 +114,14 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
                 return swift_navigation_call(target, source);
             }
             let (callee_name, receiver) = split_call_target(target, source)?;
+            // `defer { cleanup() }` parses as a call whose callee is the
+            // keyword `defer` and whose argument is a trailing closure. Swift
+            // reserves the name, so this cannot be a function the repository
+            // declared; recording it produced hundreds of unresolved sites
+            // that meant "the file uses defer", not "defer was never found".
+            if callee_name == "defer" {
+                return None;
+            }
             Some(SwiftCall {
                 callee_name,
                 receiver_expr: receiver.as_deref().and_then(clamp_receiver),

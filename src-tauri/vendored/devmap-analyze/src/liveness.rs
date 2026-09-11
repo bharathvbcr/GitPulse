@@ -1534,12 +1534,36 @@ pub fn analyze_liveness_with_coverage(
             .filter(|w| w.target_symbol == ext.file_path)
             .collect();
 
+        // Deliberately **narrower** than `Extraction::file_liveness()`'s
+        // exempt set, and the difference is the same one `TargetRoot` was
+        // introduced for. A file-level exemption says nothing reaches the
+        // *file*; this list exempts every symbol *in* it. `TargetRoot`,
+        // `ToolConfig`, `PackageMarker`, `AmbientDeclaration` and
+        // `DirectoryUnit` are all claims about the file, and an unused helper
+        // somebody tucked inside a `src/bin/tool.rs` or a `noxfile.py` is
+        // exactly as dead as one anywhere else —
+        // `test_runtime_entry_points_are_exempt_without_exempting_their_file`
+        // exists to refuse that widening.
+        //
+        // What the canonical predicate *is* consulted for is `NotCode`. A
+        // Markdown or YAML file declares nothing, so today the branch is
+        // vacuous; it is here because the rule is "a file outside the liveness
+        // population is outside every liveness verdict", and leaving one
+        // surface to rediscover that the day a YAML grammar is linked is how
+        // the three surfaces disagreed in the first place.
         let is_file_exempt = is_parse_failed
+            || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
             || file_wiring.iter().any(|w| {
                 matches!(
                     w.kind,
                     WiringKind::Vendored
                         | WiringKind::TestFile
+                        // Fixture data, golden output and examples are test
+                        // material under another name, and `is_test_path` does
+                        // not know those directories — it is pinned equal to
+                        // the Python rule. Same verdict as `TestFile`, for both
+                        // the file and its symbols.
+                        | WiringKind::Fixture
                         | WiringKind::GeneratedFile
                         | WiringKind::ScriptEntry
                         | WiringKind::StructuralExempt

@@ -158,6 +158,18 @@ describe("TaskBoard", () => {
     expect(source).not.toMatch(/\bbackdrop-blur-/);
   });
 
+  it("puts workspace names in the same label span All and repositories already use", () => {
+    // The liquid selection pill is position:absolute; inset:0. In-flow text
+    // paints under it and disappears — the screenshot failure was an empty
+    // dark pill with only the ⋯ edit control. All and repositories wrap their
+    // labels in a span so `.gp-liquid-tabs .gp-seg-btn > span` can lift them.
+    expect(source).toContain("{@render scopeSelection(scope.kind === \"global\")}<span>All</span>");
+    expect(source).toMatch(
+      /scope\.kind === "workspace" && scope\.id === group\.id\)\}<span>\{group\.icon\} \{group\.name\}/,
+    );
+    expect(source).toContain("{@render scopeSelection(scope.kind === \"repository\" && scope.id === repo.id)}<span>{repo.name}</span>");
+  });
+
   it("keeps open tasks in a tab strip with a close control beside each tab", () => {
     expect(source).toContain('role="tablist"');
     expect(source).toContain('aria-label="Open tasks"');
@@ -173,5 +185,6 @@ describe("TaskBoard", () => {
     expect(strip).toContain('role="tab"');
     expect(strip).toContain('data-testid="task-tab-close"');
     expect(strip.indexOf("</div>")).toBeLessThan(strip.indexOf('data-testid="task-tab-close"'));
+    expect(source).toContain("var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)))");
   });
 });

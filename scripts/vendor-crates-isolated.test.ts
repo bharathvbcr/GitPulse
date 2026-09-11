@@ -17,12 +17,20 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const SOURCE_TABLE = [
-  { id: "manvi", workspace: "crates", crateBase: "crates", crates: ["dc-glob", "dc-store", "dc-verify"] },
   {
     id: "devcouncil",
     workspace: "rust-port",
     crateBase: "rust-port/crates",
-    crates: ["devmap-analyze", "devmap-extract", "devmap-query", "devmap-resolve", "devmap-store"],
+    crates: [
+      "dc-glob",
+      "dc-store",
+      "dc-verify",
+      "devmap-analyze",
+      "devmap-extract",
+      "devmap-query",
+      "devmap-resolve",
+      "devmap-store",
+    ],
   },
 ] as const;
 
@@ -79,7 +87,6 @@ function fixture() {
   const env = {
     ...process.env,
     GITPULSE_ALLOW_DRIFT: "0",
-    GITPULSE_MANVI_ROOT: roots.manvi,
     GITPULSE_DEVCOUNCIL_ROOT: roots.devcouncil,
     GITPULSE_MARKDEV_ROOT: roots.markdev,
   };
@@ -109,7 +116,7 @@ describe("vendor refresh integrity", () => {
       const libraryPath = path.join(f.vendorDir, "dc-glob", "src", "lib.rs");
       const oldManifest = readFileSync(manifestPath, "utf8");
       const oldLibrary = readFileSync(libraryPath, "utf8");
-      writeFileSync(path.join(f.roots.manvi, "crates", "dc-glob", "src", "lib.rs"), "changed before failure\n");
+      writeFileSync(path.join(f.roots.devcouncil, "rust-port", "crates", "dc-glob", "src", "lib.rs"), "changed before failure\n");
       writeFileSync(
         path.join(f.roots.markdev, "core", "Cargo.toml"),
         '[package]\nname = "markdev"\nversion.workspace = true\n',
@@ -127,11 +134,11 @@ describe("vendor refresh integrity", () => {
   it("detects deleted upstream files and resolved Cargo manifest drift", () => {
     const f = fixture();
     try {
-      const crateDir = path.join(f.roots.manvi, "crates", "dc-glob");
+      const crateDir = path.join(f.roots.devcouncil, "rust-port", "crates", "dc-glob");
       const removed = path.join(crateDir, "src", "lib.rs");
       rmSync(removed);
       writeFileSync(
-        path.join(f.roots.manvi, "crates", "Cargo.toml"),
+        path.join(f.roots.devcouncil, "rust-port", "Cargo.toml"),
         '[workspace]\n[workspace.package]\nversion = "2.0.0"\n',
       );
 
@@ -167,7 +174,7 @@ describe("vendor refresh integrity", () => {
       const untouched = path.join(f.vendorDir, "markdev", "src", "lib.rs");
       const oldUntouched = readFileSync(untouched, "utf8");
       writeFileSync(
-        path.join(f.roots.manvi, "crates", "dc-glob", "src", "lib.rs"),
+        path.join(f.roots.devcouncil, "rust-port", "crates", "dc-glob", "src", "lib.rs"),
         "pub const GENERATION: usize = 2;\n",
       );
       const result = spawnSync(
@@ -177,8 +184,7 @@ describe("vendor refresh integrity", () => {
           encoding: "utf8",
           env: {
             ...process.env,
-            GITPULSE_MANVI_ROOT: f.roots.manvi,
-            GITPULSE_DEVCOUNCIL_ROOT: "/missing/devcouncil",
+            GITPULSE_DEVCOUNCIL_ROOT: f.roots.devcouncil,
             GITPULSE_MARKDEV_ROOT: "/missing/markdev",
           },
         },
@@ -198,7 +204,7 @@ describe("vendor refresh integrity", () => {
       const before = readFileSync(manifest, "utf8");
       const outside = path.join(f.root, "outside.rs");
       writeFileSync(outside, "external bytes\n");
-      symlinkSync(outside, path.join(f.roots.manvi, "crates", "dc-glob", "src", "escape.rs"));
+      symlinkSync(outside, path.join(f.roots.devcouncil, "rust-port", "crates", "dc-glob", "src", "escape.rs"));
       const result = f.run();
       expect(result.status).toBe(2);
       expect(result.stderr).toMatch(/symbolic link|symlink/i);
@@ -233,8 +239,8 @@ describe("vendor refresh integrity", () => {
             const beforeTree = snapshotTree(f.vendorDir);
             const cargo =
               location === "workspace"
-                ? path.join(f.roots.manvi, "crates", "Cargo.toml")
-                : path.join(f.roots.manvi, "crates", "dc-glob", "Cargo.toml");
+                ? path.join(f.roots.devcouncil, "rust-port", "Cargo.toml")
+                : path.join(f.roots.devcouncil, "rust-port", "crates", "dc-glob", "Cargo.toml");
             const original = readFileSync(cargo, "utf8");
             rmSync(cargo);
             if (shape === "symlink") {
@@ -270,7 +276,7 @@ describe("vendor refresh integrity", () => {
   it("accepts a regular workspace manifest at the byte limit", () => {
     const f = fixture();
     try {
-      const cargo = path.join(f.roots.manvi, "crates", "Cargo.toml");
+      const cargo = path.join(f.roots.devcouncil, "rust-port", "Cargo.toml");
       const prefix = `${readFileSync(cargo, "utf8")}\n#`;
       writeFileSync(cargo, `${prefix}${"x".repeat(MAX_MANIFEST_BYTES - Buffer.byteLength(prefix))}`);
       expect(lstatSync(cargo).size).toBe(MAX_MANIFEST_BYTES);
@@ -289,7 +295,8 @@ describe("sibling discovery", () => {
       const canonical = path.join(root, "Code", "devtools", "GitPulse");
       const worktree = path.join(root, ".codex", "worktrees", "task", "GitPulse");
       mkdirSync(canonical, { recursive: true });
-      for (const sibling of ["Manvi", "DevCouncil", "MarkDev"]) {
+      // dc-* origin is DevCouncil (Phase 3); MarkDev remains the other sibling.
+      for (const sibling of ["DevCouncil", "MarkDev", "Manvi"]) {
         mkdirSync(path.join(root, "Code", "devtools", sibling), { recursive: true });
       }
       execFileSync("git", ["init", "-q", canonical]);
@@ -307,7 +314,7 @@ describe("sibling discovery", () => {
       );
       expect(result.status, result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual(
-        ["Manvi", "DevCouncil", "MarkDev"].map((name) => path.join(root, "Code", "devtools", name)),
+        ["DevCouncil", "MarkDev"].map((name) => path.join(root, "Code", "devtools", name)),
       );
     } finally {
       rmSync(root, { recursive: true, force: true });

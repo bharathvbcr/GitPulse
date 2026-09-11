@@ -5,6 +5,7 @@
  */
 
 import type { DevmapPreviewFileResult, DevmapPreviewReport } from "./types";
+import { boundText, summarizeWalkIncomplete, tooltipWalkIncomplete } from "./walkIncomplete";
 
 /** Per-file marker for the diff rail, sourced from the shared preview call. */
 export type PreviewMarkerKind =
@@ -81,7 +82,9 @@ export function fileHonesty(result: DevmapPreviewFileResult): PreviewFileHonesty
       broken_total: report?.broken_callers.total ?? 0,
       broken_shown: report?.broken_callers.shown ?? 0,
       broken_truncated: report?.broken_callers.truncated ?? false,
-      walk_incomplete: report?.broken_callers.walk_incomplete ?? null,
+      walk_incomplete: summarizeWalkIncomplete([
+        report?.broken_callers.walk_incomplete,
+      ]),
       unreliable: true,
       claim_clean: false,
     };
@@ -122,7 +125,7 @@ export function honestyFromReport(
     broken_total: brokenTotal,
     broken_shown: report.broken_callers.shown,
     broken_truncated: report.broken_callers.truncated,
-    walk_incomplete: report.broken_callers.walk_incomplete ?? null,
+    walk_incomplete: summarizeWalkIncomplete([report.broken_callers.walk_incomplete]),
     unreliable,
     claim_clean,
   };
@@ -133,7 +136,7 @@ export function markerForHonesty(h: PreviewFileHonesty): PreviewMarker {
     return {
       kind: "unavailable",
       label: "?",
-      title: `Preview unavailable: ${h.reason ?? "unknown"}`,
+      title: boundText(`Preview unavailable: ${h.reason ?? "unknown"}`),
       brokenTotal: 0,
     };
   }
@@ -145,11 +148,15 @@ export function markerForHonesty(h: PreviewFileHonesty): PreviewMarker {
       `against=${h.compared_against}`,
     ];
     if (h.degraded_reason) bits.push(`degraded: ${h.degraded_reason}`);
-    if (h.walk_incomplete) bits.push(`walk incomplete: ${h.walk_incomplete}`);
+    if (h.walk_incomplete) {
+      bits.push(
+        `walk incomplete: ${tooltipWalkIncomplete([h.walk_incomplete]) ?? h.walk_incomplete}`,
+      );
+    }
     return {
       kind: "unreliable",
       label: "!",
-      title: `Preview unreliable — not "nothing breaks". ${bits.join("; ")}`,
+      title: boundText(`Preview unreliable — not "nothing breaks". ${bits.join("; ")}`),
       brokenTotal: h.broken_total,
     };
   }

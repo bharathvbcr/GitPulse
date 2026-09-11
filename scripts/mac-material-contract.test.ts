@@ -393,6 +393,153 @@ describe("macOS material", () => {
     expect(css).toMatch(/background-color: rgb\(var\(--c-bg\) \/ var\(--mac-shell-veil\)\)/);
   });
 
+  it("never covers a full-height pane with an opaque --c-bg plate", () => {
+    /*
+     * The token remapping only sees Tailwind `bg-background`. A local
+     * `background: rgb(var(--c-bg))` on a pane-filling root paints over the
+     * window material completely — which is how Resolve looked like the
+     * rest of the app's liquid blur "did not work". Height 100% is the
+     * pane shape; an alpha-less `--c-bg` is the cover. A field or overlay
+     * that is not a pane does not match.
+     */
+    const strays: string[] = [];
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      for (const [, selector, body] of source.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+        if (!/height:\s*100%/.test(body)) continue;
+        if (!/(?:^|;)\s*background(?:-color)?:\s*rgb\(\s*var\(--c-bg\)\s*\)\s*;/.test(body)) continue;
+        strays.push(
+          `${relative(componentsDir, file).split(sep).join("/")}: ${selector.trim()}`,
+        );
+      }
+    }
+    expect(strays).toEqual([]);
+  });
+
+  it("never paints an opaque glass-token fill that bypasses the macOS remap", () => {
+    /*
+     * Same cover as the pane plate, on any local rule: footers, menus,
+     * dialogs that size with `top`/`bottom` instead of `height: 100%`,
+     * and `var(--color-background)` which is authored as opaque `--c-bg`.
+     * `html.macos` only remaps Tailwind `bg-*`. A slash-alpha fill is a
+     * recess; an alpha-less token is a slab. The Save-task black bar was
+     * this shape.
+     */
+    const opaqueToken =
+      /(?:^|;)\s*background(?:-color)?:\s*rgb\(\s*var\(--c-(?:bg|surface|surface-hover)\)\s*\)\s*(?:;|$)/;
+    const opaqueAlias =
+      /(?:^|;)\s*background(?:-color)?:\s*var\(--color-(?:background|surface|surfaceHover)\)\s*(?:;|$)/;
+    const strays: string[] = [];
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      const styleStart = source.indexOf("<style");
+      if (styleStart === -1) continue;
+      const style = source.slice(styleStart);
+      const rel = relative(componentsDir, file).split(sep).join("/");
+      for (const [, selector, body] of style.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+        if (!opaqueToken.test(body) && !opaqueAlias.test(body)) continue;
+        strays.push(`${rel}: ${selector.trim()}`);
+      }
+    }
+    expect(strays).toEqual([]);
+  });
+
+  it("never paints a flex-1 pane with a local opaque hex plate", () => {
+    /*
+     * Same cover as the `--c-bg` plate, spelled as a hex colour the token
+     * remap cannot see. Map used `#141a25` / `#f8fafc` on `.code-map`.
+     * A flex-1 or h-full root is the pane; 3- and 6-digit hex is opaque.
+     * 4- and 8-digit hex already carry alpha, and chips are not panes.
+     */
+    const opaqueHex =
+      /(?:^|;)\s*background(?:-color)?:\s*#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b/;
+    const skip = new Set([
+      "flex",
+      "flex-col",
+      "flex-row",
+      "flex-1",
+      "min-h-0",
+      "min-w-0",
+      "h-full",
+      "w-full",
+      "overflow-hidden",
+      "overflow-auto",
+      "relative",
+      "absolute",
+      "select-none",
+      "select-text",
+      "gp-view",
+      "gp-glass",
+      "gp-scroll",
+      "gp-workspace",
+    ]);
+    const strays: string[] = [];
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      const paneClasses = new Set<string>();
+      for (const [, classes] of source.matchAll(/class="([^"]*)"/g)) {
+        const tokens = classes.split(/\s+/).filter(Boolean);
+        if (!tokens.includes("flex-1") && !tokens.includes("h-full")) continue;
+        for (const token of tokens) {
+          if (!/^[A-Za-z][\w-]*$/.test(token)) continue;
+          if (token.startsWith("bg-") || token.startsWith("text-") || token.startsWith("font-")) continue;
+          if (skip.has(token)) continue;
+          paneClasses.add(token);
+        }
+      }
+      const rel = relative(componentsDir, file).split(sep).join("/");
+      for (const name of paneClasses) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const rule = new RegExp(`\\.${escaped}(?:\\.[\\w-]+)*\\s*\\{([^}]*)\\}`, "g");
+        for (const match of source.matchAll(rule)) {
+          if (opaqueHex.test(match[1])) strays.push(`${rel}: .${name}`);
+        }
+      }
+    }
+    expect([...new Set(strays)]).toEqual([]);
+  });
+
+  it("gives every gp-segmented tablist the liquid tab treatment", () => {
+    /*
+     * The header already crossfades a glass pill between views. A section
+     * strip that stays a flat `gp-segmented` is the same control in a
+     * different material, which is how every page looked unlike the chrome
+     * above it. The class is discovered from the markup so a new tablist
+     * cannot ship without the pill.
+     */
+    const tablists: { file: string; tag: string }[] = [];
+    const missing: string[] = [];
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      const rel = relative(componentsDir, file).split(sep).join("/");
+      for (const match of source.matchAll(/<(?:div|nav)\b[^>]*\bgp-segmented\b[^>]*>/g)) {
+        const tag = match[0];
+        if (!/\brole="tablist"/.test(tag)) continue;
+        tablists.push({ file: rel, tag });
+        if (!/\bgp-liquid-tabs\b/.test(tag)) missing.push(rel);
+      }
+    }
+    expect(tablists.length, "no gp-segmented tablist was found").toBeGreaterThanOrEqual(2);
+    expect(missing).toEqual([]);
+  });
+
+  it("lets native liquid blur through the status bar the same way as other chrome", () => {
+    // Same cover the Resolve pane used: a near-opaque fill (or a promoted
+    // compositor layer) makes the window material look like it "did not
+    // work". The status bar is chrome, so it must not grow its own CSS
+    // filter either — that is the float-tier rule above.
+    const source = readFileSync(
+      new URL("../src/lib/components/StatusBar.svelte", import.meta.url),
+      "utf8",
+    );
+    const footer = source.match(/<footer[\s\S]*?class="([^"]+)"/)?.[1];
+    const tokens = footer?.split(/\s+/) ?? [];
+    expect(tokens).toContain("gp-glass");
+    expect(tokens).toContain("bg-surface");
+    expect(tokens.some((token) => token.startsWith("bg-surface/"))).toBe(false);
+    expect(tokens).not.toContain("gp-gpu");
+  });
+
   it("paints the repository strip denser than shared chrome so tab labels stay readable", () => {
     const rule = css.match(
       /html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/,

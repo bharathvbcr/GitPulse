@@ -1092,7 +1092,7 @@
 
   {#if tasksMounted}
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("tasks", error)}>
-      <div class="flex-1 flex flex-col min-h-0" class:hidden={$interfaceStore.globalSurface !== "tasks"}>
+      <div class="gp-workspace flex-1 flex flex-col min-h-0 bg-background gp-pane" class:hidden={$interfaceStore.globalSurface !== "tasks"}>
         <LazyView load={loadTaskBoard} name="Tasks" props={{ active: $interfaceStore.globalSurface === "tasks" }} />
       </div>
     </svelte:boundary>

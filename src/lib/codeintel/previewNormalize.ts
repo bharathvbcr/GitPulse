@@ -13,6 +13,7 @@ import type {
   DevmapPreviewFileResult,
   DevmapPreviewReport,
 } from "./types";
+import { summarizeWalkIncomplete } from "./walkIncomplete";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -66,6 +67,10 @@ function normalizeBrokenCallers(
   const items = Array.isArray(rec.items)
     ? (rec.items as DevmapPreviewCaller[])
     : [];
+  const foldedWalk =
+    typeof rec.walk_incomplete === "string"
+      ? summarizeWalkIncomplete([rec.walk_incomplete])
+      : null;
   return {
     available,
     reason,
@@ -73,9 +78,7 @@ function normalizeBrokenCallers(
     total: asNumber(rec.total, items.length),
     shown: asNumber(rec.shown, items.length),
     truncated: asBool(rec.truncated, false),
-    ...(typeof rec.walk_incomplete === "string"
-      ? { walk_incomplete: rec.walk_incomplete }
-      : {}),
+    ...(foldedWalk ? { walk_incomplete: foldedWalk } : {}),
   };
 }
 

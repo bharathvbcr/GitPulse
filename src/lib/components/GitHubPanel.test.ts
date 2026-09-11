@@ -216,3 +216,11 @@ describe("GitHubPanel narrowing contracts", () => {
     expect(source).toContain('class="xl:col-span-2 space-y-5 min-w-0"');
   });
 });
+
+describe("GitHubPanel materials", () => {
+  it("uses liquid tabs on the pull-request filter so the page matches the header", () => {
+    expect(source).toContain('role="tablist" aria-label="Pull request filter"');
+    expect(source).toContain("class:gp-liquid-tabs={macos}");
+    expect(source).toContain("gp-liquid-selection");
+  });
+});

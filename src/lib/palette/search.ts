@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { createAsyncGuard } from "../async/guard";
 import { searchSymbols, searchWorkspaceSymbols, listWorkspaceRepos } from "../codeintel/client";
 import type { CodeintelSymbolHit, WorkspaceFederatedHit, WorkspaceRepoEntry } from "../codeintel/types";
+import { boundText, boundedJoin, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
 import type { PaletteMode } from "./model";
 
 export interface SearchResult {
@@ -52,8 +53,10 @@ export function scheduleSearch(request: SearchRequest, publish: (result: SearchR
           result.symbols = response.items;
           const notes: string[] = [];
           if (response.truncated) notes.push(`${response.shown} of ${response.total} symbol matches returned. Refine your search for more.`);
-          if (response.walk_incomplete) notes.push(response.walk_incomplete);
-          result.note = notes.join(" · ") || null;
+          if (response.walk_incomplete) {
+            notes.push(tooltipWalkIncomplete([response.walk_incomplete]) ?? response.walk_incomplete);
+          }
+          result.note = boundText(notes.join(" · ")) || null;
         }
       } else if (request.mode === "workspace") {
         const [response, registry] = await Promise.all([deps.workspace(request.repoPath, request.text, 8000, request.semantic), deps.repos(request.repoPath)]);
@@ -61,10 +64,17 @@ export function scheduleSearch(request: SearchRequest, publish: (result: SearchR
         result.repos = registry.repos;
         const notes: string[] = [];
         if (request.semantic) notes.push("TF-IDF name ranking");
-        if (response.unavailable.length) notes.push(response.unavailable.map(repo => `${repo.repo}: ${repo.reason}`).join("; "));
+        if (response.unavailable.length) {
+          notes.push(
+            boundedJoin(
+              response.unavailable.map((repo) => `${repo.repo}: ${repo.reason}`),
+              8,
+            ),
+          );
+        }
         if (response.truncated) notes.push(`${response.shown} of ${response.total} matches returned. Refine your search for more.`);
         if (response.repos_queried === 0) notes.push("No registered repositories were searched. Open Map to manage the workspace.");
-        result.note = notes.join(" · ") || null;
+        result.note = boundText(notes.join(" · ")) || null;
         result.failed = response.unavailable.length > 0 || response.repos_queried === 0;
       }
       finish(result);

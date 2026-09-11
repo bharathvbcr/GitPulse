@@ -348,6 +348,11 @@ describe("DiffViewer store-emission memo guards", () => {
     expect(source).toContain("bind:minRung");
     expect(source).toContain("getImpactAtRung");
     expect(source).toContain('title="Change-set blast radius"');
+    expect(source).toContain("{#if impactAvailable}");
+    expect(source).toContain("boundText");
+    expect(source).toContain("summarizeWalkIncomplete");
+    expect(source).toContain("impactEdgesTitle");
+    expect(source).toContain("impactAvailable && impactWalkIncomplete");
   });
 
   it("passes shared preview markers into the file rail", () => {

@@ -318,6 +318,9 @@ fn run_devmap(
                 "devmap returned an error report despite exit 0; see DevMap logs for details"
                     .to_string(),
             ),
+            Ok(report) if report.get("ok") == Some(&Value::Bool(false)) => Some(
+                "devmap returned ok=false despite exit 0; see DevMap logs for details".to_string(),
+            ),
             Ok(_) => None,
             Err(error) => Some(format!("devmap returned non-JSON stdout: {error}")),
         });
@@ -769,6 +772,75 @@ exit /b 2
         }
     }
 
+    #[cfg(unix)]
+    fn write_recording_devmap(dir: &Path) -> PathBuf {
+        let path = dir.join("devmap");
+        fs::write(
+            &path,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> argv.log
+if [ "$1" = "status" ]; then
+  if [ -f status.json ]; then cat status.json; else printf '%s\n' '{"is_fresh":false,"schema_outdated":false}'; fi
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  printf '%s\n' '{"ok":true}'
+  exit 0
+fi
+echo unexpected: "$*" >&2
+exit 2
+"#,
+        )
+        .expect("write recording devmap");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    struct ResetTestBinary;
+    #[cfg(unix)]
+    impl Drop for ResetTestBinary {
+        fn drop(&mut self) {
+            set_test_binary(None);
+        }
+    }
+
+    #[cfg(unix)]
+    fn bind_recording_devmap(repo: &Path) -> ResetTestBinary {
+        let bin = write_recording_devmap(repo);
+        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        ResetTestBinary
+    }
+
+    #[cfg(unix)]
+    fn argv_log(repo: &Path) -> String {
+        fs::read_to_string(repo.join("argv.log")).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn assert_build_argv(log: &str, expect_manifest: bool) {
+        let builds: Vec<&str> = log
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some("build"))
+            .collect();
+        assert!(!builds.is_empty(), "no build spawned, argv log:\n{log}");
+        for line in &builds {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            assert!(
+                tokens.contains(&"--json"),
+                "build must request JSON, argv log:\n{log}"
+            );
+            let manifest = tokens.contains(&"--manifest");
+            assert_eq!(
+                manifest, expect_manifest,
+                "expected manifest={expect_manifest}, argv log:\n{log}"
+            );
+        }
+    }
+
     #[test]
     fn explicit_env_that_does_not_resolve_is_refused() {
         let _lock = crate::harness::sidecar::test_serial();
@@ -809,5 +881,209 @@ exit /b 2
         let _held = BuildGuard::try_acquire(&key).expect("first");
         let err = BuildGuard::try_acquire(&key).expect_err("second");
         assert!(err.contains("already running"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn busy_live_refresh_does_not_spawn_status_during_a_build() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let bin = write_fake_devmap(repo.path());
+        fs::write(&bin, "#!/bin/sh\necho called >> status-calls\necho '{\"is_fresh\":false,\"schema_outdated\":false}'\n").unwrap();
+        struct ResetBinary;
+        impl Drop for ResetBinary {
+            fn drop(&mut self) {
+                set_test_binary(None);
+            }
+        }
+        let _reset = ResetBinary;
+        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let _guard = BuildGuard::try_acquire(&canonical).unwrap();
+        for _ in 0..32 {
+            let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+            assert_eq!(
+                outcome.decision,
+                crate::devmap::LiveRefreshDecision::SkipBuilding
+            );
+            assert!(outcome.build.is_none());
+        }
+        assert!(
+            !repo.path().join("status-calls").exists(),
+            "busy retries spawned status children"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_obsolete_payload_uses_manifest_rebuild() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
+        )
+        .unwrap();
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::Refresh
+        );
+        assert!(outcome.build.as_ref().is_some_and(|b| b.ok), "{outcome:?}");
+        assert_build_argv(&argv_log(repo.path()), true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_obsolete_payload_rebuilds_even_when_status_claims_fresh() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":true,"schema_outdated":false,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
+        )
+        .unwrap();
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), false);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::Refresh
+        );
+        assert!(outcome.build.as_ref().is_some_and(|b| b.ok), "{outcome:?}");
+        assert_build_argv(&argv_log(repo.path()), true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_source_tree_staleness_stays_incremental() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        for reason in [
+            "source tree differs from the indexed generation; rebuild or drain watcher edits",
+            "source discovery refusals differ from the indexed generation; rebuild required",
+            "analyzer freshness unverified: the binary was built without the parsing frontend",
+            "source freshness unverified: this generation has no repository root",
+        ] {
+            let _ = fs::remove_file(repo.path().join("argv.log"));
+            fs::write(
+                repo.path().join("status.json"),
+                format!(
+                    r#"{{"is_fresh":false,"schema_outdated":false,"degraded_reason":{reason:?}}}"#
+                ),
+            )
+            .unwrap();
+            let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+            assert_eq!(
+                outcome.decision,
+                crate::devmap::LiveRefreshDecision::Refresh,
+                "{reason}"
+            );
+            assert_build_argv(&argv_log(repo.path()), false);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_ordinary_staleness_stays_incremental() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        for payload in [
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+            r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":null}"#,
+            r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":""}"#,
+            r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":"obsolete"}"#,
+            r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":"payload is obsolete"}"#,
+            r#"{"is_fresh":false,"schema_outdated":false,"message":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
+        ] {
+            let _ = fs::remove_file(repo.path().join("argv.log"));
+            fs::write(repo.path().join("status.json"), payload).unwrap();
+            let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+            assert_eq!(
+                outcome.decision,
+                crate::devmap::LiveRefreshDecision::Refresh,
+                "{payload}"
+            );
+            assert_build_argv(&argv_log(repo.path()), false);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_schema_outdated_wins_over_obsolete_payload() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":false,"schema_outdated":true,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
+        )
+        .unwrap();
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::SkipSchemaOutdated
+        );
+        assert!(outcome.build.is_none(), "{outcome:?}");
+        let log = argv_log(repo.path());
+        assert!(
+            !log.lines().any(|line| line.starts_with("build ")),
+            "schema skip spawned a build:\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_obsolete_payload_never_falls_back_to_incremental_across_a_storm() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
+        )
+        .unwrap();
+        for repo_changed in [true, false] {
+            let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), repo_changed);
+            assert_eq!(
+                outcome.decision,
+                crate::devmap::LiveRefreshDecision::Refresh,
+                "repo_changed={repo_changed}"
+            );
+        }
+        assert_build_argv(&argv_log(repo.path()), true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_failed_report_cannot_be_a_successful_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_fake_devmap(dir.path());
+        fs::write(&path, "#!/bin/sh\necho '{\"ok\":false}'\n").unwrap();
+        let binary = ResolvedDevmap {
+            path: path.to_string_lossy().into_owned(),
+            lookup: DevmapLookup::PathSearch,
+        };
+        for command in ["build", "status", "preview"] {
+            assert!(
+                run_devmap(
+                    &binary,
+                    dir.path(),
+                    &[command, "--json"],
+                    None,
+                    Duration::from_secs(5)
+                )
+                .is_err(),
+                "{command} accepted an explicit failure with exit 0"
+            );
+        }
     }
 }
