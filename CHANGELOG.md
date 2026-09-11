@@ -44,6 +44,8 @@ draft tag.
 - Treat `fresh: null` on advertised MCP output as an unverified check, not as
   a missing required field. Count the live-echo cooldown storm instead of a
   wall-clock window so coverage instrumentation cannot starve the bound.
+  Isolate spawn-limit fan-out onto a private gate so it cannot starve short
+  process-slot deadlines in the same coverage run.
 
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.

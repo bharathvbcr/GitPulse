@@ -4228,6 +4228,14 @@ mod tests {
     /// sampler watches how many exist at once. An assertion that read the
     /// gate's own counter could not tell a working gate from one that is
     /// never consulted, which is exactly the bug this pins.
+    ///
+    /// The gate is private. 64 waiters on the process-wide `spawn_gate()`
+    /// starve every other short-deadline `run_bounded` test in the same
+    /// binary — llvm-cov's `--test-threads=4` still shares one gate, and a
+    /// 5s slot wait then fails as "timed out waiting for a process slot"
+    /// even though the drain under test is fine. Production `run_observed`
+    /// always passes `spawn_gate()`; this test pins that `run_with_gate`
+    /// actually limits live children.
     #[cfg(unix)]
     #[test]
     fn run_bounded_never_exceeds_the_spawn_limit_under_fan_out() {
@@ -4237,6 +4245,7 @@ mod tests {
             CALLERS > limit,
             "the fan-out must exceed the limit to prove anything ({CALLERS} vs {limit})"
         );
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(limit)));
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         let live_dir = dir.path().to_path_buf();
@@ -4274,7 +4283,15 @@ mod tests {
                         "sh",
                         &marker,
                     ]);
-                    run_bounded(cmd, "sh", Duration::from_secs(30), None)
+                    run_with_gate(
+                        &mut cmd,
+                        "sh",
+                        Duration::from_secs(30),
+                        None,
+                        MAX_OUTPUT_BYTES,
+                        &mut (),
+                        gate,
+                    )
                 })
             })
             .collect();
