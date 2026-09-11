@@ -2707,6 +2707,13 @@ fn git_pathspec_rejected_as_outside_repo(err: &str) -> bool {
     err.to_ascii_lowercase().contains("is outside repository")
 }
 
+/// Git for Windows still glob-expands `*?[` after `:(literal)`, and treats
+/// `X:rest` as a drive. Those names must be matched in-process against the
+/// listing rather than trusted to pathspec.
+fn listing_must_match_path_exactly(path: &str) -> bool {
+    path.bytes().any(|b| matches!(b, b':' | b'*' | b'?' | b'['))
+}
+
 fn file_not_found(path: &str) -> String {
     format!("File not found: {path}")
 }
@@ -2864,22 +2871,41 @@ fn tree_file_blob<'a>(entries: &'a [TreeEntry], file_path: &str) -> Result<&'a T
 /// Lists one index path. `:(literal)` is the common path; Git for Windows
 /// still rejects `X:rest` as drive-relative, so that fatal retries against
 /// the whole `ls-files --stage` listing and keeps only the requested path.
+fn index_entries_named(raw: &[u8], file_path: &str) -> Result<Vec<IndexStageEntry>, String> {
+    Ok(parse_ls_files_stage_z(raw)?
+        .into_iter()
+        .filter(|entry| entry.path == file_path)
+        .collect())
+}
+
+fn tree_entries_named(raw: &[u8], file_path: &str) -> Result<Vec<TreeEntry>, String> {
+    Ok(parse_ls_tree_z(raw)?
+        .into_iter()
+        .filter(|entry| entry.path == file_path)
+        .collect())
+}
+
 fn ls_files_stage_records(repo: &Path, file_path: &str) -> Result<Vec<IndexStageEntry>, String> {
+    if listing_must_match_path_exactly(file_path) {
+        let raw = git(repo, &["ls-files", "-z", "--stage"])?;
+        return index_entries_named(&raw, file_path);
+    }
     let spec = literal_pathspec(file_path);
     match git(repo, &["ls-files", "-z", "--stage", "--", spec.as_str()]) {
         Ok(raw) => parse_ls_files_stage_z(&raw),
         Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
             let raw = git(repo, &["ls-files", "-z", "--stage"])?;
-            Ok(parse_ls_files_stage_z(&raw)?
-                .into_iter()
-                .filter(|entry| entry.path == file_path)
-                .collect())
+            index_entries_named(&raw, file_path)
         }
         Err(err) => Err(err),
     }
 }
 
 fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEntry>, String> {
+    if listing_must_match_path_exactly(file_path) {
+        let raw = git(repo, &["ls-tree", "-z", "--full-name", "-r", rev])?;
+        return tree_entries_named(&raw, file_path);
+    }
     let spec = literal_pathspec(file_path);
     match git(
         repo,
@@ -2888,10 +2914,7 @@ fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEn
         Ok(raw) => parse_ls_tree_z(&raw),
         Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
             let raw = git(repo, &["ls-tree", "-z", "--full-name", "-r", rev])?;
-            Ok(parse_ls_tree_z(&raw)?
-                .into_iter()
-                .filter(|entry| entry.path == file_path)
-                .collect())
+            tree_entries_named(&raw, file_path)
         }
         Err(err) => Err(err),
     }
@@ -3980,7 +4003,17 @@ mod tests {
     }
 
     fn git_in(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        let output = git_output(dir, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "Test User")
@@ -3988,12 +4021,36 @@ mod tests {
             .env("GIT_COMMITTER_NAME", "Test User")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .output()
-            .expect("spawn git");
+            .expect("spawn git")
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let output = git_output(dir, args);
         assert!(
             output.status.success(),
-            "git {args:?} failed: {}",
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// `git commit` checks the tree out; Win32 cannot store glob/colon names.
+    /// commit-tree + update-ref records HEAD without touching the working tree.
+    fn commit_index_without_checkout(dir: &Path, message: &str) {
+        let tree = git_stdout(dir, &["write-tree"]);
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
+        let parent = git_output(dir, &["rev-parse", "--verify", "-q", "HEAD"]);
+        let parent_oid = parent
+            .status
+            .success()
+            .then(|| String::from_utf8(parent.stdout).unwrap().trim().to_string())
+            .filter(|oid| !oid.is_empty());
+        if let Some(ref oid) = parent_oid {
+            args.extend_from_slice(&["-p", oid.as_str()]);
+        }
+        let commit = git_stdout(dir, &args);
+        git_in(dir, &["update-ref", "HEAD", commit.as_str()]);
     }
 
     fn init_git_repo() -> tempfile::TempDir {
@@ -4036,7 +4093,13 @@ mod tests {
         let oid = String::from_utf8(hashed.stdout).unwrap();
         let oid = oid.trim();
         let mut index = std::process::Command::new("git")
-            .args(["update-index", "--add", "--index-info"])
+            .args([
+                "-c",
+                "core.protectNTFS=false",
+                "update-index",
+                "--add",
+                "--index-info",
+            ])
             .current_dir(dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -4802,7 +4865,7 @@ mod tests {
         for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
             write_and_add_literal(dir.path(), path, format!("body-{i}\n").as_bytes());
         }
-        git_in(dir.path(), &["commit", "-q", "-m", "all names"]);
+        commit_index_without_checkout(dir.path(), "all names");
         let repo = dir.path().to_string_lossy();
         for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
             let want = format!("body-{i}\n");
@@ -4840,7 +4903,7 @@ mod tests {
         let dir = init_git_repo();
         write_and_add_literal(dir.path(), "foo*.py", b"glob-head\n");
         write_and_add_literal(dir.path(), ":colon.py", b"colon-head\n");
-        git_in(dir.path(), &["commit", "-q", "-m", "named"]);
+        commit_index_without_checkout(dir.path(), "named");
         let repo = dir.path().to_string_lossy();
         assert_eq!(
             GitReader::get_file_blob(&repo, "foo*.py", Some("HEAD"))
@@ -5214,6 +5277,19 @@ mod tests {
         assert_eq!(literal_pathspec(":3:lockfile"), ":(literal):3:lockfile");
         assert_eq!(literal_pathspec("plain.txt"), ":(literal)plain.txt");
         assert_eq!(literal_pathspec("0:foo.py"), ":(literal)0:foo.py");
+    }
+
+    #[test]
+    fn listing_must_match_glob_and_colon_names_exactly() {
+        assert!(listing_must_match_path_exactly("foo*.py"));
+        assert!(listing_must_match_path_exactly("*"));
+        assert!(listing_must_match_path_exactly("foo?.py"));
+        assert!(listing_must_match_path_exactly("foo[ab].py"));
+        assert!(listing_must_match_path_exactly("0:foo.py"));
+        assert!(listing_must_match_path_exactly(":colon.py"));
+        assert!(!listing_must_match_path_exactly("keep.txt"));
+        assert!(!listing_must_match_path_exactly("__main__.py"));
+        assert!(!listing_must_match_path_exactly("pkg/__main__.py"));
     }
 
     #[test]
