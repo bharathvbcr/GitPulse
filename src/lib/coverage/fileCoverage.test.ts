@@ -49,6 +49,24 @@ describe("coverage file helpers", () => {
     expect(() => parseFileCoverage({ path: "src/a.ts" })).toThrow(/no line map/);
   });
 
+  it("rejects a line map that omitted file identity or totals", () => {
+    const lines: unknown[] = [];
+    const truncated = { truncated: false, lines_truncated: false };
+
+    expect(() =>
+      parseFileCoverage({ path: "src/a.ts", language: "TypeScript", lines, ...truncated }),
+    ).toThrow(/omitted file identity|omitted totals/);
+    expect(() =>
+      parseFileCoverage({
+        path: "src/a.ts",
+        language: "TypeScript",
+        color_hex: "#3178c6",
+        lines,
+        ...truncated,
+      }),
+    ).toThrow(/omitted totals/);
+  });
+
   it("fetches file coverage via invoke", async () => {
     const origWindow = (globalThis as Record<string, unknown>).window;
     (globalThis as Record<string, unknown>).window = {

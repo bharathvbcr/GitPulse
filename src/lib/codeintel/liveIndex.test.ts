@@ -386,8 +386,9 @@ describe("liveIndex controller", () => {
   });
 
   it("heals every retained repository, not only the focused one", async () => {
-    const maybeRefresh = vi.fn(async () => outcome("refresh"));
+    const maybeRefresh = vi.fn(async (_repoPath: string, _changedOnDisk: boolean) => outcome("refresh"));
     const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+
     index.setScope({
       activeKey: "/devcouncil",
       retainedKeys: ["/devcouncil", "/manvi"],

@@ -66,9 +66,9 @@
   import { buildRunnablePlanSteps } from "../terminal/tokenize";
   import {
     parseDepsHealthReport,
-    type DepsHealthReport,
     type Vulnerability,
   } from "../health/types";
+
   import {
     dependabotBadgeClass as badgeClassFor,
     formatAuditCounts,
