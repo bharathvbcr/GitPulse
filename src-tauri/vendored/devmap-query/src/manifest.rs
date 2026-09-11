@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::artifacts::write_atomic;
 use crate::model::*;
 use devmap_analyze::model::*;
+use devmap_analyze::{extraction_gaps, ExtractionGap};
 use devmap_extract::model::*;
 use devmap_resolve::model::ResolvedEdge;
 use serde_json::{json, Value};
@@ -14,7 +15,7 @@ const DEAD_CANDIDATE_CAP: usize = 200;
 /// agent for orientation, both are budget-bearing, and a second constant would
 /// only let the two drift. The true total travels beside the list in
 /// `liveness_meta.unwired`, so the cap costs no information.
-const UNWIRED_CANDIDATE_CAP: usize = DEAD_CANDIDATE_CAP;
+pub(crate) const UNWIRED_CANDIDATE_CAP: usize = DEAD_CANDIDATE_CAP;
 const DEPENDENTS_CAP: usize = 1_024;
 /// Entry roots the lean manifest carries before the token budget bites.
 const ENTRY_ROOT_CAP: usize = 20;
@@ -91,11 +92,22 @@ pub fn generate_manifest_with_edges(
 /// budget and `code_graph.json` carries it uncapped, so having each derive
 /// "what is an entry root" separately is how the two artifacts start
 /// disagreeing about the same repository.
+///
+/// `ToolConfig` is here and `AmbientDeclaration` is not, though both are
+/// file-level exemptions and both used to arrive as `TargetRoot`. An entry
+/// root is where execution *starts* — `subsystem_map.is_entry_root` passes
+/// this on to a reader as exactly that claim — and a `vite.config.ts` is such
+/// a place while a `.d.ts` is a declaration the compiler consults and nothing
+/// runs. The exemption each one earns is the same; the sentence they let a
+/// consumer say is not.
 pub(crate) fn is_entry_root(ext: &Extraction) -> bool {
     ext.wiring.iter().any(|w| {
         matches!(
             w.kind,
-            WiringKind::ScriptEntry | WiringKind::FrameworkDecorator | WiringKind::TargetRoot
+            WiringKind::ScriptEntry
+                | WiringKind::FrameworkDecorator
+                | WiringKind::TargetRoot
+                | WiringKind::ToolConfig
         )
     })
 }
@@ -467,12 +479,37 @@ fn consumer_manifest_json(
     let all_unwired = crate::code_graph::unwired_candidates(extractions, edges);
     let unwired_excluded = all_unwired.excluded_coverage_loss;
     let unwired_excluded_import_blind = all_unwired.excluded_import_blind;
+    let unwired_excluded_not_code = all_unwired.excluded_not_code;
+    let unwired_excluded_not_code_reasons: serde_json::Map<String, Value> = all_unwired
+        .excluded_not_code_reasons
+        .iter()
+        .map(|(reason, count)| (reason.to_string(), json!(count)))
+        .collect();
+    let unwired_excluded_exempt = all_unwired.excluded_exempt;
+    let unwired_excluded_directory_unit = all_unwired.excluded_directory_unit;
+    let unwired_excluded_import_blind_files: Vec<String> = all_unwired
+        .excluded_import_blind_paths
+        .iter()
+        .take(UNWIRED_CANDIDATE_CAP)
+        .cloned()
+        .collect();
     let unwired_total = all_unwired.paths.len();
     let unwired_shown: Vec<String> = all_unwired
         .paths
         .into_iter()
         .take(UNWIRED_CANDIDATE_CAP)
         .collect();
+    let mut import_blind_files: Vec<String> = extraction_gaps(extractions)
+        .into_iter()
+        .filter(|entry| entry.gap == ExtractionGap::ImportBlind)
+        .map(|entry| entry.path)
+        .collect();
+    import_blind_files.sort();
+    import_blind_files.dedup();
+    let import_blind_total = import_blind_files.len();
+    import_blind_files.truncate(UNWIRED_CANDIDATE_CAP);
+    let import_blind_shown = import_blind_files.len();
+    let import_blind_truncated = import_blind_total > import_blind_shown;
     let payload = json!({
         "languages": languages.into_iter().collect::<Vec<_>>(),
         // Computed. See the derivation above, and `frameworks_computed` in
@@ -545,6 +582,13 @@ fn consumer_manifest_json(
         // receives; emitting `[]` here made the two artifacts contradict each
         // other, and read to a consumer as "nothing is unwired".
         "unwired_candidates": unwired_shown,
+        // Files whose language has no import extractor in this build.
+        //
+        // `unwired_candidates` excludes them — they cannot answer "does
+        // anything import this" — and used to publish only a count. A count
+        // of 61 with an empty candidate list is how "we did not look" came
+        // to read as "nothing is unwired". The paths are the work list.
+        "import_blind_files": import_blind_files,
         // Computed since W1.1, from the strongly-connected-component pass
         // rather than from a BFS out of the entry roots. The distinction is the
         // whole reason this key could be filled in at all: a static BFS is
@@ -696,6 +740,32 @@ fn consumer_manifest_json(
                 // empty `unwired_candidates` list can tell "nothing is unwired"
                 // from "we cannot see imports in this language at all".
                 "excluded_import_blind": unwired_excluded_import_blind,
+                "excluded_import_blind_files": unwired_excluded_import_blind_files,
+                // Files that were never in the population at all — prose, data,
+                // configuration, lockfiles, environment files — and files that
+                // are code something outside the import graph reaches: an entry
+                // root, a test, a fixture, a package marker, a tool config.
+                //
+                // Both were excluded before this key existed and neither was
+                // counted, so an empty `unwired_candidates` could not be told
+                // from a filter that had swallowed the repository. Additive:
+                // every counter above keeps its meaning, and GitPulse's
+                // `RepoMapUnwiredMeta` reads the new pair as optional.
+                "excluded_not_code": unwired_excluded_not_code,
+                // A bare count cannot tell "this repository is mostly
+                // documentation" from "a lockfile is being parsed as code", and
+                // those have different remedies.
+                "excluded_not_code_reasons": unwired_excluded_not_code_reasons,
+                "excluded_exempt": unwired_excluded_exempt,
+                // A sub-count of `excluded_exempt`, not a peer of it. Kept
+                // apart because no re-index can ever turn a `.tf` file into an
+                // answerable question: the unit of use is its directory.
+                "excluded_directory_unit": unwired_excluded_directory_unit,
+            },
+            "import_blind": {
+                "shown": import_blind_shown,
+                "total": import_blind_total,
+                "truncated": import_blind_truncated,
             },
             "unavailable": unreachable_unavailable,
         },
@@ -773,10 +843,18 @@ fn consumer_manifest_json(
                 // out. `true` makes both lists a lower bound rather than the
                 // repository's full set.
                 "inventory_walk_truncated": inventory.walk_truncated,
+            "inventory_complete": inventory.is_complete(),
+            "inventory_source": inventory.source,
+            "inventory_entries_examined": inventory.entries_examined,
+            "inventory_files_total": inventory.files_total,
+            "inventory_unreadable_count": inventory.unreadable_count,
                 "inventory_directories_visited": inventory.directories_visited,
                 "inventory_unavailable_reason": inventory.unavailable_reason,
                 // Goal-dependent; `dev map --goal` fills it downstream.
                 "candidate_files_computed": false,
+                // Paths of files this build cannot see imports for. `true`
+                // means the list above is the answer, empty or not.
+                "import_blind_files_computed": true,
                 // No language server is consulted by this kernel.
                 "lsp_computed": false,
                 // Opt-in SCA; `dev map --scan-deps` fills it downstream. The

@@ -717,6 +717,11 @@ pub struct StoreStatus {
     pub node_count: usize,
     pub edge_count: usize,
     pub degraded_reason: Option<String>,
+    /// Current source bytes match the stored inventory. None means not verified.
+    pub source_freshness: Option<bool>,
+    /// Stored parser/analyzer identity matches this binary. A parser-free reader
+    /// leaves this unknown; source verification remains independent.
+    pub analyzer_freshness: Option<bool>,
     pub quarantined_count: usize,
     /// Up to [`Store::DEGRADED_SAMPLE`] of the quarantined paths, oldest first.
     ///
@@ -750,6 +755,8 @@ impl StoreStatus {
         self.latest_generation.is_some()
             && self.pending_count == 0
             && self.degraded_reason.is_none()
+            && self.source_freshness == Some(true)
+            && self.analyzer_freshness == Some(true)
     }
 
     /// One contract for CLI, daemon and embedded readers. An absent generation
@@ -5767,7 +5774,28 @@ impl Store {
         let mut status = self.status_snapshot(db_path)?;
         if let Some(generation) = status.latest_generation {
             if status.pending_count == 0 && status.degraded_reason.is_none() {
-                status.degraded_reason = self.source_snapshot_mismatch(generation)?;
+                let (analyzer_freshness, analyzer_reason) =
+                    match self.latest_generation_payload_is_current() {
+                        Ok(true) => (Some(true), None),
+                        Ok(false) => (Some(false), Some(
+                            "stored extraction payload is obsolete; rebuild with the current analyzer".to_string())),
+                        Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
+                    };
+                let (source_freshness, source_reason) =
+                    self.source_snapshot_mismatch(generation)?;
+                status.source_freshness = source_freshness;
+                status.analyzer_freshness = analyzer_freshness;
+                status.degraded_reason =
+                    devmap_analyze::combine_reasons(source_reason, analyzer_reason);
+                // Both checks describe the same generation or neither may certify it.
+                let after = self.status_snapshot(db_path)?;
+                if after.latest_generation != Some(generation) || after.pending_count != 0 {
+                    status.source_freshness = None;
+                    status.analyzer_freshness = None;
+                    status.degraded_reason = Some(
+                        "index changed during freshness verification; retry status".to_string(),
+                    );
+                }
             }
         }
         Ok(status)
@@ -5776,55 +5804,42 @@ impl Store {
     /// Runs without holding the SQLite connection during filesystem I/O. The
     /// generation is checked again afterwards, so a writer cannot combine a
     /// newer inventory with the older status snapshot and certify it as fresh.
-    fn source_snapshot_mismatch(&self, generation: u32) -> Result<Option<String>> {
-        match self.latest_generation_payload_is_current() {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(Some(
-                    "stored extraction payload is obsolete; rebuild with the current analyzer"
-                        .to_string(),
-                ))
-            }
-            Err(error) => return Ok(Some(format!("analyzer freshness unverified: {error}"))),
-        }
+    fn source_snapshot_mismatch(&self, generation: u32) -> Result<(Option<bool>, Option<String>)> {
         let Some(root) = self.latest_repo_root()? else {
-            return Ok(Some(
-                "source freshness unverified: this generation has no repository root".to_string(),
+            return Ok((
+                None,
+                Some(
+                    "source freshness unverified: this generation has no repository root"
+                        .to_string(),
+                ),
             ));
         };
         let hashes = self.latest_file_hashes()?;
         let refusals = self.latest_discovery_refusals()?;
         let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
             Ok(scanned) => scanned,
-            Err(error) => return Ok(Some(format!("source freshness unverified: {error}"))),
+            Err(error) => return Ok((None, Some(format!("source freshness unverified: {error}")))),
         };
         if !scanned.matches_file_hashes(&hashes) {
-            return Ok(Some(
-                "source tree differs from the indexed generation; rebuild or drain watcher edits"
-                    .to_string(),
-            ));
+            return Ok((Some(false), Some(
+                "source tree differs from the indexed generation; rebuild or drain watcher edits".to_string(),
+            )));
         }
         if crate::discovery_refusals(&scanned.report) != refusals {
-            return Ok(Some(
-                "source discovery refusals differ from the indexed generation; rebuild required"
-                    .to_string(),
-            ));
+            return Ok((Some(false), Some(
+                "source discovery refusals differ from the indexed generation; rebuild required".to_string(),
+            )));
         }
-        // Git HEAD is provenance, not a source-tree signal. The hash and
-        // refusal comparisons above have already asked whether every indexed
-        // path still matches; a new SHA with the same bytes (empty commit,
-        // identical-tree checkout) cannot change the graph. Treating that lag
-        // as "rebuild required" made `is_fresh` a lie: the rebuild hashed the
-        // same files, skipped, and left the stamp behind. The daemon still
-        // uses HEAD to *wake* a drain (B5); once the drain (or a CLI skip)
-        // proves the tree unchanged it restamps rather than rebuilding.
+        // HEAD is provenance: an identical tree remains current after an empty
+        // commit. A concurrent generation or pending edit invalidates the proof.
         let after = self.status_snapshot("")?;
         if after.latest_generation != Some(generation) || after.pending_count != 0 {
-            return Ok(Some(
-                "index changed during source verification; retry status".to_string(),
+            return Ok((
+                None,
+                Some("index changed during source verification; retry status".to_string()),
             ));
         }
-        Ok(None)
+        Ok((Some(true), None))
     }
 
     fn status_snapshot(&self, db_path: &str) -> Result<StoreStatus> {
@@ -5898,6 +5913,8 @@ impl Store {
             pending_count,
             node_count,
             edge_count,
+            source_freshness: None,
+            analyzer_freshness: None,
             degraded_reason: if quarantined_count > 0 {
                 // Name the paths. See `StoreStatus::quarantined_paths`: the
                 // count alone made a permanently degraded store undiagnosable

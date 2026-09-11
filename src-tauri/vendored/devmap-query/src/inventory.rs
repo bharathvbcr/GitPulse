@@ -16,24 +16,23 @@
 //! Both live here so there is one owner for "look at the repository itself",
 //! with one set of bounds.
 //!
-//! Everything here is bounded and says so when a bound bit:
+//! Git marker discovery reuses the bounded Git listing and accepts at most
+//! [`GIT_FILE_CAP`] paths without a depth limit. Without Git metadata, the
+//! filesystem fallback bounds depth, directory count, pending frontier, entries
+//! and elapsed time between filesystem calls. Truncation and read failures make
+//! completeness false. A blocked OS filesystem call is not interruptible here.
 //!
-//!   - the marker walk descends at most [`WALK_DEPTH_CAP`] levels and visits at
-//!     most [`WALK_DIR_CAP`] directories, reporting `walk_truncated` when it
-//!     stops early — and only when a directory it would have *entered* was cut,
-//!     never for one [`skip_dir`] refuses at every depth;
-//!   - a manifest larger than [`MANIFEST_READ_CAP`] is *named* in
-//!     `refused_oversize` rather than silently skipped, and one that could not
-//!     be read for any other reason is named in `unreadable`, because "could not
-//!     read" and "read and found nothing" must never be the same answer;
-//!   - `git log` runs once, with a deadline, a commit cap and an output cap.
+//! Manifests share the descriptor-based source reader with a tighter
+//! [`MANIFEST_READ_CAP`] ceiling. Oversized, unreadable and malformed manifests
+//! are reported separately from a valid manifest declaring no commands.
+//! `git log` has its own deadline, commit cap and output cap.
 
 use devmap_analyze::graph_intel::FileChurn;
 use devmap_extract::subprocess::{run_bounded, Bounds, Failure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Largest manifest this reader will pull into memory.
 ///
@@ -43,12 +42,8 @@ use std::time::Duration;
 /// not read.
 pub const MANIFEST_READ_CAP: u64 = 256 * 1024;
 
-/// Deepest directory level the marker walk descends to.
-///
-/// Marker files (`Cargo.toml`, `go.mod`, `package.json`) sit at a package root.
-/// Eight levels reaches every one of them in this repository and in the
-/// monorepo layouts the map is aimed at, without the walk's cost being a
-/// function of how deep the deepest source tree happens to be.
+/// Depth ceiling for the non-Git filesystem fallback. A bound hit is reported;
+/// Git repositories use their path inventory and are not limited by this depth.
 pub const WALK_DEPTH_CAP: usize = 8;
 
 /// Most directories the marker walk will open.
@@ -58,6 +53,13 @@ pub const WALK_DEPTH_CAP: usize = 8;
 /// artifact write into a full-disk traversal. On this repository the walk opens
 /// roughly 400.
 pub const WALK_DIR_CAP: usize = 20_000;
+/// Entries examined by the filesystem fallback, including skipped entries.
+pub const WALK_ENTRY_CAP: usize = 200_000;
+/// Cooperative deadline between filesystem operations; it cannot interrupt a
+/// filesystem call stalled in the operating system.
+pub const WALK_DEADLINE: Duration = Duration::from_secs(5);
+pub const GIT_FILE_CAP: usize = 50_000;
+const ERROR_SAMPLE_CAP: usize = 64;
 
 /// Hard ceiling for the churn subprocess, matching the shape
 /// `devmap-store`'s `run_git_head_with_deadline` established for `rev-parse`:
@@ -190,9 +192,24 @@ pub struct RepoInventory {
     pub walk_truncated: bool,
     /// Directories opened, so a reader can size the walk that produced this.
     pub directories_visited: usize,
+    /// `git` lists tracked and unignored paths; `filesystem` is the fallback
+    /// for a directory without Git metadata. Both apply the marker skip policy.
+    pub source: String,
+    pub entries_examined: usize,
+    pub files_total: Option<usize>,
+    /// Total failures; `unreadable` is a bounded sample of this many failures.
+    pub unreadable_count: usize,
 }
 
 impl RepoInventory {
+    /// Complete within the declared marker policy, not complete code coverage.
+    pub fn is_complete(&self) -> bool {
+        self.computed
+            && !self.walk_truncated
+            && self.unreadable_count == 0
+            && self.refused_oversize.is_empty()
+    }
+
     /// A scan that did not happen, with the reason attached.
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
@@ -211,9 +228,43 @@ struct Markers {
     has_python_test: bool,
     truncated: bool,
     directories_visited: usize,
+    entries_examined: usize,
+    unreadable: Vec<String>,
+    unreadable_count: usize,
+    source: String,
+    files_total: Option<usize>,
 }
 
 impl Markers {
+    fn record_error(&mut self, root: &Path, path: &Path, error: impl std::fmt::Display) {
+        self.unreadable_count += 1;
+        if self.unreadable.len() < ERROR_SAMPLE_CAP {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            let label = if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                relative.display().to_string()
+            };
+            self.unreadable.push(format!("{label}: {error}"));
+        }
+    }
+
+    fn record_file(&mut self, relative: &Path) {
+        let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        if relative.components().count() == 1 && TOP_LEVEL_MARKERS.contains(&name) {
+            self.top_level.insert(name.to_string());
+        }
+        if NESTED_MARKERS.contains(&name) {
+            self.nested.insert(name.to_string());
+        }
+        if !self.has_python_test && name.ends_with(".py") {
+            self.has_python_test =
+                devmap_extract::wiring::is_test_path(&relative.to_string_lossy());
+        }
+    }
+
     fn top(&self, name: &str) -> bool {
         self.top_level.contains(name)
     }
@@ -253,86 +304,138 @@ fn skip_dir(name: &str, depth: usize) -> bool {
 
 /// Find every marker file, bounded in depth and in directories opened.
 fn walk_markers(root: &Path) -> Markers {
-    let mut found = Markers::default();
-    // (directory, depth). An explicit stack rather than recursion: the depth cap
-    // bounds it either way, but a stack cannot be turned into a stack overflow
-    // by a symlink loop the cap happens not to catch.
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    walk_markers_with_limits(root, WALK_DIR_CAP, WALK_ENTRY_CAP, WALK_DEADLINE)
+}
 
-    while let Some((directory, depth)) = stack.pop() {
-        if found.directories_visited >= WALK_DIR_CAP {
+fn walk_markers_with_limits(
+    root: &Path,
+    dir_cap: usize,
+    entry_cap: usize,
+    deadline: Duration,
+) -> Markers {
+    let mut found = Markers {
+        source: "filesystem".into(),
+        ..Markers::default()
+    };
+    let started = Instant::now();
+    let mut stack = vec![(root.to_path_buf(), 0)];
+    'walk: while let Some((directory, depth)) = stack.pop() {
+        if found.directories_visited >= dir_cap || started.elapsed() >= deadline {
             found.truncated = true;
             break;
         }
-        found.directories_visited += 1;
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            // An unreadable directory is not a repository claim either way. It
-            // is not `truncated` — nothing was cut short by *this* code's
-            // bounds — and the walk carries on with what it can read.
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // `file_type` does not follow symlinks, so a link to a directory is
-            // not descended into. That is the conservative reading: a linked
-            // tree is reachable from wherever it really lives, and following it
-            // is how a walk with a depth cap still runs forever.
-            let Ok(kind) = entry.file_type() else {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                found.record_error(root, &directory, error);
                 continue;
+            }
+        };
+        found.directories_visited += 1;
+        for entry in entries {
+            if found.entries_examined >= entry_cap || started.elapsed() >= deadline {
+                found.truncated = true;
+                break 'walk;
+            }
+            found.entries_examined += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    found.record_error(root, &directory, error);
+                    continue;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    found.record_error(root, &entry.path(), error);
+                    continue;
+                }
             };
             if kind.is_dir() {
-                // `skip_dir` first, and the order is the whole point:
-                // `truncated` says the two published lists are a lower bound
-                // rather than the repository's set, so it must only be set by a
-                // directory the walk would otherwise have entered. A
-                // `node_modules` or a `.git` sitting one level past the cap is
-                // refused at every depth anyway — nothing that could hold a
-                // marker was cut, and reporting it as cut spends the signal on
-                // a directory whose contents are not evidence.
                 if skip_dir(&name, depth) {
                     continue;
                 }
-                if depth + 1 > WALK_DEPTH_CAP {
+                // Account for the pending frontier as well as opened directories.
+                if depth + 1 > WALK_DEPTH_CAP || found.directories_visited + stack.len() >= dir_cap
+                {
                     found.truncated = true;
-                    continue;
+                } else {
+                    stack.push((entry.path(), depth + 1));
                 }
-                stack.push((entry.path(), depth + 1));
                 continue;
             }
-            // A symlink to a regular file counts. `file_type()` does not
-            // follow links, and a monorepo whose `package.json` or lock file is
-            // a link into a shared config directory declares its manager
-            // exactly as much as one that stores the bytes here — the previous
-            // `!kind.is_file()` reported that repository as declaring nothing,
-            // which is the shape of failure this whole module exists to remove.
-            // `Path::is_file` *does* follow, and answers `false` for a dangling
-            // link, a loop, or a link to a directory, so the extra `stat` is
-            // paid only for links and never turns into a traversal.
-            if !kind.is_file() && !(kind.is_symlink() && entry.path().is_file()) {
-                continue;
-            }
-            if depth == 0 && TOP_LEVEL_MARKERS.contains(&name.as_str()) {
-                found.top_level.insert(name.clone());
-            }
-            if NESTED_MARKERS.contains(&name.as_str()) {
-                found.nested.insert(name.clone());
-            }
-            if !found.has_python_test && name.ends_with(".py") {
-                let absolute = entry.path();
-                let relative = absolute
-                    .strip_prefix(root)
-                    .unwrap_or(absolute.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                // `wiring::is_test_path` is the kernel's one owner of "is this a
-                // test", already used by the god-node ranking. A second rule
-                // here is how the two surfaces come to disagree about the same
-                // file.
-                found.has_python_test = devmap_extract::wiring::is_test_path(&relative);
+            let regular = if kind.is_symlink() {
+                match std::fs::metadata(entry.path()) {
+                    Ok(metadata) => metadata.is_file(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        found.record_error(root, &entry.path(), error);
+                        false
+                    }
+                }
+            } else {
+                kind.is_file()
+            };
+            if regular {
+                found.record_file(entry.path().strip_prefix(root).unwrap_or(&entry.path()));
             }
         }
     }
     found
+}
+
+/// Git supplies the full depth-independent path list. Reuse its bounded command
+/// runner, while preserving this inventory's own marker policy (which includes
+/// lockfiles and differs from the source-fingerprint filter).
+fn git_markers(root: &Path) -> Result<Markers, String> {
+    let mut paths = crate::freshness::ls_files(
+        OsStr::new("git"),
+        root,
+        &["--cached", "--others", "--exclude-standard"],
+    )?;
+    paths.retain(|path| {
+        let segments: Vec<_> = path.split('/').collect();
+        !segments
+            .iter()
+            .take(segments.len().saturating_sub(1))
+            .enumerate()
+            .any(|(depth, name)| skip_dir(name, depth))
+    });
+    // Root declarations survive a cap before nested evidence is considered.
+    paths.sort_by(|a, b| a.contains('/').cmp(&b.contains('/')).then_with(|| a.cmp(b)));
+    paths.dedup();
+    let mut found = Markers {
+        source: "git".into(),
+        files_total: Some(paths.len()),
+        truncated: paths.len() > GIT_FILE_CAP,
+        ..Markers::default()
+    };
+    let started = Instant::now();
+    for relative in paths.iter().take(GIT_FILE_CAP) {
+        if started.elapsed() >= WALK_DEADLINE {
+            found.truncated = true;
+            break;
+        }
+        found.entries_examined += 1;
+        let relative = Path::new(relative);
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            found.record_error(root, relative, "Git returned a non-relative path");
+            continue;
+        }
+        let path = root.join(relative);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => found.record_file(relative),
+            Ok(_) => {} // Directories, submodules and special files are not declarations.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {} // Working-tree deletion.
+            Err(error) => found.record_error(root, &path, error),
+        }
+    }
+    Ok(found)
 }
 
 /// Read a manifest, or record why it could not be read.
@@ -369,7 +472,7 @@ fn read_bounded(
         refused.push(relative.to_string());
         return None;
     }
-    match std::fs::read_to_string(&path) {
+    match devmap_extract::read_source_with_limit(&path, MANIFEST_READ_CAP) {
         Ok(text) => Some(text),
         Err(error) => {
             unreadable.push(format!("{relative}: {error}"));
@@ -497,7 +600,21 @@ fn test_commands(
     // manager its lock file names.
     if markers.top("package.json") {
         if let Some(text) = read_bounded(root, "package.json", refused, unreadable) {
-            if let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) {
+            let parsed = serde_json::from_str::<serde_json::Value>(&text);
+            if let Err(error) = &parsed {
+                unreadable.push(format!("package.json: {error}"));
+            }
+            if let Ok(document) = parsed {
+                if !document.is_object()
+                    || document
+                        .get("scripts")
+                        .is_some_and(|scripts| !scripts.is_object())
+                {
+                    unreadable.push(
+                        "package.json: expected an object with an optional scripts object"
+                            .to_string(),
+                    );
+                }
                 let manager = if markers.top("pnpm-lock.yaml") {
                     "pnpm"
                 } else if markers.top("yarn.lock") {
@@ -506,7 +623,15 @@ fn test_commands(
                     "npm"
                 };
                 for key in ["test", "lint", "typecheck", "check", "type-check"] {
-                    if !document["scripts"][key].is_string() {
+                    let Some(script) = document.get("scripts").and_then(|scripts| scripts.get(key))
+                    else {
+                        continue;
+                    };
+                    let Some(script) = script.as_str() else {
+                        unreadable.push(format!("package.json: scripts.{key} must be a string"));
+                        continue;
+                    };
+                    if script.trim().is_empty() {
                         continue;
                     }
                     // `npm test` is a built-in; every other npm script needs
@@ -594,15 +719,24 @@ pub fn scan(root: &Path) -> RepoInventory {
             root.display()
         ));
     }
-    let markers = walk_markers(root);
+    let markers = if root.join(".git").exists() {
+        match git_markers(root) {
+            Ok(markers) => markers,
+            Err(reason) => return RepoInventory::unavailable(reason),
+        }
+    } else {
+        walk_markers(root)
+    };
     let mut refused: Vec<String> = Vec::new();
-    let mut unreadable: Vec<String> = Vec::new();
+    let mut unreadable = markers.unreadable.clone();
     let package_managers = package_managers(&markers);
     let test_commands = test_commands(root, &markers, &mut refused, &mut unreadable);
     refused.sort();
     refused.dedup();
+    let unreadable_count = markers.unreadable_count + unreadable.len() - markers.unreadable.len();
     unreadable.sort();
     unreadable.dedup();
+    unreadable.truncate(ERROR_SAMPLE_CAP);
     RepoInventory {
         package_managers,
         test_commands,
@@ -612,6 +746,10 @@ pub fn scan(root: &Path) -> RepoInventory {
         unreadable,
         walk_truncated: markers.truncated,
         directories_visited: markers.directories_visited,
+        source: markers.source,
+        entries_examined: markers.entries_examined,
+        files_total: markers.files_total,
+        unreadable_count,
     }
 }
 
@@ -883,4 +1021,42 @@ mod tests {
         assert!(!inventory.unavailable_reason.is_empty());
         assert!(inventory.package_managers.is_empty());
     }
+
+    #[test]
+    fn fallback_entry_frontier_and_deadline_limits_are_honest() {
+        let root =
+            std::env::temp_dir().join(format!("devmap-inventory-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for n in 0..128 {
+            std::fs::create_dir(root.join(format!("d{n:03}"))).unwrap();
+        }
+        let entries = walk_markers_with_limits(&root, 1000, 17, Duration::from_secs(5));
+        let frontier = walk_markers_with_limits(&root, 9, 1000, Duration::from_secs(5));
+        let deadline = walk_markers_with_limits(&root, 1000, 1000, Duration::ZERO);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(entries.entries_examined, 17);
+        assert!(entries.truncated);
+        assert_eq!(frontier.directories_visited, 9);
+        assert!(frontier.truncated);
+        assert_eq!(deadline.directories_visited, 0);
+        assert!(deadline.truncated);
+    }
+
+    #[test]
+    fn inventory_error_samples_preserve_the_total() {
+        let mut markers = Markers::default();
+        for n in 0..1000 {
+            markers.record_error(
+                Path::new("/repo"),
+                &Path::new("/repo").join(format!("d{n}")),
+                "denied",
+            );
+        }
+        assert_eq!(markers.unreadable_count, 1000);
+        assert_eq!(markers.unreadable.len(), ERROR_SAMPLE_CAP);
+    }
 }
+
+#[cfg(test)]
+#[path = "tests/inventory_reader.rs"]
+mod reader_tests;

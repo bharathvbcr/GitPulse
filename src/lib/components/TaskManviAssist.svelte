@@ -365,10 +365,10 @@
   }
 
   async function mutate(method: EnhancementMutation, input: Record<string, unknown>) {
-    if (busy || disabled) return;
+    if (busy || disabled || !task) return;
     selecting++; busy = true; error = ""; note = "";
     try {
-      const result = await action.run(method, input);
+      const result = await action.run(method, input, task.id);
       if (disposed) return;
       selecting++; proposal = result.proposal;
       selected = proposal.fields.filter((field) => !lockedFields.includes(field));

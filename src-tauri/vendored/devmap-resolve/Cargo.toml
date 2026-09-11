@@ -104,5 +104,9 @@ name = "host_global_objects"
 required-features = ["parse"]
 
 [[test]]
+name = "swift_modules"
+required-features = ["parse"]
+
+[[test]]
 name = "semantic_scope_and_identity"
 required-features = ["parse"]

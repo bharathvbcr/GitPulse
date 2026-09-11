@@ -28,6 +28,7 @@
   } from "../canvas/graphCache";
   import { paintGraphFrame } from "../canvas/graphComposite";
   import { createFrameScheduler } from "../motion/frameScheduler";
+  import { observeResize } from "../dom/observeResize";
   import { prefersReducedMotion } from "../motion/easing";
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
   import { nextLoadLimit } from "../stores/graphLimits";
@@ -810,21 +811,20 @@
   });
 
   onMount(() => {
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        // Distinguish "no measurement" from a real 0px measurement: a
-        // collapsed pane must not become a phantom viewport.
-        if (entry.target === container) containerHeight = entry.contentRect.height || 0;
-        if (entry.target === root) rootWidth = entry.contentRect.width || 0;
-      }
-      gutterRect = null;
-      rootRect = null;
-    });
-    if (container) observer.observe(container);
-    if (root) {
-      rootWidth = root.clientWidth || 0;
-      observer.observe(root);
-    }
+    const stopResize = observeResize(
+      [container, root].filter((el): el is HTMLDivElement => el != null),
+      (entries) => {
+        for (const entry of entries) {
+          // Distinguish "no measurement" from a real 0px measurement: a
+          // collapsed pane must not become a phantom viewport.
+          if (entry.target === container) containerHeight = entry.contentRect.height || 0;
+          if (entry.target === root) rootWidth = entry.contentRect.width || 0;
+        }
+        gutterRect = null;
+        rootRect = null;
+      },
+    );
+    if (root) rootWidth = root.clientWidth || 0;
 
     // Display moves change devicePixelRatio without any resize event; watch the
     // current resolution and re-arm on each transition.
@@ -873,7 +873,7 @@
       detachDpr();
       canvas?.removeEventListener("contextlost", onContextLost);
       canvas?.removeEventListener("contextrestored", onContextRestored);
-      observer.disconnect();
+      stopResize();
       scheduler.cancel();
       graphCache.dispose();
     };

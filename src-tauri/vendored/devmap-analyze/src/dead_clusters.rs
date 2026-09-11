@@ -553,6 +553,14 @@ pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) 
 /// *is*, not something the file declares, and it never joins a call cycle. A
 /// file that declares nothing else is skipped entirely rather than counted
 /// unreachable, because "declares nothing" is not evidence of anything.
+///
+/// A file the one canonical predicate says is not a liveness candidate is
+/// skipped for the same reason it is skipped by `unwired_candidates`: this is
+/// a *file-level* verdict published as `unreachable_files`, and naming a
+/// fixture, a package marker or a Terraform module in it is the same wrong
+/// answer arriving by a second route. It had one — every symbol in a
+/// `testdata/` module can perfectly well form an abandoned cycle, because that
+/// is what fixture code looks like.
 fn files_wholly_inside_clusters(
     extractions: &[Extraction],
     clustered: &BTreeSet<String>,
@@ -563,6 +571,9 @@ fn files_wholly_inside_clusters(
     let mut unreachable: Vec<String> = extractions
         .iter()
         .filter(|ext| {
+            if !ext.file_liveness().is_candidate() {
+                return false;
+            }
             let mut declared = ext
                 .symbols
                 .iter()
@@ -581,13 +592,31 @@ fn files_wholly_inside_clusters(
 }
 
 fn cluster_reason(size: usize, shown: usize) -> String {
-    let mut reason = format!(
-        "{size} symbols that reference only each other, reached by nothing outside the \
-         component — an abandoned cycle is invisible to the one-hop liveness join, because \
-         every member has an inbound edge from another member"
-    );
+    let mut reason = if size == 1 {
+        // A one-member strongly-connected component is a symbol that calls
+        // itself. "1 symbols that reference only each other" is not merely
+        // ungrammatical: it describes a group, and a reader looking for the
+        // other members of a group that has none reads the finding as
+        // truncated. Recursion is the whole of why a self-loop hides from the
+        // one-hop join, so the sentence says that instead.
+        recursive_cluster_reason()
+    } else {
+        format!(
+            "{size} symbols that reference only each other, reached by nothing outside the \
+             component — an abandoned cycle is invisible to the one-hop liveness join, because \
+             every member has an inbound edge from another member"
+        )
+    };
     append_sample_note(&mut reason, size, shown);
     reason
+}
+
+/// The self-recursion wording, shared by both reason builders so a one-member
+/// component reads the same way whichever tier reports it.
+fn recursive_cluster_reason() -> String {
+    "1 symbol that only calls itself, reached by nothing else — a recursive function is \
+     invisible to the one-hop liveness join, because its one inbound edge is its own"
+        .to_string()
 }
 
 /// The reason for a component something reaches through evidence the resolver
@@ -598,6 +627,16 @@ fn cluster_reason(size: usize, shown: usize) -> String {
 /// exactly what stops being true here, and appending a caveat to a false claim
 /// leaves the false claim in the text an agent reads first.
 fn qualified_cluster_reason(size: usize, shown: usize) -> String {
+    if size == 1 {
+        let mut reason = recursive_cluster_reason();
+        reason.push_str(
+            " — except that something outside it names the symbol through a call the resolver \
+             could not bind, so \"nothing reaches it\" is a statement about the resolver rather \
+             than about the code",
+        );
+        append_sample_note(&mut reason, size, shown);
+        return reason;
+    }
     let mut reason = format!(
         "{size} symbols that reference only each other, and something outside the component \
          names one of them through a call the resolver could not bind — an ambiguous \

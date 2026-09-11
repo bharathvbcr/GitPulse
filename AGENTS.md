@@ -22,11 +22,30 @@ The CLI and GitPulse MCP both query the DevMap store:
   or GitNexus while rebuilding with `devmap build --manifest`. An unavailable
   query is not evidence that there are no callers or affected tests.
 
-GitNexus complements DevMap with its process graph and the required impact and
-change checks below. Run both tools' applicable checks; the generated GitNexus
-block does not replace this DevMap workflow. Keep this section outside that block
-so indexing preserves it. Do not add DevMap's whole-file ownership marker to this
-mixed, maintained guide.
+## Tool precedence and skills
+
+This maintained section takes precedence over the generated GitNexus block below,
+including its unconditional MUST/NEVER instructions. DevMap is the primary index.
+GitNexus is optional: use it when DevMap lacks a required capability, is unavailable,
+or leaves a material evidence gap, or when the user explicitly requests it. State
+that reason before switching. Do not routinely run or rebuild both indexes.
+
+Before editing, use DevMap impact and source inspection to assess callers and risk.
+Before committing, review the full Git diff and query impact/affected tests for the
+changed symbols. If GitNexus is used as a fallback, follow its applicable impact and
+change checks and report HIGH/CRITICAL risk. Neither index replaces source review,
+regression tests, or the repository's required verification commands.
+
+Use these installed skills for the matching task:
+
+- General navigation: [.agents/skills/devmap/SKILL.md](.agents/skills/devmap/SKILL.md)
+- Debugging: [.agents/skills/devmap-debugging/SKILL.md](.agents/skills/devmap-debugging/SKILL.md)
+- Exploration: [.agents/skills/devmap-exploring/SKILL.md](.agents/skills/devmap-exploring/SKILL.md)
+- Impact: [.agents/skills/devmap-impact/SKILL.md](.agents/skills/devmap-impact/SKILL.md)
+- Refactoring: [.agents/skills/devmap-refactoring/SKILL.md](.agents/skills/devmap-refactoring/SKILL.md)
+
+Keep this section outside the generated block so reindexing preserves precedence.
+Do not add DevMap's whole-file ownership marker to this mixed, maintained guide.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

@@ -195,7 +195,7 @@ describe("FileViewer", () => {
 
   it("arbitrates fixed side panes from the measured File view width", () => {
     expect(source).toContain("bind:this={fileViewRoot}");
-    expect(source).toContain("new ResizeObserver");
+    expect(source).toContain("observeResize");
     expect(source).toContain("resolveFilePaneLayout");
     expect(source).toContain("{#if paneLayout.explorerVisible}");
     expect(source).toContain("{#if paneLayout.editorVisible}");

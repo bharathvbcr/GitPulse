@@ -78,6 +78,24 @@ newer reader; do not downgrade the database to fit an older binary.
 freshness is separate. Check `is_fresh` and show `degraded_reason` even when a
 query can run. Consumers requiring current results must refuse a stale index.
 
+Status also carries nullable `source_freshness` and `analyzer_freshness`.
+`true` means that check passed, `false` means a mismatch was observed, and
+`null` means it was not verified. A parser-free MCP reader checks source bytes
+without certifying a grammar identity it does not contain. Overall `is_fresh`
+requires both checks to pass, no pending edits, and no store degradation.
+Retain `freshness_reason` in GitPulse responses (the CLI calls it
+`degraded_reason`); analyzer uncertainty must not hide a source mismatch.
+
+Repository-map marker metadata includes `inventory_complete`,
+`inventory_source`, `inventory_entries_examined`, `inventory_files_total`, and
+`inventory_unreadable_count`. A computed inventory can still be incomplete.
+Git discovery is bounded to 50,000 eligible paths and has no depth ceiling;
+non-Git discovery retains depth, directory, frontier, entry and cooperative
+time limits. The unreadable-path list is capped at 64 while its count reports
+all observed failures. Completeness applies to the declared marker policy,
+not to parser, call-graph, or dynamic-language coverage.
+
+
 The host contract is a separate compatibility axis from the database schema,
 the code-graph JSON schema and the application's release version. Manvi's
 NDJSON protocol is another independent axis. Additive result fields can be

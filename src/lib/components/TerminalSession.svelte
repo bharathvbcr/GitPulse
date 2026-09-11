@@ -82,6 +82,7 @@
   import { agentPromptArgs } from "../terminal/launchRequests";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { observeResize } from "../dom/observeResize";
   import {
     clampTerminalFontSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -147,8 +148,7 @@
   let fitAddon: FitAddon | null = null;
   let searchAddon: SearchAddon | null = null;
   let searchKey: string | null = null;
-  let resizeObserver: ResizeObserver | null = null;
-  let resizeFrame: number | null = null;
+  let stopResize: (() => void) | null = null;
   let themeObserver: MutationObserver | null = null;
   let lifecycle: ReturnType<typeof createSessionLifecycle> | null = null;
   /**
@@ -451,11 +451,9 @@
     if (host) {
       const t = ensureTerm();
       t?.open(host);
-      resizeObserver = new ResizeObserver(() => {
-        if (resizeFrame !== null) return;
-        resizeFrame = requestAnimationFrame(() => { resizeFrame = null; if (!disposed) refitIfResized(); });
+      stopResize = observeResize(host, () => {
+        if (!disposed) refitIfResized();
       });
-      resizeObserver.observe(host);
       refitIfResized();
     }
     // themeStore publishes before a View Transition applies its CSS. Observe
@@ -470,10 +468,8 @@
       disposed = true;
       lifecycle?.dispose();
       lifecycle = null;
-      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
-      resizeFrame = null;
-      resizeObserver?.disconnect();
-      resizeObserver = null;
+      stopResize?.();
+      stopResize = null;
       themeObserver?.disconnect();
       themeObserver = null;
       term?.dispose();

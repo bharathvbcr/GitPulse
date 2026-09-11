@@ -37,9 +37,21 @@ pub struct CatchUp {
     pub skipped_lines: i64,
     /// Reflog entries replayed.
     pub reflog_entries: i64,
+    /// True when the wall-clock deadline stopped the pass early.
+    ///
+    /// A truncated pass is a floor: remaining transcripts/reflog entries were
+    /// not examined. Never treat `recorded` alone as complete coverage when
+    /// this is set.
+    #[serde(default)]
+    pub truncated: bool,
     /// Empty when the pass completed; otherwise what stopped it.
     pub error: String,
 }
+
+/// Whole-pass budget for catch-up. Cold watermarks once walked ~50s of
+/// transcripts; the deadline stops the walk and reports `truncated` rather
+/// than finishing late on the app-mount path.
+pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where Claude Code keeps its transcripts.
 fn transcript_root() -> Option<std::path::PathBuf> {
@@ -103,7 +115,16 @@ pub fn ingest_transcripts(repo_path: &str) -> CatchUp {
 /// Replays transcripts observed in `worktree_path` into the repository-wide
 /// ledger at `ledger_repo`.
 pub(crate) fn ingest_transcripts_into(ledger_repo: &str, worktree_path: &str) -> CatchUp {
+    ingest_transcripts_into_bounded(ledger_repo, worktree_path, None)
+}
+
+fn ingest_transcripts_into_bounded(
+    ledger_repo: &str,
+    worktree_path: &str,
+    deadline: Option<std::time::Instant>,
+) -> CatchUp {
     let mut out = CatchUp::default();
+    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let Some(root) = transcript_root() else {
         out.error = "no home directory, so transcripts cannot be located".into();
         return out;
@@ -122,6 +143,10 @@ pub(crate) fn ingest_transcripts_into(ledger_repo: &str, worktree_path: &str) ->
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files, 0);
     for path in files {
+        if expired() {
+            out.truncated = true;
+            break;
+        }
         // A transcript not modified since the watermark cannot hold an event
         // newer than it, so reading it can only reproduce work already done.
         //
@@ -141,6 +166,10 @@ pub(crate) fn ingest_transcripts_into(ledger_repo: &str, worktree_path: &str) ->
         };
         out.transcripts += 1;
         for line in content.lines() {
+            if expired() {
+                out.truncated = true;
+                break;
+            }
             if line.trim().is_empty() {
                 continue;
             }
@@ -195,6 +224,9 @@ pub(crate) fn ingest_transcripts_into(ledger_repo: &str, worktree_path: &str) ->
                     out.recorded += 1;
                 }
             }
+        }
+        if out.truncated {
+            break;
         }
     }
     out
@@ -407,13 +439,43 @@ pub fn catch_up(repo_path: &str) -> CatchUp {
 /// through either the main or linked spelling is idempotent because each
 /// source worktree has its own watermark inside that shared log.
 pub fn catch_up_into(ledger_repo: &str, worktree_path: &str) -> CatchUp {
+    catch_up_into_bounded(ledger_repo, worktree_path, Some(CATCH_UP_DEADLINE))
+}
+
+/// Like [`catch_up_into`] with an explicit budget; `None` means unbounded (tests).
+pub fn catch_up_into_bounded(
+    ledger_repo: &str,
+    worktree_path: &str,
+    budget: Option<std::time::Duration>,
+) -> CatchUp {
+    let started = std::time::Instant::now();
+    let deadline = budget.map(|d| started + d);
+    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+
     let mut total = ingest_reflog_into(ledger_repo, worktree_path, 200);
-    let transcripts = ingest_transcripts_into(ledger_repo, worktree_path);
+    if expired() {
+        total.truncated = true;
+        if total.error.is_empty() {
+            total.error = "catch-up truncated: deadline elapsed after reflog".into();
+        } else if !total.error.contains("truncated") {
+            total.error = format!(
+                "{}; catch-up truncated: deadline elapsed after reflog",
+                total.error
+            );
+        }
+        return total;
+    }
+    let transcripts = ingest_transcripts_into_bounded(ledger_repo, worktree_path, deadline);
     total.recorded += transcripts.recorded;
     total.transcripts = transcripts.transcripts;
     total.skipped_lines = transcripts.skipped_lines;
+    total.truncated = total.truncated || transcripts.truncated;
     if total.error.is_empty() {
-        total.error = transcripts.error;
+        total.error = if transcripts.truncated && transcripts.error.is_empty() {
+            "catch-up truncated: deadline elapsed during transcripts".into()
+        } else {
+            transcripts.error
+        };
     }
     total
 }
@@ -610,6 +672,35 @@ mod tests {
             ledger::tail(&anchor, 0, 1000).expect("family ledger").len(),
             events.len(),
             "the second pass changed the shared ledger"
+        );
+    }
+
+    #[test]
+    fn catch_up_deadline_reports_truncated_rather_than_finishing_late() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        // Many transcript files so the walk has work to interrupt.
+        for i in 0..200 {
+            transcript_fixture(
+                tdir.path(),
+                repo,
+                &format!("S{i}"),
+                "2026-09-01T12:00:00.000Z",
+                &format!("{repo}/src/a{i}.rs"),
+            );
+        }
+        let out = with_transcript_root(tdir.path(), || {
+            catch_up_into_bounded(repo, repo, Some(std::time::Duration::ZERO))
+        });
+        assert!(
+            out.truncated,
+            "a zero budget must report truncated, got {out:?}"
+        );
+        assert!(
+            out.error.contains("truncated"),
+            "truncated must be named in error, got {:?}",
+            out.error
         );
     }
 }

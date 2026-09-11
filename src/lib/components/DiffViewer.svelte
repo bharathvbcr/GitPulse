@@ -149,6 +149,7 @@
   import RungFilterControl from "./RungFilterControl.svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  import { observeResize } from "../dom/observeResize";
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.
@@ -514,12 +515,10 @@
   $effect(() => {
     const el = bodyEl;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver((entries) => {
+    return observeResize(el, (entries) => {
       const measured = entries[0]?.contentRect.height;
       viewportHeight = Number.isFinite(measured) && measured > 0 ? measured : 0;
     });
-    observer.observe(el);
-    return () => observer.disconnect();
   });
 
   // --- context strip -------------------------------------------------------

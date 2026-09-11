@@ -68,6 +68,7 @@ export class EnhancementAction {
               expected_revision: proposal.revision,
               ...selectionWire(this.selection()),
             },
+            taskID: action.taskID,
             result: null,
           };
           continue;

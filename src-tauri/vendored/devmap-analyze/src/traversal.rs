@@ -63,7 +63,8 @@ impl TraversalOptions {
 /// what it *received* rather than what existed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TraversalStop {
-    /// Start nodes dropped by `max_nodes` before the walk began.
+    /// Seed entries refused by `max_nodes`. Repeated accepted seeds cost no
+    /// capacity; repeated refused entries are counted as entries, not unique nodes.
     pub starts_dropped: usize,
     /// A node with unexpanded neighbours sat at `max_depth`.
     pub depth_capped: bool,
@@ -316,8 +317,9 @@ pub fn traverse_graph(
 /// exactly the walk, caps and [`TraversalStop`] reasons the one-shot spelling
 /// gives — the ownership of the index moved, nothing else.
 ///
-/// Everything the walk keeps is bounded by `limits.max_nodes` — the visited
-/// set, the enqueued set and the recorded edges — and every decline it makes is
+/// The visited set, enqueued set and recorded edges are bounded by
+/// `limits.max_nodes`; the temporary sorting buffer scales with the largest
+/// reached adjacency list. Every decline the walk makes is
 /// recorded in [`TraversalStop`] rather than left to look like a graph that
 /// ran out.
 pub fn traverse_graph_indexed<I: GraphIndex + ?Sized>(
@@ -331,15 +333,18 @@ pub fn traverse_graph_indexed<I: GraphIndex + ?Sized>(
     let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
     let mut traversed_edges = Vec::new();
     let mut max_depth_reached = 0;
-    let mut stop = TraversalStop {
-        starts_dropped: start_nodes.len().saturating_sub(limits.max_nodes),
-        ..TraversalStop::default()
-    };
+    let mut stop = TraversalStop::default();
 
-    for start in start_nodes.iter().take(limits.max_nodes) {
-        if enqueued.insert(start.as_str()) {
-            queue.push_back((start.as_str(), 0));
+    for start in start_nodes {
+        if enqueued.contains(start.as_str()) {
+            continue;
         }
+        if enqueued.len() >= limits.max_nodes {
+            stop.starts_dropped += 1;
+            continue;
+        }
+        enqueued.insert(start.as_str());
+        queue.push_back((start.as_str(), 0));
     }
 
     // Reused across expansions so a walk allocates one neighbour buffer, not
@@ -352,22 +357,33 @@ pub fn traverse_graph_indexed<I: GraphIndex + ?Sized>(
         }
         max_depth_reached = max_depth_reached.max(depth);
         let neighbors = index.neighbors(curr);
-        // Only edges the confidence floor admits count as "still expanding".
-        // The pre-filtered slice this replaced held nothing else, so an index
-        // that filters lazily must not report a node as expandable on an edge
-        // the answer would never contain.
-        let has_admitted = neighbors.iter().any(|id| index.admits(*id));
-        if depth >= limits.max_depth || visited.len() >= limits.max_nodes {
+        // Apply the same policy to the stop probe and the expansion. Reverse
+        // containment cannot lead to callers, and package topology belongs to
+        // file queries. Neither is evidence that a symbol walk was cut short.
+        let admits = |id: u32| {
+            if !index.admits(id) {
+                return false;
+            }
+            let kind = index.edge(id).kind;
+            !reverse
+                || !(matches!(
+                    kind,
+                    devmap_extract::model::EdgeKind::Contains
+                        | devmap_extract::model::EdgeKind::Defines
+                ) || (is_symbol_node(curr)
+                    && matches!(
+                        kind,
+                        devmap_extract::model::EdgeKind::Imports
+                            | devmap_extract::model::EdgeKind::MemberOf
+                    )))
+        };
+        let has_admitted = neighbors.iter().any(|id| admits(*id));
+        if depth >= limits.max_depth {
             // Only a prune that actually cost the walk an expansion is a
             // decline. A node with no outgoing edges is fully explored, and
             // counting it would make every bounded walk call itself partial.
             if has_admitted {
-                if depth >= limits.max_depth {
-                    stop.depth_capped = true;
-                }
-                if visited.len() >= limits.max_nodes {
-                    stop.node_capped = true;
-                }
+                stop.depth_capped = true;
             }
             continue;
         }
@@ -383,7 +399,7 @@ pub fn traverse_graph_indexed<I: GraphIndex + ?Sized>(
         // inbound edges copies 400 KB of ids, not 20 MB of re-allocated
         // strings.
         sorted_neighbors.clear();
-        sorted_neighbors.extend(neighbors.iter().copied().filter(|id| index.admits(*id)));
+        sorted_neighbors.extend(neighbors.iter().copied().filter(|id| admits(*id)));
         sorted_neighbors.sort_by(|a, b| {
             let left = index.edge(*a);
             let right = index.edge(*b);
@@ -403,36 +419,6 @@ pub fn traverse_graph_indexed<I: GraphIndex + ?Sized>(
 
         for id in &sorted_neighbors {
             let edge = index.edge(*id);
-            // Impact must not walk *upward* through containment. A symbol is
-            // contained by its file, so following that edge in reverse reaches
-            // the file and from there every sibling symbol in it — turning
-            // "what depends on this" into "everything nearby". Both structural
-            // kinds are excluded: `Contains` is the kind actually emitted
-            // today, `Defines` is kept so a future producer of it cannot
-            // silently reopen this hole.
-            if reverse
-                && matches!(
-                    edge.kind,
-                    devmap_extract::model::EdgeKind::Contains
-                        | devmap_extract::model::EdgeKind::Defines
-                )
-            {
-                continue;
-            }
-            // File-level topology (package imports, Go package stars) is
-            // impact for a *file* query. Following it from a symbol node turns
-            // `impact Type.method` into "every importer of this package" — the
-            // ScholarLM `segment` flood.
-            if reverse
-                && is_symbol_node(curr)
-                && matches!(
-                    edge.kind,
-                    devmap_extract::model::EdgeKind::Imports
-                        | devmap_extract::model::EdgeKind::MemberOf
-                )
-            {
-                continue;
-            }
             let next_node: &str = if reverse {
                 edge.source_symbol
             } else {
@@ -547,6 +533,58 @@ mod tests {
             details: None,
             evidence: None,
         }
+    }
+
+    #[test]
+    fn duplicate_seeds_do_not_spend_the_node_budget() {
+        let starts = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        let walk = traverse_graph(
+            &starts,
+            &[],
+            &TraversalOptions {
+                max_depth: 2,
+                max_nodes: 2,
+                reverse: false,
+            },
+        );
+        assert_eq!(walk.visited_nodes, BTreeSet::from(["a".into(), "b".into()]));
+        assert!(!walk.stop.is_incomplete(), "{:?}", walk.stop);
+    }
+
+    #[test]
+    fn excluded_reverse_edges_do_not_claim_a_depth_or_node_cap() {
+        for kind in [
+            EdgeKind::Contains,
+            EdgeKind::Defines,
+            EdgeKind::Imports,
+            EdgeKind::MemberOf,
+        ] {
+            let walk = traverse_graph(
+                &["b.go::Target".into()],
+                &[edge("a.go", "b.go::Target", kind)],
+                &TraversalOptions {
+                    max_depth: 0,
+                    max_nodes: 1,
+                    reverse: true,
+                },
+            );
+            assert!(!walk.stop.is_incomplete(), "{kind:?}: {:?}", walk.stop);
+        }
+    }
+
+    #[test]
+    fn reaching_the_node_cap_does_not_prevent_recording_edges_between_seeds() {
+        let walk = traverse_graph(
+            &["a".into(), "b".into()],
+            &[edge("b", "a", EdgeKind::Calls)],
+            &TraversalOptions {
+                max_depth: 3,
+                max_nodes: 2,
+                reverse: false,
+            },
+        );
+        assert_eq!(walk.traversed_edges.len(), 1);
+        assert!(!walk.stop.is_incomplete(), "{:?}", walk.stop);
     }
 
     /// Reverse traversal from a *symbol* must not climb file-level topology.

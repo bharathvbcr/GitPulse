@@ -30,7 +30,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-store",
-        "commit": "6fc0faf9ef9fd80ab5e590b667cf07f30fdb70f1"
+        "commit": "43b7b17cf79951a18adac5dd0779d630d0bfd585"
       },
       "omitted": [
         "tests/",
@@ -55,11 +55,12 @@
         "src/workbench/briefs.rs": "8d7e46d87b6986fa39fd72c296cc9763a5f26a82863df1170d363b2e12f833b9",
         "src/workbench/decisions.rs": "859234197b0b0438c02e5e005f926b4903f6bf81a6457db8b56487f5a86aff04",
         "src/workbench/decisions.sql": "e4acc6c419065ac479262a6ef861e4c1cec9b0234a9662641d48743fa2c25985",
-        "src/workbench/enhancements.rs": "8b81d390aaa6b0abb3061fb8a0e63900facd41c5ac27c2276e25a92969f4fe35",
+        "src/workbench/enhancement_lifecycle_tests.rs": "f6e534cec50f4baa0d3e0a2a19e1c6f6247d57d4876a85f840582baabfe70616",
+        "src/workbench/enhancements.rs": "c22f12b86408223a541fe987e71c7d8f73d35bccf8e6dc8f1edc249552c5d845",
         "src/workbench/enhancements.sql": "fea69b449c9e7122df25e0f0bb24517e9f17b1ec5472b034f6cc534eaf616372",
         "src/workbench/input.rs": "0a9599d30eabaf3771c0d7d145e98ac06efe79177598c082dbf7b0db536bf20d",
         "src/workbench/item_query_tests.rs": "f0138fd5856b7a9100571149e9d1def15317c940caab0d0f6e7db6ac171cb3d5",
-        "src/workbench/mod.rs": "ded6a8680aa08bedb74c590fed13951ba9326a187fb6659af7e42df53d8ec30b",
+        "src/workbench/mod.rs": "be108b5e269dd7407cafda3130587c7387f191f6f30fe96f34d5372377b0a2ee",
         "src/workbench/notifications.rs": "b845ec5c599f621a3c57f5b807f75c09c911d1c01df3fce60d39e107c6f60e8e",
         "src/workbench/notifications.sql": "35d39f5bcd61a1750aeeee661b053fa1ee7298271c90b6f4357180b7323489c5",
         "src/workbench/runs.rs": "1d7b254412ceb8b107b2b36d54f771ee63f2f849e7536d2b666d579579b86dae",
@@ -99,7 +100,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-analyze",
-        "commit": "4ccadc604f40e21a3a14471d0af3c7674265e15f"
+        "commit": "0197cdaa3b8e4ab15f55a219c6a237e8be646165"
       },
       "omitted": [
         "tests/",
@@ -117,18 +118,18 @@
         "dependencies.tree-sitter-python from the workspace"
       ],
       "files": {
-        "Cargo.toml": "09a4f3d8bc1cbaa9a43ed536190aeccb1347d1a9fc62d99a0910aafc8fc4b017",
+        "Cargo.toml": "d451affa97e8f5cc285b5ecfc7e74820d1c2a9c56742bdb381bb67980bc43d7f",
         "src/clones.rs": "80fcfe9b880b13b1016f434cb14e6a16ed949751987945119051f3fb6128dff4",
         "src/clustering.rs": "a154f73f80f7b95838207aeaf4f3a903a473bb90cf2330ce0013e53a79b13b6c",
-        "src/dead_clusters.rs": "02f9fb7ccca406602ca082e7dce6d6f08b36cbe1965e6d00d336b6594ff75bfd",
+        "src/dead_clusters.rs": "072634f595063d7f3a9045280f28ee3f5d2e279b8ef23b79acf88737bd1957ef",
         "src/graph_intel.rs": "5771edd83891421a06916e04f352d6bc0e74312dc8817ef46f8fce5f31a6cad9",
         "src/lib.rs": "032fff9d6d58012f0823a472f2227ec41d1a76f0efa30bdb65d2390a83dfb39b",
-        "src/liveness.rs": "506e80e8515a069da9ec3fb9544dcb9a19c7831de14e8962b36f4ec7ce04ec98",
+        "src/liveness.rs": "0245e49af464cef4c5c1f43eeb059086f19a9a14db17b95e345bdfa50031d775",
         "src/model.rs": "20e3b4e89dfd75da9d57ef960b1a4b4beb7890fa2a0a5f32751166b77f99cd8e",
         "src/pdg.rs": "412e148c3837acdded9f6e467347b877afed88fc19f2978ac28936b9a49cc786",
         "src/pdgsrc.rs": "ca5d3dea9cb36a8d4a0e162b15a3b28ec0d419f96e0779e62df878e95fa8902e",
         "src/resolution_rate.rs": "26acf697f690a8d10a9326ac819eef6f56eb6d4ff0413681013d5656406c747a",
-        "src/traversal.rs": "3f65b8f2b849e69fcc9fbbbb612e9adb44d0764f21e62d752150e80f010ad626"
+        "src/traversal.rs": "d00360945c7dca64a0c3eef6e2061b176d7b85fbe89d5091c952a1306af160bf"
       }
     },
     {
@@ -137,7 +138,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "da7d2d106201073e14d7ab43cc2f78981f6755ed"
+        "commit": "0197cdaa3b8e4ab15f55a219c6a237e8be646165"
       },
       "omitted": [
         "tests/",
@@ -190,11 +191,11 @@
         "target.'cfg(unix)'.dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "a21eb8a9a61186c63837037d0444f2759cc9f11c04a9039f30d045afdec7d7ef",
+        "Cargo.toml": "35951871d94a3ec2c1a1b98bedb836f2bbfb49d949ddd0cd37ff24ebf593d6ac",
         "build.rs": "fe652c4acc96c61496df48d32f5942a0baaa04f719563b1ad19b18a5bede9284",
-        "src/cache.rs": "75d3f1429ad99de72cbb30fdc108b6c61d9a55ebd3693fae21c39b51d69fc85e",
+        "src/cache.rs": "6d52761ee51cd17d58ec6a7daba1d6cd595c3510b703d42383c5b8d1a5ff1a90",
         "src/clonesig.rs": "11afa842f06228636d7cc0271e83925347108ed44a8c70502dfb480e47a0ea43",
-        "src/embedded.rs": "cbefdd2a2e2f27c4f6b088aa3675cd1aef5bcfe824e6c3dfc7bca676b80748a6",
+        "src/embedded.rs": "8e910facc7aabb4d21f77a2a5cc15767ccb72c0481177d46887140d42cafdf63",
         "src/fallback.rs": "35c7bb1dde061964e8ecfb92fae823ea191abcba7a20c0a5f38dd24a14635e62",
         "src/frameworks.rs": "1899508a57f6b4a06c01fc9b9852ce5a667573460619e9ac18582f97a3b4d4e0",
         "src/git_metadata.rs": "38bd4f6e6703e140c699d9a93751bfbd812cad10965a59d03101fb3b4c7d4f22",
@@ -218,7 +219,7 @@
         "src/langcalls/shell.rs": "02d745e342e6fb38297fde16e1ec406f5305e6fca9cce0dfb9ae8db422a5f561",
         "src/langcalls/solidity.rs": "cb31515fbd5be4a9235225a6479a000e494600b7f1f249716f7e52269c725c90",
         "src/langcalls/sql.rs": "e4cd7539e4f30dfa540d7e9eb8439874cc1b2759d812db9dbf35af57138e68b2",
-        "src/langcalls/swift.rs": "3c4cff66cd51ce7d7a575d1644b928bdb0fac21764cbd0161ec263656a516d50",
+        "src/langcalls/swift.rs": "d97368b8062ab06e16da835ed810b77cd35a95baf4d216cd7558d85bbaf4598d",
         "src/langdecl/dart.rs": "1fea3675cf743b5b34b82d61ae4e7e4048b7beb81a4b1d7267322e1e7b2d0b24",
         "src/langdecl/erlang.rs": "1bc157e9c61ca49861f6918c0000c184fdde557474c78528779b0573d2a15d5b",
         "src/langdecl/kotlin.rs": "f29dcacbbc58394477841c75db42d5838853eb1f0af62574a186661190f7cb5f",
@@ -227,7 +228,7 @@
         "src/langdecl/pascal.rs": "61d44d89a6a13b17ddb53f03da3201865bd971b828c5b17ea4e0737013fc1c99",
         "src/langdecl/r.rs": "3d6dff0b2432bae475c040665e790720890cd06f46568395612b9ee23340e5c4",
         "src/langdecl/solidity.rs": "696df03a24f1856fdb1dbfbcbc8cb697b5ff999b19caa72e3b270eacf91ab98d",
-        "src/langdecl/swift.rs": "e52190522076b2d7d8c29f564c9a5fb782e9c79f79a3ae53a8eeb12fad7a4806",
+        "src/langdecl/swift.rs": "fdbb4765e7fbc8cee0f7aafb188f908ddaade43ac89f1b1f676bdb83e6c28356",
         "src/langimports/cfamily.rs": "6fa9ca24a0b800f1d6dd39b44fcb5b2ef410fdd5bde28e9677934f0f00c87a87",
         "src/langimports/cfml.rs": "5a041aec5abb944a17d4f2d4830061f752e74ec01109c4f40dd355567042accd",
         "src/langimports/dart.rs": "33e16116ffdab5597dc63990814826adafd1781b5d0228cca37137a3380c2a1b",
@@ -236,7 +237,7 @@
         "src/langimports/java.rs": "0d2db5bb5f21637c2e80f8253509aa874945ae84e93fc89d8f2d2dca7ea5857c",
         "src/langimports/kotlin.rs": "61fcd06a28490eadbfdc3afaf179d3515c1796241e5b7c034608fa5a44f6563f",
         "src/langimports/lua.rs": "3752222979ce4ed9f02c69c97f42b1311101efc8f8a06d26b42a11e2b222cb1b",
-        "src/langimports/mod.rs": "2302b92535c08d55264bb957e0e73d7fceb4d8e01e91c5b0e262f57a1bce12e8",
+        "src/langimports/mod.rs": "a2688f16a5121d9ac5196bc6317cf593b8362310dc45ef9a1b6ca867358140ed",
         "src/langimports/nix.rs": "030efe5e8ed7891764d483cebfddafb6f294975fc66737a276bb470a2e5322c6",
         "src/langimports/pascal.rs": "deb372d8766c19c8d8c73b98f9150f1ec741bdd23394066806bc92830da8fccb",
         "src/langimports/php.rs": "b2dd2a45debff31a8dcac23e629b1fd8fb36688e0988c0e1df2c92db7ec6291c",
@@ -244,17 +245,19 @@
         "src/langimports/ruby.rs": "d8a20501f0e9dcca12508bb56e1276c3c0388249d4de35442c01c14b11c4cbc0",
         "src/langimports/rust.rs": "ef852e93e78b6ed5a9d292674782222049515b8f9b2be320d0a569f7e0d727fa",
         "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
+        "src/langimports/shell.rs": "e87f25d52f8bcf07c26f00b958179290fef7c2d2586c0df9939c47cad5cbccee",
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
-        "src/languages.rs": "50992c69d9378a2c132d80d8c8e5c20521a3066150fd4fd7bbf723a9e65925b7",
-        "src/lib.rs": "d16efc2eb7fb1018444ff8b1902bfc3674d1d46dc8c57878c17a0569d14dedc2",
-        "src/model.rs": "0059b938eccbf8f48a2e64ada08ec7cf306a1d61d6cd4debaa6fe831afa9a4e6",
+        "src/langimports/swift.rs": "7e7e09d2a5557f886724cd538e8a0abebc41a5292f4d3538f3e2ae5b56da538f",
+        "src/languages.rs": "b4d64b147e844cc23f2b8adc58d026ca7585b6e1862d111699d67d60081ade03",
+        "src/lib.rs": "28d81649565115363e3fe3e812bd9f71748f9e1700f797f20135fb4213155988",
+        "src/model.rs": "746cb4b651718168ddf7d5c4cc86c42df9b4467a8821efe45411fda855342c50",
         "src/notebook.rs": "854c6ca121d3c75bb72755070236241d3fb9a4eea47da27daa07d33c12e6c26b",
         "src/parent_index.rs": "3117a0e489e04f71e5a7879a0a3c14a8515ec10e35df529e3f05a9c950748311",
         "src/paths.rs": "b3d22d94e1dcd752b0908d7dac059f5bdffe06335b0b0a05cf24e03d849dc71e",
         "src/progress.rs": "b7de434d9647a53e124e478b10e7c4bd9214445c98a6ec3ce4ff3477d51d1a4e",
         "src/subprocess.rs": "3df93eb228ff663224c9a13cf45780b7939fa0b7513bde7978e6cc6ce1a27156",
-        "src/treesitter.rs": "7197f582c981c5f7e9c64104bac0a52815c0c1478f519ac55faf6c01c1d9da78",
-        "src/wiring.rs": "c966f2df3eea1629ac97b93214713eee21e2239c41dd587eee097ec84ebe4546"
+        "src/treesitter.rs": "05b47e1a809dd4c0d02f482a0716affec8a141e8a67ac13610553ab9d7257caa",
+        "src/wiring.rs": "9df693caab1a9f9f5bc175172e3983c04f14f5873b6280e1dc724484927e6356"
       }
     },
     {
@@ -263,7 +266,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-query",
-        "commit": "4ccadc604f40e21a3a14471d0af3c7674265e15f"
+        "commit": "0197cdaa3b8e4ab15f55a219c6a237e8be646165"
       },
       "omitted": [
         "tests/",
@@ -280,34 +283,35 @@
         "dependencies.regex from the workspace"
       ],
       "files": {
-        "Cargo.toml": "272f92a130fbfb3421d3bcb15fed45be392805a7216aec2fc0d0d15745e07d9e",
+        "Cargo.toml": "f34871ee750fe3a42b6ceb707ac1d6218dd541b558730c57b6fa3b052952ab71",
         "assets/force-graph.min.js.bundle": "1008539bb9e171a0dc343453366451a1b3a6ded06028ef4f978608b658ba2d0a",
         "src/api_routes.rs": "3758344d1bd33fc3506df19d9d29f682ff5468b6af9abba68d723b5ba7926743",
         "src/artifacts.rs": "57ba8ae8925914888d037cc36977566ee98928e16f8bb96799b02d6e591feb31",
         "src/ast.rs": "6ec0da5812f4036a78976a45b183ff8fb000f7b817403e352487034101d7a6f0",
         "src/cancel.rs": "63bd23f9604231f538f0db079502db8b0c23bebf4f0eaf64216a53d3c1c00ffb",
-        "src/code_graph.rs": "0c6650916e7a1af7bb49ffd8dfc9dc3680e1db0ed5e9cd932ebe2ba24374e24c",
+        "src/code_graph.rs": "48503654ec11a76b34d501c98c497b3443f3863561f463c7c47eeef00916b3f8",
         "src/cypher.rs": "b76a45dee1205833d2cb042c8d1e1ecc161675cf19a8fe0e1b62d2b62c9678d5",
         "src/digest.rs": "400ce85d492added4723f5f0b01ffd858a2837bb77b3f4adf214ce0a9cb44fb1",
-        "src/engine.rs": "451a7c15517d22941de23f4875a2e6e123a2055aeba5f13befee10fb27f24f3c",
+        "src/engine.rs": "484ae61123da72af88e4ef4c77960ddde07114672c7152aab60a9a3ad10e9737",
         "src/escape.rs": "d87b290b8613736bf735d4424495b33dfbbda99e1d944abb5507ef63a9b8b27e",
         "src/export.rs": "3bfb15986ff49dba6ebbf4af82d9050c34931e6397a04e2c8031aa2fcb4b529d",
-        "src/freshness.rs": "5492ea2bf9aaeb0c5a408c7a33f12f3c0c972beb3cda9ed08a53f4031de702c7",
-        "src/guides.rs": "feff844263b0a508c10aaddea16b525746ae6a98859397920599d8939c6ea2bf",
+        "src/freshness.rs": "170ce260ccceceff7e3c0ea78d5fa41cce87569810d7f95da359b2ee3d576b29",
+        "src/guides.rs": "de157da561c50f90e75fd7ea6e8b5eed501b680ed25033726c753b9cad99b5f7",
         "src/host.rs": "9341d12d28352ff73fbe4e7dc8a2004bf664471b115e67feca14473e5ef3b7ae",
         "src/hygiene.rs": "a94bb601725c5d4382d8415aba7ad3908a061591e25b8041fdd478678636f763",
-        "src/inventory.rs": "3d55ffbbfe2995367b08b9645427691563b119288f8f87fc71a6ed17adf3ae90",
+        "src/inventory.rs": "e2788ad2dd4f73329b54b590686591a9c8ffd589d43d03ef996278435d648f57",
         "src/lib.rs": "ed60c187fe61d83401aefbc6091c8e02405397cf749348bf9f72e35ee4d41801",
         "src/linguist.rs": "08832b5a4215e7c3242f31af0672391ad9c33b25e1d050e7c365b11b3a418908",
-        "src/manifest.rs": "279fdb350bcaee24bddb29123192661d413802afd630eb5dafc06d9a73121437",
+        "src/manifest.rs": "11d2662f228c73c1fbd4d905262e6eca406d5b779676c057f099639d60141dce",
         "src/map_preview.html": "090e7abcb22ca1e091de2f4158f316e481610c2821f7e5c054260c34333aa185",
         "src/map_preview.rs": "ab3e8abfbdb30cccab224f8462a29ccd1cedb9495e7cc27aebb90796f5b2ba95",
-        "src/model.rs": "58efcfe224f223d9ec52e8a9514b100bda541aa87328c7201842ff3079a8ddaa",
+        "src/model.rs": "1b30fd88b97cedf56f8905c16ce54b2828ca2f23629fc8a9147398283b2cca53",
         "src/query_match.rs": "d3895702cdfac77fe87cfffb7f729555f7da5f20a762c58c7437fa92c51ca51d",
         "src/rung.rs": "e962ef23a3dc51e7595bb0708bb6a132cf5bf3172f8c2b9b1050ffeaf0c7f243",
         "src/semantic.rs": "bf045dad9afd1e87a50872983081db999575d9aae54ece304c2cd9c563fc38e4",
         "src/snapshots.rs": "2021b47ec10f2743c162e453bba882180494b57c99e07139f8e9f7a9c5daa942",
-        "src/viz.rs": "2771be757c19e94c40aa27efcf1a26f239e64b437284d6f5b6dbbca6abf11c71",
+        "src/tests/inventory_reader.rs": "79449cf26dcf7e9e0c69894168b4b6575c46aa0a07feb974c9a9027d4099cac4",
+        "src/viz.rs": "52933fe62c2a554d1582255b1e7fa6030614c8a3ad25ab4023295ffbfd23eb17",
         "src/workspace.rs": "a143523a44881f0f4589a38d8edf2d0ca676747b41f530a1cd9c5ca56ddb32ee"
       }
     },
@@ -317,7 +321,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-resolve",
-        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
+        "commit": "0197cdaa3b8e4ab15f55a219c6a237e8be646165"
       },
       "omitted": [
         "tests/",
@@ -332,12 +336,12 @@
         "dependencies.serde from the workspace"
       ],
       "files": {
-        "Cargo.toml": "102d6dcdbb48304db32ddd7e976f5a50aaf64d29c408a538fb65ed7b45cb36f3",
-        "src/builtins.rs": "de63c281b6949e5f45d73672ed7aa68c8f3b24ab531ffdf30253d8c21af25b90",
+        "Cargo.toml": "9e4268f9d1a05d6781792dc448faf1a41865195b14c51e11701eb0eded9d957b",
+        "src/builtins.rs": "16f357f25553d4a26eccd17d842eeb9285d2d6984103e9464b1d2bf61a6fd409",
         "src/importpath.rs": "27d476e5a9c2b0a2dc75b26ff875e0ed9087038b798997abc009a0ae8e604b16",
         "src/lib.rs": "ad28406823b9fef01b30e881780561ae5557c9dc4a6315a71e97d9a7aaccd183",
         "src/model.rs": "2fd415056ef71ba75f73f8d39cbc086bde081b5fc6925b3d0ee138bff9382b30",
-        "src/resolver.rs": "6977ecb9add4e88d8728aa64098e436c0aa2b803899bcdb8e22fbfc6d9fd44c4"
+        "src/resolver.rs": "7e76898504cab0e70821c1061d6056ad7ae24a08c0a2800a82b753162daf02da"
       }
     },
     {
@@ -346,7 +350,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "75050891d311b8091599e32450e397d2ca8fff75"
+        "commit": "0197cdaa3b8e4ab15f55a219c6a237e8be646165"
       },
       "omitted": [
         "tests/",
@@ -366,7 +370,7 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "2db68a57277a52653823811af0ed7bccde48f827a29bce5307352fbb196246fb",
+        "src/db.rs": "c67f2d610d0bede0f633c0f054b64b7d149f1f835d19aba6e043e387100f4b0b",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
         "src/lib.rs": "189e97c932a71f282967282540b103003c5c927021e2fe238ce47745ddea892e",

@@ -26,6 +26,9 @@ export function readBrowserVerdict(html) {
   if (rows.length < 24 || rows.some(row => !row || typeof row !== "object" || !("pass" in row) || row.pass !== true)) {
     throw new Error(`Browser regressions failed: ${JSON.stringify(result)}`);
   }
+  if ("genuineObserverShapes" in result && Array.isArray(result.genuineObserverShapes) && result.genuineObserverShapes.length) {
+    console.log("genuineObserverShapes", JSON.stringify(result.genuineObserverShapes[0]));
+  }
   return `${rows.length}/${rows.length} browser regressions passed`;
 }
 

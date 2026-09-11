@@ -327,7 +327,7 @@
               <p class="text-[11px] text-amber-300 wrap-break-word">Saved history incomplete: {$diagnosticHealth.restorationError}</p>
             {/if}
             {#if $diagnosticHealth.suppressedRuntimeEvents > 0}
-              <p class="text-[11px] text-textMuted">{$diagnosticHealth.suppressedRuntimeEvents} development reload messages suppressed this session.</p>
+              <p class="text-[11px] text-textMuted">{$diagnosticHealth.suppressedRuntimeEvents} runtime notifications suppressed this session.</p>
             {/if}
           </div>
 

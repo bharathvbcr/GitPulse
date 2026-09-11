@@ -18,11 +18,14 @@
 //! `#include "lib/util.h"` names a file. `import com.foo.Bar` names
 //! `com/foo/Bar.java` by a rule the Java language specification fixes. `using
 //! System;` names neither — a C# namespace spans files and a file may declare
-//! many — and `import Foundation` names a *module*, which is the one thing that
-//! cannot explain intra-module wiring because same-module Swift files need no
-//! import at all. Those two are declined here with reasons, and the decline is
-//! pinned by `tests/language_capabilities.rs` so it stays a decision rather
-//! than becoming an oversight.
+//! many — so C# stays declined. `import Foundation` names a *module*, and that
+//! is extracted: a Swift module is the same shape as a Go package (one
+//! unqualified namespace spanning every file in a target), so the specifier
+//! maps to the module rather than to a file. Same-module files still need no
+//! import of each other; they are wired by calls, the way same-package Java
+//! files are. The decline that remains — C#, VB.NET, COBOL, SQL — is pinned by
+//! `tests/language_capabilities.rs` so it stays a decision rather than becoming
+//! an oversight.
 //!
 //! Each language lives in its own module, mirroring `langcalls`, which is the
 //! shape this repository already chose for exactly this problem: `treesitter.rs`
@@ -47,7 +50,9 @@ pub(crate) mod r;
 pub(crate) mod ruby;
 pub(crate) mod rust;
 pub(crate) mod scala;
+pub(crate) mod shell;
 pub(crate) mod solidity;
+pub(crate) mod swift;
 
 /// Route one node to its language's import extractor.
 ///
@@ -116,7 +121,9 @@ fn extractor_for(lang: &str) -> Option<ImportExtractor> {
         // rule this module applies rather than an accident.
         "rust" => rust::extract_mod,
         "scala" => scala::extract_import,
+        "shell" => shell::extract_source,
         "solidity" => solidity::extract_import,
+        "swift" => swift::extract_import,
         _ => return None,
     })
 }
@@ -150,7 +157,7 @@ pub fn extracts_imports(lang: &str) -> bool {
 /// the build.
 pub const IMPORT_EXTRACTION_LANGUAGES: &[&str] = &[
     "c", "cfml", "cpp", "cuda", "dart", "erlang", "hcl", "java", "kotlin", "lua", "luau", "nix",
-    "objc", "pascal", "php", "r", "ruby", "rust", "scala", "solidity",
+    "objc", "pascal", "php", "r", "ruby", "rust", "scala", "shell", "solidity", "swift",
 ];
 
 /// A quoted specifier with its quotes removed, or `None` when the node is not a
@@ -179,10 +186,25 @@ pub(crate) fn file_import(
     specifier: String,
     span: crate::model::Span,
 ) -> ExtractedImport {
+    named_import(raw, specifier, Vec::new(), span)
+}
+
+/// One import that also names members of the module.
+///
+/// Swift's `import struct Foundation.Date` is the case: the specifier is the
+/// module (`Foundation`) and `Date` is a member, recorded so classification
+/// can see the name as coming from that module rather than as a bare
+/// unresolved identifier.
+pub(crate) fn named_import(
+    raw: &str,
+    specifier: String,
+    imported_names: Vec<String>,
+    span: crate::model::Span,
+) -> ExtractedImport {
     ExtractedImport {
         raw_import: raw.to_string(),
         module_specifier: specifier,
-        imported_names: Vec::new(),
+        imported_names,
         local_names: Vec::new(),
         alias: None,
         span,

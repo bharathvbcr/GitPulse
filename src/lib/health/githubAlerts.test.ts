@@ -395,6 +395,133 @@ describe("maybeNotifyGithubAlerts", () => {
     expect(d.onError).toHaveBeenCalledWith("HTTP 403");
   });
 
+  it("does not treat a disabled GitHub security product as a failed check", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({}, []),
+          codeScanning: codeScanningReport({
+            available: false,
+            error:
+              "Code scanning is not enabled for this repository. Please enable code scanning in the repository settings. (HTTP 404)",
+            unavailable_reason: "product_disabled",
+          }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("clean");
+    expect(d.notify).not.toHaveBeenCalled();
+    expect(d.onError).not.toHaveBeenCalled();
+  });
+
+  it("treats product-disabled prose without unavailable_reason as a failed check", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({}, []),
+          codeScanning: codeScanningReport({
+            available: false,
+            error:
+              "Code scanning is not enabled for this repository. Please enable code scanning in the repository settings. (HTTP 404)",
+          }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalled();
+  });
+
+  it("still warns when a request failed even if the error text names a disabled product", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({}, []),
+          codeScanning: codeScanningReport({
+            available: false,
+            error:
+              "Code scanning is not enabled for this repository. Please enable code scanning in the repository settings. (HTTP 404)",
+            unavailable_reason: "product_disabled",
+          }),
+          codeScanningRequestFailed: true,
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalledWith(
+      "Code scanning is not enabled for this repository. Please enable code scanning in the repository settings. (HTTP 404)",
+    );
+  });
+
+  it("treats Dependabot-disabled plus code-scanning-off as unavailable, not failed", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport(
+            {
+              available: false,
+              error: "Dependabot alerts are disabled (HTTP 403)",
+              unavailable_reason: "product_disabled",
+            },
+            [],
+          ),
+          codeScanning: codeScanningReport({
+            available: false,
+            error: "Advanced Security must be enabled for this repository to use code scanning. (HTTP 403)",
+            unavailable_reason: "product_disabled",
+          }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("unavailable");
+    expect(d.onError).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a blank error as expected-unavailable or as a silent all-clear", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({ available: false, error: "   " }, []),
+          codeScanning: codeScanningReport({ available: false, error: "   " }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalledWith("   ");
+    expect(d.notify).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an empty error as expected-unavailable", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({ available: false, error: "" }, []),
+          codeScanning: codeScanningReport({ available: false, error: "" }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalledWith("GitHub check returned no explanation.");
+    expect(d.notify).not.toHaveBeenCalled();
+  });
+
+  it("still warns when a request failed even if the error text is empty", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({ available: false, error: "" }, []),
+          codeScanning: codeScanningReport({
+            available: false,
+            error: "Code scanning is not enabled for this repository.",
+          }),
+          dependabotRequestFailed: true,
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalledWith("GitHub request failed.");
+    expect(d.notify).not.toHaveBeenCalled();
+  });
+
   it("does not treat a local-only repository as a failed check", async () => {
     const d = deps({
       load: vi.fn().mockResolvedValue(

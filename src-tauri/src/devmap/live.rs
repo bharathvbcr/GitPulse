@@ -1,4 +1,4 @@
-//! Live index: incremental `devmap build` off watcher `repo-changed`.
+//! Live index: `devmap build` off watcher `repo-changed` and repo activation.
 //!
 //! ## Gate
 //!
@@ -8,15 +8,35 @@
 //! a settled write makes the working tree diverge from the map even when the
 //! store's pending queue is empty (no daemon).
 //!
+//! Incremental `devmap build --json` cannot restamp analyzer identity. When
+//! status names an obsolete extraction payload, this module shells out through
+//! [`super::build`] (`--manifest`) instead. Ordinary source-tree staleness
+//! stays incremental.
+//!
+//! ## Echo / failure cooldown
+//!
+//! A `repo_changed` tick that rebuilds and learns the index was already warm
+//! (`unchanged: true`) — or that the build failed — used to reopen a 1 Hz
+//! loop whenever the build itself wrote under a watched path the noise gate
+//! missed. Per-repo exponential cooldown (1s → 2s → … capped at 60s) answers
+//! further `repo_changed` ticks with [`LiveRefreshDecision::SkipCooldown`]
+//! until the wait elapses. Explicit `devmap build` / `refresh` commands never
+//! consult this gate; call [`clear_live_echo_cooldown`] after them so the next
+//! watcher tick is not stranded behind a stale wait.
+//!
 //! ## Store lifetime
 //!
 //! Never hold an open [`devmap_store::Store`] across a build. This module
-//! only reads CLI status JSON, then shells out through [`super::refresh`],
-//! which acquires [`super::cli::BuildGuard`] for the duration of the child.
+//! only reads CLI status JSON, then shells out through [`super::refresh`] or
+//! [`super::build`], which acquire [`super::cli::BuildGuard`] for the duration
+//! of the child.
 
 use super::cli::{self, is_build_in_flight, BuildOutcome, CliStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Inputs the pure gate needs — assembled by [`maybe_refresh`] or tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,11 +62,126 @@ pub enum LiveRefreshDecision {
     SkipBuilding,
     SkipSchemaOutdated,
     SkipUnavailable,
+    /// Watcher echo / failed-build backoff still active for this repo.
+    SkipCooldown,
 }
 
 impl LiveRefreshDecision {
     pub fn should_refresh(self) -> bool {
         matches!(self, Self::Refresh)
+    }
+}
+
+/// Which CLI rebuild an authorized live refresh must spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveRebuildKind {
+    Incremental,
+    Manifest,
+}
+
+/// The store's exact reason when grammar/analyzer identity no longer matches.
+/// Incremental vacuum cannot clear it; only `devmap build --manifest` can.
+const OBSOLETE_PAYLOAD_REASON: &str = "stored extraction payload is obsolete";
+
+const COOLDOWN_CAP_SECS: u64 = 60;
+
+#[derive(Debug, Clone)]
+struct EchoCooldown {
+    until: Instant,
+    /// Consecutive echo/failure builds that raised the wait (0 before first).
+    streak: u32,
+}
+
+fn echo_cooldowns() -> &'static Mutex<HashMap<String, EchoCooldown>> {
+    static MAP: OnceLock<Mutex<HashMap<String, EchoCooldown>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop the echo/failure cooldown for `repo_path` (explicit build/refresh).
+pub fn clear_live_echo_cooldown(repo_path: &str) {
+    if let Ok(mut map) = echo_cooldowns().lock() {
+        map.remove(repo_path);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_all_live_echo_cooldowns() {
+    if let Ok(mut map) = echo_cooldowns().lock() {
+        map.clear();
+    }
+}
+
+/// Next cooldown length after `streak` consecutive echo/failure builds.
+///
+/// `streak` is the count already recorded before this raise (0 → 1s, 1 → 2s, …).
+pub(crate) fn cooldown_secs_for_streak(streak: u32) -> u64 {
+    let shift = streak.min(6);
+    (1u64 << shift).min(COOLDOWN_CAP_SECS)
+}
+
+fn cooldown_remaining(repo_path: &str, now: Instant) -> Option<Duration> {
+    let map = echo_cooldowns().lock().ok()?;
+    let entry = map.get(repo_path)?;
+    if entry.until <= now {
+        return None;
+    }
+    Some(entry.until.saturating_duration_since(now))
+}
+
+fn raise_echo_cooldown(repo_path: &str, now: Instant) {
+    let Ok(mut map) = echo_cooldowns().lock() else {
+        return;
+    };
+    let streak = map
+        .get(repo_path)
+        .map(|e| e.streak.saturating_add(1))
+        .unwrap_or(0);
+    let secs = cooldown_secs_for_streak(streak);
+    map.insert(
+        repo_path.to_string(),
+        EchoCooldown {
+            until: now + Duration::from_secs(secs),
+            streak,
+        },
+    );
+}
+
+fn note_productive_build(repo_path: &str) {
+    clear_live_echo_cooldown(repo_path);
+}
+
+/// True when a finished build should raise the echo cooldown.
+///
+/// Failures (`ok: false`) and warm-path echoes (`unchanged: true`) both feed
+/// the loop the cooldown exists to stop. A missing `unchanged` field is not
+/// treated as an echo — only an explicit true is.
+pub(crate) fn build_is_echo_or_failure(build: &BuildOutcome) -> bool {
+    if !build.ok {
+        return true;
+    }
+    build
+        .report
+        .as_ref()
+        .and_then(|report| report.get("unchanged"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// True when `devmap status --json` says the stored extraction payload is from
+/// an older analyzer. Other `degraded_reason` values, including source-tree
+/// drift, must not force a full rebuild.
+pub fn needs_manifest_rebuild(payload: Option<&Value>) -> bool {
+    payload
+        .and_then(|status| status.get("degraded_reason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason.contains(OBSOLETE_PAYLOAD_REASON))
+}
+
+pub fn live_rebuild_kind(payload: Option<&Value>) -> LiveRebuildKind {
+    if needs_manifest_rebuild(payload) {
+        LiveRebuildKind::Manifest
+    } else {
+        LiveRebuildKind::Incremental
     }
 }
 
@@ -75,6 +210,9 @@ pub struct LiveRefreshOutcome {
     /// Present only when a build was started.
     pub build: Option<BuildOutcome>,
     pub reason: Option<String>,
+    /// Remaining echo/failure backoff when `decision` is [`SkipCooldown`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_ms: Option<u64>,
 }
 
 /// Serde mirror of [`LiveRefreshFacts`] for the command boundary.
@@ -104,13 +242,18 @@ fn status_bool(status: &Value, key: &str) -> Option<bool> {
 /// Read freshness + schema honesty out of `devmap status --json`.
 pub fn freshness_from_cli_status(status: &CliStatus) -> (bool, bool, bool) {
     if !status.available {
-        return (false, true, true);
+        return (false, false, false);
     }
     let Some(payload) = status.status.as_ref() else {
-        return (false, true, true);
+        return (false, false, false);
     };
-    let is_fresh = status_bool(payload, "is_fresh").unwrap_or(false);
-    let schema_outdated = status_bool(payload, "schema_outdated").unwrap_or(false);
+    let (Some(is_fresh), Some(schema_outdated)) = (
+        status_bool(payload, "is_fresh"),
+        status_bool(payload, "schema_outdated"),
+    ) else {
+        // Parseable JSON alone does not establish freshness or compatibility.
+        return (false, false, false);
+    };
     (true, is_fresh, !schema_outdated)
 }
 
@@ -119,13 +262,59 @@ pub fn freshness_from_cli_status(status: &CliStatus) -> (bool, bool, bool) {
 /// `repo_changed` is the watcher half of the stale signal: a settled write
 /// means the working tree may diverge from the indexed hashes even when the
 /// store still reports `is_fresh: true` (no daemon pending queue). Folded
-/// into effective freshness before the gate runs.
+/// into effective freshness before the gate runs. Echo/failure cooldown only
+/// applies when `repo_changed` is true — activation (`false`) and explicit
+/// CLI rebuilds are never blocked by it.
 pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome {
     let already_building = is_build_in_flight(repo_path);
+    if already_building {
+        // Busy retries must not launch status children against the active
+        // writer. No status was examined, so do not claim available/fresh/ok.
+        return LiveRefreshOutcome {
+            decision: LiveRefreshDecision::SkipBuilding,
+            facts: LiveRefreshFactsDto {
+                available: false,
+                is_fresh: false,
+                schema_ok: false,
+                already_building: true,
+            },
+            build: None,
+            reason: Some("a devmap build is already running for this repo".into()),
+            cooldown_remaining_ms: None,
+        };
+    }
+
+    let now = Instant::now();
+    if repo_changed {
+        if let Some(remaining) = cooldown_remaining(repo_path, now) {
+            let ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+            return LiveRefreshOutcome {
+                decision: LiveRefreshDecision::SkipCooldown,
+                facts: LiveRefreshFactsDto {
+                    available: false,
+                    is_fresh: false,
+                    schema_ok: false,
+                    already_building: false,
+                },
+                build: None,
+                reason: Some(format!(
+                    "live index cooldown active; retry in {ms}ms (unchanged or failed builds)"
+                )),
+                cooldown_remaining_ms: Some(ms),
+            };
+        }
+    } else {
+        // Activation / non-watcher refresh: do not inherit a watcher-echo wait.
+        clear_live_echo_cooldown(repo_path);
+    }
+
     let cli = cli::status(repo_path);
     let (available, status_fresh, schema_ok) = freshness_from_cli_status(&cli);
+    let needs_manifest = needs_manifest_rebuild(cli.status.as_ref());
     // Watcher dirty forces stale; status alone can also be stale (daemon).
-    let is_fresh = status_fresh && !repo_changed;
+    // An obsolete extraction payload is a rebuild requirement even when the
+    // CLI's `is_fresh` bit is inconsistent with `degraded_reason`.
+    let is_fresh = status_fresh && !repo_changed && !needs_manifest;
     let facts = LiveRefreshFacts {
         available,
         is_fresh,
@@ -146,30 +335,44 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                 LiveRefreshDecision::SkipSchemaOutdated => {
                     "schema outdated; refuse incremental refresh".into()
                 }
-                LiveRefreshDecision::SkipUnavailable => cli
-                    .reason
-                    .unwrap_or_else(|| "devmap status unavailable".into()),
+                LiveRefreshDecision::SkipUnavailable => cli.reason.unwrap_or_else(|| {
+                    "devmap status unavailable or missing boolean freshness/schema fields".into()
+                }),
+                LiveRefreshDecision::SkipCooldown => unreachable!(),
                 LiveRefreshDecision::Refresh => unreachable!(),
             }),
+            cooldown_remaining_ms: None,
         };
     }
-    match cli::refresh(repo_path) {
-        Ok(build) => LiveRefreshOutcome {
-            decision,
-            facts: facts.into(),
-            reason: if build.ok {
-                None
-            } else {
-                Some(
-                    build
-                        .stderr
-                        .trim()
-                        .to_string()
-                        .if_empty_then(|| "devmap refresh failed".into()),
-                )
-            },
-            build: Some(build),
-        },
+    let spawned = match live_rebuild_kind(cli.status.as_ref()) {
+        LiveRebuildKind::Manifest => cli::build(repo_path),
+        LiveRebuildKind::Incremental => cli::refresh(repo_path),
+    };
+    match spawned {
+        Ok(build) => {
+            if repo_changed && build_is_echo_or_failure(&build) {
+                raise_echo_cooldown(repo_path, Instant::now());
+            } else if build.ok {
+                note_productive_build(repo_path);
+            }
+            LiveRefreshOutcome {
+                decision,
+                facts: facts.into(),
+                reason: if build.ok {
+                    None
+                } else {
+                    Some(
+                        build
+                            .stderr
+                            .trim()
+                            .to_string()
+                            .if_empty_then(|| "devmap refresh failed".into()),
+                    )
+                },
+                build: Some(build),
+                cooldown_remaining_ms: None,
+            }
+        }
         Err(e) => {
             // BuildGuard race: status said free, then another build won.
             let decision = if e.contains("already running") {
@@ -185,6 +388,7 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                 },
                 build: None,
                 reason: Some(e),
+                cooldown_remaining_ms: None,
             }
         }
     }
@@ -207,6 +411,7 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn facts(
         available: bool,
@@ -305,7 +510,7 @@ mod tests {
             reason: Some("no binary".into()),
             status: None,
         };
-        assert_eq!(freshness_from_cli_status(&missing), (false, true, true));
+        assert_eq!(freshness_from_cli_status(&missing), (false, false, false));
     }
 
     #[test]
@@ -319,5 +524,199 @@ mod tests {
             decide_live_refresh(facts(true, is_fresh, true, false)),
             LiveRefreshDecision::Refresh
         );
+    }
+
+    #[test]
+    fn malformed_status_never_authorizes_automatic_builds() {
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"is_fresh": false}),
+            serde_json::json!({"is_fresh": "false", "schema_outdated": false}),
+            serde_json::json!({"is_fresh": false, "schema_outdated": "false"}),
+        ] {
+            let status = CliStatus {
+                available: true,
+                binary: None,
+                lookup: None,
+                reason: None,
+                status: Some(payload.clone()),
+            };
+            let (available, is_fresh, schema_ok) = freshness_from_cli_status(&status);
+            assert!(
+                !decide_live_refresh(facts(available, is_fresh, schema_ok, false)).should_refresh(),
+                "malformed status authorized a build: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn cooldown_secs_grow_exponentially_and_cap() {
+        assert_eq!(cooldown_secs_for_streak(0), 1);
+        assert_eq!(cooldown_secs_for_streak(1), 2);
+        assert_eq!(cooldown_secs_for_streak(2), 4);
+        assert_eq!(cooldown_secs_for_streak(5), 32);
+        assert_eq!(cooldown_secs_for_streak(6), 60);
+        assert_eq!(cooldown_secs_for_streak(20), 60);
+    }
+
+    #[test]
+    fn build_is_echo_or_failure_reads_unchanged_and_ok() {
+        let echo = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": true})),
+        };
+        assert!(build_is_echo_or_failure(&echo));
+        let changed = BuildOutcome {
+            report: Some(json!({"ok": true, "unchanged": false})),
+            ..echo.clone()
+        };
+        assert!(!build_is_echo_or_failure(&changed));
+        let failed = BuildOutcome {
+            ok: false,
+            report: Some(json!({"ok": false})),
+            ..echo
+        };
+        assert!(build_is_echo_or_failure(&failed));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unchanged_repo_changed_storm_is_bounded_by_cooldown() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let repo = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let bin = repo.path().join("devmap");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+if [ "$1" = "status" ]; then
+  printf '%s\n' '{"is_fresh":true,"schema_outdated":false}'
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  printf '%s\n' '{"ok":true,"unchanged":true}'
+  exit 0
+fi
+echo unexpected: "$*" >&2
+exit 2
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        cli::set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                cli::set_test_binary(None);
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = Reset;
+
+        let path = repo.path().to_string_lossy().into_owned();
+        let mut builds = 0u32;
+        let mut cooldowns = 0u32;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // ~10 Hz for three seconds — without cooldown this would spawn ~30 builds.
+        while Instant::now() < deadline {
+            let outcome = maybe_refresh(&path, true);
+            match outcome.decision {
+                LiveRefreshDecision::Refresh => builds += 1,
+                LiveRefreshDecision::SkipCooldown => cooldowns += 1,
+                other => panic!("unexpected decision during echo storm: {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            builds <= 4,
+            "echo storm spawned {builds} builds (cooldown must bound them)"
+        );
+        assert!(
+            cooldowns >= 10,
+            "echo storm should mostly hit SkipCooldown, got {cooldowns}"
+        );
+
+        // Activation (repo_changed=false) must never be blocked by cooldown.
+        clear_all_live_echo_cooldowns();
+        let _ = maybe_refresh(&path, true); // raise cooldown again
+        assert_eq!(
+            maybe_refresh(&path, true).decision,
+            LiveRefreshDecision::SkipCooldown
+        );
+        let activation = maybe_refresh(&path, false);
+        assert_ne!(
+            activation.decision,
+            LiveRefreshDecision::SkipCooldown,
+            "activation must not be blocked by echo cooldown"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_build_storm_enters_the_same_cooldown() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let repo = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let bin = repo.path().join("devmap");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+if [ "$1" = "status" ]; then
+  printf '%s\n' '{"is_fresh":false,"schema_outdated":false}'
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  echo boom >&2
+  printf '%s\n' '{"ok":false}'
+  exit 1
+fi
+echo unexpected: "$*" >&2
+exit 2
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        cli::set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                cli::set_test_binary(None);
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = Reset;
+        let path = repo.path().to_string_lossy().into_owned();
+        let first = maybe_refresh(&path, true);
+        assert_eq!(first.decision, LiveRefreshDecision::Refresh);
+        assert_eq!(first.build.as_ref().map(|b| b.ok), Some(false));
+        let second = maybe_refresh(&path, true);
+        assert_eq!(second.decision, LiveRefreshDecision::SkipCooldown);
+        assert!(second.cooldown_remaining_ms.unwrap_or(0) > 0);
     }
 }

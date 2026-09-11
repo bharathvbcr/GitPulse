@@ -261,7 +261,11 @@ pub fn is_runtime_or_generated_file(path: &str) -> bool {
     name.ends_with('~')
 }
 
-fn ls_files(program: &OsStr, root: &Path, flags: &[&str]) -> Result<Vec<String>, String> {
+pub(crate) fn ls_files(
+    program: &OsStr,
+    root: &Path,
+    flags: &[&str],
+) -> Result<Vec<String>, String> {
     let mut command = subprocess::git_with_program(program, root);
     command.arg("ls-files").arg("-z").args(flags);
     let bounds = Bounds {

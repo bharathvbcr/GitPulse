@@ -260,3 +260,7 @@ required-features = ["parse"]
 [[test]]
 name = "receiver_is_an_identity"
 required-features = ["parse"]
+
+[[test]]
+name = "file_liveness_eligibility"
+required-features = ["parse"]

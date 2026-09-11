@@ -1741,6 +1741,7 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
             alerts: Vec::new(),
             truncated: false,
             error: Some(e),
+            unavailable_reason: Some(crate::github::GithubUnavailableReason::Transport),
         })
 }
 
@@ -1759,6 +1760,7 @@ pub async fn cmd_github_code_scanning_alerts(repo_path: String) -> CodeScanningR
             alerts: Vec::new(),
             truncated: false,
             error: Some(e),
+            unavailable_reason: Some(crate::github::GithubUnavailableReason::Transport),
         })
 }
 
@@ -3532,13 +3534,21 @@ pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, String> 
 /// Build the code map via the installed `devmap` CLI.
 #[tauri::command(async)]
 pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
-    off_thread(move || crate::devmap::build(&repo_path)).await
+    off_thread(move || {
+        crate::devmap::clear_live_echo_cooldown(&repo_path);
+        crate::devmap::build(&repo_path)
+    })
+    .await
 }
 
 /// Incremental refresh via the installed `devmap` CLI.
 #[tauri::command(async)]
 pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
-    off_thread(move || crate::devmap::refresh(&repo_path)).await
+    off_thread(move || {
+        crate::devmap::clear_live_echo_cooldown(&repo_path);
+        crate::devmap::refresh(&repo_path)
+    })
+    .await
 }
 
 /// Watcher-driven live index: refresh only when stale, schema-ok, and idle.

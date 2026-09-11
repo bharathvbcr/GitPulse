@@ -812,6 +812,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
               transcripts: 0,
               skipped_lines: 0,
               reflog_entries: 0,
+              truncated: false,
               error: formatDiagnosticFailure(e),
             },
           }),

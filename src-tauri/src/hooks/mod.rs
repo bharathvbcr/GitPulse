@@ -1099,6 +1099,8 @@ mod tests {
                 available: true,
                 is_fresh: Some(true),
                 freshness_reason: None,
+                source_freshness: Some(true),
+                analyzer_freshness: Some(true),
                 pending_count: Some(0),
                 db_path: "/repo/.devcouncil/codeintel/devmap.sqlite".to_string(),
                 generation_id: Some(7),

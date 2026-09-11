@@ -11,5 +11,7 @@ export interface CatchUp {
   transcripts: number;
   skipped_lines: number;
   reflog_entries: number;
+  /** True when the wall-clock deadline stopped the pass early. */
+  truncated: boolean;
   error: string;
 }
