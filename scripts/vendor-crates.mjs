@@ -2,8 +2,8 @@
 /**
  * Vendor the sibling Rust crates GitPulse links, so it builds standalone.
  *
- * GitPulse depends on four crates owned by Manvi and DevCouncil, and on four
- * more they pull in. Reaching them by relative path — `../../../../../Manvi/…`
+ * GitPulse depends on DevCouncil and MarkDev crates, and on the crates
+ * they pull in. Reaching them by relative path — `../../../../../Manvi/…`
  * — meant a checkout of GitPulse alone did not build: it needed two unrelated
  * repositories present, at the right depth, on every machine and every CI
  * runner. This copies them in.
@@ -90,6 +90,7 @@ export function sources(env = process.env, from = REPO) {
       workspace: "rust",
       crates: [
         "dc-glob",
+        "dc-evidence",
         "dc-store",
         "dc-verify",
         "devmap-analyze",

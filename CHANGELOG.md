@@ -95,7 +95,7 @@ Publication and cross-platform qualification remain separate release gates.
   sinks. Attach the file to default setup in GitHub Settings.
 - Refresh `@lucide/svelte` 1.44.0, Vite 8.3.0, and `@types/node` 26.5.1.
 - Vendor DevCouncil analysis crates from `rust/` after that workspace flattened
-  out of `rust-port/crates`.
+  out of `rust-port/crates`. Include `dc-evidence` so `dc-verify` can link.
 
 ## [0.1.0] - 2026-09-10
 

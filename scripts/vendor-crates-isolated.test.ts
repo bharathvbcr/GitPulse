@@ -23,6 +23,7 @@ const SOURCE_TABLE = [
     crateBase: "rust",
     crates: [
       "dc-glob",
+      "dc-evidence",
       "dc-store",
       "dc-verify",
       "devmap-analyze",
