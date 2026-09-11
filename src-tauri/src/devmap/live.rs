@@ -115,7 +115,7 @@ pub fn clear_live_echo_cooldown(repo_path: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn clear_all_live_echo_cooldowns() {
     if let Ok(mut map) = echo_cooldowns().lock() {
         map.clear();

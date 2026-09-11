@@ -2279,24 +2279,66 @@ mod tests {
         );
     }
 
+    fn lexical_worktree() -> &'static Path {
+        // Relative `.devcouncil/…` events are classified only when the worktree
+        // is absolute. `/workspace/repo` is not absolute on Windows, so the
+        // relative-event branch never ran and the storm test failed closed.
+        #[cfg(windows)]
+        {
+            Path::new(r"C:\workspace\repo")
+        }
+        #[cfg(not(windows))]
+        {
+            Path::new("/workspace/repo")
+        }
+    }
+
+    fn unrelated_generated_state(i: usize) -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(
+                r"C:\unrelated\workspace\repo\.devcouncil\n{i}.sqlite"
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(format!("/unrelated/workspace/repo/.devcouncil/n{i}.sqlite"))
+        }
+    }
+
+    #[test]
+    fn relative_generated_state_event_is_noise_only_against_an_absolute_worktree() {
+        assert!(
+            !is_generated_state_noise_in(
+                Path::new(".devcouncil/deleted.sqlite"),
+                Path::new("workspace/repo")
+            ),
+            "a relative worktree cannot classify a relative event — that is the Windows /workspace/repo failure"
+        );
+        assert!(is_generated_state_noise_in(
+            Path::new(".devcouncil/deleted.sqlite"),
+            lexical_worktree()
+        ));
+    }
+
     #[test]
     fn generated_state_alias_storm_keeps_source_signal() {
-        let worktree = Path::new("/workspace/repo");
+        let worktree = lexical_worktree();
         for i in 0..1_000 {
             assert!(is_generated_state_noise_in(
                 &worktree.join(format!(".devcouncil/n{i}.sqlite")),
                 worktree
             ));
-            assert!(is_generated_state_noise_in(
-                Path::new(".devcouncil/deleted.sqlite"),
-                worktree
-            ));
+            assert!(
+                is_generated_state_noise_in(Path::new(".devcouncil/deleted.sqlite"), worktree),
+                "relative generated-state events must classify against an absolute worktree"
+            );
             assert!(!is_generated_state_noise_in(
                 &worktree.join(format!("src/n{i}.rs")),
                 worktree
             ));
             assert!(!is_generated_state_noise_in(
-                &PathBuf::from(format!("/unrelated/workspace/repo/.devcouncil/n{i}.sqlite")),
+                &unrelated_generated_state(i),
                 worktree
             ));
         }

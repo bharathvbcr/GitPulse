@@ -2700,6 +2700,13 @@ fn literal_pathspec(path: &str) -> String {
     format!(":(literal){path}")
 }
 
+/// Git for Windows still treats `X:rest` as a drive-relative path after
+/// `:(literal)` magic, so `ls-files` / `ls-tree` fail with this fatal instead
+/// of returning an empty listing. The path already passed [`sandbox_join`].
+fn git_pathspec_rejected_as_outside_repo(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("is outside repository")
+}
+
 fn file_not_found(path: &str) -> String {
     format!("File not found: {path}")
 }
@@ -2854,13 +2861,47 @@ fn tree_file_blob<'a>(entries: &'a [TreeEntry], file_path: &str) -> Result<&'a T
     Ok(entry)
 }
 
+/// Lists one index path. `:(literal)` is the common path; Git for Windows
+/// still rejects `X:rest` as drive-relative, so that fatal retries against
+/// the whole `ls-files --stage` listing and keeps only the requested path.
+fn ls_files_stage_records(repo: &Path, file_path: &str) -> Result<Vec<IndexStageEntry>, String> {
+    let spec = literal_pathspec(file_path);
+    match git(repo, &["ls-files", "-z", "--stage", "--", spec.as_str()]) {
+        Ok(raw) => parse_ls_files_stage_z(&raw),
+        Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
+            let raw = git(repo, &["ls-files", "-z", "--stage"])?;
+            Ok(parse_ls_files_stage_z(&raw)?
+                .into_iter()
+                .filter(|entry| entry.path == file_path)
+                .collect())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEntry>, String> {
+    let spec = literal_pathspec(file_path);
+    match git(
+        repo,
+        &["ls-tree", "-z", "--full-name", rev, "--", spec.as_str()],
+    ) {
+        Ok(raw) => parse_ls_tree_z(&raw),
+        Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
+            let raw = git(repo, &["ls-tree", "-z", "--full-name", "-r", rev])?;
+            Ok(parse_ls_tree_z(&raw)?
+                .into_iter()
+                .filter(|entry| entry.path == file_path)
+                .collect())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Index blob for a missing working-tree path. Never concatenates the path
 /// into a `git show` object name (`:path` / `:0:path`): those DWIM globs and
 /// revisions, and a missing glob exits 0 with empty stdout.
 fn read_index_blob(repo: &Path, file_path: &str) -> Result<Vec<u8>, String> {
-    let spec = literal_pathspec(file_path);
-    let raw = git(repo, &["ls-files", "-z", "--stage", "--", spec.as_str()])?;
-    let entries = parse_ls_files_stage_z(&raw)?;
+    let entries = ls_files_stage_records(repo, file_path)?;
     let entry = stage0_blob(&entries, file_path)?;
     read_sized_blob(repo, &entry.oid)
 }
@@ -2868,12 +2909,7 @@ fn read_index_blob(repo: &Path, file_path: &str) -> Result<Vec<u8>, String> {
 /// Commit blob for `file_path` at `rev`. Uses `ls-tree` + `cat-file` rather
 /// than `git show {rev}:{path}`, which treats `*?[` in the path as globs.
 fn read_commit_blob(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<u8>, String> {
-    let spec = literal_pathspec(file_path);
-    let raw = git(
-        repo,
-        &["ls-tree", "-z", "--full-name", rev, "--", spec.as_str()],
-    )?;
-    let entries = parse_ls_tree_z(&raw)?;
+    let entries = ls_tree_records(repo, rev, file_path)?;
     let entry = tree_file_blob(&entries, file_path)?;
     read_sized_blob(repo, &entry.oid)
 }
@@ -3963,10 +3999,68 @@ mod tests {
     fn init_git_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
         git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        git_in(dir.path(), &["config", "core.autocrlf", "false"]);
         dir
     }
 
+    /// Win32 rejects `*?:"<>|` in filenames, and `foo:bar` is an alternate
+    /// data stream rather than a path component. Those names still exist in
+    /// Git via `update-index --index-info`, which is how the blob tests seed
+    /// them without asking the filesystem to store them.
+    fn path_must_enter_index_directly(rel: &str) -> bool {
+        rel.bytes()
+            .any(|b| matches!(b, b'*' | b'?' | b'"' | b':' | b'<' | b'>' | b'|'))
+    }
+
+    fn add_blob_via_index(dir: &Path, rel: &str, body: &[u8]) {
+        use std::io::Write;
+        let mut hash = std::process::Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git hash-object");
+        hash.stdin
+            .take()
+            .expect("hash-object stdin")
+            .write_all(body)
+            .unwrap();
+        let hashed = hash.wait_with_output().expect("hash-object wait");
+        assert!(
+            hashed.status.success(),
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&hashed.stderr)
+        );
+        let oid = String::from_utf8(hashed.stdout).unwrap();
+        let oid = oid.trim();
+        let mut index = std::process::Command::new("git")
+            .args(["update-index", "--add", "--index-info"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git update-index");
+        writeln!(
+            index.stdin.take().expect("update-index stdin"),
+            "100644 {oid} 0\t{rel}"
+        )
+        .unwrap();
+        let indexed = index.wait_with_output().expect("update-index wait");
+        assert!(
+            indexed.status.success(),
+            "git update-index --index-info {rel:?} failed: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+    }
+
     fn write_and_add_literal(dir: &Path, rel: &str, body: &[u8]) {
+        if path_must_enter_index_directly(rel) {
+            add_blob_via_index(dir, rel, body);
+            return;
+        }
         let dest = dir.join(rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -3974,6 +4068,24 @@ mod tests {
         std::fs::write(&dest, body).unwrap();
         let spec = format!(":(literal){rel}");
         git_in(dir, &["add", "--", spec.as_str()]);
+    }
+
+    #[test]
+    fn adversarial_blob_names_that_win32_cannot_store_enter_the_index_directly() {
+        assert!(path_must_enter_index_directly("0:foo.py"));
+        assert!(path_must_enter_index_directly("foo*.py"));
+        assert!(path_must_enter_index_directly(":colon.py"));
+        assert!(path_must_enter_index_directly("foo:bar.py"));
+        assert!(!path_must_enter_index_directly("keep.txt"));
+        assert!(!path_must_enter_index_directly("pkg/__main__.py"));
+        assert!(!path_must_enter_index_directly("__main__.py"));
+    }
+
+    fn unlink_if_present(dir: &Path, rel: &str) {
+        let dest = dir.join(rel);
+        if dest.exists() {
+            std::fs::remove_file(&dest).unwrap();
+        }
     }
 
     fn seed_commit(dir: &Path) {
@@ -4657,9 +4769,9 @@ mod tests {
         write_and_add_literal(dir.path(), "foo*.py", b"glob-body\n");
         write_and_add_literal(dir.path(), ":colon.py", b"colon-body\n");
         write_and_add_literal(dir.path(), "pkg/__main__.py", b"nested-main\n");
-        std::fs::remove_file(dir.path().join("foo*.py")).unwrap();
-        std::fs::remove_file(dir.path().join(":colon.py")).unwrap();
-        std::fs::remove_file(dir.path().join("pkg/__main__.py")).unwrap();
+        unlink_if_present(dir.path(), "foo*.py");
+        unlink_if_present(dir.path(), ":colon.py");
+        unlink_if_present(dir.path(), "pkg/__main__.py");
         let repo = dir.path().to_string_lossy();
         assert_eq!(
             GitReader::get_file_blob(&repo, "foo*.py", None)
@@ -4702,7 +4814,7 @@ mod tests {
                 Some(want.as_str()),
                 "HEAD {path}"
             );
-            std::fs::remove_file(dir.path().join(path)).unwrap();
+            unlink_if_present(dir.path(), path);
             assert_eq!(
                 GitReader::get_file_blob(&repo, path, None)
                     .unwrap_or_else(|e| panic!("index {path}: {e}"))
@@ -5101,6 +5213,41 @@ mod tests {
         assert_eq!(literal_pathspec("weird*.txt"), ":(literal)weird*.txt");
         assert_eq!(literal_pathspec(":3:lockfile"), ":(literal):3:lockfile");
         assert_eq!(literal_pathspec("plain.txt"), ":(literal)plain.txt");
+        assert_eq!(literal_pathspec("0:foo.py"), ":(literal)0:foo.py");
+    }
+
+    #[test]
+    fn git_pathspec_rejected_as_outside_repo_matches_git_for_windows_drive_fatal() {
+        assert!(git_pathspec_rejected_as_outside_repo(
+            "fatal: :(literal)0:foo.py: '0:foo.py' is outside repository at 'C:/Users/runneradmin/AppData/Local/Temp/.tmpqll1ZA'"
+        ));
+        assert!(git_pathspec_rejected_as_outside_repo(
+            "fatal: :(literal)foo:bar.py: 'foo:bar.py' is outside repository at 'D:/a/GitPulse/GitPulse'"
+        ));
+        assert!(!git_pathspec_rejected_as_outside_repo(
+            "File not found: 0:foo.py"
+        ));
+        assert!(!git_pathspec_rejected_as_outside_repo(
+            "error: pathspec '0:foo.py' did not match any file(s) known to git"
+        ));
+        assert!(!git_pathspec_rejected_as_outside_repo(
+            "ambiguous argument '0:foo.py'"
+        ));
+    }
+
+    #[test]
+    fn stage0_blob_from_full_listing_keeps_only_the_requested_colon_name() {
+        let keep = format!("100644 {STAGE_OID} 0\tkeep.txt\0");
+        let colon = format!("100644 {STAGE_OID} 0\t0:foo.py\0");
+        let raw = [keep.as_bytes(), colon.as_bytes()].concat();
+        let filtered: Vec<_> = parse_ls_files_stage_z(&raw)
+            .expect("listing")
+            .into_iter()
+            .filter(|entry| entry.path == "0:foo.py")
+            .collect();
+        let entry = stage0_blob(&filtered, "0:foo.py").expect("colon name in mixed listing");
+        assert_eq!(entry.path, "0:foo.py");
+        assert!(stage0_blob(&filtered, "keep.txt").is_err());
     }
 
     const STAGE_OID: &str = "0123456789abcdef0123456789abcdef01234567";

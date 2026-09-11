@@ -51,6 +51,14 @@ draft tag.
   CI and release `cargo test` at one thread so sidecar hello fixtures stay
   inside their 20s window. Coverage detail and working-tree reads for an
   outbound source symlink annotate the entry without following the target.
+- Look up index and commit blobs named `0:foo.py` on Windows without leaking
+  Git-for-Windows' drive-letter "outside repository" fatal: retry against the
+  listing and keep the requested path. Seed glob and colon names through the
+  index when Win32 cannot store them. Pin `core.autocrlf=false` on stash
+  fixtures so checkout does not rewrite LF. Classify relative `.devcouncil/`
+  watcher events against an absolute worktree. Clippy `-D warnings` no
+  longer fails the Windows job on an unused `mut` DirBuilder or a unix-only
+  live-echo cooldown helper.
 
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.

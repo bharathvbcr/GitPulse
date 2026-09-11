@@ -65,6 +65,10 @@ impl TestRepo {
         run_git(dir.path(), &["config", "user.email", "test@example.com"]);
         run_git(dir.path(), &["config", "user.name", "Test User"]);
         run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        // Windows installs git with core.autocrlf=true in its system config,
+        // so a fixture inherits it and checkout rewrites LF to CRLF — breaking
+        // the byte-exact working-tree assertions these stash tests make.
+        run_git(dir.path(), &["config", "core.autocrlf", "false"]);
         Self { dir }
     }
 

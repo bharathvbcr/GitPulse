@@ -1241,13 +1241,20 @@ fn allocate_clone_staging(parent: &Path) -> Result<PathBuf, String> {
             ".gitpulse-clone-{}-{timestamp}-{next}",
             std::process::id()
         ));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&path) {
+        // `mode` is Unix-only; a `mut` builder is unused_mut on Windows
+        // under clippy `-D warnings` (release/CI).
+        let created = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(&path)
+            }
+            #[cfg(not(unix))]
+            std::fs::DirBuilder::new().create(&path)
+        };
+        match created {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("Cannot create clone staging directory: {error}")),
