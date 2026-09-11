@@ -694,16 +694,16 @@ exit 2
         let path = repo.path().to_string_lossy().into_owned();
         let mut builds = 0u32;
         let mut cooldowns = 0u32;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        // ~10 Hz for three seconds — without cooldown this would spawn ~30 builds.
-        while Instant::now() < deadline {
+        // A counted storm, not a wall-clock one: under llvm-cov a single
+        // maybe_refresh can take longer than the old 3s window, so the loop
+        // would finish with zero cooldown hits and look like the bound failed.
+        for _ in 0..20 {
             let outcome = maybe_refresh(&path, true);
             match outcome.decision {
                 LiveRefreshDecision::Refresh => builds += 1,
                 LiveRefreshDecision::SkipCooldown => cooldowns += 1,
                 other => panic!("unexpected decision during echo storm: {other:?}"),
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
         assert!(
             builds <= 4,

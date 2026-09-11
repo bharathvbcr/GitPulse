@@ -124,6 +124,14 @@ pub fn validate(arguments: &Value, schema: &Value) -> Vec<Violation> {
     violations
 }
 
+fn schema_allows_null(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(name)) => name == "null",
+        Some(Value::Array(names)) => names.iter().any(|name| name.as_str() == Some("null")),
+        _ => false,
+    }
+}
+
 fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
     let Some(schema) = schema.as_object() else {
         return;
@@ -175,13 +183,25 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                // An explicit JSON `null` is absence, not a value: every
-                // argument in this catalog is a string or a number.
+                // An explicit JSON `null` is absence for string/number
+                // arguments. Output fields whose type includes `null` (for
+                // example `fresh: null` meaning unverified) are present values.
                 match fields.get(required) {
-                    None | Some(Value::Null) => out.push(Violation::new(
+                    None => out.push(Violation::new(
                         join(path, required),
                         "required argument is missing",
                     )),
+                    Some(Value::Null) => {
+                        let allows_null = properties
+                            .and_then(|p| p.get(required))
+                            .is_some_and(schema_allows_null);
+                        if !allows_null {
+                            out.push(Violation::new(
+                                join(path, required),
+                                "required argument is missing",
+                            ));
+                        }
+                    }
                     Some(_) => {}
                 }
             }
@@ -207,10 +227,11 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
             if let Some(properties) = properties {
                 for (name, sub) in properties {
                     match fields.get(name) {
-                        // Absent optional arguments are the normal case, and an
-                        // explicit null is treated as absence to match the
-                        // required check above.
-                        None | Some(Value::Null) => {}
+                        // Absent optional arguments are the normal case. An
+                        // explicit null is absence unless the field's type
+                        // includes `null`, in which case it is a typed value.
+                        None => {}
+                        Some(Value::Null) if !schema_allows_null(sub) => {}
                         Some(present) => check(present, sub, &join(path, name), out),
                     }
                 }
@@ -470,6 +491,30 @@ mod tests {
             vec!["repo_path: required argument is missing"]
         );
         assert!(messages(json!({ "repo_path": "/tmp/x", "limit": null })).is_empty());
+    }
+
+    #[test]
+    fn a_required_field_whose_type_includes_null_accepts_explicit_null() {
+        // Codeintel output advertises `fresh: null` as "the check did not
+        // run". Treating that null as absence made every unverified envelope
+        // fail its own schema.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "fresh": { "type": ["boolean", "null"] },
+                "reason": { "type": ["string", "null"] }
+            },
+            "required": ["fresh"]
+        });
+        assert!(validate(&json!({ "fresh": null, "reason": "unverified" }), &schema).is_empty());
+        assert!(validate(&json!({ "fresh": false }), &schema).is_empty());
+        assert_eq!(
+            validate(&json!({ "reason": "unverified" }), &schema)
+                .into_iter()
+                .map(|v| v.render())
+                .collect::<Vec<_>>(),
+            vec!["fresh: required argument is missing"]
+        );
     }
 
     #[test]

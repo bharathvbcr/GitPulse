@@ -41,6 +41,9 @@ draft tag.
   native side actually sends. A leftover boolean would have made an unverified
   tree look like a completed freshness check, and the IPC scanner now sees the
   six codeintel commands that a helper had been hiding.
+- Treat `fresh: null` on advertised MCP output as an unverified check, not as
+  a missing required field. Count the live-echo cooldown storm instead of a
+  wall-clock window so coverage instrumentation cannot starve the bound.
 
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.

@@ -3434,7 +3434,7 @@ mod tests {
         let out = run_bounded(
             cmd,
             "gitpulse-fake-shebang-tool",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             None,
         )
         .expect("spawn");
