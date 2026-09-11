@@ -2,6 +2,8 @@
 
 GitPulse is a **local-first, zero-telemetry** desktop app. It has no GitPulse backend and no analytics.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. Policy and agent hosting go through Manvi; code intelligence uses selected DevCouncil modules.
+
 ```mermaid
 flowchart TD
     Webview["Tauri webview — CSP default-src 'self'"] --> IPC["IPC: cmd_* only"]

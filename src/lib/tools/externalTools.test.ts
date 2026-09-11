@@ -13,7 +13,9 @@ import {
   mapFailureMessage,
   refreshToolCapability,
   saveToolConfig,
+  setExternalToolDisabled,
   toolStatusSummary,
+  uninstallExternalTool,
   verifyTool,
   type ToolStatus,
 } from "./externalTools";
@@ -91,6 +93,17 @@ describe("toolStatusSummary", () => {
 
   it("falls back to a not-installed reason", () => {
     expect(toolStatusSummary(status({ reason: null }))).toContain("not installed");
+  });
+
+  it("names a disabled tool", () => {
+    expect(
+      toolStatusSummary(
+        status({
+          disabled: true,
+          reason: "devmap is disabled in GitPulse settings",
+        }),
+      ),
+    ).toContain("disabled");
   });
 });
 
@@ -194,6 +207,15 @@ describe("IPC wrappers", () => {
 
     await cancelExternalToolInstall();
     expect(invoke).toHaveBeenCalledWith("cmd_external_tool_install_cancel");
+
+    await uninstallExternalTool("devmap");
+    expect(invoke).toHaveBeenCalledWith("cmd_external_tool_uninstall", { tool: "devmap" });
+
+    await setExternalToolDisabled("devmap", true);
+    expect(invoke).toHaveBeenCalledWith("cmd_external_tool_set_disabled", {
+      tool: "devmap",
+      disabled: true,
+    });
 
     await getToolConfig();
     expect(invoke).toHaveBeenCalledWith("cmd_tool_config_get");

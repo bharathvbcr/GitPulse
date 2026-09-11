@@ -21,6 +21,21 @@ it("retains hidden-window changes without starting work or scheduling wakeups", 
   queue.reset();
 });
 
+it("retained mode runs every open repository while the window is visible", async () => {
+  const run = vi.fn<(key: string, isCurrent: () => boolean) => Promise<void>>(async () => {});
+  const queue = createPacedQueue({
+    ...limits, runWhen: "retained", run, onError: vi.fn(), onOverflow: vi.fn(),
+    scope: { activeKey: "/a", retainedKeys: ["/a", "/b"], visible: true },
+  });
+  queue.enqueue("/b");
+  queue.enqueue("/a");
+  await vi.advanceTimersByTimeAsync(200);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/b"]);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/b", "/a"]);
+  queue.reset();
+});
+
 it("does not run an inactive repository or a late event for a closed repository", async () => {
   const run = vi.fn<(key: string, isCurrent: () => boolean) => Promise<void>>(async () => {});
   const queue = createPacedQueue({

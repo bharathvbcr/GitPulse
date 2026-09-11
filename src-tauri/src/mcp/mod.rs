@@ -247,8 +247,14 @@ fn codeintel_output() -> Value {
         "properties": {
             "available": { "type": "boolean" },
             "source_freshness": {
-                "type": ["boolean", "null"],
-                "description": "Null means this query did not verify whole-tree freshness. Availability describes the indexed snapshot."
+                "type": "object",
+                "description": "Whole-tree freshness for the answered generation. fresh=null plus reason means the check did not run.",
+                "properties": {
+                    "fresh": { "type": ["boolean", "null"] },
+                    "generation_id": { "type": ["integer", "null"] },
+                    "reason": { "type": ["string", "null"] }
+                },
+                "required": ["fresh"]
             },
             "reason": { "type": ["string", "null"] },
             "items": { "type": "array" },

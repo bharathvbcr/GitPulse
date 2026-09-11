@@ -9,11 +9,12 @@
 use crate::engine::git_cli::{self, validate_repo, BoundedRun};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Wall-clock budget for a cold or incremental build. Large repos can take
 /// minutes; this is a backstop against a wedged child, not a target.
@@ -25,9 +26,77 @@ pub const STATUS_DEADLINE: Duration = Duration::from_secs(30);
 /// Wall-clock budget for one `devmap preview` call.
 pub const PREVIEW_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Coalesce bursty preview requests for the same `(repo, file)`.
+///
+/// Matches the live-index watcher debounce: a fixture rewrite storm that
+/// restages the same paths must not spawn one CLI child per FS event.
+pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(200);
+
+const PREVIEW_SKIP_NON_SOURCE: &str =
+    "path is not indexable source (testdata/fixtures/prose/data); preview skipped";
+const PREVIEW_SKIP_DEBOUNCED: &str =
+    "preview debounced for this file; at most one CLI call per debounce window";
+
 /// Cap on captured stdout. A status/preview JSON is small; a build report can
 /// carry coverage gaps. 8 MiB is a hard ceiling, not a typical size.
 pub const STDOUT_CAP: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct PreviewDebounceEntry {
+    until: Instant,
+    content_fingerprint: u64,
+}
+
+fn preview_debounces() -> &'static Mutex<HashMap<(String, String), PreviewDebounceEntry>> {
+    static MAP: OnceLock<Mutex<HashMap<(String, String), PreviewDebounceEntry>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_preview_debounces() {
+    if let Ok(mut map) = preview_debounces().lock() {
+        map.clear();
+    }
+}
+
+fn content_fingerprint(content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether `devmap preview` should run for this relative path.
+///
+/// Aligns with the kernel's admission rules, then additionally refuses Data /
+/// prose / fixture trees: those are indexed (or excluded) but never worth a
+/// speculative-edit CLI spawn — the 1,860-preview storm was almost entirely
+/// `testdata/**/*.json` fixture rewrites.
+pub fn preview_path_eligible(rel_path: &str) -> bool {
+    let norm = rel_path.replace('\\', "/");
+    if norm.trim().is_empty() {
+        return false;
+    }
+    if !devmap_extract::is_indexable_source(&norm) {
+        return false;
+    }
+    if devmap_extract::wiring::is_fixture_path(&norm) {
+        return false;
+    }
+    let lang = devmap_extract::detect_language(Path::new(&norm));
+    !matches!(
+        devmap_extract::languages::liveness_unit_for_language(lang),
+        devmap_extract::languages::LivenessUnit::Data
+    )
+}
+
+fn skipped_preview_file(path: &str, reason: &str) -> PreviewFileResult {
+    PreviewFileResult {
+        file_path: path.to_string(),
+        available: false,
+        reason: Some(reason.into()),
+        report: None,
+    }
+}
 
 /// How the binary was found — reported so "GitPulse cannot find devmap" and
 /// "GitPulse found a different devmap than your shell" stay distinguishable.
@@ -199,6 +268,9 @@ pub fn resolve_binary_uncached() -> Result<ResolvedDevmap, String> {
         return Err(format!(
             "GITPULSE_DEVMAP_BIN is set to {explicit}, but that path is not a file"
         ));
+    }
+    if crate::tool_config::is_disabled(crate::tool_install::ExternalTool::Devmap) {
+        return Err("devmap is disabled in GitPulse settings".into());
     }
     if let Some(saved) = crate::tool_config::saved_binary(crate::tool_install::ExternalTool::Devmap)
     {
@@ -500,6 +572,9 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             report: None,
         };
     }
+    if !preview_path_eligible(file_path) {
+        return skipped_preview_file(file_path, PREVIEW_SKIP_NON_SOURCE);
+    }
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
         Err(e) => {
@@ -511,18 +586,30 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             }
         }
     };
+    let repo_key = repo.to_string_lossy().into_owned();
+    let fingerprint = content_fingerprint(content);
+    let now = Instant::now();
+    if let Ok(map) = preview_debounces().lock() {
+        if let Some(entry) = map.get(&(repo_key.clone(), file_path.to_string())) {
+            if entry.until > now {
+                // Content changes inside the window still coalesce: a fixture
+                // rewrite storm must not spawn one child per FS event.
+                let _ = fingerprint == entry.content_fingerprint;
+                return skipped_preview_file(file_path, PREVIEW_SKIP_DEBOUNCED);
+            }
+        }
+    }
     // Refuse while a build holds the writer lock — preview reads the store.
     {
         let guards = build_guards()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = repo.to_string_lossy();
-        if guards.contains(key.as_ref()) {
+        if guards.contains(repo_key.as_str()) {
             return PreviewFileResult {
                 file_path: file_path.to_string(),
                 available: false,
                 reason: Some(format!(
-                    "a devmap build is running for {key}; preview refused until it finishes"
+                    "a devmap build is running for {repo_key}; preview refused until it finishes"
                 )),
                 report: None,
             };
@@ -539,6 +626,17 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             }
         }
     };
+    // Admit the debounce slot before spawn so concurrent callers for the same
+    // file see SkipDebounced rather than racing a second child.
+    if let Ok(mut map) = preview_debounces().lock() {
+        map.insert(
+            (repo_key.clone(), file_path.to_string()),
+            PreviewDebounceEntry {
+                until: Instant::now() + PREVIEW_DEBOUNCE,
+                content_fingerprint: fingerprint,
+            },
+        );
+    }
     let run = match run_devmap(
         &binary,
         &repo,
@@ -588,7 +686,12 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
 }
 
 /// Preview many changed files. `cancel` is polled between files.
-/// Walks at most [`MAX_PREVIEW_FILES`]; omitted files are unavailable, not silent.
+///
+/// Non-source paths (fixtures, JSON/prose/data, ignored trees) are filtered
+/// *before* the fan-out cap so a staged fixture storm cannot consume the
+/// [`MAX_PREVIEW_FILES`] budget and starve real source. Walks at most
+/// [`MAX_PREVIEW_FILES`] eligible files; omitted and ineligible files are
+/// unavailable, not silent.
 pub fn preview_many(
     repo_path: &str,
     files: &[(String, String)],
@@ -611,14 +714,24 @@ pub fn preview_many(
             }
         }
     };
-    let cap = MAX_PREVIEW_FILES.min(files.len());
-    let (walk, omitted) = files.split_at(cap);
-    let files_omitted = omitted.len();
-    let truncated = files_omitted > 0;
+    let mut ineligible = Vec::new();
+    let mut eligible = Vec::new();
+    for (path, content) in files {
+        if preview_path_eligible(path) {
+            eligible.push((path.clone(), content.clone()));
+        } else {
+            ineligible.push(skipped_preview_file(path, PREVIEW_SKIP_NON_SOURCE));
+        }
+    }
+    let cap = MAX_PREVIEW_FILES.min(eligible.len());
+    let (walk, omitted) = eligible.split_at(cap);
+    let files_omitted = omitted.len() + ineligible.len();
+    let truncated = omitted.len() > 0;
     let mut out = Vec::with_capacity(files.len());
     for (path, content) in walk {
         if cancel() {
             out.extend(omitted.iter().map(|(path, _)| omitted_preview_file(path)));
+            out.extend(ineligible);
             return PreviewOutcome {
                 available: true,
                 binary: Some(binary.path),
@@ -634,6 +747,8 @@ pub fn preview_many(
         out.push(preview(repo_path, path, content));
     }
     out.extend(omitted.iter().map(|(path, _)| omitted_preview_file(path)));
+    out.extend(ineligible);
+    let skipped_non_source = files_omitted.saturating_sub(omitted.len());
     PreviewOutcome {
         available: true,
         binary: Some(binary.path),
@@ -641,6 +756,10 @@ pub fn preview_many(
         reason: if truncated {
             Some(format!(
                 "preview fan-out capped at {MAX_PREVIEW_FILES} files; {files_omitted} file(s) not previewed"
+            ))
+        } else if skipped_non_source > 0 && walk.is_empty() {
+            Some(format!(
+                "{skipped_non_source} staged path(s) skipped as non-source (testdata/fixtures/prose/data)"
             ))
         } else {
             None
@@ -900,6 +1019,7 @@ exit 2
     #[test]
     fn preview_many_walks_at_most_the_fanout_cap() {
         let _lock = crate::harness::sidecar::test_serial();
+        clear_preview_debounces();
         let repo = git_repo();
         let bin_dir = tempfile::TempDir::new().expect("bindir");
         let bin = write_fake_devmap(bin_dir.path());
@@ -909,6 +1029,7 @@ exit 2
             .collect();
         let out = preview_many(&repo.path().to_string_lossy(), &files, || false);
         set_test_binary(None);
+        clear_preview_debounces();
         let walked = out.files.iter().filter(|file| file.available).count();
         assert_eq!(walked, 16, "preview_many walked {walked} available files");
         assert_eq!(out.files.len(), 20);
@@ -920,6 +1041,7 @@ exit 2
     #[test]
     fn preview_surfaces_json_report_from_cli() {
         let _lock = crate::harness::sidecar::test_serial();
+        clear_preview_debounces();
         let repo = git_repo();
         let bin_dir = tempfile::TempDir::new().expect("bindir");
         let bin = write_fake_devmap(bin_dir.path());
@@ -930,11 +1052,137 @@ exit 2
             "fn main() {}\n",
         );
         set_test_binary(None);
+        clear_preview_debounces();
         assert!(result.available, "{:?}", result.reason);
         let report = result.report.expect("report");
         assert_eq!(report["parse_status"], "Clean");
         assert_eq!(report["compared_against"], "disk");
         assert_eq!(report["ambiguous_callers"], 0);
+    }
+
+    #[test]
+    fn preview_path_eligible_skips_fixtures_json_and_prose() {
+        assert!(preview_path_eligible("src/main.rs"));
+        assert!(preview_path_eligible("pkg/lib.go"));
+        assert!(
+            !preview_path_eligible("rust/testdata/golden/languages/rust/nodes.json"),
+            "testdata JSON must never spawn preview"
+        );
+        assert!(!preview_path_eligible("fixtures/sample.rs"));
+        assert!(!preview_path_eligible("docs/guide.md"));
+        assert!(!preview_path_eligible("config/settings.json"));
+        assert!(!preview_path_eligible("README.md"));
+        assert!(!preview_path_eligible("notes.yaml"));
+    }
+
+    #[test]
+    fn preview_many_filters_non_source_before_fanout_cap() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_preview_debounces();
+        let repo = git_repo();
+        let bin_dir = tempfile::TempDir::new().expect("bindir");
+        let bin = write_fake_devmap(bin_dir.path());
+        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        // Twenty fixture/json paths plus one real source — without the
+        // pre-cap filter the fan-out budget would be spent on fixtures and
+        // `src/lib.rs` would never be previewed.
+        let mut files: Vec<(String, String)> = (0..20)
+            .map(|i| {
+                (
+                    format!("rust/testdata/golden/languages/lang{i}/nodes.json"),
+                    "{}\n".into(),
+                )
+            })
+            .collect();
+        files.push(("src/lib.rs".into(), "fn main() {}\n".into()));
+        let out = preview_many(&repo.path().to_string_lossy(), &files, || false);
+        set_test_binary(None);
+        clear_preview_debounces();
+        let available: Vec<_> = out
+            .files
+            .iter()
+            .filter(|file| file.available)
+            .map(|file| file.file_path.as_str())
+            .collect();
+        assert_eq!(available, ["src/lib.rs"], "{available:?}");
+        assert_eq!(out.files_total, 21);
+        assert!(
+            out.files
+                .iter()
+                .filter(|file| !file.available)
+                .all(|file| {
+                    file.reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("non-source") || reason.contains("testdata"))
+                }),
+            "ineligible paths must name the skip reason"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preview_debounce_bounds_bursts_for_one_file() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_preview_debounces();
+        let repo = git_repo();
+        let bin = repo.path().join("devmap");
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf x >> preview-calls
+if [ "$1" = "preview" ]; then
+  cat >/dev/null
+  printf '%s\n' '{"file_path":"src/lib.rs","parse_status":"Clean","delta_available":true,"file_is_indexed":true,"compared_against":"disk","symbols":[],"bodies_not_compared":0,"ambiguous_callers":0,"broken_callers":{"items":[],"shown":0,"hidden":0,"total":0,"truncated":false,"tokens_used":0,"resolution":{"Available":null}}}'
+  exit 0
+fi
+exit 2
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_test_binary(None);
+                clear_preview_debounces();
+            }
+        }
+        let _reset = Reset;
+        let path = repo.path().to_string_lossy().into_owned();
+        let mut available = 0u32;
+        let mut debounced = 0u32;
+        for i in 0..40 {
+            let result = preview(&path, "src/lib.rs", &format!("fn main() {{ /* {i} */ }}\n"));
+            if result.available {
+                available += 1;
+            } else if result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("debounced"))
+            {
+                debounced += 1;
+            } else {
+                panic!("unexpected preview outcome: {result:?}");
+            }
+        }
+        let calls = fs::read_to_string(repo.path().join("preview-calls")).unwrap_or_default();
+        assert_eq!(
+            calls.len(),
+            available as usize,
+            "CLI spawn count must match available results"
+        );
+        assert!(
+            available <= 4,
+            "burst must be bounded by debounce, got {available} available / {debounced} debounced"
+        );
+        assert!(
+            debounced >= 30,
+            "most of the burst should hit debounce, got {debounced}"
+        );
     }
 
     #[test]
@@ -991,6 +1239,27 @@ exit 2
         )
         .unwrap();
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::Refresh
+        );
+        assert!(outcome.build.as_ref().is_some_and(|b| b.ok), "{outcome:?}");
+        assert_build_argv(&argv_log(repo.path()), true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_obsolete_rebuild_reason_uses_manifest_rebuild() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":false,"schema_outdated":false,"rebuild_reason":"payload-obsolete"}"#,
+        )
+        .unwrap();
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), false);
         assert_eq!(
             outcome.decision,
             crate::devmap::LiveRefreshDecision::Refresh

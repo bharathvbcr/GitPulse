@@ -22,7 +22,7 @@ Use the connected DevMap MCP tools if they target this checkout; otherwise use t
 | Dead-code candidates | `devmap dead --json` | `devmap_dead_symbols` |
 | Proposed edit | `devmap preview --help` for installed syntax | `devmap_preview` |
 
-Read `available` or `resolution`, `reason`, `shown`, `total`, `truncated`, and `walk_incomplete` wherever present. A partial walk can omit callers even when `truncated` is false. Candidate tests are not measured test coverage; direct callers may be affected, not necessarily broken. Check source and actual tests before claiming a cause or safe deletion.
+Read `available` or `resolution`, `reason`, `shown`, `total`, `truncated`, and `walk_incomplete` wherever present. Dead rows carry their own confidence: high means no inbound evidence; `only_ambiguous_callers` / unresolved-namesake / coverage-capped rows are unconfirmed; `NoNamesake` is an explained ledger gap, not a dead finding. A partial walk can omit callers even when `truncated` is false. Candidate tests are not measured test coverage; direct callers may be affected, not necessarily broken. Check source and actual tests before claiming a cause or safe deletion.
 
 Prefer DevMap for the questions it can answer. If a required capability is absent, the index is unusable, or the answer is materially incomplete, state the specific limitation and use direct source inspection. Do not run a second index routinely. Follow explicit user and repository requirements. Check `devmap --help` and connected tool schemas before declaring a capability absent; CLI and MCP capabilities differ.
 

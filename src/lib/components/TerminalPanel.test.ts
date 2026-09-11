@@ -15,6 +15,8 @@ describe("TerminalPanel source contracts & safety hygiene", () => {
     expect(source).toContain('invoke<TerminalRunResponse>("cmd_terminal_run"');
     expect(source).toContain("repoPath,");
     expect(source).toContain("args: tokenized.argv,");
+    expect(source).toContain("timeoutSecs,");
+    expect(source).toContain("consoleLaunchRequests");
   });
 
   it("delegates every PTY session endpoint to TerminalSession", () => {

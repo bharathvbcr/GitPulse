@@ -194,22 +194,28 @@ pub fn confidence_millis(value: f32) -> i64 {
 /// (SC15). A gate constant that lives in two places will disagree eventually,
 /// and the copy nobody runs is the one that goes stale.
 ///
-/// 160 KiB is the measured worst case plus headroom: cold-build cost is
-/// ~81 KiB/file on DevCouncil and ~113 KiB/file on a Go-heavy external corpus.
+/// 176 KiB is the measured worst case plus headroom after schema 49: cold-build
+/// cost is ~167 KiB/file on DevCouncil (851 files → 139 MiB, 2026-09-11). The
+/// prior 160 KiB budget was calibrated when AmbiguousGlobal fan-out lived as
+/// edges; honesty now records those sites as unresolved ledger rows (and local
+/// bindings expand extraction payloads), which is larger per site than a capped
+/// edge fan-out. Earlier figures (~81 KiB/file DevCouncil, ~113 KiB/file on a
+/// Go-heavy corpus) remain useful history; they no longer describe this store.
 ///
 /// **This is a PER-GENERATION budget (SC27).** A store retains
 /// `GENERATION_RETENTION` (2) generations, each carrying its own extraction
 /// payloads, so the steady state is roughly double — measured on DevCouncil,
-/// 73 MiB cold against **188 MiB at steady state, 173 KiB/file**. That exceeded
-/// this constant, and no gate noticed, because the self-build gate built once
-/// into a fresh database and compared a *cold* size against it.
+/// 73 MiB cold against **188 MiB at steady state, 173 KiB/file** under the old
+/// schema. That exceeded the then-constant, and no gate noticed, because the
+/// self-build gate built once into a fresh database and compared a *cold* size
+/// against it.
 ///
 /// Both states are now gated, each against the budget that describes it: the
 /// self-build gate keeps comparing a cold build to this number, and the growth
 /// gate compares its plateaued size to `db_size_gate_steady_bytes`. Loosening
 /// this constant to cover the steady state would have blunted the cold-build
 /// check instead of adding the missing one.
-pub const DB_SIZE_GATE_PER_FILE: u64 = 160 * 1024;
+pub const DB_SIZE_GATE_PER_FILE: u64 = 176 * 1024;
 /// Generations a store retains. Mirrors `devmap_store::GENERATION_RETENTION`,
 /// which this crate cannot depend on; `retention_matches_the_store_constant` in
 /// devmap-store asserts the two agree so they cannot drift.
@@ -1318,11 +1324,23 @@ pub struct Extraction {
 
 /// A lexical binding at a specific use site. `scope` is absent for an
 /// anonymous callable, whose variables cannot borrow its graph owner's types.
+///
+/// `declared_type` and `initializer` are optional facts the extractor already
+/// has at emission time — a typed parameter / `let x: T`, or a simple
+/// construction shape (`T::new`, `T{..}`, `new T()`, `factory`). Resolve reads
+/// them through the same `LocalBinding` row rather than a parallel table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LocalBinding {
     pub start_byte: usize,
     pub name: String,
     pub scope: Option<String>,
+    /// Type annotation / declared type name when the grammar wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_type: Option<String>,
+    /// Simple initializer shape when known (`T::new`, `T{..}`, `new T()`,
+    /// factory call name). Absent when the RHS is not a recognisable shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initializer: Option<String>,
 }
 
 impl Extraction {
@@ -1600,36 +1618,36 @@ mod gate_and_binding_tests {
     /// absolute assertion somewhere, or every check of it is self-referential.
     #[test]
     fn size_gate_constants_are_their_declared_magnitudes() {
-        assert_eq!(DB_SIZE_GATE_PER_FILE, 163_840, "160 KiB per file");
+        assert_eq!(DB_SIZE_GATE_PER_FILE, 180_224, "176 KiB per file");
         // SC27: the steady-state budget is this per-generation figure times the
         // retention count, and is what a running repository is measured against.
         assert_eq!(DB_SIZE_GATE_RETAINED_GENERATIONS, 2, "2 generations kept");
         assert_eq!(
             db_size_gate_steady_bytes(10_000),
-            3_276_800_000,
+            3_604_480_000,
             "steady-state budget doubles the per-generation one"
         );
         assert_eq!(DB_SIZE_GATE_FLOOR, 62_914_560, "60 MiB floor");
-        // The floor covers repositories up to 384 files; past that the per-file
-        // budget takes over.
+        // The floor covers repositories up to 349 files at 176 KiB/file; past
+        // that the per-file budget takes over (was 384 files at 160 KiB).
         assert_eq!(
             db_size_gate_bytes(100),
             DB_SIZE_GATE_FLOOR,
             "floor dominates small repos"
         );
         assert_eq!(
-            db_size_gate_bytes(384),
+            db_size_gate_bytes(349),
             DB_SIZE_GATE_FLOOR,
             "the crossover stays on the floor"
         );
         assert_eq!(
-            db_size_gate_bytes(385),
+            db_size_gate_bytes(350),
             63_078_400,
             "one file past the crossover scales"
         );
         assert_eq!(
             db_size_gate_bytes(10_000),
-            1_638_400_000,
+            1_802_240_000,
             "per-file dominates large repos"
         );
     }

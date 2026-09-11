@@ -360,6 +360,12 @@ describe("CoverageViewer failure diagnostics and copy contracts", () => {
     expect(source).toContain('reportPanelError("coverage"');
   });
 
+  it("does not warn diagnostics when coverage source is simply absent", () => {
+    expect(source).toContain('invoke<string>("cmd_get_file_content"');
+    expect(source).toContain("isMissingFileError(reason)");
+    expect(source).not.toContain('startsWith("file not found:")');
+  });
+
   it("cleans up all copy feedback timers on reset and unmount", () => {
     expect(source).toContain("window.clearTimeout(copiedScriptTimer);");
     expect(source).toContain("window.clearTimeout(copiedAllTimer);");

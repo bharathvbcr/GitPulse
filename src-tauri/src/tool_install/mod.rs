@@ -136,6 +136,8 @@ pub struct ToolStatus {
     pub ladder: Vec<RungStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_config: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +318,73 @@ fn emit_progress(tool: ExternalTool, line: &str, rung: Option<InstallRung>) {
 
 pub fn request_cancel() {
     cancel_flag().store(true, Ordering::SeqCst);
+}
+
+fn path_is_under(child: &Path, parent: &Path) -> bool {
+    let Ok(child) = child.canonicalize() else {
+        return false;
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return false;
+    };
+    child.starts_with(parent)
+}
+
+/// Delete a GitPulse-owned binary and forget the saved path.
+///
+/// Only files inside the app bin directory are removed. A cargo/go install
+/// on PATH is left on disk; we just stop pointing at it.
+pub fn uninstall_tool(tool: ExternalTool) -> Result<String, String> {
+    let bin_dir = release::app_bin_dir()?;
+    let dest = bin_dir.join(release::binary_name(tool));
+    let saved = tool_config::saved_binary(tool);
+    let mut removed: Option<String> = None;
+
+    match remove_owned_bin(&dest) {
+        Ok(Some(path)) => removed = Some(path),
+        Ok(None) => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(ref saved_path) = saved {
+        let p = PathBuf::from(saved_path);
+        if path_is_under(&p, &bin_dir) && Some(saved_path.as_str()) != removed.as_deref() {
+            if let Ok(Some(path)) = remove_owned_bin(&p) {
+                if removed.is_none() {
+                    removed = Some(path);
+                }
+            }
+        }
+    }
+    tool_config::clear_binary(tool)?;
+    tool_capability::invalidate(tool);
+    Ok(match removed {
+        Some(path) => format!("removed {path}"),
+        None => format!(
+            "cleared the saved {} path; the binary was not in the GitPulse bin directory so it was left on disk",
+            tool.as_str()
+        ),
+    })
+}
+
+fn remove_owned_bin(path: &Path) -> Result<Option<String>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!("failed to inspect {}: {e}", path.display()));
+        }
+    };
+    if meta.is_dir() {
+        return Ok(None);
+    }
+    std::fs::remove_file(path).map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
+pub fn set_tool_disabled(tool: ExternalTool, disabled: bool) -> Result<(), String> {
+    tool_config::set_disabled(tool, disabled)?;
+    tool_capability::invalidate(tool);
+    Ok(())
 }
 
 fn clear_cancel() {
@@ -712,6 +781,7 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
                 selected_rung: Some(InstallRung::AlreadyOnPath),
                 ladder: ladder.rungs,
                 stale_config,
+                disabled: false,
             };
         }
         return ToolStatus {
@@ -731,6 +801,29 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
             selected_rung: ladder.selected,
             ladder: ladder.rungs,
             stale_config,
+            disabled: false,
+        };
+    }
+
+    if tool_config::is_disabled(tool) {
+        return ToolStatus {
+            tool,
+            installed: false,
+            path: None,
+            lookup: ToolLookup::Missing,
+            version: None,
+            reason: Some(format!(
+                "{} is disabled in GitPulse settings",
+                tool.as_str()
+            )),
+            source_checkout: source.map(|p| p.display().to_string()),
+            install_ready,
+            install_block,
+            install_command,
+            selected_rung: ladder.selected,
+            ladder: ladder.rungs,
+            stale_config,
+            disabled: true,
         };
     }
 
@@ -751,6 +844,7 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
             selected_rung: Some(InstallRung::AlreadyOnPath),
             ladder: ladder.rungs,
             stale_config,
+            disabled: false,
         };
     }
 
@@ -779,6 +873,7 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
             selected_rung: Some(InstallRung::AlreadyOnPath),
             ladder: ladder.rungs,
             stale_config,
+            disabled: false,
         };
     }
 
@@ -800,6 +895,7 @@ pub fn resolve_status(tool: ExternalTool) -> ToolStatus {
         selected_rung: ladder.selected,
         ladder: ladder.rungs,
         stale_config,
+        disabled: false,
     }
 }
 
@@ -2254,6 +2350,7 @@ mod tests {
     #[test]
     fn saved_config_binary_precedes_path_and_tags_lookup() {
         let _lock = crate::harness::sidecar::test_serial();
+        let _cfg_env = crate::tool_config::lock_config_env();
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("fake-devmap");
         #[cfg(unix)]
@@ -2286,6 +2383,96 @@ mod tests {
         assert_eq!(
             status.path.as_deref(),
             Some(bin.display().to_string().as_str())
+        );
+
+        unsafe {
+            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
+        }
+        crate::tool_config::invalidate_cache();
+        tool_capability::invalidate(ExternalTool::Devmap);
+    }
+
+    #[test]
+    fn disabled_tool_is_not_installed_without_env() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let _cfg_env = crate::tool_config::lock_config_env();
+        let dir = TempDir::new().unwrap();
+        let cfg_path = dir.path().join("tools.json");
+        unsafe {
+            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
+            std::env::remove_var("GITPULSE_DEVMAP_BIN");
+        }
+        crate::tool_config::invalidate_cache();
+        crate::tool_config::set_disabled(ExternalTool::Devmap, true).unwrap();
+        tool_capability::invalidate(ExternalTool::Devmap);
+        let status = resolve_status(ExternalTool::Devmap);
+        assert!(!status.installed);
+        assert!(status.disabled);
+        assert!(
+            status.reason.as_deref().unwrap_or("").contains("disabled"),
+            "{:?}",
+            status.reason
+        );
+        unsafe {
+            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
+        }
+        crate::tool_config::invalidate_cache();
+        tool_capability::invalidate(ExternalTool::Devmap);
+    }
+
+    #[test]
+    fn app_bin_dir_follows_tool_config_env() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let _cfg_env = crate::tool_config::lock_config_env();
+        let dir = TempDir::new().unwrap();
+        let cfg_path = dir.path().join("tools.json");
+        unsafe {
+            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
+        }
+        crate::tool_config::invalidate_cache();
+        let bin = release::app_bin_dir().expect("app bin");
+        assert_eq!(bin, dir.path().join("bin"), "{bin:?}");
+        unsafe {
+            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
+        }
+        crate::tool_config::invalidate_cache();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_broken_symlink_and_skips_directory() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let _cfg_env = crate::tool_config::lock_config_env();
+        let dir = TempDir::new().unwrap();
+        let cfg_path = dir.path().join("tools.json");
+        unsafe {
+            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
+            std::env::remove_var("GITPULSE_DEVMAP_BIN");
+        }
+        crate::tool_config::invalidate_cache();
+        tool_capability::invalidate(ExternalTool::Devmap);
+
+        let bin_dir = release::app_bin_dir().unwrap();
+        assert!(
+            bin_dir.starts_with(dir.path()),
+            "app bin {bin_dir:?} escaped TOOL_CONFIG_ENV dir {dir:?}"
+        );
+        let dest = bin_dir.join(release::binary_name(ExternalTool::Devmap));
+        std::os::unix::fs::symlink("/no/such/gitpulse-devmap", &dest).unwrap();
+        let msg = uninstall_tool(ExternalTool::Devmap).unwrap();
+        assert!(msg.contains("removed"), "{msg}");
+        assert!(
+            fs::symlink_metadata(&dest).is_err(),
+            "broken symlink survived uninstall"
+        );
+
+        fs::create_dir_all(&dest).unwrap();
+        let keep = dest.join("keep");
+        fs::write(&keep, "x").unwrap();
+        let msg = uninstall_tool(ExternalTool::Devmap).unwrap();
+        assert!(
+            keep.exists(),
+            "directory named like a binary was removed: {msg}"
         );
 
         unsafe {

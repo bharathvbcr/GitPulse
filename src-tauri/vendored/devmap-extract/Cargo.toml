@@ -269,3 +269,7 @@ required-features = ["parse"]
 name = "notebook_completeness"
 required-features = ["parse"]
 
+[[test]]
+name = "extract_bindings"
+required-features = ["parse"]
+

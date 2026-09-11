@@ -2,6 +2,14 @@
 
 GitPulse is built as a high-performance, local-first native desktop client combining a **Rust backend (Tauri 2)** with a **Svelte 5 + TypeScript frontend**.
 
+**Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is
+**components and modules**. [Manvi](https://github.com/bharathvbcr/Manvi) wraps
+them into a coding-agent harness. GitPulse uses **Manvi** for policy, workbench,
+and agent hosting, and **DevCouncil components** (`devmap` CLI and crates,
+verification reads) for code intelligence. Modules stay independently
+updatable; this app takes only the subset it needs. See
+[Module integration](MODULE_INTEGRATION.md).
+
 ```mermaid
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
@@ -50,7 +58,8 @@ flowchart TB
         LocalGit["<code>git</code> CLI"]
         LocalGh["<code>gh</code> CLI (GitHub)"]
         LocalLLM["Local LLMs (Ollama / LM Studio)"]
-        ManviSidecar["MANVI Harness Sidecar<br/>(<code>manvi serve</code> via stdio)"]
+        ManviSidecar["Manvi wrap<br/>(<code>manvi serve</code> via stdio)"]
+        DevCouncilMods["DevCouncil modules<br/>(<code>devmap</code> CLI + selected crates)"]
     end
 
     Async --> Invoke
@@ -62,6 +71,7 @@ flowchart TB
     OpsPlanner --> LocalGh
     OpsPlanner --> ManviSidecar
     Subsystems --> ManviSidecar
+    Subsystems --> DevCouncilMods
 ```
 
 ---

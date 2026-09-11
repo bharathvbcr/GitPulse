@@ -577,6 +577,9 @@ pub fn resolve_binary_uncached() -> Option<String> {
         let path = PathBuf::from(&explicit);
         return if path.is_file() { Some(explicit) } else { None };
     }
+    if crate::tool_config::is_disabled(crate::tool_install::ExternalTool::Manvi) {
+        return None;
+    }
     if let Some(saved) = crate::tool_config::saved_binary(crate::tool_install::ExternalTool::Manvi)
     {
         return Some(saved);
@@ -598,6 +601,9 @@ pub fn resolve_binary_absence() -> String {
         if !path.is_file() {
             return format!("GITPULSE_MANVI_BIN is set to {explicit}, but that path is not a file");
         }
+    }
+    if crate::tool_config::is_disabled(crate::tool_install::ExternalTool::Manvi) {
+        return "manvi is disabled in GitPulse settings".into();
     }
     not_installed_message()
 }

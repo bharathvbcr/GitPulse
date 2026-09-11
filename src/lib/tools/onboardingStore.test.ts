@@ -13,6 +13,7 @@ import {
   runVerify,
   setWizardStep,
   setWizardTool,
+  setWizardPreset,
 } from "./onboardingStore";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -38,6 +39,13 @@ describe("onboardingStore", () => {
     expect(get(onboardingStore.wizard).tool).toBe("manvi");
     closeSetupWizard();
     expect(get(onboardingStore.wizard).open).toBe(false);
+  });
+
+  it("opens with the DevMap-only preset", () => {
+    openSetupWizard("devmap");
+    expect(get(onboardingStore.wizard).preset).toBe("devmap");
+    setWizardPreset("analysis");
+    expect(get(onboardingStore.wizard).preset).toBe("analysis");
   });
 
   it("advances steps and switches tools", async () => {

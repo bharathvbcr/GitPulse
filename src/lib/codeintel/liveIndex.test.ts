@@ -385,6 +385,42 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
+  it("heals every retained repository, not only the focused one", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.setScope({
+      activeKey: "/devcouncil",
+      retainedKeys: ["/devcouncil", "/manvi"],
+      visible: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/devcouncil", false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(maybeRefresh.mock.calls.map((call) => call[0])).toEqual(["/devcouncil", "/manvi"]);
+    expect(maybeRefresh.mock.calls.every((call) => call[1] === false)).toBe(true);
+    index.setScope({
+      activeKey: "/manvi",
+      retainedKeys: ["/devcouncil", "/manvi"],
+      visible: true,
+    });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    index.setScope({
+      activeKey: "/gitpulse",
+      retainedKeys: ["/gitpulse"],
+      visible: true,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    index.setScope({
+      activeKey: "/manvi",
+      retainedKeys: ["/manvi"],
+      visible: true,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(maybeRefresh.mock.calls.filter((call) => call[0] === "/manvi")).toHaveLength(2);
+    index.reset();
+  });
+
   it("asks a status-only refresh when a repository becomes visible without a watcher event", async () => {
     const maybeRefresh = vi.fn(async () => outcome("skip_fresh"));
     const index = createLiveIndex({ debounceMs: 0, maybeRefresh });

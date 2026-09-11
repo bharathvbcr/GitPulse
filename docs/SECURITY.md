@@ -4,6 +4,11 @@ GitPulse is a **local-first, zero-telemetry** developer desktop application.
 Repository and task state stay in local stores. Git remotes, GitHub operations,
 optional tool installation and configured agent providers can use the network.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them.
+GitPulse uses Manvi for policy, workbench, and agent hosting, and selected
+DevCouncil modules for code intelligence. Take or update only the modules this
+app needs.
+
 ```mermaid
 flowchart TD
     subgraph Boundary["Security & Isolation Boundary"]

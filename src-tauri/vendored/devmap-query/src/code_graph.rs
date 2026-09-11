@@ -70,6 +70,15 @@ pub const CODE_GRAPH_TOP_LEVEL_KEYS: &[&str] = &[
 /// `SCHEMA_VERSION` in `src/devcouncil/indexing/graph/schema.py`.
 pub const CODE_GRAPH_SCHEMA_VERSION: u32 = 2;
 
+/// Byte ceiling for the verbose `code_graph.json` export.
+///
+/// Matches [`crate::host::DEFAULT_ARTIFACT_BYTES`]: a host that opens the
+/// artifact refuses anything larger, so writing past this limit would only
+/// produce a file nothing trusted can load. Oversized exports become a stub
+/// marked with `meta.graph_export_incomplete_reason` — the store stays
+/// canonical, which is what the agent guide already assumes.
+pub const CODE_GRAPH_EXPORT_MAX_BYTES: u64 = crate::host::DEFAULT_ARTIFACT_BYTES;
+
 // The consumer default paths that used to live here — `CODE_GRAPH_DEFAULT_OUTPUT`
 // and `CODE_GRAPH_COMPACT_DEFAULT_OUTPUT` — are gone rather than updated. Which
 // directory holds an artifact is now resolved per repository by
@@ -1404,7 +1413,11 @@ pub fn generate_code_graph_json(
     // buys something. This graph is 20.9 MB on DevCouncil and 105 MB on a
     // 4,300-file repository; nobody reads that by hand, and every one of its
     // consumers reaches it through `json.load`, which cannot tell the two apart.
-    Ok(serde_json::to_string(&payload)?)
+    Ok(bound_code_graph_json(
+        serde_json::to_string(&payload)?,
+        freshness,
+        CODE_GRAPH_EXPORT_MAX_BYTES,
+    ))
 }
 
 /// Both encodings from one traversal.
@@ -1426,12 +1439,80 @@ pub fn generate_code_graph_encodings(
     want_compact: bool,
 ) -> anyhow::Result<(String, Option<String>)> {
     let payload = build_code_graph_value(extractions, analysis, edges, freshness, repo_root)?;
-    let compact = if want_compact {
+    let verbose = bound_code_graph_json(
+        serde_json::to_string(&payload)?,
+        freshness,
+        CODE_GRAPH_EXPORT_MAX_BYTES,
+    );
+    // A stub verbose artifact means the full model was too large to ship; the
+    // compact form would only hide the same refusal behind a smaller file that
+    // still cannot reconstruct the graph a host needs.
+    let compact = if want_compact && !code_graph_json_is_export_stub(&verbose) {
         Some(serde_json::to_string(&encode_compact(&payload)?)?)
     } else {
         None
     };
-    Ok((serde_json::to_string(&payload)?, compact))
+    Ok((verbose, compact))
+}
+
+/// Replace an oversized verbose encoding with a bounded stub.
+///
+/// The stub keeps the schema's required top-level keys so a naive `json.load`
+/// still parses, and sets `meta.graph_export_incomplete_reason` so
+/// [`crate::host`] refuses it as incomplete — agents must use the store.
+fn bound_code_graph_json(json: String, freshness: &FreshnessInfo, limit: u64) -> String {
+    let bytes = json.len() as u64;
+    if bytes <= limit {
+        return json;
+    }
+    oversized_code_graph_stub(bytes, limit, freshness)
+}
+
+/// Whether [`bound_code_graph_json`] replaced the full model with a stub.
+pub fn code_graph_json_is_export_stub(json: &str) -> bool {
+    serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("meta")
+                .and_then(|meta| meta.get("graph_export_incomplete_reason"))
+                .and_then(Value::as_str)
+                .map(|reason| reason.starts_with("oversized:"))
+        })
+        .unwrap_or(false)
+}
+
+/// Explicit size-capped stub for an export that would exceed the host ceiling.
+fn oversized_code_graph_stub(bytes: u64, limit: u64, freshness: &FreshnessInfo) -> String {
+    let reason = format!(
+        "oversized: verbose code_graph.json would be {bytes} bytes, over the \
+         {limit}-byte export ceiling; use the DevMap store (`devmap` / MCP) \
+         rather than this file"
+    );
+    serde_json::to_string(&json!({
+        "content_fingerprint": null,
+        "dead_clusters": [],
+        "dead_clusters_incomplete": null,
+        "dead_clusters_truncated": 0,
+        "dead_code": [],
+        "edges": [],
+        "entry_roots": [],
+        "generated_head": freshness.head_sha,
+        "indexed_hash": null,
+        "meta": {
+            "map_engine": CONSUMER_MAP_ENGINE,
+            "graph_export_incomplete_reason": reason,
+            "graph_export_stub": true,
+            "graph_export_bytes": bytes,
+            "graph_export_limit_bytes": limit,
+            "generation_id": freshness.generation_id,
+        },
+        "nodes": [],
+        "schema_version": CODE_GRAPH_SCHEMA_VERSION,
+        "unreachable_files": [],
+        "unwired_candidates": [],
+    }))
+    .expect("stub serialization cannot fail")
 }
 
 /// Identity of the interned layout. A decoder written against `v1` must refuse
@@ -2692,6 +2773,63 @@ mod tests {
         for path in [ours, python, no_meta, broken] {
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
+    }
+
+    /// An oversized verbose export becomes a stub, not a file hosts refuse.
+    #[test]
+    fn an_oversized_code_graph_export_becomes_an_explicit_stub() {
+        let (extractions, analysis, edges) = compact_fixture();
+        let full =
+            generate_code_graph_json(&extractions, &analysis, &edges, &freshness(), None).unwrap();
+        assert!(
+            !super::code_graph_json_is_export_stub(&full),
+            "a fixture-sized graph must ship in full"
+        );
+        let stub = super::bound_code_graph_json(full.clone(), &freshness(), 64);
+        assert!(super::code_graph_json_is_export_stub(&stub));
+        let value: Value = serde_json::from_str(&stub).unwrap();
+        assert_eq!(value["nodes"], json!([]));
+        assert_eq!(value["edges"], json!([]));
+        let reason = value["meta"]["graph_export_incomplete_reason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.starts_with("oversized:"), "{reason}");
+        assert!(
+            value["meta"]["graph_export_stub"].as_bool() == Some(true),
+            "stub marker must be present"
+        );
+        // Compact is withheld beside a stub — a smaller encoding of a graph
+        // the verbose form refused would only hide the refusal.
+        let (verbose, compact) = generate_code_graph_encodings(
+            &extractions,
+            &analysis,
+            &edges,
+            &freshness(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!super::code_graph_json_is_export_stub(&verbose));
+        assert!(compact.is_some());
+        let (stubbed, no_compact) = {
+            // Force the stub path through the same helper the encoder uses.
+            let payload =
+                build_code_graph_value(&extractions, &analysis, &edges, &freshness(), None)
+                    .unwrap();
+            let verbose = super::bound_code_graph_json(
+                serde_json::to_string(&payload).unwrap(),
+                &freshness(),
+                64,
+            );
+            let compact = if !super::code_graph_json_is_export_stub(&verbose) {
+                Some(serde_json::to_string(&encode_compact(&payload).unwrap()).unwrap())
+            } else {
+                None
+            };
+            (verbose, compact)
+        };
+        assert!(super::code_graph_json_is_export_stub(&stubbed));
+        assert!(no_compact.is_none());
     }
 
     // ---- G6: interned wire format -------------------------------------------

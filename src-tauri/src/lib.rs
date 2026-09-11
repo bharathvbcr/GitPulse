@@ -330,6 +330,8 @@ pub fn run() {
             cmd_external_tools_status,
             cmd_external_tool_install,
             cmd_external_tool_install_cancel,
+            cmd_external_tool_uninstall,
+            cmd_external_tool_set_disabled,
             cmd_tool_config_get,
             cmd_tool_config_save,
             cmd_tool_ladder,

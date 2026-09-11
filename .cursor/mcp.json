@@ -6,7 +6,7 @@
         "/Users/bharath/Code/devtools/GitPulse",
         "mcp"
       ],
-      "command": "/Users/bharath/.local/bin/devmap",
+      "command": "devmap",
       "type": "stdio"
     },
     "gitpulse": {

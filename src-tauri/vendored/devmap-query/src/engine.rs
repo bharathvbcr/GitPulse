@@ -81,9 +81,17 @@ impl<'a> StoreQueryEngine<'a> {
         self
     }
 
+    fn finish<T>(&self, response: Response<T>) -> Response<T> {
+        attach_source_freshness(self.store, response)
+    }
+
+    fn unavailable<T>(&self, resolution: ResolutionAvailability) -> Response<T> {
+        self.finish(unavailable_response(resolution))
+    }
+
     pub fn search(&self, req: Request<String>) -> anyhow::Result<Response<SymbolHit>> {
         if req.query.trim().is_empty() {
-            return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
+            return Ok(self.finish(budget_take(Vec::new(), req.token_budget, |_| 0)));
         }
         let page = search_page_size(req.token_budget);
         let pool = search_rank_pool_size(req.token_budget);
@@ -102,7 +110,7 @@ impl<'a> StoreQueryEngine<'a> {
         // one row — so the exact answer is affordable here, and an exact answer
         // beats a disclosed approximation whenever it can be had.
         let Some(snapshot) = self.store.search_page(&req.query, pool)? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -161,7 +169,7 @@ impl<'a> StoreQueryEngine<'a> {
         // whether `total: 0` may be read as "no such symbol".
         response.walk_incomplete =
             devmap_analyze::combine_reasons(ranked_over_a_sample, coverage_gap);
-        Ok(response)
+        Ok(self.finish(response))
     }
 
     pub fn dependencies(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -186,12 +194,12 @@ impl<'a> StoreQueryEngine<'a> {
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         self.cancel.check()?;
         let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: format!("{} is not indexed", req.query),
             }));
         };
         if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: format!("{} could not be parsed", req.query),
             }));
         }
@@ -213,7 +221,7 @@ impl<'a> StoreQueryEngine<'a> {
         // every qualification the answer holds, not the last one written.
         response.walk_incomplete =
             devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
-        Ok(response)
+        Ok(self.finish(response))
     }
 
     pub fn impact(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -608,7 +616,7 @@ impl<'a> StoreQueryEngine<'a> {
         self.cancel.check()?;
         devmap_store::checked_min_confidence(req.min_confidence)?;
         let Some(index) = self.generation_edges()? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -622,7 +630,7 @@ impl<'a> StoreQueryEngine<'a> {
         let from = from.trim();
         let to = to.trim();
         if from.is_empty() || to.is_empty() {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "scoped trace endpoints must not be empty".to_string(),
             }));
         }
@@ -632,7 +640,7 @@ impl<'a> StoreQueryEngine<'a> {
         // for a question the walk cannot answer. Whether a cycle passes through
         // a symbol is `impact`'s question; a scoped trace needs two endpoints.
         if from == to {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: format!(
                     "{from:?} and {to:?} are the same symbol; a scoped trace needs two \
                      different endpoints (whether a cycle passes through it is an \
@@ -687,7 +695,7 @@ impl<'a> StoreQueryEngine<'a> {
         };
         let mut response = atomic_budget_take(path, req.token_budget, |_| 25);
         response.walk_incomplete = coverage_gap;
-        Ok(response)
+        Ok(self.finish(response))
     }
 
     /// Every edge in the latest generation at or above `min_confidence`, in
@@ -749,7 +757,7 @@ impl<'a> StoreQueryEngine<'a> {
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
         let Some(index) = self.generation_edges()? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -1395,7 +1403,7 @@ impl<'a> StoreQueryEngine<'a> {
         // and reports `truncated` for the right reason.
         let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
         let Some(page) = self.store.dead_page(limit)? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -1431,7 +1439,7 @@ impl<'a> StoreQueryEngine<'a> {
                 response.dead_clusters = Some(scan.clusters);
             }
         }
-        Ok(response)
+        Ok(self.finish(response))
     }
 
     /// Duplicate bodies in the latest generation.
@@ -1496,7 +1504,7 @@ impl<'a> StoreQueryEngine<'a> {
     ) -> anyhow::Result<Response<SymbolHit>> {
         self.cancel.check()?;
         let Some(snapshot) = self.store.all_symbols_page()? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -1505,7 +1513,7 @@ impl<'a> StoreQueryEngine<'a> {
         if symbols.is_empty() || query.trim().is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete = coverage_gap;
-            return Ok(response);
+            return Ok(self.finish(response));
         }
         // Both names, so a query can match either the bare symbol or the path
         // and type it sits under.
@@ -1542,7 +1550,7 @@ impl<'a> StoreQueryEngine<'a> {
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
         response.walk_incomplete = coverage_gap;
-        Ok(response)
+        Ok(self.finish(response))
     }
 
     /// What the map cost against what reading files would have.
@@ -1653,7 +1661,9 @@ impl<'a> StoreQueryEngine<'a> {
         let parse_status = parse_status_name(&candidate.parse_outcome).to_string();
 
         let empty_callers = || Response {
-            source_freshness: None,
+            source_freshness: crate::model::SourceFreshness::unverified(
+                "whole-tree source freshness was not checked for this answer",
+            ),
             items: Vec::new(),
             shown: 0,
             hidden: 0,
@@ -2758,7 +2768,9 @@ impl<'a> QueryEngine<'a> {
     pub fn search(&self, req: Request<String>) -> Response<SymbolHit> {
         if req.query.trim().is_empty() {
             return Response {
-                source_freshness: None,
+                source_freshness: crate::model::SourceFreshness::unverified(
+                    "whole-tree source freshness was not checked for this answer",
+                ),
                 items: Vec::new(),
                 shown: 0,
                 hidden: 0,
@@ -3615,7 +3627,9 @@ fn record_test_hit(
 
 fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
     Response {
-        source_freshness: None,
+        source_freshness: SourceFreshness::unverified(
+            "no persisted generation is available to verify against the working tree",
+        ),
         items: Vec::new(),
         shown: 0,
         hidden: 0,
@@ -3629,6 +3643,11 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
     }
+}
+
+fn attach_source_freshness<T>(store: &Store, mut response: Response<T>) -> Response<T> {
+    response.source_freshness = SourceFreshness::from_store(store.query_source_freshness());
+    response
 }
 
 pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
@@ -3842,13 +3861,13 @@ fn attribution_coverage_gap(
         Some(coverage) if coverage.unresolved_sites == total && coverage.explained_sites <= total => {
             let remaining = total - coverage.explained_sites;
             (remaining > 0).then(|| format!(
-                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies",
+                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it",
                 coverage.explained_sites,
             ))
         }
         None if total == 0 => None,
         _ => Some(format!(
-            "this generation records {total} unresolved attribution site(s), but their classification breakdown is unavailable or inconsistent; these repository-wide counts are not specific to this target, so call-graph coverage is unknown"
+            "this generation records {total} unresolved attribution site(s), but their classification breakdown is unavailable or inconsistent; these repository-wide counts are not specific to this target, so call-graph coverage for it is unknown"
         )),
     }
 }
@@ -4250,7 +4269,9 @@ where
     }
 
     Response {
-        source_freshness: None,
+        source_freshness: crate::model::SourceFreshness::unverified(
+            "whole-tree source freshness was not checked for this answer",
+        ),
         shown: out.len() as u32,
         hidden: total.saturating_sub(out.len() as u32),
         total,
@@ -4276,7 +4297,9 @@ where
         .fold(0u32, |sum, item| sum.saturating_add(cost_of(item)));
     if required > token_budget {
         return Response {
-            source_freshness: None,
+            source_freshness: crate::model::SourceFreshness::unverified(
+                "whole-tree source freshness was not checked for this answer",
+            ),
             items: Vec::new(),
             shown: 0,
             hidden: total,
@@ -4292,7 +4315,9 @@ where
         };
     }
     Response {
-        source_freshness: None,
+        source_freshness: crate::model::SourceFreshness::unverified(
+            "whole-tree source freshness was not checked for this answer",
+        ),
         shown: total,
         hidden: 0,
         total,
@@ -5458,10 +5483,19 @@ mod search_bounds_tests {
         };
         let before = StoreQueryEngine::new(&store).search(request()).unwrap();
         let wire = serde_json::to_value(&before).unwrap();
-        assert_eq!(
-            wire.get("source_freshness"),
-            Some(&serde_json::Value::Null),
-            "a query must explicitly disclose that whole-tree freshness was not checked"
+        let freshness = wire
+            .get("source_freshness")
+            .expect("query envelopes must carry source_freshness");
+        assert!(
+            freshness.get("fresh").is_some_and(|v| v.is_null()),
+            "a query must disclose that whole-tree freshness was not verified: {freshness}"
+        );
+        assert!(
+            freshness
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|reason| !reason.is_empty()),
+            "unverified freshness must name why: {freshness}"
         );
         assert!(before.items[0].source_span.contains("original_name"));
         std::fs::write(dir.join("a.py"), "def modified_name(): return 2\n").unwrap();

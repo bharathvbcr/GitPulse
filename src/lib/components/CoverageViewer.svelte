@@ -37,7 +37,7 @@
     Bug,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
-  import { formatError } from "../ui/formatError";
+  import { formatError, isMissingFileError } from "../ui/formatError";
   import { diagnostics } from "../diagnostics/diagnostics";
   import { reportPanelError } from "../diagnostics/report";
   import { coverageMetric } from "../metrics/repoMetrics";
@@ -1326,7 +1326,16 @@
               commitId: null,
             }).then(
               (content) => ({ ok: true as const, content }),
-              (err: unknown) => ({ ok: false as const, reason: reportPanelError("coverage", err) })
+              (err: unknown) => {
+                const reason = formatError(err);
+                // coverage.py emits SF:__main__.py for `python -m` runs; that
+                // path is often neither on disk nor in the index. The empty
+                // state already says so — a diagnostics warning is noise.
+                if (isMissingFileError(reason)) {
+                  return { ok: false as const, reason };
+                }
+                return { ok: false as const, reason: reportPanelError("coverage", err) };
+              }
             ),
           ]);
           if (cancelled) return;

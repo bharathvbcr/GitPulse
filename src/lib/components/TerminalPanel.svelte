@@ -5,6 +5,7 @@
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { terminalLaunchRequests } from "../terminal/launchRequests";
   import { taskTerminalRequests, consumeTaskTerminal } from "../terminal/taskLaunches";
+  import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -156,6 +157,18 @@
       tabState = openTab(tabState, request.provider, { runId: request.runId, title: request.title });
       mode = "shell";
       consumeTaskTerminal(request.runId);
+    });
+  });
+
+  $effect(() => {
+    const queued = $consoleLaunchRequests[0];
+    if (!queued || !visible || !repoPath) return;
+    if (running) return;
+    untrack(() => {
+      const claimed = consumeConsoleLaunch();
+      if (!claimed) return;
+      mode = "console";
+      void execute(claimed.command, claimed.timeoutSecs ?? 1200);
     });
   });
 
@@ -339,7 +352,7 @@
     }
   }
 
-  async function execute(rawCommand?: string) {
+  async function execute(rawCommand?: string, timeoutSecs = 600) {
     const textToRun = (rawCommand ?? commandInput).trim();
     if (!textToRun || running) return;
 
@@ -385,7 +398,7 @@
         repoPath,
         args: tokenized.argv,
         // Long enough for a cold install/build; the backend clamps to [1s, 30min].
-        timeoutSecs: 600,
+        timeoutSecs,
       });
 
       executions = executions.map((e) =>

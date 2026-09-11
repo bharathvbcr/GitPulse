@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatError } from "./formatError";
+import { formatError, isMissingFileError } from "./formatError";
 
 describe("formatError", () => {
   it("passes non-empty strings through trimmed", () => {
@@ -87,5 +87,25 @@ describe("formatError", () => {
 
   it("maps exotic non-object values (functions) to the fallback", () => {
     expect(formatError(() => "nope")).toBe("Unknown error");
+  });
+});
+
+describe("isMissingFileError", () => {
+  it("matches the backend File not found signal anywhere in the formatted string", () => {
+    expect(isMissingFileError("File not found: __main__.py")).toBe(true);
+    expect(isMissingFileError("file not found: foo*.py")).toBe(true);
+    expect(
+      isMissingFileError("cmd_get_file_content failed: File not found: pkg/__main__.py"),
+    ).toBe(true);
+    expect(isMissingFileError(formatError({ message: "File not found: x" }))).toBe(true);
+  });
+
+  it("does not treat unrelated not-found phrasing as a missing coverage file", () => {
+    expect(isMissingFileError("Unknown error")).toBe(false);
+    // "profile not found:" contains the letters "file not found:" as a
+    // substring; a bare includes() would swallow it.
+    expect(isMissingFileError("profile not found:")).toBe(false);
+    expect(isMissingFileError("not found: file")).toBe(false);
+    expect(isMissingFileError("")).toBe(false);
   });
 });

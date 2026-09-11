@@ -259,6 +259,11 @@ GitPulse is a **Tauri 2** desktop app: a Rust core that owns every privileged
 operation, and a Svelte 5 frontend that owns rendering and interaction. They meet at
 exactly one seam — `invoke("cmd_*")` — and that seam is machine-checked (§4).
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them.
+GitPulse uses Manvi for policy, workbench, and agent hosting, and selected
+DevCouncil crates plus the `devmap` CLI for code intelligence. Prefer the existing
+module; update one at a time. See [Module integration](docs/MODULE_INTEGRATION.md).
+
 ```
 GitPulse/
 ├── src/                  Svelte 5 + TypeScript frontend
@@ -272,13 +277,13 @@ GitPulse/
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
-    ├── harness/          MANVI policy gate, sidecar protocol
+    ├── harness/          Manvi wrap: policy gate, sidecar protocol
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot, code scanning)
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
     ├── mcp/              Read-only MCP tool surface and control-plane snapshots
     ├── bin/              Headless entry points (see below)
-    ├── vendored/         Copies of the Manvi and DevCouncil crates (see below)
+    ├── vendored/         Copies of selected DevCouncil and MarkDev crates (see below)
     └── terminal/ diff/ storage/ watcher/ stack/ ai/ desktop/
 ```
 
@@ -296,7 +301,7 @@ from the same crate and reuse its modules:
 `gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and
 a second surface answering the same questions from the same store would be a
 second thing to keep in step) and never takes a lease, checks out a task, or
-writes a file — those belong to DevCouncil and Manvi, and a background process
+writes a file — those belong to DevCouncil and Manvi modules, and a background process
 holding a writer lease would contend with the agent doing the work.
 
 ```bash
@@ -310,9 +315,11 @@ whatever an interrupted one did not finish and writes it exactly once.
 
 ### Vendored crates
 
-GitPulse links nine Rust crates it does not own — `dc-verify`, `dc-store` and
-`dc-glob` from Manvi, five `devmap-*` crates from DevCouncil, and `markdev`
-from MarkDev (parse/highlight with default features off). They used to
+GitPulse links selected crates it does not own — `dc-verify`, `dc-store`,
+`dc-glob`, and `dc-evidence` from DevCouncil, five `devmap-*` crates from
+DevCouncil, and `markdev` from MarkDev (parse/highlight with default features off).
+Manvi is the wrap around those DevCouncil components at runtime (`manvi serve`);
+its analysis crates are not a vendor origin. They used to
 be reached by relative path (`../../../../../Manvi/crates/…`), which meant a
 checkout of GitPulse alone did not build: it needed unrelated repositories
 present, at the right depth, on every machine and every CI runner.
@@ -334,9 +341,9 @@ npm run vendor
 Three things the tooling is careful about, each of which was a way to get this
 subtly wrong:
 
-* **Inheritance is resolved, not carried.** Both upstreams use workspace
-  inheritance, and they disagree — Manvi is edition 2024 / resolver 3,
-  DevCouncil's rust/ workspace is 2021 / resolver 3 — so a single workspace here
+* **Inheritance is resolved, not carried.** The upstreams use workspace
+  inheritance, and they disagree — DevCouncil's rust/ workspace is edition
+  2021 / resolver 3, MarkDev is a separate workspace — so a single workspace here
   could not serve both. Each vendored manifest gets the concrete values its own
   upstream would have supplied, every substitution is listed in `VENDOR.json`,
   and an inheritance form the script does not recognise is a hard failure

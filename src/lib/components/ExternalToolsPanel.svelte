@@ -14,7 +14,9 @@
     getExternalToolsStatus,
     installButtonLabel,
     installExternalTool,
+    setExternalToolDisabled,
     toolStatusSummary,
+    uninstallExternalTool,
     type ExternalTool,
     type InstallOutcome,
     type ToolStatus,
@@ -89,6 +91,32 @@
     await cancelExternalToolInstall();
   }
 
+  async function toggleDisabled(tool: ExternalTool, disabled: boolean) {
+    try {
+      await setExternalToolDisabled(tool, disabled);
+      await refresh();
+    } catch (error) {
+      loadError = formatError(error);
+    }
+  }
+
+  async function uninstall(tool: ExternalTool) {
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(
+        `Remove the GitPulse-owned ${tool} binary if it lives in the app bin directory? A cargo/go install on PATH is left on disk.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await uninstallExternalTool(tool);
+      await refresh();
+    } catch (error) {
+      loadError = formatError(error);
+    }
+  }
+
   onMount(() => {
     void refresh();
   });
@@ -143,8 +171,22 @@
             {:else}
               <button
                 type="button"
+                class="gp-btn py-0.5! px-2! text-[10px]"
+                onclick={() => void toggleDisabled(row.tool, !row.disabled)}
+              >
+                {row.disabled ? "Enable" : "Disable"}
+              </button>
+              <button
+                type="button"
+                class="gp-btn py-0.5! px-2! text-[10px]"
+                onclick={() => void uninstall(row.tool)}
+              >
+                Uninstall
+              </button>
+              <button
+                type="button"
                 class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
-                disabled={!row.install_ready || installing !== null}
+                disabled={!row.install_ready || installing !== null || row.disabled === true}
                 title={row.install_command}
                 onclick={() => void runInstall(row.tool)}
               >

@@ -44,6 +44,7 @@ export interface ToolStatus {
   selected_rung?: InstallRung | null;
   ladder?: RungStatus[];
   stale_config?: string | null;
+  disabled?: boolean;
 }
 
 export interface ToolsStatus {
@@ -71,8 +72,8 @@ export interface InstallOutcome {
 export interface ToolConfigView {
   config: {
     version: number;
-    devmap: { source_root?: string | null; binary?: string | null };
-    manvi: { source_root?: string | null; binary?: string | null };
+    devmap: { source_root?: string | null; binary?: string | null; disabled?: boolean };
+    manvi: { source_root?: string | null; binary?: string | null; disabled?: boolean };
     onboarding: {
       completed_at?: string | null;
       skipped_tools: string[];
@@ -138,6 +139,17 @@ export function cancelExternalToolInstall(): Promise<void> {
   return invoke("cmd_external_tool_install_cancel");
 }
 
+export function uninstallExternalTool(tool: ExternalTool): Promise<string> {
+  return invoke<string>("cmd_external_tool_uninstall", { tool });
+}
+
+export function setExternalToolDisabled(
+  tool: ExternalTool,
+  disabled: boolean,
+): Promise<ToolConfigView> {
+  return invoke<ToolConfigView>("cmd_external_tool_set_disabled", { tool, disabled });
+}
+
 export function getToolConfig(): Promise<ToolConfigView> {
   return invoke<ToolConfigView>("cmd_tool_config_get");
 }
@@ -171,6 +183,9 @@ export function refreshToolCapability(): Promise<void> {
 
 /** One-line status for a tool row. */
 export function toolStatusSummary(status: ToolStatus): string {
+  if (status.disabled && status.lookup !== "explicit_env") {
+    return status.reason ?? "Disabled in GitPulse settings";
+  }
   if (status.lookup === "explicit_missing") {
     return status.reason ?? "Configured path is missing";
   }

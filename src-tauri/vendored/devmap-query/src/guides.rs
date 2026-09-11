@@ -237,8 +237,10 @@ context."
         role_buckets_step(map),
         cross_subsystem_step(map),
         "7. For dead code, run `devmap dead --json` and read each row's own `confidence` \
-before acting — a high-confidence row is a parsed fact, a low one is unconfirmed, and the command \
-returns both rather than pre-filtering. Every answer also carries `walk_incomplete` when \
+before acting — a high-confidence row is a parsed fact (no inbound evidence), a low one \
+is unconfirmed (`only_ambiguous_callers`, unresolved namesake, or coverage-capped), and \
+the command returns both rather than pre-filtering. `NoNamesake` sites are explained gaps \
+in the unresolved ledger, not dead findings. Every answer also carries `walk_incomplete` when \
 unattributed calls mean the list is a lower bound. Prefer `unwired_candidates` / \
 `dead_symbol_candidates` in the map over `unreachable_files` (static BFS is noisy for routers, \
 dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unreliable` is set, \

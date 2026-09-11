@@ -14,8 +14,9 @@ pub mod repo_map;
 pub mod viz;
 
 pub use cli::{
-    build, is_build_in_flight, preview, preview_many, refresh, resolve_binary,
-    status as cli_status, BuildOutcome, CliStatus, DevmapLookup, PreviewFileResult, PreviewOutcome,
+    build, is_build_in_flight, preview, preview_many, preview_path_eligible, refresh,
+    resolve_binary, status as cli_status, BuildOutcome, CliStatus, DevmapLookup, PreviewFileResult,
+    PreviewOutcome, PREVIEW_DEBOUNCE,
 };
 pub use live::{
     clear_live_echo_cooldown, decide_live_refresh, freshness_from_cli_status, maybe_refresh,

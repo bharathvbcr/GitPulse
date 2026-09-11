@@ -2,6 +2,8 @@
 
 `gitpulse-mcp` is GitPulse's **read-only** control plane for coding agents. It never checks out a branch, writes a file, or takes a task lease. Ask it what is true; mutate through the agent that already holds the writer lease.
 
+It exposes GitPulse-owned surfaces (worktrees, ledger, collisions) and selected **DevCouncil** modules (in-process DevMap code graph, task/lease reads). Policy and agent hosting go through **Manvi**, not this server.
+
 Protocol: [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) (`server/discover`, per-request `_meta`, cacheable `tools/list`). Legacy `initialize` (2024-11-05 / 2025-11-25) still works.
 
 ## Install the server

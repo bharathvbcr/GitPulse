@@ -2,6 +2,8 @@
 
 GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil's `devmap` module for the Code → Map code graph. See [Module integration](MODULE_INTEGRATION.md).
+
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
@@ -94,9 +96,9 @@ repository's shared task board.
 - **Fork Points Are Recorded, Not Recomputed**: Once a parent has been rebased, `merge-base` collapses back to the trunk and would replay the parent's own commits onto the parent. `cmd_restack` accepts the parent tip the stack was read at, refuses one that is not an ancestor of the branch (rather than silently widening the rewrite), and so does not depend on the reflog — which a fresh clone, a bare repository, or `gc.reflogExpire` will not have.
 - **What The Hierarchy Cannot See, It Says**: A branch appears as a child only while it sits on its parent's *current* tip. Git records no "cut from" link, so a branch left behind by a rebase of its parent reappears as its own root, not as a stale child — stated on the page, with the local branches the walk placed on no stack listed by name. Otherwise a stack that fell apart reads as a repository that never had one.
 
-### 1.5 Policy (MANVI)
+### 1.5 Policy (Manvi wrap)
 
-- **Policy Monitor**: Displays real-time status of the MANVI command and file write gates.
+- **Policy Monitor**: Displays real-time status of the Manvi command and file write gates (Manvi's wrap around selected DevCouncil modules).
 - **Merged Branch Cleanup**: Identifies merged local branches and plans safe deletions without touching active or unmerged heads.
 - **Commit Review**: Analyzes outgoing commits before pushing, reporting reviewed vs total counts.
 - **Release Publisher**: Preflight checks (clean worktree, synchronized branch) before pushing SemVer tags.
@@ -160,6 +162,8 @@ reading of the same open file. Sections switch from the segmented control
 - **Uncommitted Lines Named**: Worktree-only lines carry an all-zero OID and render as `uncommitted` rather than as a link to a commit that does not exist.
 
 ### 2.3 Map
+
+DevCouncil's `devmap` module. GitPulse takes this component without requiring the rest of the DevCouncil suite, and updates it independently of the Manvi wrap.
 
 - **Repo map navigator**: Reads the `repo_map` path resolved by `devmap paths --json` (`.devmap/repo_map.json` by default, with legacy `.devcouncil` support) — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates. Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
 - **Code & doc graph canvas**: Renderer-agnostic payloads from DevMap viz / map-preview and the MarkDev doc graph, drawn on the shared canvas stack (not the commit-lane graph). The legend names node caps and truncation rather than implying the picture is the whole graph.

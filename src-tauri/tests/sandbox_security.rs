@@ -164,9 +164,22 @@ fn working_tree_reads_refuse_symlink_escape() {
     let repo = repo_dir.path().canonicalize().unwrap();
     std::os::unix::fs::symlink(outside.path().join("secret.txt"), repo.join("leak.txt")).unwrap();
 
-    // Pre-fix both calls happily fs::read the outside file.
-    assert!(GitReader::get_file_content(&repo_str, "leak.txt", None).is_err());
-    assert!(GitReader::get_file_blob(&repo_str, "leak.txt", None).is_err());
+    // Outbound Git symlink: return the link text, never the target bytes.
+    // Coverage and the file viewer need the entry itself (vendor crates that
+    // point at a sibling checkout). Following it would leak `top secret`.
+    let content = GitReader::get_file_content(&repo_str, "leak.txt", None)
+        .expect("outbound symlink is readable as the link text");
+    assert!(
+        !content.contains("top secret"),
+        "must not follow the symlink; got {content:?}"
+    );
+    assert!(
+        content.contains("secret.txt"),
+        "expected the link target path, got {content:?}"
+    );
+    let blob =
+        GitReader::get_file_blob(&repo_str, "leak.txt", None).expect("outbound symlink blob");
+    assert_eq!(blob.text.as_deref(), Some(content.as_str()));
 
     // Language stats: the untracked link is listed by `ls-files --others`.
     // Pre-fix the loop read through it and accrued LOC for Python from bytes

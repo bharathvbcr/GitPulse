@@ -2,6 +2,8 @@
 
 GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 owns rendering**, and they meet at one machine-checked seam: `invoke("cmd_*")`.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi (`manvi serve`) for policy, workbench, and agent hosting, and selected DevCouncil crates plus the `devmap` CLI for code intelligence. See [Module integration](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MODULE_INTEGRATION.md).
+
 ```mermaid
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
@@ -24,7 +26,8 @@ flowchart TB
         GitCLI["git"]
         GhCLI["gh"]
         LLM["Local LLMs on loopback"]
-        Manvi["manvi serve"]
+        Manvi["manvi serve (wraps DevCouncil)"]
+        DevCouncil["DevCouncil modules (devmap, selected crates)"]
     end
     Frontend --> Bridge --> Backend
     Backend --> Local
@@ -89,7 +92,7 @@ contracts. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/bl
 
 ## Vendored crates
 
-Manvi (`dc-verify`, `dc-store`, `dc-glob`), DevCouncil (`devmap-*`), and MarkDev (`markdev`) crates are copied into `src-tauri/vendored/` so a lone GitPulse checkout builds. Do not edit those copies. Fix upstream, then `npm run vendor`. `npm run vendor:check` reports an upstream that is not checked out as **unavailable**, never **matches**. `npm run check:vendor-schema` pins the vendored store schema against the installed `devmap` CLI when present.
+DevCouncil (`dc-*`, `devmap-*`) and MarkDev (`markdev`) crates are copied into `src-tauri/vendored/` so a lone GitPulse checkout builds. Manvi is the wrap around those components at runtime (`manvi serve`), not a vendor origin. Do not edit those copies. Fix upstream, then `npm run vendor`. `npm run vendor:check` reports an upstream that is not checked out as **unavailable**, never **matches**. `npm run check:vendor-schema` pins the vendored store schema against the installed `devmap` CLI when present.
 
 ## Contracts
 

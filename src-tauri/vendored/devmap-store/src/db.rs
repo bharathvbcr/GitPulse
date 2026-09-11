@@ -36,6 +36,57 @@ fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
+/// Typed refusal when a store's stamped schema is not this binary's.
+///
+/// Carried inside `rusqlite::Error::ToSqlConversionFailure` so existing
+/// `Result` signatures stay one type, but callers can downcast instead of
+/// matching substrings of the Display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSchema {
+    pub found: i32,
+    pub expected: i32,
+    message: String,
+}
+
+impl UnsupportedSchema {
+    fn new(store: &str, found: i32) -> Self {
+        let expected = CURRENT_SCHEMA_VERSION;
+        let remedy = if found > expected {
+            "this devmap binary is older than the store; rebuild it with \
+             `cargo build --release -p devmap-cli` or set DEVMAP_BINARY to a newer build"
+                .to_string()
+        } else if (1..=PYTHON_INDEX_SCHEMA_VERSION).contains(&found) {
+            format!(
+                "this is the Python engine's database (`.devcouncil/codeintel/index.sqlite`, \
+                 schema {PYTHON_INDEX_SCHEMA_VERSION}), not a devmap store, and this kernel \
+                 cannot convert it — point `--db` at `devmap.sqlite`"
+            )
+        } else {
+            "run `devmap build` to migrate the store".to_string()
+        };
+        Self {
+            found,
+            expected,
+            message: format!(
+                "devmap store {store}: schema version {found} is not supported by this binary \
+                 (schema {expected}); {remedy}"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for UnsupportedSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnsupportedSchema {}
+
+fn unsupported_schema_error(store: &str, found: i32) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(UnsupportedSchema::new(store, found)))
+}
+
 /// Shared by [`Store::save_generation_timed`] and [`Store::restamp_latest_head`].
 /// A stamp is provenance, not a git-object proof: `"unavailable"` and `"unknown"`
 /// are valid, which is what the CLI writes when `rev-parse` fails.
@@ -661,6 +712,21 @@ pub struct Store {
     /// on the ScholarLM corpus is milliseconds; `devmap status` asks for it on
     /// every call and nothing else about it can change.
     generation_analysis_status: Mutex<Option<(u32, AnalysisStatus)>>,
+    /// Last whole-tree source-freshness verdict from [`Store::status`].
+    ///
+    /// Query envelopes read this rather than re-walking the tree: status is the
+    /// surface that verifies; queries disclose the last known verdict for the
+    /// generation they answered from, or an explicit unverified reason when
+    /// nothing has been checked in this process.
+    source_freshness_cache: Mutex<Option<CachedSourceFreshness>>,
+}
+
+/// Process-local memo of the last [`Store::status`] source check.
+#[derive(Debug, Clone)]
+struct CachedSourceFreshness {
+    generation_id: u32,
+    fresh: Option<bool>,
+    reason: Option<String>,
 }
 
 /// A held cross-process writer lock on one store (K13).
@@ -707,7 +773,44 @@ impl Drop for WriterLock {
     }
 }
 
-/// One generation's edge rows and the evidence tier behind each of them.
+/// What a query envelope discloses about whole-tree source freshness.
+///
+/// Owned here so the store can answer without depending on the query crate;
+/// [`devmap_query::SourceFreshness`] is the wire twin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuerySourceFreshness {
+    pub fresh: Option<bool>,
+    pub generation_id: Option<u32>,
+    pub reason: Option<String>,
+}
+
+impl QuerySourceFreshness {
+    pub fn unverified(reason: impl Into<String>) -> Self {
+        Self {
+            fresh: None,
+            generation_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Capped inventory of how the working tree differs from the indexed generation.
+///
+/// Present on status when source freshness is false because the tree differs.
+/// Counts are complete; `sample_paths` is a capped listing so an operator can
+/// act without opening the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTreeDelta {
+    pub added: usize,
+    pub changed: usize,
+    pub removed: usize,
+    pub sample_paths: Vec<String>,
+}
+
+impl SourceTreeDelta {
+    /// How many paths [`Store::status`] names in `sample_paths`.
+    pub const SAMPLE: usize = 20;
+}
 
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
@@ -719,6 +822,9 @@ pub struct StoreStatus {
     pub degraded_reason: Option<String>,
     /// Current source bytes match the stored inventory. None means not verified.
     pub source_freshness: Option<bool>,
+    /// When `source_freshness` is false because the tree differs: counts plus a
+    /// capped path sample. Absent for other degradations and when fresh.
+    pub source_delta: Option<SourceTreeDelta>,
     /// Stored parser/analyzer identity matches this binary. A parser-free reader
     /// leaves this unknown; source verification remains independent.
     pub analyzer_freshness: Option<bool>,
@@ -2361,23 +2467,25 @@ impl Store {
     /// (`devmap_engine._FUTURE_SCHEMA_MARKER`, pinned to this source by a
     /// parity test); change it there and here together.
     fn unsupported_schema(store: &str, found: i32) -> rusqlite::Error {
-        let remedy = if found > CURRENT_SCHEMA_VERSION {
-            "this devmap binary is older than the store; rebuild it with \
-             `cargo build --release -p devmap-cli` or set DEVMAP_BINARY to a newer build"
-                .to_string()
-        } else if (1..=PYTHON_INDEX_SCHEMA_VERSION).contains(&found) {
-            format!(
-                "this is the Python engine's database (`.devcouncil/codeintel/index.sqlite`, \
-                 schema {PYTHON_INDEX_SCHEMA_VERSION}), not a devmap store, and this kernel \
-                 cannot convert it — point `--db` at `devmap.sqlite`"
-            )
-        } else {
-            "run `devmap build` to migrate the store".to_string()
-        };
-        refusal(format!(
-            "devmap store {store}: schema version {found} is not supported by this binary \
-             (schema {CURRENT_SCHEMA_VERSION}); {remedy}"
-        ))
+        unsupported_schema_error(store, found)
+    }
+
+    /// Downcast a store-open error to the stamped/expected schema versions.
+    ///
+    /// MCP and other shared readers must classify schema-behind by this typed
+    /// path, not by matching `"schema"` / `"migrate"` substrings in Display text.
+    pub fn unsupported_schema_versions(err: &rusqlite::Error) -> Option<(i32, i32)> {
+        match err {
+            rusqlite::Error::ToSqlConversionFailure(inner) => inner
+                .downcast_ref::<UnsupportedSchema>()
+                .map(|typed| (typed.found, typed.expected)),
+            _ => None,
+        }
+    }
+
+    /// Whether `err` is a typed unsupported-schema refusal from this store.
+    pub fn is_unsupported_schema(err: &rusqlite::Error) -> bool {
+        Self::unsupported_schema_versions(err).is_some()
     }
 
     /// The schema version stamped on an existing store, without migrating it.
@@ -2927,6 +3035,7 @@ impl Store {
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
         })
@@ -3000,6 +3109,7 @@ impl Store {
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only,
         })
@@ -3342,6 +3452,7 @@ impl Store {
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            source_freshness_cache: Mutex::new(None),
             db_path: None,
             read_only: false,
         })
@@ -5220,18 +5331,21 @@ impl Store {
         // "Confident" and "ambiguous" are the two tiers a reader acts on:
         // an exempt symbol is one liveness could not rule out, so counting it
         // as confidently dead is exactly the dishonesty D6 removed.
-        let is_ambiguous = |dead: &&DeadSymbolReport| {
-            dead.exemption_reason.as_deref() == Some("only_ambiguous_callers")
-        };
+        //
+        // The 0.4 tier is not only `only_ambiguous_callers`: an unresolved
+        // namesake veto lands at the same confidence with a different reason,
+        // and coverage-capped findings sit below 0.9 too. Counting anything
+        // under the extracted floor as `dead_confident` inflated the history
+        // trend with unconfirmed rows.
         let dead_confident = durable_analysis
             .dead_symbols
             .iter()
-            .filter(|dead| !dead.is_exempt && !is_ambiguous(dead))
+            .filter(|dead| !dead.is_exempt && dead.confidence >= 0.9)
             .count() as i64;
         let dead_ambiguous = durable_analysis
             .dead_symbols
             .iter()
-            .filter(is_ambiguous)
+            .filter(|dead| !dead.is_exempt && dead.confidence < 0.9)
             .count() as i64;
         // S-2: both of these are counted over the generation's own rows, like
         // `files`/`symbols`/`edges` above, and not over `extractions`.
@@ -5780,9 +5894,10 @@ impl Store {
                             "stored extraction payload is obsolete; rebuild with the current analyzer".to_string())),
                         Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
                     };
-                let (source_freshness, source_reason) =
+                let (source_freshness, source_reason, source_delta) =
                     self.source_snapshot_mismatch(generation)?;
                 status.source_freshness = source_freshness;
+                status.source_delta = source_delta;
                 status.analyzer_freshness = analyzer_freshness;
                 status.degraded_reason =
                     devmap_analyze::combine_reasons(source_reason, analyzer_reason);
@@ -5790,20 +5905,86 @@ impl Store {
                 let after = self.status_snapshot(db_path)?;
                 if after.latest_generation != Some(generation) || after.pending_count != 0 {
                     status.source_freshness = None;
+                    status.source_delta = None;
                     status.analyzer_freshness = None;
                     status.degraded_reason = Some(
                         "index changed during freshness verification; retry status".to_string(),
                     );
                 }
+                self.remember_source_freshness(
+                    generation,
+                    status.source_freshness,
+                    status.degraded_reason.clone(),
+                );
             }
         }
         Ok(status)
     }
 
+    /// What a query envelope should disclose about whole-tree freshness.
+    ///
+    /// Status is the surface that walks the tree. Queries attach the last
+    /// verified verdict for the generation they answered from when this process
+    /// has one, otherwise an explicit unverified reason — never a silent null.
+    pub fn query_source_freshness(&self) -> QuerySourceFreshness {
+        let latest = match self.latest_generation_id() {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return QuerySourceFreshness::unverified(
+                    "no persisted generation is available to verify against the working tree",
+                )
+            }
+            Err(error) => {
+                return QuerySourceFreshness::unverified(format!(
+                    "source freshness unverified: could not read the latest generation ({error})"
+                ))
+            }
+        };
+        let cache = self
+            .source_freshness_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        match cache {
+            Some(cached) if cached.generation_id == latest => QuerySourceFreshness {
+                fresh: cached.fresh,
+                generation_id: Some(cached.generation_id),
+                reason: cached.reason,
+            },
+            Some(cached) => QuerySourceFreshness::unverified(format!(
+                "cached source freshness described generation {}, but this answer is from \
+generation {latest}; run `devmap status` to re-verify",
+                cached.generation_id
+            )),
+            None => QuerySourceFreshness::unverified(
+                "whole-tree source freshness was not checked for this answer; run `devmap status` \
+(or call `devmap_status`) for a verified verdict",
+            ),
+        }
+    }
+
+    fn remember_source_freshness(
+        &self,
+        generation_id: u32,
+        fresh: Option<bool>,
+        reason: Option<String>,
+    ) {
+        if let Ok(mut cache) = self.source_freshness_cache.lock() {
+            *cache = Some(CachedSourceFreshness {
+                generation_id,
+                fresh,
+                reason,
+            });
+        }
+    }
+
     /// Runs without holding the SQLite connection during filesystem I/O. The
     /// generation is checked again afterwards, so a writer cannot combine a
     /// newer inventory with the older status snapshot and certify it as fresh.
-    fn source_snapshot_mismatch(&self, generation: u32) -> Result<(Option<bool>, Option<String>)> {
+    fn source_snapshot_mismatch(
+        &self,
+        generation: u32,
+    ) -> Result<(Option<bool>, Option<String>, Option<SourceTreeDelta>)> {
         let Some(root) = self.latest_repo_root()? else {
             return Ok((
                 None,
@@ -5811,23 +5992,47 @@ impl Store {
                     "source freshness unverified: this generation has no repository root"
                         .to_string(),
                 ),
+                None,
             ));
         };
         let hashes = self.latest_file_hashes()?;
         let refusals = self.latest_discovery_refusals()?;
         let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
             Ok(scanned) => scanned,
-            Err(error) => return Ok((None, Some(format!("source freshness unverified: {error}")))),
+            Err(error) => {
+                return Ok((
+                    None,
+                    Some(format!("source freshness unverified: {error}")),
+                    None,
+                ))
+            }
         };
-        if !scanned.matches_file_hashes(&hashes) {
-            return Ok((Some(false), Some(
-                "source tree differs from the indexed generation; rebuild or drain watcher edits".to_string(),
-            )));
+        let (delta, sample_paths) =
+            scanned.file_delta_with_samples(&hashes, SourceTreeDelta::SAMPLE);
+        if !delta.is_unchanged() {
+            return Ok((
+                Some(false),
+                Some(
+                    "source tree differs from the indexed generation; rebuild or drain watcher edits"
+                        .to_string(),
+                ),
+                Some(SourceTreeDelta {
+                    added: delta.added,
+                    changed: delta.changed,
+                    removed: delta.removed,
+                    sample_paths,
+                }),
+            ));
         }
         if crate::discovery_refusals(&scanned.report) != refusals {
-            return Ok((Some(false), Some(
-                "source discovery refusals differ from the indexed generation; rebuild required".to_string(),
-            )));
+            return Ok((
+                Some(false),
+                Some(
+                    "source discovery refusals differ from the indexed generation; rebuild required"
+                        .to_string(),
+                ),
+                None,
+            ));
         }
         // HEAD is provenance: an identical tree remains current after an empty
         // commit. A concurrent generation or pending edit invalidates the proof.
@@ -5836,9 +6041,10 @@ impl Store {
             return Ok((
                 None,
                 Some("index changed during source verification; retry status".to_string()),
+                None,
             ));
         }
-        Ok((Some(true), None))
+        Ok((Some(true), None, None))
     }
 
     fn status_snapshot(&self, db_path: &str) -> Result<StoreStatus> {
@@ -5913,6 +6119,7 @@ impl Store {
             node_count,
             edge_count,
             source_freshness: None,
+            source_delta: None,
             analyzer_freshness: None,
             degraded_reason: if quarantined_count > 0 {
                 // Name the paths. See `StoreStatus::quarantined_paths`: the

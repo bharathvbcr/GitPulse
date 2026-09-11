@@ -18,12 +18,27 @@ use std::sync::{Mutex, OnceLock};
 pub const CONFIG_VERSION: u32 = 1;
 pub const TOOL_CONFIG_ENV: &str = "GITPULSE_TOOL_CONFIG";
 
+static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize tests (and any other callers) that mutate [`TOOL_CONFIG_ENV`].
+pub(crate) fn lock_config_env() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPaths {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,20 +367,45 @@ pub fn set_onboarding(state: OnboardingState) -> Result<(), String> {
     Ok(())
 }
 
+pub fn clear_binary(tool: crate::tool_install::ExternalTool) -> Result<(), String> {
+    let mut cfg = load()?;
+    match tool {
+        crate::tool_install::ExternalTool::Devmap => cfg.devmap.binary = None,
+        crate::tool_install::ExternalTool::Manvi => cfg.manvi.binary = None,
+    }
+    save(&cfg)?;
+    Ok(())
+}
+
+pub fn is_disabled(tool: crate::tool_install::ExternalTool) -> bool {
+    let Ok(cfg) = load() else {
+        return false;
+    };
+    match tool {
+        crate::tool_install::ExternalTool::Devmap => cfg.devmap.disabled,
+        crate::tool_install::ExternalTool::Manvi => cfg.manvi.disabled,
+    }
+}
+
+pub fn set_disabled(tool: crate::tool_install::ExternalTool, disabled: bool) -> Result<(), String> {
+    let mut cfg = load()?;
+    match tool {
+        crate::tool_install::ExternalTool::Devmap => cfg.devmap.disabled = disabled,
+        crate::tool_install::ExternalTool::Manvi => cfg.manvi.disabled = disabled,
+    }
+    save(&cfg)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_temp_config(f: impl FnOnce(&Path)) {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::tool_config::lock_config_env();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tools.json");
-        // SAFETY: serialized behind ENV_LOCK; restored below.
+        // SAFETY: serialized behind lock_config_env; restored below.
         unsafe {
             std::env::set_var(TOOL_CONFIG_ENV, &path);
         }
@@ -416,6 +456,16 @@ mod tests {
                 Some("/no/such/devmap-binary-for-stale-test")
             );
             assert!(saved_binary(crate::tool_install::ExternalTool::Devmap).is_none());
+        });
+    }
+
+    #[test]
+    fn disabled_round_trips_and_is_reported() {
+        with_temp_config(|_| {
+            set_disabled(crate::tool_install::ExternalTool::Devmap, true).unwrap();
+            assert!(is_disabled(crate::tool_install::ExternalTool::Devmap));
+            set_disabled(crate::tool_install::ExternalTool::Devmap, false).unwrap();
+            assert!(!is_disabled(crate::tool_install::ExternalTool::Devmap));
         });
     }
 

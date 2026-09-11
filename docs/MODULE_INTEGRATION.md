@@ -1,5 +1,11 @@
 # Reusable modules and coordinated updates
 
+**DevCouncil** is **components and modules**. **Manvi** wraps those
+components into a harness. **GitPulse** uses Manvi for policy, workbench, and
+agent hosting, and DevCouncil components for code intelligence and related
+analysis. The stack is modular: update one module at a time, or take only the
+subset an app needs.
+
 DevCouncil supplies reusable Rust libraries and a process API. Manvi supplies
 a Go embedding API and a language-independent NDJSON sidecar. They are not
 dynamic shared-library plugins: changing a linked Rust or Go implementation
@@ -13,8 +19,8 @@ the configured executable and restarting it.
 | Parse, resolve and build a code index | DevCouncil `devmap` CLI | Bounded CLI calls in `src-tauri/src/devmap/cli.rs` |
 | Read and query a persisted index | DevCouncil `devmap-store`, `devmap-query`, `devmap-resolve` | Vendored Rust path dependencies with `default-features = false` |
 | HTML map and graph projection | DevCouncil `devmap-query` | Same upstream projection; HTML assets live inside the crate |
-| Repository execution task/lease reads and credential redaction | Manvi `dc-store`, `dc-verify`, `dc-glob` | Vendored Rust libraries; execution tasks and leases remain read-only in GitPulse |
-| Profile workspaces, tasks, briefs and run records | Manvi `dc-store` workbench API | `cmd_workbench_request` performs typed CRUD against a separate profile database; Manvi owns schemas, revisions and receipts |
+| Repository execution task/lease reads and credential redaction | DevCouncil `dc-store`, `dc-verify`, `dc-glob` | Vendored Rust libraries (Manvi wraps the same modules in the harness); execution tasks and leases remain read-only in GitPulse |
+| Profile workspaces, tasks, briefs and run records | Manvi wrap of DevCouncil `dc-store` workbench API | `cmd_workbench_request` performs typed CRUD against a separate profile database; Manvi owns the wrap's schemas, revisions and receipts |
 | Task suggestions and managed agent hosting | Profile Manvi host | GitPulse presents proposals and run controls; Manvi owns provider execution and request/decision delivery |
 | Policy, local-model discovery and chat preparation | Manvi `serve` | Protocol v1 in `src-tauri/src/harness/`; advertised `hello.ops` capabilities |
 | Code intelligence through a process boundary | Manvi `serve.DevmapModule` | Available to other hosts through `devmap.status` and `devmap.query`; GitPulse retains its in-process readers |
@@ -62,7 +68,11 @@ GITPULSE_DEVMAP_BIN=/absolute/path/devmap GITPULSE_MANVI_BIN=/absolute/path/manv
 
 Its saved tool configuration serves GUI launches that do not inherit the
 shell's environment. Explicit broken overrides are errors; a missing optional
-tool and a malfunctioning configured tool are different states.
+tool and a malfunctioning configured tool are different states. Setup can
+install DevMap alone, the analysis suite, or the full DevCouncil host from the
+documented scripts (copy, or Run in Terminal). Disable hides a tool without
+deleting it; Uninstall removes only a binary GitPulse placed in its app bin
+directory. There is no uv / Python install path.
 
 ## Compatibility and evidence
 

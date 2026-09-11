@@ -1472,10 +1472,8 @@ pub(crate) fn summarize_git_failure(raw: &str) -> String {
     }
 }
 
-const PUSH_DETACHED: &str =
-    "Cannot push: HEAD is detached. Check out a branch, then push.";
-const PUSH_NO_REMOTES: &str =
-    "This repository has no remotes. Add a remote before pushing.";
+const PUSH_DETACHED: &str = "Cannot push: HEAD is detached. Check out a branch, then push.";
+const PUSH_NO_REMOTES: &str = "This repository has no remotes. Add a remote before pushing.";
 
 fn branch_has_upstream(repo: &Path) -> bool {
     git_text(
@@ -1657,8 +1655,9 @@ pub fn validate_oid(oid: &str) -> Result<(), String> {
 /// - `execute_rebase_sequence`: `onto_commit` → `checkout --detach`, step
 ///   `commit_id` → `cherry-pick`;
 /// - `worktree::add_worktree`: `start_point` → `worktree add … <start>`;
-/// - `git_reader::get_file_blob`: builds `<rev>:<path>` and *independently
-///   rejects* any `:` before doing so.
+/// - `git_reader::get_file_blob`: still independently rejects `:` (a leftover
+///   belt from when it concatenated `<rev>:<path>`). Blob bytes now come from
+///   `ls-tree` + `cat-file`, never from a `rev:path` object name.
 ///
 /// No caller ever passes ranges (`a..b`), reflog syntax (`@{u}`, `HEAD@{1}`),
 /// or peel suffixes (`^{tree}`), so tightening to forbid them is proven safe:
@@ -2744,10 +2743,7 @@ mod tests {
             &["remote", "add", "beta", beta.path().to_str().unwrap()],
         );
         let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
-        assert!(
-            err.contains("cannot choose among remotes"),
-            "got: {err}"
-        );
+        assert!(err.contains("cannot choose among remotes"), "got: {err}");
         assert!(err.contains("alpha"));
         assert!(err.contains("beta"));
     }
@@ -2762,10 +2758,7 @@ mod tests {
         );
         git_in(repo.path(), &["checkout", "--detach"]);
         let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
-        assert!(
-            err.contains("HEAD is detached"),
-            "got: {err}"
-        );
+        assert!(err.contains("HEAD is detached"), "got: {err}");
     }
 
     #[test]
@@ -2799,8 +2792,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            err,
-            "Invalid ref name",
+            err, "Invalid ref name",
             "raw --force starts with '-' so validate_ref_name must refuse it before git runs"
         );
     }

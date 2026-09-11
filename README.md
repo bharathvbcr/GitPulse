@@ -19,8 +19,12 @@
 > **Successor to LiquiTask.** GitPulse is the unified replacement for the
 > deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask) agentic
 > workbench. LiquiTask's split React / IndexedDB / Go+Python sidecar stack is
-> frozen for performance reasons; task boards, agent handoff, DevCouncil, and
-> DevMap live here as one native control plane. See LiquiTask's
+> frozen for performance reasons; task boards, agent handoff, and selected
+> [Manvi](https://github.com/bharathvbcr/Manvi) and
+> [DevCouncil](https://github.com/bharathvbcr/DevCouncil) modules live here as one
+> native control plane. DevCouncil is the component layer; Manvi wraps it;
+> GitPulse uses each for its respective job and can update them independently.
+> See LiquiTask's
 > [deprecation notice](https://github.com/bharathvbcr/LiquiTask/blob/main/docs/DEPRECATION.md)
 > and [Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md) in this repo.
 
@@ -49,6 +53,14 @@ Captured from GitPulse running on macOS against its own repository.
 GitPulse stores repository and task state locally, with a native IPC boundary and
 no remote telemetry. Git remotes, GitHub operations, optional tool downloads and
 explicitly configured agent providers can use the network.
+
+**Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is
+**components and modules**. [Manvi](https://github.com/bharathvbcr/Manvi) wraps
+them into a coding-agent harness. GitPulse uses **Manvi** for policy, workbench,
+and agent hosting, and **DevCouncil components** (`devmap` CLI and crates,
+verification reads) for code intelligence. Modules stay independently updatable;
+this app takes only the subset it needs. See
+[Module integration](docs/MODULE_INTEGRATION.md).
 
 ```mermaid
 flowchart TB
@@ -85,7 +97,8 @@ flowchart TB
         GitCLI["<code>git</code> CLI"]
         GhCLI["<code>gh</code> CLI (GitHub Auth)"]
         LocalAI["Local LLMs (Ollama / LM Studio)"]
-        ManviSidecar["MANVI Harness (<code>manvi serve</code>)"]
+        ManviSidecar["Manvi wrap (<code>manvi serve</code>)"]
+        DevCouncilMods["DevCouncil modules<br/>(<code>devmap</code>, selected crates)"]
     end
 
     AsyncGuards --> IPCBridge
@@ -94,6 +107,7 @@ flowchart TB
     Analyzers --> GhCLI
     Analyzers --> LocalAI
     Backend --> ManviSidecar
+    Backend --> DevCouncilMods
 ```
 
 ---
@@ -145,7 +159,7 @@ Manvi suggestions and agent handoff.
 ### 🚀 Core Git & Visualization
 | Feature | Description |
 | --- | --- |
-| **Work View & Task Control Plane** | Unified dashboard (`F10`) binding DevCouncil tasks to linked worktrees, PRs, workflow runs, policy verdicts, and temporary grants. Agent activity recorded to a durable SQLite WAL ledger. |
+| **Work View & Task Control Plane** | Unified dashboard (`F10`) binding DevCouncil task modules to linked worktrees, PRs, workflow runs, policy verdicts, and temporary grants. Agent activity recorded to a durable SQLite WAL ledger. |
 | **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts, search, filters over loaded cards, multi-selection, context actions, drag ordering, due dates, notes-to-draft editing, reviewed Manvi title/description suggestions and versioned agent briefs. |
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. |
@@ -160,7 +174,7 @@ Manvi suggestions and agent handoff.
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
 | --- | --- |
-| **DevMap + MarkDev integration** | Schema-20 code map in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. Code → Map navigates the resolved `repo_map.json`, draws code/doc graphs, and searches tracked markdown. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
+| **DevMap + MarkDev integration** | Schema-20 code map from the DevCouncil `devmap` module, in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. Code → Map navigates the resolved `repo_map.json`, draws code/doc graphs, and searches tracked markdown. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
 | **Git-Native Provenance** | `CI:local` runs recorded as verification notes under `refs/notes/gitpulse/`, with branch and PR decay freshness badges based on distance from the default branch. |
 | **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
 | **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. The status-bar mix is ordered by share of code lines; the label is the true majority among the languages drawn. |
@@ -172,7 +186,7 @@ Manvi suggestions and agent handoff.
 ### 🤖 Local AI & Policy Safety Gate
 | Feature | Description |
 | --- | --- |
-| **MANVI Policy Gate** | Mutating Git actions are evaluated against a 5-verdict safety ladder (*Allowed*, *Demoted*, *Warned*, *Blocked*, *Unchecked*). Asymmetric degradation ensures wedged sidecars fail closed safely. |
+| **MANVI Policy Gate** | Mutating Git actions are evaluated against Manvi's wrap of DevCouncil policy: a 5-verdict safety ladder (*Allowed*, *Demoted*, *Warned*, *Blocked*, *Unchecked*). Asymmetric degradation ensures wedged sidecars fail closed safely. |
 | **On-Device AI Assistance** | Context-calibrated AI assistance for commit messages, commit explanations, and branch naming against local LLMs (Ollama, LM Studio, llama.cpp, vLLM). |
 | **Scoped Action Allowlist** | AI-suggested coverage generation and dependency fixes execute via a purpose-limited command allowlist (`cmd_manvi_run_action`) across all major ecosystems (npm, cargo, pytest, go, swift, dart, etc.) requiring explicit user confirmation. |
 
@@ -330,7 +344,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 - **[Git-client release audit](docs/GIT_CLIENT_RELEASE_AUDIT.md)** — Reproduced defects, implemented contracts, test evidence, and remaining qualification gates.
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil, devmap and Manvi modules with explicit compatibility checks.
+- **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil and Manvi modules independently; take only the subset this app needs.
 - **[Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md)** — Shared boards, task editing, Manvi suggestions, agent briefs and run boundaries. GitPulse is the successor to LiquiTask for this surface.
 - **[Command palette](docs/COMMAND_PALETTE.md)** — Eight search modes, availability, paging and keyboard navigation.
 - **[Repository hygiene](docs/REPOSITORY_HYGIENE.md)** — Storage cleanup previews, Fleet/Settings cleanup and scheduling.

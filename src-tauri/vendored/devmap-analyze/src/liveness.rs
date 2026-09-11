@@ -1,8 +1,8 @@
 use crate::model::*;
-use devmap_extract::languages::Capability;
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Symbol identity relative to its file, so that `file_path` + `symbol_name`
 /// reconstructs the graph id exactly. A method must report as `MyClass.execute`
@@ -202,7 +202,7 @@ fn go_build_variant_identities(extractions: &[Extraction]) -> HashSet<(&str, &st
 /// names and spans but, by construction, no calls and no imports. Both lose
 /// edges, and a reader deciding whether to act on a dead-code finding wants to
 /// know which kind of blindness they are looking at.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtractionCoverage {
     /// Files a grammar was wanted for and did not get to read.
     ///
@@ -218,7 +218,9 @@ pub struct ExtractionCoverage {
     ///
     /// A `.proto` or `.ps1` this build cannot parse is a genuine gap in call
     /// coverage — see [`ExtractionEngine::NotApplicable`]'s own docs drawing
-    /// exactly this line against a `.md`.
+    /// exactly this line against a `.md`. Inventory still charges these into
+    /// `coverage_gaps`; whether they *cap* findings is language-scoped — a
+    /// PowerShell recovery cannot hide callers of a Rust symbol.
     pub pattern_recovered_files: usize,
     /// Files discovery refused before any extractor saw them — oversized,
     /// unreadable, or a non-UTF-8 path.
@@ -278,6 +280,22 @@ pub struct ExtractionCoverage {
     /// `discovery_refused_files` documents: a file nothing read, counted as a
     /// file whose calls were looked for.
     pub not_parsed_files: usize,
+    /// Call-coverage holes that can demote findings, keyed by the gap file's
+    /// language.
+    ///
+    /// Inventory counters above stay corpus-wide so `coverage_gaps` still names
+    /// every hole. Capping asks a narrower question: does this hole hide
+    /// callers of *this* finding's language? A pattern-recovered `.ps1` lands
+    /// in `pattern_recovered_files` and here under `"powershell"`, and
+    /// [`language_can_reference`] refuses to let it affect Rust or Go.
+    ///
+    /// Empty when a test constructs coverage from aggregate counters alone —
+    /// [`Self::blind_files`] then falls back to those aggregates so the graded
+    /// ceiling tests keep exercising the curve without building a language map.
+    pub blind_by_language: BTreeMap<String, usize>,
+    /// Files whose calls were extracted, keyed by language — the per-language
+    /// half of [`Self::files_with_call_extraction`].
+    pub covered_by_language: BTreeMap<String, usize>,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -358,6 +376,14 @@ impl ExtractionCoverage {
         self.blind_files() == 0
     }
 
+    /// Whether call extraction covering callers of `language` is complete.
+    ///
+    /// The single-symbol pass asks this of the finding's own language so a
+    /// PowerShell pattern-recovery cannot demote a Rust orphan.
+    pub fn is_complete_for(&self, language: &str) -> bool {
+        self.blind_affecting(language) == 0
+    }
+
     /// Files that contributed no call edges, of any kind.
     ///
     /// Saturating rather than wrapping. Every counter here is bounded by a file
@@ -425,16 +451,60 @@ impl ExtractionCoverage {
         // folding them in "would cap every dead-code finding in every repository
         // that vendors one bundle".
         //
-        // They were in this sum anyway. A repository with 500 bundles and no
-        // other gap reported *complete* — so every finding kept 0.9 — and the
-        // first `.proto` added to it charged all 501 files at once, taking the
-        // ceiling from ungraded to the floor in a single file. Forgiving a class
-        // in the verdict and charging it in the ratio is not conservatism in
-        // either direction; it is two policies.
-        self.parse_failed_files
+        // Language-scoped when `blind_by_language` is populated: a PowerShell
+        // recovery beside Rust does not demote the corpus. Aggregate-only
+        // records (tests that set counters by hand) keep the pre-scoped sum.
+        let aggregate = self
+            .parse_failed_files
             .saturating_add(self.pattern_recovered_files)
             .saturating_add(self.call_blind_files)
-            .saturating_add(self.discovery_refused_files)
+            .saturating_add(self.discovery_refused_files);
+        if self.blind_by_language.is_empty() && self.covered_by_language.is_empty() {
+            return aggregate;
+        }
+        let mut blind = self.discovery_refused_files;
+        if self.covered_by_language.is_empty() {
+            for count in self.blind_by_language.values() {
+                blind = blind.saturating_add(*count);
+            }
+            return blind;
+        }
+        for (gap_lang, count) in &self.blind_by_language {
+            if self
+                .covered_by_language
+                .keys()
+                .any(|covered| language_can_reference(gap_lang, covered))
+            {
+                blind = blind.saturating_add(*count);
+            }
+        }
+        blind
+    }
+
+    /// Gaps that can hide callers of symbols in `language`.
+    fn blind_affecting(&self, language: &str) -> usize {
+        if self.blind_by_language.is_empty() && self.covered_by_language.is_empty() {
+            return self.blind_files();
+        }
+        let mut blind = self.discovery_refused_files;
+        for (gap_lang, count) in &self.blind_by_language {
+            if language_can_reference(gap_lang, language) {
+                blind = blind.saturating_add(*count);
+            }
+        }
+        blind
+    }
+
+    /// Readable call-extraction files that could produce callers of `language`.
+    fn covered_affecting(&self, language: &str) -> usize {
+        if self.covered_by_language.is_empty() {
+            return self.files_with_call_extraction;
+        }
+        self.covered_by_language
+            .iter()
+            .filter(|(lang, _)| language_can_reference(lang, language))
+            .map(|(_, count)| *count)
+            .fold(0usize, usize::saturating_add)
     }
 
     /// The blind share this record is *charged* at, which is never smaller than
@@ -446,6 +516,10 @@ impl ExtractionCoverage {
         Some(self.blind_share()?.max(MIN_CHARGED_BLIND_SHARE))
     }
 
+    fn charged_blind_share_for(&self, language: &str) -> Option<f32> {
+        Some(self.blind_share_for(language)?.max(MIN_CHARGED_BLIND_SHARE))
+    }
+
     /// The ceiling for a claim whose strength compounds over `extra` extra
     /// members, or `None` when no corpus was measured.
     ///
@@ -455,6 +529,15 @@ impl ExtractionCoverage {
     /// to land in only one of.
     fn ceiling(&self, extra: i32) -> Option<f32> {
         let charged = self.charged_blind_share()?;
+        Some(
+            (1.0 - charged)
+                .powi(COVERAGE_CEILING_EXPONENT.saturating_add(extra))
+                .clamp(COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE),
+        )
+    }
+
+    fn ceiling_for(&self, language: &str, extra: i32) -> Option<f32> {
+        let charged = self.charged_blind_share_for(language)?;
         Some(
             (1.0 - charged)
                 .powi(COVERAGE_CEILING_EXPONENT.saturating_add(extra))
@@ -484,6 +567,15 @@ impl ExtractionCoverage {
         // `as f32` on a saturated `usize` is lossy but monotone, and both sides
         // lose the same way, so the ratio survives. Clamped anyway: a ratio
         // outside `[0, 1]` would put `powi`'s base outside it too.
+        Some((blind as f32 / considered as f32).clamp(0.0, 1.0))
+    }
+
+    fn blind_share_for(&self, language: &str) -> Option<f32> {
+        let blind = self.blind_affecting(language);
+        let considered = blind.saturating_add(self.covered_affecting(language));
+        if considered == 0 {
+            return None;
+        }
         Some((blind as f32 / considered as f32).clamp(0.0, 1.0))
     }
 
@@ -541,6 +633,18 @@ impl ExtractionCoverage {
         confidence.min(ceiling)
     }
 
+    /// Ceiling for a finding in `language`, ignoring holes that language cannot
+    /// be reached from. A pattern-recovered `.ps1` must not demote Rust.
+    pub fn cap_for(&self, language: &str, confidence: f32) -> f32 {
+        if self.is_complete_for(language) {
+            return confidence;
+        }
+        let Some(ceiling) = self.ceiling_for(language, 0) else {
+            return confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP);
+        };
+        confidence.min(ceiling)
+    }
+
     /// The ceiling for a finding whose **own file** contributed no call edges.
     ///
     /// [`Self::cap`] prices a corpus-wide ratio, and for a file that is itself
@@ -563,6 +667,12 @@ impl ExtractionCoverage {
     /// that the evidence behind it could never have been gathered.
     pub fn cap_call_blind_file(&self, confidence: f32) -> f32 {
         self.cap(confidence).min(COVERAGE_LOSS_CONFIDENCE_CAP)
+    }
+
+    /// Language-aware form of [`Self::cap_call_blind_file`].
+    pub fn cap_call_blind_file_for(&self, language: &str, confidence: f32) -> f32 {
+        self.cap_for(language, confidence)
+            .min(COVERAGE_LOSS_CONFIDENCE_CAP)
     }
 
     /// The ceiling for a **whole-graph** claim, which falls faster than
@@ -602,6 +712,45 @@ impl ExtractionCoverage {
         };
         confidence.min(ceiling)
     }
+}
+
+/// Whether a file in `from` can contribute call evidence about symbols in `to`.
+///
+/// Same language always can. A language with no call extractor cannot reference
+/// anything in the graph sense — that is why PowerShell / protobuf pattern
+/// recovery must not demote Rust or Go findings. Cross-language pairs share a
+/// family only when an FFI or shared runtime makes that reference ordinary.
+pub fn language_can_reference(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    if !capabilities_for_language(from).contains(Capability::Calls) {
+        return false;
+    }
+    match (language_family(from), language_family(to)) {
+        (Some(left), Some(right)) => left == right,
+        // Unknown languages only reference themselves, via the `from == to` arm.
+        _ => false,
+    }
+}
+
+fn language_family(language: &str) -> Option<&'static str> {
+    Some(match language {
+        "javascript" | "typescript" | "tsx" | "arkts" | "svelte" | "vue" | "astro" | "liquid" => {
+            "js"
+        }
+        "c" | "cpp" | "objc" | "cuda" | "metal" => "c",
+        "java" | "kotlin" | "scala" => "jvm",
+        "csharp" | "vbnet" => "clr",
+        "python" => "python",
+        "go" => "go",
+        "rust" => "rust",
+        "swift" => "swift",
+        "ruby" => "ruby",
+        "php" => "php",
+        "dart" => "dart",
+        _ => return None,
+    })
 }
 
 /// How many members the cluster ceiling compounds over before it stops caring.
@@ -949,28 +1098,11 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// act on" — is the unattributed tier silently manufacturing confident
 /// findings.
 ///
-/// **Only two classes qualify, not the five that are not `Builtin`.** Every
-/// other class carries affirmative evidence that the site meant something else,
-/// and admitting it would veto real findings on a coincidence of spelling:
-///
-/// * `Builtin` — the name is declared by the language (`len`, `print`). A
-///   closed set; no indexed file can declare these.
-/// * `HostGlobal` — declared by the runtime (`setTimeout`, `fetch`), with the
-///   authority named in the row.
-/// * `LocalBinding` — the *enclosing symbol itself* declares the name, as a
-///   parameter or a local closure. Its own documentation calls the ladder
-///   failing here "the correct outcome rather than a defect". Admitting it
-///   would mean any function with a local named `render` resurrects every dead
-///   `render` in the corpus.
-/// * `External { module }` — bound by an import whose specifier names no
-///   indexed file. The import statement is the evidence. A *repo-relative*
-///   specifier is filed under `Unresolved` instead, precisely so this class
-///   stays import-proven.
-///
-/// What is left is exactly the two tiers where the resolver admits it does not
-/// know: `UninferredReceiver` (the receiver exists and could not be typed) and
-/// `Unresolved` (a bare name nothing explains — "the only tier that indicates a
-/// defect").
+/// **Only two classes qualify for the veto, not every non-builtin.** Classes
+/// with affirmative evidence that the site meant something else — `Builtin`,
+/// `HostGlobal`, `LocalBinding`, `External`, `NoNamesake`, `ModulePath` — must
+/// not veto. What is left is the two tiers where the resolver admits it does
+/// not know: `UninferredReceiver` and `Unresolved`.
 ///
 /// `Route` joins `Call` and `Reference` as an admitted kind because a route
 /// handler that failed to bind is the strongest version of this case: the
@@ -1111,6 +1243,10 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
 /// [`extraction_gaps`]'s entries rather than re-deciding them.
 pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     let mut coverage = ExtractionCoverage::default();
+    let path_language: HashMap<&str, &str> = extractions
+        .iter()
+        .map(|ext| (ext.file_path.as_str(), ext.language.as_str()))
+        .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
             ExtractionGap::ParseFailed => coverage.parse_failed_files += 1,
@@ -1119,18 +1255,37 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
             ExtractionGap::NotParsed => coverage.not_parsed_files += 1,
         }
+        // ImportBlind and NotParsed stay out of the capping numerator — same
+        // policy as `blind_files` before language scoping. The rest feed the
+        // per-language map that `cap_for` reads.
+        if matches!(
+            entry.gap,
+            ExtractionGap::ParseFailed | ExtractionGap::PatternRecovered | ExtractionGap::CallBlind
+        ) {
+            let lang = path_language
+                .get(entry.path.as_str())
+                .copied()
+                .unwrap_or("");
+            *coverage
+                .blind_by_language
+                .entry(lang.to_string())
+                .or_default() += 1;
+        }
     }
     // The other side of the same partition, counted from the same two
     // predicates `extraction_gaps` charges `CallBlind` from. Derived here
     // rather than as `extractions.len() - gaps` because that subtraction would
     // fold every `.md` and `.json` into the covered side and flatter the share
     // — the denominator is files whose calls were *looked for*, not files seen.
-    coverage.files_with_call_extraction = extractions
-        .iter()
-        .filter(|ext| {
-            a_grammar_read_this_file(ext) && ext.capabilities().contains(Capability::Calls)
-        })
-        .count();
+    for ext in extractions {
+        if a_grammar_read_this_file(ext) && ext.capabilities().contains(Capability::Calls) {
+            coverage.files_with_call_extraction += 1;
+            *coverage
+                .covered_by_language
+                .entry(ext.language.clone())
+                .or_default() += 1;
+        }
+    }
     coverage
 }
 
@@ -1513,9 +1668,9 @@ pub fn analyze_liveness_with_coverage(
         // percent transient. The reason and the number now agree.
         let cap = |confidence: f32| {
             if file_is_call_blind {
-                coverage.cap_call_blind_file(confidence)
+                coverage.cap_call_blind_file_for(&ext.language, confidence)
             } else {
-                coverage.cap(confidence)
+                coverage.cap_for(&ext.language, confidence)
             }
         };
 
@@ -1698,7 +1853,7 @@ pub fn analyze_liveness_with_coverage(
                     // not.
                     exemption_reason: if file_is_call_blind {
                         Some(CALL_BLIND_REASON.to_string())
-                    } else if coverage.is_complete() {
+                    } else if coverage.is_complete_for(&ext.language) {
                         None
                     } else {
                         Some(COVERAGE_LOSS_REASON.to_string())

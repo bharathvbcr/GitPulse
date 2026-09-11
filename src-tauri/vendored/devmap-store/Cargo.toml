@@ -11,6 +11,7 @@ devmap-extract = { path = "../devmap-extract", default-features = false }
 devmap-resolve = { path = "../devmap-resolve", default-features = false }
 devmap-analyze = { path = "../devmap-analyze", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
 rayon = { version = "1.10" }

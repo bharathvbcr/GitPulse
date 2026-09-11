@@ -5,6 +5,13 @@ export interface BackgroundScope {
   visible: boolean;
 }
 
+/**
+ * Which open keys may run while the window is visible.
+ * `active` (default) is the focused repository only — metrics and docs.
+ * `retained` is every open tab, so a background map can heal without focus.
+ */
+export type PacedQueueRunWhen = "active" | "retained";
+
 /** Bounded, fair background scans. A reset cannot cancel an issued IPC. */
 export function createPacedQueue(options: {
   debounceMs: number;
@@ -15,8 +22,10 @@ export function createPacedQueue(options: {
   onError: (key: string, error: unknown) => void;
   onOverflow: () => void;
   scope?: BackgroundScope;
+  runWhen?: PacedQueueRunWhen;
 }) {
   const { debounceMs, maxWaitMs, restMs, capacity } = options;
+  const runWhen: PacedQueueRunWhen = options.runWhen ?? "active";
   if (![debounceMs, maxWaitMs, restMs, capacity].every(Number.isFinite) ||
     debounceMs < 0 || maxWaitMs < debounceMs || restMs < 0 ||
     !Number.isInteger(capacity) || capacity < 1) {
@@ -35,7 +44,9 @@ export function createPacedQueue(options: {
   }
 
   function eligible(key: string): boolean {
-    return scope === null || (scope.visible && scope.activeKey === key && scope.retainedKeys.has(key));
+    if (scope === null) return true;
+    if (!scope.visible || !scope.retainedKeys.has(key)) return false;
+    return runWhen === "retained" || scope.activeKey === key;
   }
 
   function schedule(): void {
@@ -46,7 +57,7 @@ export function createPacedQueue(options: {
     for (const [key, { due }] of pending) {
       if (eligible(key)) earliest = Math.min(earliest, due);
     }
-    // Hidden/inactive dirty keys need no polling timer. Scope changes wake us.
+    // Hidden, closed, or (in active mode) unfocused keys need no wakeup.
     if (earliest === Infinity) return;
     timer = setTimeout(() => {
       timer = null;

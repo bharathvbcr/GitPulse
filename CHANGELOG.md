@@ -11,10 +11,20 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Modular DevCouncil install in Setup: DevMap only (default), analysis suite, or
+  full host. Copy the documented command or run it in Terminal → Console.
+  Settings can disable or uninstall a GitPulse-owned binary without going
+  through `cargo uninstall`. There is no uv / Python install path.
+
 ### Changed
 
 - Named GitPulse as the successor to the deprecated LiquiTask workbench in the
   README, wiki home, and Tasks documentation.
+- Document DevCouncil as independently selectable components and modules, Manvi
+  as the wrap around them, and GitPulse as the host that uses each for its
+  respective job.
 - Re-vendor DevCouncil analysis crates at v0.2.0 (`devcouncil@a31918e2`).
   GitPulse itself stays 1.0.0.
 

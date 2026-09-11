@@ -63,4 +63,24 @@ describe("architecture documentation contract", () => {
     expect(commands).toContain("async fn off_thread");
     expect(commands).toContain("tauri::async_runtime::spawn_blocking");
   });
+
+  it("states DevCouncil as modules, Manvi as the wrap, and GitPulse as a selecting host", () => {
+    const moduleIntegration = readFileSync(
+      new URL("../docs/MODULE_INTEGRATION.md", import.meta.url),
+      "utf8",
+    );
+    for (const [name, source] of [
+      ["README.md", readme],
+      ["ARCHITECTURE.md", architecture],
+      ["MODULE_INTEGRATION.md", moduleIntegration],
+    ] as const) {
+      expect(source, `${name} must name DevCouncil as components/modules`).toContain(
+        "components and modules",
+      );
+      expect(source, `${name} must say Manvi wraps them`).toMatch(/Manvi[\s\S]{0,80}wrap/i);
+      expect(source, `${name} must say GitPulse uses Manvi`).toMatch(
+        /GitPulse[\s*]*uses[\s*]*Manvi/i,
+      );
+    }
+  });
 });

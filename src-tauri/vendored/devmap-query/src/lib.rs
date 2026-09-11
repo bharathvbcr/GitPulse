@@ -47,8 +47,8 @@ pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     build_code_graph_value, build_graph_core_value, decode_compact, encode_compact,
     generate_code_graph_encodings, generate_code_graph_json, write_code_graph_atomically,
-    CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_SCHEMA_VERSION, CODE_GRAPH_TOP_LEVEL_KEYS,
-    EDGE_KIND_LABELS,
+    CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_EXPORT_MAX_BYTES, CODE_GRAPH_SCHEMA_VERSION,
+    CODE_GRAPH_TOP_LEVEL_KEYS, EDGE_KIND_LABELS,
 };
 pub use engine::{
     budget_take, clone_group_tokens, is_test_path, link_candidates, parse_clone_kind,

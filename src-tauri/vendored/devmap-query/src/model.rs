@@ -60,14 +60,69 @@ pub enum ResolutionAvailability {
     Unavailable { reason: String },
 }
 
+/// Whole-tree source freshness attached to a query envelope.
+///
+/// Status is the surface that *runs* the check. Queries carry the last
+/// verified verdict for the generation they answered from when the store
+/// knows one, or an explicit reason when they do not. `fresh: null` alone is
+/// not enough — a check that did not run must say so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFreshness {
+    /// `Some(true/false)` when verified against the working tree; `None` when
+    /// this answer did not (or could not) verify.
+    pub fresh: Option<bool>,
+    /// Generation the verdict describes, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<u32>,
+    /// Why `fresh` is null, or why a verified mismatch was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl SourceFreshness {
+    pub fn unverified(reason: impl Into<String>) -> Self {
+        Self {
+            fresh: None,
+            generation_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn verified(fresh: bool, generation_id: u32) -> Self {
+        Self {
+            fresh: Some(fresh),
+            generation_id: Some(generation_id),
+            reason: None,
+        }
+    }
+
+    pub fn verified_with_reason(
+        fresh: bool,
+        generation_id: u32,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            fresh: Some(fresh),
+            generation_id: Some(generation_id),
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn from_store(value: devmap_store::QuerySourceFreshness) -> Self {
+        Self {
+            fresh: value.fresh,
+            generation_id: value.generation_id,
+            reason: value.reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response<T> {
-    /// `None` (JSON null) means current-tree freshness was not checked. Query
-    /// completeness describes the persisted snapshot; `status` performs the
-    /// separate repository verification. Never infer freshness from an empty
-    /// result or from `walk_incomplete` being absent.
-    #[serde(default)]
-    pub source_freshness: Option<bool>,
+    /// Last verified whole-tree freshness for the generation behind this
+    /// answer, or an explicit unverified reason. Never infer freshness from an
+    /// empty result or from `walk_incomplete` being absent.
+    pub source_freshness: SourceFreshness,
     pub items: Vec<T>,
     pub shown: u32,
     pub hidden: u32,

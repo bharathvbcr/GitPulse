@@ -4,6 +4,10 @@ GitPulse is the successor to the deprecated
 [LiquiTask](https://github.com/bharathvbcr/LiquiTask) workbench. Use this app —
 not LiquiTask — for new boards and agent handoff.
 
+Profile tasks and briefs are **Manvi** workbench modules. Repository execution
+tasks and leases shown in **Work → Overview** are **DevCouncil** store modules.
+GitPulse presents both; it does not reimplement them.
+
 Use **Tasks**, beside Fleet above the repository tabs, to organize work across
 repositories. Use **Work → Tasks** for the active repository. The command palette
 also provides **Open Tasks — global and workspace Kanban boards** and

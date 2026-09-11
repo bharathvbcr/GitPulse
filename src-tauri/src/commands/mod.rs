@@ -1365,12 +1365,7 @@ pub async fn cmd_push(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let force = force.unwrap_or(false);
-        let args = GitWriter::plan_push(
-            &repo_path,
-            remote.as_deref(),
-            branch.as_deref(),
-            force,
-        )?;
+        let args = GitWriter::plan_push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
         let argv: Vec<&str> = std::iter::once("git")
             .chain(args.iter().map(String::as_str))
             .collect();
@@ -3910,6 +3905,27 @@ pub async fn cmd_external_tool_install(
 #[tauri::command]
 pub fn cmd_external_tool_install_cancel() {
     crate::tool_install::request_cancel();
+}
+
+/// Remove a GitPulse-owned binary (app bin dir only) and forget the saved path.
+#[tauri::command(async)]
+pub async fn cmd_external_tool_uninstall(
+    tool: crate::tool_install::ExternalTool,
+) -> Result<String, String> {
+    off_thread(move || crate::tool_install::uninstall_tool(tool)).await
+}
+
+/// Hide or restore a tool without deleting it. Env overrides still win.
+#[tauri::command(async)]
+pub async fn cmd_external_tool_set_disabled(
+    tool: crate::tool_install::ExternalTool,
+    disabled: bool,
+) -> Result<crate::tool_config::ToolConfigView, String> {
+    off_thread(move || {
+        crate::tool_install::set_tool_disabled(tool, disabled)?;
+        crate::tool_config::view()
+    })
+    .await
 }
 
 #[tauri::command(async)]

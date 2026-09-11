@@ -8,8 +8,8 @@
 //! a tool the global server still advertises.
 //!
 //! Every call still requires GitPulse's `repo_path` — this process mediates
-//! many repositories — unlike the global server which resolves the root from
-//! MCP `roots/list`.
+//! many repositories. The standalone `devmap mcp` server accepts the same
+//! argument and refuses first-wins when more than one store is in scope.
 
 use serde_json::{json, Value};
 

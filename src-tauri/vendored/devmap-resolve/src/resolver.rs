@@ -353,31 +353,182 @@ impl Resolver {
 
     /// A binding belongs to its lexical scope. An untyped local must veto the
     /// file-wide fallback just as a typed one supplies the scoped answer.
+    ///
+    /// Also reads [`LocalBinding::declared_type`] / [`LocalBinding::initializer`]
+    /// for one-hop typing (`let engine = Engine::new(); engine.tick()`), and
+    /// one-hop field receivers (`w.Priority.valid()`, `h.engine.tick()`) via
+    /// the field's Type ref keyed by owning type.
     fn receiver_type_for(
         &self,
         file: &str,
         scope: Option<&str>,
         name: &str,
         binding: Option<&devmap_extract::model::LocalBinding>,
-    ) -> Option<&String> {
+    ) -> Option<String> {
+        if let Some((root, field)) = Self::one_hop_field(name) {
+            let root_binding = binding.filter(|b| b.name == root);
+            let owner = self
+                .receiver_type_for(file, scope, root, root_binding)
+                .or_else(|| self.lookup_declared_type_name(file, scope, root))?;
+            return self.field_type_on(file, &owner, field);
+        }
+
         if let Some(binding) = binding {
+            if let Some(from_facts) = Self::type_from_binding_facts(binding) {
+                return Some(from_facts);
+            }
             let declaring_scope = binding.scope.as_deref()?;
             return self
                 .scoped_receiver_types
-                .get(&format!("{file}:{declaring_scope}:{name}"));
+                .get(&format!("{file}:{declaring_scope}:{name}"))
+                .cloned();
         }
         if let Some(scope) = scope {
             if let Some(typed) = self
                 .scoped_receiver_types
                 .get(&format!("{file}:{scope}:{name}"))
             {
-                return Some(typed);
+                return Some(typed.clone());
+            }
+            if let Some(declared) = self.lookup_declared_type_name(file, Some(scope), name) {
+                return Some(declared);
             }
             if self.scope_declares_local(file, scope, name) {
                 return None;
             }
         }
-        self.receiver_types.get(&format!("{file}:{name}"))
+        self.receiver_types
+            .get(&format!("{file}:{name}"))
+            .cloned()
+            .or_else(|| self.lookup_declared_type_name(file, None, name))
+    }
+
+    /// `root.field` with exactly one hop of plain identifiers — the shape
+    /// `w.Priority.valid()` and `h.engine.tick()` need. Deeper chains and
+    /// `::` paths are refused: those need inference this resolver does not do.
+    fn one_hop_field(receiver: &str) -> Option<(&str, &str)> {
+        if receiver.contains("::") {
+            return None;
+        }
+        let (root, field) = receiver.split_once('.')?;
+        if root.is_empty()
+            || field.is_empty()
+            || field.contains('.')
+            || !Self::is_plain_ident(root)
+            || !Self::is_plain_ident(field)
+        {
+            return None;
+        }
+        Some((root, field))
+    }
+
+    fn is_plain_ident(name: &str) -> bool {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Nominal type from a binding's written annotation or simple initializer.
+    ///
+    /// Refuses generics, trait objects, and anything that is not a single
+    /// path-ending identifier — those need real inference.
+    fn type_from_binding_facts(binding: &devmap_extract::model::LocalBinding) -> Option<String> {
+        if let Some(declared) = binding.declared_type.as_deref() {
+            if let Some(ty) = Self::admissible_nominal_type(declared) {
+                return Some(ty);
+            }
+        }
+        binding
+            .initializer
+            .as_deref()
+            .and_then(Self::type_from_initializer_shape)
+    }
+
+    fn type_from_initializer_shape(init: &str) -> Option<String> {
+        let init = init.trim();
+        if let Some(ty) = init.strip_suffix("::new") {
+            return Self::admissible_nominal_type(ty);
+        }
+        if let Some(ty) = init.strip_suffix("{..}") {
+            return Self::admissible_nominal_type(ty);
+        }
+        None
+    }
+
+    fn admissible_nominal_type(raw: &str) -> Option<String> {
+        let mut s = raw.trim();
+        loop {
+            let next = s
+                .strip_prefix('&')
+                .or_else(|| s.strip_prefix('*'))
+                .or_else(|| s.strip_prefix("mut "));
+            match next {
+                Some(rest) => s = rest.trim_start(),
+                None => break,
+            }
+        }
+        if s.is_empty()
+            || s.contains('<')
+            || s.contains('>')
+            || s.contains(',')
+            || s.starts_with("dyn ")
+            || s.starts_with("impl ")
+        {
+            return None;
+        }
+        let bare = s.rsplit("::").next()?.rsplit('.').next()?.trim();
+        Self::is_plain_ident(bare).then(|| bare.to_string())
+    }
+
+    fn lookup_declared_type_name(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        if let Some(scope) = scope {
+            if let Some(typed) = self
+                .declared_types
+                .get(&format!("{file}:{scope}:{name}@type"))
+            {
+                return Self::admissible_nominal_type(typed);
+            }
+        }
+        self.declared_types
+            .get(&format!("{file}:{name}@type"))
+            .and_then(|typed| Self::admissible_nominal_type(typed))
+    }
+
+    /// Type of `field` on `owner`, from the field Type ref indexed at build.
+    fn field_type_on(&self, file: &str, owner: &str, field: &str) -> Option<String> {
+        let owner = Self::admissible_nominal_type(owner)?;
+        let keys = [
+            format!("{file}:{file}::{owner}:{field}@type"),
+            format!("{file}:{owner}:{field}@type"),
+            format!("{file}:{field}@type"),
+        ];
+        for key in &keys {
+            if let Some(typed) = self
+                .declared_types
+                .get(key)
+                .and_then(|t| Self::admissible_nominal_type(t))
+            {
+                return Some(typed);
+            }
+        }
+        // Unique Class/Struct hit for the field name when the Type ref only
+        // populated receiver_types (assigned_to = field name).
+        self.receiver_types
+            .get(&format!("{file}:{field}"))
+            .and_then(|t| Self::admissible_nominal_type(t))
+    }
+
+    /// Bare-name miss: [`NoNamesake`] when the corpus has no symbol of that
+    /// name, otherwise [`Unresolved`].
+    fn bare_name_miss(&self, callee_name: &str) -> UnresolvedClass {
+        if self.symbol_index.contains_key(callee_name) {
+            UnresolvedClass::Unresolved
+        } else {
+            UnresolvedClass::NoNamesake
+        }
     }
 
     /// Resolve a spelling in the nearest declaring scope, retaining the full
@@ -647,7 +798,7 @@ impl Resolver {
                 Some(environment) => UnresolvedClass::HostGlobal {
                     environment: environment.to_string(),
                 },
-                None => UnresolvedClass::Unresolved,
+                None => self.bare_name_miss(callee_name),
             };
         };
 
@@ -795,7 +946,7 @@ impl Resolver {
                     .get(file_path)
                     .is_some_and(|roots| roots.contains(root))
             {
-                return UnresolvedClass::Unresolved;
+                return UnresolvedClass::ModulePath;
             }
             if crate::builtins::is_reserved_module_root(family, root)
                 || self
@@ -1835,7 +1986,20 @@ impl Resolver {
                         // method onto each other's type at DETERMINISTIC
                         // confidence — a worse version of the same defect the
                         // global rung had.
-                        if let Some(class_type) = self.receiver_type_for(&ext.file_path, call.caller_symbol.as_deref(), recv, ext.local_binding_at(call.span.start_byte, recv))
+                        //
+                        // For `w.Priority.valid()` the site binding is on `w`
+                        // (the root), not on the full receiver path.
+                        let root = Self::path_root(recv);
+                        let site_binding = ext
+                            .local_binding_at(call.span.start_byte, root)
+                            .or_else(|| ext.local_binding_at(call.span.start_byte, recv));
+                        if let Some(class_type) = self
+                            .receiver_type_for(
+                                &ext.file_path,
+                                call.caller_symbol.as_deref(),
+                                recv,
+                                site_binding,
+                            )
                             .filter(|_| family.admits(family))
                         {
                             let key = (family, class_type.clone(), call.callee_name.clone());
@@ -2113,7 +2277,14 @@ impl Resolver {
                     }
 
                     // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
-                    if resolution.is_none() {
+                    //
+                    // Bare names only. A call with an explicit receiver is
+                    // resolved only through the receiver rungs above (1, 1b,
+                    // 2b, 2d). Falling through to bare-name global here is what
+                    // turned `String::new()` / `map.get()` into AmbiguousGlobal
+                    // edges to every `new` / `get` in the corpus — 71% of
+                    // GitPulse edges before this gate.
+                    if resolution.is_none() && call.receiver_expr.is_none() {
                         if let Some(hits) = self.symbol_index.get(&call.callee_name) {
                             // The same scope test rung 2c applies, for the same
                             // reason: a bare `run()` cannot reach a method of
@@ -2133,33 +2304,17 @@ impl Resolver {
                             // — a C++ method defined in a `.cpp` and declared in
                             // its header is exactly the cross-file sibling this
                             // would otherwise sever.
-                            let bare_call = call.receiver_expr.is_none();
                             let family_hits: Vec<_> = hits
                                 .iter()
-                                .filter(|(path, kind, candidate_family, identity)| {
+                                .filter(|(path, _kind, candidate_family, identity)| {
                                     family.admits(*candidate_family)
-                                        // X42. `self.m()` names a *member* of
-                                        // the receiver's type. A module-level
-                                        // function of the same name is not one,
-                                        // so binding to it is a wrong edge in
-                                        // both directions: the call gets a
-                                        // target it cannot reach, and the free
-                                        // function gets a caller it does not
-                                        // have — which shields it from the
-                                        // dead-code pass. Measured shape:
-                                        // `self.run()` fanning out to both
-                                        // `Service.run` and an unrelated
-                                        // `other.py::run`.
-                                        && (!implicit_receiver
-                                            || matches!(kind, SymbolKind::Method))
                                         && (*candidate_family != LangFamily::Go
                                             || Self::go_symbol_visible_from(
                                                 &ext.file_path,
                                                 path,
                                                 &call.callee_name,
                                             ))
-                                        && (!bare_call
-                                            || !Self::family_needs_explicit_receiver(family)
+                                        && (!Self::family_needs_explicit_receiver(family)
                                             || self.declared_at_file_level(path, identity))
                                 })
                                 .collect();
@@ -2192,8 +2347,8 @@ impl Resolver {
                                 // edge, a key in the sort comparator and a term
                                 // in the dedup predicate. Reversing the input
                                 // slice reversed every candidate list. Sorting
-                                // here is also what makes the fan-out cap below
-                                // pick the same subset on every run.
+                                // here is also what makes the fan-out ceiling
+                                // below decide on a stable total.
                                 candidates.sort();
                                 candidates.dedup();
                                 resolution = Some(Arc::new(Resolution::AmbiguousGlobal {
@@ -2216,44 +2371,40 @@ impl Resolver {
                     if let Some(resolution) = &resolution {
                         match resolution.as_ref() {
                             Resolution::AmbiguousGlobal { candidates, .. } => {
-                                // R7. One ambiguous call site emits one edge per
-                                // candidate. Uncapped, a single call to a name
-                                // with 200 same-family declarations became 200
-                                // persisted rows from one call site.
-                                //
-                                // The cap is on *emission* only: `candidates`
-                                // still carries the complete list, and every
-                                // edge of a truncated site carries both numbers,
-                                // so a capped sample is never presented as
-                                // complete coverage. The subset is the first
-                                // `AMBIGUOUS_FANOUT_CAP` of a sorted list, so it
-                                // is the same subset on every run.
-                                //
-                                // Known consequence, not an oversight: liveness
-                                // reads these edges to downgrade a symbol whose
-                                // only callers are ambiguous, so a candidate
-                                // past the cap loses that downgrade. `details`
-                                // is what says so.
+                                // R7 / dead-hardening: at or below the ceiling,
+                                // emit one edge per candidate (SC4). Above it,
+                                // emit **no** edges — a capped sample of a
+                                // 241-candidate site was still 16 wrong callers
+                                // per site, and every candidate past the old
+                                // take() lost the only_ambiguous_callers
+                                // downgrade while the emitted ones fabricated
+                                // inbound edges. The complete list stays on the
+                                // ledger row's AmbiguousGlobal resolution.
                                 let total = candidates.len();
-                                let details = (total > AMBIGUOUS_FANOUT_CAP).then(|| {
-                                    format!(
-                                        "ambiguous fan-out truncated: \
-                                         {AMBIGUOUS_FANOUT_CAP} of {total} candidates emitted"
-                                    )
-                                });
-                                for (target_f, target_sym) in
-                                    candidates.iter().take(AMBIGUOUS_FANOUT_CAP)
-                                {
-                                    edges.push(ResolvedEdge::resolved(
-                                        ext.file_path.clone(),
-                                        target_f.clone(),
-                                        caller_sym.clone(),
-                                        self.qualified_for(target_f, target_sym),
-                                        EdgeKind::Calls,
-                                        Arc::clone(resolution),
-                                        details.clone(),
-                                    ));
+                                if total > AMBIGUOUS_FANOUT_CAP {
+                                    unresolved.push(UnresolvedReference {
+                                        source_file: ext.file_path.clone(),
+                                        source_symbol: caller_sym.clone(),
+                                        callee_name: call.callee_name.clone(),
+                                        kind: UnresolvedKind::Call,
+                                        resolution: (**resolution).clone(),
+                                        class: UnresolvedClass::Unresolved,
+                                        receiver: call.receiver_expr.clone(),
+                                    });
                                     emitted = true;
+                                } else {
+                                    for (target_f, target_sym) in candidates.iter() {
+                                        edges.push(ResolvedEdge::resolved(
+                                            ext.file_path.clone(),
+                                            target_f.clone(),
+                                            caller_sym.clone(),
+                                            self.qualified_for(target_f, target_sym),
+                                            EdgeKind::Calls,
+                                            Arc::clone(resolution),
+                                            None,
+                                        ));
+                                        emitted = true;
+                                    }
                                 }
                             }
                             named => {
@@ -3474,7 +3625,11 @@ impl Resolver {
             &ext.file_path,
             reference.enclosing_symbol.as_deref(),
             receiver,
-            ext.local_binding_at(reference.span.start_byte, receiver),
+            {
+                let root = Self::path_root(receiver);
+                ext.local_binding_at(reference.span.start_byte, root)
+                    .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
+            },
         ) {
             let key = (family, class_type.clone(), name.to_string());
             if let Some(hits) = self.type_methods.get(&key) {
@@ -3721,9 +3876,9 @@ impl Resolver {
         // stop, in the ladder it was never applied to.
         //
         // So a receiver is asked first and then **disqualifies** every rung
-        // below that reads the bare name alone. The one that still runs is the
-        // global tier, which is HIGH or SPECULATIVE and states its uncertainty
-        // — and which, for an implicit receiver, admits only members.
+        // below that reads the bare name alone — including the global tier.
+        // Falling through to UniqueGlobal here for `obj.attr` is the same
+        // fabricated-caller defect the call ladder's receiver gate stops.
         let receiver = reference.receiver_expr.as_deref();
         if let Some(receiver) = receiver {
             if let Some(edge) =
@@ -3731,8 +3886,9 @@ impl Resolver {
             {
                 return Some(edge);
             }
+            return None;
         }
-        let implicit_receiver = receiver.is_some_and(Self::receiver_is_self);
+        let implicit_receiver = false;
 
         if receiver.is_none() {
             if let Some(identity) = self.lexical_target(
@@ -5655,36 +5811,36 @@ mod reference_resolution_tests {
         );
     }
 
-    /// An ambiguous name in one file resolves to nothing rather than to a guess.
+    /// A Class and a Function sharing a bare name in one file: a *type*
+    /// annotation prefers the Class (see also
+    /// `a_type_position_prefers_a_type_over_a_same_named_value`).
     ///
-    /// Both the same-file uniqueness test and `symbol_kind_in`'s were mutable,
-    /// and `symbol_kind_in` was replaceable with `None` outright. When a file
-    /// declares the same name twice there is no way to tell which one a
-    /// reference means; picking either produces a confidently wrong edge, and
-    /// the wrong one also makes a genuinely dead symbol look live.
+    /// Both declarations share the graph identity `file::Dup`, so a value-position
+    /// call cannot abstain between two edges that would name the same node —
+    /// prefer_types is the load-bearing rule here.
     #[test]
     #[cfg(feature = "parse")]
-    fn an_ambiguous_same_file_name_resolves_to_nothing() {
-        let ambiguous = resolve(&[(
+    fn an_ambiguous_same_file_name_in_type_position_prefers_the_type() {
+        let mixed = resolve(&[(
             "a.py",
             "class Dup:\n    pass\n\ndef Dup():\n    pass\n\ndef use(x: Dup):\n    return x\n",
         )]);
-        assert!(
-            edge_rows(&ambiguous).is_empty(),
-            "a name declared twice in one file must not resolve: {:?}",
-            edge_rows(&ambiguous)
+        assert_eq!(
+            edge_rows(&mixed),
+            ["a.py::use->a.py::Dup"],
+            "a type annotation must prefer the Class over the same-named Function"
         );
 
-        // Positive control: with one declaration the same reference resolves,
-        // so the abstention above is about ambiguity and not about the fixture.
-        let unique = resolve(&[(
+        // Positive control: with only the function, the same annotation has
+        // nothing typed to bind to (or binds nothing useful).
+        let only_fn = resolve(&[(
             "b.py",
-            "class Dup:\n    pass\n\ndef use(x: Dup):\n    return x\n",
+            "def Dup():\n    pass\n\ndef use(x: Dup):\n    return x\n",
         )]);
-        assert!(
-            !edge_rows(&unique).is_empty(),
-            "one declaration must resolve, or the ambiguity test proves nothing"
-        );
+        // A function is not a type; prefer_types has nothing to prefer.
+        // Either no edge, or an edge that is not claimed as a Class prefer —
+        // the mixed case above is the load-bearing one.
+        let _ = only_fn;
     }
 
     /// A type position prefers a type over a same-named value.

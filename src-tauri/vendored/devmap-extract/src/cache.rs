@@ -348,7 +348,21 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notebook cells now parse independently under one shared budget; a v46 row
 /// can invent a function that spans execution units. Python empty required
 /// suites also report Partial instead of inheriting the grammar's Clean bit.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "47";
+///
+/// v48 extends every `LocalBinding` with optional `declared_type` and
+/// `initializer`, and fills those fields from facts the extractor already
+/// collected (typed parameters / `let x: T`, simple construction shapes such
+/// as `T::new` / `factory()`, Go/Rust field types). It also emits Go
+/// `field_declaration` Type references with `assigned_to` (the gap that left
+/// `w.Priority.valid()` untyped), strengthens Python `isinstance` / annotation
+/// Type uses, and records Svelte `$state` / `$derived` / `$effect` as Call
+/// sites so resolve's HostGlobal table can classify them. A v47 row has none
+/// of the new binding fields and no Go field Type edges, so a warm cache would
+/// keep serving receiver-dispatch failures that look freshly examined.
+///
+/// v49 records `dsl.Matcher` Go parameters as `RuntimeEntryPoint` wiring so
+/// ruleguard rules are not confident-dead. A v48 row has no such annotation.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "49";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

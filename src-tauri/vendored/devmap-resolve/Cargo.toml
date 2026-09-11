@@ -114,3 +114,7 @@ required-features = ["parse"]
 [[test]]
 name = "imports_stay_in_the_named_tree"
 required-features = ["parse"]
+
+[[test]]
+name = "dead_hardening_characterization"
+required-features = ["parse"]

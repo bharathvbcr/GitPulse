@@ -2,6 +2,8 @@
 
 **GitPulse** is a high-performance, local-first Git desktop client. A native Rust backend (Tauri 2) owns every privileged operation; a Svelte 5 frontend renders the graph, diffs, and audits. Nothing is sent to a GitPulse server — there isn't one.
 
+**Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is components and modules. [Manvi](https://github.com/bharathvbcr/Manvi) wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite.
+
 GitPulse is also the successor to the deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask) agentic task workbench. New boards and agent handoff belong here.
 
 [Website](https://gitpulse.vbcr.dev/) · [Releases](https://github.com/bharathvbcr/GitPulse/releases) · [Repository](https://github.com/bharathvbcr/GitPulse)

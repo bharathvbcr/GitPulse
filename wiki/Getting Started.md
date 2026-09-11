@@ -1,5 +1,7 @@
 # Getting Started
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil's `devmap` module for Code → Map.
+
 ## Open a repository
 
 1. Launch GitPulse.

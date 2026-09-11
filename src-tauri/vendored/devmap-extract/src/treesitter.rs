@@ -2077,6 +2077,22 @@ fn rust_type_item_name(node: Node, source: &str) -> Option<String> {
     None
 }
 
+/// The Go type that owns a `field_declaration` — walked up through
+/// `field_declaration_list` / `struct_type` to the enclosing `type_spec`.
+fn go_field_owner_name(node: Node, source: &str) -> Option<String> {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if parent.kind() == "type_spec" {
+            return get_child_text(parent, "name", source).filter(|name| !name.is_empty());
+        }
+        if is_callable_node(parent) {
+            return None;
+        }
+        ancestor = bounded_parent(parent);
+    }
+    None
+}
+
 /// Why a Rust `fn` can never be observed as `pub` regardless of its liveness.
 ///
 /// A trait-impl method and a defaulted trait method both reject `pub`, so
@@ -3506,6 +3522,29 @@ fn extract_node(
                     // to this function so two functions using the same
                     // parameter name cannot collide (the SC9 lesson).
                     for (param, type_name, qualifier) in param_type_bindings(node, source, lang) {
+                        if receiver.is_none() {
+                            if let Some(reason) = crate::wiring::go_framework_param_entry_reason(
+                                &type_name,
+                                qualifier.as_deref(),
+                            ) {
+                                // Framework dispatch, not an ordinary helper.
+                                // Deduped below would be wrong: one Matcher
+                                // parameter is enough; further parameters must
+                                // not emit a second annotation for the same
+                                // target.
+                                if !wiring.iter().any(|annotation| {
+                                    annotation.target_symbol == qualified_name
+                                        && annotation.kind == WiringKind::RuntimeEntryPoint
+                                        && annotation.details == reason
+                                }) {
+                                    wiring.push(WiringAnnotation {
+                                        kind: WiringKind::RuntimeEntryPoint,
+                                        target_symbol: qualified_name.clone(),
+                                        details: reason.to_string(),
+                                    });
+                                }
+                            }
+                        }
                         let scope = node.child_by_field_name("body").and_then(|body| {
                             enclosing_callable_qualified(body, source, file_symbol_name)
                         });
@@ -3643,6 +3682,45 @@ fn extract_node(
                         alias,
                         span,
                     });
+                }
+            }
+            // Struct field types are the evidence `w.Priority.valid()` needs to
+            // type the field receiver. Rust already emits this; Go did not, so
+            // every method reached only through a typed field stayed untyped.
+            "field_declaration" => {
+                if let Some(field_name) = get_child_text(node, "name", source) {
+                    if let Some(type_name) = node
+                        .child_by_field_name("type")
+                        .and_then(|ty| go_type_name(ty, source, 0))
+                    {
+                        if let Some(owner) = go_field_owner_name(node, source) {
+                            if !field_name.is_empty() && !type_name.is_empty() {
+                                let qualifier = node
+                                    .child_by_field_name("type")
+                                    .and_then(|ty| go_type_qualifier(ty, source, 0));
+                                if let Some(qualifier) = qualifier {
+                                    references.push(ExtractedReference {
+                                        name: qualifier,
+                                        kind: ReferenceKind::TypeQualifier,
+                                        span: span.clone(),
+                                        enclosing_symbol: Some(format!(
+                                            "{file_symbol_name}::{owner}"
+                                        )),
+                                        assigned_to: Some(field_name.clone()),
+                                        receiver_expr: None,
+                                    });
+                                }
+                                references.push(ExtractedReference {
+                                    name: type_name,
+                                    kind: ReferenceKind::Type,
+                                    span: span.clone(),
+                                    enclosing_symbol: Some(format!("{file_symbol_name}::{owner}")),
+                                    assigned_to: Some(field_name),
+                                    receiver_expr: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             "call_expression" | "composite_literal" => {
@@ -3818,6 +3896,35 @@ fn extract_node(
                     body_signature: None,
                     declaration_hash: None,
                 });
+                // Same SC12 binding Rust and Go already emit: a parameter's
+                // declared type is the only typed binding available when the
+                // function did not construct the value. Without it, C-family
+                // method calls on parameters (`s.compute(1)`) stay uninferred.
+                if c_family && declaration.declared_kind == SymbolKind::Function {
+                    for (param, type_name, qualifier) in param_type_bindings(node, source, lang) {
+                        let scope = node.child_by_field_name("body").and_then(|body| {
+                            enclosing_callable_qualified(body, source, file_symbol_name)
+                        });
+                        if let Some(qualifier) = qualifier {
+                            references.push(ExtractedReference {
+                                name: qualifier,
+                                kind: ReferenceKind::TypeQualifier,
+                                span: node_span(node),
+                                enclosing_symbol: scope.clone(),
+                                assigned_to: Some(param.clone()),
+                                receiver_expr: None,
+                            });
+                        }
+                        references.push(ExtractedReference {
+                            name: type_name,
+                            kind: ReferenceKind::Type,
+                            span: node_span(node),
+                            enclosing_symbol: scope,
+                            assigned_to: Some(param),
+                            receiver_expr: None,
+                        });
+                    }
+                }
             }
         }
     }
@@ -5634,7 +5741,7 @@ fn param_type_bindings(
     source: &str,
     lang: &str,
 ) -> Vec<(String, String, Option<String>)> {
-    let Some(params) = node.child_by_field_name("parameters") else {
+    let Some(params) = parameter_list_of(node) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -5657,6 +5764,21 @@ fn param_type_bindings(
                 let qualifier = ty_node.and_then(|ty| go_type_qualifier(ty, source, 0));
                 name.zip(ty).map(|(name, ty)| (name, ty, qualifier))
             }
+            // C / C++ / Objective-C / CUDA: parameters hang off the
+            // `function_declarator`, and each `parameter_declaration` names
+            // its binding through a (possibly pointer/reference-wrapped)
+            // `declarator` field rather than a `name` field. Without this
+            // arm, `int driver(S s) { return s.compute(1); }` leaves `s`
+            // untyped, so the method call stays an uninferred receiver and
+            // the out-of-line member looks dead.
+            (lang, "parameter_declaration") if is_c_family_grammar(lang) => {
+                let name = child
+                    .child_by_field_name("declarator")
+                    .and_then(|declarator| c_param_name(declarator, source, 0));
+                let ty_node = child.child_by_field_name("type");
+                let ty = ty_node.and_then(|ty| c_type_name(ty, source, 0));
+                name.zip(ty).map(|(name, ty)| (name, ty, None))
+            }
             _ => None,
         };
         if let Some((name, ty, qualifier)) = binding {
@@ -5666,6 +5788,106 @@ fn param_type_bindings(
         }
     }
     out
+}
+
+/// The `parameter_list` belonging to a callable node.
+///
+/// Rust and Go put `parameters` on the function/method node itself. The C
+/// family puts it on the nested `function_declarator` (and that declarator
+/// may itself be wrapped in pointer/reference declarators), so a direct
+/// field lookup on the definition always answers `None`.
+fn parameter_list_of(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(params) = node.child_by_field_name("parameters") {
+        return Some(params);
+    }
+    let mut declarator = node.child_by_field_name("declarator")?;
+    for _ in 0..16 {
+        if let Some(params) = declarator.child_by_field_name("parameters") {
+            return Some(params);
+        }
+        declarator = declarator.child_by_field_name("declarator")?;
+    }
+    None
+}
+
+/// Parameter binding name under a C-family declarator, unwrapping pointers
+/// and references. Bounded so a pathological nesting cannot recurse forever.
+fn c_param_name(node: Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    match node.kind() {
+        "identifier" => {
+            let text = get_node_text(node, source);
+            (!text.is_empty()).then_some(text)
+        }
+        "pointer_declarator"
+        | "reference_declarator"
+        | "array_declarator"
+        | "parenthesized_declarator"
+        | "function_declarator"
+        | "attributed_declarator" => {
+            if let Some(inner) = node.child_by_field_name("declarator") {
+                return c_param_name(inner, source, depth + 1);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(name) = c_param_name(child, source, depth + 1) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Bare type name for a C-family parameter type, unwrapping pointers and
+/// references so `S *` / `S&` / `const S` dispatch on `S`.
+fn c_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    match node.kind() {
+        "type_identifier" | "identifier" | "primitive_type" | "sized_type_specifier" => {
+            let text = get_node_text(node, source);
+            (!text.is_empty()).then_some(text)
+        }
+        "type_descriptor" | "qualified_identifier" | "scoped_type_identifier" => {
+            if let Some(name) = get_child_text(node, "name", source).filter(|n| !n.is_empty()) {
+                return Some(name);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(name) = c_type_name(child, source, depth + 1) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        "pointer_declarator" | "reference_declarator" | "abstract_pointer_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|inner| c_type_name(inner, source, depth + 1))
+            .or_else(|| {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if let Some(name) = c_type_name(child, source, depth + 1) {
+                        return Some(name);
+                    }
+                }
+                None
+            }),
+        _ => {
+            // `const S` / elaborated types may put the identifier deeper.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(name) = c_type_name(child, source, depth + 1) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+    }
 }
 
 /// The package a Go type is qualified by, unwrapping the type constructors
@@ -5906,7 +6128,7 @@ fn maybe_push_name_reference(
     file_symbol_name: &str,
     references: &mut Vec<ExtractedReference>,
 ) {
-    let ref_kind = match node.kind() {
+    let mut ref_kind = match node.kind() {
         "type_identifier" | "nested_type_identifier" => ReferenceKind::Type,
         "identifier"
         | "shorthand_property_identifier"
@@ -5927,6 +6149,16 @@ fn maybe_push_name_reference(
         | "simple_identifier" => ReferenceKind::Name,
         _ => return,
     };
+    // Python annotations and `isinstance`/`issubclass` type arguments are
+    // ordinary `identifier` nodes. Promote them to Type so resolve can see the
+    // class the same way it sees a Rust/Go type annotation.
+    if ref_kind == ReferenceKind::Name
+        && lang == "python"
+        && (python_identifier_is_type_annotation(node)
+            || python_isinstance_type_argument(node, source))
+    {
+        ref_kind = ReferenceKind::Type;
+    }
     if is_defining_name(node) || is_inside_import_or_export(node) || is_call_callee(node) {
         return;
     }
@@ -5956,11 +6188,16 @@ fn maybe_push_name_reference(
         kind: ref_kind,
         span: node_span(node),
         enclosing_symbol: enclosing_emitted_symbol_for(node, source, lang, file_symbol_name),
-        assigned_to: rust_let_bound_from_field_use(node, source).or_else(|| {
-            (ref_kind == ReferenceKind::Type)
-                .then(|| swift_parameter_bound_from_type(node, source))
-                .flatten()
-        }),
+        assigned_to: rust_let_bound_from_field_use(node, source)
+            .or_else(|| rust_let_bound_from_type_annotation(node, source))
+            .or_else(|| {
+                (ref_kind == ReferenceKind::Type)
+                    .then(|| {
+                        swift_parameter_bound_from_type(node, source)
+                            .or_else(|| ts_parameter_bound_from_type(node, source))
+                    })
+                    .flatten()
+            }),
         // The object half of a member access, so the resolver can tell
         // `cfg.enabled` from a bare local named `enabled`.
         receiver_expr: member_access_receiver(node, source),
@@ -6672,6 +6909,8 @@ fn collect_site_bindings(
     imports: &[ExtractedImport],
 ) -> Vec<LocalBinding> {
     let fixtures = python_fixture_names(root, source, imports);
+    let declared_types = binding_declared_types(references);
+    let initializers = binding_initializers(references, calls);
     let mut sites = BTreeSet::new();
     let mut parameters: HashMap<usize, BTreeSet<String>> = HashMap::new();
     let inputs = calls
@@ -6770,20 +7009,29 @@ fn collect_site_bindings(
                             }
                             let named_scope = callable_binding_name(scope, source).is_some()
                                 || is_c_family_callable(scope);
+                            let scope_name = named_scope
+                                .then(|| {
+                                    scope.child(0).and_then(|child| {
+                                        enclosing_callable_qualified(
+                                            child,
+                                            source,
+                                            file_symbol_name,
+                                        )
+                                    })
+                                })
+                                .flatten();
+                            let (declared_type, initializer) = binding_facts_for(
+                                &declared_types,
+                                &initializers,
+                                &scope_name,
+                                name,
+                            );
                             sites.insert(LocalBinding {
                                 start_byte: span.start_byte,
                                 name: name.to_string(),
-                                scope: named_scope
-                                    .then(|| {
-                                        scope.child(0).and_then(|child| {
-                                            enclosing_callable_qualified(
-                                                child,
-                                                source,
-                                                file_symbol_name,
-                                            )
-                                        })
-                                    })
-                                    .flatten(),
+                                scope: scope_name,
+                                declared_type,
+                                initializer,
                             });
                         }
                         break;
@@ -6794,6 +7042,92 @@ fn collect_site_bindings(
         }
     }
     sites.into_iter().collect()
+}
+
+/// Type refs with `assigned_to`, keyed by `(enclosing_symbol, binding name)`.
+fn binding_declared_types(
+    references: &[ExtractedReference],
+) -> HashMap<(Option<String>, String), String> {
+    let mut out = HashMap::new();
+    for reference in references {
+        if reference.kind != ReferenceKind::Type {
+            continue;
+        }
+        let Some(bound) = reference.assigned_to.as_ref() else {
+            continue;
+        };
+        if bound.is_empty() || reference.name.is_empty() {
+            continue;
+        }
+        out.entry((reference.enclosing_symbol.clone(), bound.clone()))
+            .or_insert_with(|| reference.name.clone());
+    }
+    out
+}
+
+/// Call/Constructor refs with `assigned_to`, reduced to a simple initializer shape.
+///
+/// Call *references* do not always carry `receiver_expr` — `extracted_reference`
+/// derives it from member-access shape, while `Engine::new` is a
+/// `scoped_identifier` whose receiver lives on the mirrored `ExtractedCall`.
+/// Join on the call span that contains the reference when filling `T::new`.
+fn binding_initializers(
+    references: &[ExtractedReference],
+    calls: &[ExtractedCall],
+) -> HashMap<(Option<String>, String), String> {
+    let mut out = HashMap::new();
+    for reference in references {
+        let Some(bound) = reference.assigned_to.as_ref() else {
+            continue;
+        };
+        if bound.is_empty() {
+            continue;
+        }
+        let shape = match reference.kind {
+            ReferenceKind::Constructor => Some(format!("{}{{..}}", reference.name)),
+            ReferenceKind::Call => {
+                let receiver = reference.receiver_expr.as_deref().or_else(|| {
+                    calls.iter().find_map(|call| {
+                        (call.callee_name == reference.name
+                            && call.span.start_byte <= reference.span.start_byte
+                            && call.span.end_byte >= reference.span.end_byte)
+                            .then_some(call.receiver_expr.as_deref())
+                            .flatten()
+                    })
+                });
+                Some(match receiver {
+                    Some(receiver) if reference.name == "new" => format!("{receiver}::new"),
+                    Some(receiver) => format!("{receiver}.{}", reference.name),
+                    None => reference.name.clone(),
+                })
+            }
+            _ => None,
+        };
+        let Some(shape) = shape else {
+            continue;
+        };
+        out.entry((reference.enclosing_symbol.clone(), bound.clone()))
+            .or_insert(shape);
+    }
+    out
+}
+
+fn binding_facts_for(
+    declared_types: &HashMap<(Option<String>, String), String>,
+    initializers: &HashMap<(Option<String>, String), String>,
+    scope: &Option<String>,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    let key = (scope.clone(), name.to_string());
+    let declared_type = declared_types.get(&key).cloned().or_else(|| {
+        // File-scoped Type bindings (rare) and unscoped parameter rows.
+        declared_types.get(&(None, name.to_string())).cloned()
+    });
+    let initializer = initializers
+        .get(&key)
+        .cloned()
+        .or_else(|| initializers.get(&(None, name.to_string())).cloned());
+    (declared_type, initializer)
 }
 
 fn name_is_shadowed_by_local(node: Node, source: &str, name: &str) -> bool {
@@ -6931,42 +7265,24 @@ fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet
     }
 }
 
-/// Binding a Rust `let` gives a closure, when `node` is that closure's value.
-///
-/// `callable_binding_name` deliberately returns `None` for `closure_expression`:
-/// naming the let binding as a callable would attribute calls *inside* the
-/// closure to a symbol that does not exist (`file::handler`), the SC9/SC10
-/// unjoinable-edge failure. The merge gate in `collect_scope_locals` still needs
-/// to tell a let-bound closure from an unnamed one — only the unnamed form must
-/// skip merging its parameters into the enclosing function.
-fn rust_let_bound_closure_name(node: Node, source: &str) -> Option<String> {
-    if node.kind() != "closure_expression" {
-        return None;
-    }
-    let parent = bounded_parent(node)?;
-    if parent.kind() != "let_declaration" || !field_contains(parent, "value", node) {
-        return None;
-    }
-    parent
-        .child_by_field_name("pattern")
-        .and_then(|pattern| simple_binding_name(pattern, source))
-}
-
 fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
         if is_callable_node(node) {
-            // Unnamed closures must not dump their parameters into the enclosing
-            // function's `scope_locals`. That set is what `classify_unresolved`
-            // reads for `LocalBinding`, and merging `|marker|` into
-            // `local_provider` made a later `marker("x")` look like a callback.
-            // A `let`-bound closure is different: its parameters belong with the
-            // enclosing named function, where its calls are attributed — and
-            // `callable_binding_name` cannot say so (see
-            // `rust_let_bound_closure_name`).
-            let skip_merge = node.kind() == "closure_expression"
-                && rust_let_bound_closure_name(node, source).is_none();
+            // Unnamed *and* `let`-bound closures must not dump their parameters
+            // into the enclosing function's `scope_locals`. That set is what
+            // `classify_unresolved` reads for `LocalBinding`, and merging
+            // `|marker|` or `|name|` into `run` made a later `marker("x")` /
+            // `name.len()` look like a callback of `run`. The `let` binding
+            // itself (`handler`) is still a local of `run` via the body walk;
+            // only the closure's *parameters* stay out.
+            //
+            // Previously `let`-bound closures were merged so their parameters
+            // shared the caller's scope key. That contradicted
+            // `a_rust_closure_parameter_does_not_hide_an_outer_function` and
+            // `scope_locals_are_keyed_by_the_identity_calls_report_as_their_caller`.
+            let skip_merge = node.kind() == "closure_expression";
             if !skip_merge {
                 if let Some(scope) = node
                     .child(0)
@@ -7249,6 +7565,143 @@ fn rust_let_bound_from_field_use(node: Node, source: &str) -> Option<String> {
         return None;
     }
     rust_let_bound_from_value(parent, source)
+}
+
+/// The local a Rust `let x: T` binds, when `node` is that type annotation.
+fn rust_let_bound_from_type_annotation(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    for _ in 0..8 {
+        let parent = bounded_parent(current)?;
+        if parent.kind() == "let_declaration" {
+            if field_contains(parent, "type", node) {
+                return parent
+                    .child_by_field_name("pattern")
+                    .and_then(|pattern| simple_binding_name(pattern, source));
+            }
+            return None;
+        }
+        if matches!(
+            parent.kind(),
+            "function_item" | "closure_expression" | "block" | "source_file"
+        ) {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
+/// The parameter a TypeScript/JavaScript type annotation types.
+fn ts_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    for _ in 0..8 {
+        let parent = bounded_parent(current)?;
+        if matches!(
+            parent.kind(),
+            "required_parameter" | "optional_parameter" | "typed_parameter"
+        ) {
+            return parent
+                .child_by_field_name("pattern")
+                .or_else(|| parent.child_by_field_name("name"))
+                .and_then(|pattern| {
+                    if pattern.kind() == "identifier" {
+                        let name = get_node_text(pattern, source);
+                        is_user_ident(&name).then_some(name)
+                    } else {
+                        simple_binding_name(pattern, source)
+                    }
+                });
+        }
+        if matches!(
+            parent.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "generator_function_declaration"
+                | "statement_block"
+                | "program"
+        ) {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Whether a Python identifier sits in a type annotation (`x: T`, `-> T`).
+fn python_identifier_is_type_annotation(node: Node) -> bool {
+    let mut current = node;
+    for _ in 0..8 {
+        let Some(parent) = bounded_parent(current) else {
+            return false;
+        };
+        if field_contains(parent, "type", node) || field_contains(parent, "return_type", node) {
+            return true;
+        }
+        if is_callable_node(parent) || matches!(parent.kind(), "module" | "block") {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Whether a Python identifier is a type argument of `isinstance` / `issubclass`.
+///
+/// The first argument is the value; every later positional argument (and each
+/// element of a tuple of types) names a class. Those are Type uses, not Name.
+fn python_isinstance_type_argument(node: Node, source: &str) -> bool {
+    let mut current = node;
+    for _ in 0..8 {
+        let Some(parent) = bounded_parent(current) else {
+            return false;
+        };
+        if parent.kind() == "tuple" {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "argument_list" {
+            let Some(call) = bounded_parent(parent) else {
+                return false;
+            };
+            if call.kind() != "call" {
+                return false;
+            }
+            let Some(function) = call.child_by_field_name("function") else {
+                return false;
+            };
+            let callee = get_node_text(function, source);
+            if callee != "isinstance" && callee != "issubclass" {
+                return false;
+            }
+            // Skip the value (first positional). Everything after is a type.
+            let mut cursor = parent.walk();
+            let mut index = 0usize;
+            for child in parent.named_children(&mut cursor) {
+                if child.kind() == "keyword_argument" {
+                    continue;
+                }
+                if index == 0 {
+                    index += 1;
+                    continue;
+                }
+                if node_contains(child, node) {
+                    return true;
+                }
+                index += 1;
+            }
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "call" | "function_definition" | "module" | "block"
+        ) {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn rust_let_bound_from_value(mut node: Node, source: &str) -> Option<String> {
@@ -9419,6 +9872,26 @@ mod tests {
                 .iter()
                 .map(|r| (&r.name, &r.assigned_to, r.kind))
                 .collect::<Vec<_>>(),
+        );
+
+        let cpp = extract_treesitter(
+            "f.cpp",
+            "cpp",
+            "struct S {};\nint driver(S s, S *p) { return 0; }\n",
+        );
+        let cpp_bindings: Vec<(&str, Option<&str>)> = cpp
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Type)
+            .map(|reference| (reference.name.as_str(), reference.assigned_to.as_deref()))
+            .collect();
+        assert!(
+            cpp_bindings.contains(&("S", Some("s"))),
+            "a C++ value parameter type binds its name: {cpp_bindings:?}"
+        );
+        assert!(
+            cpp_bindings.contains(&("S", Some("p"))),
+            "a C++ pointer parameter type binds through its declarator: {cpp_bindings:?}"
         );
 
         // A multi-target assignment binds nothing: `value, err := New()` does

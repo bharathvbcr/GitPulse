@@ -2,6 +2,8 @@
 
 Canonical guide: [CONTRIBUTING.md](https://github.com/bharathvbcr/GitPulse/blob/main/CONTRIBUTING.md). This page is the short path.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and selected DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite. See [Module integration](https://github.com/bharathvbcr/GitPulse/blob/main/docs/MODULE_INTEGRATION.md).
+
 ## Prerequisites
 
 | Tool | Version | Why |

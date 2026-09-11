@@ -30,12 +30,13 @@ pub const REFS_TAG_CAP: usize = 200;
 /// oids so they cannot go stale; the cap only bounds memory.
 const CHURN_CACHE_CAPACITY: usize = 8192;
 
-/// Hard ceiling for reading one working-tree file from disk.
+/// Hard ceiling for reading one file from disk or from a Git object.
 ///
 /// `get_file_blob` loads whole files into memory (and base64-expands binaries
 /// ~1.33x before they cross the IPC boundary), so an unbounded read lets a
-/// multi-GB working-tree file OOM the app. Git-object reads go through
-/// `git`'s output cap; this guards the direct `fs::read` path.
+/// multi-GB working-tree or index blob OOM the app. Working-tree reads go
+/// through [`read_working_tree_file`]; Git-object reads check `cat-file -s`
+/// before `cat-file blob`.
 const MAX_WORKING_TREE_BYTES: u64 = budget::MAX_FILE_BYTES;
 
 /// Hard ceiling on [`GitReader::list_repo_files`]'s payload.
@@ -1231,12 +1232,11 @@ impl GitReader {
             if id.contains(':') {
                 return Err("Invalid revision".into());
             }
-            let spec = format!("{}:{}", id, file_path);
-            git(&repo, &["show", &spec])?
+            read_commit_blob(&repo, id, file_path)?
         } else {
             match sandbox_join_canonical(&repo, file_path) {
                 Ok(dest) if dest.exists() => read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?,
-                Ok(_) => git(&repo, &["show", &format!(":{file_path}")])?,
+                Ok(_) => read_index_blob(&repo, file_path)?,
                 Err(err) if git_cli::is_sandbox_symlink_escape(&err) => {
                     // Outbound Git symlink: return the link text, never the
                     // target. Coverage and the file viewer both hit this for
@@ -1670,12 +1670,14 @@ impl GitReader {
     /// `:(literal)` for the same reason stage/unstage use it: a `*` in a user
     /// path must match a file named `*`, never expand across the worktree.
     /// Emptiness of the listing is the answer, so an untracked path is an
-    /// ordinary `Ok(false)` rather than an error to be interpreted.
+    /// ordinary `Ok(false)` rather than an error to be interpreted. The
+    /// listed path must equal the request: a leaked glob match must not
+    /// answer for a different file.
     pub fn is_tracked(repo_path: &str, file_path: &str) -> Result<bool, String> {
         let repo = validate_repo(repo_path)?;
-        let spec = format!(":(literal){file_path}");
-        let stdout = git_text(&repo, &["ls-files", "-z", "--", &spec])?;
-        Ok(!stdout.trim_matches('\0').is_empty())
+        let spec = literal_pathspec(file_path);
+        let stdout = git_text(&repo, &["ls-files", "-z", "--", spec.as_str()])?;
+        Ok(stdout.split('\0').any(|p| !p.is_empty() && p == file_path))
     }
 
     pub fn knowledge_report(
@@ -2696,6 +2698,203 @@ fn compute_branch_churn(repo: &Path, base: &str, branch: &str) -> Option<Compute
 /// read as magic-pathspec syntax too.
 fn literal_pathspec(path: &str) -> String {
     format!(":(literal){path}")
+}
+
+fn file_not_found(path: &str) -> String {
+    format!("File not found: {path}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexStageEntry {
+    mode: String,
+    oid: String,
+    stage: u8,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    mode: String,
+    kind: String,
+    oid: String,
+    path: String,
+}
+
+const MALFORMED_INDEX_RECORD: &str = "Malformed ls-files --stage record";
+const MALFORMED_TREE_RECORD: &str = "Malformed ls-tree record";
+
+/// Parses `git ls-files -z --stage` records: `<mode> SP <oid> SP <stage> TAB <path> NUL`.
+fn parse_ls_files_stage_z(raw: &[u8]) -> Result<Vec<IndexStageEntry>, String> {
+    let mut entries = Vec::new();
+    for record in raw.split(|&b| b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let tab = record
+            .iter()
+            .position(|&b| b == b'\t')
+            .ok_or(MALFORMED_INDEX_RECORD)?;
+        let meta = std::str::from_utf8(&record[..tab]).map_err(|_| MALFORMED_INDEX_RECORD)?;
+        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| MALFORMED_INDEX_RECORD)?;
+        if path.is_empty() {
+            return Err(MALFORMED_INDEX_RECORD.into());
+        }
+        let mut parts = meta.split_whitespace();
+        let mode = parts.next().ok_or(MALFORMED_INDEX_RECORD)?;
+        let oid = parts.next().ok_or(MALFORMED_INDEX_RECORD)?;
+        let stage_s = parts.next().ok_or(MALFORMED_INDEX_RECORD)?;
+        if parts.next().is_some() {
+            return Err(MALFORMED_INDEX_RECORD.into());
+        }
+        if mode.is_empty() || !mode.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(MALFORMED_INDEX_RECORD.into());
+        }
+        validate_oid(oid).map_err(|_| MALFORMED_INDEX_RECORD)?;
+        let stage: u8 = stage_s.parse().map_err(|_| MALFORMED_INDEX_RECORD)?;
+        if stage > 3 {
+            return Err(MALFORMED_INDEX_RECORD.into());
+        }
+        entries.push(IndexStageEntry {
+            mode: mode.to_string(),
+            oid: oid.to_string(),
+            stage,
+            path: path.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Parses `git ls-tree -z --full-name` records: `<mode> SP <type> SP <oid> TAB <path> NUL`.
+fn parse_ls_tree_z(raw: &[u8]) -> Result<Vec<TreeEntry>, String> {
+    let mut entries = Vec::new();
+    for record in raw.split(|&b| b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let tab = record
+            .iter()
+            .position(|&b| b == b'\t')
+            .ok_or(MALFORMED_TREE_RECORD)?;
+        let meta = std::str::from_utf8(&record[..tab]).map_err(|_| MALFORMED_TREE_RECORD)?;
+        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| MALFORMED_TREE_RECORD)?;
+        if path.is_empty() {
+            return Err(MALFORMED_TREE_RECORD.into());
+        }
+        let mut parts = meta.split_whitespace();
+        let mode = parts.next().ok_or(MALFORMED_TREE_RECORD)?;
+        let kind = parts.next().ok_or(MALFORMED_TREE_RECORD)?;
+        let oid = parts.next().ok_or(MALFORMED_TREE_RECORD)?;
+        if parts.next().is_some() {
+            return Err(MALFORMED_TREE_RECORD.into());
+        }
+        if mode.is_empty() || !mode.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(MALFORMED_TREE_RECORD.into());
+        }
+        if kind.is_empty() || !kind.bytes().all(|b| b.is_ascii_lowercase()) {
+            return Err(MALFORMED_TREE_RECORD.into());
+        }
+        validate_oid(oid).map_err(|_| MALFORMED_TREE_RECORD)?;
+        entries.push(TreeEntry {
+            mode: mode.to_string(),
+            kind: kind.to_string(),
+            oid: oid.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn reject_non_file_git_mode(mode: &str, path: &str) -> Result<(), String> {
+    if mode == "160000" {
+        return Err(format!("Cannot display gitlink: {path}"));
+    }
+    if mode == "040000" {
+        return Err(file_not_found(path));
+    }
+    Ok(())
+}
+
+fn stage0_blob<'a>(
+    entries: &'a [IndexStageEntry],
+    file_path: &str,
+) -> Result<&'a IndexStageEntry, String> {
+    if entries.iter().any(|entry| entry.path != file_path) {
+        return Err("ls-files returned a path other than the requested file".into());
+    }
+    let stage0: Vec<_> = entries.iter().filter(|entry| entry.stage == 0).collect();
+    if stage0.is_empty() {
+        return Err(file_not_found(file_path));
+    }
+    if stage0.len() != 1 {
+        return Err(format!("Ambiguous index entry for '{file_path}'"));
+    }
+    let entry = stage0[0];
+    reject_non_file_git_mode(&entry.mode, file_path)?;
+    Ok(entry)
+}
+
+fn tree_file_blob<'a>(entries: &'a [TreeEntry], file_path: &str) -> Result<&'a TreeEntry, String> {
+    if entries.iter().any(|entry| entry.path != file_path) {
+        return Err("ls-tree returned a path other than the requested file".into());
+    }
+    if entries.is_empty() {
+        return Err(file_not_found(file_path));
+    }
+    if entries.len() != 1 {
+        return Err(format!("Ambiguous tree entry for '{file_path}'"));
+    }
+    let entry = &entries[0];
+    reject_non_file_git_mode(&entry.mode, file_path)?;
+    if entry.kind == "commit" {
+        return Err(format!("Cannot display gitlink: {file_path}"));
+    }
+    if entry.kind != "blob" {
+        return Err(file_not_found(file_path));
+    }
+    Ok(entry)
+}
+
+/// Index blob for a missing working-tree path. Never concatenates the path
+/// into a `git show` object name (`:path` / `:0:path`): those DWIM globs and
+/// revisions, and a missing glob exits 0 with empty stdout.
+fn read_index_blob(repo: &Path, file_path: &str) -> Result<Vec<u8>, String> {
+    let spec = literal_pathspec(file_path);
+    let raw = git(repo, &["ls-files", "-z", "--stage", "--", spec.as_str()])?;
+    let entries = parse_ls_files_stage_z(&raw)?;
+    let entry = stage0_blob(&entries, file_path)?;
+    read_sized_blob(repo, &entry.oid)
+}
+
+/// Commit blob for `file_path` at `rev`. Uses `ls-tree` + `cat-file` rather
+/// than `git show {rev}:{path}`, which treats `*?[` in the path as globs.
+fn read_commit_blob(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<u8>, String> {
+    let spec = literal_pathspec(file_path);
+    let raw = git(
+        repo,
+        &["ls-tree", "-z", "--full-name", rev, "--", spec.as_str()],
+    )?;
+    let entries = parse_ls_tree_z(&raw)?;
+    let entry = tree_file_blob(&entries, file_path)?;
+    read_sized_blob(repo, &entry.oid)
+}
+
+fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
+    validate_oid(oid)?;
+    let size: u64 = git_text(repo, &["cat-file", "-s", oid])?
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid Git object size".to_string())?;
+    if size > MAX_WORKING_TREE_BYTES {
+        return Err(format!(
+            "file exceeds the {} MB working-tree size limit",
+            MAX_WORKING_TREE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = git(repo, &["cat-file", "blob", oid])?;
+    if bytes.len() as u64 != size {
+        return Err("Git object size did not match cat-file".into());
+    }
+    Ok(bytes)
 }
 
 /// Decodes one `\x01`-separated history record laid out by
@@ -3761,6 +3960,75 @@ mod tests {
         );
     }
 
+    fn init_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        dir
+    }
+
+    fn write_and_add_literal(dir: &Path, rel: &str, body: &[u8]) {
+        let dest = dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&dest, body).unwrap();
+        let spec = format!(":(literal){rel}");
+        git_in(dir, &["add", "--", spec.as_str()]);
+    }
+
+    fn seed_commit(dir: &Path) {
+        write_and_add_literal(dir, "keep.txt", b"keep\n");
+        git_in(dir, &["commit", "-q", "-m", "seed"]);
+    }
+
+    /// Names that git's `rev:path` / `:0:path` object grammar treats as globs
+    /// or DWIM revisions rather than a single literal path.
+    const BLOB_DWIM_PATHS: &[&str] = &[
+        "__main__.py",
+        "foo*.py",
+        "*",
+        "foo?.py",
+        "foo[ab].py",
+        ":colon.py",
+        "0:foo.py",
+        "HEAD",
+        "@",
+        "--",
+        "-n.py",
+        ".hidden.py",
+        "weird name.py",
+        "pkg/__main__.py",
+        "foo:bar.py",
+    ];
+
+    fn assert_blob_missing(repo: &Path, path: &str, commit: Option<&str>) {
+        let repo_s = repo.to_string_lossy();
+        match GitReader::get_file_blob(&repo_s, path, commit) {
+            Ok(blob) => panic!(
+                "missing path {path:?} (commit={commit:?}) must not succeed; text={:?} binary={}",
+                blob.text, blob.is_binary
+            ),
+            Err(err) => {
+                assert!(
+                    !err.contains("ambiguous argument"),
+                    "{path}: git DWIM leaked: {err}"
+                );
+                assert!(
+                    !err.contains("unknown revision or path"),
+                    "{path}: git DWIM leaked: {err}"
+                );
+                assert!(
+                    !err.to_lowercase().contains("does not have any commits"),
+                    "{path}: empty-repo HEAD fatal leaked: {err}"
+                );
+                assert!(
+                    err.contains(&format!("File not found: {path}")),
+                    "{path}: expected File not found, got: {err}"
+                );
+            }
+        }
+    }
+
     fn rev_parse(dir: &Path, rev: &str) -> String {
         let out = std::process::Command::new("git")
             .args(["rev-parse", rev])
@@ -4280,6 +4548,275 @@ mod tests {
         assert!(err.contains("working-tree size limit"), "got: {err}");
     }
 
+    /// Coverage.py reports `SF:__main__.py` for `python -m` runs. That path is
+    /// often absent from both the working tree and the index. The index fallback
+    /// used to call `git show :__main__.py`, which git parses as an ambiguous
+    /// revision/pathspec rather than "not in the index", and CoverageViewer
+    /// logged that fatal as a panel warning.
+    #[test]
+    fn get_file_blob_missing_dunder_main_is_not_an_ambiguous_revision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        assert!(output.status.success());
+
+        let err = GitReader::get_file_blob(&dir.path().to_string_lossy(), "__main__.py", None)
+            .expect_err("synthetic coverage.py path is not in this repo");
+        assert!(
+            !err.contains("ambiguous argument"),
+            "index fallback must not pass :__main__.py to git show; got: {err}"
+        );
+        assert!(
+            !err.contains("unknown revision or path"),
+            "git DWIM fatals must not leak as file-content errors; got: {err}"
+        );
+        assert!(
+            err.contains("File not found: __main__.py"),
+            "missing index blob must be a stable not-found error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_file_blob_reads_indexed_dunder_main_after_working_tree_delete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        assert!(output.status.success());
+        std::fs::write(dir.path().join("__main__.py"), "print(1)\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "--", "__main__.py"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git add");
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        std::fs::remove_file(dir.path().join("__main__.py")).unwrap();
+
+        let blob = GitReader::get_file_blob(&dir.path().to_string_lossy(), "__main__.py", None)
+            .expect("index still holds the blob");
+        assert_eq!(blob.text.as_deref(), Some("print(1)\n"));
+    }
+
+    /// `git show :0:foo*.py` (and `HEAD:foo*.py`) on a missing path exits 0
+    /// with empty stdout once the repo has commits. Coverage would then show
+    /// a blank file instead of the empty-state. The index/commit readers must
+    /// not concatenate user paths into git object names.
+    #[test]
+    fn get_file_blob_missing_glob_names_are_not_empty_success() {
+        let dir = init_git_repo();
+        seed_commit(dir.path());
+        let repo = dir.path();
+        for path in ["foo*.py", "*", "foo?.py", "foo[ab].py"] {
+            assert_blob_missing(repo, path, None);
+            assert_blob_missing(repo, path, Some("HEAD"));
+        }
+    }
+
+    #[test]
+    fn get_file_blob_empty_repo_missing_glob_is_not_a_head_fatal() {
+        let dir = init_git_repo();
+        assert_blob_missing(dir.path(), "foo*.py", None);
+        assert_blob_missing(dir.path(), "*", None);
+        assert_blob_missing(dir.path(), "__main__.py", None);
+    }
+
+    #[test]
+    fn get_file_blob_missing_commit_path_is_file_not_found() {
+        let dir = init_git_repo();
+        seed_commit(dir.path());
+        assert_blob_missing(dir.path(), "__main__.py", Some("HEAD"));
+        assert_blob_missing(dir.path(), "foo*.py", Some("HEAD"));
+    }
+
+    #[test]
+    fn get_file_blob_missing_adversarial_names_never_use_object_dwim() {
+        let dir = init_git_repo();
+        seed_commit(dir.path());
+        for path in BLOB_DWIM_PATHS {
+            assert_blob_missing(dir.path(), path, None);
+            assert_blob_missing(dir.path(), path, Some("HEAD"));
+        }
+        let empty = init_git_repo();
+        for path in BLOB_DWIM_PATHS {
+            assert_blob_missing(empty.path(), path, None);
+        }
+    }
+
+    #[test]
+    fn get_file_blob_reads_indexed_glob_and_colon_names_after_worktree_delete() {
+        let dir = init_git_repo();
+        write_and_add_literal(dir.path(), "foo*.py", b"glob-body\n");
+        write_and_add_literal(dir.path(), ":colon.py", b"colon-body\n");
+        write_and_add_literal(dir.path(), "pkg/__main__.py", b"nested-main\n");
+        std::fs::remove_file(dir.path().join("foo*.py")).unwrap();
+        std::fs::remove_file(dir.path().join(":colon.py")).unwrap();
+        std::fs::remove_file(dir.path().join("pkg/__main__.py")).unwrap();
+        let repo = dir.path().to_string_lossy();
+        assert_eq!(
+            GitReader::get_file_blob(&repo, "foo*.py", None)
+                .expect("literal glob name")
+                .text
+                .as_deref(),
+            Some("glob-body\n")
+        );
+        assert_eq!(
+            GitReader::get_file_blob(&repo, ":colon.py", None)
+                .expect("leading-colon name")
+                .text
+                .as_deref(),
+            Some("colon-body\n")
+        );
+        assert_eq!(
+            GitReader::get_file_blob(&repo, "pkg/__main__.py", None)
+                .expect("nested coverage.py name")
+                .text
+                .as_deref(),
+            Some("nested-main\n")
+        );
+    }
+
+    #[test]
+    fn get_file_blob_roundtrips_every_adversarial_name_through_index_and_head() {
+        let dir = init_git_repo();
+        for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
+            write_and_add_literal(dir.path(), path, format!("body-{i}\n").as_bytes());
+        }
+        git_in(dir.path(), &["commit", "-q", "-m", "all names"]);
+        let repo = dir.path().to_string_lossy();
+        for (i, path) in BLOB_DWIM_PATHS.iter().enumerate() {
+            let want = format!("body-{i}\n");
+            assert_eq!(
+                GitReader::get_file_blob(&repo, path, Some("HEAD"))
+                    .unwrap_or_else(|e| panic!("HEAD {path}: {e}"))
+                    .text
+                    .as_deref(),
+                Some(want.as_str()),
+                "HEAD {path}"
+            );
+            std::fs::remove_file(dir.path().join(path)).unwrap();
+            assert_eq!(
+                GitReader::get_file_blob(&repo, path, None)
+                    .unwrap_or_else(|e| panic!("index {path}: {e}"))
+                    .text
+                    .as_deref(),
+                Some(want.as_str()),
+                "index {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_file_content_missing_glob_is_file_not_found() {
+        let dir = init_git_repo();
+        seed_commit(dir.path());
+        let err = GitReader::get_file_content(&dir.path().to_string_lossy(), "foo*.py", None)
+            .expect_err("Coverage reads missing globs via get_file_content");
+        assert!(err.contains("File not found: foo*.py"), "got: {err}");
+    }
+
+    #[test]
+    fn get_file_blob_reads_committed_glob_and_colon_names() {
+        let dir = init_git_repo();
+        write_and_add_literal(dir.path(), "foo*.py", b"glob-head\n");
+        write_and_add_literal(dir.path(), ":colon.py", b"colon-head\n");
+        git_in(dir.path(), &["commit", "-q", "-m", "named"]);
+        let repo = dir.path().to_string_lossy();
+        assert_eq!(
+            GitReader::get_file_blob(&repo, "foo*.py", Some("HEAD"))
+                .expect("commit glob name")
+                .text
+                .as_deref(),
+            Some("glob-head\n")
+        );
+        assert_eq!(
+            GitReader::get_file_blob(&repo, ":colon.py", Some("HEAD"))
+                .expect("commit colon name")
+                .text
+                .as_deref(),
+            Some("colon-head\n")
+        );
+    }
+
+    #[test]
+    fn get_file_blob_empty_indexed_file_is_not_confused_with_a_missing_glob() {
+        let dir = init_git_repo();
+        seed_commit(dir.path());
+        write_and_add_literal(dir.path(), "empty.txt", b"");
+        std::fs::remove_file(dir.path().join("empty.txt")).unwrap();
+        let repo = dir.path().to_string_lossy();
+        let blob = GitReader::get_file_blob(&repo, "empty.txt", None).expect("empty blob");
+        assert_eq!(blob.text.as_deref(), Some(""));
+        assert_blob_missing(dir.path(), "foo*.py", None);
+    }
+
+    #[test]
+    fn get_file_blob_refuses_oversize_index_and_commit_blobs() {
+        let dir = init_git_repo();
+        let oversized = vec![0u8; (MAX_WORKING_TREE_BYTES as usize) + 1];
+        write_and_add_literal(dir.path(), "big.bin", &oversized);
+        std::fs::remove_file(dir.path().join("big.bin")).unwrap();
+        let repo = dir.path().to_string_lossy();
+        let index_err =
+            GitReader::get_file_blob(&repo, "big.bin", None).expect_err("oversized index blob");
+        assert!(
+            index_err.contains("working-tree size limit"),
+            "got: {index_err}"
+        );
+
+        write_and_add_literal(dir.path(), "big.bin", &oversized);
+        git_in(dir.path(), &["commit", "-q", "-m", "huge"]);
+        let commit_err = GitReader::get_file_blob(&repo, "big.bin", Some("HEAD"))
+            .expect_err("oversized commit blob");
+        assert!(
+            commit_err.contains("working-tree size limit"),
+            "got: {commit_err}"
+        );
+    }
+
+    #[test]
+    fn get_file_blob_refuses_index_gitlink() {
+        let dir = init_git_repo();
+        seed_commit(dir.path());
+        let oid = rev_parse(dir.path(), "HEAD");
+        git_in(
+            dir.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{oid},vendor"),
+            ],
+        );
+        let err = GitReader::get_file_blob(&dir.path().to_string_lossy(), "vendor", None)
+            .expect_err("gitlink is not a file blob");
+        assert!(
+            err.contains("gitlink"),
+            "gitlink must not be displayed as an empty file; got: {err}"
+        );
+        assert!(!err.contains("ambiguous argument"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_file_blob_reads_indexed_symlink_text_after_worktree_delete() {
+        let dir = init_git_repo();
+        std::os::unix::fs::symlink("target.py", dir.path().join("link.py")).unwrap();
+        git_in(dir.path(), &["add", "--", "link.py"]);
+        std::fs::remove_file(dir.path().join("link.py")).unwrap();
+        let blob = GitReader::get_file_blob(&dir.path().to_string_lossy(), "link.py", None)
+            .expect("symlink blob");
+        assert_eq!(blob.text.as_deref(), Some("target.py"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn get_file_blob_returns_outbound_symlink_text_not_the_target() {
@@ -4564,6 +5101,154 @@ mod tests {
         assert_eq!(literal_pathspec("weird*.txt"), ":(literal)weird*.txt");
         assert_eq!(literal_pathspec(":3:lockfile"), ":(literal):3:lockfile");
         assert_eq!(literal_pathspec("plain.txt"), ":(literal)plain.txt");
+    }
+
+    const STAGE_OID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STAGE_OID_SHA256: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn parse_ls_files_stage_z_accepts_stage_zero_and_sha256() {
+        let raw = format!("100644 {STAGE_OID} 0\t__main__.py\0").into_bytes();
+        let entries = parse_ls_files_stage_z(&raw).expect("stage record");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mode, "100644");
+        assert_eq!(entries[0].oid, STAGE_OID);
+        assert_eq!(entries[0].stage, 0);
+        assert_eq!(entries[0].path, "__main__.py");
+
+        let sha = format!("100644 {STAGE_OID_SHA256} 0\tfoo.py\0").into_bytes();
+        let hashed = parse_ls_files_stage_z(&sha).expect("sha256 oid");
+        assert_eq!(hashed[0].oid, STAGE_OID_SHA256);
+    }
+
+    #[test]
+    fn parse_ls_files_stage_z_refuses_malformed_records() {
+        assert_eq!(
+            parse_ls_files_stage_z(b"100644 oidonly\0").unwrap_err(),
+            MALFORMED_INDEX_RECORD
+        );
+        assert_eq!(
+            parse_ls_files_stage_z(format!("100644 {STAGE_OID} 0 extra\tfoo.py\0").as_bytes())
+                .unwrap_err(),
+            MALFORMED_INDEX_RECORD
+        );
+        assert_eq!(
+            parse_ls_files_stage_z(format!("100644 {STAGE_OID} 9\tfoo.py\0").as_bytes())
+                .unwrap_err(),
+            MALFORMED_INDEX_RECORD
+        );
+        assert_eq!(
+            parse_ls_files_stage_z(format!("100644 {STAGE_OID} 0\t\0").as_bytes()).unwrap_err(),
+            MALFORMED_INDEX_RECORD
+        );
+        assert_eq!(
+            parse_ls_files_stage_z(
+                format!("100644 {STAGE_OID} 0\tfoo.py\0garbage-no-tab").as_bytes()
+            )
+            .unwrap_err(),
+            MALFORMED_INDEX_RECORD
+        );
+        assert!(parse_ls_files_stage_z(b"").unwrap().is_empty());
+        assert!(parse_ls_files_stage_z(b"\0\0").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage0_blob_requires_exact_path_and_rejects_gitlink() {
+        let blob = IndexStageEntry {
+            mode: "100644".into(),
+            oid: STAGE_OID.into(),
+            stage: 0,
+            path: "foo.py".into(),
+        };
+        assert_eq!(
+            stage0_blob(&[blob.clone()], "foo.py").unwrap().oid,
+            STAGE_OID
+        );
+        assert!(stage0_blob(&[blob.clone()], "other.py")
+            .unwrap_err()
+            .contains("path other than the requested file"));
+        assert_eq!(
+            stage0_blob(&[], "foo.py").unwrap_err(),
+            "File not found: foo.py"
+        );
+        let unmerged = IndexStageEntry {
+            mode: "100644".into(),
+            oid: STAGE_OID.into(),
+            stage: 2,
+            path: "foo.py".into(),
+        };
+        assert_eq!(
+            stage0_blob(&[unmerged], "foo.py").unwrap_err(),
+            "File not found: foo.py"
+        );
+        let link = IndexStageEntry {
+            mode: "160000".into(),
+            oid: STAGE_OID.into(),
+            stage: 0,
+            path: "vendor".into(),
+        };
+        assert!(stage0_blob(&[link], "vendor")
+            .unwrap_err()
+            .contains("gitlink"));
+        let symlink = IndexStageEntry {
+            mode: "120000".into(),
+            oid: STAGE_OID.into(),
+            stage: 0,
+            path: "link.py".into(),
+        };
+        assert_eq!(stage0_blob(&[symlink], "link.py").unwrap().mode, "120000");
+        let dup = [
+            IndexStageEntry {
+                mode: "100644".into(),
+                oid: STAGE_OID.into(),
+                stage: 0,
+                path: "foo.py".into(),
+            },
+            IndexStageEntry {
+                mode: "100755".into(),
+                oid: STAGE_OID.into(),
+                stage: 0,
+                path: "foo.py".into(),
+            },
+        ];
+        assert!(stage0_blob(&dup, "foo.py")
+            .unwrap_err()
+            .contains("Ambiguous index entry"));
+    }
+
+    #[test]
+    fn parse_ls_tree_z_and_tree_file_blob_select_blobs_only() {
+        let raw = format!("100644 blob {STAGE_OID}\tfoo*.py\0").into_bytes();
+        let entries = parse_ls_tree_z(&raw).expect("tree record");
+        assert_eq!(tree_file_blob(&entries, "foo*.py").unwrap().oid, STAGE_OID);
+        assert_eq!(
+            tree_file_blob(&entries, "other.py").unwrap_err(),
+            "ls-tree returned a path other than the requested file"
+        );
+        assert_eq!(
+            tree_file_blob(&[], "__main__.py").unwrap_err(),
+            "File not found: __main__.py"
+        );
+
+        let gitlink = parse_ls_tree_z(format!("160000 commit {STAGE_OID}\tvendor\0").as_bytes())
+            .expect("gitlink record");
+        assert!(tree_file_blob(&gitlink, "vendor")
+            .unwrap_err()
+            .contains("gitlink"));
+        let tree = parse_ls_tree_z(format!("040000 tree {STAGE_OID}\tsrc\0").as_bytes())
+            .expect("tree record");
+        assert_eq!(
+            tree_file_blob(&tree, "src").unwrap_err(),
+            "File not found: src"
+        );
+        assert_eq!(
+            parse_ls_tree_z(b"100644 blob\tfoo.py\0").unwrap_err(),
+            MALFORMED_TREE_RECORD
+        );
+        let symlink = parse_ls_tree_z(format!("120000 blob {STAGE_OID}\tlink.py\0").as_bytes())
+            .expect("symlink record");
+        assert_eq!(tree_file_blob(&symlink, "link.py").unwrap().kind, "blob");
     }
 
     // -------------------------------------------------------------------------

@@ -756,18 +756,44 @@ impl ScannedTree {
     }
 
     pub fn file_delta(&self, previous: &BTreeMap<String, u64>) -> progress::FileDelta {
+        self.file_delta_with_samples(previous, 0).0
+    }
+
+    /// Like [`Self::file_delta`], and collect up to `sample_cap` differing paths
+    /// (added, then changed, then removed) so a status surface can name them.
+    pub fn file_delta_with_samples(
+        &self,
+        previous: &BTreeMap<String, u64>,
+        sample_cap: usize,
+    ) -> (progress::FileDelta, Vec<String>) {
         let mut delta = progress::FileDelta::default();
-        for (path, hash) in self.file_hashes() {
-            match previous.get(path) {
-                None => delta.added += 1,
-                Some(stored) if *stored == hash => delta.unchanged += 1,
-                Some(_) => delta.changed += 1,
+        let mut samples = Vec::new();
+        let mut push = |path: &str| {
+            if samples.len() < sample_cap {
+                samples.push(path.to_string());
+            }
+        };
+        let current: BTreeMap<&str, u64> = self.file_hashes().into_iter().collect();
+        for (path, hash) in &current {
+            match previous.get(*path) {
+                None => {
+                    delta.added += 1;
+                    push(path);
+                }
+                Some(stored) if stored == hash => delta.unchanged += 1,
+                Some(_) => {
+                    delta.changed += 1;
+                    push(path);
+                }
             }
         }
-        delta.removed = previous
-            .len()
-            .saturating_sub(delta.changed + delta.unchanged);
-        delta
+        for path in previous.keys() {
+            if !current.contains_key(path.as_str()) {
+                delta.removed += 1;
+                push(path);
+            }
+        }
+        (delta, samples)
     }
 }
 

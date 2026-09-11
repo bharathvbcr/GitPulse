@@ -119,6 +119,9 @@ dc-store = { path = "vendored/dc-store" }
 devmap-query = { path = "vendored/devmap-query", default-features = false }
 devmap-store = { path = "vendored/devmap-store", default-features = false }
 devmap-resolve = { path = "vendored/devmap-resolve", default-features = false }
+# Path admission only (`is_indexable_source`, fixture dirs, Data liveness).
+# Keep `default-features = false` — this must not pull tree-sitter grammars.
+devmap-extract = { path = "vendored/devmap-extract", default-features = false }
 
 # MarkDev's Markdown parse + tree-sitter highlight core. Default features off
 # so cbindgen / the C ABI stay out of this build; `highlight` pulls the six

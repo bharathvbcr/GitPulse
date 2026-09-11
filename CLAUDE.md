@@ -1,5 +1,14 @@
 # Code navigation for every agent
 
+## Product stack
+
+DevCouncil is **components and modules**. Manvi wraps them. GitPulse uses
+Manvi for policy, workbench, and agent hosting, and DevCouncil components
+(`devmap` CLI, vendored `devmap-*` crates, verification reads) for code
+intelligence. Prefer the existing module rather than copying it. Update one
+module at a time; do not assume the whole suite is required. Canonical write-up:
+[docs/MODULE_INTEGRATION.md](docs/MODULE_INTEGRATION.md).
+
 Start with DevMap in this repository. From the repository root, run
 `devmap paths --json` to resolve the database and `repo_map` paths, then run
 `devmap status --json` before relying on graph answers. Read the resolved

@@ -363,11 +363,7 @@ pub fn verify(
 /// Resolve a contract fact from bundle-level outcome/handoff state or the
 /// final observation. Bundle facts always win over identically named observation
 /// keys so producers cannot override `outcome.*` via forged observation text.
-fn resolve_fact(
-    bundle: &Bundle,
-    latest: Option<&Observation>,
-    fact: &str,
-) -> Option<Value> {
+fn resolve_fact(bundle: &Bundle, latest: Option<&Observation>, fact: &str) -> Option<Value> {
     match fact {
         "outcome.id" => bundle
             .outcome

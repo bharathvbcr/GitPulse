@@ -390,16 +390,18 @@ impl Resolution {
     }
 }
 
-/// Most candidates one ambiguous call site may fan out into.
+/// Most candidates one ambiguous *bare-name* call site may fan out into as
+/// edges.
 ///
-/// The `AmbiguousGlobal` rung emits one `Calls` edge per candidate. Uncapped,
-/// a single call to a name with 200 same-family declarations became 200
-/// persisted edge rows from one call site, and the cost grows with
-/// declarations x call sites rather than with either.
+/// At or below this ceiling every candidate becomes a `Calls` edge (SC4: do
+/// not collapse the ambiguity). Above it the site emits **no** edges and one
+/// ledger row whose `Resolution::AmbiguousGlobal` still carries the complete
+/// candidate list — a capped sample of a 241-candidate site was still 16
+/// wrong edges per call, and GitPulse measured 71% of all edges as
+/// `AmbiguousGlobal` before receiver calls were barred from this rung.
 ///
-/// Capping *emission* only. `Resolution::AmbiguousGlobal` keeps the complete
-/// candidate list, and every edge of a truncated site carries both numbers in
-/// `details`, so a capped sample is never presented as complete coverage.
+/// Receiver calls never reach this rung at all: they resolve only through
+/// receiver evidence, or land in the ledger as External / UninferredReceiver.
 pub const AMBIGUOUS_FANOUT_CAP: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,9 +544,27 @@ pub enum UnresolvedClass {
     /// this is by far the largest group, and it drowned the bare-name failures
     /// that actually indicate an extraction or resolution bug.
     UninferredReceiver,
+    /// A bare-name call or reference that failed every ladder rung, and **no
+    /// indexed symbol carries that bare name**.
+    ///
+    /// Distinct from [`Unresolved`]: when the corpus has no namesake, the miss
+    /// cannot be an extraction gap pointing at a declaration we failed to bind
+    /// — there is nothing to bind. Kept in the ledger for completeness; excluded
+    /// from gap numerators that treat [`Unresolved`] as a defect count.
+    NoNamesake,
+    /// A receiver that is a **module path** into this crate (`crate::`,
+    /// `super::`, `self::`, or a path rooted at a module this file's own `mod`
+    /// / `use` tree names) rather than a value whose type went uninferred.
+    ///
+    /// The path shape is affirmative evidence — the same argument
+    /// [`External`] makes for `std::fs` — so these rows are not bare defects.
+    /// A miss still means the named item was not indexed; it does not mean the
+    /// classifier guessed.
+    ModulePath,
     /// A bare-name call, in a corpus that indexes every file, that its
     /// enclosing scope does not declare and that matched no language builtin,
-    /// no host global and no import.
+    /// no host global and no import — **and** at least one indexed symbol
+    /// shares that bare name (so the miss may be a real bind failure).
     ///
     /// Also the tier for a use bound by an import whose specifier is
     /// **repo-relative** (`.helpers`, `./util`, `super::x`, `crate::y`) and
@@ -554,8 +574,9 @@ pub enum UnresolvedClass {
     /// size cap, generated — and an index gap is worth acting on. Calling it
     /// `External` would file it under "expected".
     ///
-    /// **This is the only tier that indicates a defect** — every other outcome
-    /// is explained by evidence. It is the tier to read when hunting bugs.
+    /// **This is the primary tier that indicates a defect** among bare names —
+    /// every other outcome is explained by evidence. It is the tier to read
+    /// when hunting bugs. See also [`NoNamesake`] and [`ModulePath`].
     Unresolved,
 }
 
@@ -568,6 +589,8 @@ impl UnresolvedClass {
             UnresolvedClass::LocalBinding => "local_binding",
             UnresolvedClass::External { .. } => "external",
             UnresolvedClass::UninferredReceiver => "uninferred_receiver",
+            UnresolvedClass::NoNamesake => "no_namesake",
+            UnresolvedClass::ModulePath => "module_path",
             UnresolvedClass::Unresolved => "unresolved",
         }
     }

@@ -104,10 +104,12 @@ pub struct ResolutionRate {
     pub gross_permille: Permille,
     /// `resolved / (resolved + unresolved - explained)`.
     ///
-    /// The figure worth ratcheting. `Builtin`, `HostGlobal` and `External` are
-    /// misses with affirmative evidence behind them — the language declares the
-    /// name, the runtime does, or an import proves it comes from outside the
-    /// corpus — and no amount of extractor work will ever bind them.
+    /// The figure worth ratcheting. `Builtin`, `HostGlobal`, `External`,
+    /// `NoNamesake` and `ModulePath` are misses with affirmative evidence
+    /// behind them — the language declares the name, the runtime does, an
+    /// import proves it comes from outside the corpus, the corpus has no
+    /// symbol of that name, or the receiver is a module path rather than a
+    /// value — and no amount of extractor work will ever bind them.
     ///
     /// `LocalBinding` is deliberately **kept in the denominator** even though
     /// it is also explained. A call to a value the enclosing function declares
@@ -184,6 +186,8 @@ fn is_explained(row: &UnresolvedReference) -> bool {
         UnresolvedClass::Builtin
             | UnresolvedClass::HostGlobal { .. }
             | UnresolvedClass::External { .. }
+            | UnresolvedClass::NoNamesake
+            | UnresolvedClass::ModulePath
     )
 }
 

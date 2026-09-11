@@ -6,10 +6,11 @@
  * (`decide_live_refresh`) owns stale→refresh / fresh→skip / in-flight→skip;
  * this module only schedules and publishes outcomes.
  *
- * Watcher ticks pass `repoChanged: true`. Becoming the visible repository
- * passes `false` so an obsolete or source-stale map can heal without treating
- * focus as a working-tree edit. Identical `setScope` applies for the same
- * visible key must not re-enqueue: every apply used to restart the 1 Hz
+ * Watcher ticks pass `repoChanged: true`. Opening a tab schedules a status-only
+ * heal for every retained repository, not only the focused one, so a
+ * payload-obsolete map (Manvi sitting behind a DevCouncil rebuild storm) can
+ * upgrade without waiting for focus. Identical `setScope` applies for keys
+ * already offered must not re-enqueue: every apply used to restart the 1 Hz
  * status+build loop after a finished run.
  */
 
@@ -96,8 +97,8 @@ export function createLiveIndex(opts?: {
   const busyRetries = new Map<string, number>();
   /** Keys whose pending/running attempt came from a watcher tick. */
   const dirty = new Set<string>();
-  /** Last visible activation key. Same-key `setScope` must not re-enqueue. */
-  let activationKey: string | null = null;
+  /** Retained keys already offered a status-only heal. Re-open after close. */
+  const offered = new Set<string>();
   let revision = 0;
   const queue = createPacedQueue({
     debounceMs,
@@ -105,6 +106,7 @@ export function createLiveIndex(opts?: {
     restMs: 1_000,
     capacity: 64,
     scope: opts?.scope,
+    runWhen: "retained",
     run,
     onError: (repoPath, error) => {
       busyRetries.delete(repoPath);
@@ -187,6 +189,9 @@ export function createLiveIndex(opts?: {
     setScope(scope) {
       queue.setScope(scope);
       const open = new Set(scope.retainedKeys);
+      for (const key of [...offered]) {
+        if (!open.has(key)) offered.delete(key);
+      }
       snapshots.update((map) => {
         const closed = Object.keys(map).filter((key) => !open.has(key));
         if (!closed.length) return map;
@@ -199,14 +204,23 @@ export function createLiveIndex(opts?: {
         }
         return next;
       });
-      const key = scope.visible && scope.activeKey ? scope.activeKey : null;
-      const shouldActivate = key !== null && key !== activationKey;
-      activationKey = key;
-      if (key !== null && shouldActivate && queue.enqueue(key)) {
+      const scheduled: string[] = [];
+      for (const key of scope.retainedKeys) {
+        if (!key || offered.has(key)) continue;
+        if (!queue.enqueue(key)) continue;
+        offered.add(key);
+        scheduled.push(key);
+      }
+      if (scheduled.length) {
         snapshots.update((map) => {
-          const prev = snapshotFor(map, key);
-          if (prev.phase === "running" || prev.phase === "scheduled") return map;
-          return { ...map, [key]: { ...prev, phase: "scheduled" } };
+          let next = map;
+          for (const key of scheduled) {
+            const prev = snapshotFor(next, key);
+            if (prev.phase === "running" || prev.phase === "scheduled") continue;
+            if (next === map) next = { ...map };
+            next[key] = { ...prev, phase: "scheduled" };
+          }
+          return next;
         });
       }
     },
@@ -247,7 +261,7 @@ export function createLiveIndex(opts?: {
       retained.clear();
       busyRetries.clear();
       dirty.clear();
-      activationKey = null;
+      offered.clear();
       snapshots.set({});
     },
   };

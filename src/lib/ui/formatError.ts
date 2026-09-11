@@ -76,3 +76,15 @@ export function formatError(err: unknown): string {
   const json = stableStringify(err);
   return json ?? UNKNOWN_ERROR;
 }
+
+/**
+ * True when a formatted backend error is the stable missing-file signal from
+ * `get_file_blob` / `get_file_content`. Coverage treats that as an empty
+ * state rather than a diagnostics warning. Match anywhere in the string so a
+ * wrapped IPC message still qualifies; `startsWith` misses those.
+ */
+export function isMissingFileError(reason: string): boolean {
+  // `\b` so "profile not found:" (which contains the letters "file not found:")
+  // cannot qualify. The backend signal is the token `File not found:`.
+  return /\bfile not found:/i.test(reason);
+}

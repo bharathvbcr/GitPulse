@@ -407,6 +407,13 @@ const JS_BUILTINS: &[&str] = &[
 /// File API, XHR, CSSOM/CSSOM View, W3C Background Tasks and the observer
 /// specifications; and the Node.js "Global objects" documentation.
 const HOST_GLOBALS: &[(&str, &str)] = &[
+    // Svelte runes — compiler-injected, not ECMA-262. Sorted before ASCII
+    // letters (`$` < `A`). Authority: Svelte 5 rune documentation.
+    ("$bindable", "svelte"),
+    ("$derived", "svelte"),
+    ("$effect", "svelte"),
+    ("$props", "svelte"),
+    ("$state", "svelte"),
     ("AbortController", "web+node"),
     ("AbortSignal", "web+node"),
     ("Blob", "web+node"),
@@ -1253,9 +1260,9 @@ mod tests {
         );
         for (name, environment) in HOST_GLOBALS {
             assert!(
-                matches!(*environment, "web" | "node" | "web+node"),
+                matches!(*environment, "web" | "node" | "web+node" | "svelte"),
                 "{name:?} names an environment {environment:?} that is not one \
-                 of the three this crate can cite"
+                 of the four this crate can cite"
             );
         }
     }
@@ -1361,6 +1368,18 @@ mod tests {
         assert_eq!(
             host_global_environment(LangFamily::JsTs, "setImmediate"),
             Some("node")
+        );
+        assert_eq!(
+            host_global_environment(LangFamily::JsTs, "$state"),
+            Some("svelte")
+        );
+        assert_eq!(
+            host_global_environment(LangFamily::JsTs, "$derived"),
+            Some("svelte")
+        );
+        assert_eq!(
+            host_global_environment(LangFamily::JsTs, "$effect"),
+            Some("svelte")
         );
 
         // No other family has a global object for these to live on, and a Go

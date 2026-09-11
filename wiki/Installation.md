@@ -42,7 +42,15 @@ GitPulse shells out to tools you already have:
 | `git` | Yes | Every repository operation |
 | `gh` | Optional | PRs, issues, workflow runs, Dependabot and code scanning alerts (fetched when a repository opens) |
 | Local LLM (Ollama, LM Studio, llama.cpp, vLLM) | Optional | Commit messages, explanations, health/coverage suggestions |
-| `manvi` sidecar | Optional | Policy gate; absent → verdicts are **unchecked**, never silently allowed |
+| `manvi` sidecar | Optional | Manvi wrap around DevCouncil modules: policy gate. Absent → verdicts are **unchecked**, never silently allowed |
+| `devmap` CLI | Optional | DevCouncil code-intelligence module for Code → Map. Absent is named; it is not an all-clear |
+
+Setup can install **DevMap only** (default — enough for Code → Map), the **analysis suite** (`devmap`, `dcstore`, `dcverify`, `dcgrep`), or the **full DevCouncil host**. Copy the command, or with a repository open click **Run in terminal** (Console, not the Manvi gate). Settings can disable a tool or uninstall a binary GitPulse itself placed in its app bin directory. These are native Go/Rust binaries — there is no `uv` / Python install path. Standalone from a DevCouncil checkout:
+
+```sh
+bash scripts/install.sh --only=devmap
+bash scripts/install.sh --help
+```
 
 ## Build from source
 

@@ -673,6 +673,26 @@ pub fn go_runtime_entry_reason(
     }
 }
 
+/// Go framework entry points recognised by a parameter's declared type.
+///
+/// Ruleguard rules are ordinary package-level functions whose first parameter
+/// is `dsl.Matcher`. The framework invokes them by reflection; no call site
+/// exists in the corpus. Without this exemption every rule is a confident
+/// dead-code false positive — measured on Manvi as `revealErrorDropped` /
+/// `unexplainedSkip` at the `extracted` tier.
+///
+/// Restricted to the qualifier + bare name actually written, so a local type
+/// named `Matcher` cannot quietly exempt an ordinary helper.
+pub fn go_framework_param_entry_reason(
+    type_name: &str,
+    qualifier: Option<&str>,
+) -> Option<&'static str> {
+    match (qualifier, type_name) {
+        (Some("dsl"), "Matcher") => Some("go-ruleguard invokes the rule through dsl.Matcher"),
+        _ => None,
+    }
+}
+
 /// Metal shader entry points, which the host dispatches by name.
 ///
 /// A `kernel`, `vertex` or `fragment` function is the GPU-side half of a call
@@ -1818,6 +1838,23 @@ mod tests {
         // A method named `init` is callable and is not the package initializer.
         assert!(go_runtime_entry_reason("init", Some("worker"), true).is_none());
         assert!(go_runtime_entry_reason("helper", Some("main"), false).is_none());
+    }
+
+    #[test]
+    fn go_ruleguard_matcher_param_is_a_framework_entry() {
+        assert_eq!(
+            go_framework_param_entry_reason("Matcher", Some("dsl")),
+            Some("go-ruleguard invokes the rule through dsl.Matcher")
+        );
+        assert!(
+            go_framework_param_entry_reason("Matcher", None).is_none(),
+            "a bare Matcher without the dsl qualifier is not ruleguard"
+        );
+        assert!(
+            go_framework_param_entry_reason("Matcher", Some("local")).is_none(),
+            "a local package's Matcher is not ruleguard"
+        );
+        assert!(go_framework_param_entry_reason("T", Some("dsl")).is_none());
     }
 
     #[test]

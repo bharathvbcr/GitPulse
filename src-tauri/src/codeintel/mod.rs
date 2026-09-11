@@ -6,7 +6,8 @@
 
 use crate::engine::git_cli::validate_repo;
 use devmap_query::{
-    Cancel, Request, ResolutionAvailability, Response, Rung, RungHistogram, StoreQueryEngine,
+    Cancel, Request, ResolutionAvailability, Response, Rung, RungHistogram, SourceFreshness,
+    StoreQueryEngine,
 };
 use devmap_resolve::model::ResolvedEdge;
 use devmap_store::{Store, CURRENT_SCHEMA_VERSION};
@@ -86,10 +87,10 @@ impl From<RungHistogram> for CodeintelRungHistogram {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeintelResponse<T> {
-    /// Null means this query did not verify whole-tree freshness. Availability
-    /// and complete traversal of a stored snapshot cannot establish it.
-    #[serde(default)]
-    pub source_freshness: Option<bool>,
+    /// Whole-tree freshness for the generation behind this answer. Always an
+    /// object: `fresh: null` plus a reason means the check did not run — never
+    /// confuse that with a verified stale/fresh bool.
+    pub source_freshness: SourceFreshness,
     pub available: bool,
     pub reason: Option<String>,
     pub items: Vec<T>,
@@ -105,9 +106,15 @@ pub struct CodeintelResponse<T> {
 }
 
 impl<T> CodeintelResponse<T> {
+    fn unverified_freshness() -> SourceFreshness {
+        SourceFreshness::unverified(
+            "this query did not verify whole-tree freshness; ask status for a live check",
+        )
+    }
+
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
-            source_freshness: None,
+            source_freshness: Self::unverified_freshness(),
             available: false,
             reason: Some(reason.into()),
             items: Vec::new(),
@@ -121,7 +128,7 @@ impl<T> CodeintelResponse<T> {
 
     pub fn ok(items: Vec<T>, total: u32, shown: u32, truncated: bool) -> Self {
         Self {
-            source_freshness: None,
+            source_freshness: Self::unverified_freshness(),
             available: true,
             reason: None,
             items,
@@ -131,6 +138,17 @@ impl<T> CodeintelResponse<T> {
             walk_incomplete: None,
             rungs: None,
         }
+    }
+}
+
+fn merge_source_freshness(left: SourceFreshness, right: SourceFreshness) -> SourceFreshness {
+    match (left.fresh, right.fresh) {
+        (Some(false), _) => left,
+        (_, Some(false)) => right,
+        (Some(true), Some(true)) => left,
+        _ => SourceFreshness::unverified(
+            "combined answer did not verify whole-tree freshness for every facet",
+        ),
     }
 }
 
@@ -1495,11 +1513,8 @@ fn append_affected_response<T>(
     existing.items.extend(incoming.items);
     append_affected_reason(&mut existing.reason, incoming.reason);
     append_affected_reason(&mut existing.walk_incomplete, incoming.walk_incomplete);
-    existing.source_freshness = match (existing.source_freshness, incoming.source_freshness) {
-        (Some(false), _) | (_, Some(false)) => Some(false),
-        (Some(true), Some(true)) => Some(true),
-        _ => None,
-    };
+    existing.source_freshness =
+        merge_source_freshness(existing.source_freshness.clone(), incoming.source_freshness);
     existing.rungs = match (existing.rungs.take(), incoming.rungs) {
         (Some(left), Some(right)) => Some(CodeintelRungHistogram {
             deterministic: left.deterministic.saturating_add(right.deterministic),
@@ -2220,10 +2235,10 @@ mod tests {
     fn affected_response_merge_keeps_independent_failure_metadata() {
         let mut first = CodeintelResponse::ok(vec![1], 2, 1, true);
         first.walk_incomplete = Some("parse loss".into());
-        first.source_freshness = Some(true);
+        first.source_freshness = SourceFreshness::verified(true, 1);
         let mut second = CodeintelResponse::unavailable("index unavailable");
         second.walk_incomplete = Some("depth capped".into());
-        second.source_freshness = Some(false);
+        second.source_freshness = SourceFreshness::verified(false, 1);
         let mut combined = Some(first);
         append_affected_response(&mut combined, second);
         let result = combined.unwrap();
@@ -2232,7 +2247,7 @@ mod tests {
         assert_eq!(result.total, 2);
         assert_eq!(result.shown, 1);
         assert!(result.truncated);
-        assert_eq!(result.source_freshness, Some(false));
+        assert_eq!(result.source_freshness.fresh, Some(false));
         let reason = result.walk_incomplete.unwrap();
         assert!(reason.contains("parse loss") && reason.contains("depth capped"));
     }
@@ -2389,7 +2404,12 @@ mod tests {
             .iter()
             .filter(|item| item.reason.as_deref() == Some(FANOUT_OMITTED_REASON))
             .count();
-        assert_eq!(omitted, 4, "{:?}", out.iter().map(|i| &i.reason).collect::<Vec<_>>());
+        assert_eq!(
+            omitted,
+            4,
+            "{:?}",
+            out.iter().map(|i| &i.reason).collect::<Vec<_>>()
+        );
         for item in &out[MAX_NEIGHBOR_TARGETS..] {
             assert_eq!(item.reason.as_deref(), Some(FANOUT_OMITTED_REASON));
             assert!(
@@ -2468,7 +2488,7 @@ mod tests {
             })
             .unwrap();
         response.walk_incomplete = Some("repository-wide attribution coverage is unknown".into());
-        response.source_freshness = Some(false);
+        response.source_freshness = SourceFreshness::verified(false, 1);
         response.rungs = Some(RungHistogram {
             deterministic: 2,
             high: 1,
@@ -2477,7 +2497,7 @@ mod tests {
         });
         let mapped = from_engine(response, |edge| edge.source_symbol);
         assert!(!mapped.available);
-        assert_eq!(mapped.source_freshness, Some(false));
+        assert_eq!(mapped.source_freshness.fresh, Some(false));
         assert_eq!(
             mapped.walk_incomplete.as_deref(),
             Some("repository-wide attribution coverage is unknown")
@@ -2715,10 +2735,21 @@ mod tests {
             serde_json::to_value(search(root, " ", None)).unwrap(),
         ];
         for response in responses {
+            let freshness = response
+                .get("source_freshness")
+                .expect("query envelopes must carry source_freshness");
+            assert!(
+                freshness.is_object(),
+                "source_freshness must be a structured object: {response}"
+            );
             assert_eq!(
-                response.get("source_freshness"),
+                freshness.get("fresh"),
                 Some(&serde_json::Value::Null),
                 "query availability does not verify source freshness: {response}"
+            );
+            assert!(
+                freshness.get("reason").and_then(|v| v.as_str()).is_some(),
+                "unverified freshness must carry a reason: {response}"
             );
         }
     }
@@ -2728,7 +2759,11 @@ mod tests {
         let repo = repo_with_one_generation();
         let store = open_repo_map(repo.path().to_str().unwrap()).unwrap();
         let engine = StoreQueryEngine::new(&store);
-        for verdict in [None, Some(false), Some(true)] {
+        for verdict in [
+            SourceFreshness::unverified("not checked"),
+            SourceFreshness::verified(false, 1),
+            SourceFreshness::verified(true, 1),
+        ] {
             let mut response = engine
                 .search(Request {
                     query: "probe_caller".into(),
@@ -2737,7 +2772,7 @@ mod tests {
                     max_depth: 1,
                 })
                 .unwrap();
-            response.source_freshness = verdict;
+            response.source_freshness = verdict.clone();
             let mapped = from_engine(response, |hit| hit.symbol_name);
             assert_eq!(mapped.source_freshness, verdict);
             assert_eq!(mapped.items, vec!["probe_caller"]);

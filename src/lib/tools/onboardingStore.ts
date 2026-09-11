@@ -24,6 +24,8 @@ import {
   type VerifyReport,
 } from "./externalTools";
 
+import type { DevcouncilPreset } from "./devcouncilInstall";
+
 export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "done";
 
 export interface SetupWizardState {
@@ -31,6 +33,8 @@ export interface SetupWizardState {
   tool: ExternalTool;
   step: WizardStep;
   focusToolOnly: boolean;
+  /** DevCouncil component subset. Ignored when `tool` is `manvi`. */
+  preset: DevcouncilPreset;
 }
 
 const wizard = writable<SetupWizardState>({
@@ -38,6 +42,7 @@ const wizard = writable<SetupWizardState>({
   tool: "devmap",
   step: "explain",
   focusToolOnly: false,
+  preset: "devmap",
 });
 
 const status = writable<ToolsStatus | null>(null);
@@ -97,7 +102,13 @@ export async function refreshToolConfig(): Promise<ToolConfigView | null> {
 }
 
 export function openSetupWizard(tool: ExternalTool = "devmap", step: WizardStep = "explain") {
-  wizard.set({ open: true, tool, step, focusToolOnly: tool !== "devmap" || step !== "explain" });
+  wizard.set({
+    open: true,
+    tool,
+    step,
+    focusToolOnly: tool !== "devmap" || step !== "explain",
+    preset: "devmap",
+  });
   void ensureProgressListener();
   void refreshToolsStatus();
   void refreshToolConfig();
@@ -113,8 +124,12 @@ export function setWizardStep(step: WizardStep) {
 }
 
 export function setWizardTool(tool: ExternalTool) {
-  wizard.update((w) => ({ ...w, tool }));
+  wizard.update((w) => ({ ...w, tool, preset: tool === "devmap" ? w.preset : "devmap" }));
   void loadLadderAndPreflight(tool);
+}
+
+export function setWizardPreset(preset: DevcouncilPreset) {
+  wizard.update((w) => ({ ...w, preset }));
 }
 
 async function loadLadderAndPreflight(tool: ExternalTool) {
@@ -210,3 +225,5 @@ export async function markOnboardingComplete() {
 export async function runVerify(tool: ExternalTool) {
   verify.set(await verifyTool(tool));
 }
+
+export type { DevcouncilPreset };

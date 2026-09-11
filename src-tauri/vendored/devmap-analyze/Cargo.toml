@@ -135,5 +135,13 @@ name = "a_console_script_entry_reaches_its_function"
 required-features = ["parse"]
 
 [[test]]
+name = "ruleguard_framework_entry"
+required-features = ["parse"]
+
+[[test]]
+name = "powershell_coverage_cap"
+required-features = ["parse"]
+
+[[test]]
 name = "unreachable_files_respect_file_liveness"
 required-features = ["parse"]

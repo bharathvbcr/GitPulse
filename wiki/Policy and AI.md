@@ -1,6 +1,6 @@
 # Policy and AI
 
-Mutating Git (commit, push, rebase, branch delete, worktree prune, …) is evaluated by the **MANVI** harness when it is running. GitPulse talks to `manvi serve` over stdio (NDJSON).
+Mutating Git (commit, push, rebase, branch delete, worktree prune, …) is evaluated by the **Manvi** wrap of DevCouncil policy when it is running. GitPulse talks to `manvi serve` over stdio (NDJSON). Code intelligence uses DevCouncil's `devmap` module directly and is not the same sidecar.
 
 ```mermaid
 flowchart TD

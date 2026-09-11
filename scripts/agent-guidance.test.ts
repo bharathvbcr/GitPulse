@@ -17,6 +17,9 @@ it.each(["AGENTS.md", "CLAUDE.md"])("%s is DevMap-pivotal and has no GitNexus bl
   expect(guide).toContain("unavailable");
   expect(guide).toContain("truncated");
   expect(guide).toContain("DevMap is the primary index");
+  expect(guide).toContain("components and modules");
+  expect(guide).toContain("Manvi wraps them");
+  expect(guide).toContain("GitPulse uses");
 });
 
 it("keeps the bundled DevMap skills and plugin marketplace available to Git", () => {

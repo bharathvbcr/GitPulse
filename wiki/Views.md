@@ -2,6 +2,8 @@
 
 GitPulse has **four views**. Each holds sections (lenses) on one subject. Tasks, Fleet and the terminal dock are workspace surfaces outside those four views.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. Work → Policy and Tasks go through Manvi; Code → Map uses DevCouncil's `devmap` module.
+
 ![Files view: explorer, syntax-highlighted viewer, and uncommitted status](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-files.png)
 
 The complete catalog lives in [docs/FEATURES.md](https://github.com/bharathvbcr/GitPulse/blob/main/docs/FEATURES.md). This page is the map.
@@ -16,7 +18,7 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 | **Resolve** | 3-way conflict editor: ours / theirs / base, marker jump, accept current / incoming / both. |
 | **Remote** | PRs and issues in the wide column; workflows, runs, and releases in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
 | **Stack** | Branch hierarchy as a tree. Restack plans the whole subtree before the first rewrite and rebases parent-before-child. |
-| **Policy** | MANVI gate status, merged-branch cleanup, outgoing commit review, release preflight. |
+| **Policy** | Manvi wrap of DevCouncil modules: gate status, merged-branch cleanup, outgoing commit review, release preflight. |
 | **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, Manvi suggestions and agent handoff. |
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.

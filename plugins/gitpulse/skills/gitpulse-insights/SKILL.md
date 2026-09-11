@@ -12,6 +12,8 @@ metadata:
 
 GitPulse's MCP server is **read-only**. It never checks out a branch, writes a file, or takes a task lease. Ask it what is true, then mutate through the agent that already holds the writer lease.
 
+It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process DevMap). Policy and agent hosting go through **Manvi**, not this server.
+
 ## Before you edit
 
 1. Call `gitpulse_insights` with the absolute `repo_path`.

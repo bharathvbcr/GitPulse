@@ -4,6 +4,12 @@ Three products — **GitPulse**, **DevCouncil**, **Manvi** — share five
 artifacts. Each artifact has exactly **one canonical owner**. Everyone else
 links, execs, or speaks the versioned contract in this directory.
 
+**DevCouncil** is the component and module layer. **Manvi** wraps those
+components into a harness. **GitPulse** uses Manvi for policy, workbench, and
+agent hosting, and DevCouncil modules for code intelligence and related
+analysis. Modules stay independently versioned: a host can update one, or take
+only a subset.
+
 This directory is the source of truth. GitPulse and Manvi carry *vendored
 copies*, and each repo's CI fails if its copy has drifted.
 

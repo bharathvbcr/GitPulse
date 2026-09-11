@@ -5,6 +5,8 @@ gives it more room and **Restore terminal size** returns to its previous height.
 Hiding the dock or switching repositories preserves its shells. Closing a terminal
 tab terminates that session; closing a repository tab closes its terminal sessions.
 
+A Manvi session is the wrap around DevCouncil components (policy, agent hosting). GitPulse uses it here without requiring the rest of the DevCouncil suite.
+
 Choose Shell, Claude, Manvi, or Codex in **New session type**, then press **+**.
 Each repository keeps its own tabs. The tab strip scrolls to the selected tab.
 The application allows 16 concurrent sessions across repositories, including
@@ -85,9 +87,9 @@ deadlines. A spawn still unresolved after 15 seconds retains its capacity slot;
 a late process is closed before another can start. Restart waits for confirmed
 native cleanup and drains the old renderer before showing the replacement.
 
-Interactive shells remain user-controlled and run outside the MANVI gate.
+Interactive shells remain user-controlled and run outside the Manvi wrap.
 Console uses the existing direct-command execution path, with bounded output,
-timeouts, and MANVI gating for Git commands. It retains up to 100 commands and
+timeouts, and Manvi gating for Git commands. It retains up to 100 commands and
 100 results / 8 MiB, and discloses removed results. Completion preserves the
 reader's scroll position and does not steal focus from another control.
 

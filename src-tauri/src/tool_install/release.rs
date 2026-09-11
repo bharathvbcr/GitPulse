@@ -74,7 +74,7 @@ fn asset_stem(tool: ExternalTool) -> &'static str {
     tool.as_str()
 }
 
-fn binary_name(tool: ExternalTool) -> &'static str {
+pub(crate) fn binary_name(tool: ExternalTool) -> &'static str {
     if cfg!(windows) {
         match tool {
             ExternalTool::Devmap => "devmap.exe",
@@ -263,9 +263,15 @@ pub fn verify_checksum(path: &Path, expected_hex: &str) -> Result<(), String> {
 }
 
 /// App-owned bin directory for installed prebuilts.
+///
+/// Follows `config_path()` so `GITPULSE_TOOL_CONFIG` tests (and anyone who
+/// relocates tools.json) keep binaries next to that file instead of writing
+/// into the real Application Support directory.
 pub fn app_bin_dir() -> Result<PathBuf, String> {
-    let base = crate::tool_config::default_config_dir()
-        .ok_or_else(|| "cannot resolve config dir for app bin".to_string())?;
+    let cfg = crate::tool_config::config_path()?;
+    let base = cfg
+        .parent()
+        .ok_or_else(|| format!("tools.json path {} has no parent directory", cfg.display()))?;
     let dir = base.join("bin");
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     Ok(dir)
