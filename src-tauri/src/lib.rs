@@ -9,6 +9,7 @@ pub mod devmap;
 pub mod diff;
 pub mod docs;
 pub mod engine;
+mod fs_entry;
 pub mod github;
 pub mod grants;
 pub mod graph;
@@ -151,6 +152,7 @@ pub fn run() {
             cmd_compute_word_diff,
             cmd_syntax_highlight,
             cmd_stage_file,
+            cmd_change_index,
             cmd_unstage_file,
             cmd_stage_selective_patch,
             cmd_unstage_selective_patch,

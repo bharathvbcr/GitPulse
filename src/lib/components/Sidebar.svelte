@@ -6,6 +6,7 @@
   import WorktreesPanel from "./WorktreesPanel.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { formatPathParts } from "../files/formatPath";
+  import { hasUnstagedChanges, statusForSide } from "../files/fileStatus";
   import {
     layoutStore,
     loadSections,
@@ -86,8 +87,8 @@
 
   let query = $derived(fileFilter.trim().toLowerCase());
   let isFiltering = $derived(query.length > 0);
-  let stagedFiles = $derived(statuses.filter((s) => s.is_staged));
-  let unstagedFiles = $derived(statuses.filter((s) => !s.is_staged));
+  let stagedFiles = $derived(statuses.filter((s) => s.is_staged).map((s) => statusForSide(s, true)));
+  let unstagedFiles = $derived(statuses.filter(hasUnstagedChanges).map((s) => statusForSide(s, false)));
   let filteredStaged = $derived(
     isFiltering ? stagedFiles.filter((f) => f.path.toLowerCase().includes(query)) : stagedFiles,
   );

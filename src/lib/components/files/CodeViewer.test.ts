@@ -3,11 +3,19 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compile } from "svelte/compiler";
 import { describe, expect, it } from "vitest";
+import { render } from "svelte/server";
+import CodeViewer from "./CodeViewer.svelte";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "CodeViewer.svelte"), "utf8");
 
 describe("CodeViewer", () => {
+  it("renders immutable previews without an Edit or Save control", () => {
+    const { body } = render(CodeViewer, { props: { filePath: "stash.diff", content: "+new content\n", readOnly: true } });
+    expect(body).not.toContain("<span>Edit</span>");
+    expect(body).not.toContain("Save (⌘S)");
+    expect(body).toContain('aria-readonly="true"');
+  });
   it("integrates syntax tokenizer and language detection", () => {
     expect(source).toContain("detectLanguageFromPath");
     expect(source).toContain("tokenizeLine");

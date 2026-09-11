@@ -465,10 +465,12 @@ if (params.has("check")) {
     check("save bar is not an opaque slab", saveBar.parentElement === editor() && footerAlpha < 1);
     confirmAnswer=true; await click("Close task details");
     failConfiguration=true; await click("New task"); await wait(()=>editor().textContent.includes("Manvi temporarily unavailable"));
-    check("inline configuration failure exposes a working retry", Boolean(button("Reload Manvi configuration")) && !button("Reload Manvi configuration").matches(":disabled"));
-    failConfiguration=false; blankConfiguration=true; await click("Reload Manvi configuration");
-    check("an unconfigured model exposes selection beside drafting", Boolean(editor().querySelector(".model-settings input")) && editor().querySelector(".model-settings").open && button("Improve with Manvi").matches(":disabled"));
-    await change(editor().querySelector(".model-settings input"),"quick-fixture");
+    check("inline configuration failure exposes a working retry", Boolean(button("Retry Manvi configuration")) && !button("Retry Manvi configuration").matches(":disabled"));
+    failConfiguration=false; blankConfiguration=true; await click("Retry Manvi configuration");
+    check("an unconfigured model exposes selection beside drafting", Boolean(editor().querySelector(".manvi-assist .change-link")) && enhanceButton().matches(":disabled"));
+    blankConfiguration=false;
+    await harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "replacement-fixture" });
+    await settle(150);
     await change(editor().querySelector(".notes-label textarea"),"A recoverable task");
     check("choosing a task model recovers drafting without reopening the editor", !button("Draft with Manvi").matches(":disabled"));
     editor().querySelectorAll(".field-picks button").forEach(el=>el.click()); await settle();

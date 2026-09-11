@@ -39,6 +39,10 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
             gitpulse_lib::commands::cmd_list_branches,
             gitpulse_lib::commands::cmd_get_status,
             gitpulse_lib::commands::cmd_stage_file,
+            gitpulse_lib::commands::cmd_change_index,
+            gitpulse_lib::commands::cmd_stash_list,
+            gitpulse_lib::commands::cmd_stash_show,
+            gitpulse_lib::commands::cmd_stash_save,
             gitpulse_lib::commands::cmd_get_commit_graph,
             gitpulse_lib::commands::cmd_branch_stats,
             gitpulse_lib::commands::cmd_get_file_diff,
@@ -901,4 +905,59 @@ fn global_cleaner_ipc_rejects_invalid_policies_and_caller_supplied_execution_aut
     ] {
         assert!(invoke("cmd_cleaner_run", body).is_err());
     }
+}
+
+#[test]
+fn release_index_selection_round_trips_counts_actions_and_validation() {
+    let repo = repo_with_change();
+    for action in ["stage", "unstage"] {
+        let result = invoke("cmd_change_index", json!({ "repoPath": repo.path(), "filePaths": ["README.md", "README.md"], "action": action })).unwrap();
+        assert_eq!(result["output"], 1);
+        assert!(result["policy"]["status"].is_string());
+        let statuses = invoke("cmd_get_status", json!({ "repoPath": repo.path() })).unwrap();
+        assert_eq!(statuses[0]["is_staged"], action == "stage");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "changed\n"
+        );
+    }
+    for body in [
+        json!({ "repoPath": repo.path(), "filePaths": ["README.md"], "action": "erase" }),
+        json!({ "repoPath": repo.path(), "filePaths": "README.md", "action": "stage" }),
+        json!({ "repoPath": repo.path(), "filePaths": ["README.md", "../escape"], "action": "stage" }),
+    ] {
+        assert!(invoke("cmd_change_index", body).is_err());
+    }
+    let statuses = invoke("cmd_get_status", json!({ "repoPath": repo.path() })).unwrap();
+    assert_eq!(statuses[0]["is_staged"], false);
+}
+
+#[test]
+fn release_stash_options_and_preview_preserve_the_ipc_envelopes() {
+    let repo = repo_with_change();
+    std::fs::write(repo.path().join("untracked.txt"), "keep locally\n").unwrap();
+    assert!(invoke(
+        "cmd_stash_save",
+        json!({ "repoPath": repo.path(), "message": "rejected", "options": { "keepIndex": true } })
+    )
+    .is_err());
+    let result = invoke("cmd_stash_save", json!({ "repoPath": repo.path(), "message": "review this", "options": { "include_untracked": false, "keep_index": false } })).unwrap();
+    assert!(result["policy"]["status"].is_string());
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("untracked.txt")).unwrap(),
+        "keep locally\n"
+    );
+    let list = invoke("cmd_stash_list", json!({ "repoPath": repo.path() })).unwrap();
+    assert_eq!(list["truncated"], false);
+    let entries = list["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["message"], "review this");
+    let preview = invoke(
+        "cmd_stash_show",
+        json!({ "repoPath": repo.path(), "oid": entries[0]["oid"] }),
+    )
+    .unwrap();
+    assert!(preview["text"].as_str().unwrap().contains("+changed"));
+    assert_eq!(preview["truncated"], false);
+    assert!(preview["truncation_reason"].is_null());
 }

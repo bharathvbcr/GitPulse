@@ -57,7 +57,7 @@
         cmd_get_file_diff: () => ({ text: "diff --git a/src/change-0.ts b/src/change-0.ts\n", truncated: false, truncation_reason: null }),
         cmd_list_tags: () => ({ tags: [], truncated: false }),
         cmd_repo_operation: a => a.repoPath.includes("review-flow") ? operation : null,
-        cmd_stash_list: () => [], cmd_watch_repo: () => null, cmd_unwatch_repo: () => null,
+        cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_watch_repo: () => null, cmd_unwatch_repo: () => null,
         cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
         cmd_set_recent_menu: () => null,
         cmd_workspace_sync: () => ({ repos: [] }),

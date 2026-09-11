@@ -64,7 +64,7 @@ const policy={status:"unchecked",checked:false,target:"fixture",rule:"",severity
 const fixture={
  cmd_resolve_repo:a=>({path:a.path,name:"GitPulse",is_bare:false}),
  cmd_list_branches:()=>[],cmd_get_status:()=>[...files.map(path=>({path,status_code:"UU",is_staged:false,is_conflicted:true,additions:0,deletions:0})),...[...stagedFiles].map(path=>({path,status_code:"M ",is_staged:true,is_conflicted:false,additions:1,deletions:0}))],
- cmd_list_tags:()=>({tags:[],truncated:false}),cmd_stash_list:()=>[],cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,cmd_list_repo_files:()=>files,
+ cmd_last_fetch_at: () => null, cmd_list_tags:()=>({tags:[],truncated:false}),cmd_stash_list: () => ({ entries: [], truncated: false }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,cmd_list_repo_files:()=>files,
  cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
  cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
  cmd_workspace_sync:()=>({repos:[]}),

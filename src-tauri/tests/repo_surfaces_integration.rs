@@ -98,7 +98,7 @@ fn lists_the_stash_stack_newest_first_with_branches_and_messages() {
     fs::write(dir.join("f.txt"), "second\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "second WIP"]);
 
-    let entries = stash::list(&dir.to_string_lossy()).unwrap();
+    let entries = stash::list(&dir.to_string_lossy()).unwrap().entries;
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].index, 0);
     assert_eq!(entries[0].message, "second WIP");
@@ -115,6 +115,7 @@ fn an_empty_stack_lists_as_empty() {
     commit(repo.path(), "f.txt", "a\n", "c1");
     assert!(stash::list(&repo.path().to_string_lossy())
         .unwrap()
+        .entries
         .is_empty());
 }
 
@@ -126,7 +127,7 @@ fn applying_a_stash_restores_the_changes_and_keeps_the_entry() {
     fs::write(dir.join("f.txt"), "stashed\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "wip"]);
 
-    let entries = stash::list(&dir.to_string_lossy()).unwrap();
+    let entries = stash::list(&dir.to_string_lossy()).unwrap().entries;
     let entry = &entries[0];
     stash::run_action_with(
         &dir.to_string_lossy(),
@@ -139,7 +140,7 @@ fn applying_a_stash_restores_the_changes_and_keeps_the_entry() {
 
     assert_eq!(fs::read_to_string(dir.join("f.txt")).unwrap(), "stashed\n");
     assert_eq!(
-        stash::list(&dir.to_string_lossy()).unwrap().len(),
+        stash::list(&dir.to_string_lossy()).unwrap().entries.len(),
         1,
         "apply must leave the entry on the stack"
     );
@@ -153,7 +154,7 @@ fn popping_a_stash_restores_the_changes_and_removes_the_entry() {
     fs::write(dir.join("f.txt"), "stashed\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "wip"]);
 
-    let entry = stash::list(&dir.to_string_lossy()).unwrap()[0].clone();
+    let entry = stash::list(&dir.to_string_lossy()).unwrap().entries[0].clone();
     stash::run_action_with(
         &dir.to_string_lossy(),
         StashAction::Pop,
@@ -164,7 +165,10 @@ fn popping_a_stash_restores_the_changes_and_removes_the_entry() {
     .unwrap();
 
     assert_eq!(fs::read_to_string(dir.join("f.txt")).unwrap(), "stashed\n");
-    assert!(stash::list(&dir.to_string_lossy()).unwrap().is_empty());
+    assert!(stash::list(&dir.to_string_lossy())
+        .unwrap()
+        .entries
+        .is_empty());
 }
 
 /// The regression the module exists for: the stack moved under the caller, so
@@ -178,7 +182,7 @@ fn a_stale_index_is_refused_rather_than_dropping_the_wrong_entry() {
 
     fs::write(dir.join("f.txt"), "original\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "the one the user saw"]);
-    let stale = stash::list(&dir.to_string_lossy()).unwrap()[0].clone();
+    let stale = stash::list(&dir.to_string_lossy()).unwrap().entries[0].clone();
     assert_eq!(stale.index, 0);
 
     // Something else pushes a stash: every index shifts by one.
@@ -199,7 +203,7 @@ fn a_stale_index_is_refused_rather_than_dropping_the_wrong_entry() {
     );
 
     // Both entries survive: nothing was destroyed.
-    let after = stash::list(&dir.to_string_lossy()).unwrap();
+    let after = stash::list(&dir.to_string_lossy()).unwrap().entries;
     assert_eq!(after.len(), 2);
     assert!(after.iter().any(|e| e.oid == stale.oid));
 }
@@ -211,7 +215,7 @@ fn an_index_past_the_end_of_the_stack_is_refused() {
     commit(dir, "f.txt", "base\n", "base");
     fs::write(dir.join("f.txt"), "x\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "only"]);
-    let entry = stash::list(&dir.to_string_lossy()).unwrap()[0].clone();
+    let entry = stash::list(&dir.to_string_lossy()).unwrap().entries[0].clone();
 
     let err = stash::run_action_with(
         &dir.to_string_lossy(),
@@ -222,7 +226,10 @@ fn an_index_past_the_end_of_the_stack_is_refused() {
     )
     .unwrap_err();
     assert!(err.contains("no longer exists"), "got: {err}");
-    assert_eq!(stash::list(&dir.to_string_lossy()).unwrap().len(), 1);
+    assert_eq!(
+        stash::list(&dir.to_string_lossy()).unwrap().entries.len(),
+        1
+    );
 }
 
 #[test]
@@ -232,7 +239,7 @@ fn a_refused_gate_leaves_the_stash_stack_untouched() {
     commit(dir, "f.txt", "base\n", "base");
     fs::write(dir.join("f.txt"), "x\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "only"]);
-    let entry = stash::list(&dir.to_string_lossy()).unwrap()[0].clone();
+    let entry = stash::list(&dir.to_string_lossy()).unwrap().entries[0].clone();
 
     let err = stash::run_action_with(
         &dir.to_string_lossy(),
@@ -243,7 +250,10 @@ fn a_refused_gate_leaves_the_stash_stack_untouched() {
     )
     .unwrap_err();
     assert_eq!(err, "blocked by policy");
-    assert_eq!(stash::list(&dir.to_string_lossy()).unwrap().len(), 1);
+    assert_eq!(
+        stash::list(&dir.to_string_lossy()).unwrap().entries.len(),
+        1
+    );
 }
 
 #[test]
@@ -253,7 +263,7 @@ fn the_gate_sees_the_selector_for_destructive_verbs_and_the_oid_for_apply() {
     commit(dir, "f.txt", "base\n", "base");
     fs::write(dir.join("f.txt"), "x\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "only"]);
-    let entry = stash::list(&dir.to_string_lossy()).unwrap()[0].clone();
+    let entry = stash::list(&dir.to_string_lossy()).unwrap().entries[0].clone();
 
     let (seen, _) = stash::run_action_with(
         &dir.to_string_lossy(),
@@ -283,14 +293,58 @@ fn showing_a_stash_renders_its_diff() {
     commit(dir, "f.txt", "base\n", "base");
     fs::write(dir.join("f.txt"), "changed\n").unwrap();
     run_git(dir, &["stash", "push", "-u", "-m", "wip"]);
-    let entry = stash::list(&dir.to_string_lossy()).unwrap()[0].clone();
+    let entry = stash::list(&dir.to_string_lossy()).unwrap().entries[0].clone();
 
-    let diff = stash::show(&dir.to_string_lossy(), &entry.oid).unwrap();
+    let diff = stash::show(&dir.to_string_lossy(), &entry.oid)
+        .unwrap()
+        .text;
     assert!(diff.contains("f.txt"), "diff must name the file: {diff}");
     assert!(
         diff.contains("changed"),
         "diff must show the change: {diff}"
     );
+}
+
+#[test]
+fn release_stash_listing_reports_when_older_entries_are_omitted() {
+    let repo = init_repo();
+    let dir = repo.path();
+    commit(dir, "f.txt", "base\n", "base");
+    fs::write(dir.join("f.txt"), "changed\n").unwrap();
+    run_git(dir, &["stash", "push", "-m", "repeated entry"]);
+    // Repeated OIDs are legal stash entries; use Git's own reflog record.
+    let log = dir.join(".git/logs/refs/stash");
+    let record = fs::read_to_string(&log).unwrap();
+    fs::write(log, record.repeat(501)).unwrap();
+    let payload = serde_json::to_value(stash::list(&dir.to_string_lossy()).unwrap()).unwrap();
+    assert_eq!(
+        payload.get("truncated"),
+        Some(&serde_json::Value::Bool(true)),
+        "a capped stack must disclose missing entries"
+    );
+    assert_eq!(payload["entries"].as_array().unwrap().len(), 500);
+}
+
+#[test]
+fn release_stash_preview_reports_its_payload_limit() {
+    let repo = init_repo();
+    let dir = repo.path();
+    commit(dir, "f.txt", "base\n", "base");
+    fs::write(
+        dir.join("f.txt"),
+        format!("{}\n", "content".repeat(20)).repeat(70_000),
+    )
+    .unwrap();
+    run_git(dir, &["stash", "push", "-m", "large refactor"]);
+    let oid = gitpulse_lib::engine::git_cli::git_text(dir, &["rev-parse", "refs/stash"]).unwrap();
+    let payload =
+        serde_json::to_value(stash::show(&dir.to_string_lossy(), oid.trim()).unwrap()).unwrap();
+    assert_eq!(
+        payload.get("truncated"),
+        Some(&serde_json::Value::Bool(true)),
+        "a partial preview must be distinguishable from a complete one"
+    );
+    assert!(payload["text"].as_str().unwrap().len() <= 8 * 1024 * 1024);
 }
 
 #[test]

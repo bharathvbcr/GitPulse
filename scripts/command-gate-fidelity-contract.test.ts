@@ -38,6 +38,10 @@ const WRITER = readFileSync(
  * A NEW unparseable command fails instead of joining this list quietly.
  */
 const DERIVED_ARGV = Object.freeze({
+  cmd_stage_file: "change_index_with builds and judges the same literal argv before executing; native batch regressions verify scope and denial before any write",
+  cmd_unstage_file: "change_index_with shares the path-limited reset plan with the gate; native tests cover unborn branches and preservation of working files",
+  cmd_change_index: "change_index_with judges every bounded chunk before the first write; native stress tests inspect exact argv and late gate denial",
+  cmd_stash_save: "handler and writer both use StashSaveOptions::argv; native option tests verify staged and untracked behavior",
   cmd_hygiene_execute: "hygiene::execute owns the backend plan and gives its exact argv or file boundary to the command gate; native hygiene tests cover denial, changed plans, exact scope and single use",
   cmd_rebase_interactive: "derives the planned sequence; rebase_planned_commands_* mirror tests cover it",
   cmd_stash_action: "argv built from the selected stash OID at runtime",
@@ -175,6 +179,23 @@ describe("the command gate judges the command that actually runs", () => {
     // let a real gap hide behind a justification that stopped applying.
     const stale = Object.keys(DERIVED_ARGV).filter((name) => !derived.includes(name));
     expect(stale, `stale derived-argv entries: ${stale.join(", ")}`).toEqual([]);
+  });
+
+  it("single-file and batch index commands judge the executor's plan", () => {
+    for (const name of ["cmd_stage_file", "cmd_unstage_file", "cmd_change_index"]) {
+      const body = fnBody(PRODUCTION_COMMANDS, name);
+      expect(body).toContain("GitWriter::change_index_with");
+      expect(body).toContain("guard(&repo_path, argv)");
+    }
+    const executor = fnBody(PRODUCTION_WRITER, "change_index_with")!;
+    expect(executor).toContain("judge(&args)?");
+    expect(executor).toContain("git_text(&repo, &args)");
+    expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_text(&repo, &args)"));
+  });
+
+  it("stash save shares its options with the gate", () => {
+    expect(fnBody(PRODUCTION_COMMANDS, "cmd_stash_save")).toContain("options.argv(message.as_deref())");
+    expect(fnBody(PRODUCTION_WRITER, "stash_save_with")).toContain("options.argv(message)");
   });
 
   it.each(literalArgvCommands().compared.map((c) => [c.name, c] as const))(

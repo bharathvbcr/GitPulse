@@ -100,7 +100,7 @@ describe("describeUpdateCheck", () => {
 describe("isDismissed", () => {
   it("matches only the exact dismissed version", () => {
     expect(isDismissed(result({ latestVersion: "1.2.3" }), "1.2.3")).toBe(true);
-    expect(isDismissed(result({ latestVersion: "0.2.0" }), "1.2.3")).toBe(false);
+    expect(isDismissed(result({ latestVersion: "2.3.4" }), "1.2.3")).toBe(false);
     expect(isDismissed(result(), "")).toBe(false);
   });
 
@@ -181,7 +181,7 @@ describe("maybeNotifyUpdate", () => {
 
   it("speaks up again for a newer version than the dismissed one", async () => {
     const d = deps({
-      check: vi.fn().mockResolvedValue(result({ latestVersion: "0.2.0" })),
+      check: vi.fn().mockResolvedValue(result({ latestVersion: "2.3.4" })),
       prefs: {
         checkForUpdates: true,
         lastUpdateCheckAt: 0,

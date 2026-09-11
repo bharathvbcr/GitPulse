@@ -51,7 +51,8 @@
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
           case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
-          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": case "cmd_stash_list": return [];
+          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
+          case "cmd_stash_list": return { entries: [], truncated: false };
           case "cmd_list_tags": return { tags: [], truncated: false };
           case "cmd_branch_stats": return {};
           case "cmd_repo_operation": return null;

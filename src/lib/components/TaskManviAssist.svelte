@@ -132,7 +132,7 @@
   const confirmedModel = $derived(configuration?.model_source === "env" && configuration.model.trim()
     ? (liveSelection ? describeSelection({ base_url: liveSelection.base_url, model: configuration.model }) : `${configuration.provider} / ${configuration.model}`)
     : selectionSummary);
-  const manviReady = $derived(Boolean(liveSelection) && Boolean(configuration?.provider.trim() && configuration?.model.trim()) && !configurationError);
+  const manviReady = $derived(!configPending && Boolean(liveSelection) && Boolean(configuration?.provider.trim() && configuration?.model.trim()) && !configurationError);
   const fieldReason = $derived(
     lockedFields.includes("title") && lockedFields.includes("description")
       ? "Title and description are locked"
@@ -186,6 +186,13 @@
 
   $effect(() => { onBusy(controlsLocked); });
   $effect(() => {
+    // Configuration belongs to the shared model selection. A picker change
+    // must recover this editor without closing it or losing the draft.
+    void liveSelection?.base_url;
+    void liveSelection?.model;
+    untrack(() => { void loadConfig(); });
+  });
+  $effect(() => {
     if (quick && active) untrack(() => { if (!startRequest) { void loadConfig(); void history(); } });
   });
   $effect(() => {
@@ -206,15 +213,22 @@
   });
   async function loadConfig() {
     if (configPending || acting || disabled) return;
+    const selectionKey = JSON.stringify(liveSelection);
     configPending = true;
     try {
       const config = await bounded(enhancementConfiguration(liveSelection));
-      if (disposed) return;
+      if (disposed || selectionKey !== JSON.stringify(liveSelection)) return;
       configuration = config;
       configurationError = null;
     } catch (cause) {
-      if (!disposed) configurationError = explainError(cause);
-    } finally { if (!disposed) configPending = false; }
+      if (!disposed && selectionKey === JSON.stringify(liveSelection)) configurationError = explainError(cause);
+    } finally {
+      if (!disposed) {
+        configPending = false;
+        // Coalesce rapid selection changes into one follow-up request.
+        if (selectionKey !== JSON.stringify(liveSelection)) void loadConfig();
+      }
+    }
   }
 
   async function history(append = false) {

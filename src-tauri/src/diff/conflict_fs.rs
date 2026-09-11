@@ -219,6 +219,10 @@ mod unix {
         Err("Cannot allocate a conflict recovery entry".into())
     }
     fn rename(directory: &File, from: &CString, to: &CString, swap: bool) -> Result<(), String> {
+        if !swap {
+            return crate::fs_entry::rename_noreplace_at(directory, from, directory, to)
+                .map_err(|error| format!("Atomic conflict replacement failed: {error}"));
+        }
         // SAFETY: both names and the shared parent descriptor are live. The
         // kernel either exchanges entries or refuses to replace the target.
         #[cfg(target_os = "macos")]
@@ -228,11 +232,7 @@ mod unix {
                 from.as_ptr(),
                 directory.as_raw_fd(),
                 to.as_ptr(),
-                if swap {
-                    libc::RENAME_SWAP
-                } else {
-                    libc::RENAME_EXCL
-                },
+                libc::RENAME_SWAP,
             )
         };
         #[cfg(target_os = "linux")]
@@ -242,11 +242,7 @@ mod unix {
                 from.as_ptr(),
                 directory.as_raw_fd(),
                 to.as_ptr(),
-                if swap {
-                    libc::RENAME_EXCHANGE
-                } else {
-                    libc::RENAME_NOREPLACE
-                },
+                libc::RENAME_EXCHANGE,
             )
         };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]

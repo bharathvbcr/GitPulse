@@ -24,6 +24,10 @@ export interface StatusLike {
   is_conflicted: boolean;
   additions: number;
   deletions: number;
+  staged_additions?: number;
+  staged_deletions?: number;
+  unstaged_additions?: number;
+  unstaged_deletions?: number;
   warnings?: string[];
 }
 
@@ -47,7 +51,11 @@ export function statusesEqual(a: readonly StatusLike[], b: readonly StatusLike[]
       left.is_staged !== right.is_staged ||
       left.is_conflicted !== right.is_conflicted ||
       left.additions !== right.additions ||
-      left.deletions !== right.deletions
+      left.deletions !== right.deletions ||
+      left.staged_additions !== right.staged_additions ||
+      left.staged_deletions !== right.staged_deletions ||
+      left.unstaged_additions !== right.unstaged_additions ||
+      left.unstaged_deletions !== right.unstaged_deletions
     ) {
       return false;
     }

@@ -4,6 +4,7 @@ import type { ThemePreference } from "../stores/themeStore";
 import { REGISTERED_VIEWS, resolveSection } from "../views/viewRegistry";
 import { actionLabel, blocksOtherMutations, headline } from "../repos/operation";
 import type { NativeEvent } from "./nativeActions";
+import { hasUnstagedChanges } from "../files/fileStatus";
 
 export interface MenuLabel { id: string; text: string }
 export interface MenuRepository {
@@ -126,7 +127,7 @@ export function buildMenuState(
   allow("stash", mutable && changes > 0);
   allow("stash-pop", mutable && !repo.stashFailed && repo.stashEntries.length > 0);
   allow("quick-commit", mutable && changes > 0);
-  allow("stage-all", worktree && repo.statuses.some((file) => !file.is_staged));
+  allow("stage-all", worktree && repo.statuses.some(hasUnstagedChanges));
   allow("unstage-all", worktree && repo.statuses.some((file) => file.is_staged));
   for (const action of ["continue", "abort", "skip"] as const) {
     allow(`operation-${action}`, worktree && !!operation?.available.includes(action)

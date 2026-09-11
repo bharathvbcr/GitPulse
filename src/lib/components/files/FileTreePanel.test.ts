@@ -60,7 +60,8 @@ describe("FileTreePanel", () => {
       menuStart,
     );
     const statusMenu = source.slice(menuStart, menuEnd);
-    const elseIndex = statusMenu.indexOf("{:else}");
+    // Both independent guards must be present: a mixed status offers both.
+    const elseIndex = statusMenu.indexOf("{#if hasUnstagedChanges(status)}");
     const stagedBranch = statusMenu.slice(0, elseIndex);
     const unstagedBranch = statusMenu.slice(elseIndex);
 

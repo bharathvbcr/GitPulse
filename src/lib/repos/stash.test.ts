@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   STASH_ACTIONS,
+  parseStashList,
+  stashEntryKey,
   isDestructiveStashAction,
   isStaleStackError,
   stackMatches,
@@ -12,6 +14,26 @@ import {
   stashTitle,
   type StashEntry,
 } from "./stash";
+
+describe("stash listing contract", () => {
+  it("preserves explicit truncation and duplicate objects at distinct positions", () => {
+    const first = entry();
+    const second = entry({ index: 1, selector: "stash@{1}" });
+    expect(parseStashList({ entries: [first, second], truncated: true })).toEqual({ entries: [first, second], truncated: true });
+    expect(stashEntryKey(first)).not.toBe(stashEntryKey(second));
+  });
+  it.each([null, [], {}, { entries: [], truncated: "false" }, { entries: Array(501).fill(entry()), truncated: false }])("rejects malformed or oversized listings (%j)", (value) => {
+    expect(() => parseStashList(value)).toThrow("Invalid stash listing");
+  });
+  it.each([
+    { index: -1 }, { index: 0.5 }, { selector: "stash@{9}" }, { oid: "--help" }, { timestamp: NaN }, { message: null },
+  ])("refuses an invalid entry without fabricating defaults (%j)", (bad) => {
+    expect(() => parseStashList({ entries: [{ ...entry(), ...bad }], truncated: false })).toThrow("Invalid stash entry");
+  });
+  it("rejects duplicate stack positions", () => {
+    expect(() => parseStashList({ entries: [entry(), entry()], truncated: false })).toThrow("Invalid stash entry");
+  });
+});
 
 function entry(extra: Partial<StashEntry> = {}): StashEntry {
   return {

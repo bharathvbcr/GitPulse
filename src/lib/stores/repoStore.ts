@@ -44,8 +44,9 @@ import {
 } from "../repos/persist";
 import { scheduleWorkspaceSync } from "../codeintel/workspaceSync";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
-import { summarizeBulkOutcome } from "../repos/bulkOps";
-import type { StashAction, StashEntry } from "../repos/stash";
+import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
+import { hasUnstagedChanges } from "../files/fileStatus";
+import { indexSelectionPaths } from "../repos/bulkOps";
 import {
   WATCH_ACTIVE,
   WATCH_UNKNOWN,
@@ -106,6 +107,7 @@ export type { InvokeFn };
 
 /** Mirrors the Rust `ResetMode` under `rename_all = "lowercase"`. */
 export type ResetMode = "soft" | "mixed" | "keep" | "hard";
+export type IndexAction = "stage" | "unstage";
 
 /** How the current selection was created; decides what a preference flip may refetch. */
 export type SelectionKind = "file" | "commit" | "range";
@@ -118,6 +120,10 @@ export interface FileStatus {
   is_conflicted: boolean;
   additions: number;
   deletions: number;
+  staged_additions?: number;
+  staged_deletions?: number;
+  unstaged_additions?: number;
+  unstaged_deletions?: number;
   /**
    * Why this row's additions/deletions may understate reality — its numstat
    * record could not be parsed. Rust omits the key entirely while empty, so
@@ -278,6 +284,7 @@ export interface RepoSession {
   stashEntries: StashEntry[];
   /** True when the stash probe failed, so an empty list is not read as "none". */
   stashFailed: boolean;
+  stashTruncated: boolean;
   /** True when older tags exist beyond the listing cap. */
   tagsTruncated: boolean;
   /** True when the tag list could not be read, so empty is not "no tags". */
@@ -356,6 +363,7 @@ export interface RepoState {
   stashEntries: StashEntry[];
   /** True when the active session's stash probe failed. */
   stashFailed: boolean;
+  stashTruncated: boolean;
   /** True when older tags exist beyond the listing cap. */
   tagsTruncated: boolean;
   /** True when the active session's tag list could not be read. */
@@ -438,6 +446,8 @@ const WATCHER_ECHO_SUPPRESS_MS = 2500;
 const REFETCH_SELECTION_KINDS = new Set([
   "stage",
   "unstage",
+  "stage-all",
+  "unstage-all",
   "stage-patch",
   "unstage-patch",
   "discard",
@@ -477,6 +487,7 @@ function emptyProjected(): RepoState {
     operation: IDLE_OPERATION,
     stashEntries: [],
     stashFailed: false,
+    stashTruncated: false,
     tagsTruncated: false,
     tagsFailed: false,
     watch: WATCH_UNKNOWN,
@@ -528,6 +539,7 @@ function createSession(
     operation: extras.operation ?? IDLE_OPERATION,
     stashEntries: extras.stashEntries ?? [],
     stashFailed: extras.stashFailed ?? false,
+    stashTruncated: extras.stashTruncated ?? false,
     tagsTruncated: extras.tagsTruncated ?? false,
     tagsFailed: extras.tagsFailed ?? false,
     watch: extras.watch ?? WATCH_UNKNOWN,
@@ -550,7 +562,7 @@ function project(internal: InternalState): RepoState {
       pinned: tab.pinned,
       isActive: tab.id === internal.workspace.activeId,
       isBare: session?.isBare ?? false,
-      isDirty: statuses.some((file) => !file.is_staged || file.is_conflicted),
+      isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
       isLoading: session?.isLoading ?? false,
       error: session?.error ?? null,
       currentBranch: session?.currentBranch ?? null,
@@ -595,6 +607,7 @@ function project(internal: InternalState): RepoState {
     operation: active?.operation ?? IDLE_OPERATION,
     stashEntries: active?.stashEntries ?? [],
     stashFailed: active?.stashFailed ?? false,
+    stashTruncated: active?.stashTruncated ?? false,
     tagsTruncated: active?.tagsTruncated ?? false,
     tagsFailed: active?.tagsFailed ?? false,
     watch: active?.watch ?? WATCH_UNKNOWN,
@@ -1038,6 +1051,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     operation: OperationState;
     stashEntries: StashEntry[];
     stashFailed: boolean;
+    stashTruncated: boolean;
     tagsTruncated: boolean;
     tagsFailed: boolean;
     fetchedAt: number | null;
@@ -1059,9 +1073,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // Same fail-soft-but-honest treatment as the operation probe: an empty
       // stash list and an unreadable one must not render the same, because a
       // forgotten stash is work that exists nowhere else.
-      invokeFn<StashEntry[]>("cmd_stash_list", { repoPath: path })
-        .then((entries) => ({ entries: entries ?? [], failed: false }))
-        .catch(() => ({ entries: [] as StashEntry[], failed: true })),
+      invokeFn<unknown>("cmd_stash_list", { repoPath: path })
+        .then((raw) => ({ ...parseStashList(raw), failed: false }))
+        .catch(() => ({ entries: [] as StashEntry[], failed: true, truncated: false })),
       invokeFn<number | null>("cmd_last_fetch_at", { repoPath: path })
         .then((value) => (typeof value === "number" ? value : null))
         .catch(() => null),
@@ -1078,6 +1092,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       operation,
       stashEntries: stash.entries,
       stashFailed: stash.failed,
+      stashTruncated: stash.truncated,
       tagsTruncated: tags.truncated,
       tagsFailed: tags.failed,
       fetchedAt,
@@ -1144,6 +1159,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       operation: OperationState;
       stashEntries: StashEntry[];
       stashFailed: boolean;
+      stashTruncated: boolean;
       tagsTruncated: boolean;
       tagsFailed: boolean;
       fetchedAt: number | null;
@@ -1862,8 +1878,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         await preview;
         return;
       }
-      const file = session.statuses.find(status => isStaged === undefined || status.is_staged === isStaged)
+      const file = session.statuses.find(status => isStaged === undefined || (isStaged ? status.is_staged : hasUnstagedChanges(status)))
         ?? session.statuses[0];
+      const side = isStaged === false && file && hasUnstagedChanges(file) ? false : file?.is_staged ?? false;
       openEpoch += 1;
       // Invalidate late commit/range reads even when this worktree became clean.
       selectionGeneration.next();
@@ -1874,13 +1891,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedDiffTruncated: false,
         selectedDiffTruncationReason: null,
         selectedDiffPending: Boolean(file),
-        selectedIsStaged: file?.is_staged ?? false,
+        selectedIsStaged: side,
         selectionKind: "file",
         activeTab: "history",
         viewSections: { ...session.viewSections, history: "diff" },
       });
       interfaceStore.setFleetOpen(false);
-      if (file) await store.selectFileDiff(file.path, file.is_staged);
+      if (file) await store.selectFileDiff(file.path, side);
     },
     selectFileDiff: async (filePath: string, isStaged: boolean = false) => {
       const session = activeSession();
@@ -2093,10 +2110,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating("stage", filePath, (path) =>
         invokeFn("cmd_stage_file", { repoPath: path, filePath }),
       ),
-    unstageFile: async (filePath: string) =>
-      runMutating("unstage", filePath, (path) =>
-        invokeFn("cmd_unstage_file", { repoPath: path, filePath }),
-      ),
+    unstageFile: async (filePath: string) => {
+      const session = activeSession();
+      if (!session) return { ok: false, error: "No active repository" };
+      const file = session.statuses.find((entry) => entry.path === filePath && entry.is_staged);
+      const filePaths = file ? indexSelectionPaths([file], "unstage") : [filePath];
+      return runMutating("unstage", filePath, (path) => filePaths.length > 1
+        ? invokeFn("cmd_change_index", { repoPath: path, filePaths, action: "unstage" })
+        : invokeFn("cmd_unstage_file", { repoPath: path, filePath }), { session });
+    },
     stageSelectivePatch: async (
       filePatch: FilePatch,
       isStaging: boolean = true,
@@ -2177,10 +2199,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       ),
 
     /** The diff a stash entry holds, addressed by object id. */
-    stashShow: async (oid: string): Promise<string> => {
+    stashShow: async (oid: string): Promise<DiffPayload> => {
       const session = activeSession();
       if (!session) throw new Error("No repository is open.");
-      return invokeFn<string>("cmd_stash_show", { repoPath: session.path, oid });
+      return invokeFn<DiffPayload>("cmd_stash_show", { repoPath: session.path, oid });
     },
 
     // --- replaying and rewinding commits --------------------------------
@@ -2403,9 +2425,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating<ReleasePublishResult>("release-publish", tag, (path) =>
         invokeFn("cmd_publish_release", { repoPath: path, tag, message }),
       ),
-    stashSave: async (message?: string) =>
+    stashSave: async (message?: string, options?: StashSaveOptions) =>
       runMutating("stash", message ?? "", (path) =>
-        invokeFn("cmd_stash_save", { repoPath: path, message }),
+        invokeFn("cmd_stash_save", { repoPath: path, message, options }),
       ),
     stashPop: async () => {
       // The menu/palette "Pop" used to call `git stash pop` on stash@{0}
@@ -2554,7 +2576,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         // An unreadable stash list must not read as an empty one; consumers
         // treat a failed probe as unknown through `stashFailed`/`loadFailed`.
         stashEntries: session?.stashEntries.length ?? 0,
-        stashFailed: Boolean(session?.stashFailed),
+        stashFailed: Boolean(session?.stashFailed || session?.stashTruncated),
         operation: session?.operation ?? IDLE_OPERATION,
         watch: session?.watch ?? WATCH_UNKNOWN,
         loadFailed: Boolean(session?.error),
@@ -2569,22 +2591,29 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return repoFacts().map(toWipInput);
   }
 
-  async function runStageBatch(kind: "stage" | "unstage"): Promise<MutationOutcome> {
+  async function runStageBatch(kind: IndexAction): Promise<MutationOutcome> {
     const session = activeSession();
     if (!session) return { ok: false, error: "No active repository" };
-    const files = session.statuses.filter((file) => file.is_staged === (kind === "unstage"));
-    const finish = beginMutation(session.path, `${kind}-all`);
+    const files = session.statuses.filter((file) => kind === "unstage" ? file.is_staged : hasUnstagedChanges(file));
+    if (files.length === 0) return { ok: true };
+    if (kind === "stage" && files.some((file) => file.is_conflicted)) {
+      return { ok: false, error: "Resolve conflicts before staging all files. Stage each resolved file explicitly." };
+    }
+    const filePaths = indexSelectionPaths(files, kind);
+    const finishActivity = beginMutation(session.path, `${kind}-all`);
     try {
-      const outcomes: MutationOutcome[] = [];
-      for (const file of files) {
-        outcomes.push(await runMutating(kind, file.path, (path) => kind === "stage"
-          ? invokeFn("cmd_stage_file", { repoPath: path, filePath: file.path })
-          : invokeFn("cmd_unstage_file", { repoPath: path, filePath: file.path }),
-        { skipRefresh: true, session, trackActivity: false }));
+      const outcome = await runMutating(`${kind}-all`, `${filePaths.length} paths`, (path) =>
+        invokeFn("cmd_change_index", { repoPath: path, filePaths, action: kind }), { session, trackActivity: false });
+      // Native batches can stop after a completed chunk. Keep activity alive
+      // through recovery and retain the diagnostic after hydration.
+      if (!outcome.ok) {
+        await store.refresh(session.path);
+        applyToSession(session.id, session.generation, { error: outcome.error ?? "Index update failed" });
       }
-      if (files.length > 0) await store.refresh(session.path);
-      return summarizeBulkOutcome(outcomes, kind === "stage" ? "staged" : "unstaged");
-    } finally { finish(); }
+      return outcome;
+    } finally {
+      finishActivity();
+    }
   }
 
   async function runMutating<T = unknown>(

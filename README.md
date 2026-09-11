@@ -58,7 +58,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(206 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(207 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -142,6 +142,8 @@ Manvi suggestions and agent handoff.
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. |
 | **Precision Diff Viewer** | File, commit, and range diffs that name what they show, in a true side-by-side or unified layout sharing one row model. Syntax colouring under the intra-line word diff, find-in-diff with regex, block-to-block stepping, both line-number columns behind a pinned gutter, a filterable and resizable file rail, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging from either layout. |
+| **Batch Index Updates** | Stage or unstage the current selection in one native request, with bounded Git commands, shared mutation locking, and explicit partial-failure recovery. Unstaging a rename includes both paths; new repositories work before their first commit. |
+| **Stash Review** | Save named stashes, include untracked files or keep staged changes, and preview a stash inline before restoring or removing it. Limited lists and previews are labelled. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
 | **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
 | **Fleet Dashboard** | Workspace-wide grid (`Cmd/Ctrl+Shift+F`) covering every open repository and every recent one: changes, sync, conflicts, stash, worktrees, agent sessions and last activity live; lines of code, disk usage, dependency audits and coverage on demand, cached with their age. Every cell is a value, *not scanned*, or *could not read* — never a reassuring zero — and every total states what it could not count. |
@@ -282,9 +284,9 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
-| `npm run check:ipc` | Verify 206 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 207 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
-| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 54 contracts (998 fields) |
+| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 55 contracts (1006 fields) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
 | `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |
 | `npm run mcp:doctor` | Assert the `gitpulse-mcp` on PATH is this tree's build, not a stale copy |
@@ -309,10 +311,15 @@ Publish the draft only after **Verify Release Completeness** succeeds.
 
 ---
 
+macOS bundles use an ad-hoc signature by default so their resources are sealed.
+For trusted distribution, configure `APPLE_SIGNING_IDENTITY` and notarization
+through Tauri's release setup. An ad-hoc build is not a notarized release.
+
 ## In-Depth Documentation
 
 For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
+- **[Git-client release audit](docs/GIT_CLIENT_RELEASE_AUDIT.md)** — Reproduced defects, implemented contracts, test evidence, and remaining qualification gates.
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
 - **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil, devmap and Manvi modules with explicit compatibility checks.

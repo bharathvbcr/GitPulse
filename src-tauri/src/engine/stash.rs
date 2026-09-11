@@ -18,7 +18,8 @@
 //! object id directly (git allows it there), so it addresses the exact commit
 //! and needs no index at all.
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_text, git_text_capped, validate_repo};
+use crate::engine::git_reader::DiffPayload;
 use crate::engine::git_writer::{repo_mutation_lock, validate_oid};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -27,6 +28,14 @@ use std::path::Path;
 /// already pathological; the bound keeps a runaway `.git` from pulling an
 /// unbounded payload through the IPC boundary.
 const MAX_STASH_ENTRIES: usize = 500;
+const MAX_STASH_LIST_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashList {
+    pub entries: Vec<StashEntry>,
+    /// More entries exist, or a byte/record limit prevented a complete read.
+    pub truncated: bool,
+}
 
 /// One entry on the stash stack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,10 +107,11 @@ fn split_subject(subject: &str) -> (Option<String>, String) {
 /// (a truncated read) is dropped rather than filled with defaults: half an
 /// entry addressed by index is precisely the hazard this module exists to
 /// prevent.
-fn parse_stash_list(raw: &str) -> Vec<StashEntry> {
+fn parse_stash_list(raw: &str) -> StashList {
     let fields: Vec<&str> = raw.split('\0').collect();
     let mut entries = Vec::new();
-    let (groups, _remainder) = fields.as_chunks::<4>();
+    let (groups, remainder) = fields.as_chunks::<4>();
+    let mut truncated = groups.len() > MAX_STASH_ENTRIES || remainder.iter().any(|s| !s.is_empty());
     for (position, group) in groups.iter().enumerate() {
         if entries.len() >= MAX_STASH_ENTRIES {
             break;
@@ -110,6 +120,11 @@ fn parse_stash_list(raw: &str) -> Vec<StashEntry> {
         let selector = selector.trim();
         let oid = oid.trim();
         if selector.is_empty() || oid.is_empty() {
+            truncated = true;
+            continue;
+        }
+        if selector != format!("stash@{{{position}}}") || validate_oid(oid).is_err() {
+            truncated = true;
             continue;
         }
         let (branch, message) = split_subject(subject);
@@ -126,28 +141,38 @@ fn parse_stash_list(raw: &str) -> Vec<StashEntry> {
             timestamp: timestamp.trim().parse::<i64>().unwrap_or(0),
         });
     }
-    entries
+    StashList { entries, truncated }
 }
 
 /// Lists the stash stack, newest first.
-pub fn list(repo_path: &str) -> Result<Vec<StashEntry>, String> {
+pub fn list(repo_path: &str) -> Result<StashList, String> {
     let repo = validate_repo(repo_path)?;
     list_in(&repo)
 }
 
-fn list_in(repo: &Path) -> Result<Vec<StashEntry>, String> {
-    let raw = git_text(
+fn list_in(repo: &Path) -> Result<StashList, String> {
+    let (raw, incomplete) = git_text_capped(
         repo,
-        &["stash", "list", "-z", "--format=%gd%x00%H%x00%ct%x00%gs"],
+        &[
+            "stash",
+            "list",
+            "-z",
+            "-n",
+            &(MAX_STASH_ENTRIES + 1).to_string(),
+            "--format=%gd%x00%H%x00%ct%x00%gs",
+        ],
+        MAX_STASH_LIST_BYTES,
     )?;
-    Ok(parse_stash_list(&raw))
+    let mut report = parse_stash_list(&raw);
+    report.truncated |= incomplete.is_some();
+    Ok(report)
 }
 
 /// Renders the diff a stash entry would apply.
 ///
 /// Addressed by object id, so a shifting stack cannot make this show the wrong
 /// entry — it is a read, and a read of the wrong thing is still wrong.
-pub fn show(repo_path: &str, oid: &str) -> Result<String, String> {
+pub fn show(repo_path: &str, oid: &str) -> Result<DiffPayload, String> {
     let repo = validate_repo(repo_path)?;
     validate_oid(oid)?;
     // `-u` includes files the stash captured as untracked, which are otherwise
@@ -159,10 +184,14 @@ pub fn show(repo_path: &str, oid: &str) -> Result<String, String> {
         &["stash", "show", "-p", "-u", oid],
         crate::engine::budget::MAX_DIFF_BYTES,
     )?;
-    Ok(if incomplete.is_some() {
-        crate::engine::budget::drop_partial_last_line(text)
-    } else {
-        text
+    Ok(DiffPayload {
+        text: if incomplete.is_some() {
+            crate::engine::budget::drop_partial_last_line(text)
+        } else {
+            text
+        },
+        truncated: incomplete.is_some(),
+        truncation_reason: incomplete.map(|reason| reason.describe()),
     })
 }
 
@@ -206,12 +235,16 @@ where
     // Re-read the stack under the lock. Anything the caller believed about it
     // is a claim from before it took the lock.
     let entries = list_in(&repo)?;
-    let Some(entry) = entries.iter().find(|e| e.index == index) else {
+    let Some(entry) = entries.entries.iter().find(|e| e.index == index) else {
         return Err(format!(
             "Stash entry {index} no longer exists — the stash stack now holds {} entr{}. \
              Refresh the stash list and try again.",
-            entries.len(),
-            if entries.len() == 1 { "y" } else { "ies" }
+            entries.entries.len(),
+            if entries.entries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
         ));
     };
     if !entry.oid.eq_ignore_ascii_case(expected_oid) {
@@ -251,7 +284,7 @@ mod tests {
             ),
         ]
         .join("\0");
-        let entries = parse_stash_list(&raw);
+        let entries = parse_stash_list(&raw).entries;
         assert_eq!(entries.len(), 2);
 
         assert_eq!(entries[0].index, 0);
@@ -268,8 +301,8 @@ mod tests {
 
     #[test]
     fn an_empty_stack_lists_as_empty_rather_than_erroring() {
-        assert!(parse_stash_list("").is_empty());
-        assert!(parse_stash_list("\0").is_empty());
+        assert!(parse_stash_list("").entries.is_empty());
+        assert!(parse_stash_list("\0").entries.is_empty());
     }
 
     #[test]
@@ -281,7 +314,7 @@ mod tests {
             record("stash@{0}", "aaaa1111", "1700000200", "On main: kept"),
             "stash@{1}\0bbbb2222"
         );
-        let entries = parse_stash_list(&raw);
+        let entries = parse_stash_list(&raw).entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].oid, "aaaa1111");
     }
@@ -316,7 +349,7 @@ mod tests {
     #[test]
     fn an_unparseable_timestamp_reads_as_zero_rather_than_failing_the_listing() {
         let raw = record("stash@{0}", "aaaa1111", "not-a-time", "On main: x");
-        let entries = parse_stash_list(&raw);
+        let entries = parse_stash_list(&raw).entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].timestamp, 0);
     }
@@ -327,7 +360,7 @@ mod tests {
             .map(|i| record(&format!("stash@{{{i}}}"), "aaaa1111", "1", "On main: x"))
             .collect::<Vec<_>>()
             .join("\0");
-        assert_eq!(parse_stash_list(&raw).len(), MAX_STASH_ENTRIES);
+        assert_eq!(parse_stash_list(&raw).entries.len(), MAX_STASH_ENTRIES);
     }
 
     #[test]

@@ -86,6 +86,338 @@ impl TestRepo {
     }
 }
 
+#[test]
+fn release_unstage_before_first_commit_preserves_working_file() {
+    let repo = TestRepo::init();
+    repo.write("new.txt", "staged\n");
+    GitWriter::stage_file(&repo.path_str(), "new.txt").unwrap();
+    repo.write("new.txt", "newer working content\n");
+    GitWriter::unstage_file(&repo.path_str(), "new.txt").unwrap();
+    let statuses = GitReader::get_status(&repo.path_str()).unwrap();
+    assert!(statuses.iter().all(|s| !s.is_staged), "{statuses:?}");
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("new.txt")).unwrap(),
+        "newer working content\n"
+    );
+}
+
+#[test]
+fn release_missing_branch_never_discards_a_same_named_file() {
+    let repo = TestRepo::init();
+    repo.write("topic", "committed\n");
+    repo.commit_all("seed");
+    repo.write("topic", "precious uncommitted work\n");
+    let result = GitWriter::checkout_branch(&repo.path_str(), "topic");
+    let content = fs::read_to_string(repo.dir.path().join("topic")).unwrap();
+    assert_eq!(
+        content, "precious uncommitted work\n",
+        "checkout result: {result:?}"
+    );
+    assert!(result.is_err(), "a filename is not a branch: {result:?}");
+}
+
+#[test]
+fn release_selected_file_commit_preserves_unrelated_index() {
+    let repo = TestRepo::init();
+    repo.write("selected.txt", "old selected\n");
+    repo.write("unrelated.txt", "old unrelated\n");
+    repo.commit_all("seed");
+    repo.write("unrelated.txt", "staged unrelated\n");
+    GitWriter::stage_file(&repo.path_str(), "unrelated.txt").unwrap();
+    repo.write("unrelated.txt", "unstaged unrelated\n");
+    repo.write("selected.txt", "new selected\n");
+    GitWriter::commit_files(&repo.path_str(), "selected only", &["selected.txt".into()]).unwrap();
+    let head = GitReader::head_id(&repo.path_str()).unwrap();
+    let changes = GitReader::get_commit_files(&repo.path_str(), &head).unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "unrelated staged work entered the commit: {changes:?}"
+    );
+    let indexed = Command::new("git")
+        .args(["show", ":unrelated.txt"])
+        .current_dir(repo.dir.path())
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+    assert_eq!(indexed.stdout, b"staged unrelated\n");
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("unrelated.txt")).unwrap(),
+        "unstaged unrelated\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_selected_file_commit_treats_wildcards_literally() {
+    let repo = TestRepo::init();
+    repo.write("*", "selected\n");
+    repo.write("unrelated.txt", "leave alone\n");
+    GitWriter::commit_files(&repo.path_str(), "literal star", &["*".into()]).unwrap();
+    let files = Command::new("git")
+        .args(["ls-tree", "--name-only", "HEAD"])
+        .current_dir(repo.dir.path())
+        .output()
+        .unwrap();
+    assert!(files.status.success());
+    assert_eq!(files.stdout, b"*\n");
+}
+
+#[test]
+fn release_amend_without_message_retains_the_previous_message() {
+    let repo = TestRepo::init();
+    repo.write("file", "old\n");
+    repo.commit_all("preserve this message");
+    repo.write("file", "new\n");
+    GitWriter::stage_file(&repo.path_str(), "file").unwrap();
+    GitWriter::commit(&repo.path_str(), "", true).unwrap();
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(repo.dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"preserve this message\n");
+}
+
+#[test]
+fn release_batch_index_roundtrip_is_bounded_and_preserves_unselected_work() {
+    use gitpulse_lib::engine::git_writer::IndexAction;
+    let repo = TestRepo::init();
+    let files: Vec<String> = (0..1025)
+        .map(|i| format!("changes/file {i} [日本語].txt"))
+        .collect();
+    for file in &files {
+        repo.write(file, "staged content\n");
+    }
+    repo.write("unselected.txt", "never staged\n");
+    let mut judged = Vec::new();
+    let (_, count) =
+        GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |argv| {
+            judged.push(argv.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(count, files.len());
+    assert_eq!(
+        judged.len(),
+        9,
+        "1025 files need nine 128-path chunks, not 1025 processes"
+    );
+    assert!(judged
+        .iter()
+        .all(|args| args.len() <= 131 && args[0..3] == ["git", "add", "--"]));
+    assert!(judged
+        .iter()
+        .flat_map(|args| &args[3..])
+        .all(|p| p.starts_with(":(literal)")));
+    let statuses = GitReader::get_status(&repo.path_str()).unwrap();
+    assert_eq!(statuses.iter().filter(|s| s.is_staged).count(), files.len());
+    assert!(statuses
+        .iter()
+        .any(|s| s.path == "unselected.txt" && !s.is_staged));
+    for file in &files {
+        repo.write(file, "newer working content\n");
+    }
+    let (_, count) =
+        GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Unstage, |_| Ok(()))
+            .unwrap();
+    assert_eq!(count, files.len());
+    assert!(GitReader::get_status(&repo.path_str())
+        .unwrap()
+        .iter()
+        .all(|s| !s.is_staged));
+    for file in &files {
+        assert_eq!(
+            fs::read_to_string(repo.dir.path().join(file)).unwrap(),
+            "newer working content\n"
+        );
+    }
+}
+
+#[test]
+fn release_batch_checks_every_path_and_policy_before_mutating() {
+    use gitpulse_lib::engine::git_writer::IndexAction;
+    let repo = TestRepo::init();
+    repo.write("valid", "preserve\n");
+    for bad in [
+        "".to_string(),
+        "../escape".into(),
+        "bad\0path".into(),
+        "x".repeat(4097),
+    ] {
+        let mut judged = false;
+        assert!(GitWriter::change_index_with(
+            &repo.path_str(),
+            &["valid".into(), bad],
+            IndexAction::Stage,
+            |_| {
+                judged = true;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert!(!judged, "invalid requests must not reach policy or Git");
+    }
+    let too_many = vec!["valid".to_string(); 20_001];
+    assert!(
+        GitWriter::change_index_with(&repo.path_str(), &too_many, IndexAction::Stage, |_| Ok(()))
+            .is_err()
+    );
+    let files: Vec<String> = (0..129).map(|i| format!("file-{i}")).collect();
+    for file in &files {
+        repo.write(file, "work\n");
+    }
+    let mut calls = 0;
+    let result = GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |_| {
+        calls += 1;
+        if calls == 2 {
+            Err("policy unavailable".to_string())
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(result.unwrap_err(), "policy unavailable");
+    assert!(GitReader::get_status(&repo.path_str())
+        .unwrap()
+        .iter()
+        .all(|s| !s.is_staged));
+}
+
+#[test]
+fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
+    use gitpulse_lib::engine::git_writer::IndexAction;
+    let repo = TestRepo::init();
+    repo.write("valid", "work\n");
+    let (_, count) = GitWriter::change_index_with(
+        &repo.path_str(),
+        &["valid".into(), "valid".into()],
+        IndexAction::Stage,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(count, 1);
+    let mut files: Vec<String> = (0..128).map(|i| format!("file-{i}")).collect();
+    for file in &files {
+        repo.write(file, "work\n");
+    }
+    files.push("missing-file".into());
+    let error =
+        GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |_| Ok(()))
+            .unwrap_err();
+    assert!(error.contains("after 128 of 129"), "{error}");
+    assert_eq!(
+        GitReader::get_status(&repo.path_str())
+            .unwrap()
+            .iter()
+            .filter(|s| s.is_staged)
+            .count(),
+        129
+    );
+    let lock = repo.dir.path().join(".git/index.lock");
+    fs::write(&lock, "another writer").unwrap();
+    let error = GitWriter::change_index_with(
+        &repo.path_str(),
+        &["valid".into()],
+        IndexAction::Unstage,
+        |_| Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.contains("after 0 of 1"), "{error}");
+    assert_eq!(fs::read_to_string(lock).unwrap(), "another writer");
+}
+
+#[test]
+fn release_stash_options_keep_staged_work_and_leave_untracked_files() {
+    use gitpulse_lib::engine::git_writer::StashSaveOptions;
+    let repo = TestRepo::init();
+    repo.write("staged", "old\n");
+    repo.write("unstaged", "old\n");
+    repo.commit_all("seed");
+    repo.write("staged", "ready\n");
+    GitWriter::stage_file(&repo.path_str(), "staged").unwrap();
+    repo.write("unstaged", "set aside\n");
+    repo.write("untracked", "leave here\n");
+    let options = StashSaveOptions {
+        include_untracked: false,
+        keep_index: true,
+    };
+    assert_eq!(
+        options.argv(Some("--literal-message")),
+        [
+            "git",
+            "stash",
+            "push",
+            "--keep-index",
+            "-m",
+            "--literal-message"
+        ]
+    );
+    GitWriter::stash_save_with(&repo.path_str(), Some("ready work"), options).unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("staged")).unwrap(),
+        "ready\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("unstaged")).unwrap(),
+        "old\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("untracked")).unwrap(),
+        "leave here\n"
+    );
+    assert!(GitReader::get_status(&repo.path_str())
+        .unwrap()
+        .iter()
+        .any(|s| s.path == "staged" && s.is_staged));
+}
+
+#[test]
+fn release_concurrent_clones_never_remove_another_clones_repository() {
+    let source = TestRepo::init();
+    for i in 0..256 {
+        source.write(&format!("file-{i}.txt"), &"data\n".repeat(2048));
+    }
+    source.commit_all("source");
+    let expected = GitReader::head_id(&source.path_str()).unwrap();
+    let parent = TempDir::new().unwrap();
+    for round in 0..3 {
+        let target = parent.path().join(format!("clone-{round}"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            let url = source.path_str();
+            let dest = target.to_string_lossy().into_owned();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                GitWriter::clone_repo(&url, &dest)
+            }));
+        }
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(
+            outcomes.iter().any(Result::is_ok),
+            "no clone completed: {outcomes:?}"
+        );
+        assert_eq!(
+            GitReader::head_id(target.to_str().unwrap()).unwrap_or_else(|e| panic!(
+                "a failed contender damaged the destination: {e}; {outcomes:?}"
+            )),
+            expected
+        );
+        for path in outcomes.iter().filter_map(|outcome| outcome.as_ref().ok()) {
+            assert_eq!(
+                GitReader::head_id(path).unwrap(),
+                expected,
+                "every reported successful clone must survive the other callers"
+            );
+        }
+    }
+}
+
 /// Regression (NUL-safe record framing): a commit subject containing a raw
 /// 0x01 byte used to be able to split the `log` stream into bogus records
 /// when 0x01 was the record terminator. Framing now terminates records with
@@ -2183,4 +2515,62 @@ fn a_fork_point_that_is_not_an_ancestor_is_refused_rather_than_replaced() {
     let err = GitWriter::prepare_restack(&canon, "feature", "main", Some(sibling_tip.as_str()))
         .expect_err("a fork point off another branch must be refused");
     assert!(err.contains("no longer the stack on disk"), "{err}");
+}
+
+#[test]
+fn release_partial_staging_exposes_both_sides_without_double_counting_files() {
+    let repo = TestRepo::init();
+    repo.write("mixed.txt", "before\n");
+    repo.commit_all("seed");
+    repo.write("mixed.txt", "staged\n");
+    GitWriter::stage_file(&repo.path_str(), "mixed.txt").unwrap();
+    repo.write("mixed.txt", "working\nextra\n");
+    let statuses = GitReader::get_status(&repo.path_str()).unwrap();
+    assert_eq!(statuses.len(), 1);
+    let value = serde_json::to_value(&statuses[0]).unwrap();
+    assert_eq!(value["status_code"], "MM");
+    assert_eq!(value["staged_additions"], 1);
+    assert_eq!(value["staged_deletions"], 1);
+    assert_eq!(value["unstaged_additions"], 2);
+    assert_eq!(value["unstaged_deletions"], 1);
+    assert_eq!(value["additions"], 3);
+    use gitpulse_lib::engine::git_writer::IndexAction;
+    GitWriter::change_index_with(
+        &repo.path_str(),
+        &["mixed.txt".into()],
+        IndexAction::Stage,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(git_out(repo.dir.path(), &["diff", "--", "mixed.txt"]), "");
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("mixed.txt")).unwrap(),
+        "working\nextra\n"
+    );
+}
+
+#[test]
+fn release_unmerged_entries_are_not_reported_as_staged_changes() {
+    let repo = TestRepo::init();
+    repo.write("conflict.txt", "base\n");
+    repo.commit_all("seed");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("conflict.txt", "feature\n");
+    repo.commit_all("feature");
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("conflict.txt", "main\n");
+    repo.commit_all("main");
+    let merge = Command::new("git")
+        .args(["merge", "feature"])
+        .current_dir(repo.dir.path())
+        .output()
+        .unwrap();
+    assert!(!merge.status.success());
+    let statuses = GitReader::get_status(&repo.path_str()).unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert!(statuses[0].is_conflicted);
+    assert!(
+        !statuses[0].is_staged,
+        "unmerged entries must remain in conflict review, not ready to commit: {statuses:?}"
+    );
 }

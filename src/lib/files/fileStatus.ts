@@ -27,6 +27,20 @@ export function isUntrackedStatusCode(code: string): boolean {
   return compact === "?" || compact === "??";
 }
 
+/** Porcelain's index and working-tree columns are independent. */
+export function hasUnstagedChanges(status: Pick<StatusLike, "is_staged" | "status_code">): boolean {
+  return !status.is_staged || (status.status_code.length === 2
+    && status.status_code[1] !== " " && status.status_code[1] !== "?");
+}
+
+/** Project an existing record for a side-specific list without duplicating
+ * repository-wide status rows or counting the combined churn on both sides. */
+export function statusForSide<T extends Pick<StatusLike, "is_staged" | "additions" | "deletions" | "staged_additions" | "staged_deletions" | "unstaged_additions" | "unstaged_deletions">>(status: T, staged: boolean): T {
+  return { ...status, is_staged: staged,
+    additions: (staged ? status.staged_additions : status.unstaged_additions) ?? status.additions,
+    deletions: (staged ? status.staged_deletions : status.unstaged_deletions) ?? status.deletions };
+}
+
 export function classifyFileChange(status: StatusLike | null | undefined): FileChangeKind {
   if (!status) return "clean";
   if (status.is_conflicted) return "conflict";
@@ -43,13 +57,13 @@ export function statusMatchesScope(status: StatusLike | undefined, scope: FileSt
     case "staged":
       return kind === "staged";
     case "unstaged":
-      return kind === "unstaged";
+      return kind !== "conflict" && kind !== "untracked" && hasUnstagedChanges(status);
     case "untracked":
       return kind === "untracked";
     case "conflict":
       return kind === "conflict";
     case "modified":
-      return kind === "unstaged";
+      return kind !== "conflict" && kind !== "untracked" && hasUnstagedChanges(status);
     default:
       return true;
   }
@@ -68,9 +82,11 @@ export function summarizeStatuses(statuses: readonly StatusLike[]): StatusDashbo
   for (const status of statuses) {
     const kind = classifyFileChange(status);
     if (kind === "conflict") next.conflicted += 1;
-    else if (kind === "staged") next.staged += 1;
     else if (kind === "untracked") next.untracked += 1;
-    else next.unstaged += 1;
+    else {
+      if (status.is_staged) next.staged += 1;
+      if (hasUnstagedChanges(status)) next.unstaged += 1;
+    }
     next.additions += status.additions || 0;
     next.deletions += status.deletions || 0;
   }
@@ -184,4 +200,3 @@ export function statusBadgeLabel(kind: FileChangeKind, full = false): string {
       return "";
   }
 }
-
