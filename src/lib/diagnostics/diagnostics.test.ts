@@ -752,11 +752,18 @@ describe("installGlobalDiagnostics", () => {
       message: `Uncaught Error: ${exact}`,
       error: new Error(exact),
     });
-    // Chromium stamps the document URL into filename with lineno/colno 0 and
+    // Chromium/Tauri stamps the document URL into filename with lineno/colno 0 and
     // leaves error null — verified against a genuine observer-loop fixture.
     target.emit("error", {
       message: exact,
       filename: "http://127.0.0.1:58430/harness/diagnostics.html?check=1",
+      lineno: 0,
+      colno: 0,
+      error: null,
+    });
+    target.emit("error", {
+      message: exact,
+      filename: "tauri://localhost/index.html",
       lineno: 0,
       colno: 0,
       error: null,
@@ -773,11 +780,12 @@ describe("installGlobalDiagnostics", () => {
       "browser-resize-observer",
       "browser-resize-observer",
       "browser-resize-observer",
+      "browser-resize-observer",
       "uncaught-error",
       "uncaught-error",
     ]);
-    expect(recorded[7].message).toBe("Uncaught Error: ResizeObserver loop limit exceeded");
-    expect(recorded[8].message).toBe("syntax goop");
+    expect(recorded[8].message).toBe("Uncaught Error: ResizeObserver loop limit exceeded");
+    expect(recorded[9].message).toBe("syntax goop");
     expect(originalError).toHaveBeenCalledTimes(2);
     expect(originalError).toHaveBeenCalledWith("[gitpulse] uncaught error: syntax goop");
     uninstall();

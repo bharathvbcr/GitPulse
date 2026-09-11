@@ -822,9 +822,9 @@ export function isBrowserObserverNoise(message: string): boolean {
   return /^ResizeObserver loop (?:limit exceeded|completed with undelivered notifications)\.?$/.test(text);
 }
 
-/** Document URLs Chromium stamps on ResizeObserver delivery ErrorEvents. */
+/** Document URLs Chromium/WebKit/Tauri stamps on ResizeObserver delivery ErrorEvents. */
 function isDocumentUrlFilename(filename: string): boolean {
-  return /^(?:https?:|file:|about:)/i.test(filename.trim());
+  return /^(?:https?:|file:|about:|tauri:|asset:|ipc:)/i.test(filename.trim());
 }
 
 /**
