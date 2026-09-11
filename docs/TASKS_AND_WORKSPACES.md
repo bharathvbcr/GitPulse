@@ -1,5 +1,9 @@
 # Tasks and workspaces
 
+GitPulse is the successor to the deprecated
+[LiquiTask](https://github.com/bharathvbcr/LiquiTask) workbench. Use this app —
+not LiquiTask — for new boards and agent handoff.
+
 Use **Tasks**, beside Fleet above the repository tabs, to organize work across
 repositories. Use **Work → Tasks** for the active repository. The command palette
 also provides **Open Tasks — global and workspace Kanban boards** and

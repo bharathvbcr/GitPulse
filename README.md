@@ -16,6 +16,14 @@
   <a href="https://gitpulse.vbcr.dev/"><strong>Explore the Live Showcase &amp; Interactive Topology (gitpulse.vbcr.dev) &rarr;</strong></a>
 </p>
 
+> **Successor to LiquiTask.** GitPulse is the unified replacement for the
+> deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask) agentic
+> workbench. LiquiTask's split React / IndexedDB / Go+Python sidecar stack is
+> frozen for performance reasons; task boards, agent handoff, DevCouncil, and
+> DevMap live here as one native control plane. See LiquiTask's
+> [deprecation notice](https://github.com/bharathvbcr/LiquiTask/blob/main/docs/DEPRECATION.md)
+> and [Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md) in this repo.
+
 <p align="center">
   <img src="docs/assets/screenshot-graph.png" alt="GitPulse graph view: canvas commit graph with lanes, ref decorations, and the commit diff pane" width="100%">
 </p>
@@ -323,7 +331,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
 - **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil, devmap and Manvi modules with explicit compatibility checks.
-- **[Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md)** — Shared boards, task editing, Manvi suggestions, agent briefs and run boundaries.
+- **[Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md)** — Shared boards, task editing, Manvi suggestions, agent briefs and run boundaries. GitPulse is the successor to LiquiTask for this surface.
 - **[Command palette](docs/COMMAND_PALETTE.md)** — Eight search modes, availability, paging and keyboard navigation.
 - **[Repository hygiene](docs/REPOSITORY_HYGIENE.md)** — Storage cleanup previews, Fleet/Settings cleanup and scheduling.
 - **[Native menus and status icon](docs/MACOS_MENUS.md)** — Menu actions, repository context and the macOS status popover.
