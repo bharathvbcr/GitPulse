@@ -11,6 +11,11 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Named GitPulse as the successor to the deprecated LiquiTask workbench in the
+  README, wiki home, and Tasks documentation.
+
 ## [1.0.0] - 2026-09-11
 
 Local release candidate: core Git workflow improvements and reliability fixes.
@@ -96,6 +101,8 @@ Publication and cross-platform qualification remain separate release gates.
 - Refresh `@lucide/svelte` 1.44.0, Vite 8.3.0, and `@types/node` 26.5.1.
 - Vendor DevCouncil analysis crates from `rust/` after that workspace flattened
   out of `rust-port/crates`. Include `dc-evidence` so `dc-verify` can link.
+  Re-vendor `dc-verify` so ledger writes keep using `rigor::redact_secrets`.
+- Document GitPulse as the successor to the deprecated LiquiTask workbench.
 
 ## [0.1.0] - 2026-09-10
 

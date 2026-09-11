@@ -432,6 +432,53 @@ fn safe_evidence(line: &str) -> String {
     truncate(trimmed, 120)
 }
 
+/// Redacts vendor-shaped credentials in an arbitrary string.
+///
+/// GitPulse's action ledger is the caller this exists for. It redacts at write
+/// time rather than at display time: display-time redaction protects the screen
+/// and nothing else, because the secret is already on disk.
+///
+/// Each match is replaced with the same prefix-preserving rendering the secret
+/// gate reports. A token is replaced wherever it appears, not only at its
+/// first occurrence.
+pub fn redact_secrets(text: &str) -> String {
+    // Collect first, mutate after. Replacing while scanning would shift the
+    // offsets `matches` just computed, and a pattern matching inside the
+    // replacement text would then redact the redaction.
+    let mut tokens: Vec<(String, usize)> = Vec::new();
+    for line in text.lines() {
+        for pattern in SECRET_PATTERNS {
+            if let Some(token) = pattern.matches(line) {
+                tokens.push((token, pattern.prefix.len()));
+            }
+        }
+    }
+    if tokens.is_empty() {
+        return text.to_string();
+    }
+    // Longest first, so a short prefix cannot partially rewrite a longer token
+    // that contains it and leave the tail in place.
+    tokens.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+
+    let mut out = text.to_string();
+    for (token, keep) in tokens {
+        if !out.contains(&token) {
+            continue;
+        }
+        out = out.replace(&token, &redact(&token, keep));
+    }
+    out
+}
+
+/// Reports whether `text` carries anything the secret gate would stop.
+///
+/// Callers that must *refuse* rather than redact use this: a value that cannot
+/// be safely stored is not the same as one that was stored redacted.
+pub fn contains_secret(text: &str) -> bool {
+    text.lines()
+        .any(|line| SECRET_PATTERNS.iter().any(|p| p.matches(line).is_some()))
+}
+
 /// redact keeps the identifying prefix and hides the rest.
 fn redact(token: &str, keep: usize) -> String {
     let keep = keep.min(token.len());
@@ -577,4 +624,61 @@ fn truncate(text: &str, n: usize) -> String {
     }
     let cut: String = text.chars().take(n).collect();
     format!("{cut}…")
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redacts_a_credential_in_an_argv_line() {
+        let argv = r#"["git","push","https://x-access-token:ghp_0123456789abcdefghijklmnopqrstuvwxyzA@github.com/o/r"]"#;
+        let out = redact_secrets(argv);
+        assert!(
+            !out.contains("ghp_0123456789abcdefghijklmnopqrstuvwxyzA"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ghp_"),
+            "the shape is still identifiable: {out}"
+        );
+        assert!(out.contains("chars)"), "the length is reported: {out}");
+    }
+
+    #[test]
+    fn leaves_ordinary_text_byte_for_byte_alone() {
+        for ordinary in [
+            "git commit -m 'fix the task-runner and disk-cache'",
+            "cargo test --workspace",
+            "",
+            "no credentials here at all",
+        ] {
+            assert_eq!(redact_secrets(ordinary), ordinary, "rewrote {ordinary:?}");
+        }
+    }
+
+    #[test]
+    fn redacts_every_occurrence_not_just_the_first() {
+        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let text = format!("{key} and again {key}");
+        let out = redact_secrets(&text);
+        assert!(!out.contains(key), "a repeated key survived: {out}");
+    }
+
+    #[test]
+    fn contains_secret_agrees_with_redaction() {
+        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        assert!(contains_secret(key));
+        assert!(!contains_secret("cargo build --release"));
+        assert_ne!(redact_secrets(key), key);
+        assert_eq!(redact_secrets("cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn redaction_output_carries_no_secret_of_its_own() {
+        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let once = redact_secrets(key);
+        assert_eq!(redact_secrets(&once), once);
+        assert!(!contains_secret(&once));
+    }
 }

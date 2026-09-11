@@ -713,21 +713,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-evidence"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "dc-glob"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "dc-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "dc-verify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "dc-evidence",
  "dc-glob",
+ "serde_json",
 ]
 
 [[package]]

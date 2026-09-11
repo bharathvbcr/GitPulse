@@ -7,7 +7,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-evidence",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -31,7 +31,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-glob",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -53,7 +53,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -98,7 +98,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-verify",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -117,7 +117,7 @@
         "src/evidence_cli.rs": "129bbd2c98cb1525843d933566b5cbf2399db37d57408eeecb96882ca8de067c",
         "src/json_stdout.rs": "d79284aa1f7d2148266c74151071bf4a1bb6dd3b93e34fafb646bc2d7de10336",
         "src/lib.rs": "6e317c6e7839721f4854719b0a80997c1faf86279e0fb14b6581dd9bb5484185",
-        "src/rigor.rs": "a7373a8df493a9ed0db9addcb0530f6419beae4651854297d3fb96345775d089"
+        "src/rigor.rs": "df8c399778d81836a9595143ce4f0e133cf74c4e41708353686c067e505202c8"
       }
     },
     {
@@ -126,7 +126,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-analyze",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -164,7 +164,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-extract",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -292,7 +292,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-query",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -347,7 +347,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-resolve",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
@@ -376,7 +376,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-store",
-        "commit": "ee595607c977974fad6127382998170ce5b50421"
+        "commit": "1400fe8aef36e039551e06ff8fab9d5a6821cbbf"
       },
       "omitted": [
         "tests/",
