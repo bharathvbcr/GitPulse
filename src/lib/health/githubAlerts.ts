@@ -14,7 +14,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { createRepoPanelCache } from "../panels/repoPanelCache";
 import { formatError } from "../ui/formatError";
 import { normalizeSeverity } from "./format";
-import type { CodeScanningReport, DependabotReport } from "./types";
+import {
+  parseCodeScanningReport,
+  parseDependabotReport,
+  type CodeScanningReport,
+  type DependabotReport,
+} from "./types";
 
 /**
  * Registered backend commands. Module-level literals so
@@ -30,10 +35,10 @@ export interface GithubAlertsCommands {
 }
 
 const defaultCommands: GithubAlertsCommands = {
-  dependabot: (repoPath) =>
-    invoke<DependabotReport>(GITHUB_DEPENDABOT_COMMAND, { repoPath }),
-  codeScanning: (repoPath) =>
-    invoke<CodeScanningReport>(GITHUB_CODE_SCANNING_COMMAND, { repoPath }),
+  dependabot: async (repoPath) =>
+    parseDependabotReport(await invoke(GITHUB_DEPENDABOT_COMMAND, { repoPath })),
+  codeScanning: async (repoPath) =>
+    parseCodeScanningReport(await invoke(GITHUB_CODE_SCANNING_COMMAND, { repoPath })),
 };
 
 /**
@@ -253,11 +258,35 @@ export function seriousGithubFingerprint(snapshot: GithubAlertsSnapshot): string
 }
 
 /**
+ * True when GitHub's own message says the security product is off or has
+ * never produced a result — not a missing scope, not a transport failure.
+ * Mirrors Rust `is_product_disabled_message` in `src-tauri/src/github/mod.rs`.
+ * Empty or whitespace is false.
+ */
+export function isProductDisabledMessage(message: string): boolean {
+  const text = message.trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    text.includes("code scanning is not enabled") ||
+    text.includes("code scanning is disabled") ||
+    text.includes("advanced security must be enabled") ||
+    text.includes("dependabot alerts are disabled") ||
+    text.includes("dependabot alerts are not enabled") ||
+    text.includes("dependabot is not enabled") ||
+    text.includes("dependabot is not currently enabled") ||
+    text.includes("no analysis found")
+  );
+}
+
+/**
  * GitHub explaining that a security product is off for this repository is
  * not a GitPulse check failure. The Health panel still receives
  * `available: false` plus the error; launch diagnostics must not treat the
  * explanation as a warning. Classification is owned by Rust
- * (`unavailable_reason`); this layer only consumes the enum.
+ * (`unavailable_reason`); this layer also recognizes the same product-off
+ * phrases when that field is missing.
  */
 function checkFailureMessage(
   available: boolean,
@@ -274,6 +303,9 @@ function checkFailureMessage(
   if (error == null) return null;
   if (!error.trim()) return error || "GitHub check returned no explanation.";
   if (unavailableReason === "product_disabled" || unavailableReason === "not_github_remote") {
+    return null;
+  }
+  if (isProductDisabledMessage(error)) {
     return null;
   }
   return error;

@@ -135,7 +135,10 @@
    * the Alt+Arrow stepper, or a jump from another pane. Only follows the
    * selection, never the reader's own scrolling.
    */
-  let lastFollowed = $state(-1);
+  /** Last followed row. A plain `let`, never $state: the follow
+   *  effect reads and writes it, and a reactive read there would
+   *  recreate a self-dependency. */
+  let lastFollowed = -1;
   $effect(() => {
     const index = activeIndex;
     if (index < 0 || index === lastFollowed) return;

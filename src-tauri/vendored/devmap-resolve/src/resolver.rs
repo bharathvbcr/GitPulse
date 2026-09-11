@@ -2638,7 +2638,7 @@ impl Resolver {
     /// The two implementations were identical when the table-driven ladder
     /// landed, and two identical copies of path normalisation is how a resolver
     /// starts answering two different questions about one `..`.
-    fn normalize_rel(base_dir: &str, spec: &str) -> String {
+    fn normalize_rel(base_dir: &str, spec: &str) -> Option<String> {
         crate::importpath::normalize_rel(base_dir, spec)
     }
 
@@ -3222,7 +3222,7 @@ impl Resolver {
         files
     }
 
-    fn apply_go_replace(&self, spec: &str) -> (String, Option<String>) {
+    fn apply_go_replace(&self, spec: &str) -> Option<(String, Option<String>)> {
         let mut best: Option<(&GoModule, &(String, String))> = None;
         for module in &self.go_modules {
             for replace in &module.replaces {
@@ -3235,7 +3235,7 @@ impl Resolver {
             }
         }
         let Some((module, (from, to))) = best else {
-            return (spec.to_string(), None);
+            return Some((spec.to_string(), None));
         };
         let suffix = spec[from.len()..].trim_start_matches('/');
         let joined = if to.starts_with('.') || to.starts_with('/') {
@@ -3244,7 +3244,7 @@ impl Resolver {
             } else {
                 module.dir.as_str()
             };
-            let replaced = Self::normalize_rel(base, to);
+            let replaced = Self::normalize_rel(base, to)?;
             if suffix.is_empty() {
                 replaced
             } else {
@@ -3255,7 +3255,7 @@ impl Resolver {
         } else {
             format!("{to}/{suffix}")
         };
-        (spec.to_string(), Some(joined))
+        Some((spec.to_string(), Some(joined)))
     }
 
     fn resolve_go_import(&self, specifier: &str) -> Vec<String> {
@@ -3263,7 +3263,9 @@ impl Resolver {
         if spec.is_empty() || spec == "C" {
             return Vec::new();
         }
-        let (original, replaced) = self.apply_go_replace(spec);
+        let Some((original, replaced)) = self.apply_go_replace(spec) else {
+            return Vec::new();
+        };
         if let Some(replaced_dir) = replaced {
             let files = self.go_files_in_dir(&replaced_dir);
             if !files.is_empty() {
@@ -3382,7 +3384,9 @@ impl Resolver {
         }
         let mut directories: Vec<String> = Vec::new();
         for root in rule.roots {
-            let dir = crate::importpath::normalize_rel(root, &relative);
+            let Some(dir) = crate::importpath::normalize_rel(root, &relative) else {
+                continue;
+            };
             // The repository root is never a package. Without this an
             // unqualified wildcard would link its importer to every file in the
             // corpus — the one shape of this expansion that is not merely large
@@ -3410,8 +3414,11 @@ impl Resolver {
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
             return Vec::new();
         }
-        let directory =
-            crate::importpath::normalize_rel(&Self::parent_dir(current_file), specifier);
+        let Some(directory) =
+            crate::importpath::normalize_rel(&Self::parent_dir(current_file), specifier)
+        else {
+            return Vec::new();
+        };
         if directory.is_empty() {
             return Vec::new();
         }
@@ -3987,7 +3994,7 @@ impl Resolver {
         // `import { helper } from "./helpers"` was classified as an *external*
         // import — the corpus was told a local file came from outside it.
         if LangFamily::from_lang(lang) == LangFamily::JsTs && clean_spec.starts_with('.') {
-            let base = Self::normalize_rel(&dir, clean_spec);
+            let base = Self::normalize_rel(&dir, clean_spec)?;
             let candidates = [
                 base.clone(),
                 format!("{}.ts", base),
@@ -4154,7 +4161,9 @@ impl Resolver {
             while !parts.is_empty() {
                 let module_path = parts.join("/");
                 for module_dir in &bases {
-                    let base = Self::normalize_rel(module_dir, &module_path);
+                    let Some(base) = Self::normalize_rel(module_dir, &module_path) else {
+                        continue;
+                    };
                     // `base` itself, before the two conventional forms: a
                     // `#[path = "generated/tables.rs"] mod tables;` reaches this
                     // rung as `self::generated/tables.rs`, and the extension is
@@ -4935,14 +4944,18 @@ mod import_resolution_tests {
 
         // `apply_go_replace` returns (original spec, replacement target); the
         // replacement is the second element.
-        let (_, specific) = resolver.apply_go_replace("example.com/lib/inner/pkg");
+        let (_, specific) = resolver
+            .apply_go_replace("example.com/lib/inner/pkg")
+            .expect("replacement stays in the repository");
         assert_eq!(
             specific.as_deref(),
             Some("vendor/inner/pkg"),
             "the longer prefix must win"
         );
 
-        let (_, general) = resolver.apply_go_replace("example.com/lib/other");
+        let (_, general) = resolver
+            .apply_go_replace("example.com/lib/other")
+            .expect("replacement stays in the repository");
         assert_eq!(
             general.as_deref(),
             Some("vendor/lib/other"),
@@ -4950,7 +4963,9 @@ mod import_resolution_tests {
         );
 
         // A specifier matching neither prefix yields no replacement at all.
-        let (spec, untouched) = resolver.apply_go_replace("other.com/thing");
+        let (spec, untouched) = resolver
+            .apply_go_replace("other.com/thing")
+            .expect("replacement stays in the repository");
         assert_eq!(spec, "other.com/thing");
         assert_eq!(untouched, None, "a non-matching spec must not be rewritten");
     }
@@ -4970,7 +4985,9 @@ mod import_resolution_tests {
             module("sub", "m2", &[("example.com/dup", "./second")]),
         ]);
 
-        let (_, target) = resolver.apply_go_replace("example.com/dup");
+        let (_, target) = resolver
+            .apply_go_replace("example.com/dup")
+            .expect("replacement stays in the repository");
         assert_eq!(
             target.as_deref(),
             Some("first"),
@@ -4979,7 +4996,9 @@ mod import_resolution_tests {
 
         // Repeat: the answer must not depend on iteration order across calls.
         for _ in 0..3 {
-            let (_, again) = resolver.apply_go_replace("example.com/dup");
+            let (_, again) = resolver
+                .apply_go_replace("example.com/dup")
+                .expect("replacement stays in the repository");
             assert_eq!(again.as_deref(), Some("first"), "resolution must be stable");
         }
     }
@@ -4993,7 +5012,9 @@ mod import_resolution_tests {
     fn local_replace_targets_are_recognised_by_either_marker() {
         let mut dot = Resolver::new();
         dot.index_go_modules(&[module("", "m", &[("example.com/a", "./local/a")])]);
-        let (_, dot_target) = dot.apply_go_replace("example.com/a");
+        let (_, dot_target) = dot
+            .apply_go_replace("example.com/a")
+            .expect("replacement stays in the repository");
         assert_eq!(
             dot_target.as_deref(),
             Some("local/a"),
@@ -5002,18 +5023,18 @@ mod import_resolution_tests {
 
         let mut slash = Resolver::new();
         slash.index_go_modules(&[module("", "m", &[("example.com/b", "/abs/b")])]);
-        let (_, slash_target) = slash.apply_go_replace("example.com/b");
-        assert!(
-            slash_target
-                .as_deref()
-                .is_some_and(|target| !target.starts_with("example.com")),
-            "an absolute target must resolve to a path, got {slash_target:?}"
+        assert_eq!(
+            slash.apply_go_replace("example.com/b"),
+            None,
+            "an absolute target has no repository-relative identity"
         );
 
         // A module-path target (neither marker) stays a module path.
         let mut remote = Resolver::new();
         remote.index_go_modules(&[module("", "m", &[("example.com/c", "other.com/c")])]);
-        let (_, remote_target) = remote.apply_go_replace("example.com/c");
+        let (_, remote_target) = remote
+            .apply_go_replace("example.com/c")
+            .expect("replacement stays in the repository");
         assert_eq!(
             remote_target.as_deref(),
             Some("other.com/c"),

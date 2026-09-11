@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// Records the resolved version of every grammar, for the extraction cache key.
 fn stamp_grammar_versions(manifest_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let lock_path = manifest_dir.join("../..").join("Cargo.lock");
+    let lock_path = manifest_dir.join("..").join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock_path.display());
 
     let lock = fs::read_to_string(&lock_path)?;
@@ -93,7 +93,7 @@ fn stamp_grammar_versions(manifest_dir: &Path) -> Result<(), Box<dyn Error>> {
 /// Compiling the C directly and declaring the entry point ourselves sidesteps
 /// it and keeps the grammar on the same runtime as every other one.
 fn build_vendored_grammars(manifest_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let vendor = manifest_dir.join("../../vendor/grammars");
+    let vendor = manifest_dir.join("../vendor/grammars");
     if !vendor.is_dir() {
         return Ok(());
     }

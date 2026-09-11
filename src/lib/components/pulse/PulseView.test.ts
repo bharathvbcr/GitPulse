@@ -65,6 +65,20 @@ describe("PulseView honesty contracts", () => {
     expect(source).toContain('activeTab === "hotspots"');
     expect(source).toContain("cmd_scan_coverage");
   });
+
+  it("tracks the loaded repository with a plain let so the load effect cannot self-invalidate", () => {
+    expect(source).toMatch(/let loadedPath:\s*string \| null = null;/);
+    expect(source).not.toMatch(/let loadedPath\s*=\s*\$state/);
+    expect(source).toContain("A plain `let`, never $state");
+  });
+
+  it("resets the author filter without tracking that write from the load effect", () => {
+    const start = source.indexOf("$effect(() => {\n    const path = $repoStore.currentPath;");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("// LOC now tracks the repository"));
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf('authorFilter = "all"'));
+  });
 });
 
 describe("PulseView export card wiring", () => {

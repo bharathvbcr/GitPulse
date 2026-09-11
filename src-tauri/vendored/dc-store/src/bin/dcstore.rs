@@ -543,10 +543,7 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                     required("data")?,
                 )
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
-            Ok(object(&[
-                ("ok", &json_bool(true)),
-                ("id", &id.to_string()),
-            ]))
+            Ok(object(&[("ok", &json_bool(true)), ("id", &id.to_string())]))
         }
 
         "evidence-list" => {

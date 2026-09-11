@@ -23,6 +23,17 @@ describe("titleFromNotes", () => {
     expect(titleFromNotes("a\u0000b")).toBe("ab");
     expect(titleFromNotes("x".repeat(400)).length).toBe(300);
   });
+
+  it("does not treat list markers, abbreviations, or markup as the title", () => {
+    expect(titleFromNotes("1. Fix the auth bug in both repos")).toBe("1. Fix the auth bug in both repos");
+    expect(titleFromNotes("12. Restore the original E42 path")).toBe("12. Restore the original E42 path");
+    expect(titleFromNotes("Dr. Smith reported E42 on login.")).toBe("Dr. Smith reported E42 on login.");
+    expect(titleFromNotes("e.g. keep the original stack trace.")).toBe("e.g. keep the original stack trace.");
+    expect(titleFromNotes("i.e. the original E42 must stay.")).toBe("i.e. the original E42 must stay.");
+    expect(titleFromNotes("# Keep the original E42 across both links")).toBe("Keep the original E42 across both links");
+    expect(titleFromNotes("- [ ] Preserve repository scope")).toBe("Preserve repository scope");
+    expect(titleFromNotes("* Keep both repository links")).toBe("Keep both repository links");
+  });
 });
 
 describe("applyNotesToDraft", () => {
@@ -56,6 +67,17 @@ describe("applyNotesToDraft", () => {
     const title = titleFromNotes("😀".repeat(301));
     expect(title.isWellFormed()).toBe(true);
     expect([...title]).toHaveLength(300);
+  });
+
+  it("keeps numbered and constrained notes as a usable draft Manvi can rewrite", () => {
+    const numbered = applyNotesToDraft({ title: "", description: "" }, "1. Fix the auth bug in both repos\nMust keep E42.");
+    expect(numbered.title).toBe("1. Fix the auth bug in both repos");
+    expect(numbered.description).toContain("Must keep E42.");
+    expect(canAskManvi({ title: "", repository_ids: ["r"] }, "1. Fix the auth bug in both repos")).toBeNull();
+    const constrained = consumeNotes({ title: "", description: "" }, "Must keep E42. Do not drop the reproduction steps.");
+    expect(constrained.title).toBe("Must keep E42.");
+    expect(constrained.description).toContain("Do not drop the reproduction steps.");
+    expect(constrained.notes).toBe("");
   });
 
   it("consumes notes into the draft once so they cannot be re-applied", () => {

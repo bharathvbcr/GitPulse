@@ -28,7 +28,7 @@ or HTML assets into independent implementations.
 For a Rust host, a dependency declaration selects the existing query library:
 
 ```toml
-devmap-query = { path = "../DevCouncil/rust-port/crates/devmap-query", default-features = false }
+devmap-query = { path = "../DevCouncil/rust/devmap-query", default-features = false }
 ```
 
 That line is suitable for a local multi-repository workspace. A distributed

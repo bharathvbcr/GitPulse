@@ -17,7 +17,21 @@ import { writable } from "svelte/store";
 import { createPacedQueue, type BackgroundScope } from "../async/pacedQueue";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { maybeRefreshDevmap } from "./client";
-import type { LiveRefreshDecision, LiveRefreshOutcome } from "./types";
+import type { DevmapBuildOutcome, LiveRefreshDecision, LiveRefreshOutcome } from "./types";
+
+/**
+ * Mirror of Rust `build_is_echo_or_failure` for the *publication* half:
+ * an `unchanged: true` build is a successful warm-path echo, not a new
+ * index. Missing `unchanged` is not an echo — only an explicit true is.
+ */
+function isUnchangedEcho(build: DevmapBuildOutcome | null | undefined): boolean {
+  if (!build || build.ok !== true) return false;
+  const report = build.report;
+  if (report === null || report === undefined || typeof report !== "object" || Array.isArray(report)) {
+    return false;
+  }
+  return (report as { unchanged?: unknown }).unchanged === true;
+}
 
 /** Coalesce watcher ticks the same way `handleRepoChanged` does (200ms). */
 export const LIVE_INDEX_DEBOUNCE_MS = 200;
@@ -152,6 +166,10 @@ export function createLiveIndex(opts?: {
     dirty.delete(repoPath);
     const failed =
       outcome.decision === "refresh" && outcome.build?.ok !== true;
+    const published =
+      outcome.decision === "refresh" &&
+      outcome.build?.ok === true &&
+      !isUnchangedEcho(outcome.build);
     patch(repoPath, {
       phase: queue.isPending(repoPath) ? "scheduled" : failed
         ? "failed"
@@ -160,7 +178,7 @@ export function createLiveIndex(opts?: {
       reason: failed && !outcome.build ? "Refresh returned no build outcome" : outcome.reason,
       refreshing: false,
       updatedAt: Date.now(),
-      ...(outcome.decision === "refresh" && !failed ? { revision: ++revision } : {}),
+      ...(published ? { revision: ++revision } : {}),
     });
   }
 

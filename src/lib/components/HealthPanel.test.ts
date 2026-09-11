@@ -134,6 +134,16 @@ describe("HealthPanel rendering", () => {
     );
   });
 
+  it("parses the health report before the pane reads .length", () => {
+    const localScan = source.slice(
+      source.indexOf("async function scan("),
+      source.indexOf("async function scanDependabot"),
+    );
+    expect(localScan).toContain("parseDepsHealthReport");
+    expect(localScan).toContain("finally");
+    expect(localScan).toContain("loading = false");
+  });
+
   it("keeps credentialed GitHub checks off the local scan path", () => {
     const localScan = source.slice(
       source.indexOf("async function scan("),
@@ -194,6 +204,11 @@ describe("HealthPanel rendering", () => {
 });
 
 describe("HealthPanel flicker contracts", () => {
+  it("tracks the scanned path with a plain object so the load effect cannot loop", () => {
+    expect(source).toMatch(/const scanned = \{ path: "" \}/);
+    expect(source).not.toMatch(/let scanned = \$state/);
+  });
+
   it("hydrates the cached report before rescanning so revisits render instantly", () => {
     expect(source).toContain("createRepoPanelCache<{");
     expect(source).toContain("dependabotCheckedAt: number | null");

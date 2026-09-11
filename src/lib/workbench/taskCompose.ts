@@ -8,6 +8,42 @@ export const AGENT_COPY_PREAMBLE =
 
 const TITLE_CAP = 300;
 const NOTES_CAP = 65_536;
+const WEAK_TITLE_CLAUSE = /^(?:\d+|[A-Za-z]{1,4}|[A-Za-z](?:\.[A-Za-z])+)$/;
+
+function stripTitleMarkup(line: string): string {
+  return line
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^[-*+]\s+(?:\[[ xX]\]\s+)?/, "")
+    .trim();
+}
+
+function isWeakTitleClause(clause: string): boolean {
+  const body = clause.trim().replace(/[.!?]+$/u, "").trim();
+  return !body || WEAK_TITLE_CLAUSE.test(body);
+}
+
+function firstStrongClause(line: string): string {
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch !== "." && ch !== "!" && ch !== "?") continue;
+    if (i + 1 < line.length && !/\s/u.test(line[i + 1]!)) continue;
+    const clause = line.slice(0, i + 1).trim();
+    if (isWeakTitleClause(clause)) continue;
+    return clause;
+  }
+  return line;
+}
+
+function titleSource(text: string): string {
+  const lines = text.split(/\n/);
+  for (const raw of lines) {
+    const line = stripTitleMarkup(raw.trim());
+    if (!line) continue;
+    const clause = firstStrongClause(line);
+    if (!isWeakTitleClause(clause)) return clause;
+  }
+  return stripTitleMarkup((lines[0] ?? text).trim()) || text;
+}
 
 export function sanitizeNotes(value: unknown, cap = NOTES_CAP): string {
   if (typeof value !== "string") return "";
@@ -17,14 +53,12 @@ export function sanitizeNotes(value: unknown, cap = NOTES_CAP): string {
   return [...cleaned].slice(0, limit).join("");
 }
 
-/** First line or sentence of notes, capped for `items.put`. */
+/** First strong line or sentence of notes, skipping list markers and abbreviations. */
 export function titleFromNotes(notes: unknown, cap = TITLE_CAP): string {
   const limit = Number.isSafeInteger(cap) && cap >= 16 ? cap : TITLE_CAP;
   const text = sanitizeNotes(notes, NOTES_CAP);
   if (!text) return "";
-  const line = (text.split(/\n/)[0] ?? text).trim();
-  const sentence = (line.split(/(?<=[.!?])\s+/)[0] ?? line).trim();
-  const source = sentence || line || text;
+  const source = titleSource(text);
   const characters = [...source];
   return characters.length > limit ? characters.slice(0, limit - 1).join("") + "…" : source;
 }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { themeStore, type ThemePreference } from "../stores/themeStore";
   import { densityStore, type DensityMode } from "../stores/densityStore";
@@ -126,7 +127,7 @@
   $effect(() => {
     if (railSections.length === 0) return;
     if (!railSections.some((entry) => entry.id === activeSection)) {
-      activeSection = railSections[0].id;
+      untrack(() => { activeSection = railSections[0].id; });
     }
   });
 

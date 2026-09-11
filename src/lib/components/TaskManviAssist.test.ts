@@ -20,6 +20,11 @@ describe("TaskManviAssist", () => {
     expect(source).not.toContain("Task model settings");
   });
 
+  it("surfaces why Cmd+Enter cannot start Manvi instead of returning silently", () => {
+    expect(source).toContain("if (askDisabled && !quick)");
+    expect(source).toContain("error = gate ?? fieldReason");
+  });
+
   it("keeps inline accept, compact history, and field locks in one section", () => {
     expect(source).toContain("startQuickEnhance");
     expect(source).toContain("Use this title");

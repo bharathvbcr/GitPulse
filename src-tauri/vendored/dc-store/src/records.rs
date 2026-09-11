@@ -105,10 +105,7 @@ pub fn evidence_append(
 /// Lists evidence rows, newest first, optionally filtered by task.
 ///
 /// `truncated` is true when more than [`MAX_LIST_ROWS`] matched.
-pub fn evidence_list(
-    conn: &Connection,
-    task_id: Option<&str>,
-) -> Result<(Vec<EvidenceRow>, bool)> {
+pub fn evidence_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<EvidenceRow>, bool)> {
     let limit = (MAX_LIST_ROWS + 1) as i64;
     let map_row = |row: &rusqlite::Row<'_>| {
         Ok(EvidenceRow {
@@ -335,10 +332,7 @@ pub fn run_get(conn: &Connection, id: &str) -> Result<Option<VerificationRun>> {
 /// Lists verification runs, newest first, optionally filtered by task.
 ///
 /// `truncated` is true when more than [`MAX_LIST_ROWS`] matched.
-pub fn runs_list(
-    conn: &Connection,
-    task_id: Option<&str>,
-) -> Result<(Vec<VerificationRun>, bool)> {
+pub fn runs_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<VerificationRun>, bool)> {
     let limit = (MAX_LIST_ROWS + 1) as i64;
     let mut rows = match task_id {
         Some(task) => {

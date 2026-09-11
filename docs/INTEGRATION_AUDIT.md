@@ -75,7 +75,7 @@ require recompiling their host; arbitrary ABI compatibility is not promised.
   repository. The knowledge sample remained explicitly truncated (128 of
   1,097 files). This supplemental run did not regenerate the coverage report.
   Evidence: `/tmp/gitpulse-ignored-rust-llvmcov-20260908.log`.
-- **DevCouncil:** canonical `rust-port/verify.sh` completed with `ALL GATES
+- **DevCouncil:** canonical `rust/verify.sh` completed with `ALL GATES
   GREEN`: formatting, strict Clippy, workspace tests, hostile fixtures,
   concurrency, determinism, fuzz smoke, memory and incremental/cold parity.
   The self-build indexed 1,626 files in 8.462 seconds with a 152 MiB database

@@ -75,6 +75,136 @@ export interface CodeintelStatus {
   reason?: string | null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionalBoolean(value: unknown): boolean | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === "boolean") return value;
+  throw new Error("codeintel: expected a boolean");
+}
+
+function optionalFiniteNumber(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  throw new Error("codeintel: expected a number");
+}
+
+function optionalString(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === "string") return value;
+  throw new Error("codeintel: expected a string");
+}
+
+/**
+ * Unwraps a `CodeintelResponse`. Null, a non-object, or an `available: true`
+ * payload without `items` is a failed read — Health used to dereference
+ * `.available` / `.length` off that and crash the pane, which tore its
+ * effects down so a reactive loop looked like a clean stress run.
+ */
+export function parseCodeintelResponse<T>(
+  value: unknown,
+  command = "codeintel",
+): CodeintelResponse<T> {
+  if (!isRecord(value)) {
+    throw new Error(`${command} returned no payload`);
+  }
+  if (typeof value.available !== "boolean") {
+    throw new Error(`${command} omitted available`);
+  }
+  if (value.available) {
+    if (!Array.isArray(value.items)) {
+      throw new Error(`${command} claimed availability without items`);
+    }
+    if (typeof value.truncated !== "boolean") {
+      throw new Error(`${command} omitted truncated`);
+    }
+  } else if (value.items !== undefined && !Array.isArray(value.items)) {
+    throw new Error(`${command} returned a corrupt items list`);
+  }
+  const items = Array.isArray(value.items) ? (value.items as T[]) : [];
+  const total =
+    typeof value.total === "number" && Number.isFinite(value.total)
+      ? Math.max(0, Math.trunc(value.total))
+      : items.length;
+  const shown =
+    typeof value.shown === "number" && Number.isFinite(value.shown)
+      ? Math.max(0, Math.trunc(value.shown))
+      : items.length;
+  const rungs = value.rungs;
+  let histogram: CodeintelRungHistogram | undefined;
+  if (rungs !== undefined && rungs !== null) {
+    if (!isRecord(rungs)) {
+      throw new Error(`${command} returned a corrupt rung histogram`);
+    }
+    const num = (key: keyof CodeintelRungHistogram) => {
+      const raw = rungs[key];
+      if (typeof raw !== "number" || !Number.isFinite(raw)) {
+        throw new Error(`${command} returned a corrupt rung histogram`);
+      }
+      return raw;
+    };
+    histogram = {
+      deterministic: num("deterministic"),
+      high: num("high"),
+      speculative: num("speculative"),
+      filtered_out: num("filtered_out"),
+    };
+  }
+  const walk = value.walk_incomplete;
+  if (walk !== undefined && typeof walk !== "string") {
+    throw new Error(`${command} returned a corrupt walk_incomplete`);
+  }
+  return {
+    source_freshness: optionalBoolean(value.source_freshness),
+    available: value.available,
+    reason: optionalString(value.reason) ?? null,
+    items,
+    total,
+    shown,
+    truncated: value.truncated === true,
+    ...(typeof walk === "string" ? { walk_incomplete: walk } : {}),
+    ...(histogram ? { rungs: histogram } : {}),
+  };
+}
+
+/**
+ * Unwraps `cmd_codeintel_status`. A null IPC result used to become
+ * `graph.value.available` in Health and crash the pane mid-scan.
+ */
+export function parseCodeintelStatus(
+  value: unknown,
+  command = "cmd_codeintel_status",
+): CodeintelStatus {
+  if (!isRecord(value)) {
+    throw new Error(`${command} returned no payload`);
+  }
+  if (typeof value.available !== "boolean") {
+    throw new Error(`${command} omitted available`);
+  }
+  if (value.available && typeof value.db_path !== "string") {
+    throw new Error(`${command} claimed availability without db_path`);
+  }
+  return {
+    available: value.available,
+    is_fresh: optionalBoolean(value.is_fresh),
+    freshness_reason: optionalString(value.freshness_reason),
+    source_freshness: optionalBoolean(value.source_freshness),
+    analyzer_freshness: optionalBoolean(value.analyzer_freshness),
+    pending_count: optionalFiniteNumber(value.pending_count),
+    db_path: typeof value.db_path === "string" ? value.db_path : "",
+    generation_id: optionalFiniteNumber(value.generation_id),
+    total_files: optionalFiniteNumber(value.total_files),
+    total_symbols: optionalFiniteNumber(value.total_symbols),
+    total_edges: optionalFiniteNumber(value.total_edges),
+    reason: optionalString(value.reason) ?? null,
+  };
+}
+
 export type CodeintelRung = "deterministic" | "high" | "speculative";
 
 export interface CodeintelNeighbors {
@@ -330,6 +460,10 @@ export interface DevmapPreviewOutcome {
   reason?: string | null;
   files: DevmapPreviewFileResult[];
   cancelled: boolean;
+  /** True when the batch was capped before every file was previewed. */
+  truncated?: boolean;
+  files_total?: number;
+  files_omitted?: number;
 }
 
 /** Decision from the live-index gate (`decide_live_refresh`). */

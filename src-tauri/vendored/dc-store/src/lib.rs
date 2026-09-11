@@ -166,7 +166,7 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::SchemaVersion { detail } => {
                 write!(f, "schema_version precondition failed: {detail}")
-            },
+            }
         }
     }
 }

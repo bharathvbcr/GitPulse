@@ -536,6 +536,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
 
   function activateRepository(repoPath: string | null): void {
     if (!repoPath) {
+      if (activeRepositoryKey === UNSCOPED_REPOSITORY) return;
       activeRepositoryKey = UNSCOPED_REPOSITORY;
       publishBucket(
         UNSCOPED_REPOSITORY,
@@ -544,6 +545,13 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       return;
     }
     const { key, bucket } = bucketFor(repoPath);
+    // App's catch-up $effect used to call this on every repoStore emission
+    // (~6s status poll). Each call built a new projection object and notified
+    // every $harnessStore subscriber, even when the journal was already this
+    // repository. A no-op when the key is unchanged is the same contract as
+    // repoStore.setError: publishing identity is how a forwarding effect
+    // becomes effect_update_depth_exceeded.
+    if (key === activeRepositoryKey) return;
     activeRepositoryKey = key;
     publishBucket(key, bucket);
   }

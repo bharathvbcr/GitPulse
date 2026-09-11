@@ -448,26 +448,31 @@
             applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs),
         })
       : null;
-    compactPane = null;
     lastAppliedStoreFile = "";
     if (!repo) {
-      tabState = emptyEditorTabs();
-      activeBlob = null;
+      untrack(() => {
+        compactPane = null;
+        tabState = emptyEditorTabs();
+        activeBlob = null;
+      });
       prevLoadKey = "";
       return;
     }
     const cached = tabCache.get(repo);
-    if (cached) {
-      tabState = cached.tabs;
-      explorerOpen = cached.explorerOpen;
-      dashboardOpen = cached.dashboardOpen;
-      preferredSidePane = cached.preferredSidePane ?? "explorer";
-    } else {
-      tabState = emptyEditorTabs();
-      explorerOpen = true;
-      dashboardOpen = true;
-      preferredSidePane = "explorer";
-    }
+    untrack(() => {
+      compactPane = null;
+      if (cached) {
+        tabState = cached.tabs;
+        explorerOpen = cached.explorerOpen;
+        dashboardOpen = cached.dashboardOpen;
+        preferredSidePane = cached.preferredSidePane ?? "explorer";
+      } else {
+        tabState = emptyEditorTabs();
+        explorerOpen = true;
+        dashboardOpen = true;
+        preferredSidePane = "explorer";
+      }
+    });
     prevLoadKey = "";
   });
 
@@ -479,12 +484,14 @@
     }
     if (storeSelected === lastAppliedStoreFile) return;
     lastAppliedStoreFile = storeSelected;
-    if (!tabState.tabs.some((t) => t.path === storeSelected)) {
-      tabState = openPreview(tabState, storeSelected);
-      persistTabs(hydratedRepo);
-    } else {
-      tabState = activateEditorTab(tabState, storeSelected);
-    }
+    untrack(() => {
+      if (!tabState.tabs.some((t) => t.path === storeSelected)) {
+        tabState = openPreview(tabState, storeSelected);
+        persistTabs(hydratedRepo);
+      } else {
+        tabState = activateEditorTab(tabState, storeSelected);
+      }
+    });
   });
 
   $effect(() => {
@@ -514,7 +521,9 @@
     // A compact selection is a temporary replacement surface. Once the view
     // grows enough to restore an editor split, do not resurrect it on a later
     // resize unless the user requests it again.
-    if (paneLayout.mode !== "compact" && compactPane !== null) compactPane = null;
+    if (paneLayout.mode !== "compact" && compactPane !== null) {
+      untrack(() => { compactPane = null; });
+    }
   });
 
   onMount(() => {

@@ -22,7 +22,7 @@
  *
  * Both upstreams use workspace inheritance (`version.workspace = true`,
  * `serde.workspace = true`), and the two workspaces disagree: Manvi is edition
- * 2024 / resolver 3, DevCouncil's rust-port is edition 2021 / resolver 2. One
+ * 2024 / resolver 3, DevCouncil's rust/ workspace is edition 2021 / resolver 3. One
  * workspace here could not supply both, so each vendored manifest gets the
  * concrete values its own upstream would have given it. Every rewrite is listed
  * in the manifest, and an inheritance form this script does not recognise is a
@@ -83,11 +83,11 @@ export const MANIFEST = path.join(VENDOR_DIR, "VENDOR.json");
 export function sources(env = process.env, from = REPO) {
   return [
     {
-      // dc-* crates live in DevCouncil rust-port (Phase 3). Manvi's crates/
+      // dc-* crates live in DevCouncil rust/ (flattened workspace). Manvi's crates/
       // directory only keeps symlinks for local builds — do not vendor from there.
       id: "devcouncil",
       root: env.GITPULSE_DEVCOUNCIL_ROOT ?? findSibling("DevCouncil", from),
-      workspace: "rust-port",
+      workspace: "rust",
       crates: [
         "dc-glob",
         "dc-store",
@@ -98,7 +98,7 @@ export function sources(env = process.env, from = REPO) {
         "devmap-resolve",
         "devmap-store",
       ],
-      crateDir: (/** @type {string} */ name) => path.join("rust-port", "crates", name),
+      crateDir: (/** @type {string} */ name) => path.join("rust", name),
     },
     {
       // MarkDev's parse + highlight core. Package name is `markdev`; the

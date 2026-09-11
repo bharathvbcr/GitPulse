@@ -1,8 +1,17 @@
 {
   "mcpServers": {
+    "devmap": {
+      "args": [
+        "--root",
+        "/Users/bharath/Code/devtools/GitPulse",
+        "mcp"
+      ],
+      "command": "/Users/bharath/.local/bin/devmap",
+      "type": "stdio"
+    },
     "gitpulse": {
-      "command": "gitpulse-mcp",
       "args": [],
+      "command": "gitpulse-mcp",
       "type": "stdio"
     }
   }

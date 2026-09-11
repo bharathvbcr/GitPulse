@@ -55,11 +55,28 @@ describe("CommitComposer", () => {
     expect(source).toContain('data-testid="commit-preview-breaks"');
   });
 
+  it("depends on the staged-path key, not the statuses array identity", () => {
+    expect(source).toMatch(/import\s*\{[^}]*\buntrack\b[^}]*\}\s*from\s*"svelte"/);
+    const start = source.indexOf("let previewPathsKey");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("A3: blast radius"));
+    expect(effect).toContain("void previewPathsKey");
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(
+      effect.indexOf("previewStore.refresh"),
+    );
+  });
+
   it("composes staged blast radius with layered impact (no min_rung)", () => {
     expect(source).toContain("getImpactLayeredMany");
     expect(source).toContain("cancelCodeintelQuery");
     expect(source).toContain("newCodeintelCancelToken");
     expect(source).toContain("BlastRadiusPanel");
     expect(source).not.toContain("minRung");
+  });
+
+  it("caps staged blast fan-out and reports omitted seeds", () => {
+    expect(source).toContain("capFanout");
+    expect(source).toContain("omittedLayeredImpact");
   });
 });

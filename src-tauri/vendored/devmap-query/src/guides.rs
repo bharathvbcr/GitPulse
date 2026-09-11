@@ -249,11 +249,15 @@ tool config; how many were left out, and why, is in `liveness_meta.unwired.exclu
 empty list means nothing is unwired rather than that the filter swallowed the repository."
             .to_string(),
         "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
-`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) over \
-GitNexus. CLI equivalents: `devmap explore <name>`, `devmap search`, `devmap impact`, \
-`devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. Read `truncated` and \
-`total` on every envelope before treating a list as complete. When DevMap cannot answer, \
-record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` — do not switch indexes."
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) \
+or the matching `devmap` CLI commands: `devmap explore <name>`, `devmap search`, \
+`devmap impact`, `devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. \
+Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and \
+check `repository.root` in the envelope before trusting the answer — Cursor shares one \
+MCP process across workspace tabs. \
+Read `truncated` and `total` on every envelope before treating a list as complete. \
+When DevMap cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` \
+— do not switch indexes."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \
@@ -292,7 +296,7 @@ alwaysApply: true\n\
 \n\
 Use `{map_rel}` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.\n\
 \n\
-Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.\n\
+Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one MCP process across workspace tabs. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.\n\
 \n\
 Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.\n\
 \n\
@@ -302,7 +306,11 @@ Before editing a symbol, run impact analysis. Before committing, review the diff
     )
 }
 
-fn write_marked_file(path: &Path, text: &str, ours: impl Fn(&str) -> bool) -> std::io::Result<GuideDisposition> {
+fn write_marked_file(
+    path: &Path,
+    text: &str,
+    ours: impl Fn(&str) -> bool,
+) -> std::io::Result<GuideDisposition> {
     match std::fs::read_to_string(path) {
         Ok(existing) => {
             if !ours(&existing) {
@@ -576,6 +584,20 @@ mod tests {
     }
 
     #[test]
+    fn the_generated_guide_does_not_name_gitnexus() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(
+            !text.contains("GitNexus"),
+            "generated AGENTS.md must not name GitNexus: {text}"
+        );
+        let rule = cursor_rule_text("m.json");
+        assert!(
+            !rule.contains("GitNexus"),
+            "generated Cursor rule must not name GitNexus: {rule}"
+        );
+    }
+
+    #[test]
     fn a_guide_can_bootstrap_a_new_worktree_and_refresh_its_exported_map() {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
         assert!(text.contains("devmap paths --json"), "{text}");
@@ -584,6 +606,24 @@ mod tests {
         assert!(
             !text.contains("re-run `devmap build`"),
             "a database-only build cannot repair an exported map: {text}"
+        );
+    }
+
+    #[test]
+    fn the_guide_tells_agents_to_pass_repo_path_and_check_repository_root() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(
+            text.contains("repo_path"),
+            "agents must pass repo_path on every devmap_* call: {text}"
+        );
+        assert!(
+            text.contains("repository.root"),
+            "agents must check repository.root before trusting an answer: {text}"
+        );
+        let rule = cursor_rule_text("m.json");
+        assert!(
+            rule.contains("repo_path") && rule.contains("repository.root"),
+            "{rule}"
         );
     }
 }

@@ -110,6 +110,19 @@ describe("WorkView", () => {
     // never seen, for a reason that scrolled off screen with the old repo.
     expect(source).toContain("facetRepo");
     expect(source).toMatch(/facet = "all";\s+query = "";/);
+    const start = source.indexOf("let facetRepo");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, start + 360);
+    expect(effect).toContain("if (repo === facetRepo) return");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf('facet = "all"'));
+  });
+
+  it("resets the row page without tracking the limit write", () => {
+    const start = source.indexOf("void facet; void query; void $repoStore.currentPath");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, start + 160);
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("rowLimit = 100"));
   });
 
   it("says where the reader is standing, and admits when it has not measured it", () => {

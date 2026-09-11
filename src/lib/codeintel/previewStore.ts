@@ -6,6 +6,11 @@
 import { writable, derived, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { previewDevmapEdits } from "./client";
+import {
+  CODEINTEL_FANOUT_CAP,
+  capFanout,
+  omittedPreviewFile,
+} from "./fanout";
 import { normalizePreviewFileResult } from "./previewNormalize";
 import {
   markersByPath,
@@ -103,11 +108,24 @@ export const previewStore = {
 
   /**
    * Refresh preview for the given paths (typically staged files). Same results
-   * are published for CommitComposer and DiffFileRail.
+   * are published for CommitComposer and DiffFileRail. A second call with the
+   * same repo+key while loaded or in-flight is a no-op — status-poll identity
+   * changes must not re-walk every staged file.
    */
   async refresh(repoPath: string | null, paths: string[]): Promise<void> {
     const key = pathsKey(paths);
+    const current = get({ subscribe });
     if (!repoPath || paths.length === 0) {
+      if (
+        !current.loading &&
+        current.repoPath === repoPath &&
+        current.pathsKey === key &&
+        current.files.length === 0 &&
+        current.outcome === null &&
+        current.error === null
+      ) {
+        return;
+      }
       generation.next();
       set({
         repoPath,
@@ -120,6 +138,15 @@ export const previewStore = {
       return;
     }
 
+    if (
+      current.repoPath === repoPath &&
+      current.pathsKey === key &&
+      (current.loading || (current.outcome !== null && !current.error))
+    ) {
+      return;
+    }
+
+    const { kept, omitted, truncated, total } = capFanout(paths);
     const token = generation.next();
     update((s) => ({
       ...s,
@@ -130,7 +157,7 @@ export const previewStore = {
     }));
 
     try {
-      const { pairs, unread } = await collectFilePairs(repoPath, paths);
+      const { pairs, unread } = await collectFilePairs(repoPath, kept);
       if (!generation.isCurrent(token)) return;
 
       let outcome: DevmapPreviewOutcome | null = null;
@@ -150,12 +177,25 @@ export const previewStore = {
         };
       }
 
-      const files = [...fromPreview, ...unread];
+      const files = [
+        ...fromPreview,
+        ...unread,
+        ...omitted.map(omittedPreviewFile),
+      ];
       update(() => ({
         repoPath,
         pathsKey: key,
         loading: false,
-        outcome,
+        outcome: {
+          ...outcome,
+          truncated,
+          files_total: total,
+          files_omitted: omitted.length,
+          reason: truncated
+            ? (outcome.reason ??
+              `preview fan-out capped at ${CODEINTEL_FANOUT_CAP} files; ${omitted.length} file(s) not previewed`)
+            : outcome.reason,
+        },
         files,
         error: null,
       }));
@@ -187,11 +227,15 @@ export const previewSummary = derived(previewStore, ($s): PreviewCommitSummary |
     return summarizePreview([], {
       cancelled: $s.outcome?.cancelled,
       reason: $s.outcome?.reason ?? null,
+      filesOmitted: $s.outcome?.files_omitted,
+      filesTotal: $s.outcome?.files_total,
     });
   }
   return summarizePreview($s.files, {
     cancelled: $s.outcome?.cancelled,
     reason: $s.outcome?.reason ?? null,
+    filesOmitted: $s.outcome?.files_omitted,
+    filesTotal: $s.outcome?.files_total,
   });
 });
 

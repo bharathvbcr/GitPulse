@@ -15,6 +15,9 @@ use std::process::ExitCode;
 use dc_verify::rigor::{Finding, Severity, detect_stubs, intersect_coverage, scan_secrets};
 use dc_verify::{classify_scope, parse_unified};
 
+#[path = "../evidence_cli.rs"]
+mod evidence_cli;
+
 fn main() -> ExitCode {
     let args = match collect_args() {
         Ok(args) => args,
@@ -60,6 +63,9 @@ const IDENTITY: &str = "dc-verify";
 const SCHEMA_VERSION: u32 = 1;
 
 fn run(args: &[String]) -> Result<String, String> {
+    if args.first().is_some_and(|arg| arg == "evidence-check") {
+        return evidence_cli::run(&args[1..]);
+    }
     let mut planned: Vec<String> = Vec::new();
     let mut coverage_path: Option<String> = None;
     let mut root: Option<String> = None;
@@ -104,7 +110,7 @@ fn run(args: &[String]) -> Result<String, String> {
 
     match positional.first().copied() {
         Some("health") => Ok(format!(
-            "{{\"ok\":true,\"verifier\":{},\"schema_version\":{}}}",
+            "{{\"ok\":true,\"verifier\":{},\"schema_version\":{},\"evidence_schema_versions\":[1]}}",
             quote(IDENTITY),
             SCHEMA_VERSION
         )),
@@ -113,7 +119,9 @@ fn run(args: &[String]) -> Result<String, String> {
             coverage_path.as_deref(),
             root.as_deref().map(std::path::Path::new),
         ),
-        Some(other) => Err(format!("unknown command {other:?} (check, health)")),
+        Some(other) => Err(format!(
+            "unknown command {other:?} (check, health, evidence-check)"
+        )),
     }
 }
 

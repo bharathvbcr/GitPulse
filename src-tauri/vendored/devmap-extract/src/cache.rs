@@ -339,7 +339,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v46 records the enclosing callable as `parent_symbol` of a nested
 /// `const walk = () => {}`. A v45 row parents those arrows on the file, so
 /// `walk()` inside `collapseAll` cannot join to `collapseAll.walk`.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "46";
+/// v47 refuses malformed notebook code cells instead of silently discarding
+/// their contents and keeps the cell-cap verdict when the parsed prefix has
+/// only prose. All notebook source spans now map decoded code to the original
+/// JSON, and lexical bindings, exports and symbol wiring survive projection.
+/// A v46 row can claim Clean for a notebook it did not read, point into prose
+/// copies or metadata, drop Unicode-escaped declarations and omit bindings.
+/// Notebook cells now parse independently under one shared budget; a v46 row
+/// can invent a function that spans execution units. Python empty required
+/// suites also report Partial instead of inheriting the grammar's Clean bit.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "47";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -416,7 +425,13 @@ pub fn current_payload_identity(language: &str) -> (String, String) {
 #[cfg(feature = "parse")]
 pub fn grammar_version_for(language: &str) -> String {
     let base = base_grammar_identity(language);
-    let embedded = crate::embedded::permitted_embedded_languages(language);
+    let mut embedded = crate::embedded::permitted_embedded_languages(language);
+    // Kernel selection lives in notebook metadata, which is covered by the
+    // content hash. Every grammar that selection can reach must also be in
+    // the key so upgrading a linked kernel grammar invalidates warm payloads.
+    if language == "notebook" {
+        embedded.extend(crate::notebook::kernel_grammars());
+    }
     if embedded.is_empty() {
         return base;
     }

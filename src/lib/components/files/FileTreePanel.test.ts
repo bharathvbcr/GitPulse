@@ -207,6 +207,16 @@ describe("FileTreePanel", () => {
    * open file — so opening a folder in a large repository discarded the
    * position the user had just navigated to. Only a new selection reveals.
    */
+  it("consumes locatePath without tracking the handshake writes", () => {
+    const effect = source.slice(
+      source.indexOf("$effect(() => {\n    const target = locatePath;"),
+      source.indexOf("let lastRevealNonce"),
+    );
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("locatePath = null"));
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("selectedIndex = idx"));
+  });
+
   it("does not re-reveal the open file when a folder is expanded or collapsed", () => {
     const effect = source.slice(
       source.indexOf("$effect(() => {\n    const selected = effectiveSelected;"),

@@ -98,13 +98,18 @@ pub fn parse_where(clause: &str) -> WhereClause {
     }
     for term in split_on_keyword(clause, "AND") {
         let text = term.trim();
-        if text.is_empty() {
-            continue;
-        }
         if let Some(value) = call_argument(text, "contains", "a.name") {
-            parsed.name_filter = Some(value);
+            if parsed.name_filter.is_some() {
+                parsed.unparsed.push(text.to_string());
+            } else {
+                parsed.name_filter = Some(value);
+            }
         } else if let Some(value) = call_argument(text, "starts with", "b.path") {
-            parsed.path_prefix = Some(value);
+            if parsed.path_prefix.is_some() {
+                parsed.unparsed.push(text.to_string());
+            } else {
+                parsed.path_prefix = Some(value);
+            }
         } else {
             parsed.unparsed.push(text.to_string());
         }
@@ -151,7 +156,7 @@ fn split_on_keyword<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
         let ends_word = |at: usize| -> bool {
             at == 0 || at >= bytes.len() || !bytes[at].is_ascii_alphanumeric() && bytes[at] != b'_'
         };
-        if upper[index..].starts_with(&keyword)
+        if bytes[index..].starts_with(keyword.as_bytes())
             && ends_word(index.wrapping_sub(1).min(bytes.len()))
             && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
             && ends_word(index + keyword.len())
@@ -182,7 +187,7 @@ fn call_argument(term: &str, name: &str, field: &str) -> Option<String> {
     let term = term.trim();
     // The head is matched case-insensitively and with flexible spacing, because
     // `starts with (b.path, …)` is written every way a person writes it.
-    let squashed: String = term.split_whitespace().collect::<Vec<_>>().join(" ");
+    let squashed = normalize_whitespace(term);
     // ASCII folding, for the same reason as `split_on_keyword`: `head.len()`
     // is used as an offset into `squashed`.
     let lower = squashed.to_ascii_lowercase();
@@ -256,17 +261,39 @@ struct Pattern {
     limit_requested: usize,
 }
 
+/// Collapse syntax whitespace while preserving every character inside literals.
+fn normalize_whitespace(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut quote = None;
+    let mut pending_space = false;
+    for character in text.chars() {
+        if let Some(open) = quote {
+            normalized.push(character);
+            if character == open {
+                quote = None;
+            }
+        } else if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(character);
+            if character == '\'' || character == '"' {
+                quote = Some(character);
+            }
+        }
+    }
+    normalized
+}
+
 /// Parse the one supported pattern, or say why it is not supported.
 fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
-    let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
-    // ASCII folding: see `split_on_keyword`. These offsets slice `normalized`.
-    let upper = normalized.to_ascii_uppercase();
+    let normalized = normalize_whitespace(query);
 
     for clause in ["CREATE", "DELETE", "MERGE", "SET", "REMOVE", "DETACH"] {
-        if upper
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .any(|w| w == clause)
-        {
+        if split_on_keyword(&normalized, clause).len() > 1 {
             return Err(json!({
                 "ok": false,
                 "code": "mutating_clause",
@@ -275,44 +302,45 @@ fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
         }
     }
 
-    let Some(match_at) = upper.find("MATCH ") else {
-        return Err(unsupported(&normalized));
-    };
-    let Some(return_at) = upper.find(" RETURN ") else {
-        return Err(unsupported(&normalized));
-    };
-    if return_at < match_at {
+    // Every clause boundary uses the same quote-aware, byte-safe scanner.
+    // Looking for substrings parsed RETURN inside a literal as syntax and
+    // accepted arbitrary input preceding the first MATCH.
+    if !normalized.to_ascii_uppercase().starts_with("MATCH ") {
         return Err(unsupported(&normalized));
     }
-
-    let pattern_and_where = &normalized[match_at + "MATCH ".len()..return_at];
-    let tail = &normalized[return_at + " RETURN ".len()..];
-
-    // LIMIT, if present, closes the query; what precedes it is the projection.
-    let tail_upper = tail.to_ascii_uppercase();
-    let (projection, limit_requested) = match tail_upper.rfind(" LIMIT ") {
-        Some(at) => (
-            &tail[..at],
-            tail[at + " LIMIT ".len()..]
+    let returns = split_on_keyword(&normalized["MATCH ".len()..], "RETURN");
+    let [pattern_and_where, tail] = returns.as_slice() else {
+        return Err(unsupported(&normalized));
+    };
+    if tail.trim().is_empty() {
+        return Err(unsupported(&normalized));
+    }
+    let limits = split_on_keyword(tail, "LIMIT");
+    let (projection, limit_requested) = match limits.as_slice() {
+        [projection] => (*projection, default_limit),
+        [projection, limit] => (
+            *projection,
+            limit
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| unsupported(&normalized))?,
         ),
-        None => (tail, default_limit),
+        _ => return Err(unsupported(&normalized)),
     };
-
-    let upper_pw = pattern_and_where.to_ascii_uppercase();
-    let (pattern, where_text) = match upper_pw.find(" WHERE ") {
-        Some(at) => (
-            &pattern_and_where[..at],
-            &pattern_and_where[at + " WHERE ".len()..],
-        ),
-        None => (pattern_and_where, ""),
+    let wheres = split_on_keyword(pattern_and_where, "WHERE");
+    let (pattern, where_text) = match wheres.as_slice() {
+        [pattern] => (*pattern, ""),
+        [pattern, clause] if !clause.trim().is_empty() => (*pattern, *clause),
+        _ => return Err(unsupported(&normalized)),
     };
 
     let bound = parse_pattern(pattern).ok_or_else(|| unsupported(&normalized))?;
     if let Err(item) = validate_return(projection, &bound.variables) {
         return Err(unsupported_return(&normalized, &item, &bound.variables));
+    }
+    let mut where_clause = parse_where(where_text);
+    if where_clause.path_prefix.is_some() && !bound.variables.contains(&"b") {
+        where_clause.unparsed.push(where_text.trim().to_string());
     }
     let relationships = bound.relationships;
 
@@ -341,7 +369,7 @@ fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
 
     Ok(Pattern {
         relationships: resolved,
-        where_clause: parse_where(where_text),
+        where_clause,
         limit_requested,
     })
 }
@@ -391,9 +419,8 @@ fn parse_pattern(pattern: &str) -> Option<BoundPattern> {
     let relationships: Vec<String> = names
         .split('|')
         .map(|name| name.trim().to_lowercase())
-        .filter(|name| !name.is_empty())
         .collect();
-    if relationships.is_empty() {
+    if relationships.iter().any(String::is_empty) {
         return None;
     }
     let variables = if binds_r {
@@ -850,6 +877,117 @@ starts with(b.path, 'nowhere/') RETURN a, b",
         ] {
             let result = run(&graph(), query, 50);
             assert_eq!(result["ok"], json!(true), "{query}: {result}");
+        }
+    }
+
+    #[test]
+    fn audit_unquoted_unicode_is_refused_without_panicking() {
+        for value in ["é", "中", "🦀", "ﬁ", "ŉ", "OR", "AND"] {
+            let parsed = parse_where(value);
+            assert!(!parsed.unparsed.is_empty(), "{value:?}: {parsed:?}");
+            let query = format!("MATCH (a) WHERE {value} RETURN a");
+            let result = run(&graph(), &query, 50);
+            assert_eq!(result["ok"], false, "{query}: {result}");
+        }
+    }
+
+    #[test]
+    fn audit_repeated_filters_cannot_silently_drop_a_conjunct() {
+        let disjunction =
+            "contains(a.name, 'x') OR contains(a.name, 'y') AND contains(a.name, 'z')";
+        let parsed = parse_where(disjunction);
+        assert_eq!(parsed.unparsed, vec![disjunction]);
+        assert_eq!(parsed.name_filter, None);
+        // A keyword prefix is one unsupported term, not a valid filter plus
+        // an invented second fragment. The public parser reports that term.
+        let prefix_term = "contains(a.name, 'run') ANDROID";
+        let parsed = parse_where(prefix_term);
+        assert_eq!(parsed.unparsed, vec![prefix_term]);
+        assert_eq!(parsed.name_filter, None);
+        for clause in [
+            "contains(a.name, 'no-match') AND contains(a.name, 'run')",
+            "starts with(b.path, 'no-match/') AND starts with(b.path, 'src/')",
+            "AND contains(a.name, 'run')",
+            "contains(a.name, 'run') AND",
+            "contains(a.name, 'run') AND AND contains(a.name, 'run')",
+        ] {
+            let query = format!("MATCH (a)-[r:calls]->(b) WHERE {clause} RETURN a, b");
+            let result = run(&graph(), &query, 50);
+            assert_eq!(result["ok"], false, "{query}: {result}");
+        }
+    }
+
+    #[test]
+    fn audit_filter_literals_are_never_rewritten_or_parsed_as_clauses() {
+        for literal in [
+            "two  spaces",
+            "tab\tinside",
+            "line\ninside",
+            "a RETURN b",
+            "DELETE",
+            "a WHERE b",
+        ] {
+            let graph = json!({"nodes": [{"id": "1", "name": literal}], "edges": []});
+            let query = format!("MATCH (a) WHERE contains(a.name, '{literal}') RETURN a");
+            let result = run(&graph, &query, 50);
+            assert_eq!(result["ok"], true, "{query}: {result}");
+            assert_eq!(result["total"], 1, "{query}: {result}");
+            assert_eq!(
+                parse_where(&format!("contains(a.name, '{literal}')"))
+                    .name_filter
+                    .as_deref(),
+                Some(literal)
+            );
+        }
+    }
+
+    #[test]
+    fn audit_only_complete_bound_patterns_can_be_answered() {
+        for query in [
+            "garbage MATCH (a) RETURN a",
+            "MATCH (a) WHERE starts with(b.path, 'src/') RETURN a",
+            "MATCH (a) WHERE RETURN a",
+            "MATCH (a)-[r:calls||imports]->(b) RETURN a",
+            "MATCH (a)-[r:|calls]->(b) RETURN a",
+            "MATCH (a)-[r:calls|]->(b) RETURN a",
+        ] {
+            let result = run(&graph(), query, 50);
+            assert_eq!(result["ok"], false, "{query}: {result}");
+        }
+    }
+
+    #[test]
+    fn audit_unicode_and_clause_stress_preserves_literals_and_never_panics() {
+        let atoms = [
+            "é", "中", "🦀", "ﬁ", "ŉ", "  ", "\t", "\n", "RETURN", "WHERE", "LIMIT", "DELETE",
+            "AND", "OR", "_", "x",
+        ];
+        for first in atoms {
+            for second in atoms {
+                for third in atoms {
+                    let literal = format!("{first}{second}{third}");
+                    let graph = json!({"nodes": [{"id": "match", "name": literal}], "edges": []});
+                    for quote in ['\'', '"'] {
+                        let query = format!("\n MATCH\t(a) WHERE contains (a.name, {quote}{literal}{quote}) RETURN a LIMIT 1 ");
+                        let result = run(&graph, &query, 50);
+                        assert_eq!(result["ok"], true, "{query:?}: {result}");
+                        assert_eq!(result["total"], 1, "{query:?}: {result}");
+                    }
+                    let malformed = format!("MATCH (a) WHERE {literal} RETURN a");
+                    assert_eq!(run(&graph, &malformed, 50)["ok"], false, "{malformed:?}");
+                }
+            }
+        }
+        let syntax = "MATCH (a)-[r:calls]->(b) WHERE contains(a.name, 'run') RETURN a, b";
+        for position in 0..=syntax.len() {
+            for character in ['é', '中', '🦀', '\'', '"', '(', ')', '\0'] {
+                let query = format!("{}{character}{}", &syntax[..position], &syntax[position..]);
+                let result = run(&graph(), &query, usize::MAX);
+                assert!(result["ok"].is_boolean(), "{query:?}: {result}");
+                if result["ok"] == true {
+                    assert!(result["shown"].as_u64().unwrap() <= MAX_ROW_LIMIT as u64);
+                }
+            }
         }
     }
 }

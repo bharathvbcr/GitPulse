@@ -455,6 +455,41 @@ describe("repository-scoped ledger projection", () => {
     expect(get(store).actions.map((action) => action.label)).toEqual(["canonical"]);
   });
 
+  it("does not republish the journal when the active repository is already that key", () => {
+    const store = createHarnessStore({ invoke: ledgerInvoke(new Map()) });
+    store.activateRepository(repoA);
+    store.recordAction({ kind: "commit", label: "once", ok: true }, 1);
+
+    let publishes = 0;
+    const stop = store.subscribe(() => {
+      publishes += 1;
+    });
+    store.activateRepository(repoA);
+    store.activateRepository(`${repoA}/`);
+    expect(publishes).toBe(1);
+
+    store.activateRepository(repoB);
+    expect(get(store).actions).toEqual([]);
+    expect(publishes).toBe(2);
+
+    store.activateRepository(repoA);
+    expect(get(store).actions.map((action) => action.label)).toEqual(["once"]);
+    expect(publishes).toBe(3);
+    stop();
+  });
+
+  it("does not republish when clearing an already-unscoped journal", () => {
+    const store = createHarnessStore({ invoke: ledgerInvoke(new Map()) });
+    let publishes = 0;
+    const stop = store.subscribe(() => {
+      publishes += 1;
+    });
+    store.activateRepository(null);
+    store.activateRepository("");
+    expect(publishes).toBe(1);
+    stop();
+  });
+
   it("adopts the backend canonical bucket when an append notification uses a symlink spelling", async () => {
     const canonical = "/real/repository";
     const alias = "/linked/repository";

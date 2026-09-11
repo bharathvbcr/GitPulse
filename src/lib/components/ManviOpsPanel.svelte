@@ -495,8 +495,9 @@
     github = null;
     notice = null;
     pollError = null;
-    releaseTag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
-    releaseMessage = `Release ${releaseTag}`;
+    const tag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
+    releaseTag = tag;
+    releaseMessage = `Release ${tag}`;
     releaseConfirmed = false;
     pendingIssueRepo = null; // a queued request for an older repo is obsolete
     if (repo) void loadIssues(repo);

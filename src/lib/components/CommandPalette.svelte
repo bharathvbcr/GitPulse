@@ -122,11 +122,11 @@
 
   $effect(() => {
     void query; void repoPath;
-    page = 0; highlighted = 0; actionError = null;
+    untrack(() => { page = 0; highlighted = 0; actionError = null; });
   });
   $effect(() => {
-    if (page >= pageCount) page = pageCount - 1;
-    if (highlighted >= filteredCommands.length) highlighted = Math.max(0, filteredCommands.length - 1);
+    if (page >= pageCount) untrack(() => { page = pageCount - 1; });
+    if (highlighted >= filteredCommands.length) untrack(() => { highlighted = Math.max(0, filteredCommands.length - 1); });
   });
   $effect(() => {
     void highlighted; void filteredCommands;

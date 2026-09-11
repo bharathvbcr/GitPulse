@@ -9,7 +9,7 @@ description: Use DevMap first for code navigation, callers, blast radius, traces
 
 Resolve this checkout with `devmap paths --json`, then check `devmap status --json`. Read the returned `repo_map` path; do not assume `.devcouncil` rather than `.devmap`. A missing, stale, or partially parsed index is not complete evidence. Rebuild with `devmap build --manifest` when needed and authorized, then recheck status.
 
-Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. GitPulse's `gitpulse_codeintel_*` tools also query DevMap: pass the absolute `repo_path`. Discover the actual tool names and schemas; a host need not expose every CLI capability.
+Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. Always pass `repo_path` (the absolute repository path) on every `devmap_*` and `gitpulse_codeintel_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one `devmap mcp` process across tabs. Discover the actual tool names and schemas; a host need not expose every CLI capability.
 
 | Question | CLI | DevMap MCP, when available |
 |---|---|---|

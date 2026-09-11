@@ -1393,6 +1393,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // diagnostics log so the banner's dismissal never loses it.
       if (error) diagnostics.error("repo", error);
       const session = activeSession();
+      // Publishing an unchanged error retriggers every $repoStore subscriber,
+      // including App's forwarding $effect that calls setError to clear —
+      // which is the freeze that shipped as effect_update_depth_exceeded.
+      if (
+        internal.workspaceError === error &&
+        (session === undefined || session.error === error)
+      ) {
+        return;
+      }
       if (session) {
         putSession({ ...session, error });
       }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { RepoChangedPayload } from "./lib/repos/events";
   import type { LedgerAppended } from "./lib/ledger/types";
-  import { onDestroy, onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
@@ -230,9 +230,11 @@
   $effect(() => {
     const err = $repoStore.error;
     if (err) {
-      diagnostics.error("repo:operation", err);
-      toastStore.error(err);
-      repoStore.setError(null);
+      untrack(() => {
+        diagnostics.error("repo:operation", err);
+        toastStore.error(err);
+        repoStore.setError(null);
+      });
     }
   });
 
@@ -821,14 +823,17 @@
   let lastCaughtUpPath: string | null = null;
   $effect(() => {
     const path = $repoStore.currentPath;
-    // Switch the public journal projection synchronously. Durable events for
-    // other open repositories may still arrive and refresh their own buckets,
-    // but they must never become visible in this repository's journal.
-    harnessStore.activateRepository(path);
+    // Status polls rebuild repoStore and re-run this effect. Activating the
+    // journal on every emission republishes harnessStore synchronously, which
+    // is a second reactive clock on the same tick as every $harnessStore
+    // subscriber — the shape that becomes effect_update_depth_exceeded once
+    // any of those writes repoStore. Only a genuine path change may switch.
     if (path === lastCaughtUpPath) return;
     lastCaughtUpPath = path;
-    if (!path) return;
-    void harnessStore.catchUp(path);
+    untrack(() => {
+      harnessStore.activateRepository(path);
+      if (path) void harnessStore.catchUp(path);
+    });
   });
 
   $effect(() => {
@@ -838,7 +843,7 @@
     const path = $repoStore.currentPath;
     if (path === lastModalRepoPath) return;
     lastModalRepoPath = path;
-    isRebaseModalOpen = false;
+    untrack(() => { isRebaseModalOpen = false; });
   });
 </script>
 
@@ -1044,9 +1049,11 @@
       </div>
 
       <!-- Bottom Ambient Status Bar -->
+      <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("status", error)}>
       {#key $repoStore.currentPath}
       <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} />
       {/key}
+      </svelte:boundary>
 
     <!-- First-run coach mark onboarding tip -->
     <CoachMark

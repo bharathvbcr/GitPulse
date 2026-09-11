@@ -122,8 +122,15 @@
   const activeBlock = $derived(missedBlocks[activeBlockIndex]);
   const selectedVisible = $derived(visibleFiles.some(file => file.path === selectedFile?.path));
 
-  $effect(() => { void visibleFiles; fileScrollTop = 0; });
-  $effect(() => { if (!selectedFile) selectedScope = false; });
+  $effect(() => {
+    void visibleFiles;
+    untrack(() => {
+      if (fileScrollTop !== 0) fileScrollTop = 0;
+    });
+  });
+  $effect(() => {
+    if (!selectedFile) untrack(() => { selectedScope = false; });
+  });
 
   function clearFileFilters() {
     fileQuery = "";
@@ -1184,7 +1191,7 @@
     if (selected === prevSyncedSelection) return;
     prevSyncedSelection = selected;
     if (selected) {
-      selectedPath = selected;
+      untrack(() => { selectedPath = selected; });
     }
   });
 

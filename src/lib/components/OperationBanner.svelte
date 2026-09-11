@@ -51,7 +51,8 @@
   // Disarm whenever the underlying operation changes shape: an armed "Abort
   // rebase" that survives into a different operation would fire at something
   // the user never looked at.
-  let armedFor = $state<string | null>(null);
+  /** Last armed signature. A plain `let`, never $state. */
+  let armedFor: string | null = null;
   $effect(() => {
     const signature = operation
       ? `${operation.kind}:${operation.current_step ?? ""}:${operation.conflicted_total}`

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AiGeneration } from "../stores/harnessStore";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
@@ -258,19 +258,25 @@
     if (!name) return;
     const idx = allRows.findIndex((r) => r.kind === "branch" && r.branch.name === name);
     if (idx < 0) {
-      if (allRows.length > 0) locateName = null;
+      untrack(() => {
+        if (allRows.length > 0) locateName = null;
+      });
       return;
     }
-    locateName = null;
-    if (!containerEl) return;
-    selectedIndex = idx;
-    const targetY = Math.max(0, idx * ROW_HEIGHT - viewportHeight / 3);
-    containerEl.scrollTo({ top: targetY, behavior: "smooth" });
+    untrack(() => {
+      locateName = null;
+      if (!containerEl) return;
+      selectedIndex = idx;
+      const targetY = Math.max(0, idx * ROW_HEIGHT - viewportHeight / 3);
+      containerEl.scrollTo({ top: targetY, behavior: "smooth" });
+    });
   });
 
   $effect(() => {
     if (selectedIndex >= allRows.length) {
-      selectedIndex = allRows.length > 0 ? allRows.length - 1 : -1;
+      untrack(() => {
+        selectedIndex = allRows.length > 0 ? allRows.length - 1 : -1;
+      });
     }
   });
 

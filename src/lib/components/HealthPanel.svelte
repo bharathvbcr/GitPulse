@@ -34,6 +34,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -63,8 +64,10 @@
     loadGithubAlerts,
   } from "../health/githubAlerts";
   import { buildRunnablePlanSteps } from "../terminal/tokenize";
-  import type {
-    Vulnerability,
+  import {
+    parseDepsHealthReport,
+    type DepsHealthReport,
+    type Vulnerability,
   } from "../health/types";
   import {
     dependabotBadgeClass as badgeClassFor,
@@ -278,66 +281,79 @@
     // Automatic local scans stay local. GitHub alerts use the GitHub CLI
     // and the network; they run through scanDependabot, not this path.
     const [deps, dead, graph] = await Promise.allSettled([
-      invoke<DepsHealthReport>("cmd_scan_deps_health", { repoPath }),
+      invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
       getDeadSymbols(repoPath),
       getCodeintelStatus(repoPath),
     ]);
     if (!guard.isLive()) return;
-    if (deps.status === "fulfilled") {
-      report = deps.value;
-      // A new scan supersedes whatever a plan was written against.
-      plan = null;
-      planError = null;
-    } else {
-      errorMsg = formatError(deps.reason);
+    try {
+      if (deps.status === "fulfilled") {
+        report = deps.value;
+        // A new scan supersedes whatever a plan was written against.
+        plan = null;
+        planError = null;
+      } else {
+        errorMsg = formatError(deps.reason);
+        report = null;
+        // A failed scan must not mark the repo as scanned, or the effect above
+        // would refuse to rescan it after something changes.
+        scanned.path = "";
+      }
+      if (dead.status === "fulfilled") {
+        deadSymbolsAvailable = dead.value.available;
+        deadSymbols = dead.value.available ? dead.value.items : [];
+        // `total` counts what the query saw; `items` is what fitted in the
+        // budget. Never below the row count, so a backend that reports only
+        // `shown` cannot make the heading claim fewer than it lists.
+        deadSymbolsTotal = dead.value.available
+          ? Math.max(dead.value.total ?? 0, dead.value.items.length)
+          : 0;
+        deadSymbolsTruncated = dead.value.available && dead.value.truncated === true;
+        deadSymbolsReason = dead.value.available
+          ? null
+          : (dead.value.reason ?? "dead-symbol query unavailable");
+      } else {
+        deadSymbols = [];
+        deadSymbolsAvailable = false;
+        deadSymbolsTotal = 0;
+        deadSymbolsTruncated = false;
+        deadSymbolsReason = formatError(dead.reason);
+      }
+      // An IPC-level failure is folded into the same unavailable shape the
+      // command itself uses, so "could not ask" never renders as "asked, and
+      // there is no graph".
+      codegraph =
+        graph.status === "fulfilled"
+          ? graph.value
+          : {
+              available: false,
+              db_path: "",
+              reason: formatError(graph.reason),
+            };
+      if (deps.status === "fulfilled") {
+        healthCache.set(repoPath, {
+          deps: deps.value,
+          dependabot,
+          dependabotCheckedAt,
+          dependabotRequestFailed,
+          codeScanning,
+          codeScanningCheckedAt,
+          codeScanningRequestFailed,
+        });
+      }
+    } catch (err: unknown) {
+      errorMsg = formatError(err);
       report = null;
-      // A failed scan must not mark the repo as scanned, or the effect above
-      // would refuse to rescan it after something changes.
       scanned.path = "";
-    }
-    if (dead.status === "fulfilled") {
-      deadSymbolsAvailable = dead.value.available;
-      deadSymbols = dead.value.available ? dead.value.items : [];
-      // `total` counts what the query saw; `items` is what fitted in the
-      // budget. Never below the row count, so a backend that reports only
-      // `shown` cannot make the heading claim fewer than it lists.
-      deadSymbolsTotal = dead.value.available
-        ? Math.max(dead.value.total ?? 0, dead.value.items.length)
-        : 0;
-      deadSymbolsTruncated = dead.value.available && dead.value.truncated === true;
-      deadSymbolsReason = dead.value.available
-        ? null
-        : (dead.value.reason ?? "dead-symbol query unavailable");
-    } else {
       deadSymbols = [];
       deadSymbolsAvailable = false;
       deadSymbolsTotal = 0;
       deadSymbolsTruncated = false;
-      deadSymbolsReason = formatError(dead.reason);
+      deadSymbolsReason = formatError(err);
+      codegraph = { available: false, db_path: "", reason: formatError(err) };
+    } finally {
+      if (guard.isLive()) loading = false;
     }
-    // An IPC-level failure is folded into the same unavailable shape the
-    // command itself uses, so "could not ask" never renders as "asked, and
-    // there is no graph".
-    codegraph =
-      graph.status === "fulfilled"
-        ? graph.value
-        : {
-            available: false,
-            db_path: "",
-            reason: formatError(graph.reason),
-          };
-    if (deps.status === "fulfilled") {
-      healthCache.set(repoPath, {
-        deps: deps.value,
-        dependabot,
-        dependabotCheckedAt,
-        dependabotRequestFailed,
-        codeScanning,
-        codeScanningCheckedAt,
-        codeScanningRequestFailed,
-      });
-    }
-    if (guard.isLive()) loading = false;
   }
 
   /**
@@ -576,59 +592,63 @@
       dependabotInflight?.cancel();
       fixInflight?.cancel();
       stepsInflight?.cancel();
-      scanned.path = "";
-      report = null;
-      dependabot = null;
-      dependabotCheckedAt = null;
-      dependabotRequestFailed = false;
-      codeScanning = null;
-      codeScanningCheckedAt = null;
-      codeScanningRequestFailed = false;
-      errorMsg = null;
-      actionError = null;
-      loading = false;
-      checkingGithub = false;
-      plan = null;
-      planError = null;
+      untrack(() => {
+        scanned.path = "";
+        report = null;
+        dependabot = null;
+        dependabotCheckedAt = null;
+        dependabotRequestFailed = false;
+        codeScanning = null;
+        codeScanningCheckedAt = null;
+        codeScanningRequestFailed = false;
+        errorMsg = null;
+        actionError = null;
+        loading = false;
+        checkingGithub = false;
+        plan = null;
+        planError = null;
+      });
       return;
     }
     if (path === scanned.path) return;
     scanned.path = path;
     dependabotInflight?.cancel();
-    checkingGithub = false;
     // Hydrate last-known data synchronously so a revisit renders instantly
     // (the placeholder below only fires when there is no cached report).
     const cached = healthCache.get(path);
     const github = githubAlertsCache.get(path);
-    if (cached) {
-      report = cached.deps;
-      dependabot = cached.dependabot;
-      dependabotCheckedAt = cached.dependabotCheckedAt;
-      dependabotRequestFailed = cached.dependabotRequestFailed;
-      codeScanning = cached.codeScanning;
-      codeScanningCheckedAt = cached.codeScanningCheckedAt;
-      codeScanningRequestFailed = cached.codeScanningRequestFailed;
-    } else {
-      report = null;
-      dependabot = null;
-      dependabotCheckedAt = null;
-      dependabotRequestFailed = false;
-      codeScanning = null;
-      codeScanningCheckedAt = null;
-      codeScanningRequestFailed = false;
-      deadSymbols = [];
-      deadSymbolsAvailable = false;
-      deadSymbolsReason = null;
-      codegraph = null;
-    }
-    if (github) {
-      dependabot = github.dependabot;
-      dependabotCheckedAt = github.checkedAt;
-      dependabotRequestFailed = github.dependabotRequestFailed;
-      codeScanning = github.codeScanning;
-      codeScanningCheckedAt = github.checkedAt;
-      codeScanningRequestFailed = github.codeScanningRequestFailed;
-    }
+    untrack(() => {
+      checkingGithub = false;
+      if (cached) {
+        report = cached.deps;
+        dependabot = cached.dependabot;
+        dependabotCheckedAt = cached.dependabotCheckedAt;
+        dependabotRequestFailed = cached.dependabotRequestFailed;
+        codeScanning = cached.codeScanning;
+        codeScanningCheckedAt = cached.codeScanningCheckedAt;
+        codeScanningRequestFailed = cached.codeScanningRequestFailed;
+      } else {
+        report = null;
+        dependabot = null;
+        dependabotCheckedAt = null;
+        dependabotRequestFailed = false;
+        codeScanning = null;
+        codeScanningCheckedAt = null;
+        codeScanningRequestFailed = false;
+        deadSymbols = [];
+        deadSymbolsAvailable = false;
+        deadSymbolsReason = null;
+        codegraph = null;
+      }
+      if (github) {
+        dependabot = github.dependabot;
+        dependabotCheckedAt = github.checkedAt;
+        dependabotRequestFailed = github.dependabotRequestFailed;
+        codeScanning = github.codeScanning;
+        codeScanningCheckedAt = github.checkedAt;
+        codeScanningRequestFailed = github.codeScanningRequestFailed;
+      }
+    });
     void scan(path);
     // Launch also fetches these; this call joins that in-flight request or
     // hydrates from its cache so opening Health after a warning is not empty.

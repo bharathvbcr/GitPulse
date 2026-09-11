@@ -1350,13 +1350,12 @@ pub async fn cmd_pull(
 /// Pushes, after the command gate has judged it. A force push is refused by
 /// the harness's hard rules, which is the whole reason this call is gated.
 ///
-/// Judged argv is the executed argv: GitWriter::push runs
-/// `--force-with-lease`, so that exact flag is what gets judged. The
-/// harness's `command.force_push` hard rule catches it — verified against a
-/// live `manvi serve`: both `git push --force origin main` and
-/// `git push --force-with-lease origin main` come back deny/hard. (The old
-/// code judged a fictional `--force`; truthful rendering keeps denies intact
-/// without belt-and-braces double-gating.)
+/// Judged argv is the executed argv: [`GitWriter::plan_push`] is the single
+/// planner, and [`GitWriter::push_planned`] runs that same vec. An unpublished
+/// branch therefore cannot be judged as a bare `git push` and then fail
+/// with git's "no upstream" fatal — the gate sees `-u <remote> <branch>`
+/// when that is what will run. `--force-with-lease` is still the force flag
+/// the harness's `command.force_push` hard rule catches.
 #[tauri::command(async)]
 pub async fn cmd_push(
     repo_path: String,
@@ -1366,18 +1365,17 @@ pub async fn cmd_push(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let force = force.unwrap_or(false);
-        let mut argv = vec!["git", "push"];
-        if force {
-            argv.push("--force-with-lease");
-        }
-        if let Some(ref r) = remote {
-            argv.push(r.as_str());
-        }
-        if let Some(ref b) = branch {
-            argv.push(b.as_str());
-        }
+        let args = GitWriter::plan_push(
+            &repo_path,
+            remote.as_deref(),
+            branch.as_deref(),
+            force,
+        )?;
+        let argv: Vec<&str> = std::iter::once("git")
+            .chain(args.iter().map(String::as_str))
+            .collect();
         let policy = guard(&repo_path, &argv)?;
-        let output = GitWriter::push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
+        let output = GitWriter::push_planned(&repo_path, &args)?;
         Ok(Guarded { policy, output })
     })
     .await

@@ -125,7 +125,7 @@
         families: [{ family: "rust", languages: ["Rust"], color_hex: "#dea584",
                      expected_formats: ["lcov"], expected_paths: ["lcov.info"], found: true,
                      suggested_commands: ["cargo llvm-cov"], setup_commands: [], tool_ready: true,
-                     tool_detail: "cargo-llvm-cov 0.6" }],
+                     tool_detail: "cargo-llvm-cov 0.6", duration_hint: "first scan ~2s" }],
         languages: [{ language: "Rust", color_hex: "#dea584", files: 3, lines_found: 50, lines_hit: 40, percentage: 80 }],
         artifacts: [{ path: "lcov.info", format: "lcov", family: "rust", skipped: false,
                       skip_reason: null, totals: { lines_found: 50, lines_hit: 40, percentage: 80 } }],
@@ -133,6 +133,130 @@
         overall: { lines_found: 50, lines_hit: 40, percentage: 80 },
         truncated: false,
         limit_notices: [],
+        go_modules: [],
+        go_modules_partial: false,
+      });
+      // Complete FileCoverage, per src/lib/coverage/types.ts. CoverageViewer
+      // loads this when a file is selected; a null here would throw on
+      // `detail.lines` the same way a missing Health command threw on `.length`.
+      const fileCoverage = (args) => ({
+        path: args?.filePath ?? "src/a.rs",
+        language: "Rust",
+        color_hex: "#dea584",
+        lines: [{ line_no: 1, hits: 4 }, { line_no: 2, hits: 0 }],
+        totals: { lines_found: 50, lines_hit: 40, percentage: 80 },
+        truncated: false,
+        lines_truncated: false,
+      });
+      // Complete DepsHealthReport, per src/lib/health/types.ts. The previous
+      // manifest omitted `lifecycle_scripts` (and the rest of NpmManifest), so
+      // HealthPanel threw on `.length` mid-render and tore its effects down.
+      const healthReport = () => ({
+        node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true,
+        cargo_audit_present: true, pip_audit_present: false, govulncheck_present: false,
+        composer_present: false, bundler_audit_present: false,
+        scanners_ran: ["npm", "cargo"], audit_complete: false,
+        manifests: [{
+          path: "package.json", name: "gitpulse", version: "0.0.5", private: true,
+          license: "MIT", engines_node: ">=22", package_manager: "npm",
+          lockfile: "package-lock.json", has_workspaces: false,
+          dep_count: 12, dev_dep_count: 8, optional_dep_count: 0, peer_dep_count: 0,
+          lifecycle_scripts: ["postinstall"],
+        }],
+        ecosystems: [{
+          family: "node",
+          manifests: ["package.json", "apps/a/package.json", "apps/b/package.json",
+                      "apps/c/package.json", "apps/d/package.json"],
+          note: "npm",
+        }],
+        issues: [{
+          severity: "warning", code: "engines_mismatch",
+          message: "engines.node is >=22", path: "package.json",
+        }],
+        vulnerabilities: [{
+          name: "left-pad", severity: "low", is_direct: false,
+          title: "ReDoS in left-pad", url: "https://github.com/advisories/GHSA-xxxx",
+          range: "<1.3.0", fix_available: "1.3.0", via: ["dep-a"], ecosystem: "npm",
+        }],
+        audit: { info: 0, low: 1, moderate: 0, high: 0, critical: 0, unknown: 0, total: 1 },
+        outdated: [{
+          name: "svelte", current: "5.0.0", wanted: "5.57.0", latest: "5.57.0",
+          dep_type: "devDependencies", location: "/",
+        }],
+        truncated: true,
+        limit_notices: [
+          { resource: "outdated npm packages", kept: 1, total: 4 },
+          { resource: "node ecosystem artifacts", kept: 4, total: 5 },
+        ],
+      });
+      const dependabotReport = () => ({
+        available: true, cli_present: true, is_github_remote: true,
+        slug: "bharathvbcr/GitPulse",
+        alerts: [{
+          number: 1, package: "left-pad", ecosystem: "npm",
+          manifest_path: "package.json", scope: "runtime", severity: "low",
+          title: "ReDoS in left-pad", advisory_id: "GHSA-xxxx", cve_id: "CVE-2016-0000",
+          vulnerable_range: "<1.3.0", first_patched: "1.3.0",
+          url: "https://github.com/bharathvbcr/GitPulse/security/dependabot/1",
+          created_at: "2026-01-01T00:00:00Z",
+        }],
+        truncated: false, error: null, unavailable_reason: undefined,
+      });
+      const codeScanningReport = () => ({
+        available: true, cli_present: true, is_github_remote: true,
+        slug: "bharathvbcr/GitPulse",
+        alerts: [{
+          number: 2, rule_id: "js/unused-local-variable", rule_name: "Unused variable",
+          severity: "note", state: "open", tool: "CodeQL", tool_version: "2.0",
+          title: "Unused local variable", path: "src/a.ts", start_line: 12,
+          url: "https://github.com/bharathvbcr/GitPulse/security/code-scanning/2",
+          dismissed_reason: "", created_at: "2026-01-02T00:00:00Z",
+          updated_at: "2026-01-03T00:00:00Z",
+        }],
+        truncated: false, error: null, unavailable_reason: undefined,
+      });
+      // Complete CodeintelResponse<CodeintelDeadSymbol>, per
+      // src/lib/codeintel/types.ts. Missing from FIXTURES, invoke returned
+      // null, and HealthPanel read `.available` off it.
+      const deadSymbols = () => ({
+        source_freshness: true,
+        available: true,
+        reason: null,
+        items: [
+          {
+            symbol_name: "unused_helper", file_path: "src/legacy.rs",
+            confidence: 0.9, is_exempt: false, exemption_reason: null,
+          },
+          {
+            symbol_name: "kept_for_api", file_path: "src/api.rs",
+            confidence: 0.4, is_exempt: true, exemption_reason: "public API",
+          },
+        ],
+        total: 5,
+        shown: 2,
+        truncated: true,
+        walk_incomplete: undefined,
+        rungs: { deterministic: 2, high: 1, speculative: 2, filtered_out: 0 },
+      });
+      const codeintelStatus = () => ({
+        available: true,
+        is_fresh: true,
+        freshness_reason: null,
+        source_freshness: true,
+        analyzer_freshness: true,
+        pending_count: 0,
+        db_path: "/r/DevCouncil/.devcouncil/codeintel/devmap.sqlite",
+        generation_id: 12,
+        total_files: 400,
+        total_symbols: 2100,
+        total_edges: 5400,
+        reason: null,
+      });
+      const terminalRun = (args) => ({
+        command: Array.isArray(args?.args) ? args.args.join(" ") : "true",
+        gated: false, policy: null, timed_out: false, exit_code: 0,
+        stdout_tail: "ok", stderr_tail: "", truncated: false,
+        truncation_reason: null, duration_ms: 12,
       });
       // Complete StorageReport, per src/lib/storage/types.ts. `scan.truncated`
       // was missing and StoragePanel threw on it mid-render, which tore down
@@ -195,31 +319,20 @@
         cmd_fleet_snapshot: fleetSnapshot,
         cmd_fleet_record_metrics: () => null,
         cmd_scan_coverage: coverageReport,
+        cmd_get_file_coverage: fileCoverage,
+        cmd_get_file_content: () => "fn a() {}\n",
         cmd_storage_scan: storageReport,
         cmd_get_pulse_report: pulseReport,
         cmd_get_pulse_snapshots: () => [],
         cmd_get_knowledge_report: () => ({ authors: [], files: [] }),
         cmd_get_dora_report: () => null,
-        // Complete DepsHealthReport / DependabotReport, per src/lib/health/types.ts.
-        cmd_scan_deps_health: () => ({
-          node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true,
-          cargo_audit_present: true, pip_audit_present: false, govulncheck_present: false,
-          composer_present: false, bundler_audit_present: false,
-          scanners_ran: ["npm", "cargo"], audit_complete: true,
-          manifests: [{ path: "package.json", name: "gitpulse", version: "0.0.5", private: true, license: "MIT" }],
-          ecosystems: [{ family: "node", manifests: ["package.json"], note: "npm" }],
-          issues: [], vulnerabilities: [],
-          audit: { info: 0, low: 1, moderate: 0, high: 0, critical: 0, unknown: 0, total: 1 },
-          outdated: [], truncated: false, limit_notices: [],
-        }),
-        cmd_github_dependabot_alerts: () => ({
-          available: true, cli_present: true, is_github_remote: true,
-          slug: "bharathvbcr/GitPulse", alerts: [], truncated: false, error: null,
-        }),
-        cmd_github_code_scanning_alerts: () => ({
-          available: true, cli_present: true, is_github_remote: true,
-          slug: "bharathvbcr/GitPulse", alerts: [], truncated: false, error: null,
-        }),
+        cmd_scan_deps_health: healthReport,
+        cmd_github_dependabot_alerts: dependabotReport,
+        cmd_github_code_scanning_alerts: codeScanningReport,
+        cmd_codeintel_dead_symbols: deadSymbols,
+        cmd_codeintel_status: codeintelStatus,
+        cmd_manvi_run_action: terminalRun,
+        cmd_terminal_run: terminalRun,
         cmd_list_branches: () => [], cmd_get_status: () => [],
         // Complete TagList, per src/lib/branches/types.ts. A bare array here is
         // the retired Vec<TagInfo> shape, which parseTagList treats as a FAILED
@@ -329,6 +442,7 @@
         FleetView: () => import("../src/lib/components/FleetView.svelte"),
         TerminalPanel: () => import("../src/lib/components/TerminalPanel.svelte"),
         ManviOpsPanel: () => import("../src/lib/components/ManviOpsPanel.svelte"),
+        StatusBar: () => import("../src/lib/components/StatusBar.svelte"),
         LoopCanary: () => import("./LoopCanary.svelte"),
       };
       const Component = (await pickNamedFunction(LOADERS, COMPONENT, Object.keys(LOADERS))()).default;
@@ -463,6 +577,17 @@
         xtermScreens: target.querySelectorAll(".xterm-screen").length,
       };
       document.title = `gp-stress done ${COMPONENT}/${SCENARIO} depth=${depthCount()} chars=${window.__gpResult.renderedChars}`;
+      document.documentElement.setAttribute(
+        "data-gp-result",
+        encodeURIComponent(JSON.stringify(window.__gpResult)),
+      );
+      const report = q.get("report");
+      if (report?.startsWith("/__gp_result/")) {
+        await fetch(report, {
+          method: "POST",
+          body: document.documentElement.outerHTML,
+        }).catch((error) => console.error("Harness result delivery failed", error));
+      }
     </script>
   </body>
 </html>

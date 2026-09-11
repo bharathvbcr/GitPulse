@@ -112,7 +112,7 @@
 
 <script lang="ts">
   import { repoStore, type DiffPayload } from "../stores/repoStore";
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { Check, GitMerge, AlertTriangle, ChevronUp, ChevronDown, FileCode2, Search, RotateCcw, Loader2 } from "@lucide/svelte";
@@ -221,7 +221,9 @@
     if (parsedDoc) await updatePreview(parsedDoc);
   }
   $effect(() => {
-    if (!conflictedFiles.some(file => file.path === selectedFile)) selectedFile = conflictedFiles[0]?.path ?? null;
+    if (!conflictedFiles.some(file => file.path === selectedFile)) {
+      untrack(() => { selectedFile = conflictedFiles[0]?.path ?? null; });
+    }
   });
   $effect(() => () => {
     loadGuard?.cancel(); previewGuard?.cancel(); saveGuard?.cancel(); reviewGuard?.cancel();

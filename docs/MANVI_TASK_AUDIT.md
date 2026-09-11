@@ -6,6 +6,22 @@ model-output decoder. Evidence below distinguishes browser fixtures from real
 processes and inference. This is bounded verification, not proof that every
 provider or model preserves meaning for every prompt.
 
+## 2026-09-11 follow-up: notes-to-task extraction still failed after rewrite hardening
+
+The 2026-09-09 work treated Manvi as a field rewriter. Notes-first drafting still
+failed in three places, each reproduced against unmodified code before the fix:
+
+| Finding | Pre-fix evidence | Resulting behavior |
+| --- | --- | --- |
+| Local title extraction split on list numbers and abbreviations | `titleFromNotes("1. Fix the auth bug in both repos")` returned `"1."`; `"Dr. Smith reported E42 on login."` returned `"Dr."` | Title extraction skips weak clauses (`1.`, `Dr.`, `e.g.`), heading markers, and checkbox bullets. A weak first line falls through to the next non-empty line. |
+| Notes-derived titles froze Manvi rewrites | Notes `Must keep E42. Do not drop the reproduction steps.` became the title; decode then rejected `Preserve E42 reproduction` with `model altered a protected constraint in title` | Title constraints that also appear in the description stay protected in the description only. Title-only constraints that are not in the description remain frozen. Identifier literals such as `E42` stay required in the title. |
+| Thinking models and chat preambles were refused | `<think>…</think>` then JSON was an explicit refusal; `"Sure, I can help.\\nHere is the JSON:"` plus an object also failed | Complete `<think>` / `<thinking>` wrappers, leftover close tags, multi-line chat preambles, and `JSON: {…}` unwrap to one object. Unclosed think, think without JSON, trailing prose, extra keys, and a second object still fail. Raw wrapping may be up to 256 KiB; the JSON object remains capped at 72 KiB. |
+| Cmd+Enter failed with no message when Ask was gated | `generate()` returned when `askDisabled && !quick` | The same gate now writes `gate` / `fieldReason` / a live-attempt message into the assist error. |
+
+Verification (this follow-up): GitPulse focused workbench tests 70 passed, including a 200-item numbered-list corpus and abbreviation cases. Manvi decoder unit tests passed, including 10 race repetitions. Fuzz: `FuzzEnhancementOutputCannotSmuggleUnrequestedFields` 277,482 executions in 20s, passed; `FuzzEnhancementUnwrapKeepsSingleObjectContract` 1,547,001 executions in 20s, passed. Browser harness, signed app install, and live-model inference were not repeated here; GitPulse also has unrelated uncommitted UI work outside this path.
+
+Security impact: the accepted model-output envelope expands only to complete think wrappers and a leading `{` after those wrappers. Extra keys, trailing tokens, tools, and duplicate keys remain refused. No credentials, authorization, or provider-resolution changes.
+
 ## Delivery locations
 
 - GitPulse: `/Users/bharath/.codex/worktrees/manvi-task-hardening/GitPulse`,

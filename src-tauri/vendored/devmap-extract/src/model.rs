@@ -1070,7 +1070,7 @@ pub enum WiringKind {
     /// Treated as [`Self::TestFile`] is, for both the file and its symbols.
     /// `is_test_path` does not know these directories — it is pinned equal to
     /// the Python rule by a parity test — so 60 of this repository's 138
-    /// unwired candidates were `rust-port/testdata/**`.
+    /// unwired candidates were `rust/testdata/**`.
     Fixture,
     /// The language's unit of use is the *directory*, and nothing in this build
     /// resolves one.

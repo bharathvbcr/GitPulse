@@ -21,7 +21,7 @@ For a Rust host, the linked implementation is selected with one dependency
 declaration; updating it requires rebuilding the host:
 
 ```toml
-devmap-query = { path = "../DevCouncil/rust-port/crates/devmap-query", default-features = false }
+devmap-query = { path = "../DevCouncil/rust/devmap-query", default-features = false }
 ```
 
 The filesystem provider uses the host's repository root. Its path and byte-limit

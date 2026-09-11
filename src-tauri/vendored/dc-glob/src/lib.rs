@@ -166,7 +166,7 @@ mod tests {
     /// the same CPython-generated fixture; if they drift, one of them fails.
     #[test]
     fn matches_cpython_fixture() {
-        let fixture = include_str!("../../../../testdata/fnmatch-parity.tsv");
+        let fixture = include_str!("../../testdata/fnmatch-parity.tsv");
         let mut checked = 0usize;
         for (lineno, line) in fixture.lines().enumerate() {
             if line.starts_with('#') || line.trim().is_empty() {

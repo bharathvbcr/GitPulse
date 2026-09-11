@@ -7,7 +7,7 @@ alwaysApply: true
 
 Use `.devcouncil/repo_map.json` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.
 
-Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.
+Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one MCP process across workspace tabs. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.
 
 Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.
 

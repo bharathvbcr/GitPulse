@@ -389,7 +389,7 @@ pub fn resolve_source_root(tool: ExternalTool) -> Result<PathBuf, String> {
 pub fn install_target(tool: ExternalTool, root: &Path) -> Result<PathBuf, String> {
     match tool {
         ExternalTool::Devmap => {
-            let crate_path = root.join("rust-port/crates/devmap-cli");
+            let crate_path = root.join("rust/devmap-cli");
             if crate_path.join("Cargo.toml").is_file() {
                 return Ok(crate_path);
             }
@@ -398,7 +398,7 @@ pub fn install_target(tool: ExternalTool, root: &Path) -> Result<PathBuf, String
                 return Ok(alt);
             }
             Err(format!(
-                "{} has no rust-port/crates/devmap-cli (looked under {})",
+                "{} has no rust/devmap-cli (looked under {})",
                 tool.env_root(),
                 root.display()
             ))
@@ -426,7 +426,7 @@ fn documented_command(tool: ExternalTool, target: Option<&Path>) -> String {
             format!("cargo install --path {} --locked --force", path.display())
         }
         (ExternalTool::Devmap, None) => {
-            "cargo install --path <DevCouncil>/rust-port/crates/devmap-cli --locked --force".into()
+            "cargo install --path <DevCouncil>/rust/devmap-cli --locked --force".into()
         }
         (ExternalTool::Manvi, Some(path)) => {
             format!("go -C {} install ./cmd/manvi", path.display())
@@ -1977,7 +1977,7 @@ mod tests {
         let err = install_target(ExternalTool::Devmap, tmp.path()).unwrap_err();
         assert!(err.contains("devmap-cli"), "{err}");
 
-        let crate_dir = tmp.path().join("rust-port/crates/devmap-cli");
+        let crate_dir = tmp.path().join("rust/devmap-cli");
         fs::create_dir_all(&crate_dir).unwrap();
         fs::write(
             crate_dir.join("Cargo.toml"),
@@ -2004,6 +2004,9 @@ mod tests {
         assert!(cmd.contains("cargo install --path"));
         assert!(cmd.contains("--locked"));
         assert!(cmd.contains("--force"));
+
+        let fallback = documented_command(ExternalTool::Devmap, None);
+        assert!(fallback.contains("rust/devmap-cli"), "{fallback}");
 
         let cmd = documented_command(ExternalTool::Manvi, Some(Path::new("/x/manvi")));
         assert!(cmd.contains("go -C"));

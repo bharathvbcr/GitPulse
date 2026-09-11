@@ -9,8 +9,22 @@ export function buildHitMap(lines: CoveredLine[]): Map<number, number> {
   return hits;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function parseFileCoverage(value: unknown): FileCoverage {
+  if (!isRecord(value) || !Array.isArray(value.lines)) {
+    throw new Error("cmd_get_file_coverage returned no line map");
+  }
+  if (typeof value.truncated !== "boolean" || typeof value.lines_truncated !== "boolean") {
+    throw new Error("cmd_get_file_coverage omitted truncation flags");
+  }
+  return value as FileCoverage;
+}
+
 export function fetchFileCoverage(repoPath: string, filePath: string): Promise<FileCoverage> {
-  return invoke<FileCoverage>("cmd_get_file_coverage", { repoPath, filePath });
+  return invoke("cmd_get_file_coverage", { repoPath, filePath }).then(parseFileCoverage);
 }
 
 export function hitBadgeClass(hits: number | undefined): string {

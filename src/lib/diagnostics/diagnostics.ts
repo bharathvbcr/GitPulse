@@ -2,6 +2,7 @@ import { writable, type Readable } from "svelte/store";
 import { formatError } from "../ui/formatError";
 import { browserStorage, type StorageLike } from "../repos/persist";
 import { escapeRegExp } from "../text/lineSearch";
+import { isProductDisabledMessage } from "../health/githubAlerts";
 
 /**
  * Central capture of everything that goes wrong while the app runs: uncaught
@@ -633,10 +634,26 @@ export function redactDiagnosticText(value: string): string {
 /** Formats untrusted thrown values without allowing a hostile getter to fail diagnostics. */
 export function formatDiagnosticFailure(detail: unknown): string {
   try {
-    return redactDiagnosticText(formatError(detail));
+    return enrichSvelteRuntimeMessage(redactDiagnosticText(formatError(detail)));
   } catch {
     return "Unknown error";
   }
+}
+
+/**
+ * Svelte's `effect_update_depth_exceeded` is thrown as the svelte.dev URL
+ * alone. A dump that only quotes that URL cannot say *what* froze the UI,
+ * so the next report looks like a link, not a diagnosis.
+ */
+export function isSvelteEffectLoopMessage(message: string): boolean {
+  return /effect_update_depth_exceeded/i.test(message)
+    || /svelte\.dev\/e\/effect_update_depth_exceeded/i.test(message);
+}
+
+function enrichSvelteRuntimeMessage(message: string): string {
+  if (!isSvelteEffectLoopMessage(message)) return message;
+  if (message.includes("read and wrote the same state")) return message;
+  return `Maximum update depth exceeded: an $effect read and wrote the same state until Svelte aborted (${message}).`;
 }
 
 export interface DiagnosticsHealth {
@@ -946,6 +963,21 @@ function isRestoredObserverDump(entry: DiagnosticEntry): boolean {
   return entry.source === "browser-resize-observer" || entry.source === "uncaught-error";
 }
 
+/**
+ * 0.1.0 treated GitHub's "product is off" prose as a GitPulse check failure
+ * and wrote it into the persisted ring. Restoring those warnings after the
+ * classifier was fixed made a fixed bug look live. Live `github-alerts:check`
+ * events still record; only the historical product-disabled *warnings* drop.
+ * Errors and unknown GitHub prose stay.
+ */
+function isRestoredGithubAlertsProductDisabled(entry: DiagnosticEntry): boolean {
+  return (
+    entry.severity === "warning"
+    && entry.source === "github-alerts:check"
+    && isProductDisabledMessage(entry.message)
+  );
+}
+
 function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
@@ -1014,6 +1046,7 @@ function loadPersisted(storage: StorageLike | null, development: boolean): {
   let entries = sanitized
     .filter((entry) => !isHostRuntimeNoise(entry.message, development))
     .filter((entry) => !isRestoredObserverDump(entry))
+    .filter((entry) => !isRestoredGithubAlertsProductDisabled(entry))
     // Newest first regardless of how the blob was written.
     .sort((a, b) => b.id - a.id)
     .slice(0, MAX_DIAGNOSTIC_ENTRIES);

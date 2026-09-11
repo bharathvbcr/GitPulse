@@ -61,4 +61,14 @@ describe("CommandPalette", () => {
     expect(footer).not.toMatch(/background(?:-color)?:/);
     expect(source).not.toMatch(/background:\s*var\(--color-background\)/);
   });
+
+  it("resets paging without tracking the page/highlight writes", () => {
+    const start = source.indexOf("void query; void repoPath");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, start + 220);
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("page = 0"));
+    expect(effect).toContain("highlighted = 0");
+    expect(effect).toContain("actionError = null");
+  });
 });

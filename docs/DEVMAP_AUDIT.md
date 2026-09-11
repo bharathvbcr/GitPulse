@@ -76,7 +76,7 @@ These earlier changes are subject to the final integration audit above.
 - Upstream: `cargo clippy -p devmap-query --no-default-features --lib --test viz_projection --example viz_snapshot -- -D warnings` passes.
 - Full `npm run check` currently fails in concurrent `src/lib/terminal/sessionLifecycle.test.ts` work: `.mock` access on a plain function type, a deferred promise/mock return mismatch, and `mockResolvedValueOnce()` without an argument. No DevMap diagnostics were reported. This is a failed workspace gate, not a pass.
 - Only `devmap-query/src/viz.rs` and its manifest record changed under `src-tauri/vendored`. The scoped vendor command is `node scripts/vendor-crates.mjs --crate=devmap-query`.
-- Regenerate the local preview from the canonical projection with `cargo run -p devmap-query --no-default-features --example viz_snapshot -- /absolute/path/to/code_graph.json` in DevCouncil's `rust-port`; redirect stdout to the preview JSON. `--symbols` selects the symbol projection.
+- Regenerate the local preview from the canonical projection with `cargo run -p devmap-query --no-default-features --example viz_snapshot -- /absolute/path/to/code_graph.json` in DevCouncil's `rust/`; redirect stdout to the preview JSON. `--symbols` selects the symbol projection.
 - The pending implementation and browser checks listed at this checkpoint were addressed in the following pass.
 
 ## Final local hardening pass

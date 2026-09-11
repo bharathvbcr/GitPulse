@@ -177,6 +177,39 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
+  it("does not bump revision when a successful build reports unchanged", async () => {
+    const index = createLiveIndex({
+      debounceMs: 0,
+      maybeRefresh: async () =>
+        outcome("refresh", {
+          build: {
+            ok: true,
+            binary: "/bin/devmap",
+            lookup: "path_search",
+            exit_code: 0,
+            stdout: "{}",
+            stderr: "",
+            timed_out: false,
+            report: { unchanged: true },
+          },
+        }),
+    });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(index.get("/repo").revision).toBe(0);
+    index.reset();
+  });
+
+  it("still publishes a revision when unchanged is absent from a successful build", async () => {
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh: async () => outcome("refresh") });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(index.get("/repo").revision).toBe(1);
+    index.reset();
+  });
+
   it("surfaces skip_cooldown as scheduled without busy-retrying", async () => {
     const maybeRefresh = vi.fn(async () =>
       outcome("skip_cooldown", {

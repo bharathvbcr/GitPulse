@@ -152,9 +152,11 @@
   $effect(() => {
     const request = $taskTerminalRequests.find((request) => request.repoPath === repoPath);
     if (!request || (!canCreate && !tabState.tabs.some((tab) => tab.taskRunId === request.runId))) return;
-    tabState = openTab(tabState, request.provider, { runId: request.runId, title: request.title });
-    mode = "shell";
-    consumeTaskTerminal(request.runId);
+    untrack(() => {
+      tabState = openTab(tabState, request.provider, { runId: request.runId, title: request.title });
+      mode = "shell";
+      consumeTaskTerminal(request.runId);
+    });
   });
 
   function newTab(launcher: LauncherKind, initialPrompt?: string): boolean {
@@ -264,7 +266,7 @@
     if (!visible || mode !== "shell") return;
     const id = activeId;
     if (!id) return;
-    if (unread.has(id)) unread = new Set([...unread].filter((key) => key !== id));
+    if (unread.has(id)) untrack(() => { unread = new Set([...unread].filter((key) => key !== id)); });
     const session = sessions[id];
     void tick().then(() => {
       if (!visible || mode !== "shell" || activeId !== id) return;

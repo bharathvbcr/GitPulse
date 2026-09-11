@@ -16,7 +16,7 @@ copies*, and each repo's CI fails if its copy has drifted.
 | Policy verdict | **Manvi** — `manvi/policy/decision.go`, `manvi/gate/gate.go` | `verdict.schema.json`, `verdict.cases.json` |
 | Ledger event | **GitPulse** — it owns the resident watcher and the UI | `event.schema.json` |
 | Task + lease store | **Manvi** — `crates/dc-store/src/schema.rs` owns the DDL | `lease.schema.md` |
-| Code graph | **DevCouncil** — `rust-port` `devmap` | *(crate API, no wire contract)* |
+| Code graph | **DevCouncil** — `rust/` `devmap` | *(crate API, no wire contract)* |
 | Verification gates | **Manvi** — `crates/dc-verify` | *(binary CLI, no wire contract)* |
 
 Owning an artifact means: the owner's source is authoritative, the owner's

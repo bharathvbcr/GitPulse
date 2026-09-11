@@ -24,6 +24,10 @@ const src = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta
 
 const harness = src("../harness/stress.html");
 const fleetTypes = src("../src/lib/fleet/types.ts");
+const healthTypes = src("../src/lib/health/types.ts");
+const codeintelTypes = src("../src/lib/codeintel/types.ts");
+const coverageTypes = src("../src/lib/coverage/types.ts");
+const terminalTypes = src("../src/lib/terminal/runResult.ts");
 
 /**
  * The harness with its comments removed.
@@ -36,8 +40,9 @@ const fixtures = harness.replace(/\/\/[^\n]*/g, "");
 
 /** Field names of a TS interface, ignoring comments and nested members. */
 function fieldsOf(source: string, name: string): string[] {
-  const start = source.indexOf(`export interface ${name} {`);
-  if (start < 0) throw new Error(`interface ${name} not found`);
+  const found = new RegExp(`export interface ${name}(?:<[^>]+>)? \\{`).exec(source);
+  if (!found) throw new Error(`interface ${name} not found`);
+  const start = found.index;
   const body = source.slice(start, source.indexOf("\n}", start));
   const fields: string[] = [];
   for (const line of body.split("\n").slice(1)) {
@@ -54,6 +59,10 @@ describe("the stress harness stands in for the real IPC layer", () => {
     expect(fieldsOf(fleetTypes, "FleetMetrics").length).toBeGreaterThan(20);
     expect(fieldsOf(fleetTypes, "FleetCommitStats").length).toBeGreaterThan(8);
     expect(fieldsOf(fleetTypes, "FleetRepoFacet").length).toBeGreaterThan(8);
+    expect(fieldsOf(healthTypes, "NpmManifest").length).toBeGreaterThan(8);
+    expect(fieldsOf(codeintelTypes, "CodeintelDeadSymbol").length).toBeGreaterThan(3);
+    expect(fieldsOf(codeintelTypes, "CodeintelStatus").length).toBeGreaterThan(6);
+    expect(fieldsOf(codeintelTypes, "CodeintelResponse").length).toBeGreaterThan(5);
   });
 
   for (const name of ["FleetMetrics", "FleetCommitStats", "FleetRepoFacet", "FleetSnapshot"]) {
@@ -86,4 +95,50 @@ describe("the stress harness stands in for the real IPC layer", () => {
     // "render no chip at all" branch would never run in the harness.
     expect(fixtures).toMatch(/loc_prev:\s*i === 0 \? null/);
   });
+
+  it("answers every command HealthPanel invokes on mount", () => {
+    // invoke returns null for a missing key. HealthPanel then reads
+    // `.available` and `.length` off that null and throws; the throw tears
+    // the pane's effects down, so a loop would look like a clean run.
+    for (const cmd of [
+      "cmd_scan_deps_health",
+      "cmd_github_dependabot_alerts",
+      "cmd_github_code_scanning_alerts",
+      "cmd_codeintel_dead_symbols",
+      "cmd_codeintel_status",
+    ]) {
+      expect(fixtures, `HealthPanel invoke ${cmd} is missing from FIXTURES`).toContain(cmd);
+    }
+  });
+
+  for (const [source, name] of [
+    [healthTypes, "NpmManifest"],
+    [healthTypes, "DepsHealthReport"],
+    [healthTypes, "DependabotReport"],
+    [healthTypes, "DependabotAlertInfo"],
+    [healthTypes, "CodeScanningReport"],
+    [healthTypes, "CodeScanningAlertInfo"],
+    [healthTypes, "Vulnerability"],
+    [healthTypes, "OutdatedPackage"],
+    [healthTypes, "HealthIssue"],
+    [healthTypes, "AuditSummary"],
+    [healthTypes, "EcosystemHint"],
+    [healthTypes, "ScanLimitNotice"],
+    [codeintelTypes, "CodeintelDeadSymbol"],
+    [codeintelTypes, "CodeintelStatus"],
+    [codeintelTypes, "CodeintelResponse"],
+    [codeintelTypes, "CodeintelRungHistogram"],
+    [coverageTypes, "CoverageFamilyStatus"],
+    [coverageTypes, "CoverageReport"],
+    [coverageTypes, "FileCoverage"],
+    [terminalTypes, "TerminalRunResult"],
+    [terminalTypes, "TerminalSpawned"],
+  ] as const) {
+    it(`supplies every ${name} field Health/Coverage/Terminal may read`, () => {
+      const missing = fieldsOf(source, name).filter(
+        (field) => !new RegExp(`\\b${field}\\s*[:,}]`).test(fixtures),
+      );
+      expect(missing, `harness fixture is missing ${name}: ${missing.join(", ")}`).toEqual([]);
+    });
+  }
 });

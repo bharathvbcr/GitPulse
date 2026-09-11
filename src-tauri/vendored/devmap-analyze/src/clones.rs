@@ -220,12 +220,15 @@ pub fn group_clones(candidates: &[CloneCandidate], unsigned_symbols: usize) -> C
 
     // Largest bodies first: a 900-node duplication is worth more of a reader's
     // attention than a 33-node one, whatever the member count. Ties break on
-    // member count then signature, so the order is total and the report is
-    // byte-identical across builds of the same tree.
+    // full member count then signature. Counting just the displayed sample
+    // makes every group of 32 or more tie and lets a smaller group win on its
+    // hash instead. The report must rank the population, not its sample (R7).
     groups.sort_by(|a, b| {
         b.min_nodes
             .cmp(&a.min_nodes)
-            .then(b.members.len().cmp(&a.members.len()))
+            .then_with(|| {
+                (b.members.len() + b.members_omitted).cmp(&(a.members.len() + a.members_omitted))
+            })
             .then(a.signature.cmp(&b.signature))
     });
 
@@ -279,6 +282,77 @@ fn build_group(
         min_nodes,
         members,
         members_omitted,
+    }
+}
+
+#[cfg(test)]
+mod ranking_regressions {
+    use super::{group_clones, CloneCandidate, MAX_GROUP_MEMBERS};
+    use devmap_extract::model::SymbolKind;
+
+    // R4/R7: rank the population before applying the member sample cap.
+    #[test]
+    fn clone_ranking_uses_all_members_before_the_display_cap() {
+        let sizes = [2, 31, 32, 33, 65, 1_000];
+        let mut candidates = Vec::new();
+        for (group, count) in sizes.into_iter().enumerate() {
+            let signature = u64::try_from(group).expect("six fixture groups fit in u64");
+            for member in 0..count {
+                candidates.push(CloneCandidate {
+                    file_path: format!("g{group}/m{member:04}.rs"),
+                    symbol_name: "Record".into(),
+                    qualified_name: "Record".into(),
+                    span_start: 0,
+                    span_end: 100,
+                    kind: SymbolKind::Struct,
+                    exact: signature,
+                    structural: signature,
+                    nodes: 40,
+                });
+            }
+        }
+        let report = group_clones(&candidates, 7);
+        let counts: Vec<_> = report
+            .groups
+            .iter()
+            .map(|group| group.members.len() + group.members_omitted)
+            .collect();
+        assert_eq!(counts, sizes.into_iter().rev().collect::<Vec<_>>());
+        assert_eq!(report.signed_symbols, candidates.len());
+        assert_eq!(report.unsigned_symbols, 7);
+        for group in &report.groups {
+            assert!(group.members.len() <= MAX_GROUP_MEMBERS);
+        }
+        candidates.reverse();
+        assert_eq!(
+            serde_json::to_string(&report).expect("serialize report"),
+            serde_json::to_string(&group_clones(&candidates, 7))
+                .expect("serialize reversed report")
+        );
+    }
+
+    // A mutation exposed that the prior structural fixtures all had two
+    // members: rejecting every larger group still passed those tests.
+    #[test]
+    fn structural_clone_groups_include_more_than_two_distinct_bodies() {
+        let candidates: Vec<_> = (0..3)
+            .map(|member| CloneCandidate {
+                file_path: format!("member{member}.py"),
+                symbol_name: "compute".into(),
+                qualified_name: "compute".into(),
+                span_start: 0,
+                span_end: 100,
+                kind: SymbolKind::Function,
+                exact: member,
+                structural: 99,
+                nodes: 40,
+            })
+            .collect();
+        let report = group_clones(&candidates, 0);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].kind, super::CloneKind::Structural);
+        assert_eq!(report.groups[0].members.len(), 3);
+        assert_eq!(report.groups[0].members_omitted, 0);
     }
 }
 

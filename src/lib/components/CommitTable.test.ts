@@ -30,6 +30,16 @@ describe("CommitTable graph node hover", () => {
     expect(source).toContain("graphViewport.scrollLeft");
     expect(source).toContain("onscroll={handleGraphScroll}");
   });
+
+  it("does not let $state-proxied scrollLeft retrigger the clamp effect", () => {
+    const effect = source.slice(
+      source.indexOf("graphViewportWidth;\n    graphContentWidth;"),
+      source.indexOf("$effect(() => {\n    filteredRows;"),
+    );
+    expect(effect).toContain("untrack(() => {");
+    expect(effect).toContain("viewport.scrollLeft = next");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("viewport.scrollLeft = next"));
+  });
 });
 
 describe("CommitTable keyboard parity for graph context", () => {

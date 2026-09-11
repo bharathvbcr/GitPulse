@@ -120,7 +120,7 @@ const SKIP_DIR_TOP_LEVEL: &[&str] = &["dist", "build", "out"];
 /// Marker basenames the walk records wherever it finds them.
 ///
 /// A nested one is real evidence: this repository's `Cargo.toml` is at
-/// `rust-port/Cargo.toml` and its `go.mod` at
+/// `rust/Cargo.toml` and its `go.mod` at
 /// `backend/go_orchestrator/go.mod`, so a top-level-only rule would report a
 /// polyglot repository as Python-only.
 const NESTED_MARKERS: &[&str] = &[

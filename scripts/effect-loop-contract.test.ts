@@ -8,25 +8,24 @@ import { escapeRegExp } from "../src/lib/text/lineSearch.ts";
  * A pane that crashes with `effect_update_depth_exceeded` takes its whole
  * surface down, and the shape that causes it is invisible on inspection.
  *
- * `Metric.subscribe` (src/lib/metrics/freshness.ts) delivers the CURRENT
- * snapshot synchronously, from inside `subscribe()` itself. So when an
- * `$effect` subscribes, that first callback runs while the effect is still
- * being tracked. If the callback reads a `$state` the effect also writes, the
- * read registers as a dependency of the effect that writes it, every write
- * re-invalidates the effect, and Svelte aborts the pane after ~1000 passes.
+ * Three shapes, all scanned from the tree rather than listed here:
  *
- * Two panes shipped that shape:
+ * 1. A `$state` read+write inside a synchronous callback registered from
+ *    `$effect`. `Metric.subscribe` (src/lib/metrics/freshness.ts) delivers the
+ *    CURRENT snapshot from inside `subscribe()` itself, so the first callback
+ *    runs while the effect is still being tracked. PulseView's workspace LOC
+ *    strip (`const next = [...workspaceLoc]`) and StoragePanel's
+ *    `historyVersion += 1` (the compound assignment IS the read) shipped this.
  *
- *   PulseView's workspace LOC strip (`const next = [...workspaceLoc]`), which
- *   arms as soon as two repositories are open.
+ * 2. A `$state` read+write in the `$effect` body itself, after `untrack(...)`
+ *    and after stripping those sync-callback arguments so they stay check (1).
+ *    PulseView's `loadedPath = $state` load effect is this shape.
  *
- *   StoragePanel's usage history (`historyVersion += 1`, where the compound
- *   assignment IS the read). This one needs BOTH a cached measurement and a
- *   re-run of the effect: on a cold mount the snapshot is idle, the `if
- *   (snap.value && ...)` branch does not execute, and the tracked read never
- *   happens. Switching the active repository back to an already-measured one
- *   is what arms it — a mount-only check reports a false clean here, which is
- *   exactly what the browser A/B run showed before the scenario was widened.
+ * 3. A `$storeName` auto-subscription plus `name.set` / `name.update` /
+ *    `name.setError` in the same effect after `untrack`. App's
+ *    `$repoStore.error` forwarding that called `repoStore.setError(null)` is
+ *    this shape. Svelte runes (`state`, `derived`, `effect`, `props`,
+ *    `bindable`, `inspect`, `host`) are not stores.
  *
  * Neither is visible in `npm test` on its own: vitest runs
  * `environment: "node"`, where `$effect` compiles out entirely.
@@ -116,10 +115,15 @@ const word = (name: string) => escapeRegExp(name);
 
 export function countWrites(region: string, name: string): { plain: number; compound: number } {
   const n = word(name);
+  const prop = `(?:\\.[A-Za-z_$][\\w$]*|\\[[^\\]]+\\])+`;
   const plain = [...region.matchAll(new RegExp(`(?<![=!<>+\\-*/%&|^])\\b${n}\\s*=(?!=)`, "g"))].length;
   const compound =
     [...region.matchAll(new RegExp(`\\b${n}\\s*(?:\\+\\+|--|(?:\\+|-|\\*|/|%|\\||&|\\^|\\?\\?|\\|\\||&&)=)`, "g"))].length +
-    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*\\b${n}\\b`, "g"))].length;
+    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*\\b${n}\\b`, "g"))].length +
+    // `$state` is a proxy: `scanned.path = x` reads and writes the same
+    // binding. Counting only `scanned =` missed the HealthPanel shape.
+    [...region.matchAll(new RegExp(`\\b${n}${prop}\\s*(?:\\+\\+|--|(?:\\+|-|\\*|/|%|\\||&|\\^|\\?\\?|\\|\\||&&)?=(?!=))`, "g"))].length +
+    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*\\b${n}${prop}`, "g"))].length;
   return { plain, compound };
 }
 
@@ -141,6 +145,34 @@ function stripUntracked(region: string): string {
     out = out.slice(0, at) + " ".repeat(width) + out.slice(at + width);
   }
 }
+
+/** Blank the argument lists of synchronous-callback APIs so a subscribe /
+ *  map body stays check (1) and is not also reported as an effect-body loop. */
+export function stripSyncCallbackArgs(region: string): string {
+  const out = region.split("");
+  const re = new RegExp(SYNC_CALLBACK_APIS.source, "g");
+  for (const sc of region.matchAll(re)) {
+    const paren = (sc.index ?? 0) + sc[0].length - 1;
+    const call = balanced(region, paren);
+    for (let k = 1; k < call.length - 1; k++) {
+      if (out[paren + k] !== "\n") out[paren + k] = " ";
+    }
+  }
+  return out.join("");
+}
+
+/** `$foo` auto-subscriptions that are Svelte runes, not stores. */
+export const SVELTE_RUNES = new Set([
+  "state",
+  "derived",
+  "effect",
+  "props",
+  "bindable",
+  "inspect",
+  "host",
+]);
+
+const STORE_WRITE = /\b([A-Za-z_$][\w$]*)\.(set|update|setError)\s*\(/g;
 
 /**
  * Synchronous-callback APIs: a callback handed to one of these can run while
@@ -193,13 +225,130 @@ interface ScanResult {
   runeModules: number;
   effects: number;
   callbackSites: number;
+  storeSites: number;
   statesSeen: number;
+}
+
+function relPath(file: string): string {
+  return file.startsWith(SRC + "/") ? file.slice(SRC.length + 1) : file;
+}
+
+function collectFromScript(
+  file: string,
+  raw: string,
+  code: string,
+  offset: number,
+): Pick<ScanResult, "violations" | "effects" | "callbackSites" | "storeSites" | "statesSeen" | "runeModules"> {
+  const violations: Violation[] = [];
+  let effects = 0;
+  let callbackSites = 0;
+  let storeSites = 0;
+  const stateNames = [
+    ...code.matchAll(/(?:let|const|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*\$state\b/g),
+  ].map((m) => m[1]);
+  const statesSeen = stateNames.length;
+  const hasEffect = code.includes("$effect");
+  const runeModules = hasEffect && stateNames.length > 0 ? 1 : 0;
+  if (!hasEffect) {
+    return { violations, effects, callbackSites, storeSites, statesSeen, runeModules };
+  }
+  const helpers = helperBodies(code);
+
+  for (const em of code.matchAll(/\$effect(?:\.pre)?\s*\(/g)) {
+    effects++;
+    const effectBody = balanced(code, code.indexOf("(", em.index ?? 0));
+    const line = raw.slice(0, offset + (em.index ?? 0)).split("\n").length;
+    const fileName = relPath(file);
+
+    const callbackRe = new RegExp(SYNC_CALLBACK_APIS.source, "g");
+    for (const sc of effectBody.matchAll(callbackRe)) {
+      callbackSites++;
+      const call = balanced(effectBody, effectBody.indexOf("(", sc.index ?? 0));
+      let region = call;
+      for (const [name, body] of helpers) {
+        if (new RegExp(`\\b${word(name)}\\s*\\(`).test(call)) region += "\n" + body;
+      }
+      region = stripUntracked(region);
+      for (const state of stateNames) {
+        const writes = countWrites(region, state);
+        const total = writes.plain + writes.compound;
+        const reads = countReads(region, state);
+        if (total > 0 && reads > 0) {
+          violations.push({
+            file: fileName,
+            line,
+            state,
+            api: sc[1],
+            reads,
+            writes: total,
+          });
+        }
+      }
+    }
+
+    const body = stripSyncCallbackArgs(stripUntracked(effectBody));
+    for (const state of stateNames) {
+      const writes = countWrites(body, state);
+      const total = writes.plain + writes.compound;
+      const reads = countReads(body, state);
+      if (total > 0 && reads > 0) {
+        violations.push({
+          file: fileName,
+          line,
+          state,
+          api: "body",
+          reads,
+          writes: total,
+        });
+      }
+    }
+
+    const storeRegion = stripUntracked(effectBody);
+    const storeReads = new Set(
+      [...storeRegion.matchAll(/\$([A-Za-z_$][\w$]*)/g)]
+        .map((m) => m[1])
+        .filter((name) => !SVELTE_RUNES.has(name)),
+    );
+    storeSites += storeReads.size;
+    const writeRe = new RegExp(STORE_WRITE.source, "g");
+    for (const wm of storeRegion.matchAll(writeRe)) {
+      const name = wm[1];
+      const method = wm[2];
+      if (!storeReads.has(name)) continue;
+      const reads = [...storeRegion.matchAll(new RegExp(`\\$${word(name)}\\b`, "g"))].length;
+      violations.push({
+        file: fileName,
+        line,
+        state: name,
+        api: method,
+        reads,
+        writes: 1,
+      });
+    }
+  }
+
+  return { violations, effects, callbackSites, storeSites, statesSeen, runeModules };
+}
+
+export function scanSnippet(src: string): ScanResult {
+  const code = blankNonCode(src);
+  const part = collectFromScript("snippet.svelte.ts", src, code, 0);
+  return {
+    violations: part.violations,
+    files: 1,
+    runeModules: part.runeModules,
+    effects: part.effects,
+    callbackSites: part.callbackSites,
+    storeSites: part.storeSites,
+    statesSeen: part.statesSeen,
+  };
 }
 
 export function scan(): ScanResult {
   const violations: Violation[] = [];
   let effects = 0;
   let callbackSites = 0;
+  let storeSites = 0;
   let statesSeen = 0;
   let runeModules = 0;
   const files = runeFiles(SRC);
@@ -207,56 +356,33 @@ export function scan(): ScanResult {
   for (const file of files) {
     const raw = readFileSync(file, "utf8");
     for (const { code, offset } of scriptRegions(file, raw)) {
-      const stateNames = [
-        ...code.matchAll(/(?:let|const|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*\$state\b/g),
-      ].map((m) => m[1]);
-      if (stateNames.length === 0) continue;
-      statesSeen += stateNames.length;
-      if (code.includes("$effect")) runeModules++;
-      const helpers = helperBodies(code);
-
-      for (const em of code.matchAll(/\$effect(?:\.pre)?\s*\(/g)) {
-        effects++;
-        const effectBody = balanced(code, code.indexOf("(", em.index ?? 0));
-        for (const sc of effectBody.matchAll(SYNC_CALLBACK_APIS)) {
-          callbackSites++;
-          const call = balanced(effectBody, effectBody.indexOf("(", sc.index ?? 0));
-          let region = call;
-          for (const [name, body] of helpers) {
-            if (new RegExp(`\\b${word(name)}\\s*\\(`).test(call)) region += "\n" + body;
-          }
-          region = stripUntracked(region);
-          for (const state of stateNames) {
-            const writes = countWrites(region, state);
-            const total = writes.plain + writes.compound;
-            const reads = countReads(region, state);
-            if (total > 0 && reads > 0) {
-              violations.push({
-                file: file.slice(SRC.length + 1),
-                line: raw.slice(0, offset + (em.index ?? 0)).split("\n").length,
-                state,
-                api: sc[1],
-                reads,
-                writes: total,
-              });
-            }
-          }
-        }
-      }
+      const part = collectFromScript(file, raw, code, offset);
+      violations.push(...part.violations);
+      effects += part.effects;
+      callbackSites += part.callbackSites;
+      storeSites += part.storeSites;
+      statesSeen += part.statesSeen;
+      runeModules += part.runeModules;
     }
   }
-  return { violations, files: files.length, runeModules, effects, callbackSites, statesSeen };
+  return { violations, files: files.length, runeModules, effects, callbackSites, storeSites, statesSeen };
+}
+
+function formatViolation(v: Violation): string {
+  if (v.api === "body") {
+    return `${v.file}:${v.line} — $effect writes ${v.state} and reads it back in its body (${v.reads} read/${v.writes} write)`;
+  }
+  if (v.api === "set" || v.api === "update" || v.api === "setError") {
+    return `${v.file}:${v.line} — $effect auto-subscribes $${v.state} and calls ${v.state}.${v.api}() (${v.reads} read/${v.writes} write)`;
+  }
+  return `${v.file}:${v.line} — $effect writes ${v.state} and reads it back inside .${v.api}() (${v.reads} read/${v.writes} write)`;
 }
 
 describe("no $effect reads the state it writes through a synchronous callback", () => {
   const result = scan();
 
-  it("finds no self-invalidating callback", () => {
-    const report = result.violations.map(
-      (v) =>
-        `${v.file}:${v.line} — $effect writes ${v.state} and reads it back inside .${v.api}() (${v.reads} read/${v.writes} write)`,
-    );
-    expect(report).toEqual([]);
+  it("finds no self-invalidating effect", () => {
+    expect(result.violations.map(formatViolation)).toEqual([]);
   });
 
   it("actually examined the panes it claims to cover", () => {
@@ -266,6 +392,7 @@ describe("no $effect reads the state it writes through a synchronous callback", 
     expect(result.runeModules).toBeGreaterThan(20);
     expect(result.effects).toBeGreaterThan(40);
     expect(result.callbackSites).toBeGreaterThan(3);
+    expect(result.storeSites).toBeGreaterThan(3);
     expect(result.statesSeen).toBeGreaterThan(100);
   });
 
@@ -327,5 +454,107 @@ describe("no $effect reads the state it writes through a synchronous callback", 
       blankNonCode(`rows.subscribe(p, () => { const n = [...untrack(() => rows)]; rows = n; })`),
     );
     expect(countReads(sample, "rows")).toBe(1); // the .subscribe receiver only
+  });
+
+  it("flags $state read+write in an $effect body after untrack and subscribe args are stripped", () => {
+    const pulseLoaded = `
+      let loadedPath = $state(null);
+      $effect(() => {
+        if (path === loadedPath) return;
+        loadedPath = path;
+      });`;
+    const storageBody = `
+      let historyVersion = $state(0);
+      $effect(() => { historyVersion += 1; });`;
+    const pulse = scanSnippet(pulseLoaded);
+    expect(pulse.violations.some((v) => v.api === "body" && v.state === "loadedPath")).toBe(true);
+    const storage = scanSnippet(storageBody);
+    expect(storage.violations.some((v) => v.api === "body" && v.state === "historyVersion")).toBe(true);
+    const fixed = scanSnippet(`
+      let loadedPath = null;
+      $effect(() => {
+        if (path === loadedPath) return;
+        loadedPath = path;
+      });`);
+    expect(fixed.violations.filter((v) => v.state === "loadedPath")).toEqual([]);
+  });
+
+  it("does not treat a subscribe callback as an effect-body loop", () => {
+    const sample = scanSnippet(`
+      let workspaceLoc = $state([]);
+      $effect(() => {
+        locMetric.subscribe(p, (snap) => {
+          const next = [...workspaceLoc];
+          workspaceLoc = next;
+        });
+      });`);
+    expect(sample.violations.filter((v) => v.api === "body")).toEqual([]);
+    expect(sample.violations.some((v) => v.api === "subscribe" && v.state === "workspaceLoc")).toBe(
+      true,
+    );
+  });
+
+  it("flags $repoStore.error auto-sub plus repoStore.setError in the same effect", () => {
+    const looping = scanSnippet(`
+      $effect(() => {
+        const err = $repoStore.error;
+        if (err) repoStore.setError(null);
+      });`);
+    expect(looping.violations.some((v) => v.state === "repoStore" && v.api === "setError")).toBe(
+      true,
+    );
+    const fixed = scanSnippet(`
+      $effect(() => {
+        const err = $repoStore.error;
+        if (err) untrack(() => { repoStore.setError(null); });
+      });`);
+    expect(fixed.violations.filter((v) => v.state === "repoStore")).toEqual([]);
+    const setShape = scanSnippet(`
+      $effect(() => { const v = $items; items.set(v); });`);
+    expect(setShape.violations.some((v) => v.state === "items" && v.api === "set")).toBe(true);
+    const updateShape = scanSnippet(`
+      $effect(() => { const v = $items; items.update((n) => n); });`);
+    expect(updateShape.violations.some((v) => v.state === "items" && v.api === "update")).toBe(true);
+  });
+
+  it("flags $state property mutation in an $effect body", () => {
+    const looping = scanSnippet(`
+      let scanned = $state({ path: "" });
+      $effect(() => {
+        if (path === scanned.path) return;
+        scanned.path = path;
+      });`);
+    expect(looping.violations.some((v) => v.api === "body" && v.state === "scanned")).toBe(true);
+    const indexed = scanSnippet(`
+      let statuses = $state({});
+      $effect(() => {
+        statuses[key] = { running: true };
+      });`);
+    expect(indexed.violations.some((v) => v.api === "body" && v.state === "statuses")).toBe(true);
+    const plain = scanSnippet(`
+      const scanned = { path: "" };
+      $effect(() => {
+        if (path === scanned.path) return;
+        scanned.path = path;
+      });`);
+    expect(plain.violations.filter((v) => v.state === "scanned")).toEqual([]);
+  });
+
+  it("does not treat Svelte runes as store auto-subscriptions", () => {
+    const sample = scanSnippet(`
+      $effect(() => {
+        let n = $state(0);
+        const d = $derived(1);
+        $inspect(n);
+        $host();
+        state.set(1);
+        derived.update(() => 0);
+        effect.setError(null);
+        props.set(1);
+        bindable.update(() => 0);
+        inspect.setError(null);
+        host.set(1);
+      });`);
+    expect(sample.violations.filter((v) => SVELTE_RUNES.has(v.state))).toEqual([]);
   });
 });

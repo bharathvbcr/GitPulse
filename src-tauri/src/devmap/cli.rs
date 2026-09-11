@@ -90,7 +90,19 @@ pub struct PreviewOutcome {
     pub files: Vec<PreviewFileResult>,
     /// True when the caller cancelled mid-batch (or a per-repo build lock was held).
     pub cancelled: bool,
+    /// True when the batch was capped before every file was previewed.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub files_total: usize,
+    #[serde(default)]
+    pub files_omitted: usize,
 }
+
+/// Keep in sync with `codeintel::MAX_NEIGHBOR_TARGETS` and TS `CODEINTEL_FANOUT_CAP`.
+pub const MAX_PREVIEW_FILES: usize = 16;
+pub const PREVIEW_FANOUT_OMITTED_REASON: &str =
+    "preview fan-out capped; this file was not previewed";
 
 fn build_guards() -> &'static Mutex<HashSet<String>> {
     static GUARDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -576,11 +588,13 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
 }
 
 /// Preview many changed files. `cancel` is polled between files.
+/// Walks at most [`MAX_PREVIEW_FILES`]; omitted files are unavailable, not silent.
 pub fn preview_many(
     repo_path: &str,
     files: &[(String, String)],
     mut cancel: impl FnMut() -> bool,
 ) -> PreviewOutcome {
+    let files_total = files.len();
     let binary = match resolve_binary() {
         Ok(b) => b,
         Err(e) => {
@@ -591,12 +605,20 @@ pub fn preview_many(
                 reason: Some(e),
                 files: Vec::new(),
                 cancelled: false,
+                truncated: false,
+                files_total,
+                files_omitted: 0,
             }
         }
     };
+    let cap = MAX_PREVIEW_FILES.min(files.len());
+    let (walk, omitted) = files.split_at(cap);
+    let files_omitted = omitted.len();
+    let truncated = files_omitted > 0;
     let mut out = Vec::with_capacity(files.len());
-    for (path, content) in files {
+    for (path, content) in walk {
         if cancel() {
+            out.extend(omitted.iter().map(|(path, _)| omitted_preview_file(path)));
             return PreviewOutcome {
                 available: true,
                 binary: Some(binary.path),
@@ -604,17 +626,39 @@ pub fn preview_many(
                 reason: Some("preview cancelled before all files finished".into()),
                 files: out,
                 cancelled: true,
+                truncated,
+                files_total,
+                files_omitted,
             };
         }
         out.push(preview(repo_path, path, content));
     }
+    out.extend(omitted.iter().map(|(path, _)| omitted_preview_file(path)));
     PreviewOutcome {
         available: true,
         binary: Some(binary.path),
         lookup: Some(binary.lookup),
-        reason: None,
+        reason: if truncated {
+            Some(format!(
+                "preview fan-out capped at {MAX_PREVIEW_FILES} files; {files_omitted} file(s) not previewed"
+            ))
+        } else {
+            None
+        },
         files: out,
         cancelled: false,
+        truncated,
+        files_total,
+        files_omitted,
+    }
+}
+
+fn omitted_preview_file(path: &str) -> PreviewFileResult {
+    PreviewFileResult {
+        file_path: path.to_string(),
+        available: false,
+        reason: Some(PREVIEW_FANOUT_OMITTED_REASON.into()),
+        report: None,
     }
 }
 
@@ -851,6 +895,26 @@ exit 2
         std::env::remove_var("GITPULSE_DEVMAP_BIN");
         assert!(err.contains("GITPULSE_DEVMAP_BIN"), "{err}");
         assert!(err.contains("not a file"), "{err}");
+    }
+
+    #[test]
+    fn preview_many_walks_at_most_the_fanout_cap() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let bin_dir = tempfile::TempDir::new().expect("bindir");
+        let bin = write_fake_devmap(bin_dir.path());
+        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let files: Vec<(String, String)> = (0..20)
+            .map(|i| (format!("src/f{i}.rs"), "fn x() {}\n".into()))
+            .collect();
+        let out = preview_many(&repo.path().to_string_lossy(), &files, || false);
+        set_test_binary(None);
+        let walked = out.files.iter().filter(|file| file.available).count();
+        assert_eq!(walked, 16, "preview_many walked {walked} available files");
+        assert_eq!(out.files.len(), 20);
+        assert!(out.truncated);
+        assert_eq!(out.files_omitted, 4);
+        assert_eq!(out.files_total, 20);
     }
 
     #[test]

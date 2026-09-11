@@ -717,13 +717,15 @@
     const target = locatePath;
     if (!target) return;
     const idx = rows.findIndex((row) => row.path === target);
-    if (idx < 0) {
+    untrack(() => {
+      if (idx < 0) {
+        locatePath = null;
+        return;
+      }
       locatePath = null;
-      return;
-    }
-    locatePath = null;
-    selectedIndex = idx;
-    ensureVisible(idx);
+      selectedIndex = idx;
+      ensureVisible(idx);
+    });
   });
 
   /**
@@ -746,7 +748,9 @@
 
   $effect(() => {
     if (selectedIndex >= rows.length) {
-      selectedIndex = rows.length > 0 ? rows.length - 1 : -1;
+      untrack(() => {
+        selectedIndex = rows.length > 0 ? rows.length - 1 : -1;
+      });
     }
   });
 

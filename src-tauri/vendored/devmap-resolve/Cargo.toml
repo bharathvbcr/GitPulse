@@ -110,3 +110,7 @@ required-features = ["parse"]
 [[test]]
 name = "semantic_scope_and_identity"
 required-features = ["parse"]
+
+[[test]]
+name = "imports_stay_in_the_named_tree"
+required-features = ["parse"]

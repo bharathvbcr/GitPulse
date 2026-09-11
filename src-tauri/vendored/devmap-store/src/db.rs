@@ -3348,26 +3348,24 @@ impl Store {
     }
 
     pub fn get_or_create_path_id(&self, path: &str) -> Result<u32> {
-        let conn = lock_conn(&self.conn)?;
+        let mut conn = lock_conn(&self.conn)?;
         if let Some(id) = conn
-            .query_row(
-                "SELECT id FROM paths WHERE path = ?1",
-                params![path],
-                |row| row.get(0),
-            )
+            .query_row("SELECT id FROM paths WHERE path = ?1", [path], |row| {
+                row.get(0)
+            })
             .optional()?
         {
             return Ok(id);
         }
-        conn.execute(
-            "INSERT OR IGNORE INTO paths (path) VALUES (?1)",
-            params![path],
-        )?;
-        conn.query_row(
-            "SELECT id FROM paths WHERE path = ?1",
-            params![path],
-            |row| row.get(0),
-        )
+        self.refuse_if_read_only()?;
+        // Keep conversion inside the transaction: an allocated SQLite ID can
+        // exceed our u32 contract, and a refused intern must leave no row.
+        // Acquire the writer before the second lookup so concurrent interns
+        // cannot invalidate a deferred read snapshot before insertion.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = Self::ensure_path_id(&tx, path)?;
+        tx.commit()?;
+        Ok(id)
     }
 
     #[cfg(feature = "parse")]
@@ -3396,7 +3394,6 @@ impl Store {
         Ok(id)
     }
 
-    #[cfg(feature = "parse")]
     fn ensure_path_id(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<u32> {
         // `prepare_cached`, not `query_row`/`execute`: those compile the SQL
         // afresh on every call, and this is the most-called statement in the
@@ -4104,7 +4101,9 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4)",
             params![now, head_sha, analysis_json, repo_root],
         )?;
-        let gen_id: u32 = tx.last_insert_rowid() as u32;
+        let gen_id = u32::try_from(tx.last_insert_rowid()).map_err(|_| {
+            refusal("generation ID space exhausted; cannot represent another generation")
+        })?;
 
         let prev_gen: Option<u32> = tx
             .query_row(
@@ -7166,6 +7165,7 @@ impl Store {
     /// in milliconfidence space, so `0.9` matches HIGH rows SQLite REAL
     /// cannot round-trip from `f32`.
     pub fn count_dead_at_least(&self, min: f32) -> Result<u32> {
+        let min = checked_min_confidence(min)?;
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(0);
@@ -8657,7 +8657,7 @@ mod connection_tests {
     ///
     /// `lock_conn` exists precisely so a poisoned store mutex becomes an error
     /// the caller can report, and five readers bypassed it with
-    /// `.expect("store mutex poisoned")`. Under the release profile's
+    /// `.expect("store mutex poisoned")`. Under the former release profile's
     /// `panic = "abort"` those are not recoverable panics — they end the
     /// process. A daemon serving IPC would vanish mid-request because one
     /// earlier query panicked while holding the lock; the CLI would die with no

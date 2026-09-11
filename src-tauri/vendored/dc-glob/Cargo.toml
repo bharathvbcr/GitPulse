@@ -1,7 +1,12 @@
 [package]
 name = "dc-glob"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "Python fnmatch semantics, shared by the harness's analysis plane"
 
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

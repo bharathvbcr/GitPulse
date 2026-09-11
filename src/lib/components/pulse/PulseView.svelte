@@ -47,7 +47,10 @@
   let workspaceLoc = $state<
     { path: string; name: string; value: number | null; truncated: boolean; failed: boolean }[]
   >([]);
-  let loadedPath = $state<string | null>(null);
+  /** Last path this view loaded. A plain `let`, never $state: the load
+   *  effect reads and writes it, and a reactive read there would recreate
+   *  the self-dependency the workspace-LOC strip was fixed to avoid. */
+  let loadedPath: string | null = null;
 
   // The tab set as a VALUE, not a reference. repoStore rebuilds openTabs with
   // .map() on every status poll (~6s), so an effect that depends on the array
@@ -83,12 +86,14 @@
     const path = $repoStore.currentPath;
     if (path === loadedPath) return;
     loadedPath = path;
-    if (!path) {
-      pulseStore.reset();
-      return;
-    }
-    void pulseStore.load(path);
-    authorFilter = "all";
+    untrack(() => {
+      if (!path) {
+        pulseStore.reset();
+        return;
+      }
+      void pulseStore.load(path);
+      authorFilter = "all";
+    });
   });
 
   // LOC now tracks the repository instead of the tab that opened it: the

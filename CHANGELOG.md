@@ -11,7 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-09-10
+## [1.0.0] - 2026-09-11
 
 Local release candidate: core Git workflow improvements and reliability fixes.
 Publication and cross-platform qualification remain separate release gates.
@@ -50,6 +50,13 @@ Publication and cross-platform qualification remain separate release gates.
 - Seal macOS app bundles with an ad-hoc signature by default, avoiding invalid
   linker-only signatures. A configured Apple signing identity can override this;
   trusted distribution and notarization remain separate checks.
+- Cap layered-impact and preview fan-out at 16 seeds and report the omitted
+  remainder. A truncated walk is never presented as complete coverage.
+- Parse Dependabot, code-scanning, and dependency-health payloads as typed
+  reports instead of trusting raw JSON shape.
+- Plan a first push of an unpublished branch against a configured remote
+  (`checkout.defaultRemote`, then `origin`, then a lone remote). Refuse when
+  none of those exist rather than inventing `origin`.
 
 ### Verification
 
@@ -87,6 +94,8 @@ Publication and cross-platform qualification remain separate release gates.
   offsetof tests and WRY cookie conversion in those ports are not GitPulse
   sinks. Attach the file to default setup in GitHub Settings.
 - Refresh `@lucide/svelte` 1.44.0, Vite 8.3.0, and `@types/node` 26.5.1.
+- Vendor DevCouncil analysis crates from `rust/` after that workspace flattened
+  out of `rust-port/crates`.
 
 ## [0.1.0] - 2026-09-10
 

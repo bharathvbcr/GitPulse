@@ -10,6 +10,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { openExternal } from "../desktop/openExternal";
   import {
@@ -127,12 +128,14 @@
     // refreshes in place so "clean" cannot outlive the working tree.
     if (repoChanged) {
       const cached = repo ? workCache.get(repo) : undefined;
-      projection = cached?.projection ?? null;
-      loadedAt = cached?.loadedAt ?? null;
-      navigationError = null;
-      refreshError = null;
-      collisions = null;
-      collisionError = null;
+      untrack(() => {
+        projection = cached?.projection ?? null;
+        loadedAt = cached?.loadedAt ?? null;
+        navigationError = null;
+        refreshError = null;
+        collisions = null;
+        collisionError = null;
+      });
     }
     if (repo) refresh(repo);
     else { refreshWork.cancel(); loading = false; refreshEpoch += 1; }
@@ -233,7 +236,10 @@
   let facet = $state<WorkFacet>("all");
   let query = $state("");
   let rowLimit = $state(100);
-  $effect(() => { void facet; void query; void $repoStore.currentPath; rowLimit = 100; });
+  $effect(() => {
+    void facet; void query; void $repoStore.currentPath;
+    untrack(() => { rowLimit = 100; });
+  });
 
   const visibleRows = $derived(
     projection ? filterWorkRows(projection.rows, facet, query) : [],
@@ -263,8 +269,10 @@
     const repo = $repoStore.currentPath;
     if (repo === facetRepo) return;
     facetRepo = repo;
-    facet = "all";
-    query = "";
+    untrack(() => {
+      facet = "all";
+      query = "";
+    });
   });
 
   function openMcpSettings() {

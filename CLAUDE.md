@@ -9,7 +9,11 @@ Generated state is per-worktree and is not copied by Git. If the store or map
 is missing, run `devmap build --manifest` from this worktree's root, then check
 status and read the map again. A plain build updates only the database.
 Never copy another worktree's database to conceal missing local state.
-The CLI and GitPulse MCP both query the DevMap store:
+The CLI and GitPulse MCP both query the DevMap store. Always pass this
+repository's absolute `repo_path` on every `devmap_*` and
+`gitpulse_codeintel_*` call, and check `repository.root` in the envelope
+before trusting the answer — Cursor shares one `devmap mcp` process across
+workspace tabs.
 
 - Use `devmap_search` / `gitpulse_codeintel_search` with this repository's
   absolute `repo_path`, or `devmap search <name> --json`, for symbol discovery.

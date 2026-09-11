@@ -8,7 +8,7 @@ import { check, main, MANIFEST, readToml, resolveManifest, sources, VENDOR_DIR }
  * GitPulse must build from a checkout of GitPulse.
  *
  * It used to reach `../../../../../Manvi/crates/…` and
- * `../../../../../DevCouncil/rust-port/crates/…`, so a lone clone did not
+ * `../../../../../DevCouncil/rust/…`, so a lone clone did not
  * build: it needed two unrelated repositories present, at the right depth, on
  * every machine and every CI runner. The crates are vendored under
  * `src-tauri/vendored/` now, and this is what keeps them that way — a single
@@ -283,7 +283,7 @@ describe("the source table", () => {
       GITPULSE_DEVCOUNCIL_ROOT: "/b",
       GITPULSE_MARKDEV_ROOT: "/c",
     });
-    // Manvi is no longer a vendor origin (dc-* live in DevCouncil rust-port).
+    // Manvi is no longer a vendor origin (dc-* live in DevCouncil rust/).
     expect(configured.map((s) => s.root)).toEqual(["/b", "/c"]);
   });
 

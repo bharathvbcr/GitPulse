@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { guardedDismiss } from "./modalGuard";
   import { graphStore } from "../stores/graphStore";
@@ -52,13 +53,15 @@
     // Rebuild the plan only when it cannot destroy user work: on opening, or
     // while pristine and the underlying history actually moved.
     if ((!wasOpen || planCurrent) && shouldReseed({ isOpen, wasOpen, dirty: planDirty, currentSignature: current, seededSignature })) {
-      planRepoPath = $repoStore.currentPath;
-      planGeneration = $repoStore.generation;
-      errorMsg = null;
-      ontoBranch = $repoStore.defaultBranch || "main";
-      items = seedRebasePlan($graphStore.commits);
-      seededSignature = current;
-      planDirty = false;
+      untrack(() => {
+        planRepoPath = $repoStore.currentPath;
+        planGeneration = $repoStore.generation;
+        errorMsg = null;
+        ontoBranch = $repoStore.defaultBranch || "main";
+        items = seedRebasePlan($graphStore.commits);
+        seededSignature = current;
+        planDirty = false;
+      });
     }
     wasOpen = isOpen;
   });

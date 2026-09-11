@@ -322,7 +322,7 @@ pub(crate) fn ls_files(
 ///
 /// A cache that *is* gitignored never reaches this: `git ls-files` does not list
 /// it. The gap is a tagged cache no ignore rule happens to cover — measured on
-/// this workspace, `rust-port/.gitignore` carries `/target/`, which does not
+/// this workspace, `rust/.gitignore` carries `/target/`, which does not
 /// match the `target-lane*` directories beside it, and 8,252 of the 9,654 paths
 /// the old rule kept came from them. Dropping them took `inventory()` on this
 /// repository from 2.33s to 0.75s, because a path ruled out here never pays for
@@ -662,7 +662,7 @@ mod tests {
         }
         for path in [
             "src/devcouncil/indexing/graph/build.py",
-            "rust-port/crates/devmap-query/src/freshness.rs",
+            "rust/devmap-query/src/freshness.rs",
             // `build`/`dist`/`out`/`target` only count at the top level.
             "src/graph/build/x.py",
             "pkg/dist/index.ts",

@@ -197,4 +197,34 @@ describe("previewSummary honesty", () => {
     expect(summary.files[0].broken_truncated).toBe(true);
     expect(summary.files[0].walk_incomplete).toBe("partial");
   });
+
+  it("names a fan-out cap instead of claiming staged changes are safe", () => {
+    const file: DevmapPreviewFileResult = {
+      file_path: "src/a.ts",
+      available: true,
+      reason: null,
+      report: {
+        file_path: "src/a.ts",
+        parse_status: "Clean",
+        delta_available: true,
+        file_is_indexed: true,
+        compared_against: "disk",
+        degraded_reason: null,
+        symbols: [],
+        bodies_not_compared: 0,
+        ambiguous_callers: 0,
+        broken_callers: {
+          available: true,
+          reason: null,
+          items: [],
+          total: 0,
+          shown: 0,
+          truncated: false,
+        },
+      },
+    };
+    const summary = summarizePreview([file], { filesOmitted: 4, filesTotal: 20 });
+    expect(summary.headline).toContain("4 of 20");
+    expect(summary.headline).toContain("not a clean bill of health");
+  });
 });

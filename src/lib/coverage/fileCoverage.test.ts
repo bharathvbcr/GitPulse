@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildHitMap, hitBadgeClass } from "./fileCoverage";
+import { buildHitMap, hitBadgeClass, parseFileCoverage } from "./fileCoverage";
 
 describe("coverage file helpers", () => {
   it("maps covered lines onto line numbers", () => {
@@ -42,6 +42,11 @@ describe("coverage file helpers", () => {
     expect(hitBadgeClass(0)).toBe(
       "w-8 px-1 text-right text-[10px] tabular-nums shrink-0 text-red-400/80"
     );
+  });
+
+  it("rejects a null or item-less file-coverage payload", () => {
+    expect(() => parseFileCoverage(null)).toThrow(/no line map/);
+    expect(() => parseFileCoverage({ path: "src/a.ts" })).toThrow(/no line map/);
   });
 
   it("fetches file coverage via invoke", async () => {

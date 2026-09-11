@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import {
     harnessStore,
@@ -21,6 +22,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
   import { tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
+  import { capFanout, omittedLayeredImpact } from "../codeintel/fanout";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let dirtyCount = $derived($repoStore.statuses.length);
@@ -49,9 +51,10 @@
 
   $effect(() => {
     const repo = $repoStore.currentPath;
-    const key = previewPathsKey;
-    void key;
-    void previewStore.refresh(repo, previewPaths);
+    void previewPathsKey;
+    untrack(() => {
+      void previewStore.refresh(repo, previewPaths);
+    });
   });
 
   // A3: blast radius over the staged set (layered — no min_rung).
@@ -61,34 +64,41 @@
 
   $effect(() => {
     const repo = $repoStore.currentPath;
-    const paths = previewPaths;
-    blastGuard?.cancel();
-    if (!repo || paths.length === 0) {
-      blast = null;
-      blastLoading = false;
-      return;
-    }
-    const guard = createAsyncGuard();
-    const cancelToken = newCodeintelCancelToken();
-    blastGuard = {
-      isLive: () => guard.isLive(),
-      cancel: () => {
-        guard.cancel();
-        void cancelCodeintelQuery(cancelToken);
-      },
-    };
-    blastLoading = true;
-    void getImpactLayeredMany(repo, paths, 800, cancelToken)
-      .then((results) => {
-        if (!guard.isLive()) return;
-        blast = composeLayeredImpacts(results, paths);
+    void previewPathsKey;
+    untrack(() => {
+      const paths = previewPaths;
+      blastGuard?.cancel();
+      if (!repo || paths.length === 0) {
+        blast = null;
         blastLoading = false;
-      })
-      .catch(() => {
-        if (!guard.isLive()) return;
-        blast = emptyComposedBlast("layered impact request failed");
-        blastLoading = false;
-      });
+        return;
+      }
+      const guard = createAsyncGuard();
+      const cancelToken = newCodeintelCancelToken();
+      blastGuard = {
+        isLive: () => guard.isLive(),
+        cancel: () => {
+          guard.cancel();
+          void cancelCodeintelQuery(cancelToken);
+        },
+      };
+      blastLoading = true;
+      const { kept, omitted } = capFanout(paths);
+      void getImpactLayeredMany(repo, kept, 800, cancelToken)
+        .then((results) => {
+          if (!guard.isLive()) return;
+          blast = composeLayeredImpacts(
+            [...results, ...omitted.map(omittedLayeredImpact)],
+            paths,
+          );
+          blastLoading = false;
+        })
+        .catch(() => {
+          if (!guard.isLive()) return;
+          blast = emptyComposedBlast("layered impact request failed");
+          blastLoading = false;
+        });
+    });
   });
 
   $effect(() => () => blastGuard?.cancel());

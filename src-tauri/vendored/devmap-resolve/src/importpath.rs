@@ -204,11 +204,21 @@ pub fn rule_for(lang: &str) -> Option<&'static ImportPathRule> {
 }
 
 /// Join a relative specifier onto a base directory and resolve `.` and `..`.
+/// Absolute paths and parents above the repository return `None`: clamping an
+/// escaping path to the root would bind an unrelated, same-named local file.
 ///
 /// The single owner of this normalisation. `Resolver::normalize_rel` delegates
 /// here rather than keeping a second copy, because a `..` handled two ways is
 /// how a resolver starts answering two different questions about one import.
-pub fn normalize_rel(base_dir: &str, spec: &str) -> String {
+pub fn normalize_rel(base_dir: &str, spec: &str) -> Option<String> {
+    let absolute_or_drive = |path: &str| {
+        path.starts_with(['/', '\\'])
+            || (path.as_bytes().get(1) == Some(&b':')
+                && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+    };
+    if absolute_or_drive(base_dir) || absolute_or_drive(spec) {
+        return None;
+    }
     let joined = if base_dir.is_empty() || base_dir == "." {
         spec.to_string()
     } else {
@@ -220,12 +230,12 @@ pub fn normalize_rel(base_dir: &str, spec: &str) -> String {
         match part {
             "" | "." => {}
             ".." => {
-                stack.pop();
+                stack.pop()?;
             }
             other => stack.push(other),
         }
     }
-    stack.join("/")
+    Some(stack.join("/"))
 }
 
 /// How many candidate paths one specifier may produce.
@@ -279,17 +289,20 @@ pub fn candidates(rule: &ImportPathRule, importing_dir: &str, specifier: &str) -
 
     for form in &forms {
         // The importing file's own directory, first and always.
-        let base = normalize_rel(importing_dir, form);
-        for extension in rule.extensions {
-            push(format!("{base}{extension}"), &mut out);
-        }
-        for index in rule.index_files {
-            push(format!("{base}/{index}"), &mut out);
+        if let Some(base) = normalize_rel(importing_dir, form) {
+            for extension in rule.extensions {
+                push(format!("{base}{extension}"), &mut out);
+            }
+            for index in rule.index_files {
+                push(format!("{base}/{index}"), &mut out);
+            }
         }
         // Then the language's build roots, for a specifier that is not written
         // relative.
         for root in &roots {
-            let rooted = normalize_rel(root, form);
+            let Some(rooted) = normalize_rel(root, form) else {
+                continue;
+            };
             for extension in rule.extensions {
                 push(format!("{rooted}{extension}"), &mut out);
             }
@@ -323,5 +336,8 @@ pub fn strip_dart_package_prefix(specifier: &str) -> Option<&str> {
 /// missing edge; a wrong one is worse.
 pub fn is_relative_specifier(specifier: &str) -> bool {
     let spec = specifier.trim().trim_matches(|c| c == '"' || c == '\'');
-    spec.starts_with("./") || spec.starts_with("../")
+    spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with(".\\")
+        || spec.starts_with("..\\")
 }

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
   import { graphStore } from "../stores/graphStore";
   import { repoStore } from "../stores/repoStore";
@@ -736,14 +736,20 @@
   $effect(() => {
     graphViewportWidth;
     graphContentWidth;
-    if (!graphViewport) return;
-    const next = clampGraphScrollLeft(
-      graphViewport.scrollLeft,
-      graphViewportWidth,
-      graphContentWidth,
-    );
-    if (graphViewport.scrollLeft !== next) graphViewport.scrollLeft = next;
-    if (graphScrollLeft !== next) graphScrollLeft = next;
+    const viewport = graphViewport;
+    if (!viewport) return;
+    // `graphViewport` is $state holding a DOM node. Svelte 5 proxies that
+    // object, so reading and writing `scrollLeft` here is the same loop as
+    // `scanned.path = path` — and subpixel rounding can keep the write live.
+    untrack(() => {
+      const next = clampGraphScrollLeft(
+        viewport.scrollLeft,
+        graphViewportWidth,
+        graphContentWidth,
+      );
+      if (viewport.scrollLeft !== next) viewport.scrollLeft = next;
+      if (graphScrollLeft !== next) graphScrollLeft = next;
+    });
   });
 
   $effect(() => {
@@ -784,9 +790,11 @@
     const tooltipStale = (row: VisualCommitRow | null) =>
       row !== null && !filteredRows.some((r) => r.id === row.id);
     if (tooltipStale(tooltipRow) || tooltipStale(tooltipMergeTarget)) {
-      tooltipRow = null;
-      tooltipMergeTarget = null;
-      hoveredCommitId = null;
+      untrack(() => {
+        tooltipRow = null;
+        tooltipMergeTarget = null;
+        hoveredCommitId = null;
+      });
     }
     schedulePaint();
   });

@@ -8,11 +8,11 @@ import { expect, it } from "vitest";
 function fixture() {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-regression-")));
   const upstream = path.join(root, "upstream");
-  for (const dir of ["scripts", "src-tauri/vendored", "upstream/rust-port/crates/dc-glob/src"]) mkdirSync(path.join(root, dir), { recursive: true });
+  for (const dir of ["scripts", "src-tauri/vendored", "upstream/rust/dc-glob/src"]) mkdirSync(path.join(root, dir), { recursive: true });
   for (const file of ["vendor-crates.mjs", "usage.mjs", "columns.mjs"]) cpSync(new URL(file, import.meta.url), path.join(root, "scripts", file));
-  writeFileSync(path.join(upstream, "rust-port/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "1.0.0"\n');
-  writeFileSync(path.join(upstream, "rust-port/crates/dc-glob/Cargo.toml"), '[package]\nname = "dc-glob"\nversion.workspace = true\n');
-  writeFileSync(path.join(upstream, "rust-port/crates/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
+  writeFileSync(path.join(upstream, "rust/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "1.0.0"\n');
+  writeFileSync(path.join(upstream, "rust/dc-glob/Cargo.toml"), '[package]\nname = "dc-glob"\nversion.workspace = true\n');
+  writeFileSync(path.join(upstream, "rust/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
   const manifest = path.join(root, "src-tauri/vendored/VENDOR.json");
   writeFileSync(manifest, '{"crates":[]}');
   const run = (...args: string[]) => spawnSync(process.execPath, [path.join(root, "scripts/vendor-crates.mjs"), ...args, "--json"], {
@@ -27,8 +27,8 @@ function fixture() {
 it("detects upstream deletions and inherited manifest changes", () => {
   const f = fixture();
   try {
-    rmSync(path.join(f.upstream, "rust-port/crates/dc-glob/src/lib.rs"));
-    writeFileSync(path.join(f.upstream, "rust-port/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "2.0.0"\n');
+    rmSync(path.join(f.upstream, "rust/dc-glob/src/lib.rs"));
+    writeFileSync(path.join(f.upstream, "rust/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "2.0.0"\n');
     const result = f.run("--check");
     expect(result.status, result.stderr).toBe(1);
     const report = JSON.parse(result.stdout);
@@ -77,8 +77,8 @@ it.each(["--crate=dc-glob", "full"])("preserves every old byte when %s preparati
     const oldManifest = readFileSync(f.manifest, "utf8");
     const library = path.join(f.root, "src-tauri/vendored/dc-glob/src/lib.rs");
     const oldLibrary = readFileSync(library, "utf8");
-    writeFileSync(path.join(f.upstream, "rust-port/crates/dc-glob/src/lib.rs"), "changed bytes\n");
-    if (mode !== "full") writeFileSync(path.join(f.upstream, "rust-port/crates/dc-glob/Cargo.toml"), '[package]\nname = "dc-glob"\nmissing.workspace = true\n');
+    writeFileSync(path.join(f.upstream, "rust/dc-glob/src/lib.rs"), "changed bytes\n");
+    if (mode !== "full") writeFileSync(path.join(f.upstream, "rust/dc-glob/Cargo.toml"), '[package]\nname = "dc-glob"\nmissing.workspace = true\n');
     const result = mode === "full" ? f.run() : f.run(mode);
     expect(result.status).toBe(2);
     expect(readFileSync(f.manifest, "utf8")).toBe(oldManifest);
@@ -102,7 +102,7 @@ it.runIf(process.platform !== "win32")("rejects source symlinks instead of copyi
   const f = fixture();
   try {
     writeFileSync(path.join(f.root, "outside.rs"), "external bytes");
-    symlinkSync(path.join(f.root, "outside.rs"), path.join(f.upstream, "rust-port/crates/dc-glob/src/escape.rs"));
+    symlinkSync(path.join(f.root, "outside.rs"), path.join(f.upstream, "rust/dc-glob/src/escape.rs"));
     const before = readFileSync(f.manifest, "utf8");
     const result = f.run("--crate=dc-glob");
     expect(result.status).toBe(2);
@@ -115,12 +115,12 @@ it("keeps repeated source, manifest, and deletion updates coherent", () => {
   const f = fixture();
   try {
     for (let generation = 0; generation < 12; generation++) {
-      const source = path.join(f.upstream, "rust-port/crates/dc-glob");
+      const source = path.join(f.upstream, "rust/dc-glob");
       const optional = path.join(source, "build.rs");
       if (generation % 2 === 0) writeFileSync(optional, `fn main() { println!("generation ${generation}"); }`);
       else rmSync(optional);
       writeFileSync(path.join(source, "src/lib.rs"), `pub const GENERATION: usize = ${generation};\n`);
-      writeFileSync(path.join(f.upstream, "rust-port/Cargo.toml"), `[workspace]\n[workspace.package]\nversion = "1.0.${generation}"\n`);
+      writeFileSync(path.join(f.upstream, "rust/Cargo.toml"), `[workspace]\n[workspace.package]\nversion = "1.0.${generation}"\n`);
       expect(f.run("--check").status).toBe(1);
       const update = f.run("--crate=dc-glob");
       expect(update.status, update.stderr).toBe(0);
@@ -137,7 +137,7 @@ it("keeps repeated source, manifest, and deletion updates coherent", () => {
 it("excludes local state and upstream tests from both snapshot and comparison", () => {
   const f = fixture();
   try {
-    const source = path.join(f.upstream, "rust-port/crates/dc-glob");
+    const source = path.join(f.upstream, "rust/dc-glob");
     mkdirSync(path.join(source, "src/.devcouncil"));
     mkdirSync(path.join(source, "tests"));
     writeFileSync(path.join(source, "src/.devcouncil/session"), "local state");
@@ -152,11 +152,11 @@ it("excludes local state and upstream tests from both snapshot and comparison", 
 it("updates one crate without reading or rewriting unrelated upstreams", () => {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-scope-")));
   try {
-    for (const dir of ["scripts", "src-tauri/vendored/untouched", "upstream/rust-port/crates/dc-glob/src"]) mkdirSync(path.join(root, dir), { recursive: true });
+    for (const dir of ["scripts", "src-tauri/vendored/untouched", "upstream/rust/dc-glob/src"]) mkdirSync(path.join(root, dir), { recursive: true });
     for (const file of ["vendor-crates.mjs", "usage.mjs", "columns.mjs"]) cpSync(new URL(file, import.meta.url), path.join(root, "scripts", file));
-    writeFileSync(path.join(root, "upstream/rust-port/Cargo.toml"), "[workspace]\n[workspace.package]\nversion = \"1.0.0\"\n");
-    writeFileSync(path.join(root, "upstream/rust-port/crates/dc-glob/Cargo.toml"), "[package]\nname = \"dc-glob\"\nversion.workspace = true\n");
-    writeFileSync(path.join(root, "upstream/rust-port/crates/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
+    writeFileSync(path.join(root, "upstream/rust/Cargo.toml"), "[workspace]\n[workspace.package]\nversion = \"1.0.0\"\n");
+    writeFileSync(path.join(root, "upstream/rust/dc-glob/Cargo.toml"), "[package]\nname = \"dc-glob\"\nversion.workspace = true\n");
+    writeFileSync(path.join(root, "upstream/rust/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
     const untouched = { name: "untouched", origin: { commit: "preserved" }, files: { "lib.rs": "preserved" } };
     writeFileSync(path.join(root, "src-tauri/vendored/untouched/lib.rs"), "original bytes");
     const manifestPath = path.join(root, "src-tauri/vendored/VENDOR.json");

@@ -83,7 +83,7 @@ pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886
 /// `node_modules`, `dist`, `build` — so a cargo output directory named anything
 /// else was walked as source. Measured in generation 779 of this repository's
 /// store: 1,041 of 2,363 indexed files were `.fingerprint/*.json` and
-/// `.rustc_info.json` under `rust-port/target-serve` and `target-store`, and
+/// `.rustc_info.json` under `rust/target-serve` and `target-store`, and
 /// the daemon had queued 47,000 pending rows from them. Neither was gitignored;
 /// neither was named `target`.
 ///
@@ -257,7 +257,7 @@ mod prune_ledger_tests {
     #[test]
     fn a_poisoned_prune_ledger_is_recovered_rather_than_silently_dropped() {
         let ledger: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
-        super::recover_lock(&ledger).insert("rust-port/target-serve".to_string());
+        super::recover_lock(&ledger).insert("rust/target-serve".to_string());
 
         let writer = Arc::clone(&ledger);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -278,7 +278,7 @@ mod prune_ledger_tests {
             "a directory recorded before the panic is still a directory that was \
              pruned, and the report has to say so"
         );
-        assert!(recovered.contains("rust-port/target-serve"));
+        assert!(recovered.contains("rust/target-serve"));
     }
 }
 
@@ -486,7 +486,7 @@ pub fn extract_file(path: &str, source: &str) -> Extraction {
     // reconstructed buffer straight to the extractor would produce symbols
     // whose spans index a string that exists only in memory.
     if notebook::is_notebook(path) {
-        return notebook::extract_notebook(path, source, extract_treesitter);
+        return notebook::extract_notebook_bounded(path, source);
     }
     let lang = detect_language(Path::new(path));
     extract_treesitter(path, lang, source)

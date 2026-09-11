@@ -180,7 +180,12 @@ export function markerForHonesty(h: PreviewFileHonesty): PreviewMarker {
 
 export function summarizePreview(
   files: DevmapPreviewFileResult[],
-  opts: { cancelled?: boolean; reason?: string | null } = {},
+  opts: {
+    cancelled?: boolean;
+    reason?: string | null;
+    filesOmitted?: number;
+    filesTotal?: number;
+  } = {},
 ): PreviewCommitSummary {
   const honesty = files.map(fileHonesty);
   const unreliableFiles = honesty.filter((h) => h.unreliable || !h.available).length;
@@ -189,6 +194,8 @@ export function summarizePreview(
   const brokenCallerTotal = honesty.reduce((n, h) => n + h.broken_total, 0);
   const claimCleanCount = honesty.filter((h) => h.claim_clean).length;
   const availableFiles = honesty.filter((h) => h.available).length;
+  const filesOmitted = opts.filesOmitted ?? 0;
+  const filesTotal = opts.filesTotal ?? files.length;
 
   let headline: string;
   if (opts.reason && files.length === 0) {
@@ -197,6 +204,8 @@ export function summarizePreview(
     headline = "No staged files to preview";
   } else if (opts.cancelled) {
     headline = "Preview cancelled before every staged file finished";
+  } else if (filesOmitted > 0) {
+    headline = `Preview fan-out capped: ${filesOmitted} of ${filesTotal} file(s) not previewed — not a clean bill of health`;
   } else if (unavailableFiles === files.length) {
     headline = "Could not preview staged changes — not a clean bill of health";
   } else if (unreliableFiles > 0 && brokenCallerTotal === 0) {

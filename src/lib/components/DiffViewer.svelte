@@ -49,6 +49,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { FileBlob } from "../files/types";
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
@@ -143,6 +144,7 @@
     emptyComposedBlast,
     type ComposedBlastRadius,
   } from "../codeintel/blastCompose";
+  import { capFanout, omittedLayeredImpact } from "../codeintel/fanout";
   import { rungParam } from "../codeintel/rungFilter";
   import { boundText, summarizeWalkIncomplete, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
   import type { CodeintelRung, CodeintelRungHistogram } from "../codeintel/types";
@@ -447,7 +449,9 @@
 
   // Re-anchor on the visible row whenever the result set changes, so typing
   // another character does not throw the reader back to match one.
-  let lastMatchSignature = $state("");
+  /** Last search-result signature. A plain `let`, never $state: the
+   *  re-anchor effect reads and writes it. */
+  let lastMatchSignature = "";
   $effect(() => {
     const signature = `${searchQuery}|${searchCase}|${searchRegex}|${search.matches.length}`;
     if (signature === lastMatchSignature) return;
@@ -560,6 +564,8 @@
    * like a commit that touched one file.
    */
   let fetchedFiles = $state<{ commitId: string; files: CommitFileChange[] } | null>(null);
+  /** Last commit this effect asked for. A plain `let`, never $state. */
+  let fetchedFor: string | null = null;
   let filesGuard: AsyncGuard | null = null;
 
   $effect(() => {
@@ -568,7 +574,8 @@
     // Nothing to fetch when there is no commit, or when the graph store's
     // details already cover this one.
     if (!repo || !commitId || details?.id === commitId) return;
-    if (fetchedFiles?.commitId === commitId) return;
+    if (fetchedFor === commitId) return;
+    fetchedFor = commitId;
     filesGuard?.cancel();
     const guard = createAsyncGuard();
     filesGuard = guard;
@@ -641,35 +648,41 @@
 
   $effect(() => {
     const repo = $repoStore.currentPath;
-    const paths = rail.entries.map((e) => e.path);
     void changeSetPathsKey;
-    changeSetBlastGuard?.cancel();
-    if (!repo || paths.length === 0) {
-      changeSetBlast = null;
-      changeSetBlastLoading = false;
-      return;
-    }
-    const guard = createAsyncGuard();
-    const cancelToken = newCodeintelCancelToken();
-    changeSetBlastGuard = {
-      isLive: () => guard.isLive(),
-      cancel: () => {
-        guard.cancel();
-        void cancelCodeintelQuery(cancelToken);
-      },
-    };
-    changeSetBlastLoading = true;
-    void getImpactLayeredMany(repo, paths, 800, cancelToken)
-      .then((results) => {
-        if (!guard.isLive()) return;
-        changeSetBlast = composeLayeredImpacts(results, paths);
+    untrack(() => {
+      const paths = rail.entries.map((e) => e.path);
+      changeSetBlastGuard?.cancel();
+      if (!repo || paths.length === 0) {
+        changeSetBlast = null;
         changeSetBlastLoading = false;
-      })
-      .catch(() => {
-        if (!guard.isLive()) return;
-        changeSetBlast = emptyComposedBlast("layered impact request failed");
-        changeSetBlastLoading = false;
-      });
+        return;
+      }
+      const guard = createAsyncGuard();
+      const cancelToken = newCodeintelCancelToken();
+      changeSetBlastGuard = {
+        isLive: () => guard.isLive(),
+        cancel: () => {
+          guard.cancel();
+          void cancelCodeintelQuery(cancelToken);
+        },
+      };
+      changeSetBlastLoading = true;
+      const { kept, omitted } = capFanout(paths);
+      void getImpactLayeredMany(repo, kept, 800, cancelToken)
+        .then((results) => {
+          if (!guard.isLive()) return;
+          changeSetBlast = composeLayeredImpacts(
+            [...results, ...omitted.map(omittedLayeredImpact)],
+            paths,
+          );
+          changeSetBlastLoading = false;
+        })
+        .catch(() => {
+          if (!guard.isLive()) return;
+          changeSetBlast = emptyComposedBlast("layered impact request failed");
+          changeSetBlastLoading = false;
+        });
+    });
   });
 
   $effect(() => () => changeSetBlastGuard?.cancel());
@@ -962,8 +975,8 @@
    * the selection and leaves the scroll alone, because the reader has not
    * gone anywhere.
    */
-  let viewKey = $state<string | null>(null);
-  let contentKey = $state<string | null>(null);
+  let viewKey: string | null = null;
+  let contentKey: string | null = null;
 
   $effect(() => {
     const key = [
@@ -1005,7 +1018,7 @@
     else unifiedScroll = Math.min(offset, Math.max(0, count * ROW_HEIGHT - viewportHeight));
   }
 
-  let imageBlobKey = $state<string | null>(null);
+  let imageBlobKey: string | null = null;
 
   $effect(() => {
     const path = singleSection?.path ?? $repoStore.selectedFilePath;

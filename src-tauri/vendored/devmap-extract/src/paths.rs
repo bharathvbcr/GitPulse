@@ -15,11 +15,10 @@
 //! heard of DevCouncil should not have an orchestrator's directory created in it
 //! by a code-intelligence tool.
 //!
-//! But DevCouncil is still here, and 38 Python modules under `src/devcouncil/`
-//! read `.devcouncil/repo_map.json`. Writing the map somewhere else would strand
-//! every one of them silently — they would read a stale file and report it fresh,
-//! which is the exact failure mode this codebase spends its comments guarding
-//! against.
+//! Compatibility remains for checkouts that already have `.devcouncil/`.
+//! Writing the map somewhere else would leave that directory holding a stale
+//! `repo_map.json` that still looks like the live one, which is the exact
+//! failure mode this codebase spends its comments guarding against.
 //!
 //! So the directory is *resolved*, in this order:
 //!

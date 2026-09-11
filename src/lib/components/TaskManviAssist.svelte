@@ -300,7 +300,10 @@
   }
 
   async function generate() {
-    if (askDisabled && !quick) return;
+    if (askDisabled && !quick) {
+      error = gate ?? fieldReason ?? (liveAttempt ? "A suggestion is already in progress." : "Manvi cannot draft this task yet.");
+      return;
+    }
     if (quick && (liveAttempt || disabled || controlsLocked || !manviReady || !available.length || !task)) return;
     busy = true; epoch++; error = ""; note = "";
     try {

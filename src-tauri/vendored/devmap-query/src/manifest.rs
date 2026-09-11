@@ -1107,7 +1107,7 @@ fn path_suffix(lower_name: &str) -> &str {
 /// is deliberately wider than its ancestor:** that version only looked at the
 /// *top-level* directory for `tests`/`docs`, which was sound when the Python
 /// engine mapped `src/devcouncil` alone. This kernel maps the whole repository,
-/// where every test directory is nested — `rust-port/crates/*/tests/`,
+/// where every test directory is nested — `rust/devmap-*/tests/`,
 /// `backend/go_orchestrator/**`, `benchmarks/` — so a top-only check classifies
 /// none of them. Any path segment counts here.
 fn file_kind(path: &str, language: &str) -> &'static str {

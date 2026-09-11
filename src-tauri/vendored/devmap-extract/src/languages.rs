@@ -1048,7 +1048,7 @@ pub const DEFAULT_INDEX_EXCLUDE_PREFIXES: &[&str] = &["vendor/grammars"];
 pub fn is_default_index_excluded(rel_path: &str) -> bool {
     let norm = rel_path.replace('\\', "/").to_lowercase();
     let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.len() >= 2 && segments[..segments.len() - 1].iter().any(|s| *s == "testdata") {
+    if segments.len() >= 2 && segments[..segments.len() - 1].contains(&"testdata") {
         return true;
     }
     for prefix in DEFAULT_INDEX_EXCLUDE_PREFIXES {

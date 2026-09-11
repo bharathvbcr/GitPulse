@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -11,6 +12,7 @@ import {
   GITHUB_DEPENDABOT_COMMAND,
   describeSeriousGithubAlerts,
   githubAlertsCache,
+  isProductDisabledMessage,
   isSeriousGithubSeverity,
   loadGithubAlerts,
   maybeNotifyGithubAlerts,
@@ -107,6 +109,70 @@ function snapshot(
     ...overrides,
   };
 }
+
+function sourceFunctionBody(source: string, header: string): string {
+  const start = source.indexOf(header);
+  expect(start, `${header} must exist`).toBeGreaterThanOrEqual(0);
+  const from = source.indexOf("{", start);
+  expect(from, `${header} must open a body`).toBeGreaterThan(start);
+  let depth = 0;
+  for (let i = from; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(from, i + 1);
+    }
+  }
+  throw new Error(`${header} body never closed`);
+}
+
+function quotedStrings(body: string): string[] {
+  return [...body.matchAll(/"([^"]*)"/g)].map((match) => match[1]);
+}
+
+describe("isProductDisabledMessage", () => {
+  it("is false for empty or whitespace", () => {
+    expect(isProductDisabledMessage("")).toBe(false);
+    expect(isProductDisabledMessage("   ")).toBe(false);
+    expect(isProductDisabledMessage("\n\t")).toBe(false);
+  });
+
+  it("rejects similar but unknown prose", () => {
+    expect(isProductDisabledMessage("Secret scanning is not enabled")).toBe(false);
+    expect(isProductDisabledMessage("Code scanning is not configured")).toBe(false);
+    expect(isProductDisabledMessage("Dependabot alerts disabled")).toBe(false);
+    expect(isProductDisabledMessage("no analyses found")).toBe(false);
+    expect(isProductDisabledMessage("code scanning is enabled")).toBe(false);
+  });
+
+  it("matches the phrases in Rust is_product_disabled_message", () => {
+    const rust = readFileSync(
+      new URL("../../../src-tauri/src/github/mod.rs", import.meta.url),
+      "utf8",
+    );
+    const rustPhrases = quotedStrings(
+      sourceFunctionBody(rust, "fn is_product_disabled_message"),
+    );
+    expect(
+      rustPhrases,
+      "is_product_disabled_message must list product-off phrases",
+    ).not.toEqual([]);
+
+    const js = readFileSync(new URL("./githubAlerts.ts", import.meta.url), "utf8");
+    const jsPhrases = quotedStrings(
+      sourceFunctionBody(js, "export function isProductDisabledMessage"),
+    );
+    expect(jsPhrases).toEqual(rustPhrases);
+
+    for (const phrase of rustPhrases) {
+      expect(isProductDisabledMessage(phrase), phrase).toBe(true);
+      expect(isProductDisabledMessage(`  ${phrase.toUpperCase()} (HTTP 404)  `), phrase).toBe(
+        true,
+      );
+    }
+  });
+});
 
 describe("isSeriousGithubSeverity", () => {
   it("treats critical, high, and CodeQL error as serious", () => {
@@ -250,6 +316,28 @@ describe("loadGithubAlerts production cache", () => {
       .mocked(invoke)
       .mock.calls.filter(([command]) => command === GITHUB_DEPENDABOT_COMMAND);
     expect(dependabotCalls).toHaveLength(1);
+  });
+
+  it("treats a null Dependabot payload as a failed check, not zero alerts", async () => {
+    mockGithubInvoke({
+      dependabot: async () => null as unknown as DependabotReport,
+    });
+    const result = await loadGithubAlerts("/null-dep");
+    expect(result.dependabotRequestFailed).toBe(true);
+    expect(result.dependabot.available).toBe(false);
+    expect(result.dependabot.alerts).toEqual([]);
+    expect(result.codeScanning.available).toBe(true);
+  });
+
+  it("treats a null code-scanning payload as a failed check, not zero alerts", async () => {
+    mockGithubInvoke({
+      codeScanning: async () => null as unknown as CodeScanningReport,
+    });
+    const result = await loadGithubAlerts("/null-cs");
+    expect(result.codeScanningRequestFailed).toBe(true);
+    expect(result.codeScanning.available).toBe(false);
+    expect(result.codeScanning.alerts).toEqual([]);
+    expect(result.dependabot.available).toBe(true);
   });
 
   it("returns the cached snapshot on a later call", async () => {
@@ -432,7 +520,7 @@ describe("maybeNotifyGithubAlerts", () => {
     expect(d.onError).not.toHaveBeenCalled();
   });
 
-  it("treats product-disabled prose without unavailable_reason as a failed check", async () => {
+  it("treats product-disabled prose without unavailable_reason as clean (0.1.0 flood gap)", async () => {
     const d = deps({
       load: vi.fn().mockResolvedValue(
         snapshot({
@@ -445,11 +533,12 @@ describe("maybeNotifyGithubAlerts", () => {
         }),
       ),
     });
-    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
-    expect(d.onError).toHaveBeenCalled();
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("clean");
+    expect(d.notify).not.toHaveBeenCalled();
+    expect(d.onError).not.toHaveBeenCalled();
   });
 
-  it("treats no-analysis-found prose without unavailable_reason as a failed check", async () => {
+  it("treats no-analysis-found prose without unavailable_reason as clean (0.1.0 flood gap)", async () => {
     const d = deps({
       load: vi.fn().mockResolvedValue(
         snapshot({
@@ -461,8 +550,34 @@ describe("maybeNotifyGithubAlerts", () => {
         }),
       ),
     });
-    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
-    expect(d.onError).toHaveBeenCalledWith("no analysis found (HTTP 1)");
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("clean");
+    expect(d.notify).not.toHaveBeenCalled();
+    expect(d.onError).not.toHaveBeenCalled();
+  });
+
+  it("still treats similar but unknown GitHub prose as a failed check", async () => {
+    const unknown = [
+      "Secret scanning is not enabled for this repository. (HTTP 404)",
+      "Code scanning is not configured for this repository. (HTTP 404)",
+      "Dependabot alerts disabled (HTTP 403)",
+      "no analyses found (HTTP 1)",
+    ];
+    for (const error of unknown) {
+      const d = deps({
+        load: vi.fn().mockResolvedValue(
+          snapshot({
+            dependabot: dependabotReport({}, []),
+            codeScanning: codeScanningReport({
+              available: false,
+              error,
+            }),
+          }),
+        ),
+      });
+      await expect(maybeNotifyGithubAlerts(d), error).resolves.toBe("failed");
+      expect(d.onError).toHaveBeenCalledWith(error);
+      expect(d.notify).not.toHaveBeenCalled();
+    }
   });
 
   it("still warns when a request failed even if the error text names a disabled product", async () => {

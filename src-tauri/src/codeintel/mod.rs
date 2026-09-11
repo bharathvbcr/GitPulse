@@ -851,9 +851,10 @@ pub fn impact_layered_with_cancel(
 }
 
 /// Compose layered impact over a changed-file set. Each seed is one
-/// `impact_layered` call — unlike [`neighbors`], there is no kernel fan-out
-/// cap to chunk. Cancellation is checked between targets so a dismissed pane
-/// cannot finish the whole set.
+/// `impact_layered` call, capped at [`MAX_NEIGHBOR_TARGETS`]. Omitted seeds
+/// are unavailable with a distinct fan-out reason — not cancelled, not unmatched.
+/// Cancellation is checked between walked targets so a dismissed pane cannot
+/// finish the whole set.
 pub fn impact_layered_many(
     repo_path: &str,
     targets: &[String],
@@ -862,7 +863,7 @@ pub fn impact_layered_many(
     impact_layered_many_with_cancel(repo_path, targets, token_budget, None)
 }
 
-/// Layered-many with a shared cancel token (checked between targets).
+/// Layered-many with a shared cancel token (checked between walked targets).
 pub fn impact_layered_many_with_cancel(
     repo_path: &str,
     targets: &[String],
@@ -871,7 +872,11 @@ pub fn impact_layered_many_with_cancel(
 ) -> Vec<CodeintelLayeredImpact> {
     targets
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
+            if i >= MAX_NEIGHBOR_TARGETS {
+                return omitted_layered_impact(t);
+            }
             if let Some(cancel) = cancel.as_ref() {
                 if cancel.is_cancelled() {
                     return cancelled_layered_impact(t);
@@ -1112,6 +1117,8 @@ fn affected_tests_from_store(
 
 const QUALIFICATION_MAX_CHARS: usize = 720;
 const QUERY_CANCELLED_REASON: &str = "query cancelled";
+/// Keep in sync with `MAX_PREVIEW_FILES` and TS `CODEINTEL_FANOUT_CAP`.
+const FANOUT_OMITTED_REASON: &str = "layered-impact fan-out capped; this seed was not walked";
 
 fn cancelled_layered_impact(target: &str) -> CodeintelLayeredImpact {
     CodeintelLayeredImpact {
@@ -1122,6 +1129,20 @@ fn cancelled_layered_impact(target: &str) -> CodeintelLayeredImpact {
             seeds: vec![target.to_string()],
             unmatched_targets: Vec::new(),
             layers: CodeintelResponse::unavailable(QUERY_CANCELLED_REASON),
+            total_impacted: 0,
+        },
+    }
+}
+
+fn omitted_layered_impact(target: &str) -> CodeintelLayeredImpact {
+    CodeintelLayeredImpact {
+        available: false,
+        reason: Some(FANOUT_OMITTED_REASON.into()),
+        edges: CodeintelResponse::unavailable(FANOUT_OMITTED_REASON),
+        blast_radius: CodeintelBlastRadius {
+            seeds: vec![target.to_string()],
+            unmatched_targets: Vec::new(),
+            layers: CodeintelResponse::unavailable(FANOUT_OMITTED_REASON),
             total_impacted: 0,
         },
     }
@@ -2355,6 +2376,28 @@ mod tests {
         assert!(text.chars().count() <= 3);
         assert!(text.starts_with('😀'), "{text}");
         assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn layered_many_caps_fanout_and_reports_omitted_seeds() {
+        let targets: Vec<String> = (0..MAX_NEIGHBOR_TARGETS + 4)
+            .map(|i| format!("f{i}.ts"))
+            .collect();
+        let out = impact_layered_many("/tmp/not-a-repo", &targets, Some(50));
+        assert_eq!(out.len(), targets.len());
+        let omitted = out
+            .iter()
+            .filter(|item| item.reason.as_deref() == Some(FANOUT_OMITTED_REASON))
+            .count();
+        assert_eq!(omitted, 4, "{:?}", out.iter().map(|i| &i.reason).collect::<Vec<_>>());
+        for item in &out[MAX_NEIGHBOR_TARGETS..] {
+            assert_eq!(item.reason.as_deref(), Some(FANOUT_OMITTED_REASON));
+            assert!(
+                item.blast_radius.unmatched_targets.is_empty(),
+                "{:?}",
+                item.blast_radius.unmatched_targets
+            );
+        }
     }
 
     #[test]

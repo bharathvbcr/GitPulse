@@ -8,10 +8,12 @@ import {
   createDiagnostics,
   formatDiagnosticReport,
   formatDiagnosticTime,
+  formatDiagnosticFailure,
   installGlobalDiagnostics,
   diagnosticFingerprint,
   isHostRuntimeNoise,
   isBrowserObserverNoise,
+  isSvelteEffectLoopMessage,
   redactDiagnosticText,
   isSecretFieldName,
   normalizeFieldName,
@@ -459,6 +461,75 @@ describe("createDiagnostics", () => {
     ]);
   });
 
+  it("drops persisted 0.1.0 github-alerts product-disabled warnings without dropping live failures", () => {
+    const productOff =
+      "Code scanning is not enabled for this repository. Please enable code scanning in the repository settings. (HTTP 1)";
+    const noAnalysis = "no analysis found (HTTP 1)";
+    const forbidden = "HTTP 403";
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        {
+          id: 6,
+          at: 6,
+          severity: "warning",
+          source: "github-alerts:check",
+          message: productOff,
+          count: 2,
+        },
+        {
+          id: 5,
+          at: 5,
+          severity: "warning",
+          source: "github-alerts:check",
+          message: noAnalysis,
+          count: 9,
+        },
+        {
+          id: 4,
+          at: 4,
+          severity: "warning",
+          source: "github-alerts:check",
+          message: forbidden,
+          count: 1,
+        },
+        {
+          id: 3,
+          at: 3,
+          severity: "error",
+          source: "github-alerts:check",
+          message: productOff,
+          count: 1,
+        },
+        {
+          id: 2,
+          at: 2,
+          severity: "error",
+          source: "uncaught-error",
+          message: "https://svelte.dev/e/effect_update_depth_exceeded",
+          count: 1,
+        },
+        {
+          id: 1,
+          at: 1,
+          severity: "error",
+          source: "repo:operation",
+          message: "fatal: The current branch main has no upstream branch.",
+          count: 1,
+        },
+      ]),
+    });
+    const store = createDiagnostics({ storage, development: false });
+    expect(get(store).map((entry) => ({ source: entry.source, message: entry.message }))).toEqual([
+      { source: "github-alerts:check", message: forbidden },
+      { source: "github-alerts:check", message: productOff },
+      {
+        source: "uncaught-error",
+        message: "https://svelte.dev/e/effect_update_depth_exceeded",
+      },
+      { source: "repo:operation", message: "fatal: The current branch main has no upstream branch." },
+    ]);
+  });
+
   it("compacts consecutive fingerprint matches already in the persisted blob", () => {
     // Live coalescing only folds the head, and only after fingerprint masking
     // exists. Overnight UI-timer warnings written before that masking stay as
@@ -615,6 +686,19 @@ describe("isBrowserObserverNoise", () => {
   });
 });
 
+describe("formatDiagnosticFailure", () => {
+  it("turns a bare Svelte effect-loop URL into a diagnosis and stays idempotent", () => {
+    const url = "https://svelte.dev/e/effect_update_depth_exceeded";
+    expect(isSvelteEffectLoopMessage(url)).toBe(true);
+    expect(isSvelteEffectLoopMessage("Maximum update depth exceeded")).toBe(false);
+    const once = formatDiagnosticFailure(url);
+    expect(once).toContain("read and wrote the same state");
+    expect(once).toContain(url);
+    expect(formatDiagnosticFailure(once)).toBe(once);
+    expect(formatDiagnosticFailure("clone failed")).toBe("clone failed");
+  });
+});
+
 describe("formatDiagnosticReport", () => {
   const generatedAt = new Date("2026-08-25T12:00:00Z");
 
@@ -735,6 +819,17 @@ describe("installGlobalDiagnostics", () => {
     expect(recorded[0].message).toContain("promise died");
     expect(recorded[1].message).toBe("syntax goop");
     expect(recorded[2].message).toContain("typed badly");
+    uninstall();
+  });
+
+  it("records a Svelte effect-loop uncaught error with a diagnosis, not only the docs URL", () => {
+    const { recorded, target, uninstall } = setup();
+    target.emit("error", { message: "https://svelte.dev/e/effect_update_depth_exceeded" });
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].source).toBe("uncaught-error");
+    expect(recorded[0].severity).toBe("error");
+    expect(recorded[0].message).toContain("read and wrote the same state");
+    expect(recorded[0].message).toContain("https://svelte.dev/e/effect_update_depth_exceeded");
     uninstall();
   });
 

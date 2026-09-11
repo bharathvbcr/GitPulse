@@ -1,32 +1,44 @@
 import { invoke } from "@tauri-apps/api/core";
-import type {
-  CodeintelAffectedTests,
-  CodeintelClones,
-  CodeintelDeadSymbol,
-  CodeintelEdge,
-  CodeintelExplore,
-  CodeintelLayeredImpact,
-  CodeintelNeighbors,
-  CodeintelResponse,
-  CodeintelRung,
-  CodeintelStatus,
-  CodeintelSymbolHit,
-  DevmapBuildOutcome,
-  DevmapCliStatus,
-  DevmapPreviewFileResult,
-  DevmapPreviewOutcome,
-  GraphVizLoad,
-  LiveRefreshOutcome,
-  RepoMapLoad,
-  WorkspaceLinksResult,
-  WorkspaceRegisterResult,
-  WorkspaceSearchResult,
-  WorkspaceSnapshot,
-  WorkspaceUnregisterResult,
+import {
+  parseCodeintelResponse,
+  parseCodeintelStatus,
+  type CodeintelAffectedTests,
+  type CodeintelClones,
+  type CodeintelDeadSymbol,
+  type CodeintelEdge,
+  type CodeintelExplore,
+  type CodeintelLayeredImpact,
+  type CodeintelNeighbors,
+  type CodeintelResponse,
+  type CodeintelRung,
+  type CodeintelStatus,
+  type CodeintelSymbolHit,
+  type DevmapBuildOutcome,
+  type DevmapCliStatus,
+  type DevmapPreviewFileResult,
+  type DevmapPreviewOutcome,
+  type GraphVizLoad,
+  type LiveRefreshOutcome,
+  type RepoMapLoad,
+  type WorkspaceLinksResult,
+  type WorkspaceRegisterResult,
+  type WorkspaceSearchResult,
+  type WorkspaceSnapshot,
+  type WorkspaceUnregisterResult,
 } from "./types";
 
+function invokeResponse<T>(
+  command: string,
+  args: Record<string, unknown>,
+): Promise<CodeintelResponse<T>> {
+  return invoke(command, args).then((raw) => parseCodeintelResponse<T>(raw, command));
+}
+
 export async function getCodeintelStatus(repoPath: string): Promise<CodeintelStatus> {
-  return invoke<CodeintelStatus>("cmd_codeintel_status", { repoPath });
+  return parseCodeintelStatus(
+    await invoke("cmd_codeintel_status", { repoPath }),
+    "cmd_codeintel_status",
+  );
 }
 
 export async function searchSymbols(
@@ -34,7 +46,7 @@ export async function searchSymbols(
   query: string,
   tokenBudget?: number,
 ): Promise<CodeintelResponse<CodeintelSymbolHit>> {
-  return invoke<CodeintelResponse<CodeintelSymbolHit>>("cmd_codeintel_search", {
+  return invokeResponse<CodeintelSymbolHit>("cmd_codeintel_search", {
     repoPath,
     query,
     tokenBudget,
@@ -47,7 +59,7 @@ export async function getImpact(
   tokenBudget?: number,
   cancelToken?: string,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invoke<CodeintelResponse<CodeintelEdge>>("cmd_codeintel_impact", {
+  return invokeResponse<CodeintelEdge>("cmd_codeintel_impact", {
     repoPath,
     target,
     tokenBudget,
@@ -62,7 +74,7 @@ export async function getImpactAtRung(
   minRung?: CodeintelRung,
   cancelToken?: string,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invoke<CodeintelResponse<CodeintelEdge>>("cmd_codeintel_impact_at_rung", {
+  return invokeResponse<CodeintelEdge>("cmd_codeintel_impact_at_rung", {
     repoPath,
     target,
     tokenBudget,
@@ -75,7 +87,7 @@ export async function getDeadSymbols(
   repoPath: string,
   tokenBudget?: number,
 ): Promise<CodeintelResponse<CodeintelDeadSymbol>> {
-  return invoke<CodeintelResponse<CodeintelDeadSymbol>>("cmd_codeintel_dead_symbols", {
+  return invokeResponse<CodeintelDeadSymbol>("cmd_codeintel_dead_symbols", {
     repoPath,
     tokenBudget,
   });
@@ -87,7 +99,7 @@ export async function getDependencies(
   tokenBudget?: number,
   minRung?: CodeintelRung,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invoke<CodeintelResponse<CodeintelEdge>>("cmd_codeintel_dependencies", {
+  return invokeResponse<CodeintelEdge>("cmd_codeintel_dependencies", {
     repoPath,
     filePath,
     tokenBudget,
@@ -102,7 +114,7 @@ export async function traceBetween(
   tokenBudget?: number,
   minRung?: CodeintelRung,
 ): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invoke<CodeintelResponse<CodeintelEdge>>("cmd_codeintel_trace", {
+  return invokeResponse<CodeintelEdge>("cmd_codeintel_trace", {
     repoPath,
     from,
     to,

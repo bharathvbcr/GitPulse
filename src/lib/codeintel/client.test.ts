@@ -263,7 +263,21 @@ describe("codeintel client", () => {
   });
 
   it("covers the remaining codeintel and digmap IPC wrappers", async () => {
-    vi.mocked(invoke).mockResolvedValue({});
+    const envelope = {
+      available: true,
+      reason: null,
+      items: [],
+      total: 0,
+      shown: 0,
+      truncated: false,
+    };
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "cmd_codeintel_neighbors") return [];
+      if (command === "cmd_codeintel_impact_layered_many") return [];
+      if (command === "cmd_codeintel_cancel") return true;
+      if (String(command).startsWith("cmd_codeintel_")) return envelope;
+      return {};
+    });
 
     await getDependencies("/repo", "src/a.ts", 10);
     expect(invoke).toHaveBeenCalledWith("cmd_codeintel_dependencies", {
@@ -343,5 +357,31 @@ describe("codeintel client", () => {
       filePath: "src/a.ts",
       content: "x",
     });
+  });
+
+  it("rejects a null dead-symbol payload instead of returning it to Health", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(null);
+    await expect(getDeadSymbols("/repo")).rejects.toThrow(/no payload/);
+  });
+
+  it("rejects an available dead-symbol payload that omitted items", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ available: true, truncated: false });
+    await expect(getDeadSymbols("/repo")).rejects.toThrow(/without items/);
+  });
+
+  it("rejects a null status payload instead of returning it to Health", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(null);
+    await expect(getCodeintelStatus("/repo")).rejects.toThrow(/no payload/);
+  });
+
+  it("keeps an unavailable dead-symbol query as unavailable, not a crash", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      available: false,
+      reason: "index missing",
+    });
+    const res = await getDeadSymbols("/repo");
+    expect(res.available).toBe(false);
+    expect(res.items).toEqual([]);
+    expect(res.reason).toBe("index missing");
   });
 });

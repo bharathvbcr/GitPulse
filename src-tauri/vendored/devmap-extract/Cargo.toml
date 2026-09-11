@@ -264,3 +264,8 @@ required-features = ["parse"]
 [[test]]
 name = "file_liveness_eligibility"
 required-features = ["parse"]
+
+[[test]]
+name = "notebook_completeness"
+required-features = ["parse"]
+

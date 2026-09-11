@@ -688,30 +688,49 @@ impl GitWriter {
         }
     }
 
+    /// Arguments after `git` for a push. The command gate judges this exact
+    /// argv; [`Self::push_planned`] executes it, so a missing upstream cannot
+    /// be judged as a bare `git push` and then run as `git push -u …`.
+    pub fn plan_push(
+        repo_path: &str,
+        remote: Option<&str>,
+        branch: Option<&str>,
+        force: bool,
+    ) -> Result<Vec<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        plan_push_argv(&repo, remote, branch, force)
+    }
+
     pub fn push(
         repo_path: &str,
         remote: Option<&str>,
         branch: Option<&str>,
         force: bool,
     ) -> Result<String, String> {
+        let args = Self::plan_push(repo_path, remote, branch, force)?;
+        Self::push_planned(repo_path, &args)
+    }
+
+    /// Runs a previously planned `push` argv. Refuses anything other than
+    /// `--force-with-lease`, `-u`, and validated ref names so a caller cannot
+    /// smuggle `--force` past the lease-only contract.
+    pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
+        if args.first().map(String::as_str) != Some("push") {
+            return Err("internal: planned push argv must start with push".into());
+        }
+        for arg in args.iter().skip(1) {
+            if arg == "--force-with-lease" || arg == "-u" {
+                continue;
+            }
+            validate_ref_name(arg)?;
+        }
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut args = vec!["push"];
-        if force {
-            args.push("--force-with-lease");
-        }
-        if let Some(r) = remote {
-            validate_ref_name(r)?;
-            args.push(r);
-        }
-        if let Some(b) = branch {
-            validate_ref_name(b)?;
-            args.push(b);
-        }
-        git_text_network(&repo, &args)
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        git_text_network(&repo, &refs)
     }
 
     /// Pushes exactly one tag ref. Using a fully-qualified refspec avoids an
@@ -1453,6 +1472,118 @@ pub(crate) fn summarize_git_failure(raw: &str) -> String {
     }
 }
 
+const PUSH_DETACHED: &str =
+    "Cannot push: HEAD is detached. Check out a branch, then push.";
+const PUSH_NO_REMOTES: &str =
+    "This repository has no remotes. Add a remote before pushing.";
+
+fn branch_has_upstream(repo: &Path) -> bool {
+    git_text(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .map(|text| !text.trim().is_empty())
+    .unwrap_or(false)
+}
+
+fn current_branch_name(repo: &Path) -> Result<String, String> {
+    match git_text(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                Err(PUSH_DETACHED.into())
+            } else {
+                Ok(name.to_string())
+            }
+        }
+        Err(_) => Err(PUSH_DETACHED.into()),
+    }
+}
+
+fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
+    let text = git_text(repo, &["remote"])?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Remote to publish an unpublished branch to when the caller did not name one.
+///
+/// Priority: `checkout.defaultRemote` when it names a configured remote,
+/// `origin` when it exists, a lone remote, else a refusal naming the choices.
+/// Never invents `origin` — `git push -u origin …` against a missing remote is
+/// the same class of raw fatal this path exists to replace.
+fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
+    let remotes = configured_remotes(repo)?;
+    if remotes.is_empty() {
+        return Err(PUSH_NO_REMOTES.into());
+    }
+    if let Ok(configured) = git_text(repo, &["config", "--get", "checkout.defaultRemote"]) {
+        let name = configured.trim();
+        if remotes.iter().any(|remote| remote == name) {
+            return Ok(name.to_string());
+        }
+    }
+    if remotes.iter().any(|remote| remote == "origin") {
+        return Ok("origin".into());
+    }
+    if let [only] = remotes.as_slice() {
+        return Ok(only.clone());
+    }
+    Err(format!(
+        "This branch has no upstream. GitPulse cannot choose among remotes {} — specify one to push.",
+        remotes.join(", ")
+    ))
+}
+
+fn plan_push_argv(
+    repo: &Path,
+    remote: Option<&str>,
+    branch: Option<&str>,
+    force: bool,
+) -> Result<Vec<String>, String> {
+    let mut args = vec!["push".to_string()];
+    if force {
+        args.push("--force-with-lease".into());
+    }
+    match (remote, branch) {
+        (None, None) => {
+            if !branch_has_upstream(repo) {
+                let branch = current_branch_name(repo)?;
+                let remote = unpublished_push_remote(repo)?;
+                validate_ref_name(&remote)?;
+                validate_ref_name(&branch)?;
+                args.push("-u".into());
+                args.push(remote);
+                args.push(branch);
+            }
+        }
+        (Some(remote), None) => {
+            validate_ref_name(remote)?;
+            args.push(remote.to_string());
+        }
+        (Some(remote), Some(branch)) => {
+            validate_ref_name(remote)?;
+            validate_ref_name(branch)?;
+            args.push(remote.to_string());
+            args.push(branch.to_string());
+        }
+        (None, Some(branch)) => {
+            validate_ref_name(branch)?;
+            args.push(branch.to_string());
+        }
+    }
+    Ok(args)
+}
+
 pub fn validate_ref_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Invalid ref name".into());
@@ -1799,6 +1930,55 @@ mod tests {
         assert!(
             output.status.success(),
             "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        dir
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn git {}: {err}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_text(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .map_err(|err| format!("spawn git {}: {err}", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn repo_path(dir: &tempfile::TempDir) -> String {
+        dir.path().to_str().expect("utf-8 repo path").to_string()
+    }
+
+    fn init_bare() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init --bare");
+        assert!(
+            output.status.success(),
+            "bare init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         dir
@@ -2433,6 +2613,196 @@ mod tests {
         for message in [&removed, &kept] {
             assert!(message.contains("clone failed (timeout)"), "{message}");
         }
+    }
+
+    #[test]
+    fn unpublished_push_plans_set_upstream_to_origin() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap();
+        assert_eq!(
+            argv,
+            vec!["push", "-u", "origin", "main"],
+            "an unpublished branch must be judged as the -u that will run, not a bare git push"
+        );
+    }
+
+    #[test]
+    fn unpublished_force_push_keeps_lease_and_sets_upstream() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, None, true).unwrap();
+        assert_eq!(
+            argv,
+            vec!["push", "--force-with-lease", "-u", "origin", "main"]
+        );
+    }
+
+    #[test]
+    fn push_with_upstream_stays_a_bare_push() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        GitWriter::push(&repo_path(&repo), None, None, false).expect("first push publishes");
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap();
+        assert_eq!(argv, vec!["push"]);
+    }
+
+    #[test]
+    fn explicit_remote_and_branch_do_not_invent_set_upstream() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let argv =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("main"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "main"]);
+    }
+
+    #[test]
+    fn unpublished_push_uses_the_only_remote_even_when_it_is_not_origin() {
+        let remote = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "company", remote.path().to_str().unwrap()],
+        );
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap();
+        assert_eq!(argv, vec!["push", "-u", "company", "main"]);
+    }
+
+    #[test]
+    fn unpublished_push_prefers_checkout_default_remote_when_named() {
+        let alpha = init_bare();
+        let beta = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "alpha", alpha.path().to_str().unwrap()],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "beta", beta.path().to_str().unwrap()],
+        );
+        git_in(repo.path(), &["config", "checkout.defaultRemote", "beta"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap();
+        assert_eq!(argv, vec!["push", "-u", "beta", "main"]);
+    }
+
+    #[test]
+    fn unpublished_push_prefers_origin_when_several_remotes_are_unconfigured() {
+        let origin = init_bare();
+        let other = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "other", other.path().to_str().unwrap()],
+        );
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap();
+        assert_eq!(argv, vec!["push", "-u", "origin", "main"]);
+    }
+
+    #[test]
+    fn unpublished_push_refuses_to_invent_a_remote_when_none_exist() {
+        let repo = init_repo_with_commit();
+        let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
+        assert!(
+            err.contains("no remotes"),
+            "must not fall through to git's no-upstream fatal, got: {err}"
+        );
+        assert!(!err.to_lowercase().contains("set-upstream"));
+    }
+
+    #[test]
+    fn unpublished_push_refuses_when_remotes_are_ambiguous() {
+        let alpha = init_bare();
+        let beta = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "alpha", alpha.path().to_str().unwrap()],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "beta", beta.path().to_str().unwrap()],
+        );
+        let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
+        assert!(
+            err.contains("cannot choose among remotes"),
+            "got: {err}"
+        );
+        assert!(err.contains("alpha"));
+        assert!(err.contains("beta"));
+    }
+
+    #[test]
+    fn unpublished_push_refuses_detached_head() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(repo.path(), &["checkout", "--detach"]);
+        let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
+        assert!(
+            err.contains("HEAD is detached"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unpublished_push_sets_upstream_on_a_local_origin() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        GitWriter::push(&repo_path(&repo), None, None, false).expect("publish");
+        let tracking = git_text(
+            repo.path(),
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )
+        .expect("upstream");
+        assert_eq!(tracking.trim(), "origin/main");
+    }
+
+    #[test]
+    fn push_planned_refuses_a_raw_force_flag() {
+        let repo = init_repo_with_commit();
+        let err = GitWriter::push_planned(
+            &repo_path(&repo),
+            &["push".into(), "--force".into(), "origin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid ref name",
+            "raw --force starts with '-' so validate_ref_name must refuse it before git runs"
+        );
     }
 
     #[test]

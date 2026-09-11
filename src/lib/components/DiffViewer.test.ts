@@ -343,6 +343,23 @@ describe("DiffViewer store-emission memo guards", () => {
     expect(source).toContain("BlastRadiusPanel");
   });
 
+  it("depends on the change-set path key, not rail entry identity", () => {
+    expect(source).toMatch(/import\s*\{[^}]*\buntrack\b[^}]*\}\s*from\s*"svelte"/);
+    const start = source.indexOf("let changeSetPathsKey");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("$effect(() => () => changeSetBlastGuard"));
+    expect(effect).toContain("void changeSetPathsKey");
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(
+      effect.indexOf("getImpactLayeredMany"),
+    );
+  });
+
+  it("caps change-set blast fan-out and reports omitted seeds", () => {
+    expect(source).toContain("capFanout");
+    expect(source).toContain("omittedLayeredImpact");
+  });
+
   it("offers min_rung on flat impact and keeps layered blast separate", () => {
     expect(source).toContain("RungFilterControl");
     expect(source).toContain("bind:minRung");

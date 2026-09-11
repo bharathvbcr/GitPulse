@@ -8,7 +8,7 @@ Download a pre-built installer from the [latest release](https://github.com/bhar
 | **Linux** | `.AppImage`, `.deb` | x86_64 | Built on Ubuntu 22.04 (glibc 2.35+) |
 | **Windows** | `.msi`, `.exe` | x64 | Windows 10 / 11 |
 
-Current packaged version is **0.1.0** (`package.json` / release manifests). Prefer the GitHub Releases page over a cached copy.
+Current packaged version is **1.0.0** (`package.json` / release manifests). Prefer the GitHub Releases page over a cached copy.
 
 ## macOS Gatekeeper
 

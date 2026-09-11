@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
@@ -79,7 +79,7 @@
   // Escape could dismiss; drop the menu the moment its tab vanishes.
   $effect(() => {
     if (menu && !$repoStore.openTabs.some((tab) => tab.id === menu?.id)) {
-      menu = null;
+      untrack(() => { menu = null; });
     }
   });
 

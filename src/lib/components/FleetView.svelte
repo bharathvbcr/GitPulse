@@ -33,6 +33,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   let cleanerOpen = $state(false);
   /**
@@ -293,7 +294,9 @@
   });
 
   $effect(() => {
-    if (focusedIndex > visibleRows.length - 1) focusedIndex = Math.max(0, visibleRows.length - 1);
+    if (focusedIndex > visibleRows.length - 1) {
+      untrack(() => { focusedIndex = Math.max(0, visibleRows.length - 1); });
+    }
   });
 
   /** Column headers, in render order, with the sort key each one carries. */

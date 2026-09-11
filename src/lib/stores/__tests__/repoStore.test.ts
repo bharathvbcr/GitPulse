@@ -5,6 +5,7 @@ import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
 import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
 import type { FilterState } from "../filterStore";
 import { interfaceStore } from "../interfaceStore";
+import { diagnostics } from "../../diagnostics/diagnostics";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -231,6 +232,42 @@ describe("repository content revisions", () => {
       await store.openRepo(`/r/content-${i}`);
       expect(Object.keys(get(store.contentRevisions))).toHaveLength(1);
     }
+  });
+});
+
+describe("repoStore.setError", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("setError(null) clears the active session; a second identical call does not republish", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    store.setError("boom");
+    expect(get(store).error).toBe("boom");
+    let publishes = 0;
+    const unsub = store.subscribe(() => {
+      publishes += 1;
+    });
+    publishes = 0;
+    store.setError(null);
+    expect(get(store).error).toBeNull();
+    expect(publishes).toBe(1);
+    publishes = 0;
+    store.setError(null);
+    expect(get(store).error).toBeNull();
+    expect(publishes).toBe(0);
+    unsub();
+  });
+
+  it("still records a truthy error in diagnostics when the value is unchanged", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    const spy = vi.spyOn(diagnostics, "error");
+    store.setError("boom");
+    store.setError("boom");
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy).toHaveBeenNthCalledWith(1, "repo", "boom");
+    expect(spy).toHaveBeenNthCalledWith(2, "repo", "boom");
+    expect(get(store).error).toBe("boom");
   });
 });
 

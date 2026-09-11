@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../../stores/repoStore";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
@@ -335,18 +336,24 @@
     const source = content;
     if (path !== previousFilePath) {
       previousFilePath = path;
-      editorGeneration += 1;
-      editDraft = restored ?? source;
-      isEditing = restored !== null;
-      isSaving = false;
-      saveSuccess = false;
+      untrack(() => {
+        editorGeneration += 1;
+        editDraft = restored ?? source;
+        isEditing = restored !== null;
+        isSaving = false;
+        saveSuccess = false;
+      });
       return;
     }
     if (restored !== null && !isEditing) {
-      editDraft = restored;
-      isEditing = true;
+      untrack(() => {
+        editDraft = restored;
+        isEditing = true;
+      });
     } else if (restored === null && !isEditing) {
-      editDraft = source;
+      untrack(() => {
+        editDraft = source;
+      });
     }
   });
 

@@ -12,21 +12,20 @@
 //!
 //! **What this does instead.** Code cells are reconstructed and parsed, which
 //! is the only way to get real symbols. Each resulting symbol is then
-//! *relocated*: its declaration is found in the raw file bytes, and the span it
-//! carries is that range. A symbol whose declaration cannot be located keeps
-//! the span of the cell it came from, which is coarse but true. One that cannot
-//! even be attributed to a cell is dropped and counted — never emitted with a
-//! guessed span.
+//! *relocated* through a structural map from decoded cell bytes to raw JSON
+//! bytes. The same map relocates calls, references, imports, exports, lexical
+//! bindings and parser diagnostics; duplicate text in prose or output cells
+//! cannot steal a source location. A mapping failure refuses the extraction.
 //!
 //! Markdown cells are not scanned, for the reason `fallback` does not scan
 //! Markdown: a type described in prose is not a type the notebook declares.
 
-use crate::model::{ExtractedSymbol, Extraction, ExtractionEngine, ParseOutcome, Span};
+use crate::model::{Extraction, ExtractionEngine, ParseOutcome, Span};
 
 /// Cells beyond this are not read.
 ///
-/// Generated and checkpointed notebooks reach tens of thousands of cells, and
-/// the relocation pass below is linear in cells × symbols. Exceeding it is
+/// Generated and checkpointed notebooks reach tens of thousands of cells.
+/// Source mapping is linear in input size; exceeding this ingestion bound is
 /// reported as a diagnostic, never silently truncated.
 const MAX_CELLS: usize = 5_000;
 
@@ -34,7 +33,52 @@ const MAX_CELLS: usize = 5_000;
 struct Cell {
     code: String,
     /// Byte range in the raw `.ipynb` covering this cell's `source` value.
-    raw_span: Option<Span>,
+    raw_span: Span,
+}
+
+struct NotebookKernel {
+    names: &'static [&'static str],
+    grammar: &'static str,
+    extension: &'static str,
+}
+
+// Dispatch and cache invalidation read the same table: a newly supported
+// kernel must not leave notebook payloads keyed on an unavailable grammar.
+const KERNELS: &[NotebookKernel] = &[
+    NotebookKernel {
+        names: &["python"],
+        grammar: "python",
+        extension: "py",
+    },
+    NotebookKernel {
+        names: &["r"],
+        grammar: "r",
+        extension: "R",
+    },
+    NotebookKernel {
+        names: &["julia"],
+        grammar: "julia",
+        extension: "jl",
+    },
+    NotebookKernel {
+        names: &["javascript", "typescript"],
+        grammar: "typescript",
+        extension: "ts",
+    },
+    NotebookKernel {
+        names: &["rust"],
+        grammar: "rust",
+        extension: "rs",
+    },
+    NotebookKernel {
+        names: &["scala"],
+        grammar: "scala",
+        extension: "scala",
+    },
+];
+
+pub(crate) fn kernel_grammars() -> impl Iterator<Item = &'static str> {
+    KERNELS.iter().map(|kernel| kernel.grammar)
 }
 
 /// The language a notebook's kernel declares, mapped to an extractor language.
@@ -55,65 +99,251 @@ fn kernel_language(doc: &serde_json::Value) -> Option<&'static str> {
         .and_then(|name| name.as_str())?
         .to_ascii_lowercase();
 
-    Some(match declared.as_str() {
-        "python" => "python",
-        "r" => "r",
-        "julia" => "julia",
-        "javascript" | "typescript" => "typescript",
-        "rust" => "rust",
-        "scala" => "scala",
-        _ => return None,
-    })
+    KERNELS
+        .iter()
+        .find(|kernel| kernel.names.contains(&declared.as_str()))
+        .map(|kernel| kernel.grammar)
 }
 
 /// The file extension a reconstructed cell buffer should be named with, so
 /// `detect_language` routes it to the same grammar the kernel declares.
 fn synthetic_extension(language: &str) -> &'static str {
-    match language {
-        "python" => "py",
-        "r" => "R",
-        "julia" => "jl",
-        "typescript" => "ts",
-        "rust" => "rs",
-        "scala" => "scala",
-        _ => "txt",
-    }
+    KERNELS
+        .iter()
+        .find(|kernel| kernel.grammar == language)
+        .map(|kernel| kernel.extension)
+        .unwrap_or("txt")
 }
 
 /// A cell's `source` is either a string or an array of strings.
 fn cell_source(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Array(lines) => Some(
-            lines
-                .iter()
-                .filter_map(|line| line.as_str())
-                .collect::<Vec<_>>()
-                .concat(),
-        ),
+        serde_json::Value::Array(lines) => lines
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Option<Vec<_>>>()
+            .map(|lines| lines.concat()),
         _ => None,
     }
 }
 
-/// Locate `needle` in `raw`, returning the byte range of the line containing it.
-///
-/// Used to relocate a reconstructed symbol into the file on disk. The search is
-/// over the *escaped* form, because that is what the raw bytes hold: a
-/// declaration written `def load(path):` appears in the JSON as
-/// `"def load(path):\n"`, so the unescaped needle would never be found.
-fn locate_line(raw: &str, needle: &str) -> Option<Span> {
-    if needle.is_empty() {
-        return None;
+/// Read the immediate children of a validated JSON object or array with their
+/// original byte offsets. Serde owns token parsing, escapes and nesting limits.
+/// Repeated object keys remain ordered here; callers select the last one just
+/// as serde_json::Value does.
+fn json_children(raw: &str, span: &Span) -> Option<Vec<(Option<String>, Span)>> {
+    let mut at = span.start_byte;
+    let skip_space = |at: &mut usize| {
+        while raw.as_bytes().get(*at).is_some_and(u8::is_ascii_whitespace) {
+            *at += 1;
+        }
+    };
+    skip_space(&mut at);
+    let object = match raw.as_bytes().get(at)? {
+        b'{' => true,
+        b'[' => false,
+        _ => return None,
+    };
+    at += 1;
+    let mut values = Vec::new();
+    loop {
+        skip_space(&mut at);
+        if raw.as_bytes().get(at) == Some(if object { &b'}' } else { &b']' }) {
+            return Some(values);
+        }
+        let key = if object {
+            let mut stream = serde_json::Deserializer::from_str(raw.get(at..span.end_byte)?)
+                .into_iter::<String>();
+            let key = stream.next()?.ok()?;
+            at += stream.byte_offset();
+            skip_space(&mut at);
+            if raw.as_bytes().get(at) != Some(&b':') {
+                return None;
+            }
+            at += 1;
+            skip_space(&mut at);
+            Some(key)
+        } else {
+            None
+        };
+        let start_byte = at;
+        let mut stream = serde_json::Deserializer::from_str(raw.get(at..span.end_byte)?)
+            .into_iter::<serde::de::IgnoredAny>();
+        stream.next()?.ok()?;
+        at += stream.byte_offset();
+        values.push((
+            key,
+            Span {
+                start_byte,
+                end_byte: at,
+            },
+        ));
+        skip_space(&mut at);
+        if raw.as_bytes().get(at) == Some(&b',') {
+            at += 1;
+        } else if raw.as_bytes().get(at) != Some(if object { &b'}' } else { &b']' }) {
+            return None;
+        }
     }
-    // `serde_json::to_string` of a string yields the quoted, escaped form;
-    // trimming the quotes leaves exactly the bytes the file contains.
-    let escaped = serde_json::to_string(needle).ok()?;
-    let escaped = escaped.get(1..escaped.len().saturating_sub(1))?;
-    let at = raw.find(escaped)?;
-    Some(Span {
-        start_byte: at,
-        end_byte: at + escaped.len(),
-    })
+}
+
+fn json_field(raw: &str, span: &Span, name: &str) -> Option<Span> {
+    json_children(raw, span)?
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key.as_deref() == Some(name))
+        .map(|(_, span)| span)
+}
+
+struct SourceSegment {
+    decoded: Span,
+    raw: Span,
+    escaped: bool,
+}
+
+#[derive(Default)]
+struct SourceMap(Vec<SourceSegment>);
+
+impl SourceMap {
+    fn push(&mut self, decoded: Span, raw: Span, escaped: bool) {
+        if !escaped {
+            if let Some(last) = self.0.last_mut() {
+                if !last.escaped
+                    && last.decoded.end_byte == decoded.start_byte
+                    && last.raw.end_byte == raw.start_byte
+                {
+                    last.decoded.end_byte = decoded.end_byte;
+                    last.raw.end_byte = raw.end_byte;
+                    return;
+                }
+            }
+        }
+        self.0.push(SourceSegment {
+            decoded,
+            raw,
+            escaped,
+        });
+    }
+
+    /// Serde validates and decodes each JSON string. This only tracks how many
+    /// raw bytes represented each decoded character; it never interprets JSON
+    /// independently. Adjacent unescaped characters share one map segment.
+    fn append_string(&mut self, raw: &str, span: &Span, buffer: &mut String) -> Option<()> {
+        let text: String = serde_json::from_str(raw.get(span.start_byte..span.end_byte)?).ok()?;
+        let mut at = span.start_byte + 1;
+        let base = buffer.len();
+        for (offset, ch) in text.char_indices() {
+            let escaped = raw.as_bytes().get(at) == Some(&b'\\');
+            let width = if escaped && raw.as_bytes().get(at + 1) == Some(&b'u') {
+                if ch.len_utf8() == 4 {
+                    12
+                } else {
+                    6
+                }
+            } else if escaped {
+                2
+            } else {
+                ch.len_utf8()
+            };
+            self.push(
+                Span {
+                    start_byte: base + offset,
+                    end_byte: base + offset + ch.len_utf8(),
+                },
+                Span {
+                    start_byte: at,
+                    end_byte: at + width,
+                },
+                escaped,
+            );
+            at += width;
+        }
+        if at != span.end_byte.checked_sub(1)? {
+            return None;
+        }
+        buffer.push_str(&text);
+        Some(())
+    }
+
+    fn append_cell(&mut self, raw: &str, cell: &Cell, buffer: &mut String) -> Option<()> {
+        let before = buffer.len();
+        if raw.as_bytes().get(cell.raw_span.start_byte) == Some(&b'[') {
+            for (_, span) in json_children(raw, &cell.raw_span)? {
+                self.append_string(raw, &span, buffer)?;
+            }
+        } else {
+            self.append_string(raw, &cell.raw_span, buffer)?;
+        }
+        if buffer.get(before..)? != cell.code {
+            return None;
+        }
+        if !cell.code.ends_with('\n') {
+            // The separator is synthesized, so it maps to the source value's
+            // end boundary rather than to any code from the following cell.
+            self.push(
+                Span {
+                    start_byte: buffer.len(),
+                    end_byte: buffer.len() + 1,
+                },
+                Span {
+                    start_byte: cell.raw_span.end_byte,
+                    end_byte: cell.raw_span.end_byte,
+                },
+                true,
+            );
+            buffer.push('\n');
+        }
+        Some(())
+    }
+
+    fn span(&self, span: &Span) -> Option<Span> {
+        if span.start_byte > span.end_byte {
+            return None;
+        }
+        let first = self
+            .0
+            .partition_point(|part| part.decoded.end_byte <= span.start_byte);
+        if span.start_byte == span.end_byte {
+            if let Some(part) = self.0.get(first) {
+                let at = if part.escaped {
+                    part.raw.start_byte
+                } else {
+                    part.raw.start_byte + span.start_byte - part.decoded.start_byte
+                };
+                return Some(Span {
+                    start_byte: at,
+                    end_byte: at,
+                });
+            }
+            let last = self.0.last()?;
+            return (span.start_byte == last.decoded.end_byte).then_some(Span {
+                start_byte: last.raw.end_byte,
+                end_byte: last.raw.end_byte,
+            });
+        }
+        let last = self
+            .0
+            .partition_point(|part| part.decoded.start_byte < span.end_byte)
+            .checked_sub(1)?;
+        let start = self.0.get(first)?;
+        let end = self.0.get(last)?;
+        if span.end_byte > end.decoded.end_byte {
+            return None;
+        }
+        Some(Span {
+            start_byte: if start.escaped {
+                start.raw.start_byte
+            } else {
+                start.raw.start_byte + span.start_byte - start.decoded.start_byte
+            },
+            end_byte: if end.escaped {
+                end.raw.end_byte
+            } else {
+                end.raw.start_byte + span.end_byte - end.decoded.start_byte
+            },
+        })
+    }
 }
 
 /// Whether `path` is a notebook this module handles.
@@ -121,13 +351,54 @@ pub fn is_notebook(path: &str) -> bool {
     path.rsplit('.').next().is_some_and(|ext| ext == "ipynb")
 }
 
-/// Extract a notebook by reconstructing its code cells and relocating the
-/// symbols back into the raw file.
+/// Extract independent notebook code cells and relocate their semantic payloads.
+///
+/// Compatibility adapter for custom parsers. The callback must bound its own
+/// execution time: an opaque synchronous callback cannot be cancelled here.
+/// The shared deadline is checked before and after every callback; production
+/// uses `extract_notebook_bounded` to pass the remaining budget to tree-sitter.
 pub fn extract_notebook(
     path: &str,
     raw: &str,
     parse: impl Fn(&str, &str, &str) -> Extraction,
 ) -> Extraction {
+    extract_notebook_with_parser(
+        path,
+        raw,
+        crate::treesitter::DEFAULT_PARSE_BUDGET,
+        |path, language, source, _remaining| parse(path, language, source),
+    )
+}
+
+/// Production entry: every cell receives only the remaining shared budget.
+pub(crate) fn extract_notebook_bounded(path: &str, raw: &str) -> Extraction {
+    extract_notebook_with_parser(
+        path,
+        raw,
+        crate::treesitter::DEFAULT_PARSE_BUDGET,
+        crate::treesitter::extract_treesitter_with_budget,
+    )
+}
+
+fn extract_notebook_with_parser(
+    path: &str,
+    raw: &str,
+    budget: std::time::Duration,
+    parse: impl Fn(&str, &str, &str, std::time::Duration) -> Extraction,
+) -> Extraction {
+    let started = std::time::Instant::now();
+    if raw.len() as u64 > crate::MAX_SOURCE_BYTES {
+        return crate::treesitter::refused_extraction(
+            path,
+            "notebook",
+            raw,
+            format!(
+                "source has {} bytes, over the {} byte input limit",
+                raw.len(),
+                crate::MAX_SOURCE_BYTES
+            ),
+        );
+    }
     let mut diagnostics: Vec<String> = Vec::new();
 
     // The grammarless path already produces a correctly shaped `Extraction`
@@ -143,6 +414,32 @@ pub fn extract_notebook(
         extraction.diagnostics = diagnostics;
         extraction
     };
+
+    let Some(deadline) = started.checked_add(budget) else {
+        return base(
+            ParseOutcome::Failed {
+                reason: "notebook extraction budget is outside the supported clock range"
+                    .to_string(),
+            },
+            ExtractionEngine::Unavailable {
+                requested_language: "notebook".to_string(),
+            },
+            diagnostics,
+        );
+    };
+    if std::time::Instant::now() >= deadline {
+        return base(
+            ParseOutcome::Failed {
+                reason: format!(
+                    "notebook extraction exceeded the {budget:?} budget before parsing"
+                ),
+            },
+            ExtractionEngine::Unavailable {
+                requested_language: "notebook".to_string(),
+            },
+            diagnostics,
+        );
+    }
 
     let doc: serde_json::Value = match serde_json::from_str(raw) {
         Ok(doc) => doc,
@@ -202,29 +499,62 @@ pub fn extract_notebook(
         ));
     }
 
+    let raw_cell_spans = json_field(
+        raw,
+        &Span {
+            start_byte: 0,
+            end_byte: raw.len(),
+        },
+        "cells",
+    )
+    .and_then(|span| json_children(raw, &span));
+    let Some(raw_cell_spans) = raw_cell_spans else {
+        return base(
+            ParseOutcome::Failed {
+                reason: "notebook cell source positions could not be decoded".to_string(),
+            },
+            ExtractionEngine::Notebook {
+                kernel_language: language.to_string(),
+            },
+            diagnostics,
+        );
+    };
+    let mut invalid_cells = 0usize;
     let cells: Vec<Cell> = all_cells
         .iter()
         .take(MAX_CELLS)
-        .filter(|cell| {
-            cell.get("cell_type")
-                .and_then(|kind| kind.as_str())
-                .is_some_and(|kind| kind == "code")
-        })
-        .filter_map(|cell| {
-            let code = cell_source(cell.get("source")?)?;
-            let raw_span = code
-                .lines()
-                .next()
-                .and_then(|first| locate_line(raw, first));
+        .enumerate()
+        .filter_map(|(index, cell)| {
+            match cell.get("cell_type").and_then(|kind| kind.as_str()) {
+                Some("markdown" | "raw") => return None,
+                Some("code") => {}
+                _ => {
+                    invalid_cells += 1;
+                    return None;
+                }
+            }
+            let Some(code) = cell.get("source").and_then(cell_source) else {
+                invalid_cells += 1;
+                return None;
+            };
+            let Some(raw_span) = raw_cell_spans
+                .get(index)
+                .and_then(|(_, cell_span)| json_field(raw, cell_span, "source"))
+            else {
+                invalid_cells += 1;
+                return None;
+            };
             Some(Cell { code, raw_span })
         })
         .collect();
 
-    if cells.is_empty() {
-        // A notebook of prose and outputs declares nothing. That is a complete
-        // answer, not a failure to parse one.
+    // A malformed code cell has unknown contents. Failing the container is
+    // safer than parsing a concatenation that silently removed part of it.
+    if invalid_cells > 0 {
         return base(
-            ParseOutcome::Clean,
+            ParseOutcome::Failed {
+                reason: format!("notebook has {invalid_cells} malformed cell(s): each cell needs a known cell_type and code source must be a string or an array of strings"),
+            },
             ExtractionEngine::Notebook {
                 kernel_language: language.to_string(),
             },
@@ -232,218 +562,288 @@ pub fn extract_notebook(
         );
     }
 
-    // One buffer, so a symbol defined in cell 3 and called in cell 7 resolves
-    // the way the notebook actually behaves when run top to bottom.
-    let mut buffer = String::new();
-    for cell in &cells {
-        buffer.push_str(&cell.code);
-        if !cell.code.ends_with('\n') {
-            buffer.push('\n');
-        }
-    }
-
+    // A notebook shares names across cells, not parser state. Independent
+    // parsing prevents a dangling function/string/bracket in one cell from
+    // borrowing the next cell's source and being published as Clean.
     let synthetic = format!("{path}.{}", synthetic_extension(language));
-    let parsed = parse(&synthetic, language, &buffer);
-    // Everything the parse produced is named for `synthetic`. That name must
-    // not survive into the extraction in any field: the resolver joins symbols,
-    // parents and callers by these strings, and one that names a file which does
-    // not exist produces edges nothing can match.
-    let synthetic_prefix = format!("{synthetic}::");
-    let real_prefix = format!("{path}::");
-
-    let mut relocated: Vec<ExtractedSymbol> = Vec::new();
-    let mut unlocatable = 0usize;
-    for mut symbol in parsed.symbols {
-        // The reconstructed buffer is a file to the extractor, so it emits its
-        // own `File` node named for the synthetic path. That node describes a
-        // buffer that does not exist; the base already carries the real one for
-        // the `.ipynb` itself, and letting this one through put two File nodes
-        // in the graph for one file.
-        if symbol.kind == crate::model::SymbolKind::File {
-            continue;
-        }
-        // The declaration line as it appeared in the reconstructed buffer.
-        let declaration = buffer
-            .get(symbol.span.start_byte..symbol.span.end_byte)
-            .and_then(|text| text.lines().next())
-            .unwrap_or_default()
-            .trim_end();
-
-        let span = locate_line(raw, declaration).or_else(|| {
-            // Coarse but true: the cell this symbol came from.
-            cells
-                .iter()
-                // `contains("")` is unconditionally true, so an empty
-                // declaration silently took cell 0's span and was reported as
-                // located — a guessed span presented as a found one, which the
-                // module doc explicitly forbids. The parallel call path already
-                // guards this; the symbol path did not.
-                .find(|cell| !declaration.is_empty() && cell.code.contains(declaration))
-                .and_then(|cell| cell.raw_span.clone())
-        });
-
-        match span {
-            Some(span) => {
-                symbol.span = span;
-                // Rewrite the *prefix*, do not rebuild the name from
-                // `symbol.name`. A method's qualified name is
-                // `<file>::Holder.method`, and rebuilding it flattened that to
-                // `<file>::method` while the call attributed to it kept the
-                // dotted form — so every method declared in a notebook was
-                // recorded under a name nothing referred to.
-                symbol.qualified_name = match symbol
-                    .qualified_name
-                    .strip_prefix(synthetic_prefix.as_str())
-                {
-                    Some(rest) => format!("{real_prefix}{rest}"),
-                    // No synthetic prefix to strip: fall back to the plain
-                    // file-qualified form rather than leaving a name that
-                    // points at the parse buffer.
-                    None => format!("{real_prefix}{}", symbol.name),
-                };
-                // The parent too. A top-level declaration's parent is the file
-                // it was parsed from, and left as the synthetic name it no
-                // longer equals `file_path` — so the resolver's "only emit a
-                // second Contains when the parent is a real type" guard stopped
-                // firing, and every symbol in a notebook got two containment
-                // edges, the second from a file that does not exist.
-                if let Some(parent) = symbol.parent_symbol.as_mut() {
-                    if parent.as_str() == synthetic.as_str() {
-                        *parent = path.to_string();
-                    } else if let Some(rest) = parent.strip_prefix(synthetic_prefix.as_str()) {
-                        *parent = format!("{real_prefix}{rest}");
-                    }
-                }
-                relocated.push(symbol);
-            }
-            None => unlocatable += 1,
-        }
-    }
-    if unlocatable > 0 {
-        // Dropped, not guessed. A span that does not index this file renders as
-        // whatever bytes happen to sit at the offset.
-        diagnostics.push(format!(
-            "{unlocatable} symbol(s) could not be located in the raw notebook and were dropped"
-        ));
-    }
-
-    // A prefix read is part of the result, not a note about it.
-    let outcome = match (&parsed.parse_outcome, dropped_cells, unlocatable) {
-        (ParseOutcome::Failed { .. }, _, _) => parsed.parse_outcome,
-        (_, 0, 0) => parsed.parse_outcome,
-        (other, _, _) => {
-            let mut losses = Vec::new();
-            if dropped_cells > 0 {
-                losses.push(format!(
-                    "{MAX_CELLS} of {} cells were read and {dropped_cells} were not",
-                    MAX_CELLS + dropped_cells
-                ));
-            }
-            if unlocatable > 0 {
-                losses.push(format!(
-                    "{unlocatable} symbol(s) could not be located in the raw notebook \
-                     and were dropped"
-                ));
-            }
-            if matches!(other, ParseOutcome::Partial { .. }) {
-                losses.push("the parsed cells also carried syntax errors".to_string());
-            }
-            ParseOutcome::Fallback {
-                reason: format!(
-                    "notebook symbol list is a prefix, not a set: {} — absence of a symbol \
-                     is not evidence it is not declared",
-                    losses.join("; ")
-                ),
-            }
-        }
-    };
-
     let mut extraction = base(
-        outcome,
+        ParseOutcome::Clean,
         ExtractionEngine::Notebook {
             kernel_language: language.to_string(),
         },
         diagnostics,
     );
-    // The base carries the `File` node; the relocated declarations join it
-    // rather than replacing it, so a notebook is addressable even when every
-    // symbol in it proved unlocatable.
-    extraction.symbols.extend(relocated);
-    extraction.imports = parsed.imports;
-    // Calls need the same relocation the symbols got, for the same reason and
-    // in two places.
-    //
-    // `caller_symbol` is qualified with the *synthetic* path the parse ran
-    // against, so a call from `summarize` arrived as
-    // `analysis.ipynb.py::summarize` while its own node was recorded as
-    // `analysis.ipynb::summarize`. The resolver joins those by name: the edge
-    // pointed at a symbol no node row declared, and `devmap impact` answered
-    // with a caller that does not exist. It also invented a second containing
-    // file, so every symbol got two `Contains` edges.
-    //
-    // The span is relocated to the cell the call sits in — coarse, but a real
-    // range in the real file, which is the rule the symbols already follow.
-    // Nothing persists a call span today; leaving one that indexes a buffer
-    // which no longer exists is a trap for whoever first does.
-    // One relocation, applied to both edge kinds.
-    //
-    // `references` were not carried forward at all, which the capability matrix
-    // could not see until the corpus gained an `.ipynb`: a notebook declaring
-    // `class Widget(BaseWidget)` produced no `ReferenceKind::Heritage`, so W1.2's
-    // `Extends`/`Implements` edges never fired for a notebook and every
-    // `Capability::References` consumer saw an empty vector for a file whose
-    // grammar had read it cleanly. That is the over-claim direction — a bit the
-    // kernel declares and does not deliver — which is the one failure the
-    // capability registry exists to make impossible.
-    let relocate_span = |span: &mut Span| {
-        let line = buffer
-            .get(span.start_byte..span.end_byte)
-            .and_then(|text| text.lines().next())
-            .unwrap_or_default();
-        if let Some(cell) = cells
-            .iter()
-            .find(|cell| !line.is_empty() && cell.code.contains(line))
-        {
-            if let Some(raw_span) = cell.raw_span.clone() {
-                *span = raw_span;
-            }
+    let mut partial_ranges = Vec::new();
+    let mut incomplete = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        let fail = |reason: String| {
+            base(
+                ParseOutcome::Failed {
+                    reason: format!("notebook code cell {}: {reason}", index + 1),
+                },
+                ExtractionEngine::Notebook {
+                    kernel_language: language.to_string(),
+                },
+                Vec::new(),
+            )
+        };
+        let mut buffer = String::new();
+        let mut source_map = SourceMap::default();
+        if source_map.append_cell(raw, cell, &mut buffer).is_none() {
+            return fail("source map could not be decoded".to_string());
         }
-    };
-    let relocate_owner = |owner: &mut String| {
-        if let Some(name) = owner.strip_prefix(synthetic_prefix.as_str()) {
-            *owner = format!("{real_prefix}{name}");
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return fail(format!("extraction exceeded the shared {budget:?} budget"));
         }
-    };
-
-    extraction.calls = parsed
-        .calls
-        .into_iter()
-        .map(|mut call| {
-            if let Some(caller) = call.caller_symbol.as_mut() {
-                relocate_owner(caller);
+        let parsed = parse(&synthetic, language, &buffer, remaining);
+        if std::time::Instant::now() >= deadline {
+            return fail(format!("extraction exceeded the shared {budget:?} budget"));
+        }
+        if let ParseOutcome::Failed { reason } = &parsed.parse_outcome {
+            return fail(reason.clone());
+        }
+        let Some(parsed) = relocate_cell(parsed, &source_map, path, &synthetic) else {
+            return fail("source span falls outside this cell".to_string());
+        };
+        match parsed.parse_outcome {
+            ParseOutcome::Clean => {}
+            ParseOutcome::Partial { error_ranges } => partial_ranges.extend(error_ranges),
+            ParseOutcome::Fallback { reason } | ParseOutcome::Skipped { reason } => {
+                incomplete.push(format!("cell {}: {reason}", index + 1));
             }
-            relocate_span(&mut call.span);
-            call
-        })
-        .collect();
-    extraction.references = parsed
-        .references
-        .into_iter()
-        .map(|mut reference| {
-            if let Some(enclosing) = reference.enclosing_symbol.as_mut() {
-                relocate_owner(enclosing);
-            }
-            relocate_span(&mut reference.span);
-            reference
-        })
-        .collect();
+            ParseOutcome::Failed { reason } => return fail(reason),
+        }
+        extraction.symbols.extend(parsed.symbols);
+        extraction.imports.extend(parsed.imports);
+        extraction.calls.extend(parsed.calls);
+        extraction.exports.extend(parsed.exports);
+        extraction.references.extend(parsed.references);
+        extraction.routes.extend(parsed.routes);
+        extraction.wiring.extend(parsed.wiring);
+        extraction.diagnostics.extend(parsed.diagnostics);
+        extraction.scope_locals.extend(parsed.scope_locals);
+        extraction.local_bindings.extend(parsed.local_bindings);
+        // These are empty for currently supported kernels, but remain part of
+        // the merge contract if a kernel with Go metadata is added later.
+        extraction.go_package = parsed.go_package.or(extraction.go_package);
+        extraction.go_build_constrained |= parsed.go_build_constrained;
+        extraction
+            .go_interface_methods
+            .extend(parsed.go_interface_methods);
+        extraction.go_method_params.extend(parsed.go_method_params);
+    }
+    if dropped_cells > 0 {
+        incomplete.push(format!("notebook has {} cells; only the first {MAX_CELLS} were read and {dropped_cells} were not", all_cells.len()));
+    }
+    if !incomplete.is_empty() {
+        if !partial_ranges.is_empty() {
+            incomplete.push("parsed cells also contain syntax errors".to_string());
+        }
+        extraction.parse_outcome = ParseOutcome::Fallback {
+            reason: incomplete.join("; "),
+        };
+    } else if !partial_ranges.is_empty() {
+        partial_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+        partial_ranges.dedup();
+        extraction.parse_outcome = ParseOutcome::Partial {
+            error_ranges: partial_ranges,
+        };
+    }
+    extraction.local_bindings.sort();
+    extraction.local_bindings.dedup();
+    extraction.scope_locals.sort();
+    extraction.scope_locals.dedup();
+    if std::time::Instant::now() >= deadline {
+        return base(
+            ParseOutcome::Failed {
+                reason: format!("notebook finalization exceeded the shared {budget:?} budget"),
+            },
+            ExtractionEngine::Notebook {
+                kernel_language: language.to_string(),
+            },
+            Vec::new(),
+        );
+    }
     extraction
+}
+
+/// One owner for translating all fields from a single execution unit.
+fn relocate_cell(
+    mut parsed: Extraction,
+    source_map: &SourceMap,
+    path: &str,
+    synthetic: &str,
+) -> Option<Extraction> {
+    let synthetic_prefix = format!("{synthetic}::");
+    let real_prefix = format!("{path}::");
+    let rewrite_owner = |owner: &mut String| {
+        if owner.as_str() == synthetic {
+            *owner = path.to_string();
+        } else if let Some(rest) = owner.strip_prefix(&synthetic_prefix) {
+            *owner = format!("{real_prefix}{rest}");
+        }
+    };
+    parsed
+        .symbols
+        .retain(|symbol| symbol.kind != crate::model::SymbolKind::File);
+    let mut unmapped = 0usize;
+    let mut relocate = |span: &mut Span| {
+        if let Some(mapped) = source_map.span(span) {
+            *span = mapped;
+        } else {
+            unmapped += 1;
+        }
+    };
+    for symbol in &mut parsed.symbols {
+        relocate(&mut symbol.span);
+        rewrite_owner(&mut symbol.qualified_name);
+        if let Some(owner) = &mut symbol.parent_symbol {
+            rewrite_owner(owner);
+        }
+    }
+    for import in &mut parsed.imports {
+        relocate(&mut import.span);
+    }
+    for call in &mut parsed.calls {
+        relocate(&mut call.span);
+        if let Some(owner) = &mut call.caller_symbol {
+            rewrite_owner(owner);
+        }
+    }
+    for reference in &mut parsed.references {
+        relocate(&mut reference.span);
+        if let Some(owner) = &mut reference.enclosing_symbol {
+            rewrite_owner(owner);
+        }
+    }
+    for export in &mut parsed.exports {
+        relocate(&mut export.span);
+        rewrite_owner(&mut export.exported_name);
+        if let Some(owner) = &mut export.local_name {
+            rewrite_owner(owner);
+        }
+    }
+    for route in &mut parsed.routes {
+        relocate(&mut route.span);
+    }
+    for binding in &mut parsed.local_bindings {
+        let mut point = Span {
+            start_byte: binding.start_byte,
+            end_byte: binding.start_byte,
+        };
+        relocate(&mut point);
+        binding.start_byte = point.start_byte;
+        if let Some(owner) = &mut binding.scope {
+            rewrite_owner(owner);
+        }
+    }
+    if let ParseOutcome::Partial { error_ranges } = &mut parsed.parse_outcome {
+        for range in error_ranges {
+            let mut span = Span {
+                start_byte: range.start_byte,
+                end_byte: range.end_byte,
+            };
+            relocate(&mut span);
+            range.start_byte = span.start_byte;
+            range.end_byte = span.end_byte;
+        }
+    }
+    for (owner, _) in &mut parsed.scope_locals {
+        rewrite_owner(owner);
+    }
+    // Synthetic filename-based file annotations do not describe the notebook;
+    // keep the raw file's annotations and preserve real symbol-scoped wiring.
+    parsed
+        .wiring
+        .retain(|annotation| annotation.target_symbol != synthetic);
+    for annotation in &mut parsed.wiring {
+        rewrite_owner(&mut annotation.target_symbol);
+    }
+    for method in &mut parsed.go_method_params {
+        rewrite_owner(&mut method.qualified_name);
+    }
+    (unmapped == 0).then_some(parsed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SymbolKind;
+    use crate::model::{ExtractedSymbol, SymbolKind};
+
+    #[test]
+    fn every_cell_receives_only_the_remaining_notebook_budget() {
+        let raw = notebook(
+            "python",
+            &[
+                ("code", "def first():\n    pass"),
+                ("code", "def other():\n    pass"),
+            ],
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        let budget = std::time::Duration::from_secs(2);
+        let result = extract_notebook_with_parser(
+            "budget.ipynb",
+            &raw,
+            budget,
+            |path, language, source, remaining| {
+                seen.borrow_mut().push(remaining);
+                let result = crate::treesitter::extract_treesitter_with_budget(
+                    path, language, source, remaining,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                result
+            },
+        );
+        assert!(matches!(result.parse_outcome, ParseOutcome::Clean));
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0] < budget && seen[1] < seen[0],
+            "budgets were reset per cell: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_notebook_budget_discards_the_prefix_and_stops_parsing() {
+        let raw = notebook(
+            "python",
+            &[
+                ("code", "def first():\n    pass"),
+                ("code", "def other():\n    pass"),
+            ],
+        );
+        let calls = std::cell::Cell::new(0);
+        let result = extract_notebook_with_parser(
+            "budget.ipynb",
+            &raw,
+            std::time::Duration::from_millis(200),
+            |path, language, source, remaining| {
+                calls.set(calls.get() + 1);
+                let result = crate::extract_treesitter(path, language, source);
+                std::thread::sleep(remaining + std::time::Duration::from_millis(2));
+                result
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(result.parse_outcome, ParseOutcome::Failed { .. }));
+        assert!(result
+            .symbols
+            .iter()
+            .all(|symbol| symbol.kind == SymbolKind::File));
+    }
+
+    #[test]
+    fn zero_or_unrepresentable_notebook_budgets_refuse_before_callback() {
+        let raw = notebook("python", &[("code", "def first():\n    pass")]);
+        for budget in [std::time::Duration::ZERO, std::time::Duration::MAX] {
+            let result =
+                extract_notebook_with_parser("budget.ipynb", &raw, budget, |_, _, _, _| {
+                    panic!("invalid budget reached callback")
+                });
+            assert!(matches!(result.parse_outcome, ParseOutcome::Failed { .. }));
+        }
+    }
 
     fn notebook(language: &str, cells: &[(&str, &str)]) -> String {
         let cells: Vec<serde_json::Value> = cells
@@ -628,8 +1028,8 @@ mod tests {
         }
     }
 
-    /// Cells share one buffer, so a call across cells resolves the way the
-    /// notebook behaves when run top to bottom.
+    /// Cells share notebook identities, so cross-cell calls remain resolvable
+    /// while each code cell remains an independent parse unit.
     /// The synthetic filename must not survive anywhere in the extraction.
     ///
     /// It leaked three times before this test existed: into `qualified_name`

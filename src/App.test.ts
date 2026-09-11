@@ -272,6 +272,34 @@ describe("App overlay wiring", () => {
     expect(script).toContain("scanGithubAlerts(path)");
     expect(script).toContain("interfaceStore.subscribe");
   });
+
+  it("forwards repoStore.error without tracking the diagnostics/toast/setError writes", () => {
+    const { script } = scriptAndTemplate(source);
+    expect(script).toMatch(/import\s*\{[^}]*\buntrack\b[^}]*\}\s*from\s*"svelte"/);
+    const start = script.indexOf("const err = $repoStore.error");
+    expect(start).toBeGreaterThan(-1);
+    const effect = script.slice(script.lastIndexOf("$effect", start), start + 280);
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("diagnostics.error"));
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("toastStore.error"));
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("repoStore.setError(null)"));
+  });
+
+  it("catches up the harness journal only on a genuine repository path change", () => {
+    const { script } = scriptAndTemplate(source);
+    const start = script.indexOf("let lastCaughtUpPath");
+    expect(start).toBeGreaterThan(-1);
+    const effect = script.slice(start, start + 900);
+    expect(effect).toContain("if (path === lastCaughtUpPath) return");
+    expect(effect.indexOf("if (path === lastCaughtUpPath) return")).toBeLessThan(
+      effect.indexOf("harnessStore.activateRepository"),
+    );
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(
+      effect.indexOf("harnessStore.activateRepository"),
+    );
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("harnessStore.catchUp"));
+  });
 });
 
 
@@ -303,6 +331,14 @@ describe("App chrome preferences", () => {
     const tasks = source.slice(start, end);
     expect(tasks).toContain("gp-workspace");
     expect(tasks).toContain("bg-background");
+  });
+
+  it("isolates StatusBar crashes under the status pane boundary", () => {
+    const start = source.indexOf('paneCrashes.report("status"');
+    expect(start).toBeGreaterThan(-1);
+    const window = source.slice(Math.max(0, start - 220), start + 160);
+    expect(window).toContain("<svelte:boundary failed={paneFailed}");
+    expect(window).toContain("<StatusBar");
   });
 
   it("hides the repository tab strip only while a single repository is open", () => {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { ChevronDown, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { repoStore } from "../stores/repoStore";
@@ -64,7 +64,7 @@
       $repoStore.activeTabId,
       open,
     );
-    if (next !== hostedIds) hostedIds = next;
+    if (next !== hostedIds) untrack(() => { hostedIds = next; });
   });
 
   const hostedTabs = $derived(

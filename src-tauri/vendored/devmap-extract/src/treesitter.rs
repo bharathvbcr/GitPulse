@@ -468,7 +468,8 @@ fn extract_treesitter_before_deadline(
                 let content_hash = content_hash(source);
 
                 let root = tree.root_node();
-                let parse_outcome = parse_outcome_of(root, source, is_metal_path(path));
+                let parse_outcome =
+                    parse_outcome_of(root, source, is_metal_path(path), lang == "python");
 
                 let mut symbols = Vec::new();
                 let mut imports = Vec::new();
@@ -776,14 +777,42 @@ fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>
     }
 }
 
-fn parse_outcome_of(root: Node, source: &str, is_metal: bool) -> ParseOutcome {
-    if !root.has_error() {
+fn parse_outcome_of(root: Node, source: &str, is_metal: bool, is_python: bool) -> ParseOutcome {
+    if !root.has_error() && !is_python {
         return ParseOutcome::Clean;
     }
     let mut error_ranges = Vec::new();
     let mut stack = vec![root];
     let mut cursor = root.walk();
+    let mut since_check = 0u32;
     while let Some(node) = stack.pop() {
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if walk_deadline_passed() {
+                return ParseOutcome::Failed {
+                    reason: "parse outcome validation exceeded the extraction budget".to_string(),
+                };
+            }
+        }
+        // tree-sitter-python permits an empty `block`, although Python
+        // requires a statement after a compound header. This is a suite node,
+        // not the optional body of an empty module. Comments are extras and
+        // do not satisfy it; `pass` and a docstring do.
+        let empty_python_suite = is_python && node.kind() == "block" && {
+            let mut children = node.walk();
+            let empty = !node
+                .named_children(&mut children)
+                .any(|child| child.kind() != "comment");
+            empty
+        };
+        if empty_python_suite {
+            let owner = bounded_parent(node).unwrap_or(node);
+            error_ranges.push(TextRange {
+                start_byte: owner.start_byte(),
+                end_byte: owner.end_byte(),
+            });
+        }
         if (node.is_error() || node.is_missing())
             && !is_benign_jsx_ampersand(node, source)
             && !(is_metal && is_benign_metal_qualifier(node, source))
@@ -797,7 +826,7 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool) -> ParseOutcome {
         if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
-                if child.has_error() {
+                if child.has_error() || is_python {
                     stack.push(child);
                 }
                 if !cursor.goto_next_sibling() {
@@ -1605,7 +1634,7 @@ const DEADLINE_CHECK_STRIDE: u32 = 256;
 /// taken independently with no ordering check, so
 /// `export const isClose = (c) => c === '}' || c === '{';` — valid, idiomatic
 /// JavaScript — produced an inverted slice range and panicked, aborting the
-/// whole build (`extract_all` runs under rayon and release sets
+/// whole build (`extract_all` runs under rayon and release then used
 /// `panic = "abort"`). With the two literals the other way round the same scan
 /// did not panic; it fabricated an import *and* an export of a name spelled
 /// `'`, which is the quieter half of the same defect. `export default function
