@@ -341,7 +341,7 @@ through Tauri's release setup. An ad-hoc build is not a notarized release.
 
 For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
-- **[Git-client release audit](docs/GIT_CLIENT_RELEASE_AUDIT.md)** — Reproduced defects, implemented contracts, test evidence, and remaining qualification gates.
+- **[Open qualification](docs/QUALIFICATION.md)** — Remaining workbench and notification gates. Dated audits are under [docs/archive/](docs/archive/README.md).
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
 - **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil and Manvi modules independently; take only the subset this app needs.
@@ -349,7 +349,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 - **[Command palette](docs/COMMAND_PALETTE.md)** — Eight search modes, availability, paging and keyboard navigation.
 - **[Repository hygiene](docs/REPOSITORY_HYGIENE.md)** — Storage cleanup previews, Fleet/Settings cleanup and scheduling.
 - **[Native menus and status icon](docs/MACOS_MENUS.md)** — Menu actions, repository context and the macOS status popover.
-- **[Terminal Guide](docs/TERMINAL.md)** — Tabs, split panes, Find, shortcuts, output export, and recovery. The [terminal audit](docs/TERMINAL_AUDIT.md) records stress tests and verification limits.
+- **[Terminal Guide](docs/TERMINAL.md)** — Tabs, split panes, Find, shortcuts, output export, and recovery. Native PTY stress evidence is in the [archived terminal audit](docs/archive/TERMINAL_AUDIT.md).
 - 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 4 application views, their sections and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.

@@ -261,7 +261,7 @@ After child exit, output gets one shared two-second EOF grace. Incomplete output
 remains distinguishable from complete empty output. Structured-output callers
 require complete streams; partial diff and command views retain explicit reasons.
 Optional tool installation uses this same runner with cancellation and bounded
-progress callbacks. See the [subprocess audit](SUBPROCESS_DIAGNOSTICS_AUDIT.md)
+progress callbacks. See the [archived subprocess audit](archive/SUBPROCESS_DIAGNOSTICS_AUDIT.md)
 for contracts, regression evidence and platform verification limits.
 
 - **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers.
@@ -279,7 +279,7 @@ for contracts, regression evidence and platform verification limits.
 - **`docs/`**: Repo markdown vault from `git ls-files`, search / broken links / backlinks / doc graph, and link-preserving rename (`git mv` + staged rewrites).
 - **`workspace_registry`**: Registers open tabs into DevMap's workspace for cross-repo `::` search.
 - **`harness/`**: Sidecar client managing policy gates and local model communication via NDJSON stdio.
-- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved diagnostics and exit status. Each reader has a 256 KiB output window, released by renderer acknowledgements. Writes lock their own session; Close waits for reaping and capacity release. The frontend lifecycle controller prepares event listeners before spawn, serializes restart and input, and retains failed-close ownership in the global session registry. See [Terminal](TERMINAL.md) and [terminal audit](TERMINAL_AUDIT.md).
+- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved diagnostics and exit status. Each reader has a 256 KiB output window, released by renderer acknowledgements. Writes lock their own session; Close waits for reaping and capacity release. The frontend lifecycle controller prepares event listeners before spawn, serializes restart and input, and retains failed-close ownership in the global session registry. See [Terminal](TERMINAL.md) and the [archived terminal audit](archive/TERMINAL_AUDIT.md).
 - **`grants/`**: Policy grant model, scoped overrides, and override lifecycle for elevated paths.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history.
 - **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
@@ -624,7 +624,7 @@ FTS hits with explicit bound filters. Scoped searches evaluate their full-text
 match set once. Page selection precedes body formatting and includes at most one
 lookahead row; sorting discarded candidates cannot expand detail-field processing
 across the profile. The native adapter consumes this same canonical query code.
-See [the data-layer measurements](AGENTIC_WORKSPACES_BENCHMARK.md) for normal and
+See [the archived data-layer measurements](archive/AGENTIC_WORKSPACES_BENCHMARK.md) for normal and
 stress fixtures, regression evidence and the remaining desktop resource checks.
 
 Text saves persist a debounced queue entry before a coalesced wake hint reaches

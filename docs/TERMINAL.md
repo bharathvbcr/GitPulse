@@ -102,5 +102,5 @@ keyboard focus, global tab limits, session preservation, split panes, resizing,
 narrow/light layout, and exact large-paste delivery.
 The displayed counters make shell writes, spawns, kills, and runtime errors visible.
 This does not validate native PTY execution; no commands execute in the harness.
-See [the terminal audit](TERMINAL_AUDIT.md) for real-PTY tests, failure evidence,
+See [the archived terminal audit](archive/TERMINAL_AUDIT.md) for real-PTY tests, failure evidence,
 ownership contracts, and remaining platform verification limits.

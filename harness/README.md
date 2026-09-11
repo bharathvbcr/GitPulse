@@ -185,7 +185,7 @@ The September 2026 redesign was initially checked with MarkDev's 288 files,
 now supplies 5,094 relationships from that source graph, including calls,
 references, and inheritance. All 226 Swift files have displayed connections.
 The preview explicitly reports 13 unresolvable graph records.
-See `docs/DEVMAP_AUDIT.md` for the current verification ledger and open gates.
+See [docs/QUALIFICATION.md](../docs/QUALIFICATION.md) for open gates and [the archived DevMap audit](../docs/archive/DEVMAP_AUDIT.md) for the dated verification ledger.
 Browser callback verification does
 not verify opening a file inside the installed Tauri application.
 
@@ -312,7 +312,7 @@ capacity, tabs and split panes, including a 200px dock. The input suite checks a
 exact 300,000-byte Unicode paste and atomic oversize rejection. Visible counters
 report spawns, kills, writes, resizes, runtime errors and individual assertions.
 
-Native PTY stress tests are separate. See [the terminal audit](../docs/TERMINAL_AUDIT.md)
+Native PTY stress tests are separate. See [the archived terminal audit](../docs/archive/TERMINAL_AUDIT.md)
 for commands, ownership contracts, reproduced failures and platform limits.
 
 Managed Codex is also covered by `/harness/task-runs.html`: the retained checks
