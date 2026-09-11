@@ -1060,8 +1060,14 @@ fn http_status_from_gh_output(output: &CapturedOutput) -> Option<u16> {
         .or_else(|| http_status_from_gh_text(&output.stdout_text()))
 }
 
-/// True when GitHub's own message says the security product is off — not a
-/// missing scope, not a transport failure.
+/// True when GitHub's own message says the security product is off or has
+/// never produced a result — not a missing scope, not a transport failure.
+///
+/// `"no analysis found"` is GitHub's 404 for `GET .../code-scanning/alerts`
+/// on a repository that has never run CodeQL. That is the empty product,
+/// not a GitPulse check failure. A process exit of 1 spliced as
+/// `(HTTP 1)` must not change the classification: status parsing refuses
+/// non-3-digit codes, so this phrase is what remains.
 fn is_product_disabled_message(message: &str) -> bool {
     let text = message.trim().to_ascii_lowercase();
     if text.is_empty() {
@@ -1074,6 +1080,7 @@ fn is_product_disabled_message(message: &str) -> bool {
         || text.contains("dependabot alerts are not enabled")
         || text.contains("dependabot is not enabled")
         || text.contains("dependabot is not currently enabled")
+        || text.contains("no analysis found")
 }
 
 /// Classify why a Dependabot / code-scanning report is unavailable.
@@ -2733,6 +2740,27 @@ mod tests {
                 true,
                 true,
                 Some("Code scanning is not enabled for this repository. (HTTP 404)"),
+                ProductDisabled,
+            ),
+            (
+                "no-analysis-found",
+                true,
+                true,
+                Some("no analysis found"),
+                ProductDisabled,
+            ),
+            (
+                "no-analysis-found-404",
+                true,
+                true,
+                Some("no analysis found (HTTP 404)"),
+                ProductDisabled,
+            ),
+            (
+                "no-analysis-found-exit-spliced-as-http-1",
+                true,
+                true,
+                Some("no analysis found (HTTP 1)"),
                 ProductDisabled,
             ),
             (

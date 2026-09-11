@@ -57,6 +57,8 @@ const SUPPORTED_KEYWORDS: &[&str] = &[
     "maximum",
     "minLength",
     "maxLength",
+    "minItems",
+    "maxItems",
     "items",
 ];
 
@@ -215,6 +217,23 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
             }
         }
         Value::Array(items) => {
+            let count = items.len() as u64;
+            if let Some(min) = schema.get("minItems").and_then(Value::as_u64) {
+                if count < min {
+                    out.push(Violation::new(
+                        path,
+                        format!("must have at least {min} items, got {count}"),
+                    ));
+                }
+            }
+            if let Some(max) = schema.get("maxItems").and_then(Value::as_u64) {
+                if count > max {
+                    out.push(Violation::new(
+                        path,
+                        format!("must have at most {max} items, got {count}"),
+                    ));
+                }
+            }
             if let Some(sub) = schema.get("items") {
                 for (index, item) in items.iter().enumerate() {
                     check(item, sub, &format!("{path}[{index}]"), out);

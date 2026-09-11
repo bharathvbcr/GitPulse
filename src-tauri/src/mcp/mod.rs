@@ -1557,7 +1557,7 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(required, vec!["repo_path"]);
-        assert!(tool["inputSchema"]["properties"]["task_id"].is_null());
+        assert!(tool["inputSchema"]["properties"]["task_id"].is_object());
     }
 
     #[test]
@@ -1653,6 +1653,12 @@ mod tests {
                         assert!(
                             schema["maxLength"].is_number(),
                             "{name}.{argument} is a string with no maxLength"
+                        );
+                    }
+                    Some("array") => {
+                        assert!(
+                            schema["maxItems"].is_number(),
+                            "{name}.{argument} is an array with no maxItems"
                         );
                     }
                     other => panic!("{name}.{argument} has unexpected type {other:?}"),

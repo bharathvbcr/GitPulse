@@ -12,7 +12,8 @@ use crate::coverage_toolchain::{
     NATIVE_COVERAGE_BUILD_DIR, NATIVE_COVERAGE_FLAG, NATIVE_COVERAGE_LCOV, VENV_PYTHON_RELPATHS,
 };
 use crate::engine::git_cli::{
-    capture_command, git_text_partial, sandbox_join, sandbox_join_canonical, validate_repo,
+    capture_command, git_text_partial, is_sandbox_symlink_escape, sandbox_join,
+    sandbox_join_canonical, validate_repo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -417,12 +418,23 @@ impl CoverageScanner {
 
     pub fn file_coverage(repo_path: &str, file_path: &str) -> Result<FileCoverage, String> {
         let repo = validate_repo(repo_path)?;
-        let joined = sandbox_join_canonical(&repo, file_path)?;
-        let rel = joined
-            .strip_prefix(&repo)
-            .map_err(|_| "File path escapes the repository".to_string())?
-            .to_string_lossy()
-            .replace('\\', "/");
+        // Lexical containment first: `../` and absolute paths stay errors.
+        sandbox_join(&repo, file_path)?;
+        let rel = match sandbox_join_canonical(&repo, file_path) {
+            Ok(joined) => joined
+                .strip_prefix(&repo)
+                .map_err(|_| "File path escapes the repository".to_string())?
+                .to_string_lossy()
+                .replace('\\', "/"),
+            Err(err) if is_sandbox_symlink_escape(&err) => {
+                // Git-tracked outbound symlink (workspace vendor crates):
+                // coverage annotates the entry, never the target. Following
+                // it is the sandbox refusal; treating that as a panel
+                // warning is the dump that listed dcverify.rs twelve times.
+                file_path.replace('\\', "/")
+            }
+            Err(err) => return Err(err),
+        };
         let rel = LanguageDetector::normalize_rel_path(&rel);
         if rel.is_empty() {
             return Err("Invalid file path".into());
@@ -4406,6 +4418,41 @@ src/main.go:4.1,4.8 1 0
         assert!(CoverageScanner::file_coverage(root, ".").is_err());
         assert!(CoverageScanner::file_coverage(root, "").is_err());
         assert!(CoverageScanner::file_coverage(root, "../outside").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_coverage_of_an_outbound_symlink_is_empty_not_an_error() {
+        let repo = git_repo();
+        let outside = TempDir::new().expect("outside");
+        write(outside.path(), "secret.rs", "fn leaked() {}\n");
+        std::fs::create_dir_all(repo.path().join("crates/dc-verify/src/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            repo.path().join("crates/dc-verify/src/bin/dcverify.rs"),
+        )
+        .unwrap();
+        write(repo.path(), "src/lib.rs", "fn a() {}\n");
+        write(
+            repo.path(),
+            "lcov.info",
+            "SF:crates/dc-verify/src/bin/dcverify.rs\nDA:1,9\nend_of_record\n",
+        );
+        let detail = CoverageScanner::file_coverage(
+            repo.path().to_str().unwrap(),
+            "crates/dc-verify/src/bin/dcverify.rs",
+        )
+        .expect("an outbound vendor symlink is not a coverage failure");
+        assert_eq!(detail.path, "crates/dc-verify/src/bin/dcverify.rs");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.rs")).unwrap(),
+            "fn leaked() {}\n",
+            "coverage must not need to follow the link to succeed"
+        );
+        assert!(
+            CoverageScanner::file_coverage(repo.path().to_str().unwrap(), "../outside").is_err(),
+            "lexical escapes stay errors"
+        );
     }
 
     #[test]

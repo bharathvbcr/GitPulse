@@ -38,8 +38,9 @@ describe("withinDeadline", () => {
       const request = vi.fn(() => new Promise(() => undefined));
       const deadline = 40;
       const result = withinDeadline(request, deadline);
+      const assertion = expect(result).rejects.toThrow("Overview refresh deadline exceeded");
       await vi.advanceTimersByTimeAsync(50);
-      await expect(result).rejects.toThrow("Overview refresh deadline exceeded");
+      await assertion;
     } finally {
       vi.useRealTimers();
       vi.restoreAllMocks();

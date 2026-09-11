@@ -1234,11 +1234,20 @@ impl GitReader {
             let spec = format!("{}:{}", id, file_path);
             git(&repo, &["show", &spec])?
         } else {
-            let dest = sandbox_join_canonical(&repo, file_path)?;
-            if dest.exists() {
-                read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?
-            } else {
-                git(&repo, &["show", &format!(":{}", file_path)])?
+            match sandbox_join_canonical(&repo, file_path) {
+                Ok(dest) if dest.exists() => read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?,
+                Ok(_) => git(&repo, &["show", &format!(":{file_path}")])?,
+                Err(err) if git_cli::is_sandbox_symlink_escape(&err) => {
+                    // Outbound Git symlink: return the link text, never the
+                    // target. Coverage and the file viewer both hit this for
+                    // workspace vendor crates (dc-verify → Manvi).
+                    let entry = sandbox_join_entry(&repo, file_path)?;
+                    std::fs::read_link(&entry)
+                        .map_err(|e| format!("Cannot read symlink '{file_path}': {e}"))?
+                        .into_os_string()
+                        .into_encoded_bytes()
+                }
+                Err(err) => return Err(err),
             }
         };
 
@@ -4269,6 +4278,39 @@ mod tests {
         let err = GitReader::get_file_blob(&dir.path().to_string_lossy(), "big.bin", None)
             .expect_err("oversized working-tree file");
         assert!(err.contains("working-tree size limit"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_file_blob_returns_outbound_symlink_text_not_the_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        assert!(output.status.success());
+
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+        let target = outside.path().join("secret.txt");
+        std::os::unix::fs::symlink(&target, dir.path().join("leak.rs")).unwrap();
+
+        let blob = GitReader::get_file_blob(&dir.path().to_string_lossy(), "leak.rs", None)
+            .expect("outbound symlink is readable as the link text");
+        let text = blob.text.expect("link text is not binary");
+        assert!(
+            !text.contains("top secret"),
+            "must not follow the symlink; got {text:?}"
+        );
+        assert!(
+            text.contains("secret.txt") || text == target.to_string_lossy(),
+            "expected the link target path, got {text:?}"
+        );
+        assert!(
+            GitReader::get_file_blob(&dir.path().to_string_lossy(), "../outside", None).is_err(),
+            "lexical escapes stay errors"
+        );
     }
 
     /// Regression (M1+M11): porcelain v1 `-z` lays rename/copy records out as

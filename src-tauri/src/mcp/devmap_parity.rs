@@ -34,28 +34,24 @@ pub const TOOL_NAMES: &[&str] = &[
 ];
 
 fn budget_default() -> Value {
-    let mut prop = budget_prop();
-    prop["default"] = json!(2000);
-    prop
+    budget_prop()
 }
 
 fn depth_prop() -> Value {
     json!({
         "type": "integer",
-        "description": "Maximum traversal depth. A walk stopped by this cap sets walk_incomplete.",
+        "description": "Maximum traversal depth (default 3). A walk stopped by this cap sets walk_incomplete.",
         "minimum": 1,
-        "maximum": 64,
-        "default": 3
+        "maximum": 64
     })
 }
 
 fn confidence_prop() -> Value {
     json!({
         "type": "number",
-        "description": "Minimum edge confidence in [0,1]",
+        "description": "Minimum edge confidence in [0,1] (default 0.0)",
         "minimum": 0.0,
-        "maximum": 1.0,
-        "default": 0.0
+        "maximum": 1.0
     })
 }
 
@@ -201,9 +197,9 @@ pub fn tool_definitions() -> Vec<Value> {
                 "budget": budget_default(),
                 "limit": {
                     "type": "integer",
+                    "description": "Maximum definitions to return (default 20)",
                     "minimum": 1,
-                    "maximum": 100,
-                    "default": 20
+                    "maximum": 100
                 },
                 "depth": depth_prop()
             }),

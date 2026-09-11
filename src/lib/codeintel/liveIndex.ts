@@ -8,7 +8,9 @@
  *
  * Watcher ticks pass `repoChanged: true`. Becoming the visible repository
  * passes `false` so an obsolete or source-stale map can heal without treating
- * focus as a working-tree edit.
+ * focus as a working-tree edit. Identical `setScope` applies for the same
+ * visible key must not re-enqueue: every apply used to restart the 1 Hz
+ * status+build loop after a finished run.
  */
 
 import { writable } from "svelte/store";
@@ -80,6 +82,8 @@ export function createLiveIndex(opts?: {
   const busyRetries = new Map<string, number>();
   /** Keys whose pending/running attempt came from a watcher tick. */
   const dirty = new Set<string>();
+  /** Last visible activation key. Same-key `setScope` must not re-enqueue. */
+  let activationKey: string | null = null;
   let revision = 0;
   const queue = createPacedQueue({
     debounceMs,
@@ -177,12 +181,14 @@ export function createLiveIndex(opts?: {
         }
         return next;
       });
-      if (scope.visible && scope.activeKey && queue.enqueue(scope.activeKey)) {
-        const active = scope.activeKey;
+      const key = scope.visible && scope.activeKey ? scope.activeKey : null;
+      const shouldActivate = key !== null && key !== activationKey;
+      activationKey = key;
+      if (key !== null && shouldActivate && queue.enqueue(key)) {
         snapshots.update((map) => {
-          const prev = snapshotFor(map, active);
+          const prev = snapshotFor(map, key);
           if (prev.phase === "running" || prev.phase === "scheduled") return map;
-          return { ...map, [active]: { ...prev, phase: "scheduled" } };
+          return { ...map, [key]: { ...prev, phase: "scheduled" } };
         });
       }
     },
@@ -223,6 +229,7 @@ export function createLiveIndex(opts?: {
       retained.clear();
       busyRetries.clear();
       dirty.clear();
+      activationKey = null;
       snapshots.set({});
     },
   };

@@ -286,7 +286,7 @@ npm run tauri dev
 | `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
 | `npm run check:ipc` | Verify 207 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
-| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 55 contracts (1006 fields) |
+| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 55 contracts (1014 fields) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
 | `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |
 | `npm run mcp:doctor` | Assert the `gitpulse-mcp` on PATH is this tree's build, not a stale copy |

@@ -414,6 +414,24 @@ describe("maybeNotifyGithubAlerts", () => {
     expect(d.onError).not.toHaveBeenCalled();
   });
 
+  it("does not warn for CodeQL never-run when Rust marks product_disabled", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({}, []),
+          codeScanning: codeScanningReport({
+            available: false,
+            error: "no analysis found (HTTP 1)",
+            unavailable_reason: "product_disabled",
+          }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("clean");
+    expect(d.notify).not.toHaveBeenCalled();
+    expect(d.onError).not.toHaveBeenCalled();
+  });
+
   it("treats product-disabled prose without unavailable_reason as a failed check", async () => {
     const d = deps({
       load: vi.fn().mockResolvedValue(
@@ -429,6 +447,22 @@ describe("maybeNotifyGithubAlerts", () => {
     });
     await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
     expect(d.onError).toHaveBeenCalled();
+  });
+
+  it("treats no-analysis-found prose without unavailable_reason as a failed check", async () => {
+    const d = deps({
+      load: vi.fn().mockResolvedValue(
+        snapshot({
+          dependabot: dependabotReport({}, []),
+          codeScanning: codeScanningReport({
+            available: false,
+            error: "no analysis found (HTTP 1)",
+          }),
+        }),
+      ),
+    });
+    await expect(maybeNotifyGithubAlerts(d)).resolves.toBe("failed");
+    expect(d.onError).toHaveBeenCalledWith("no analysis found (HTTP 1)");
   });
 
   it("still warns when a request failed even if the error text names a disabled product", async () => {

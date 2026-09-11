@@ -362,6 +362,18 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
+  it("repeated setScope of the same visible repository does not re-enqueue", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    for (let i = 0; i < 32; i++) {
+      index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+    }
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/repo", false);
+    index.reset();
+  });
+
   it("a watcher tick still reports repoChanged even when activation is also pending", async () => {
     const maybeRefresh = vi.fn(async () => outcome("refresh"));
     const index = createLiveIndex({ debounceMs: 0, maybeRefresh });

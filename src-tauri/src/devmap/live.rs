@@ -20,9 +20,15 @@
 //! loop whenever the build itself wrote under a watched path the noise gate
 //! missed. Per-repo exponential cooldown (1s → 2s → … capped at 60s) answers
 //! further `repo_changed` ticks with [`LiveRefreshDecision::SkipCooldown`]
-//! until the wait elapses. Explicit `devmap build` / `refresh` commands never
-//! consult this gate; call [`clear_live_echo_cooldown`] after them so the next
-//! watcher tick is not stranded behind a stale wait.
+//! until the wait elapses.
+//!
+//! Activation (`repo_changed: false`) is never *blocked* by that wait — a
+//! newly focused repository still gets a status check — but it must not
+//! *clear* the wait. Clearing it turned every focus/scope apply into a
+//! cooldown reset, so a status-stale repo rebuilt at 1 Hz even after an
+//! `unchanged: true` echo. Explicit `devmap build` / `refresh` commands still
+//! call [`clear_live_echo_cooldown`] so the next watcher tick is not
+//! stranded behind a stale wait.
 //!
 //! ## Store lifetime
 //!
@@ -263,8 +269,10 @@ pub fn freshness_from_cli_status(status: &CliStatus) -> (bool, bool, bool) {
 /// means the working tree may diverge from the indexed hashes even when the
 /// store still reports `is_fresh: true` (no daemon pending queue). Folded
 /// into effective freshness before the gate runs. Echo/failure cooldown only
-/// applies when `repo_changed` is true — activation (`false`) and explicit
-/// CLI rebuilds are never blocked by it.
+/// *blocks* when `repo_changed` is true — activation (`false`) still runs a
+/// status check — but activation does not reset that wait. An `unchanged`
+/// or failed live build is not a productive restamp and must not clear it
+/// either.
 pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome {
     let already_building = is_build_in_flight(repo_path);
     if already_building {
@@ -303,9 +311,6 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                 cooldown_remaining_ms: Some(ms),
             };
         }
-    } else {
-        // Activation / non-watcher refresh: do not inherit a watcher-echo wait.
-        clear_live_echo_cooldown(repo_path);
     }
 
     let cli = cli::status(repo_path);
@@ -350,8 +355,10 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
     };
     match spawned {
         Ok(build) => {
-            if repo_changed && build_is_echo_or_failure(&build) {
-                raise_echo_cooldown(repo_path, Instant::now());
+            if build_is_echo_or_failure(&build) {
+                if repo_changed {
+                    raise_echo_cooldown(repo_path, Instant::now());
+                }
             } else if build.ok {
                 note_productive_build(repo_path);
             }
@@ -665,6 +672,11 @@ exit 2
             activation.decision,
             LiveRefreshDecision::SkipCooldown,
             "activation must not be blocked by echo cooldown"
+        );
+        assert_eq!(
+            maybe_refresh(&path, true).decision,
+            LiveRefreshDecision::SkipCooldown,
+            "activation must not reset watcher-echo cooldown"
         );
     }
 

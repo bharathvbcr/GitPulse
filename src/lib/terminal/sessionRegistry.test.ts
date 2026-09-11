@@ -25,7 +25,8 @@ describe("terminal session registry", () => {
 
     lease.update("ready");
     expect(snapshots.at(-1)?.map((entry) => entry.status)).toEqual(["ready"]);
-    expect(snapshots).toHaveLength(2);
+    expect(snapshots).toHaveLength(3);
+    expect(snapshots[0]).toEqual([]);
   });
 
   it("releases a session and removes it from published state", () => {
@@ -36,7 +37,7 @@ describe("terminal session registry", () => {
     const lease = registry.reserve(record({ key: "a", status: "ready" }));
     lease.release();
 
-    expect(updates).toEqual([1, 0]);
+    expect(updates).toEqual([0, 1, 0]);
     expect(get(registry)).toHaveLength(0);
   });
 

@@ -229,10 +229,7 @@ pub fn sandbox_join_canonical(repo: &Path, file_path: &str) -> Result<PathBuf, S
                     .canonicalize()
                     .map_err(|e| format!("Cannot resolve '{}': {}", current.display(), e))?;
                 if !resolved.starts_with(&repo_canonical) {
-                    return Err(format!(
-                        "File path escapes the repository via symlink: {}",
-                        file_path
-                    ));
+                    return Err(symlink_escape_message(file_path));
                 }
                 current = resolved;
             }
@@ -243,6 +240,18 @@ pub fn sandbox_join_canonical(repo: &Path, file_path: &str) -> Result<PathBuf, S
         }
     }
     Ok(current)
+}
+
+fn symlink_escape_message(file_path: &str) -> String {
+    format!("File path escapes the repository via symlink: {file_path}")
+}
+
+/// True when [`sandbox_join_canonical`] refused a path because a symlink
+/// resolved outside the repository. Callers that inspect the Git *entry*
+/// (coverage of a vendor link, `read_link`) match this instead of treating
+/// the refusal as a user-facing failure. Write paths must still fail closed.
+pub fn is_sandbox_symlink_escape(err: &str) -> bool {
+    err.contains("escapes the repository via symlink")
 }
 
 /// Resolve the parent of a Git entry without following the entry itself.
@@ -4325,6 +4334,7 @@ mod tests {
         let repo = dir.path().canonicalize().unwrap();
 
         let err = sandbox_join_canonical(&repo, "leak").expect_err("file symlink escape");
+        assert!(is_sandbox_symlink_escape(&err), "got: {err}");
         assert!(err.contains("escapes the repository"), "got: {err}");
         let err = sandbox_join_canonical(&repo, "dir-leak/payload.txt")
             .expect_err("directory symlink escape");
