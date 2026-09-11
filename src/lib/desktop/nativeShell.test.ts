@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dispatchNativeMenu as _dispatchNativeMenu } from "./nativeActions";
 import { subscribeNativeShell, syncRecentMenu, takePendingOpen } from "./nativeShell";
 
-type NativeListener = (event: { payload: unknown }) => unknown;
+type NativeListener = (event: any) => unknown;
 
 const dispatchNativeMenu = vi.mocked(_dispatchNativeMenu);
 const invokeMock = vi.fn();
@@ -198,7 +198,7 @@ describe("native shell integration", () => {
     expect(handlers.setDropActive).toHaveBeenCalledWith(false);
     expect(handlers.openRepo).toHaveBeenCalledWith("/root/good");
 
-    await dragDropListener?.({ payload: { type: "enter", paths: ["/repo/error"] });
+    await dragDropListener?.({ payload: { type: "enter", paths: ["/repo/error"] } });
     await dragDropListener?.({ payload: { type: "drop", paths: ["", "/repo/error"] } });
     expect(handlers.openError).toHaveBeenCalledWith("not-a-git-repo");
   });

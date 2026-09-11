@@ -47,6 +47,38 @@ export interface TaskLease {
   expires_at: string | null;
 }
 
+export interface TaskEvidence {
+  id: number;
+  kind: string;
+  task_id: string | null;
+  requirement_id: string | null;
+  acceptance_criterion_id: string | null;
+  data_json: string;
+}
+
+export interface TaskGap {
+  id: string;
+  severity: string;
+  gap_type: string;
+  task_id: string | null;
+  description: string;
+  evidence_json: string;
+  recommended_fix: string;
+  blocking: boolean;
+  file: string | null;
+  line: number | null;
+}
+
+export interface TaskRun {
+  id: string;
+  task_id: string;
+  sandbox: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  commands_json: string;
+}
+
 /** What GitPulse can see of a repository's DevCouncil state. */
 export interface TaskView {
   /**
@@ -56,6 +88,12 @@ export interface TaskView {
   available: boolean;
   store_path: string;
   leases: TaskLease[];
+  evidence: TaskEvidence[];
+  evidence_truncated: boolean;
+  gaps: TaskGap[];
+  gaps_truncated: boolean;
+  runs: TaskRun[];
+  runs_truncated: boolean;
   /**
    * Empty when the store could be read; otherwise why it could not.
    *
