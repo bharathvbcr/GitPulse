@@ -28,6 +28,13 @@
 > [deprecation notice](https://github.com/bharathvbcr/LiquiTask/blob/main/docs/DEPRECATION.md)
 > and [Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md) in this repo.
 
+**1.0** adds a desktop shell around that control plane: native application menus
+with Go to every section, a rebuilt command palette (`⌘K` / `Ctrl+K`), an
+optional macOS menu-bar status popover, modular DevCouncil setup (DevMap by
+default), Insights → Pulse, and GitHub Dependabot / code-scanning alerts when a
+repository opens. Release notes are in the [Changelog](CHANGELOG.md); the full
+catalog is in [Features](docs/FEATURES.md).
+
 <p align="center">
   <img src="docs/assets/screenshot-graph.png" alt="GitPulse graph view: canvas commit graph with lanes, ref decorations, and the commit diff pane" width="100%">
 </p>
@@ -130,6 +137,8 @@ flowchart LR
         Terminal["<b>Terminal</b> (<code>⌃`</code>)<br/>Native PTY, docked under the current view"]
         Fleet["<b>Fleet</b> (<code>Cmd/Ctrl+Shift+F</code>)<br/>Every open repository at once — not a view"]
         Tasks["<b>Tasks</b><br/>Global, saved-workspace and repository boards"]
+        Palette["<b>Command Palette</b> (<code>⌘K</code> / <code>Ctrl+K</code>)<br/>Eight search modes — not a view"]
+        Menus["<b>Native Menus</b><br/>Go opens all 16 sections; optional macOS status icon"]
         MCP["<b>MCP</b><br/>Read-only Agent Plugins tools"]
     end
 ```
@@ -156,13 +165,20 @@ Manvi suggestions and agent handoff.
 
 ## Key Features
 
+### 🖥️ Desktop Shell
+| Feature | Description |
+| --- | --- |
+| **Native Application Menu** | GitPulse · File · Edit · View · Go · Repository · Window · Help. **Go** opens all 16 sections directly; live checkmarks follow selection and appearance; repository switcher, staging, branch and parked-operation actions reflect availability. Help covers documentation, shortcuts, diagnostics, optional-tool setup, release notes and issue reporting. See [Native menus and status icon](docs/MACOS_MENUS.md). |
+| **macOS Menu Bar Status** | Opt-in pulse icon (`Settings → Layout`) opens a compact popover: Changed / Staged / Conflicts cards, last-fetch age, one primary action, and expandable details. Launch at login and hide-Dock-while-closed keep the app in the menu bar. The popover cannot mutate Git. |
+| **Command Palette** | `⌘K` / `Ctrl+K` with eight discoverable modes (`>`, `/`, `%`, `#`, `@`, `:`, `::`, `?`): commands, files, repositories, commits, branches, single- and cross-repo symbols, and help. Contextual availability, result paging and keyboard focus. See [Command palette](docs/COMMAND_PALETTE.md). |
+
 ### 🚀 Core Git & Visualization
 | Feature | Description |
 | --- | --- |
-| **Work View & Task Control Plane** | Unified dashboard (`F10`) binding DevCouncil task modules to linked worktrees, PRs, workflow runs, policy verdicts, and temporary grants. Agent activity recorded to a durable SQLite WAL ledger. |
-| **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts, search, filters over loaded cards, multi-selection, context actions, drag ordering, due dates, notes-to-draft editing, reviewed Manvi title/description suggestions and versioned agent briefs. |
+| **Work View & Task Control Plane** | Unified dashboard (`F10`). Overview keys on the worktree (or a bound DevCouncil task when a store exists); blocked parked operations sort first; agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. Links PRs, workflow runs, policy verdicts and temporary grants. Stack restack plans the whole subtree before the first rewrite. Agent activity recorded to a durable SQLite WAL ledger. |
+| **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts, Kanban drag with neighbor insertion, search, filters over loaded cards, multi-selection, context actions, due dates, notes-to-draft editing, field locks during Manvi enhance, adding currently open tabs as members, and agent copy of a saved revision or an explicitly labelled unsaved draft. |
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
-| **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. |
+| **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. Cherry-pick and revert from the commit row. |
 | **Precision Diff Viewer** | File, commit, and range diffs that name what they show, in a true side-by-side or unified layout sharing one row model. Syntax colouring under the intra-line word diff, find-in-diff with regex, block-to-block stepping, both line-number columns behind a pinned gutter, a filterable and resizable file rail, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging from either layout. |
 | **Batch Index Updates** | Stage or unstage the current selection in one native request, with bounded Git commands, shared mutation locking, and explicit partial-failure recovery. Unstaging a rename includes both paths; new repositories work before their first commit. |
 | **Stash Review** | Save named stashes, include untracked files or keep staged changes, and preview a stash inline before restoring or removing it. Limited lists and previews are labelled. |
@@ -174,12 +190,14 @@ Manvi suggestions and agent handoff.
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
 | --- | --- |
-| **DevMap + MarkDev integration** | Schema-20 code map from the DevCouncil `devmap` module, in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. Code → Map navigates the resolved `repo_map.json`, draws code/doc graphs, and searches tracked markdown. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
+| **DevMap + MarkDev integration** | Schema-20 code map from the DevCouncil `devmap` module, in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. **Code → Map** is the structural navigator — resolved `repo_map.json`, code/doc graphs, tracked-markdown search — not a third reading of the open file. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
 | **Git-Native Provenance** | `CI:local` runs recorded as verification notes under `refs/notes/gitpulse/`, with branch and PR decay freshness badges based on distance from the default branch. |
+| **Repository Pulse** | Insights → Pulse: 53-week contribution heatmap, rhythm and punch card, commit hygiene, bus factor, local DORA approximations, and an exportable SVG summary card. Unscanned tiles render as an em dash with a reason — never a fake zero. |
 | **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
 | **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. The status-bar mix is ordered by share of code lines; the label is the true majority among the languages drawn. |
 | **Storage & Hygiene Audit** | Disk usage and build/cache maintenance, with a [global cleaner](docs/REPOSITORY_HYGIENE.md) in Fleet and Settings: selected roots, exclusions, retention, scheduled cleanup and run history. |
-| **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot, and GitHub Code Scanning. |
+| **Multi-Ecosystem Health** | Local audits via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit` and `bundler-audit`. GitHub Dependabot and code scanning alerts (via local `gh`) fetch when a repository opens; critical and high findings warn. Turn off under Settings → Analysis. **Scan local** still does not call GitHub. |
+| **Optional Tools Setup** | Help → Set Up Optional Tools (or the command palette) installs **DevMap only** by default, or the analysis suite / full DevCouncil host. Copy the command or run it in Terminal → Console. Settings can disable or uninstall a GitPulse-owned binary. Native Go/Rust binaries only — no uv / Python install path. |
 | **Durable Crash Logging** | Synchronous append-only per-binary crash logging with bounded backtraces surviving process restarts across GUI and CLI binaries (`gitpulsed`, `gitpulse-mcp`). |
 | **MCP 2.0 + agent plugins** | `gitpulse-mcp` speaks MCP `2026-07-28` (`server/discover`, per-request `_meta`, cacheable `tools/list`) and still answers the legacy `initialize` handshake. The canonical package is `plugins/gitpulse/`, with native Codex, Claude Code, and [Agent Plugins 1.0](https://agent-plugins.org/specification) manifests plus shared skills. Tools are read-only insights: worktrees, collisions, change context, ledger, code graph. |
 
@@ -248,6 +266,16 @@ Download pre-built installers from the [latest release](https://github.com/bhara
 | **macOS** | `.dmg` | Universal (Apple Silicon & Intel) | Unsigned binary. Run quarantine command below. |
 | **Linux** | `.AppImage`, `.deb` | x86_64 | Built on Ubuntu 22.04 (glibc 2.35+) |
 | **Windows** | `.msi`, `.exe` | x64 | Windows 10/11 installer |
+
+### Optional Tools (`devmap` / `manvi`)
+
+Code → Map needs the `devmap` CLI; the policy gate needs `manvi`. In-app **Help →
+Set Up Optional Tools** (also in the command palette) installs **DevMap only** by
+default, or the analysis suite / full DevCouncil host. Copy the documented
+command, or with a repository open run it in Terminal → Console. Settings can
+disable a tool or uninstall a binary GitPulse itself placed in its app bin
+directory. These are native Go/Rust binaries — there is no uv / Python install
+path.
 
 ### macOS Unsigned Gatekeeper Note
 macOS quarantines unsigned downloads. After dragging GitPulse to `/Applications`, run:
