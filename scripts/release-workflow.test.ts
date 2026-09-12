@@ -68,6 +68,16 @@ it("uploads into the prepared release id without retargeting the tag", () => {
   expect(action).not.toMatch(/^\s+releaseCommitish:/m);
 });
 
+it("runs the macOS universal build through the npm tauri script so PATH shims are reached", () => {
+  // tauri-action uses `npm run tauri` only when package.json has a tauri script
+  // and the action does not set tauriScript. That script is scripts/tauri.mjs,
+  // which prepends scripts/bin so lipo and codesign wrap the system tools.
+  // Override either and the next universal release dies at bundling/signing.
+  expect(workflow).not.toMatch(/^\s*tauriScript:/m);
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  expect(pkg.scripts.tauri).toBe("node scripts/tauri.mjs");
+});
+
 
 it("supports hosted runners without an external devmap CLI and reports that absence", () => {
   const line = workflow.split("\n").find(line => line.includes("run: npm run check:vendor-schema"));

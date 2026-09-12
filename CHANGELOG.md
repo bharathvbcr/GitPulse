@@ -151,6 +151,18 @@ release pipeline that can finish after GitHub detaches a draft tag.
   sign of `gitpulse` failed with `code object is not signed at all / In
   subcomponent: gitpulse-hook`. `scripts/bin/codesign` piggy-backs on the main
   binary's sign the same way `scripts/bin/lipo` stitches the helpers.
+- Quiet Linux GTK framework ports that drowned the release clippy log:
+  explicit `extern "C"` on libappindicator-sys, gir builder visibility and
+  `TypedArrayData<'_>` in javascriptcore-rs, crate-level `unexpected_cfgs`
+  on webkit2gtk, and wry `v2_42` / `macos_12_unavailable` check-cfg plus
+  `allow(deprecated)` on webkitgtk `run_javascript`. Path patches are
+  lint-capped, so those warnings never failed the job.
+- Name an in-flight CI or coverage run instead of treating it as "no
+  successful run". `release-state ready` checks that locally before the `v*`
+  tag is moved, so a tag pushed with main cannot burn preflight and then die
+  in the 5-minute prepare job. The release workflow still must not override
+  tauri-action's `tauriScript`; the npm `tauri` script is what puts the
+  lipo and codesign shims on PATH.
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.
 - Keep partially staged files visible on both sides in the sidebar and diff

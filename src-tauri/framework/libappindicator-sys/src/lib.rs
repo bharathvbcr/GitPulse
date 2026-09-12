@@ -47,6 +47,7 @@ pub static LIB: Lazy<Library> = Lazy::new(|| {
     );
   }
 
+  #[cfg(not(feature = "backcompat"))]
   panic!(
     "Failed to load ayatana-appindicator3 or appindicator3 dynamic library\n{}\n{}",
     libayatana.unwrap_err(),
@@ -915,7 +916,7 @@ pub unsafe fn app_indicator_new(
   icon_name: *const gchar,
   category: AppIndicatorCategory,
 ) -> *mut AppIndicator {
-  let f = LIB.get::<unsafe extern fn(*const gchar, *const gchar, AppIndicatorCategory) -> *mut AppIndicator>(b"app_indicator_new\0")
+  let f = LIB.get::<unsafe extern "C" fn(*const gchar, *const gchar, AppIndicatorCategory) -> *mut AppIndicator>(b"app_indicator_new\0")
         .expect("Can't get the extern function. This shouldn't happen unless the linked library is wrong.");
   f(id, icon_name, category)
 }

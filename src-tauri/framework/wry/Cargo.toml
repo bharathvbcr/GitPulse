@@ -427,4 +427,6 @@ priority = 0
 check-cfg = [
     "cfg(linux)",
     "cfg(gtk)",
+    "cfg(feature, values(\"v2_42\"))",
+    "cfg(macos_12_unavailable)",
 ]

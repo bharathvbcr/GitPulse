@@ -80,6 +80,32 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
     expect(config).toMatch(/^[ \t]+- src-tauri\/framework\/\*\*\s*$/m);
   });
 
+  it("keeps Linux GTK ports free of the rustc lints Linux clippy -D warnings surfaces", () => {
+    const framework = join(REPO, "src-tauri", "framework");
+    const appIndicator = readFileSync(join(framework, "libappindicator-sys", "src", "lib.rs"), "utf8");
+    expect(appIndicator).not.toMatch(/unsafe extern fn\b/);
+    expect(appIndicator).toMatch(/#\[cfg\(not\(feature = "backcompat"\)\)\]\s*\n\s*panic!/s);
+
+    const jscValue = readFileSync(join(framework, "javascriptcore-rs", "src", "value.rs"), "utf8");
+    expect(jscValue).toMatch(/fn typed_array_get_data\(&self\) -> TypedArrayData<'_>/);
+    const jscAuto = readFileSync(join(framework, "javascriptcore-rs", "src", "auto", "mod.rs"), "utf8");
+    expect(jscAuto).toMatch(/^pub mod builders \{/m);
+
+    const webkit = readFileSync(join(framework, "webkit2gtk", "src", "lib.rs"), "utf8");
+    expect(webkit).not.toMatch(/feature = "cargo-clippy"/);
+    expect(webkit).toMatch(/^#!\[allow\(unexpected_cfgs\)\]/m);
+
+    const wryToml = readFileSync(join(framework, "wry", "Cargo.toml"), "utf8");
+    expect(wryToml).toMatch(/cfg\(feature, values\(\\?"v2_42\\?"\)\)/);
+    expect(wryToml).toMatch(/cfg\(macos_12_unavailable\)/);
+    expect(readFileSync(join(framework, "wry", "src", "webkitgtk", "mod.rs"), "utf8")).toMatch(
+      /^#!\[allow\(deprecated\)\]/m,
+    );
+    expect(
+      readFileSync(join(framework, "wry", "src", "webkitgtk", "synthetic_mouse_events.rs"), "utf8"),
+    ).toMatch(/^#!\[allow\(deprecated\)\]/m);
+  });
+
   it("runs stable TypeScript 7 while preserving the compiler API for Svelte and contracts", () => {
     expect(PKG.devDependencies?.["@typescript/native-preview"]).toBeUndefined();
     expect(NPM_LOCK.packages["node_modules/@typescript/native"]?.version).toBe("7.0.2");

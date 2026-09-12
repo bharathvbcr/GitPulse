@@ -1,4 +1,7 @@
 #![allow(deprecated)]
+#![allow(unexpected_cfgs)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::useless_transmute)]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -10,8 +13,6 @@ pub use glib;
 
 pub use glib::Error;
 
-#[cfg_attr(feature = "cargo-clippy", allow(too_many_arguments))]
-#[cfg_attr(feature = "cargo-clippy", allow(useless_transmute))]
 #[macro_use]
 mod rt;
 

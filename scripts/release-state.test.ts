@@ -216,8 +216,37 @@ describe("remote release lifecycle", () => {
   });
   it.each(["failure", "cancelled", "skipped", null])("refuses CI conclusion %s", conclusion => {
     const {run, calls} = fixture({ci: {head_sha: commit, event: "push", status: "completed", conclusion}});
-    expect(() => runReleaseStage(options, run)).toThrow(/successful latest push run/);
+    expect(() => runReleaseStage(options, run)).toThrow(/concluded/);
     expect(calls.some(call => call.some(arg => arg.includes("/releases")))).toBe(false);
+  });
+  it.each(["queued", "in_progress"])("refuses an in-flight CI run as %s rather than as missing", status => {
+    const {run, calls} = fixture({ci: {head_sha: commit, event: "push", status, conclusion: null}});
+    expect(() => runReleaseStage(options, run)).toThrow(/still/);
+    expect(() => runReleaseStage(options, run)).toThrow(/wait for it to succeed before tagging/);
+    expect(calls.some(call => call.some(arg => arg.includes("/releases")))).toBe(false);
+  });
+  it("refuses a commit CI has not started for", () => {
+    const {run, calls} = fixture();
+    const empty: Runner = (program, args, input) => {
+      if (program === "gh" && String(args[4] ?? "").includes("actions/workflows/")) {
+        return {status: 0, failed: false, stdout: "HTTP/2.0 200 Status\nContent-Type: application/json\r\n\r\n{\"workflow_runs\":[]}"};
+      }
+      return run(program, args, input);
+    };
+    expect(() => runReleaseStage(options, empty)).toThrow(/has no push run/);
+    expect(calls.some(call => call.some(arg => arg.includes("/releases")))).toBe(false);
+  });
+  it("ready checks CI without requiring the tag to already point here or mutating a draft", () => {
+    const {run, calls} = fixture();
+    expect(runReleaseStage({...options, stage: "ready"}, run)).toEqual({release_id: "", commit, tag, stage: "ready"});
+    expect(calls.some(call => call[0] === "git" && call.includes("ls-remote"))).toBe(false);
+    expect(calls.some(call => call.includes("POST") || call.includes("PATCH") || call.includes("DELETE"))).toBe(false);
+    expect(calls.filter(call => call.some(arg => arg.includes("actions/workflows/")))).toHaveLength(2);
+  });
+  it("ready refuses before GitHub when the checkout is not the preflight commit", () => {
+    const {run, calls} = fixture({local: "c".repeat(40)});
+    expect(() => runReleaseStage({...options, stage: "ready"}, run)).toThrow(/Checkout differs/);
+    expect(calls.filter(call => call[0] === "gh")).toHaveLength(0);
   });
   it.each(["releases/tags/", "actions/workflows/", "releases"])("does not treat an incomplete API response as an absent release: %s", fail => {
     const {run, calls} = fixture({fail});

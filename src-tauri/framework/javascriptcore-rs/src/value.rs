@@ -41,7 +41,7 @@ pub trait ValueExtManual: 'static {
   #[cfg(any(feature = "v2_38", docsrs))]
   #[cfg_attr(docsrs, doc(cfg(feature = "v2_38")))]
   #[doc(alias = "jsc_value_typed_array_get_data")]
-  fn typed_array_get_data(&self) -> TypedArrayData;
+  fn typed_array_get_data(&self) -> TypedArrayData<'_>;
 }
 
 impl<O: IsA<Value>> ValueExtManual for O {
@@ -61,7 +61,7 @@ impl<O: IsA<Value>> ValueExtManual for O {
 
   #[cfg(any(feature = "v2_38", docsrs))]
   #[cfg_attr(docsrs, doc(cfg(feature = "v2_38")))]
-  fn typed_array_get_data(&self) -> TypedArrayData {
+  fn typed_array_get_data(&self) -> TypedArrayData<'_> {
     use crate::TypedArrayType::*;
     unsafe {
       let mut len = 0;

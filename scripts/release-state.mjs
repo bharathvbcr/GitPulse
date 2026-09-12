@@ -31,12 +31,12 @@ function record(value) {
  */
 export function runReleaseStage(options, run = runCommand) {
   const { stage, repo, tag, commit, releaseId, notes } = options;
-  if (!["prepare", "check", "finalize"].includes(stage)) throw new Error("Expected prepare, check, or finalize");
+  if (!["prepare", "check", "finalize", "ready"].includes(stage)) throw new Error("Expected prepare, check, finalize, or ready");
   if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(repo)) throw new Error("Invalid repository");
   const parsed = parseTag(tag);
   if (!parsed.ok) throw new Error(parsed.reason);
   if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error("Expected the full preflight commit SHA");
-  if (stage !== "prepare" && !/^[1-9]\d*$/.test(releaseId ?? "")) throw new Error("Expected the prepared release ID");
+  if (stage !== "prepare" && stage !== "ready" && !/^[1-9]\d*$/.test(releaseId ?? "")) throw new Error("Expected the prepared release ID");
   if (stage === "finalize" && (!notes || Buffer.byteLength(notes) > 125_000)) throw new Error("Missing or oversized release notes");
   const base = `repos/${repo}`;
   /** @param {string} endpoint @param {string} [method] @param {Record<string, unknown>} [body] @param {boolean} [allowMissing] */
@@ -59,9 +59,12 @@ export function runReleaseStage(options, run = runCommand) {
     if (result.status !== 0 || status < 200 || status >= 300) throw new Error(`GitHub ${method} ${endpoint}: HTTP ${status}`);
     return JSON.parse(match[2]);
   }
-  function checkTag() {
+  function checkCheckout() {
     const local = run("git", ["rev-parse", "HEAD"]);
     if (local.failed || local.status !== 0 || local.stdout.trim() !== commit) throw new Error("Checkout differs from preflight commit");
+  }
+  function checkTag() {
+    checkCheckout();
     const remote = run("git", ["ls-remote", "--exit-code", "origin", `refs/tags/${tag}`, `refs/tags/${tag}^{}`]);
     if (remote.failed || remote.status !== 0) throw new Error("Remote release tag could not be verified");
     const refs = remote.stdout.trim().split(/\r?\n/).map(line => line.split(/\s+/));
@@ -70,6 +73,36 @@ export function runReleaseStage(options, run = runCommand) {
     const peeled = refs.find(([, ref]) => ref === `refs/tags/${tag}^{}`);
     if (!tagged || (peeled ?? tagged)[0] !== commit) throw new Error("Remote release tag moved or names another commit");
     return { object: tagged[0].toLowerCase(), peeled: (peeled ?? tagged)[0].toLowerCase() };
+  }
+  /**
+   * Prepare's 5-minute budget cannot wait out a 30-minute CI matrix. An in-flight
+   * run used to look identical to "CI never started", so a tag pushed with main
+   * burned preflight and then died here. Name the three states separately.
+   * `ready` is the local check that must pass *before* the tag is moved.
+   * @param {string} workflow
+   */
+  function requireSuccessfulPushRun(workflow) {
+    const runs = record(api(`actions/workflows/${workflow}/runs?head_sha=${commit}&event=push&per_page=1`));
+    const entries = runs.workflow_runs;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error(`${workflow} has no push run for the preflight commit`);
+    }
+    if (entries.length !== 1) throw new Error(`${workflow} returned an unexpected run page for the preflight commit`);
+    const latest = record(entries[0]);
+    if (latest.head_sha !== commit || latest.event !== "push") {
+      throw new Error(`${workflow} has no push run for the preflight commit`);
+    }
+    if (latest.status !== "completed") {
+      throw new Error(`${workflow} is still ${String(latest.status)} for the preflight commit — wait for it to succeed before tagging`);
+    }
+    if (latest.conclusion !== "success") {
+      throw new Error(`${workflow} latest push run concluded ${String(latest.conclusion)} for the preflight commit`);
+    }
+  }
+  if (stage === "ready") {
+    checkCheckout();
+    for (const workflow of ["ci.yml", "coverage.yml"]) requireSuccessfulPushRun(workflow);
+    return { release_id: "", commit, tag, stage };
   }
   const tagIdentity = checkTag();
   /** @param {Record<string, unknown> | null} release */
@@ -154,12 +187,7 @@ export function runReleaseStage(options, run = runCommand) {
   if (stage === "prepare") {
     // The newest run must have completed successfully, including every matrix
     // leg. An older successful attempt cannot hide a newer failure/cancellation.
-    for (const workflow of ["ci.yml", "coverage.yml"]) {
-      const runs = record(api(`actions/workflows/${workflow}/runs?head_sha=${commit}&event=push&per_page=1`));
-      const entries = runs.workflow_runs;
-      const latest = Array.isArray(entries) && entries.length === 1 ? record(entries[0]) : null;
-      if (!latest || latest.head_sha !== commit || latest.event !== "push" || latest.status !== "completed" || latest.conclusion !== "success") throw new Error(`${workflow} has no successful latest push run for the preflight commit`);
-    }
+    for (const workflow of ["ci.yml", "coverage.yml"]) requireSuccessfulPushRun(workflow);
     release = findExistingDraft();
     if (!release) {
       // Do not automatically retry a POST whose outcome is unknown. A rerun
@@ -221,12 +249,12 @@ export function runReleaseStage(options, run = runCommand) {
 export function main(argv = process.argv.slice(2)) {
   if (wantsHelp(argv)) {
     console.log(formatUsage({name: "release-state", summary: "Verify remote release provenance and manage its draft lifecycle.",
-      flags: [{flag: "prepare|check|finalize", description: "stage to run; uses GH_REPO, RELEASE_TAG, RELEASE_COMMIT and RELEASE_ID"}],
+      flags: [{flag: "prepare|check|finalize|ready", description: "stage to run; uses GH_REPO, RELEASE_TAG, RELEASE_COMMIT and RELEASE_ID. ready checks CI without mutating the draft or requiring the tag to already point here"}],
       exits: "0 stage verified; 1 release refused or verification unavailable"}));
     return 0;
   }
   try {
-    if (argv.length !== 1) throw new Error("Usage: release-state.mjs prepare|check|finalize (RELEASE_TAG, RELEASE_COMMIT, GH_REPO, RELEASE_ID)");
+    if (argv.length !== 1) throw new Error("Usage: release-state.mjs prepare|check|finalize|ready (RELEASE_TAG, RELEASE_COMMIT, GH_REPO, RELEASE_ID)");
     const tag = process.env.RELEASE_TAG ?? "";
     let notes;
     if (argv[0] === "finalize") {
@@ -236,7 +264,7 @@ export function main(argv = process.argv.slice(2)) {
     }
     const result = runReleaseStage({stage: argv[0], repo: process.env.GH_REPO ?? "", tag,
       commit: process.env.RELEASE_COMMIT ?? "", releaseId: process.env.RELEASE_ID, notes});
-    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${result.release_id}\n`);
+    if (process.env.GITHUB_OUTPUT && result.release_id) appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${result.release_id}\n`);
     console.log(JSON.stringify(result));
     return 0;
   } catch (error) {

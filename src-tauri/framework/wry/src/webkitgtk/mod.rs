@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+#![allow(deprecated)]
+
 #[cfg(feature = "x11")]
 use dpi::LogicalPosition;
 use dpi::LogicalSize;
