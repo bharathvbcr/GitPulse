@@ -41,6 +41,14 @@ function fixture(change: {
       return respond({message: "Not Found"}, 404);
     }
     if (endpoint.includes("actions/workflows/")) return respond({workflow_runs: [change.ci ?? {head_sha: commit, event: "push", status: "completed", conclusion: "success"}]});
+    if (args[3] === "DELETE") {
+      const assetMatch = /releases\/assets\/(\d+)$/.exec(String(args[4] ?? ""));
+      if (assetMatch && release && Array.isArray(release.assets)) {
+        const id = Number(assetMatch[1]);
+        release = {...release, assets: release.assets.filter(asset => asset.id !== id)};
+      }
+      return {status: 0, failed: false, stdout: "HTTP/2.0 204 No Content\r\n\r\n"};
+    }
     if (args[3] === "POST") { release = {...draft(), ...JSON.parse(input ?? "{}")}; return change.uncertainPost ? {status: null, failed: true, stdout: ""} : respond(release, 201); }
     if (args[3] === "PATCH") {
       patched = true;
@@ -135,21 +143,63 @@ describe("remote release lifecycle", () => {
   });
   it.each([
     {draft: false}, {draft: undefined}, {published_at: "2026-09-08"}, {immutable: true}, {prerelease: true},
-    {tag_name: "v0.0.8"}, {target_commitish: "c".repeat(40)}, {id: 0}, {id: 9007199254740992},
+    {id: 0}, {id: 9007199254740992},
   ])("refuses unsafe existing release metadata %j", change => {
     const {run, calls} = fixture({release: {...draft(), ...change}});
     expect(() => runReleaseStage(options, run)).toThrow();
-    expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
+    expect(calls.some(call => call.includes("POST") || call.includes("PATCH") || call.includes("DELETE"))).toBe(false);
+  });
+  it("clears leftover installer assets before a rebuild so Windows cannot 422 on a name that already exists", () => {
+    const leftover = {
+      ...draft(),
+      assets: [
+        {id: 11, name: "GitPulse_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`},
+        {id: 12, name: "GitPulse_1.2.3_x64_en-US.msi", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`},
+      ],
+    };
+    const {run, calls} = fixture({release: leftover, list: [leftover]});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    const deleted = calls.filter(call => call.includes("DELETE")).map(call => call.find(arg => String(arg).includes("releases/assets/")) ?? "");
+    expect(deleted.some(arg => arg.endsWith("/releases/assets/11"))).toBe(true);
+    expect(deleted.some(arg => arg.endsWith("/releases/assets/12"))).toBe(true);
+    expect(calls.some(call => call.includes("POST"))).toBe(false);
+  });
+  it("retargets a leftover draft onto this commit instead of refusing the SHA GitHub still has", () => {
+    const stale = {...draft(), target_commitish: "d".repeat(40), assets: []};
+    const {run, patches, calls} = fixture({release: stale, list: [stale]});
+    expect(runReleaseStage(options, run).release_id).toBe("42");
+    expect(calls.filter(call => call.includes("POST"))).toHaveLength(0);
+    expect(patches.some(body => JSON.parse(body).target_commitish === commit && JSON.parse(body).tag_name === tag)).toBe(true);
+  });
+  it("refuses a leftover installer that has no asset id instead of skipping it", () => {
+    const leftover = {
+      ...draft(),
+      assets: [{name: "GitPulse_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}],
+    };
+    const {run, calls} = fixture({release: leftover, list: [leftover]});
+    expect(() => runReleaseStage(options, run)).toThrow(/asset ID/);
+    expect(calls.some(call => call.includes("DELETE"))).toBe(false);
+  });
+  it("does not delete installers during the pre-upload identity check", () => {
+    const {run, calls} = fixture();
+    expect(runReleaseStage({...options, stage: "check", releaseId: "42"}, run).stage).toBe("check");
+    expect(calls.some(call => call.includes("DELETE"))).toBe(false);
+  });
+  it("refuses a different version tag on check rather than renaming it mid-upload", () => {
+    const {run, calls} = fixture({release: {...draft(), tag_name: "v0.0.8"}});
+    expect(() => runReleaseStage({...options, stage: "check", releaseId: "42"}, run)).toThrow(/Draft tag/);
+    expect(calls.some(call => call.includes("POST") || call.includes("PATCH") || call.includes("DELETE"))).toBe(false);
   });
   it.each(["main", tag, `refs/tags/${tag}`, commit.slice(0, 7)])("accepts GitHub echoing ref name %s after the tag is associated", commitish => {
     const {run, calls} = fixture({release: {...draft(), target_commitish: commitish}});
     expect(runReleaseStage(options, run).release_id).toBe("42");
     expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
   });
-  it("accepts GitHub detaching the git tag as untagged-hex after uploads", () => {
-    const {run, calls} = fixture({release: {...draft(), tag_name: "untagged-f782e62dab083869a408"}});
+  it("writes the intended tag name back when prepare resumes an untagged draft", () => {
+    const {run, calls, patches} = fixture({release: {...draft(), tag_name: "untagged-f782e62dab083869a408"}});
     expect(runReleaseStage(options, run).release_id).toBe("42");
-    expect(calls.some(call => call.includes("POST") || call.includes("PATCH"))).toBe(false);
+    expect(calls.some(call => call.includes("POST"))).toBe(false);
+    expect(patches.some(body => JSON.parse(body).tag_name === tag && JSON.parse(body).target_commitish === commit)).toBe(true);
   });
   it.each(["untagged", "untagged-", "untagged-not-hex", "latest", "v0.0.8"])("refuses a tag name that is not this release or GitHub's untagged hex form: %s", tag_name => {
     const {run, calls} = fixture({release: {...draft(), tag_name}});

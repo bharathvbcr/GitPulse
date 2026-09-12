@@ -43,9 +43,18 @@ export function runReleaseStage(options, run = runCommand) {
   function api(endpoint, method = "GET", body, allowMissing = false) {
     const result = run("gh", ["api", "--include", "--method", method, `${base}/${endpoint}`,
       ...(body ? ["--input", "-"] : [])], body ? JSON.stringify(body) : undefined);
-    const match = /^HTTP\/[\d.]+ (\d{3})[^\n]*\r?\n[\s\S]*?\r?\n\r?\n([\s\S]*)$/.exec(result.stdout);
-    if (result.failed || !match) throw new Error(`GitHub ${method} ${endpoint}: incomplete response`);
-    const status = Number(match[1]);
+    const statusLine = /^HTTP\/[\d.]+ (\d{3})\b/.exec(result.stdout ?? "");
+    if (result.failed || !statusLine) throw new Error(`GitHub ${method} ${endpoint}: incomplete response`);
+    const status = Number(statusLine[1]);
+    // DELETE /releases/assets/{id} is 204 with an empty body. Parsing that as
+    // JSON turns a successful wipe into "unexpected end of JSON input" after
+    // the first leftover Windows installer is gone and the rest still 422.
+    if (status === 204) {
+      if (result.status !== 0) throw new Error(`GitHub ${method} ${endpoint}: HTTP ${status}`);
+      return null;
+    }
+    const match = /^HTTP\/[\d.]+ (\d{3})[^\n]*\r?\n[\s\S]*?\r?\n\r?\n([\s\S]*)$/.exec(result.stdout ?? "");
+    if (!match) throw new Error(`GitHub ${method} ${endpoint}: incomplete response`);
     if (status === 404 && allowMissing && result.status === 1) return null;
     if (result.status !== 0 || status < 200 || status >= 300) throw new Error(`GitHub ${method} ${endpoint}: HTTP ${status}`);
     return JSON.parse(match[2]);
@@ -64,8 +73,21 @@ export function runReleaseStage(options, run = runCommand) {
   }
   const tagIdentity = checkTag();
   /** @param {Record<string, unknown> | null} release */
-  function checkDraft(release) {
+  function assertMutableDraft(release) {
     if (!release || release.draft !== true || release.prerelease !== false || release.immutable === true || release.published_at !== null) throw new Error("Release is not a mutable unpublished draft");
+    if (typeof release.id !== "number" || !Number.isSafeInteger(release.id) || release.id <= 0 || (releaseId && String(release.id) !== releaseId)) throw new Error("Draft release ID changed or is invalid");
+    return release;
+  }
+  /** @param {Record<string, unknown>} release */
+  function assertDraftTag(release) {
+    if (typeof release.tag_name !== "string" || (release.tag_name !== tag && !/^untagged-[0-9a-f]+$/i.test(release.tag_name))) {
+      throw new Error(`Draft tag differs from preflight (${String(release.tag_name)})`);
+    }
+  }
+  /** @param {Record<string, unknown> | null} release */
+  function checkDraft(release) {
+    release = assertMutableDraft(release);
+    assertDraftTag(release);
     // GitHub keeps the SHA we POST, then often echoes a branch or tag name once
     // the existing git tag is associated. v0.0.9's finalize died on that rewrite
     // after every installer had uploaded. The remote tag peel is the pin;
@@ -76,9 +98,6 @@ export function runReleaseStage(options, run = runCommand) {
     // rewrite tag_name to untagged-<hex>. That rewrite aborted finalize once
     // every installer was already on the draft. The peel is the pin; finalize
     // writes the intended tag name back with the notes.
-    if (typeof release.tag_name !== "string" || (release.tag_name !== tag && !/^untagged-[0-9a-f]+$/i.test(release.tag_name))) {
-      throw new Error(`Draft tag differs from preflight (${String(release.tag_name)})`);
-    }
     if (typeof release.target_commitish !== "string" || !release.target_commitish) throw new Error("Draft commitish is missing");
     if (/^[a-f0-9]{7,40}$/i.test(release.target_commitish)) {
       const sha = release.target_commitish.toLowerCase();
@@ -87,7 +106,6 @@ export function runReleaseStage(options, run = runCommand) {
         throw new Error(`Draft commit SHA differs from preflight (${release.target_commitish})`);
       }
     }
-    if (typeof release.id !== "number" || !Number.isSafeInteger(release.id) || release.id <= 0 || (releaseId && String(release.id) !== releaseId)) throw new Error("Draft release ID changed or is invalid");
     return release;
   }
   /** @param {Record<string, unknown>} release */
@@ -147,6 +165,40 @@ export function runReleaseStage(options, run = runCommand) {
       // Do not automatically retry a POST whose outcome is unknown. A rerun
       // reads the existing draft before deciding whether creation is necessary.
       release = record(api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}`, draft: true, prerelease: false, body: "Draft — platform builds and verification are pending." }));
+    } else {
+      // Identity first. `/releases/tags/{tag}` can still return a published
+      // release; wiping its installers would delete the last successful set.
+      release = assertMutableDraft(release);
+      assertDraftTag(release);
+      // The matrix always rebuilds. Leftover names — especially the Windows
+      // NSIS/MSI pair from a cancelled attempt — make GitHub 422
+      // already_exists. tauri-action retries that three times and then fails
+      // the Windows leg with every other platform already uploaded. Wipe the
+      // previous attempt's installers before the matrix runs.
+      const assets = Array.isArray(release.assets) ? release.assets : [];
+      for (const raw of assets) {
+        const metadata = record(raw);
+        if (typeof metadata.id !== "number" || !Number.isSafeInteger(metadata.id) || metadata.id <= 0) {
+          throw new Error("Release asset ID is missing or invalid");
+        }
+        api(`releases/assets/${metadata.id}`, "DELETE", undefined, true);
+      }
+      if (assets.length > 0) {
+        const cleared = record(api(`releases/${release.id}`));
+        if (Array.isArray(cleared.assets) && cleared.assets.length > 0) {
+          throw new Error("Draft still has installer assets after wipe");
+        }
+      }
+      // A draft still carrying the previous tagged SHA is that earlier tree.
+      // checkDraft would refuse it after a tag move, which is the only draft
+      // we can resume. Retarget onto this commit; a ref name is left alone.
+      const commitish = typeof release.target_commitish === "string" ? release.target_commitish : "";
+      const shaMismatch = /^[a-f0-9]{7,40}$/i.test(commitish) &&
+        ![commit, tagIdentity.object, tagIdentity.peeled].some(pin => pin === commitish.toLowerCase() || pin.startsWith(commitish.toLowerCase()));
+      const untagged = typeof release.tag_name === "string" && /^untagged-[0-9a-f]+$/i.test(release.tag_name);
+      if (untagged || shaMismatch) {
+        release = record(api(`releases/${release.id}`, "PATCH", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}` }));
+      }
     }
   } else {
     release = record(api(`releases/${releaseId}`));

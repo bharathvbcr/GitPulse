@@ -137,7 +137,20 @@ release pipeline that can finish after GitHub detaches a draft tag.
   pinned commit, and a ref name is not a second pin. An `untagged-` placeholder
   is accepted only in GitHub's hex form, and finalize writes the intended tag
   name back with the notes. Platform builds upload by release ID only so
-  tauri-action cannot retarget the draft.
+  tauri-action cannot retarget the draft. Prepare now also deletes leftover
+  draft installers before the matrix rebuilds: GitHub 422s a second Windows
+  NSIS/MSI upload of the same name, and tauri-action retries that as a
+  flaky upload until the Windows leg fails. A draft still pinned to the
+  previous tagged SHA is retargeted onto this commit after that wipe, never
+  mutated until it is proven a mutable unpublished draft.
+- Sign every nested helper in the macOS universal bundle before the main
+  binary. Tauri copies every `[[bin]]` into `Contents/MacOS` and signs them in
+  manifest order — main first. Once `Info.plist` is in the bundle, codesign
+  treats that file as the bundle executable and every other Mach-O as nested
+  code that must already be signed. `lipo` produces unsigned helpers, so the
+  sign of `gitpulse` failed with `code object is not signed at all / In
+  subcomponent: gitpulse-hook`. `scripts/bin/codesign` piggy-backs on the main
+  binary's sign the same way `scripts/bin/lipo` stitches the helpers.
 - Keep unmerged index entries in conflict review instead of reporting them
   as staged and ready to commit.
 - Keep partially staged files visible on both sides in the sidebar and diff
