@@ -195,6 +195,7 @@
     aria-expanded={open}
     aria-controls="header-repo-menu"
     data-testid="header-repo-menu"
+    data-tour="repository"
     onclick={toggle}
     onkeydown={onTriggerKey}
   >

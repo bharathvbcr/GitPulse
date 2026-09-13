@@ -57,9 +57,16 @@ untrusted checkout described as a broken one.
   serves. No host sends it; `mcp:doctor` needs it because silence is a
   legitimate answer to every real hook invocation, so nothing else can tell an
   absent binary from a current one.
-- First-run walkthrough: an interactive tour introducing repositories, views,
-  tasks, and platform folder access, replayable at any time from **Walkthrough**
-  in the title bar.
+- First-run walkthrough: an interactive tour that highlights the controls
+  themselves as you open a repository, try views, and explore Tasks and
+  Settings, rather than describing them from a panel off to one side. The card
+  anchors to the control it is describing — taking the space below it where
+  there is room and above it where there is not — scrolls that control into
+  view, and follows it as the window resizes. It sits below menus, trust
+  prompts and Settings in the stacking order, so it never covers what it is
+  pointing at, and it observes its target only while a step is on screen:
+  nothing polls, and no listener outlives the step that created it. Replayable
+  at any time from **Walkthrough** in the title bar.
 - An **Archive** dock on the tasks board: completed tasks for the current
   scope, with their own search and **Load more**, and a header badge carrying
   the server's total rather than the loaded page. A selection restores to any

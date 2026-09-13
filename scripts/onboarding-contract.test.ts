@@ -18,8 +18,15 @@ describe("onboarding integration and native permission purposes", () => {
   });
   it("mounts the production tour with existing actions and a persistent replay entry", () => {
     const app = read("src/App.svelte");
-    expect(app).toContain('<ProductTour onOpenRepository={() => void repoStore.pickAndOpenRepo()}');
+    expect(app).toContain('<ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}');
     expect(app).toContain('onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}');
     expect(app).toContain('onclick={() => productTour.open()}>Walkthrough</button>');
+    expect(app).toContain('onTasks={() => interfaceStore.setTasksOpen(true)}');
+    expect(app).toContain('repoStore.setActiveTab(view)');
+    expect(app).toContain('repositoryPath={$repoStore.currentPath}');
+    expect(app).toContain('settingsOpen={isSettingsModalOpen}');
+    expect(read("src/lib/components/HeaderRepoMenu.svelte")).toContain('data-tour="repository"');
+    expect(read("src/lib/components/ViewTabBar.svelte")).toContain('data-tour="views"');
+    expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="tasks"');
   });
 });

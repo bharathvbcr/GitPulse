@@ -1,57 +1,107 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { X, ArrowRight, FolderOpen, Compass } from "@lucide/svelte";
+  import { X, ArrowRight, FolderOpen, Compass, Check } from "@lucide/svelte";
   import { productTour, TOUR_STEPS, type ProductTourStore } from "../../tools/productTour";
+  import { observeTourTarget, type TourRect } from "../../tools/productTourTarget";
   import { hostPlatform } from "../../stores/platformStore";
   import { repositoryAccessGuidance, shortcutTextLabel } from "../../ui/platformCopy";
   import { trapFocus } from "../../ui/focusTrap";
   import { LAYERS } from "../../ui/layers";
   import { VIEW_REGISTRY } from "../../views/viewRegistry";
+  import type { ViewTab } from "../../repos/persist";
   import { isImeComposition } from "../../keyboard/imeGuard";
 
-  let { tour = productTour, onOpenRepository, onSettings, onTools }: {
+  let { tour = productTour, onOpenRepository, onSettings, onTools, onTasks, onView,
+    repositoryPath = null, activeView = "work", repositoryVisible = true, tasksOpen = false, settingsOpen = false }: {
     tour?: ProductTourStore;
-    onOpenRepository: () => void;
+    onOpenRepository: () => void | Promise<unknown>;
     onSettings: () => void;
     onTools: () => void;
+    onTasks: () => void;
+    onView: (view: ViewTab) => void;
+    repositoryPath?: string | null;
+    activeView?: ViewTab;
+    repositoryVisible?: boolean;
+    tasksOpen?: boolean;
+    settingsOpen?: boolean;
   } = $props();
   let heading = $state<HTMLHeadingElement | null>(null);
+  let target = $state<TourRect | null>(null);
+  let position = $state({ left: 16, top: 80 });
+  let busy = $state(false);
+  let actionError = $state<string | null>(null);
+  let settingsVisited = $state(false);
   const step = $derived(TOUR_STEPS[$tour.step]);
+  const live = $derived(step !== "welcome" && step !== "ready");
+  const selector = $derived(step === "views" && !repositoryVisible ? "[data-tour='unavailable']" : `[data-tour='${step}']`);
+  const achieved = $derived(step === "repository" ? !!repositoryPath : step === "views" ? !!repositoryPath && repositoryVisible : step === "tasks" ? tasksOpen : step === "permissions" && settingsVisited);
   onMount(() => tour.initialize());
+  $effect(() => { if ($tour.open && step === "permissions" && settingsOpen) settingsVisited = true; });
 
-  async function move(forward: boolean) {
-    if (forward) tour.next(); else tour.back();
-    await tick();
+  function guide(node: HTMLElement) {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     heading?.focus();
+    $effect(() => {
+      if (live) return observeTourTarget(selector, node, (rect, next) => { target = rect; position = next; });
+      const trap = trapFocus(node, { autofocus: false });
+      return () => trap.destroy();
+    });
+    return { destroy() {
+      // Do not steal focus from a picker, trust prompt, or other app surface.
+      if (node.contains(document.activeElement) || document.activeElement === document.body) {
+        const replay = document.querySelector<HTMLElement>("[data-tour='replay']");
+        if (replay) replay.focus(); else if (previous?.isConnected) previous.focus();
+      }
+    } };
   }
-  async function leave(action: () => void, complete = false) {
-    if (!(complete ? tour.finish() : tour.dismiss())) return;
-    await tick();
-    action();
+  async function move(forward: boolean) {
+    actionError = null;
+    if (forward) tour.next(); else tour.back();
+    await tick(); heading?.focus();
+  }
+  async function openRepository(complete = false) {
+    if (busy || (complete && !tour.finish())) return;
+    busy = true; actionError = null;
+    try { await onOpenRepository(); }
+    catch { actionError = "The repository could not be opened. Try again or skip this step."; }
+    finally { busy = false; }
+  }
+  async function leaveForTools() {
+    if (!tour.dismiss()) return;
+    await tick(); onTools();
+  }
+  function focusTarget() {
+    const element = Array.from(document.querySelectorAll<HTMLElement>(selector)).find(el => el.getClientRects().length > 0);
+    const control = element?.matches("button") ? element : element?.querySelector<HTMLElement>("[aria-selected='true'], button");
+    control?.focus();
   }
   function keydown(event: KeyboardEvent) {
-    // Keep app shortcuts out of the walkthrough; Tab is owned by trapFocus.
     event.stopPropagation();
     if (event.key === "Escape" && !isImeComposition(event)) {
-      event.preventDefault();
-      tour.dismiss();
+      event.preventDefault(); tour.dismiss();
     }
   }
 </script>
 
 {#if $tour.open}
-  <div class="gp-scrim bg-black/40 flex items-center justify-center p-4" style:z-index={LAYERS.MODAL}>
-    <div class="gp-card shadow-float rounded-2xl w-full max-w-xl max-h-[calc(100dvh-2rem)] overflow-auto p-6 flex flex-col gap-5"
-      role="dialog" aria-modal="true" aria-labelledby="product-tour-title" tabindex="-1"
-      onkeydown={keydown} use:trapFocus={{ initial: () => heading }}>
+  {#if live && target && !settingsOpen}
+    <div class="tour-spotlight" aria-hidden="true" style:z-index={LAYERS.TOUR}
+      style:left={`${target.left - 4}px`} style:top={`${target.top - 4}px`}
+      style:width={`${target.width + 8}px`} style:height={`${target.height + 8}px`}></div>
+  {/if}
+  <div class:tour-modal={!live} class:tour-live={live} style:z-index={live ? LAYERS.TOUR : LAYERS.MODAL}>
+    <div class="gp-card shadow-float rounded-2xl tour-card" class:tour-coach={live}
+      style:left={live ? `${position.left}px` : undefined} style:top={live ? `${position.top}px` : undefined}
+      role="dialog" aria-modal={!live} aria-labelledby="product-tour-title" tabindex="-1"
+      onkeydown={keydown} use:guide>
       <header class="flex items-center justify-between gap-3">
-        <span class="text-xs text-textMuted flex items-center gap-2"><Compass size={16} /> GitPulse walkthrough · {$tour.step + 1} of {TOUR_STEPS.length}</span>
+        <span class="text-xs text-textMuted flex items-center gap-2"><Compass size={16} /> Walkthrough · {$tour.step + 1} of {TOUR_STEPS.length}</span>
         <button class="gp-icon-btn" aria-label="Close walkthrough and resume later" onclick={() => tour.dismiss()}><X size={16} /></button>
       </header>
       <div class="flex gap-1" aria-hidden="true">
         {#each TOUR_STEPS as _, index}<span class="h-1 flex-1 rounded-full" class:bg-accent={index <= $tour.step} class:bg-border={index > $tour.step}></span>{/each}
       </div>
-      <div class="space-y-4 text-sm text-textMuted leading-relaxed">
+      <div class="space-y-3 text-sm text-textMuted leading-relaxed">
         <h1 id="product-tour-title" bind:this={heading} tabindex="-1" class="text-xl font-semibold text-textPrimary outline-none">
           {#if step === "welcome"}Your work, in one place
           {:else if step === "repository"}Start with a repository
@@ -61,44 +111,74 @@
           {:else}Ready when you are{/if}
         </h1>
         {#if step === "welcome"}
-          <p>Review changes, follow branches, and keep track of work across your repositories. This short tour introduces the workspace and explains the access GitPulse uses.</p>
-          <p>You can leave at any time and resume with the Walkthrough button in the title bar.</p>
+          <p>Take a hands-on tour of GitPulse. Open a repository, try the workspace views, and find Tasks and Settings.</p>
+          <p>The guide will move beside the controls as you explore. Every step is optional; use Walkthrough in the title bar to resume later.</p>
         {:else if step === "repository"}
-          <p>Use Open Repository to choose an existing Git folder, or Clone Repo on the welcome screen to download one. GitPulse asks you to review repository trust before enabling operations.</p>
-          <p>Repository tabs keep projects close at hand. Opening a repository does not commit or push your changes.</p>
-          <button class="gp-btn" onclick={() => leave(onOpenRepository)}><FolderOpen size={15} /> Choose a repository</button>
+          <p>{target ? "Try the highlighted Open menu to choose or clone a repository. You can also use the button below." : "Use the button below to choose a repository. The Open menu is not currently visible."} Review repository trust when asked.</p>
+          <button class="gp-btn" disabled={busy} onclick={() => openRepository()}><FolderOpen size={15} /> {busy ? "Opening…" : "Choose a repository"}</button>
+          {#if repositoryPath}<p role="status" class="tour-success"><Check size={15} /> Repository open. Continue when you’re ready.</p>
+          {:else}<p class="text-xs">No repository open yet. Canceling the picker keeps you here; you can try again or skip.</p>{/if}
         {:else if step === "views"}
-          <dl class="space-y-3">
-            {#each [VIEW_REGISTRY.work, VIEW_REGISTRY.code, VIEW_REGISTRY.history, VIEW_REGISTRY.insights] as view}
-              <div><dt class="font-semibold text-textPrimary">{view.label}</dt><dd>{view.summary}</dd></div>
+          <p>Try a view below or use the highlighted tabs. Each opens a different part of the same repository.</p>
+          <div class="grid grid-cols-2 gap-2" aria-label="Try workspace views">
+            {#each Object.values(VIEW_REGISTRY) as view}
+              <button class="gp-btn justify-center" disabled={!repositoryPath}
+                aria-pressed={!!repositoryPath && repositoryVisible && activeView === view.id}
+                onclick={() => onView(view.id)}>{view.label}</button>
             {/each}
-          </dl>
-          <p>Press <kbd class="gp-keycap">{shortcutTextLabel("⌘K", $hostPlatform.os)}</kbd> to find commands, branches, files, and commits.</p>
+          </div>
+          {#if repositoryPath && repositoryVisible}
+            <p role="status"><strong class="text-textPrimary">{VIEW_REGISTRY[activeView].label}</strong> — {VIEW_REGISTRY[activeView].summary}</p>
+          {:else if !repositoryPath}
+            <p>Open a repository to try these views, or skip for now.</p>
+            <button class="gp-btn" disabled={busy} onclick={() => openRepository()}>Choose a repository</button>
+          {:else}<p>Select a view to return to your repository.</p>{/if}
+          <p class="text-xs">Find commands with <kbd class="gp-keycap">{shortcutTextLabel("⌘K", $hostPlatform.os)}</kbd>.</p>
         {:else if step === "tasks"}
-          <p>Open Tasks from the workspace controls to capture an idea, connect its repository, and record what done means. Review changes and run results before accepting agent work.</p>
-          <p>DevMap adds code intelligence. Manvi provides policy and agent workflows. Both have an existing setup guide and can be configured later.</p>
-          <button class="gp-btn" onclick={() => leave(onTools)}>Set up optional tools</button>
+          <p>Open the real task board to see where ideas, repositories, and acceptance criteria come together. You can explore without creating a task.</p>
+          <button class="gp-btn" onclick={onTasks}>Open Tasks</button>
+          {#if tasksOpen}<p role="status" class="tour-success"><Check size={15} /> Tasks is open. Explore the board, then continue here.</p>{/if}
+          <p class="text-xs">DevMap adds code intelligence; Manvi provides policy and agent workflows. Configure either when you need it.</p>
+          <button class="gp-btn" onclick={leaveForTools}>Set up optional tools</button>
         {:else if step === "permissions"}
-          <p>Folder access follows your operating system’s permissions. Repository trust is a separate GitPulse decision; it does not override denied folder access.</p>
           <p>{repositoryAccessGuidance($hostPlatform.os)}</p>
-          <p>Launch at login is optional in Settings. Remote Git operations and AI providers use their separately configured credentials. The tour does not enable them.</p>
-          <button class="gp-btn" onclick={() => leave(onSettings)}>Open Settings</button>
+          <p class="text-xs">Repository trust is a separate GitPulse decision; it does not override denied folder access. Launch at login is optional in Settings.</p>
+          <button class="gp-btn" onclick={onSettings}>Open Settings</button>
+          {#if settingsVisited}<p role="status" class="tour-success"><Check size={15} /> Settings opened. No permission grant is required to finish.</p>
+          {:else}<p class="text-xs">Explore Settings, then close it to return to this step. The tour does not change permissions or credentials.</p>{/if}
         {:else}
-          <p>Choose a repository to begin, or explore the workspace. Return to this walkthrough from the title bar whenever you need it.</p>
-          <button class="gp-btn" onclick={() => leave(onOpenRepository, true)}><FolderOpen size={15} /> Finish and open a repository</button>
+          <p>You’ve reached the end of the walkthrough. Keep exploring, or return here any time from the title bar.</p>
+          <p class="text-xs">Skipped steps stay optional. Finishing records the tour as complete; it does not grant access or confirm a repository operation.</p>
+          <button class="gp-btn" onclick={() => openRepository(true)}><FolderOpen size={15} /> Finish and open a repository</button>
         {/if}
+        {#if live && target}<button class="tour-focus" onclick={focusTarget}>Focus highlighted control</button>{/if}
       </div>
-      {#if $tour.error}
-        <div role="alert" class="text-xs text-textMuted space-y-2"><p>{$tour.error}</p><button class="gp-btn" onclick={() => tour.closeForSession()}>Close without saving</button></div>
+      {#if $tour.error || actionError}
+        <div role="alert" class="text-xs text-textMuted space-y-2"><p>{$tour.error ?? actionError}</p>
+          {#if $tour.error}<button class="gp-btn" onclick={() => tour.closeForSession()}>Close without saving</button>{/if}
+        </div>
       {/if}
       <footer class="flex items-center justify-between gap-3 pt-3 border-t border-border">
         <button class="gp-btn" onclick={() => tour.dismiss()}>Later</button>
         <div class="flex gap-2">
           <button class="gp-btn" disabled={$tour.step === 0} onclick={() => move(false)}>Back</button>
           {#if step === "ready"}<button class="gp-btn-primary" onclick={() => tour.finish()}>Finish</button>
-          {:else}<button class="gp-btn-primary" onclick={() => move(true)}>Next <ArrowRight size={14} /></button>{/if}
+          {:else}<button class="gp-btn-primary" onclick={() => move(true)}>{step === "welcome" ? "Start tour" : achieved ? "Continue" : "Skip step"} <ArrowRight size={14} /></button>{/if}
         </div>
       </footer>
     </div>
   </div>
 {/if}
+
+<style>
+  .tour-modal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; background: #0006; }
+  .tour-live { position: fixed; inset: 0; pointer-events: none; }
+  .tour-card { width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; pointer-events: auto; }
+  .tour-coach { position: absolute; width: min(380px, calc(100vw - 32px)); padding: 20px; }
+  .tour-spotlight { position: fixed; border: 2px solid var(--color-accent); border-radius: 12px; box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 15%, transparent); pointer-events: none; }
+  .tour-success { display: flex; align-items: flex-start; gap: 8px; color: var(--color-textPrimary); }
+  .tour-success :global(svg) { flex-shrink: 0; margin-top: 3px; color: var(--color-accent); }
+  .tour-focus { font-size: 12px; color: var(--color-accent); text-decoration: underline; text-underline-offset: 3px; }
+  @media (prefers-reduced-motion: no-preference) { .tour-card { animation: tour-enter 150ms ease-out; } }
+  @keyframes tour-enter { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+</style>

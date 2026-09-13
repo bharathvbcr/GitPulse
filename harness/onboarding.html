@@ -1,71 +1,128 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>GitPulse walkthrough checks</title></head>
-<body><button id="replay">Walkthrough</button><div id="app"></div><pre id="result"></pre>
+<html><head><meta charset="utf-8"><title>GitPulse interactive walkthrough checks</title></head>
+<body><div id="app"></div><pre id="result"></pre>
 <script type="module">
   import "../src/app.css";
   import { mount, unmount, tick } from "svelte";
-  import { get } from "svelte/store";
-  import ProductTour from "../src/lib/components/onboarding/ProductTour.svelte";
+  import { get, writable } from "svelte/store";
+  import OnboardingHost from "./OnboardingHost.svelte";
   import { createProductTour } from "../src/lib/tools/productTour";
   import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
   const params = new URLSearchParams(location.search);
   const errors = [];
   addEventListener("error", e => errors.push(e.message));
   addEventListener("unhandledrejection", e => errors.push(String(e.reason)));
-  let saved = null, fail = false, opened = 0, settings = 0, tools = 0;
+  let saved = null, fail = false, opened = 0, settings = 0, tools = 0, picker = "cancel";
+  let releasePicker;
+  const workspace = writable({ path: null, view: "work", tasks: false, settings: false, hideTargets: false });
+  const patch = value => workspace.update(s => ({ ...s, ...value }));
   const storage = { getItem: () => saved, setItem: (_key, value) => { if (fail) throw Error("quota"); saved = value; } };
   let tour = createProductTour(() => storage);
   let app;
-  const settle = async () => { await tick(); await new Promise(r => requestAnimationFrame(r)); await tick(); };
+  const settle = async () => { await tick(); await new Promise(r => setTimeout(r, 60)); await tick(); };
   const mountTour = async () => {
-    app = mount(ProductTour, { target: document.getElementById("app"), props: {
-      tour, onOpenRepository: () => opened++, onSettings: () => settings++, onTools: () => tools++,
+    app = mount(OnboardingHost, { target: document.getElementById("app"), props: {
+      tour, workspace,
+      openRepository: async () => {
+        opened++;
+        if (picker === "wait") await new Promise(resolve => { releasePicker = resolve; });
+        if (picker === "fail") throw Error("picker unavailable");
+        if (picker === "open") patch({ path: "/test/repository" });
+      },
+      openSettings: () => { settings++; patch({ settings: true }); },
+      openTools: () => tools++,
     }});
     await settle();
   };
-  document.getElementById("replay").onclick = () => tour.open();
   resetHostPlatformForTests({ os: "macos", dock_hiding: true });
-  document.getElementById("replay").focus();
-  await mountTour();
   if (params.get("theme") === "light") document.documentElement.classList.add("light");
+  await mountTour();
   if (!params.has("check")) {
-    // Manual preview uses exactly the same component and controller as the checks.
+    picker = "open";
   } else {
     const results = [];
     const check = (name, pass) => { results.push({ name, pass: !!pass }); if (!pass) throw Error(name); };
-    const body = () => document.querySelector('[role="dialog"]');
+    const body = () => document.querySelector('[aria-labelledby="product-tour-title"]');
     const text = () => body()?.textContent ?? "";
     const click = async label => {
-      const button = [...document.querySelectorAll("button")].find(b => b.textContent.trim() === label);
+      const button = [...(body() ?? document).querySelectorAll("button")].find(b => b.textContent.trim() === label)
+        ?? [...document.querySelectorAll("button")].find(b => b.textContent.trim() === label);
       if (!button || button.disabled) throw Error(`Unavailable button ${label}`);
       button.click(); await settle();
     };
+    const next = () => click(get(tour).step === 0 ? "Start tour" : [...body().querySelectorAll("button")].find(b => b.classList.contains("gp-btn-primary")).textContent.trim());
+    const spot = () => document.querySelector('.tour-spotlight');
     try {
       check("first launch opens", body());
-      check("accessible modal", body().getAttribute("aria-modal") === "true");
+      check("accessible welcome modal", body().getAttribute("aria-modal") === "true");
       check("initial heading focus", document.activeElement.id === "product-tour-title");
       check("progress visible", text().includes("1 of 6"));
       check("back disabled at start", [...body().querySelectorAll("button")].find(b => b.textContent === "Back").disabled);
-      await click("Next");
+      await next();
       check("repository step", text().includes("Start with a repository"));
+      check("repository step lets users interact with the app", body().getAttribute("aria-modal") === "false");
       check("focus follows step", document.activeElement.id === "product-tour-title");
-      await click("Choose a repository");
-      check("picker callback once", opened === 1);
-      check("picker closes tour", !body());
-      check("action defers completion", JSON.parse(saved).status === "deferred");
-      check("focus restored", document.activeElement.id === "replay");
-      await click("Walkthrough");
-      check("reopen resumes", text().includes("Start with a repository"));
-      await click("Next");
-      check("view descriptions rendered", body().querySelectorAll("dt").length === 4);
+      check("real Open menu highlighted", spot() && Math.abs(spot().getBoundingClientRect().left - document.querySelector('[data-tour="repository"]').getBoundingClientRect().left + 4) < 1);
+      check("spotlight does not intercept clicks", getComputedStyle(spot()).pointerEvents === "none");
+      const anchor = document.querySelector('[data-tour="repository"]');
+      const box = anchor.getBoundingClientRect();
+      check("Open menu remains hit-testable", anchor.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)));
+      await click("Focus highlighted control");
+      check("keyboard can reach the actual control", document.activeElement === anchor);
+      anchor.click(); await settle();
+      check("actual repository menu opens above guide", document.querySelector('[role="menu"]'));
+      const menuItem = document.querySelector('[role="menuitem"]');
+      menuItem.click(); await settle();
+      check("real menu delivers picker callback", opened === 1);
+      check("canceled picker keeps tour active", body() && JSON.parse(saved).status === "active");
+      check("canceled picker does not report success", !body().querySelector('[role="status"]'));
+      picker = "wait"; await click("Choose a repository");
+      check("pending picker disables repeat action", [...body().querySelectorAll("button")].find(b => b.textContent.trim() === "Opening…")?.disabled);
+      releasePicker(); await settle();
+      check("settled picker can be retried", text().includes("Choose a repository"));
+      picker = "fail"; await click("Choose a repository");
+      check("picker error visible", body().querySelector('[role="alert"]')?.textContent.includes("could not be opened"));
+      picker = "cancel"; await click("Choose a repository");
+      check("retry clears action error", !body().querySelector('[role="alert"]'));
+      await next();
+      check("views require an actual open repository", [...body().querySelectorAll('[aria-pressed]')].every(b => b.disabled));
+      check("missing views explain how to proceed", text().includes("Open a repository to try"));
+      check("missing target removes old spotlight", !spot());
+      await click("Back"); picker = "open"; await click("Choose a repository");
+      check("repository state confirms success", text().includes("Repository open."));
+      check("picker leaves current step active", get(tour).step === 1 && JSON.parse(saved).status === "active");
+      await next();
+      check("four live view controls", body().querySelectorAll('[aria-pressed]').length === 4);
       check("mac shortcut", text().includes("⌘K"));
       resetHostPlatformForTests({ os: "windows", dock_hiding: false }); await settle();
       check("Windows shortcut", text().includes("Ctrl+K"));
-      await click("Next");
+      for (const [label, id] of [["Code", "code"], ["History", "history"], ["Insights", "insights"], ["Work", "work"]]) {
+        await click(label);
+        check(`${label} changes the host view`, get(workspace).view === id);
+        check(`${label} reports the actual selection`, body().querySelector('[aria-pressed="true"]')?.textContent.trim() === label);
+      }
+      const rect = spot().getBoundingClientRect();
+      const views = document.querySelector('[data-tour="views"]');
+      views.style.marginLeft = "45px"; window.dispatchEvent(new Event("resize")); await settle();
+      check("spotlight follows changed layout", spot().getBoundingClientRect().left > rect.left + 40);
+      patch({ hideTargets: true }); await settle();
+      check("removed target clears spotlight", !spot());
+      const card = body().getBoundingClientRect();
+      check("missing target keeps guide within viewport", card.left >= 0 && card.top >= 0 && card.right <= innerWidth && card.bottom <= innerHeight);
+      patch({ hideTargets: false }); await settle();
+      check("remounted target is discovered", spot());
+      await next();
       check("task step", text().includes("Turn an idea into a task"));
+      await click("Open Tasks");
+      check("Tasks opens without dismissing tour", get(workspace).tasks && body());
+      check("Tasks success uses host state", text().includes("Tasks is open."));
       await click("Set up optional tools");
-      check("tool setup callback", tools === 1 && !body());
-      await click("Walkthrough"); await click("Next");
+      check("tool setup callback and deferral", tools === 1 && !body() && JSON.parse(saved).status === "deferred");
+      check("focus restored", document.activeElement.id === "replay");
+      check("dismiss removes spotlight", !spot());
+      await click("Walkthrough");
+      check("reopen resumes", text().includes("Turn an idea into a task"));
+      await next();
       check("Windows permission guidance", text().includes("Windows Security"));
       resetHostPlatformForTests({ os: "linux", dock_hiding: false }); await settle();
       check("Linux permission guidance", text().includes("folder ownership"));
@@ -75,16 +132,19 @@
       check("mac permission recovery", text().includes("Files and Folders"));
       check("trust distinct from OS access", text().includes("does not override denied folder access"));
       await click("Open Settings");
-      check("Settings callback", settings === 1 && !body());
-      await click("Walkthrough"); await click("Next");
+      check("Settings callback retains active tour", settings === 1 && body() && get(tour).step === 4);
+      check("Settings gets focus above tour", document.querySelector('[aria-label="Settings fixture"]').contains(document.activeElement));
+      await click("Close Settings");
+      check("Settings return acknowledged without a grant claim", text().includes("Settings opened. No permission grant"));
+      await next();
       check("final step", text().includes("Ready when you are"));
-      // Exercise the actual focus trap at the end of the button ring.
+      check("final modal has no stale spotlight", !spot() && body().getAttribute("aria-modal") === "true");
       const buttons = [...body().querySelectorAll("button")].filter(b => !b.disabled);
       buttons.at(-1).focus();
       buttons.at(-1).dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
-      check("Tab wraps inside dialog", document.activeElement === buttons[0]);
+      check("Tab wraps inside final dialog", document.activeElement === buttons[0]);
       buttons[0].dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }));
-      check("Shift Tab wraps inside dialog", document.activeElement === buttons.at(-1));
+      check("Shift Tab wraps inside final dialog", document.activeElement === buttons.at(-1));
       fail = true; await click("Finish");
       check("save failure stays open", body());
       check("save failure announced", body().querySelector('[role="alert"]')?.textContent.includes("could not be saved"));
@@ -96,19 +156,22 @@
       check("completed relaunch stays closed", !body());
       await click("Walkthrough");
       check("replay starts at beginning", text().includes("Your work, in one place"));
+      body().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", isComposing: true, bubbles: true, cancelable: true })); await settle();
+      check("IME Escape does not exit", body());
       body().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
       check("Escape defers", !body() && JSON.parse(saved).status === "deferred");
-      await click("Walkthrough"); await click("Next"); await click("Back");
+      await click("Walkthrough"); await next(); await click("Back");
       check("Back returns to previous step", text().includes("Your work, in one place"));
       fail = true; await click("Later"); await click("Close without saving");
       check("explicit session exit", !body());
       fail = false; await click("Walkthrough");
-      const dialog = body();
-      check("dialog fits viewport", dialog.getBoundingClientRect().height <= innerHeight && dialog.getBoundingClientRect().width <= innerWidth);
-      for (let i = get(tour).step; i < 5; i++) await click("Next");
+      for (let i = get(tour).step; i < 5; i++) await next();
+      const before = opened;
       await click("Finish and open a repository");
-      check("final repository callback", opened === 2 && !body());
+      check("final repository callback", opened === before + 1 && !body());
       check("final action records tour completion", JSON.parse(saved).status === "completed");
+      await unmount(app); window.dispatchEvent(new Event("resize")); await settle();
+      check("unmount removes guide and observers safely", !spot() && !body());
       check("no runtime errors", errors.length === 0);
       document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
     } catch (error) {

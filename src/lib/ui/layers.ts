@@ -18,6 +18,7 @@
  */
 export const LAYERS = {
   DROP_OVERLAY: 40,
+  TOUR: 45, // Live guide stays below menus, trust prompts, and Settings.
   MENU: 50,
   MODAL: 50,
   PROMPT: 60,

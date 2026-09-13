@@ -95,6 +95,7 @@
     class="flex items-center gap-1.5 shrink-0"
     role="tablist"
     aria-label="Views"
+    data-tour="views"
     tabindex="-1"
     onkeydown={onKeydown}
   >

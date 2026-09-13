@@ -43,8 +43,9 @@ catalog is in [Features](docs/FEATURES.md).
 
 ## Getting started
 
-The first-run walkthrough introduces repositories, views, Tasks, and platform
-access. Resume or replay it from **Walkthrough** in the title bar. Tool installation
+The interactive first-run walkthrough highlights app controls as you open a
+repository, try views, and explore Tasks and Settings. Resume or replay it from
+**Walkthrough** in the title bar. Tool installation
 and launch at login are optional. See [Onboarding and permissions](docs/ONBOARDING.md).
 
 ## Screenshots

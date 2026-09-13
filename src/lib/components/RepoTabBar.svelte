@@ -458,6 +458,7 @@
         type="button"
         class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
         aria-pressed={tasksOpen}
+        data-tour="tasks"
         onclick={() => interfaceStore.setTasksOpen(true)}
         title="Tasks — global, workspace and repository Kanban boards"
       >

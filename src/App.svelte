@@ -915,7 +915,7 @@
 
     <!-- Right Actions -->
     <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
-      <button class="gp-btn" title="Resume or replay the walkthrough" onclick={() => productTour.open()}>Walkthrough</button>
+      <button class="gp-btn" data-tour="replay" title="Resume or replay the walkthrough" onclick={() => productTour.open()}>Walkthrough</button>
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
       {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}
@@ -1113,8 +1113,13 @@
   {/if}
   </div>
 
-  <ProductTour onOpenRepository={() => void repoStore.pickAndOpenRepo()}
-    onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")} />
+  <ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}
+    onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}
+    onTasks={() => interfaceStore.setTasksOpen(true)}
+    onView={(view) => { interfaceStore.setGlobalSurface("repository"); repoStore.setActiveTab(view); }}
+    repositoryPath={$repoStore.currentPath} activeView={$repoStore.activeTab}
+    repositoryVisible={$interfaceStore.globalSurface === "repository"}
+    tasksOpen={$interfaceStore.globalSurface === "tasks"} settingsOpen={isSettingsModalOpen} />
   <SetupWizard />
 
   {#if tasksMounted}

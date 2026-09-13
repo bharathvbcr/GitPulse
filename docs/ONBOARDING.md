@@ -7,12 +7,28 @@ Work/Code/History/Insights views, Tasks and optional tools, platform access, and
 getting started. The title-bar **Walkthrough** button is available with or
 without an open repository.
 
-**Next** and **Back** save the current step. **Later**, the close button, and
+**Start tour**, **Continue**, **Skip step**, and **Back** save the current step. **Later**, the close button, and
 Escape defer the tour without recording completion; reopen it to resume.
-**Finish** records completion, and replay then starts at the beginning. Choosing
-a repository, Settings, or optional tools closes and defers the tour before
-opening the existing app flow. The final repository action records tour
-completion, not a successful repository open or a permission grant.
+**Finish** records completion, and replay then starts at the beginning.
+
+The welcome and finish cards are modal. The four middle steps are live guides:
+the app remains clickable, keyboard focus can leave the guide, and a highlight
+follows the existing Open menu, view tabs, or Tasks control. **Focus highlighted
+control** moves keyboard focus to that control. The guide observes layout and
+target changes only while it is active and stays below menus and native trust
+or Settings dialogs. If a control is hidden or unavailable, the guide remains
+on screen with direct actions and a skip option. Small windows scroll the card.
+
+Choosing a repository keeps the guide open. Canceling or failing the picker
+does not claim success; the open repository state controls its acknowledgment.
+Work/Code/History/Insights buttons navigate the actual repository using the
+existing view registry. Without a repository they are disabled and the guide
+offers the picker. **Open Tasks** opens the real task board without creating a
+task. **Open Settings** keeps the current tour step; close Settings to continue.
+The acknowledgment means Settings was opened, not that a permission was granted.
+Optional tool setup defers the tour before opening its existing wizard.
+The final repository action records tour completion, not a successful
+repository open or a permission grant. Skipping an interaction never blocks finishing.
 
 Progress lives in `gitpulse.product-tour.v1` in the webview's local storage,
 separately from CLI installation configuration and repository data. A crash or
@@ -43,12 +59,14 @@ and [Downloads folder documentation](https://developer.apple.com/documentation/b
 
 ## Verification
 
-- `npm test -- src/lib/tools/productTour.test.ts scripts/onboarding-contract.test.ts`
+- `npm test -- src/lib/tools/productTour.test.ts src/lib/tools/productTourTarget.test.ts scripts/onboarding-contract.test.ts`
   checks persistence, bounded navigation, corrupt state, unavailable storage,
-  failed completion/retry, native purpose strings, and App integration.
+  failed completion/retry, viewport placement, native purpose strings, and App integration.
 - `npm run test:browser -- --harness onboarding` mounts the production component
-  and exercises navigation, callbacks, replay/relaunch, focus trapping and
-  restoration, Escape, platform copy, and storage failure recovery.
+  and exercises live targets, actual Open-menu interactions, picker cancellation,
+  failure and retry, view/Tasks/Settings state, moving and missing targets,
+  replay/relaunch, modal focus trapping, live focus handoff, restoration, Escape,
+  platform copy, and storage failure recovery.
 - `npm run test:webkit -- --harness onboarding` repeats those checks in native
   WebKit. Both are registered in the repository's all-harness runners.
 - `/harness/onboarding.html` is the manual preview; `?check=1` runs its assertions.
