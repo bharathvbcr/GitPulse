@@ -739,6 +739,9 @@ fn enrich_cargo(
     if !report.cargo_audit_present {
         return false;
     }
+    let Some(audit_program) = cargo_audit_program(env) else {
+        return false;
+    };
     let mut ran = false;
     for rel in &targets.cargo_locks {
         let valid_lock = sandbox_join_canonical(repo, rel)
@@ -757,7 +760,7 @@ fn enrich_cargo(
         }
         match capture_scanner_command(
             env,
-            "cargo",
+            audit_program,
             &["audit", "--json", "--file", rel],
             Some(repo),
             AUDIT_TIMEOUT,
@@ -940,7 +943,21 @@ fn enrich_go(
             &["-json", "./..."],
             Some(&cwd),
             AUDIT_TIMEOUT,
-            &[("GOFLAGS", "-mod=readonly"), ("GO111MODULE", "on")],
+            // `GOTOOLCHAIN=local` is the same rule as composer's
+            // `--no-plugins`: a scan reads dependency metadata, so the
+            // checkout must not get to choose what runs. Loading packages
+            // reads the module's own `go` and `toolchain` lines, and under the
+            // default `auto` the go command downloads and executes the
+            // toolchain those lines name — so a `toolchain` line alone turns a
+            // Health scan into fetching and running a binary the repository
+            // picked. `local` pins the installed toolchain; a module that
+            // genuinely needs a newer one now fails loudly as
+            // `govulncheck_failed` instead of quietly switching.
+            &[
+                ("GOFLAGS", "-mod=readonly"),
+                ("GO111MODULE", "on"),
+                ("GOTOOLCHAIN", "local"),
+            ],
         );
         ran = true;
         let Some(text) = scanner_stdout(
@@ -996,7 +1013,21 @@ fn enrich_php(
         let out = capture_scanner_command(
             env,
             composer_program(),
-            &["audit", "--format=json", "--locked", "--no-interaction"],
+            // `--no-plugins` and `--no-scripts` are what make this a read of
+            // composer.lock rather than a run of the repository. Composer
+            // loads plugin packages from the project's own `vendor/` on every
+            // startup, `audit` included, and the project's own `composer.json`
+            // is what allow-lists them — so without these a Health scan
+            // executes checked-in PHP. `npm_config_ignore_scripts` already
+            // holds that line for npm; this is the same rule, same reason.
+            &[
+                "audit",
+                "--format=json",
+                "--locked",
+                "--no-interaction",
+                "--no-plugins",
+                "--no-scripts",
+            ],
             Some(&cwd),
             AUDIT_TIMEOUT,
             &[
@@ -1466,17 +1497,34 @@ fn capture_scanner_command(
     )
 }
 
+/// The spelling that reaches cargo-audit, preferring the one a repository
+/// cannot redirect.
+///
+/// `audit` is an external subcommand, not a built-in, so `cargo audit` is
+/// resolved against `[alias]` in the checkout's own `.cargo/config.toml`
+/// first: `alias.audit = ["run", …]` turns a Health scan into a build and run
+/// of the repository's code. Cargo invokes the external binary as
+/// `cargo-audit audit …`, so the arguments are identical and no alias table
+/// sits in front of it. `cargo install cargo-audit` writes that binary beside
+/// `cargo`, so the aliasable spelling is only a fallback for a host that
+/// somehow has the subcommand without it.
+fn cargo_audit_program(env: &ScanEnv) -> Option<&'static str> {
+    ["cargo-audit", "cargo"].into_iter().find(|program| {
+        capture_scanner_command(
+            env,
+            program,
+            &["audit", "--version"],
+            None,
+            VERSION_TIMEOUT,
+            &[("CARGO_TERM_COLOR", "never")],
+        )
+        .map(|o| o.success)
+        .unwrap_or(false)
+    })
+}
+
 fn cargo_audit_available(env: &ScanEnv) -> bool {
-    capture_scanner_command(
-        env,
-        "cargo",
-        &["audit", "--version"],
-        None,
-        VERSION_TIMEOUT,
-        &[("CARGO_TERM_COLOR", "never")],
-    )
-    .map(|o| o.success)
-    .unwrap_or(false)
+    cargo_audit_program(env).is_some()
 }
 
 /// npm's binary name for this platform.
@@ -4197,6 +4245,182 @@ not-json-at-all
             },
         ];
         assert_eq!(npm_scan_roots(&manifests), vec![String::new()]);
+    }
+
+    /// THE CLASS: a Health scan reads dependency metadata; it must not become
+    /// a way for a checkout to run its own code. `npm_config_ignore_scripts`
+    /// already holds that line for npm. Composer loads plugin packages out of
+    /// the project's own `vendor/` on every startup — `audit` included — and
+    /// the project's `composer.json` is what allow-lists them, so the same
+    /// rule has to be spelled on this invocation too.
+    #[cfg(unix)]
+    #[test]
+    fn a_composer_audit_never_loads_the_projects_own_plugins_or_scripts() {
+        let repo = git_repo();
+        write(repo.path(), "composer.lock", "{\"packages\":[]}\n");
+        write(repo.path(), "composer.json", "{\"name\":\"demo/demo\"}\n");
+        git_add(repo.path(), "composer.lock");
+        git_add(repo.path(), "composer.json");
+
+        let stubs = TempDir::new().unwrap();
+        let argv_log = stubs.path().join("composer-argv");
+        write_exec(
+            stubs.path(),
+            "composer",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Composer 2.10.0'; exit 0; fi\n\
+                 echo \"$*\" >> {}\necho '{{\"advisories\":{{}}}}'\nexit 0\n",
+                argv_log.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert!(
+            report.scanners_ran.contains(&"composer".to_string()),
+            "composer did not run: {:?}",
+            report.scanners_ran
+        );
+        let argv = fs::read_to_string(&argv_log).expect("composer recorded no invocation");
+        assert!(
+            argv.contains("--no-plugins"),
+            "composer audit would activate the repository's own plugins: {argv}"
+        );
+        assert!(
+            argv.contains("--no-scripts"),
+            "composer audit would run the repository's own scripts: {argv}"
+        );
+    }
+
+    /// Third instance of the same class, and the one that reaches furthest:
+    /// loading a module's packages reads its own `go` and `toolchain` lines,
+    /// and under the default `GOTOOLCHAIN=auto` the go command downloads and
+    /// executes the toolchain those lines name. A `toolchain` line in a
+    /// checked-out `go.mod` therefore chooses which binary a Health scan runs.
+    ///
+    /// Measured against the real tools before this was written: with
+    /// GitPulse's own env pairs, `govulncheck -json ./...` on a module
+    /// declaring `toolchain go1.99.7` reports
+    /// `go: downloading go1.99.7 (darwin/arm64)` and exits 1; with
+    /// `GOTOOLCHAIN=local` the same scan exits 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_go_scan_never_lets_the_module_choose_the_toolchain_that_runs() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "go.mod",
+            "module demo\n\ngo 1.26.4\n\ntoolchain go1.99.7\n",
+        );
+        git_add(repo.path(), "go.mod");
+
+        let stubs = TempDir::new().unwrap();
+        let env_log = stubs.path().join("govulncheck-env");
+        write_exec(
+            stubs.path(),
+            "govulncheck",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = -version ]; then echo 'govulncheck v1.8.0'; exit 0; fi\n\
+                 echo \"GOTOOLCHAIN=${{GOTOOLCHAIN-<unset>}}\" >> {}\n\
+                 echo '{{\"config\":{{\"scanner_name\":\"govulncheck\"}}}}'\nexit 0\n",
+                env_log.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert!(
+            report.scanners_ran.contains(&"govulncheck".to_string()),
+            "govulncheck did not run: {:?}",
+            report.scanners_ran
+        );
+        let seen = fs::read_to_string(&env_log).expect("govulncheck recorded no invocation");
+        assert!(
+            seen.contains("GOTOOLCHAIN=local"),
+            "the module's own toolchain line still decides what runs: {seen}"
+        );
+    }
+
+    /// `audit` is an external cargo subcommand, not a built-in, so `[alias]`
+    /// in the checkout's `.cargo/config.toml` shadows it — `alias.audit =
+    /// ["run", …]` turns the scan into a build and run of repository code.
+    /// Reaching the subcommand binary directly leaves no alias table in front
+    /// of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_audit_does_not_go_through_the_repositorys_alias_table() {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        write(
+            repo.path(),
+            ".cargo/config.toml",
+            "[alias]\naudit = [\"run\", \"--bin\", \"payload\"]\n",
+        );
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        git_add(repo.path(), ".cargo/config.toml");
+
+        let stubs = TempDir::new().unwrap();
+        let aliased = stubs.path().join("went-through-cargo");
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\n\
+             echo '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        write_exec(
+            stubs.path(),
+            "cargo",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = audit ]; then echo \"$*\" >> {}; fi\n\
+                 if [ \"$1\" = audit ] && [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\nexit 64\n",
+                aliased.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert_eq!(report.scanners_ran, vec!["cargo".to_string()]);
+        assert!(
+            !aliased.exists(),
+            "the audit was dispatched through cargo, where the repository's alias decides what runs: {}",
+            fs::read_to_string(&aliased).unwrap_or_default()
+        );
     }
 
     #[cfg(unix)]

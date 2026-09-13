@@ -81,6 +81,46 @@ fn saves_preserve_modes_and_internal_symlinks_and_refuse_read_only_files() {
     }
 }
 
+/// An ordinary content write drops set-user-ID and set-group-ID, and the
+/// Linux metadata path strips them along with `security.capability`. macOS
+/// reaches the same publication through `fcopyfile(COPYFILE_METADATA)`, which
+/// copies the whole mode — so without an explicit mask a save would leave a
+/// set-id file set-id on one platform only, which is the contract holding in
+/// three places and failing in the fourth.
+#[cfg(unix)]
+#[test]
+fn a_saved_file_keeps_its_permissions_but_never_its_set_id_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixture();
+    let root = repo.path().to_str().unwrap();
+    let target = repo.path().join("tool");
+    std::fs::write(&target, "old").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    // Some filesystems refuse set-user-ID outright; nothing to prove if so.
+    if std::fs::metadata(&target).unwrap().permissions().mode() & 0o4000 == 0 {
+        eprintln!("SKIPPED: this filesystem does not keep set-user-ID");
+        return;
+    }
+    sandbox_write(root, "tool", "new").unwrap();
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "new",
+        "the save itself must still land"
+    );
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "a saved file kept a set-id or sticky bit: {:o}",
+        mode
+    );
+    assert_eq!(
+        mode & 0o777,
+        0o755,
+        "clearing set-id must not disturb the ordinary permission bits"
+    );
+}
+
 #[test]
 fn concurrent_saves_publish_whole_files_or_report_a_conflict() {
     let repo = fixture();

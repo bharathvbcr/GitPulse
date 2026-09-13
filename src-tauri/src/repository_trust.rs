@@ -14,6 +14,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 pub const REQUIRED: &str = "REPOSITORY_TRUST_REQUIRED";
+/// A refusal that approving the repository cannot fix, so it must not carry
+/// [`REQUIRED`]: the desktop reads that marker as "ask for approval and retry"
+/// (`repoStore.openRepo`, `externalTools`), and a prompt whose approval
+/// changes nothing is a loop, not a diagnosis. This one says the *name* of the
+/// directory is writable by other principals, which is a filesystem change to
+/// make, not a decision to take.
+pub const SHARED_DIRECTORY: &str = "REPOSITORY_DIRECTORY_IS_SHARED";
 const MAX_METADATA: u64 = 16 * 1024;
 const MAX_RECORD: u64 = 128 * 1024;
 const MAX_SESSION_GRANTS: usize = 4096;
@@ -233,9 +240,20 @@ pub(crate) fn git_directories(repo: &Path) -> Result<(PathBuf, PathBuf), String>
 
 /// Require a current grant. Called at admission and again at process spawn.
 pub fn require(repo: &Path) -> Result<(), String> {
+    require_identified(repo).map(|_| ())
+}
+
+/// [`require`], returning the identity it validated.
+///
+/// Admission needs the identity itself, not just the verdict: it has to prove
+/// that the object this grant was checked against is the same object the child
+/// will be anchored to. Re-reading the path for that would be one more lookup a
+/// rename could redirect, so the single sample that was approved is the one
+/// that gets compared.
+fn require_identified(repo: &Path) -> Result<Identity, String> {
     let current = identity(repo.to_str().ok_or("Repository path is not UTF-8")?)?;
     if trusted(&current)? {
-        return Ok(());
+        return Ok(current);
     }
     Err(format!("{REQUIRED}: Open {} in GitPulse and explicitly trust this checkout before running repository commands.", current.checkout.path.display()))
 }
@@ -321,10 +339,34 @@ pub fn revoke(repo_path: &str) -> Result<(), String> {
     }
 }
 
+/// Whatever must outlive admission for the spawn to land where it was
+/// admitted, so callers hold it across `spawn` on every platform.
+///
+/// What that amounts to differs, and the empty Unix shape is not an oversight:
+/// there the guarantee travels inside the `Command` itself, as a `pre_exec`
+/// closure owning the pinned descriptor, so nothing is left for the caller to
+/// keep alive. On Windows it is these directory handles, whose share mode is
+/// the only thing stopping a component of the path from being renamed while
+/// the child starts.
+pub(crate) struct AdmittedCwd {
+    #[cfg(windows)]
+    _pinned: Vec<std::fs::File>,
+}
+
 /// All bounded child processes share this last admission check. Global probes
 /// get the executable volume's root, never an inherited repository directory.
 /// A project tool's explicit directory is checked against its nearest repo.
-pub(crate) fn check_command(cmd: &mut std::process::Command) -> Result<(), String> {
+///
+/// The directory is *pinned*, not merely inspected. `Command::current_dir`
+/// stores a path and the operating system resolves it again at spawn, so
+/// admitting the object a path names and then letting the spawn re-walk that
+/// path authorizes one directory and runs in another: renaming any component
+/// and leaving a symlink in its place redirects the child into a checkout that
+/// was never approved, whose `core.fsmonitor` and aliases then execute. Every
+/// directory is pinned, not only one already inside a repository — otherwise
+/// the same substitution turns an unremarkable working directory into a
+/// repository after the point where admission decided none was involved.
+pub(crate) fn check_command(cmd: &mut std::process::Command) -> Result<AdmittedCwd, String> {
     if cmd.get_current_dir().is_none() {
         let executable = std::env::current_exe()
             .and_then(|path| path.canonicalize())
@@ -335,12 +377,183 @@ pub(crate) fn check_command(cmd: &mut std::process::Command) -> Result<(), Strin
             .ok_or("Missing executable volume root")?;
         cmd.current_dir(root);
     }
-    if let Some(cwd) = cmd.get_current_dir() {
-        if let Some(repo) = crate::engine::git_cli::find_git_root(cwd) {
-            require(&repo)?;
+    let cwd = cmd
+        .get_current_dir()
+        .ok_or("Missing process directory")?
+        .to_path_buf();
+    admit_directory(cmd, &cwd)
+}
+
+/// Resolve a directory, pin it, prove the pinned object is still the one the
+/// path names, and require trust for whatever repository holds it.
+///
+/// One owner for that sequence: both the process seam and the PTY seam need
+/// exactly it, and they differ only in what they can do about a path that
+/// another principal could still substitute afterwards.
+#[cfg(unix)]
+fn pin_and_admit(cwd: &Path) -> Result<crate::fs_entry::PinnedDir, String> {
+    use std::os::unix::fs::MetadataExt;
+    // Canonicalize first. A canonical path holds no symlink by construction,
+    // so the no-follow walk below accepts every legitimate location — macOS
+    // temporary directories under `/var`, a symlinked home — and refuses only
+    // a component substituted *after* this resolution, which is the attack.
+    let resolved = cwd
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve {}: {error}", cwd.display()))?;
+    let pinned = crate::fs_entry::pin_dir_nofollow(&resolved)
+        .map_err(|error| format!("Cannot pin process directory {}: {error}", cwd.display()))?;
+    let held = pinned.dir.metadata().map_err(|e| e.to_string())?;
+    let named = fs::metadata(&resolved).map_err(|e| e.to_string())?;
+    if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err("Process directory changed while it was being admitted".into());
+    }
+    let approved = match crate::engine::git_cli::find_git_root(&resolved) {
+        Some(repo) => Some(require_identified(&repo)?),
+        None => None,
+    };
+    if !pinned.exclusive {
+        // The child will be anchored to the pinned descriptor rather than to
+        // the path, so the repository that was trusted has to be the pinned
+        // object's OWN repository. `find_git_root` answers about the path, and
+        // between the pin and that walk a rename can make the two describe
+        // different trees — a swap that is reverted before the walk leaves the
+        // descriptor inside an untrusted checkout while the path shows a
+        // trusted one, or none at all. Reading it back through the descriptor
+        // is the only answer a rename cannot reach.
+        //
+        // Paid only on this path, like the re-anchor itself: where every
+        // component is beyond other users' reach the two walks cannot diverge,
+        // and the ancestor walk would cost the hot `git` seam for nothing.
+        let anchored = crate::fs_entry::repository_identity_of_pin(&pinned.dir)
+            .map_err(|error| format!("Cannot identify the pinned repository: {error}"))?;
+        let trusted = approved
+            .as_ref()
+            .map(|identity| (identity.checkout.device, identity.checkout.inode));
+        if anchored != trusted {
+            return Err(
+                "Process directory changed while it was being admitted: the approved repository \
+                 is not the one this process would run in"
+                    .into(),
+            );
         }
     }
-    Ok(())
+    Ok(pinned)
+}
+
+/// Admit a directory for an interface that cannot re-anchor its own child.
+///
+/// A `std::process::Command` can be handed the pinned descriptor and corrected
+/// after the fact; a PTY cannot. `portable_pty` builds the command itself,
+/// owns the only `pre_exec` hook on it, and exposes no slave descriptor, so
+/// the child's working directory comes from resolving the path and nothing can
+/// fix it afterwards. Where the path is provably beyond another principal's
+/// reach that resolution is safe. Where it is not, this refuses: starting a
+/// long-lived interactive session in a directory that may have been swapped
+/// between approval and launch is the one outcome the gate exists to prevent,
+/// and there is no correcting hook to fall back on.
+pub(crate) fn require_unsubstitutable_dir(dir: &Path) -> Result<AdmittedCwd, String> {
+    #[cfg(unix)]
+    {
+        let pinned = pin_and_admit(dir)?;
+        if let Some(holder) = pinned.shared_holder {
+            return Err(format!(
+                "{SHARED_DIRECTORY}: cannot start a session in {} because {} is writable by other \
+                 users, so that path can be pointed at a different directory after this checkout \
+                 is approved. Approving the repository again will not change this — remove group \
+                 and other write access from that directory, or set its sticky bit.",
+                dir.display(),
+                holder.display()
+            ));
+        }
+        Ok(AdmittedCwd {})
+    }
+    #[cfg(windows)]
+    {
+        // Windows holds the path open instead: the pinned chain omits
+        // FILE_SHARE_DELETE, so no component can be renamed while the caller
+        // keeps this guard alive across the spawn.
+        admit_directory_windows(dir)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Err("Process admission cannot pin a directory on this platform".into())
+    }
+}
+
+/// The pinned descriptor and the path must name the same object, or a
+/// component moved between the two resolutions and neither answer describes
+/// what would run.
+#[cfg(unix)]
+fn admit_directory(cmd: &mut std::process::Command, cwd: &Path) -> Result<AdmittedCwd, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let pinned = pin_and_admit(cwd)?;
+    if pinned.exclusive {
+        // Nobody outside this user can rename a component of this path, so the
+        // spawn's own resolution reaches the object just admitted. Re-anchoring
+        // anyway would buy nothing and cost the `posix_spawn` fast path: a
+        // `pre_exec` closure forces `fork` + `exec` of a process holding the
+        // parent's whole address space, measured at +123% per spawn by
+        // `benches/process_spawn.rs`, on the seam every `git` call goes through.
+        return Ok(AdmittedCwd {});
+    }
+    // A shared ancestor can be substituted by someone else between here and the
+    // spawn, so stop trusting the path and hand the child the descriptor.
+    let dir = pinned.dir;
+    // SAFETY: `fchdir` is async-signal-safe and the closure allocates nothing,
+    // takes no lock, and touches no other state — the only requirements between
+    // `fork` and `exec`. The descriptor stays open until exec closes it.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fchdir(dir.as_raw_fd()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(AdmittedCwd {})
+}
+
+#[cfg(windows)]
+fn admit_directory(_cmd: &mut std::process::Command, cwd: &Path) -> Result<AdmittedCwd, String> {
+    admit_directory_windows(cwd)
+}
+
+#[cfg(windows)]
+fn admit_directory_windows(cwd: &Path) -> Result<AdmittedCwd, String> {
+    // Canonical first, for the reason the Unix arm gives: `pin_directory`
+    // refuses a reparse point, and a junction anywhere in the caller's spelling
+    // is ordinary, not hostile.
+    let resolved = cwd
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve {}: {error}", cwd.display()))?;
+    let pinned = crate::fs_entry::pin_dir_chain(&resolved, false)
+        .map_err(|error| format!("Cannot pin process directory {}: {error}", cwd.display()))?;
+    let leaf = pinned.last().ok_or("Missing pinned process directory")?;
+    let held = crate::fs_entry::windows_file_identity(leaf)
+        .map_err(|error| format!("Cannot identify process directory: {error}"))?;
+    let named = crate::fs_entry::pin_directory(&resolved)
+        .and_then(|handle| crate::fs_entry::windows_file_identity(&handle))
+        .map_err(|error| format!("Cannot identify process directory: {error}"))?;
+    if held != named {
+        return Err("Process directory changed while it was being admitted".into());
+    }
+    if let Some(repo) = crate::engine::git_cli::find_git_root(&resolved) {
+        require(&repo)?;
+    }
+    // The handles stay open across the spawn: without FILE_SHARE_DELETE no
+    // component of this path can be renamed or removed while the child starts.
+    // That also removes the reason the Unix arm reads the repository back
+    // through the pinned descriptor: the pin is taken before this trust check,
+    // and nothing can rename a component while it is held, so the path cannot
+    // come to mean something else between the two reads.
+    Ok(AdmittedCwd { _pinned: pinned })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn admit_directory(_cmd: &mut std::process::Command, _cwd: &Path) -> Result<AdmittedCwd, String> {
+    Err("Process admission cannot pin a directory on this platform".into())
 }
 
 #[cfg(test)]
@@ -416,6 +629,202 @@ mod tests {
         crate::watcher::start_watch_inner(&state, path.into(), |_| {}).unwrap();
         revoke(path).unwrap();
         crate::watcher::unwatch(&state, path.into()).unwrap();
+    }
+
+    /// THE CLASS: admission resolved a path, the spawn resolved it again, and
+    /// only the second one decided where the child actually ran. Substituting
+    /// the directory in between authorized one checkout and executed another —
+    /// whose `core.fsmonitor` and aliases are exactly what the gate exists to
+    /// keep from running. No race is needed to prove it: the substitution
+    /// happens between the two calls the real seam makes back to back.
+    ///
+    /// The holding directory is world-writable, which is precisely when
+    /// another principal could do this and therefore when admission stops
+    /// trusting the path and hands the child a descriptor instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_substituted_directory_cannot_redirect_an_admitted_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).unwrap();
+        let admitted_path = base.join("admitted");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir(&admitted_path).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+
+        let mut cmd = std::process::Command::new("/bin/pwd");
+        cmd.current_dir(&admitted_path);
+        // Named, not dropped: on Windows this holds the directory handles open
+        // across the spawn; on Unix the re-anchor lives in the command itself.
+        let _admission = check_command(&mut cmd).expect("a plain directory is admitted");
+
+        // The directory that was admitted keeps its identity under a new name;
+        // its old name now points somewhere that was never admitted.
+        let moved = base.join("moved");
+        fs::rename(&admitted_path, &moved).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &admitted_path).unwrap();
+
+        let output = cmd.output().expect("spawn pwd");
+        let ran_in = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            ran_in, moved,
+            "the child ran in a directory that was never admitted"
+        );
+        assert_ne!(ran_in, elsewhere.canonicalize().unwrap());
+    }
+
+    /// The fast path is taken on exactly one condition, so that condition is
+    /// asserted directly rather than inferred from a timing difference: a
+    /// private chain is exclusive, and one world-writable ancestor is enough
+    /// to lose it.
+    #[cfg(unix)]
+    /// No-narrowing for the strict path, and the one that would bite hardest
+    /// if the descriptor-side repository walk disagreed with `find_git_root`:
+    /// an ordinary trusted checkout under a world-writable holder must still
+    /// be admitted, from its root and from a subdirectory, every single time.
+    ///
+    /// The two walks answer the same question by different means, so a
+    /// mismatch in how either reads `.git` — a worktree's `.git` file, a
+    /// symlink, a bare layout — would show up here as a refusal of a
+    /// repository nobody was attacking.
+    #[cfg(unix)]
+    #[test]
+    fn a_trusted_checkout_under_a_shared_holder_is_still_admitted_every_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let holder = base.join("holder");
+        fs::create_dir(&holder).unwrap();
+        let checkout = holder.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let nested = checkout.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&checkout)
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        crate::test_support::trust_repo(&checkout);
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(
+            !crate::fs_entry::pin_dir_nofollow(&checkout)
+                .unwrap()
+                .exclusive,
+            "the layout must put admission on the strict path, or this proves nothing"
+        );
+
+        for cwd in [&checkout, &nested] {
+            for attempt in 0..25 {
+                let mut cmd = std::process::Command::new("/bin/pwd");
+                cmd.current_dir(cwd);
+                let _admission = check_command(&mut cmd).unwrap_or_else(|error| {
+                    panic!(
+                        "attempt {attempt} refused a trusted checkout at {}: {error}",
+                        cwd.display()
+                    )
+                });
+                let output = cmd.output().expect("spawn pwd");
+                let ran_in = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+                    .canonicalize()
+                    .unwrap();
+                assert_eq!(&ran_in, cwd, "attempt {attempt} landed elsewhere");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_privately_held_path_skips_the_child_side_re_anchor() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let nested = base.join("outer").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(
+            crate::fs_entry::pin_dir_nofollow(&nested)
+                .unwrap()
+                .exclusive,
+            "a chain under a private temporary directory is reachable only by this user"
+        );
+        fs::set_permissions(base.join("outer"), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            !crate::fs_entry::pin_dir_nofollow(&nested)
+                .unwrap()
+                .exclusive,
+            "a world-writable holder lets another user rename the component under it"
+        );
+        // The leaf's own permissions are not what decides this: renaming an
+        // entry needs write on the directory holding it.
+        fs::set_permissions(base.join("outer"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            crate::fs_entry::pin_dir_nofollow(&nested)
+                .unwrap()
+                .exclusive
+        );
+    }
+
+    /// Pinning must not narrow what is admissible: a repository reached
+    /// through a symlinked ancestor is ordinary, and the no-follow walk runs
+    /// on the canonical path precisely so it stays that way.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_reached_through_a_symlinked_ancestor_is_still_admitted() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        fs::create_dir_all(real.join("inner")).unwrap();
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let mut cmd = std::process::Command::new("/bin/pwd");
+        cmd.current_dir(alias.join("inner"));
+        let _admission = check_command(&mut cmd).expect("a symlinked ancestor is not an attack");
+        let output = cmd.output().expect("spawn pwd");
+        assert_eq!(
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+                .canonicalize()
+                .unwrap(),
+            real.join("inner").canonicalize().unwrap()
+        );
+    }
+
+    /// Load-bearing for the whole admission design, not just for grants:
+    /// discovery walks a path to find the repository that must be trusted, and
+    /// that walk races anything able to rewrite the tree. It stays harmless
+    /// only because approval is bound to a *location as well as an object* —
+    /// so no attacker can move an already-approved checkout into the path
+    /// being walked and have the grant come with it.
+    #[test]
+    fn a_grant_does_not_travel_with_the_directory_it_approved() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("approved");
+        fs::create_dir(&original).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&original)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let path = original.to_str().unwrap();
+        let preview = inspect(path).unwrap();
+        grant(path, &preview.identity, false).unwrap();
+        require(&original).expect("the approved checkout is trusted where it was approved");
+
+        let moved = parent.path().join("relocated");
+        fs::rename(&original, &moved).unwrap();
+        assert!(
+            require(&moved).is_err(),
+            "the grant followed the directory to a path that was never approved"
+        );
+        assert!(
+            require(&original).is_err(),
+            "a vanished path still answered as trusted"
+        );
     }
 
     #[cfg(unix)]

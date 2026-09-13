@@ -684,11 +684,19 @@ fn spawn_session_inner<R: tauri::Runtime>(
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }
-    let spawn_result = crate::repository_trust::require(&repo).and_then(|_| {
-        pair.slave
-            .spawn_command(cmd)
-            .map_err(|error| format!("Failed to spawn process '{shell}': {error}"))
-    });
+    // Not the plain `require`: a PTY child cannot be re-anchored the way
+    // `procguard::spawn` re-anchors an ordinary one, because `portable_pty`
+    // builds the command, owns its only `pre_exec` hook, and hands back no
+    // slave descriptor. So the directory has to be one that cannot be
+    // substituted between this check and the launch, and the guard is held
+    // across `spawn_command` for the platforms where holding it is what does
+    // the work.
+    let spawn_result =
+        crate::repository_trust::require_unsubstitutable_dir(&repo).and_then(|_anchored| {
+            pair.slave
+                .spawn_command(cmd)
+                .map_err(|error| format!("Failed to spawn process '{shell}': {error}"))
+        });
     let child = match spawn_result {
         Ok(child) => child,
         Err(reason) => {
@@ -2258,6 +2266,122 @@ mod tests {
             .expect("git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir);
+    }
+
+    /// A checkout inside `holder`, trusted, with `holder` set to `mode`.
+    #[cfg(unix)]
+    fn repo_under_holder(base: &std::path::Path, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let holder = base.join("holder");
+        std::fs::create_dir(&holder).unwrap();
+        let repo = holder.join("checkout");
+        std::fs::create_dir(&repo).unwrap();
+        init_test_repo(&repo);
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(mode)).unwrap();
+        repo
+    }
+
+    #[cfg(unix)]
+    fn try_pty_launch(repo: &std::path::Path, marker: &str) -> Result<TerminalSpawned, String> {
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        spawn_session_inner(
+            app.handle(),
+            &state,
+            repo.to_str().unwrap(),
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), format!("touch {marker}")]),
+            None,
+            None,
+        )
+    }
+
+    /// THE CLASS: trust is granted to an object, but a PTY child's working
+    /// directory is resolved from a *path* at launch — and unlike
+    /// `procguard::spawn`, nothing can re-anchor it afterwards, because
+    /// `portable_pty` owns the command's only `pre_exec` hook. So a session may
+    /// only start where the name cannot be swapped out from under it.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_refuses_a_checkout_whose_holder_other_users_can_rewrite() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = repo_under_holder(base.path(), 0o777);
+        let error = try_pty_launch(&repo, "world-writable-marker")
+            .expect_err("a substitutable holder must not start an interactive session");
+        assert!(
+            error.contains(crate::repository_trust::SHARED_DIRECTORY),
+            "refusal must name this specific cause, not an incidental failure: {error}"
+        );
+        // Granting trust cannot fix a writable holder, so this must not carry
+        // the marker the desktop reacts to by prompting for approval — that
+        // would send the user round a loop whose every turn ends here.
+        assert!(
+            !error.contains(crate::repository_trust::REQUIRED),
+            "refusal invites a trust prompt that cannot resolve it: {error}"
+        );
+        assert!(
+            error.contains("holder"),
+            "a refusal has to name the directory to change: {error}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !repo.join("world-writable-marker").exists(),
+            "the shell ran despite the refusal"
+        );
+    }
+
+    /// A gate that refuses most of the time is a different defect from one
+    /// that always refuses, and only repetition tells them apart. Both verdicts
+    /// have to be the same on every attempt, or a user retries until they get
+    /// the answer they want.
+    #[cfg(unix)]
+    #[test]
+    fn the_terminal_verdict_is_identical_on_every_attempt() {
+        let base = tempfile::tempdir().unwrap();
+        let (a, b) = (base.path().join("a"), base.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let shared = repo_under_holder(&a, 0o777);
+        let sticky = repo_under_holder(&b, 0o1777);
+
+        for attempt in 0..25 {
+            let refusal = try_pty_launch(&shared, &format!("shared-{attempt}"))
+                .expect_err("attempt {attempt} started a session in a substitutable checkout");
+            assert!(
+                refusal.contains(crate::repository_trust::SHARED_DIRECTORY),
+                "attempt {attempt} refused for the wrong reason: {refusal}"
+            );
+        }
+        for attempt in 0..25 {
+            try_pty_launch(&sticky, &format!("sticky-{attempt}")).unwrap_or_else(|e| {
+                panic!("attempt {attempt} wrongly refused a sticky holder: {e}")
+            });
+        }
+    }
+
+    /// The carve-out that keeps the refusal honest rather than merely strict:
+    /// a sticky holder — `/tmp`, `/Users/Shared` — lets nobody but the entry's
+    /// owner rename it, so those checkouts must still open a terminal.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_still_opens_under_a_sticky_world_writable_holder() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = repo_under_holder(base.path(), 0o1777);
+        let spawned = try_pty_launch(&repo, "sticky-marker")
+            .expect("a sticky holder cannot be rewritten by another user");
+        for _ in 0..100 {
+            if repo.join("sticky-marker").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            repo.join("sticky-marker").exists(),
+            "session {} never ran in the checkout",
+            spawned.id
+        );
     }
 
     #[test]

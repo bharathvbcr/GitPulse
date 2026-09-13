@@ -244,7 +244,10 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     if shutting_down() {
         return Err(refused(label));
     }
-    crate::repository_trust::check_command(cmd)
+    // Held until after the spawn: admission pins the directory the child will
+    // run in, and releasing that pin before `spawn` would hand the resolution
+    // back to the path it was checked against.
+    let _admitted = crate::repository_trust::check_command(cmd)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     sys::prepare(cmd);
     let mut child = cmd.spawn()?;

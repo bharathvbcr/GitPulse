@@ -449,7 +449,17 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
         None,
     )
     .unwrap();
-    receive.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Setup, not the assertion: this only waits for the window to reach its
+    // limit so there is something for `close` to wake. A shell `printf` loop
+    // needs about four seconds to push 256 KiB through a PTY on a developer
+    // machine, so a five-second deadline failed roughly one run in six here
+    // with nothing wrong — a flake that teaches people to re-run a red suite.
+    // The deadline stays bounded, just far enough above the real cost to mean
+    // "this never happened" rather than "this machine was busy". Every
+    // assertion below is unchanged.
+    receive
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the output window never reached its limit");
     std::thread::sleep(Duration::from_millis(50));
     let pending = total.load(std::sync::atomic::Ordering::SeqCst);
     assert!((256 * 1024 - 4096..=256 * 1024).contains(&pending));

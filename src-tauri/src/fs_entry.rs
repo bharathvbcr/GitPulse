@@ -122,21 +122,179 @@ pub(crate) fn rename_noreplace(_source: &Path, _target: &Path) -> io::Result<()>
 /// happens relative to the preceding pinned descriptor, never a path re-walk.
 #[cfg(unix)]
 pub(crate) fn pin_parent(path: &Path, create: bool) -> io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Component;
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Expected an absolute file path",
         ));
     }
-    let mut directory = std::fs::File::open("/")?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
-    for (depth, component) in parent.components().enumerate() {
+    open_dir_chain(parent, create).map(|pinned| pinned.dir)
+}
+
+/// A pinned directory, and whether its *name* is beyond another user's reach.
+#[cfg(unix)]
+pub(crate) struct PinnedDir {
+    pub(crate) dir: std::fs::File,
+    /// True when no principal other than this user or root can rename any
+    /// component of the path, so the name cannot be made to point somewhere
+    /// else after it has been resolved. False whenever that cannot be
+    /// established.
+    ///
+    /// Mode bits are the same signal Git's own `safe.directory` ownership
+    /// check uses. It does not model POSIX/NFSv4 ACLs: an ACL granting another
+    /// user write on an ancestor would not show up here, so this answers
+    /// "provably private", never "provably shared".
+    pub(crate) exclusive: bool,
+    /// The first directory that cost the path its exclusivity, so a refusal can
+    /// name what to change instead of only saying no.
+    pub(crate) shared_holder: Option<std::path::PathBuf>,
+}
+
+/// Pin `dir` itself, walking it component by component without following a
+/// symlink at any of them.
+///
+/// The descriptor is bound to the directory's inode, so renaming or replacing
+/// any component of the path afterwards cannot redirect work done through it.
+/// That is the difference between validating a path and validating the object
+/// a path happened to name a moment ago.
+#[cfg(unix)]
+/// The identity of the repository the pinned directory belongs to, read
+/// through descriptors instead of names.
+///
+/// [`crate::engine::git_cli::find_git_root`] walks a *path*, so each step is a
+/// fresh name lookup that a concurrent rename can redirect. This walks the same
+/// tree with `openat(fd, "..")`, where the kernel derives the parent from the
+/// object itself, so the answer describes the directory that was actually
+/// pinned and no rename running alongside can change it.
+///
+/// The two tests mirror `find_git_root` exactly — a `.git` entry, resolved
+/// through a symlink the way `Path::exists` does, or a bare layout of a `HEAD`
+/// file beside an `objects` directory — so a legitimate checkout is never
+/// classified differently by the two walks.
+#[cfg(unix)]
+pub(crate) fn repository_identity_of_pin(dir: &std::fs::File) -> io::Result<Option<(u64, u64)>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    // A duplicate, so the caller keeps the descriptor it will hand the child.
+    let mut current = dir.try_clone()?;
+    for _ in 0..256 {
+        let metadata = current.metadata()?;
+        let here = (metadata.dev(), metadata.ino());
+        if holds_a_repository(&current) {
+            return Ok(Some(here));
+        }
+        // SAFETY: live directory descriptor and a NUL-terminated literal.
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returned a newly owned descriptor.
+        let parent = unsafe { std::fs::File::from_raw_fd(fd) };
+        let above = parent.metadata()?;
+        if (above.dev(), above.ino()) == here {
+            // `..` of the filesystem root is itself; there is nowhere left.
+            return Ok(None);
+        }
+        current = parent;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "File path exceeds the directory depth limit",
+    ))
+}
+
+/// Does this directory look like the root of a repository?
+#[cfg(unix)]
+fn holds_a_repository(dir: &std::fs::File) -> bool {
+    if entry_mode(dir, c".git").is_some() {
+        return true;
+    }
+    let head = entry_mode(dir, c"HEAD");
+    let objects = entry_mode(dir, c"objects");
+    matches!(head, Some(mode) if mode & libc::S_IFMT == libc::S_IFREG)
+        && matches!(objects, Some(mode) if mode & libc::S_IFMT == libc::S_IFDIR)
+}
+
+/// `st_mode` of one entry under a pinned directory, or `None` when it cannot be
+/// read for any reason — the same answer `Path::exists` gives, so this walk and
+/// `find_git_root` agree on dangling links and unreadable entries too.
+#[cfg(unix)]
+fn entry_mode(dir: &std::fs::File, name: &std::ffi::CStr) -> Option<libc::mode_t> {
+    use std::os::fd::AsRawFd;
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: live directory descriptor and a NUL-terminated literal name.
+    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut status, 0) };
+    (rc == 0).then_some(status.st_mode)
+}
+
+pub(crate) fn pin_dir_nofollow(dir: &Path) -> io::Result<PinnedDir> {
+    if !dir.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected an absolute directory path",
+        ));
+    }
+    open_dir_chain(dir, false)
+}
+
+#[cfg(unix)]
+fn held_by_a_trusted_owner(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let owner = metadata.uid();
+    // SAFETY: `geteuid` reads this process's own credentials and cannot fail.
+    owner == unsafe { libc::geteuid() } || owner == 0
+}
+
+/// Is `entry` beyond the reach of every principal but this user and root?
+///
+/// Answers the question the name asks, in the direction the name asks it:
+/// `true` means nobody else can rename this entry away.
+///
+/// Renaming an entry needs write permission on the directory holding it, so
+/// the holder decides — except when the holder is sticky, where only the
+/// entry's own owner or root may rename it. That carve-out is what keeps a
+/// world-writable `/tmp` or `/Users/Shared` usable: without it every checkout
+/// under one would read as shared and be refused a terminal.
+#[cfg(unix)]
+fn holder_keeps_entry_private(holder: &std::fs::Metadata, entry: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if !held_by_a_trusted_owner(holder) {
+        return false;
+    }
+    if holder.mode() & 0o022 == 0 {
+        return true;
+    }
+    holder.mode() & 0o1000 != 0 && held_by_a_trusted_owner(entry)
+}
+
+/// Shared walk behind [`pin_parent`] and [`pin_dir_nofollow`]: open each
+/// component of `dir` relative to the previous descriptor, never re-walking a
+/// path and never following a symlink.
+#[cfg(unix)]
+fn open_dir_chain(dir: &Path, create: bool) -> io::Result<PinnedDir> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let mut directory = std::fs::File::open("/")?;
+    // Optional throughout: this walk also backs `pin_parent`, which every file
+    // save goes through, and an unreadable stat must cost the path its
+    // exclusivity — never turn a save that used to work into an error.
+    let mut holder = directory.metadata().ok();
+    let mut walked = std::path::PathBuf::from("/");
+    let mut shared_holder =
+        (!holder.as_ref().is_some_and(held_by_a_trusted_owner)).then(|| walked.clone());
+    for (depth, component) in dir.components().enumerate() {
         if depth >= 256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -183,8 +341,25 @@ pub(crate) fn pin_parent(path: &Path, create: bool) -> io::Result<std::fs::File>
         }
         // SAFETY: successful openat returned a newly owned descriptor.
         directory = unsafe { std::fs::File::from_raw_fd(fd) };
+        let entry = directory.metadata().ok();
+        // Whether THIS component can be swapped is decided by the directory
+        // holding it, not by the component itself. An unknown holder or entry
+        // answers "not private", which is the safe direction.
+        let private = match (&holder, &entry) {
+            (Some(holder), Some(entry)) => holder_keeps_entry_private(holder, entry),
+            _ => false,
+        };
+        if shared_holder.is_none() && !private {
+            shared_holder = Some(walked.clone());
+        }
+        walked.push(part);
+        holder = entry;
     }
-    Ok(directory)
+    Ok(PinnedDir {
+        dir: directory,
+        exclusive: shared_holder.is_none(),
+        shared_holder,
+    })
 }
 
 #[cfg(windows)]
@@ -246,7 +421,6 @@ pub(crate) fn pin_directory(path: &Path) -> io::Result<std::fs::File> {
 
 #[cfg(windows)]
 pub(crate) fn pin_parents(path: &Path, create: bool) -> io::Result<Vec<std::fs::File>> {
-    use std::path::{Component, PathBuf};
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -256,9 +430,25 @@ pub(crate) fn pin_parents(path: &Path, create: bool) -> io::Result<Vec<std::fs::
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing parent"))?;
+    pin_dir_chain(parent, create)
+}
+
+/// Pin `dir` and every ancestor. Windows has no `O_NOFOLLOW` walk, so the
+/// guarantee comes from the handles themselves: [`pin_directory`] omits
+/// `FILE_SHARE_DELETE`, so while these are held no component of the path can
+/// be renamed or removed, and none of them may be a reparse point.
+#[cfg(windows)]
+pub(crate) fn pin_dir_chain(dir: &Path, create: bool) -> io::Result<Vec<std::fs::File>> {
+    use std::path::{Component, PathBuf};
+    if !dir.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected an absolute directory path",
+        ));
+    }
     let mut current = PathBuf::new();
     let mut handles = Vec::new();
-    for component in parent.components() {
+    for component in dir.components() {
         if handles.len() >= 256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

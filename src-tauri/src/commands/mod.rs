@@ -2414,13 +2414,34 @@ pub async fn cmd_harness_reconnect() -> crate::harness::HarnessStatus {
     .unwrap_or_else(|e| harness_join_failure(e.to_string()))
 }
 
+/// Judges `command` for `repo_path` on the calling thread.
+///
+/// Reserved endpoint, but still an entry point: `root` crosses a process
+/// boundary into the harness sidecar, so it is resolved as a repository here
+/// instead of being forwarded as an arbitrary string. Filesystem-only on
+/// purpose — judging a command starts nothing in the checkout, so this asks
+/// for identity, not execution authority.
+///
+/// A path that is not a repository comes back unchecked, carrying the
+/// resolution failure as its detail, rather than as a verdict for a root the
+/// gate was never given.
+fn policy_verdict_for(repo_path: &str, command: &str) -> crate::harness::PolicyVerdict {
+    match crate::engine::git_cli::validate_repo_path(repo_path) {
+        Ok(repo) => crate::harness::check_command(&repo.to_string_lossy(), command, None),
+        Err(reason) => crate::harness::PolicyVerdict::unchecked(
+            command,
+            &crate::harness::HarnessError::Unavailable(reason),
+        ),
+    }
+}
+
 #[tauri::command(async)]
 pub async fn cmd_policy_check_command(
     repo_path: String,
     command: String,
 ) -> crate::harness::PolicyVerdict {
     let command_for_fallback = command.clone();
-    off_thread(move || Ok::<_, String>(crate::harness::check_command(&repo_path, &command, None)))
+    off_thread(move || Ok::<_, String>(policy_verdict_for(&repo_path, &command)))
         .await
         .unwrap_or_else(|e| {
             crate::harness::PolicyVerdict::unchecked(
@@ -2530,6 +2551,64 @@ mod tests {
         std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
         crate::test_support::trust_repo(dir.path());
         dir
+    }
+
+    /// The gate must never answer for a root it was never given.
+    ///
+    /// Pre-fix the caller's string went straight to the sidecar as `root`, so
+    /// the verdict described whatever the harness made of a path this process
+    /// had not resolved. The needle is the resolution failure itself: a
+    /// sidecar that is absent, slow, or unhappy writes its own detail and
+    /// never this one, so the assertion cannot pass by the harness being down.
+    #[test]
+    fn a_policy_check_will_not_judge_a_root_that_is_not_a_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let verdict = policy_verdict_for(&dir.path().to_string_lossy(), "git status");
+
+        assert!(!verdict.checked, "a root that never resolved was judged");
+        assert_eq!(verdict.status, crate::harness::PolicyStatus::Unchecked);
+        assert!(
+            verdict.detail.contains("Not a Git repository"),
+            "the refusal must say why the gate did not run: {:?}",
+            verdict.detail
+        );
+        assert_eq!(
+            verdict.target, "git status",
+            "the judged target is the command, not the root"
+        );
+    }
+
+    /// Root shapes that must not reach a second process at all. Each is
+    /// refused for a different reason, and each must still say which.
+    #[test]
+    fn a_policy_check_refuses_every_root_shape_that_cannot_name_a_checkout() {
+        for root in [
+            "",
+            "relative/path",
+            "/no/such/directory/anywhere",
+            "/tmp/\u{7}bell",
+        ] {
+            let verdict = policy_verdict_for(root, "git status");
+            assert!(!verdict.checked, "{root:?} was forwarded to the harness");
+            assert!(
+                !verdict.detail.is_empty(),
+                "{root:?} was refused without saying why"
+            );
+        }
+    }
+
+    /// No-narrowing: resolving the root must not cost a real checkout its
+    /// verdict. Asserted on the refusal text rather than on `checked`, because
+    /// whether the sidecar answers here depends on the machine.
+    #[test]
+    fn a_policy_check_still_forwards_a_real_checkout() {
+        let dir = repo_with_tracked_and_untracked();
+        let verdict = policy_verdict_for(&dir.path().to_string_lossy(), "git status");
+        assert!(
+            !verdict.detail.contains("Not a Git repository"),
+            "a real checkout was refused by the resolution step: {:?}",
+            verdict.detail
+        );
     }
 
     #[test]

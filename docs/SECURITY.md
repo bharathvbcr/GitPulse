@@ -63,6 +63,26 @@ flowchart TD
   result, never a successful empty scan.
 - Global tool probes run from a neutral filesystem root. Local source-tool
   installation requires approval for the checkout used to build the tool.
+- Approval binds a directory, not a path. Because the operating system resolves
+  a working-directory path again when a child starts, GitPulse pins the
+  approved directory and starts the child on that pinned directory, so
+  renaming a path component and leaving a link in its place cannot divert a
+  Git or tool process into a checkout that was never approved. Where the whole
+  path is already beyond other users' reach — every component owned by this
+  user or root, and not writable by group or other unless it is sticky — the
+  pin is redundant and is skipped, which keeps the common case on the fast
+  process-launch path.
+- On that pinned path the repository a child belongs to is read back through
+  the pinned directory itself rather than by walking the path a second time,
+  and the approval must name that same repository. A rename that briefly
+  substitutes a directory and puts it back can otherwise leave the two
+  descriptions disagreeing, with the child anchored to one checkout while the
+  approval was granted for another.
+- A terminal is the one child that cannot be re-anchored after it starts, so it
+  is refused outright when a directory holding some component of the checkout's
+  path is writable by other users. That refusal names the directory to change
+  and is deliberately distinct from a trust refusal: approving the repository
+  again cannot resolve it.
 - Use the repository tab's **Revoke repository trust** action to close the tab
   and block subsequent operations. Already-started terminals and agent tasks
   retain the authority they were given; stop them separately when needed.
@@ -119,6 +139,19 @@ flowchart TD
   in diagnostics, never presented as an all-clear.
 - **Scan local** on the Health panel does not call GitHub. The **Check GitHub
   alerts** button remains a manual refresh.
+
+### Local Dependency Scans Read, They Do Not Build
+- Health's local dependency scan runs whichever audit CLIs are already on
+  PATH, and each is invoked so that it reads dependency metadata instead of
+  running the checkout: npm with `ignore-scripts`, Composer with
+  `--no-plugins --no-scripts` so the project's own `vendor/` plugins are not
+  activated, pip-audit with `--no-deps --disable-pip`, cargo-audit through its
+  subcommand binary so an `[alias]` in the checkout's Cargo configuration
+  cannot shadow it, and govulncheck with `GOTOOLCHAIN=local` so a module's own
+  `toolchain` line cannot choose which Go toolchain is downloaded and run.
+- A scan that cannot complete is reported as a failed check, never as a clean
+  result. These are bounded read-only invocations, not a sandbox: each scanner
+  still parses repository-supplied files with the user's account permissions.
 
 ### Opt-In Release Checks
 - Automatic application release checks are off by default; GitPulse does not

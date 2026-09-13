@@ -110,6 +110,29 @@ fn main() {
             }
             cmd
         }),
+        // What process admission now costs. `repository_trust::check_command`
+        // re-anchors the child onto a pinned descriptor, because
+        // `current_dir` stores a path the OS resolves again at spawn and a
+        // substituted component would otherwise run the child in a checkout
+        // that was never approved. `fchdir` is cheap; the price is the
+        // `pre_exec` closure itself, which is the row above measured again on
+        // the syscall admission actually makes.
+        measure("process_group(0) + pre_exec fchdir  [admission]", || {
+            let mut cmd = trivial();
+            cmd.process_group(0);
+            let dir = std::fs::File::open("/").expect("pin /");
+            // SAFETY: `fchdir` is async-signal-safe and the closure touches no
+            // shared memory; the descriptor stays open until exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(std::os::fd::AsRawFd::as_raw_fd(&dir)) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd
+        }),
     ];
 
     println!("\n{SAMPLES} samples per row, {WARMUP} warmup\n");

@@ -379,11 +379,17 @@ mod unix {
                         mode & !0o111
                     };
                 }
-                if source.mode != next.mode || !cfg!(target_os = "macos") || original.is_none() {
-                    handle
-                        .set_permissions(std::fs::Permissions::from_mode(mode))
-                        .map_err(|e| e.to_string())?;
-                }
+                // Unconditional, and `mode` is masked to 0o777, so this is
+                // also what clears set-user-ID, set-group-ID and the sticky
+                // bit. Those are dropped by an ordinary content write and by
+                // the Linux arm above, which strips them along with
+                // `security.capability`; `fcopyfile` copies the whole mode, so
+                // without this a saved resolution would leave a set-id file
+                // set-id on macOS alone. For every other bit this repeats what
+                // the metadata copy already applied.
+                handle
+                    .set_permissions(std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| e.to_string())?;
                 handle.sync_all().map_err(|e| e.to_string())?;
             }
         }
