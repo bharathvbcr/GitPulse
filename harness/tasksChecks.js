@@ -21,6 +21,10 @@ let tasks = [
   { ...makeTask("task-2", "Make task sheets easier to scan", "repo-0", "review"), priority: 1, kind: "improvement", owner: "Bharath", labels: ["usability", "tasks", "desktop"], repository_ids: ["repo-0", "repo-1"] },
   makeTask("task-3", "Review the agent handoff", "repo-1", "backlog"),
   ...Array.from({length: 32}, (_, i) => makeTask(`task-${i + 10}`, `Ready task ${String(i + 1).padStart(2, "0")}`, "repo-0")),
+  // More completed tasks than one page holds, so the archive's "showing N of
+  // M" line and its Load more are exercised against a real second page rather
+  // than a list that happens to fit.
+  ...Array.from({length: 34}, (_, i) => makeTask(`task-${i + 100}`, `Completed task ${String(i + 1).padStart(2, "0")}`, "repo-0", "done")),
 ];
 let corruptDelete = false, loseDelete = false;
 const deleted = new Set(), deleteWrites = [];
@@ -119,7 +123,13 @@ mockIPC(async (cmd, args) => {
     }
     case "items.list": {
       if (failList) throw {code: "store_error", message: "Fixture task storage offline"};
-      const matching = tasks.filter(task => !deleted.has(task.id) && task.status === input.status && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (!input.workspace_id || task.repository_ids.some(id => workspace.repository_ids.includes(id))) && (!input.query || task.title.toLowerCase().includes(input.query.toLowerCase())));
+      const matching = tasks.filter(task => !deleted.has(task.id) && task.status === input.status && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (!input.workspace_id || task.repository_ids.some(id => workspace.repository_ids.includes(id))) && (!input.query || task.title.toLowerCase().includes(input.query.toLowerCase())))
+        // `ORDER BY t.position,t.id`, the same key the store pages on. The
+        // fixture used to page in array order, so `items.put` — which appends
+        // — moved an edited task to the end of its new column and off the
+        // first page. Paging is what this fixture is for, so the order it
+        // pages in has to be the real one.
+        .sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       const result = JSON.stringify(page(matching, Number(input.cursor ?? 0), input.limit));
       if (holdSearch && input.query === "older") return new Promise(resolve => heldSearch.push(() => resolve(result)));
       return result;
@@ -622,6 +632,98 @@ if (params.has("check")) {
       && [...viewMenu().querySelectorAll('[data-task-field-toggle][aria-checked="true"]')].length === 5);
     viewToggle().click(); await settle();
     check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
+
+    // ---- The archive, and what it is willing to claim --------------------
+    const archive = () => root.querySelector('[data-testid="task-archive"]');
+    const archiveRows = () => [...root.querySelectorAll('[data-testid="task-archive-row"]')];
+    const archiveSummaryText = () => root.querySelector('[data-testid="task-archive-summary"]')?.textContent.replace(/\s+/g, " ").trim();
+    const archiveToggle = () => [...root.querySelectorAll("header button")].find(el => el.getAttribute("aria-label") === "Archive");
+    // Counted from the fixture rather than written as a literal: earlier
+    // checks move tasks into and out of Done, so a hard-coded total would
+    // measure this block's position in the script, not the archive.
+    const completed = () => tasks.filter(task => !deleted.has(task.id) && task.status === "done").length;
+    const expected = completed();
+    check("the board badges the server's completed total, not a page of it",
+      expected > 30 && archiveToggle()?.textContent.trim() === String(expected));
+    archiveToggle().click(); await settle(200);
+    await wait(() => archiveRows().length > 0);
+    check("the archive opens on the completed tasks for this scope",
+      Boolean(archive()) && archiveRows().length === 30);
+    // The one number this panel must not get wrong. 30 rows on screen out of
+    // 35 completed tasks has to read as both numbers, or a reader clears an
+    // archive they have only partly seen.
+    check("a partly loaded archive says so, with both numbers",
+      archiveSummaryText() === `Showing 30 of ${expected} completed tasks. Load more to see the rest.`);
+    button("Load more", archive()).click(); await settle(200);
+    check("Load more grows the page instead of replacing it",
+      archiveRows().length === expected && archiveSummaryText() === `${expected} completed tasks.`);
+    // A restore is the board's own status update, so it must land in the
+    // board's confirm dialog rather than writing straight through.
+    archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();
+    archiveRows()[1].querySelector('input[type="checkbox"]').click(); await settle();
+    const restored = archiveRows().slice(0, 2).map(row => row.getAttribute("data-card-id"));
+    await change(archive().querySelector('[aria-label="Restore to"]'), "ready", "change");
+    button("Restore", archive()).click(); await settle(150);
+    const restoreDialog = document.querySelector('[role="dialog"][aria-label="Update tasks"]');
+    check("restoring goes through the board's confirm-and-retry dialog", Boolean(restoreDialog));
+    button("Update 2 tasks", restoreDialog).click(); await settle(250);
+    button("Done", restoreDialog).click(); await settle(250);
+    check("a restored task leaves the archive and returns to the chosen column",
+      restored.every(id => tasks.find(task => task.id === id)?.status === "ready")
+      && archiveRows().every(row => !restored.includes(row.getAttribute("data-card-id")))
+      && restored.every(id => Boolean(card(id)?.closest('[data-task-column="ready"]'))));
+    // A write drops the accumulated pages and reloads from the first one.
+    // Merging a fresh page into rows fetched before the write is how a
+    // restored or deleted task keeps its seat in the list; the cursor only
+    // runs forward, so there is no way to re-fetch the deeper pages. The
+    // summary then has to report the new total against the 30 rows actually
+    // reloaded, which is the case this asserts.
+    check("a restore reloads the archive from its first page, against the new total",
+      archiveToggle().textContent.trim() === String(expected - 2)
+      && archiveRows().length === Math.min(30, expected - 2)
+      && archiveSummaryText() === `Showing 30 of ${expected - 2} completed tasks. Load more to see the rest.`);
+    await change(archive().querySelector('[aria-label="Search completed tasks"]'), "Completed task 30");
+    await settle(350);
+    check("the archive searches completed work without touching the board's search",
+      archiveRows().length === 1 && root.querySelector('[aria-label="Search tasks"]').value === "");
+    await change(archive().querySelector('[aria-label="Search completed tasks"]'), "");
+    await settle(350);
+    // The dock is a second way to read completed work, not a move, and it
+    // says which of the two is true right now.
+    check("the archive admits that Done is still on the board",
+      archive().textContent.includes("also in the Done column") && Boolean(columnEl("done")));
+    button("Hide Done on the board", archive()).click(); await settle(200);
+    check("hiding Done from the archive uses the board's own column preference",
+      !columnEl("done") && archive().textContent.includes("Done column is hidden"));
+    check("the board's hidden-column note then offers the archive by name",
+      Boolean(hiddenNote()) && Boolean(button("Open archive", hiddenNote())));
+    button("Show Done on the board", archive()).click(); await settle(200);
+    check("and the same control puts it back", Boolean(columnEl("done")) && !hiddenNote());
+    // A backgrounded window defers the query, the way the Inbox does. What it
+    // must not do is answer it: an unread archive saying "No completed tasks
+    // in this scope" underneath a header badge reading 34 is a check that
+    // could not run reporting the same result as one that ran and passed.
+    archiveToggle().click(); await settle();
+    const realHidden = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    archiveToggle().click(); await settle(250);
+    check("a backgrounded window never reports an unread archive as an empty one",
+      Boolean(archive())
+      && archiveRows().length === 0
+      && !archiveSummaryText().includes("No completed tasks")
+      && archiveSummaryText().includes("have not loaded yet")
+      && archiveSummaryText().includes("Paused while this window is in the background")
+      && archiveToggle().textContent.trim() === String(expected - 2));
+    Object.defineProperty(document, "hidden", realHidden);
+    document.dispatchEvent(new Event("visibilitychange"));
+    await wait(() => archiveRows().length > 0);
+    check("returning to the foreground loads the archive without a manual refresh",
+      archiveRows().length === Math.min(30, expected - 2) && !archiveSummaryText().includes("have not loaded yet"));
+
+    archiveToggle().click(); await settle();
+    check("the archive closes and leaves the board as it was",
+      !archive() && root.querySelectorAll("[data-task-column]").length === 6);
 
     // ---- The fuller right-click menu ------------------------------------
     await openMenu("task-11");

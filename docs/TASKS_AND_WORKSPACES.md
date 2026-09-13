@@ -75,6 +75,20 @@ per profile and **Reset board view** restores all of them. Hiding a column does
 not hide its work silently: a banner names how many tasks are in the columns
 currently off screen, and the board refuses to hide its last column.
 
+**Archive**, beside the Inbox, holds the scope's completed tasks. It has its own
+search and **Load more**, and its header badge is the store's total for the
+scope rather than the page on screen. Select rows to restore them to any other
+status or delete them; both go through the same confirm-and-retry dialog as a
+bulk change from the board, so a lost reply is reconciled the same way. A write
+reloads the dock from its first page — the store's cursor only runs forward, so
+pages already scrolled past cannot be refreshed in place. The archive is a
+second way to read completed work, not a move: it says whether the Done column
+is still on the board and offers the same hide the View menu owns, and once
+Done is hidden the board's banner offers the archive by name. Tasks are listed
+in the board's own order and stamped with their last update, because the store
+keeps no completion time to sort by. While the window is in the background the
+query is deferred, and the panel says that rather than showing an empty archive.
+
 Search uses the store's full-text query. **Filters** narrows loaded cards by
 priority, type, owner, label and due date. **Due soon** means from now through the
 next seven days; overdue tasks have their own filter. Facet choices and **Select

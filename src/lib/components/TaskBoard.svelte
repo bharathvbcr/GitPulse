@@ -4,7 +4,7 @@
   import { onMount, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { Bot, Clipboard, EyeOff, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
+  import { Archive, Bot, Clipboard, EyeOff, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { isCaseInsensitiveFs } from "../repos/paths";
@@ -23,6 +23,7 @@
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, type TaskFacet } from "../workbench/taskOrganize";
+  import { ARCHIVE_STATUS, offersArchive } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
   import { parseQuickAddDue, quickAddDraft, type QuickAddResult } from "../workbench/taskQuickAdd";
@@ -51,6 +52,7 @@
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
   import AutomaticEnhancements from "./AutomaticEnhancements.svelte";
   import AttentionInbox from "./AttentionInbox.svelte";
+  import TaskArchive from "./TaskArchive.svelte";
   import TaskContextMenu from "./TaskContextMenu.svelte";
   import QuickEnhanceSheet from "./QuickEnhanceSheet.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -88,6 +90,8 @@
   let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; x: number; y: number } | null>(null);
   let skipClick = false;
   let showInbox = $state(false);
+  let showArchive = $state(false);
+  let archiveToken = $state(0);
   let unread = $state(0);
   let addMenu = $state(false);
   let adding = $state(false);
@@ -145,6 +149,8 @@
   const busy = $derived(moving || opening || deleting || actionDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
+  /** The server's count for this scope, so the badge is not a page size. */
+  const completedCount = $derived(displayColumns[ARCHIVE_STATUS]?.total ?? 0);
   $effect(() => {
     if (repositoryPath) return;
     publishTaskChrome({ openTabs: taskTabs.tabs.length, inProgress: inProgressCount });
@@ -176,6 +182,22 @@
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
+  /**
+   * A task write finished; tell the archive dock to reload.
+   *
+   * The dock listens for `workbench-changed` itself, but that event is a
+   * delivery hint the host is allowed to lose — and the tasks fixture never
+   * emits it at all. A task that reached Done and did not appear in the
+   * archive, or a restored one that stayed in it, would read as a write that
+   * did not happen, so the board tells the dock directly at each of the three
+   * points where it knows a write committed. Every write goes through one of
+   * them: the batch dialog, an inline move, or the editor's save.
+   *
+   * It is deliberately not called from `loadBoard`, which also runs on every
+   * debounced keystroke and would reset the dock's paging and selection under
+   * a reader who is only typing.
+   */
+  function taskWritten() { archiveToken++; }
   function loadedHas(id: string, pages: Partial<Record<TaskStatus, Page<TaskCard>>>): boolean {
     return Object.values(pages).some((page) => page?.items.some((item) => item.id === id));
   }
@@ -620,7 +642,7 @@
       if (!rows.some(row => row.state === "uncertain" || row.state === "waiting")) pendingUpdate = null;
       const done = rows.filter(row => row.state === "done").length;
       announce = `${done} of ${rows.length} tasks updated`;
-      if (done) await loadBoard();
+      if (done) { taskWritten(); await loadBoard(); }
       const failure = rows.find(row => row.state === "uncertain" || row.state === "failed");
       if (failure) error = failure.error;
     } finally { moving = false; }
@@ -711,6 +733,7 @@
     session = { tabId: draftId, pane: draftId, value: null, status };
   }
   function onEditorSaved(saved: Task) {
+    taskWritten();
     void loadBoard();
     if (!session) return;
     taskTabs = retargetTaskTab(taskTabs, session.tabId, { id: saved.id, title: saved.title, status: saved.status, draft: false });
@@ -728,8 +751,22 @@
     if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
     actionDialog = { cards: [...cards], action: {kind:"delete"} };
   }
+  /**
+   * Restore and delete from the archive dock.
+   *
+   * Routed into the board's own `actionDialog` rather than run by the dock:
+   * one confirm step, one batch, one interrupted-write recovery path for
+   * every task mutation this board performs, wherever it was started.
+   */
+  async function archiveAction(cards: TaskCard[], action: TaskAction) {
+    if (busy || !cards.length) return;
+    if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
+    if (!await confirmDiscard("Change archived tasks?")) return;
+    actionDialog = { cards: [...cards], action };
+  }
   function tasksChanged(ids: string[]) {
     columns = removeFromColumns(columns, new Set(ids));
+    if (ids.length) taskWritten();
     selected = new Set([...selected].filter(id => !ids.includes(id)));
     const dropped = Boolean(session?.value && ids.includes(session.value.id));
     if (dropped) session = null;
@@ -928,6 +965,10 @@
             <Inbox size={13} />
             {#if !unreadError && unread > 0}<span class="gp-pill">{unread}</span>{/if}
           </button>
+          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-label="Archive" title="Archive — completed tasks in this scope" onclick={() => { showArchive = !showArchive; }}>
+            <Archive size={13} />
+            {#if completedCount > 0}<span class="gp-pill">{completedCount}</span>{/if}
+          </button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
@@ -993,6 +1034,11 @@
       <p class="hidden-note" role="status" data-testid="task-hidden-columns">
         <EyeOff size={11} />
         {hiddenWork.summary} hidden from this board.
+        {#if offersArchive(hiddenWork.statuses)}
+          <!-- Completed work is the one hidden column with somewhere else to
+               be read, so it is the one that earns a second door here. -->
+          <button type="button" class="link" onclick={() => { showArchive = true; }}>Open archive</button>
+        {/if}
         <button type="button" class="link" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
       </p>
     {/if}
@@ -1013,6 +1059,18 @@
     {/if}
     {#if pendingUpdate && !moving}<div class="banner error" role="alert">Confirm the interrupted task update before making another change.<button class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Retry task update</button></div>{/if}
     {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
+    {#if showArchive}
+      <TaskArchive
+        {scope}
+        {active}
+        {busy}
+        {hiddenColumns}
+        refreshToken={archiveToken}
+        onopen={openTask}
+        onaction={(cards, action) => void archiveAction(cards, action)}
+        ontogglecolumn={() => interfaceStore.toggleTaskColumn(ARCHIVE_STATUS)}
+      />
+    {/if}
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
     <div class="sr-only" role="status" aria-live="polite">{announce}</div>

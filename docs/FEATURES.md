@@ -119,6 +119,12 @@ beside Fleet opens global and saved-workspace scopes over the same records.
   Quick Enhance exposes details that compact cards omit.
 - **Hand off**: Copy a saved task brief or an explicitly labeled unsaved draft for
   an agent. Task run controls prepare a saved revision before launch.
+- **Archive**: A dock beside the Inbox holds the scope's completed tasks, with
+  its own search and **Load more**. Restore returns a selection to any other
+  status through the same confirmation as any bulk change. The panel reports
+  what it has loaded against the server's total, says whether the Done column
+  is still on the board, and does not report an archive it has not read as an
+  empty one.
 - **Delete**: Confirm removal from every board. Partial results retain failures
   and skipped items; the screen cannot restore the deleted task ID.
 

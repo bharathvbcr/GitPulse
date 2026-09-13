@@ -60,6 +60,18 @@ untrusted checkout described as a broken one.
 - First-run walkthrough: an interactive tour introducing repositories, views,
   tasks, and platform folder access, replayable at any time from **Walkthrough**
   in the title bar.
+- An **Archive** dock on the tasks board: completed tasks for the current
+  scope, with their own search and **Load more**, and a header badge carrying
+  the server's total rather than the loaded page. A selection restores to any
+  other status, or is deleted, through the same confirm-and-retry dialog every
+  other bulk change uses — the dock owns no write path of its own. It says
+  whether the Done column is still on the board and offers the same hide the
+  View menu owns, rather than keeping a second flag that could disagree with
+  it, and the board's hidden-column banner offers the archive by name once
+  Done is off screen. The panel reports the loaded count against the total for
+  as long as they differ, and an archive that has not been read — the query is
+  deferred while the window is in the background — says so instead of reading
+  as an empty one.
 
 ### Changed
 
