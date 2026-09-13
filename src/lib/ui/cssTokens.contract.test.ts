@@ -44,9 +44,31 @@ function collect(pattern: RegExp, from: typeof files): Map<string, string> {
   return found;
 }
 
+/**
+ * Where a custom-property declaration is allowed to begin: the start of a
+ * line, immediately after the `{` that opens a block, or immediately after the
+ * `;` that closed the declaration before it. That is the whole of CSS's
+ * answer, and matching the boundary instead of the line is what lets this see
+ * the second and later declarations on a line.
+ *
+ * Anchoring to the line alone under-collected for as long as the compact
+ * one-line block style has been in the tree — `.status-shell[data-material]`
+ * has declared three tokens on one line since before this guard existed. It
+ * stayed invisible because every token written that way also appeared
+ * first-on-a-line somewhere else, so the sweep found it anyway. The first
+ * tokens that did not, `--hue-b`/`--hue-c`/`--hue-d`, were reported as
+ * undefined from three characters after the `--hue-a` it did find, with all
+ * four declared together on one line.
+ *
+ * The boundary is also what keeps prose out: a token named in a `*`-prefixed
+ * doc comment follows none of the three, so describing a token still never
+ * counts as declaring one.
+ */
+const DECLARATION = /(?:^|[{;])[ \t]*(--[A-Za-z0-9_-]+)[ \t]*:/gm;
+
 /** Declared in a stylesheet or a component `<style>` block, or set from JS. */
 const defined = new Set([
-  ...collect(/^[ \t]*(--[A-Za-z0-9_-]+)[ \t]*:/gm, files).keys(),
+  ...collect(DECLARATION, files).keys(),
   ...collect(/setProperty\(\s*["'`](--[A-Za-z0-9_-]+)/g, files).keys(),
 ]);
 
@@ -64,6 +86,28 @@ describe("custom properties resolve to something that defines them", () => {
     expect(defined.size).toBeGreaterThan(20);
     expect(cssReferences.size).toBeGreaterThan(20);
     expect(scriptReferences.size).toBeGreaterThan(0);
+  });
+
+  it("counts a declaration that is not the first one on its line", () => {
+    // What this guard is for is catching a token nothing declares, so the half
+    // of it that finds declarations has to find all of them. A line-anchored
+    // sweep saw only the first declaration of a compact block and reported the
+    // rest as undefined — a missing-token report for tokens a few characters
+    // from one it had just accepted.
+    const block = ".shell {\n  --probe-one:1; --probe-two:2; --probe-three:3;\n}\n";
+    expect([...block.matchAll(DECLARATION)].map((match) => match[1])).toEqual([
+      "--probe-one",
+      "--probe-two",
+      "--probe-three",
+    ]);
+  });
+
+  it("does not count a token named in prose as a declaration", () => {
+    // The other half of the boundary: matching `--token:` anywhere would let a
+    // comment vouch for the very name it is warning about, and this guard's
+    // whole value is that a misspelt token has nothing to hide behind.
+    const prose = "/**\n * --probe-documented: described here, declared nowhere.\n */\n";
+    expect([...prose.matchAll(DECLARATION)]).toEqual([]);
   });
 
   it("defines every token reached through var()", () => {
