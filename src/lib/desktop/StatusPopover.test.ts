@@ -66,9 +66,9 @@ describe("compact status popover", () => {
     expect(parked).not.toContain('aria-label="Command palette"');
   });
   it("uses the app's liquid blur glass in the native material mode", () => {
-    // The native material block should contain the hue field, glass fills,
-    // specular edge treatment, and liquid-ease transitions so the popover
-    // reads as the same glass surface language as the main workspace.
+    // The material block should contain the hue field, glass fills, specular
+    // edge treatment, and liquid-ease transitions so the popover reads as the
+    // same glass surface language as the main workspace.
     const nativeBlock = source.slice(
       source.indexOf('[data-material="native"]'),
       source.indexOf("@supports"),
@@ -98,5 +98,30 @@ describe("compact status popover", () => {
     // Liquid-ease cubic-bezier on interactive elements.
     expect(nativeBlock).toContain("--liquid-ease:cubic-bezier(0.22, 1, 0.36, 1)");
     expect(nativeBlock).toContain("scale(0.97)");
+  });
+  it("tunes the browser fixture from the same rules as the native material", () => {
+    // The fixture used to carry its own copy of the glass ladder, and the copy
+    // drifted: it had the base tuning but neither appearance arm, so in light
+    // mode it drew the dark glass — a .05 sheen against the material's .7, a
+    // black .22 shade against its .07 navy, .4 cards against .58, and the dark
+    // hue blobs at twice the gain. Nothing caught it, because a fixture is
+    // only ever compared against itself.
+    //
+    // So the invariant is structural rather than a list of values: every rule
+    // that declares or reads a glass token has to name both materials — the
+    // ladder, both appearance arms, the panel treatment and the inner cards,
+    // five of them as this stands. Comments come out first: prose about one
+    // material must not stand in for a selector that targets it. The blur is
+    // the sole material-specific rule and touches no glass token, because
+    // native's blur comes from the window server rather than from CSS.
+    const styles = source.slice(source.indexOf("<style>")).replace(/\/\*[\s\S]*?\*\//g, "");
+    const tuned = [...styles.matchAll(/([^{}]+)\{([^}]*)\}/g)]
+      .filter(([, selector, body]) => body.includes("--glass-") && selector.includes("data-material"))
+      .map(([, selector]) => selector.replace(/\s+/g, " ").trim());
+    expect(tuned.length).toBeGreaterThanOrEqual(3);
+    for (const selector of tuned) {
+      expect(selector).toContain('[data-material="native"]');
+      expect(selector).toContain('[data-material="preview"]');
+    }
   });
 });

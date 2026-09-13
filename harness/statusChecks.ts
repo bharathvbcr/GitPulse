@@ -45,6 +45,26 @@ export async function checkStatusPopover() {
    */
   const paintsOuterShadow = (value: string) =>
     value !== "none" && value.replace(/\([^)]*\)/g, "").split(",").some(part => !part.includes("inset"));
+  /**
+   * The glass ladder as the cascade actually resolves it, for whichever
+   * material the shell is currently carrying.
+   *
+   * The fixture's entire job is to stand in for the native material, so the
+   * two have to resolve this ladder identically in both appearances. Reading
+   * one material against the other, rather than against literals, keeps the
+   * check true as the surface is retuned — what it pins is that the fixture
+   * is not tuned separately, which is the only way it can quietly stop
+   * representing what ships. An unreadable token would make two empty strings
+   * compare equal, so it throws instead of passing vacuously.
+   */
+  const glassTokens = () => {
+    const style = getComputedStyle(element(".status-shell"));
+    const tokens = ["--hue-a", "--hue-gain", "--glass-edge", "--glass-sheen-top", "--glass-shade-bottom", "--glass-tint", "--bg", "--surface", "--soft"]
+      .map(token => `${token}:${style.getPropertyValue(token).trim()}`);
+    const missing = tokens.filter(entry => entry.endsWith(":"));
+    if (missing.length) throw new Error(`Glass ladder unreadable: ${missing.join(" ")}`);
+    return tokens.join(" ");
+  };
   const contrastOnGlass = () => {
     const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
     const context = canvas.getContext("2d");
@@ -145,10 +165,16 @@ export async function checkStatusPopover() {
     check("the non-native fallback stays opaque", backdrop() === "none" && getComputedStyle(element(".panel")).backgroundColor === "rgb(250, 251, 252)");
     await select(2, "preview");
     const shell = element(".status-shell");
+    const previewLightGlass = glassTokens();
     shell.setAttribute("data-material", "native"); await settle();
     check("native material does not pay for a second CSS blur", backdrop() === "none" && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
     check("native material has no outer painted gutter", getComputedStyle(shell).padding === "0px" && !paintsOuterShadow(getComputedStyle(element(".panel")).boxShadow));
+    check("the light fixture is tuned like the native material it stands in for", glassTokens() === previewLightGlass);
+    await select(0, "dark");
+    const nativeDarkGlass = glassTokens();
     shell.setAttribute("data-material", "preview"); await settle();
+    check("the dark fixture is tuned like the native material it stands in for", glassTokens() === nativeDarkGlass);
+    await select(0, "light"); await settle();
     await select(0, "dark");
     await select(1, "busy");
     check("active work remains visible in the headline", element("h1").textContent === "Fetching…");

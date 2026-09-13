@@ -297,8 +297,20 @@
      The native window server supplies desktop blur via NSVisualEffectView.
      On top of that the page paints the same hue field and glass fills as the
      main app so the popover reads as part of the same surface language.
-     The browser fixture ("preview") approximates the effect with CSS filters. */
-  .status-shell[data-material="native"] {
+     The browser fixture ("preview") stands in for that material, simulating
+     only the part it cannot have — the desktop blur — with a CSS filter.
+
+     Both materials therefore share one ladder and one pair of appearance
+     arms. They used to be two copies, and the copy drifted exactly the way
+     copies do: the fixture carried the base ladder but neither arm, so in
+     light mode it drew the dark tuning — a .05 sheen where the material has
+     .7, a hard black .22 shade where the material has a .07 navy, thin .4
+     cards where the material has .58, and the dark hue blobs at twice the
+     gain. A fixture tuned differently from the surface it represents
+     validates something that never ships, so the two are now the same
+     declaration rather than two that have to be kept in step. */
+  .status-shell[data-material="native"],
+  .status-shell[data-material="preview"] {
     --liquid-ease:cubic-bezier(0.22, 1, 0.36, 1);
     /* Hue blobs — same four colours as .gp-shell in app.css, dark theme. */
     --hue-a:52 78 200; --hue-b:12 150 170; --hue-c:110 66 210; --hue-d:180 50 130;
@@ -308,7 +320,6 @@
     --glass-sheen-top:rgb(255 255 255 / .05);
     --glass-shade-bottom:rgb(0 0 0 / .22);
     --glass-tint:rgb(23 76 176 / .07);
-    padding:0;
     /* 0.8 is a floor, not a taste choice. This panel floats over an arbitrary
        desktop, so every foreground token has to clear 4.5:1 against BOTH a
        pure-white and a pure-black wallpaper, and panel opacity is the only
@@ -331,13 +342,20 @@
       radial-gradient(82% 78% at 88% 100%, rgb(var(--hue-b) / calc(.38 * var(--hue-gain))), rgb(var(--hue-b) / 0) 100%),
       radial-gradient(72% 68% at 6% 96%, rgb(var(--hue-d) / calc(.3 * var(--hue-gain))), rgb(var(--hue-d) / 0) 100%);
   }
+  /* Native only: the window server owns the frame, so the page must not add a
+     gutter around it. The fixture keeps the shell's 8px so the simulated
+     backdrop stays visible around the panel. */
+  .status-shell[data-material="native"] { padding:0; }
   :global(:where(.dark)) .status-shell[data-material="native"],
-  :global(:where(html:not(.light))) .status-shell[data-material="native"] {
+  :global(:where(.dark)) .status-shell[data-material="preview"],
+  :global(:where(html:not(.light))) .status-shell[data-material="native"],
+  :global(:where(html:not(.light))) .status-shell[data-material="preview"] {
     --glass-sheen-top:rgb(255 255 255 / .05);
     --glass-shade-bottom:rgb(0 0 0 / .22);
     --glass-tint:rgb(182 206 255 / .07);
   }
-  .status-shell[data-material="native"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *) {
+  .status-shell[data-material="native"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *),
+  .status-shell[data-material="preview"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *) {
     --hue-a:120 152 255; --hue-b:46 196 214; --hue-c:168 136 252; --hue-d:240 122 186;
     --hue-gain:.5;
     /* Same floor as the dark arm above; light solves to .787. */
@@ -350,7 +368,8 @@
     --glass-tint:rgb(23 76 176 / .05);
     --line:var(--glass-edge);
   }
-  .status-shell[data-material="native"] .panel {
+  .status-shell[data-material="native"] .panel,
+  .status-shell[data-material="preview"] .panel {
     border-color:var(--glass-edge);
     /* Two-pass glass treatment matching gp-glass: specular sheen + hue tint. */
     background-image:
@@ -361,59 +380,40 @@
       inset 0 -1px 0 var(--glass-shade-bottom);
   }
   /* Inner surfaces thin so they read as glass cards inside the panel. */
-  .status-shell[data-material="native"] :is(.metric, .detail-action, .repositories, .chip, .mark) {
+  .status-shell[data-material="native"] :is(.metric, .detail-action, .repositories, .chip, .mark),
+  .status-shell[data-material="preview"] :is(.metric, .detail-action, .repositories, .chip, .mark) {
     border-color:var(--glass-edge);
     background:var(--surface);
   }
   /* Liquid-ease transitions on interactive elements. */
   @media (prefers-reduced-motion: no-preference) {
-    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip),
+    .status-shell[data-material="preview"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip) {
       transition-property:color, background-color, border-color, box-shadow, transform;
       transition-duration:180ms;
       transition-timing-function:var(--liquid-ease);
     }
-    .status-shell[data-material="native"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled),
+    .status-shell[data-material="preview"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled) {
       transform:scale(0.97);
     }
   }
+  /* The one thing the fixture cannot borrow: native gets its desktop blur from
+     the window server, so only the fixture pays for a CSS filter. */
   @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
-    .status-shell[data-material="preview"] {
-      --liquid-ease:cubic-bezier(0.22, 1, 0.36, 1);
-      --hue-a:52 78 200; --hue-b:12 150 170; --hue-c:110 66 210; --hue-d:180 50 130;
-      --hue-gain:1;
-      --glass-edge:rgb(255 255 255 / .14);
-      --glass-sheen-top:rgb(255 255 255 / .05);
-      --glass-shade-bottom:rgb(0 0 0 / .22);
-      --glass-tint:rgb(23 76 176 / .07);
-      /* Matches the native arm: the fixture must not look more transparent
-         than the material it stands in for, or it validates a surface that
-         never ships. Same 4.5:1 floor, same .8. */
-      --bg:rgb(var(--base) / .8);
-      --surface:rgb(var(--card-base) / .4);
-      --soft:rgb(var(--card-base) / .28);
-      --line:var(--glass-edge);
-      --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber);
-      background-image:
-        radial-gradient(90% 80% at 2% 0%, rgb(var(--hue-a) / calc(.5 * var(--hue-gain))), rgb(var(--hue-a) / 0) 100%),
-        radial-gradient(80% 76% at 98% 6%, rgb(var(--hue-c) / calc(.42 * var(--hue-gain))), rgb(var(--hue-c) / 0) 100%),
-        radial-gradient(82% 78% at 88% 100%, rgb(var(--hue-b) / calc(.38 * var(--hue-gain))), rgb(var(--hue-b) / 0) 100%),
-        radial-gradient(72% 68% at 6% 96%, rgb(var(--hue-d) / calc(.3 * var(--hue-gain))), rgb(var(--hue-d) / 0) 100%);
-    }
     .status-shell[data-material="preview"] .panel {
       -webkit-backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
       backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
-      border-color:var(--glass-edge);
-      background-image:
-        linear-gradient(155deg, var(--glass-sheen-top), transparent 46%),
-        linear-gradient(200deg, var(--glass-tint), transparent 72%);
-      box-shadow:
-        inset 0 1px 0 var(--glass-sheen-top),
-        inset 0 -1px 0 var(--glass-shade-bottom);
     }
-    .status-shell[data-material="preview"] :is(.metric, .detail-action, .repositories, .chip, .mark) {
-      border-color:var(--glass-edge);
-      background:var(--surface);
-    }
+  }
+  /* With no CSS filter there is no desktop blur to stand in for, so the fixture
+     drops the glass rather than show a translucent panel over an unblurred
+     page — the one thing the shipping material never is. This is the same
+     opaque surface the accessibility preferences below fall back to. The
+     native material needs no such gate: its blur does not come from CSS. */
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
+    .status-shell[data-material="preview"] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
+    .status-shell[data-material="preview"] .panel { background-image:none; box-shadow:none; }
   }
   @media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
     .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
