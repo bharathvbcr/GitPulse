@@ -9,6 +9,7 @@
 //! Precedence for resolution: env → saved config → sibling (source) → PATH.
 //! Progress streams via rate-limited `tool-install-progress` events.
 
+pub mod components;
 pub mod release;
 
 use crate::engine::git_cli::{self, BoundedRun};
@@ -538,11 +539,36 @@ fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
     } else {
         text.into_owned()
     };
-    let line = combined.lines().find(|l| {
-        let lower = l.to_ascii_lowercase();
-        lower.contains("version") || lower.contains("devmap") || lower.contains("manvi")
-    })?;
-    Some(line.trim().chars().take(120).collect())
+    version_line(&combined, tool.as_str())
+}
+
+/// Pick the line of a tool's version output that actually carries a version.
+///
+/// Two passes, and the order is the point. `manvi --version` prints a block
+/// whose first line is the bare program name and whose *second* line holds the
+/// version, so a single pass that accepts either a "version" match or a
+/// name match reports the string `manvi` as the version — which is worse than
+/// reporting none, because it reads like a successful probe. Prefer a line
+/// that mentions a version; fall back to the program name only when nothing
+/// does, which is how `devmap 0.2.1 (store schema 20, …)` is read.
+///
+/// Internal whitespace is collapsed: these blocks are column-aligned, and the
+/// padding is meaningless once the line is out of its block.
+pub(crate) fn version_line(text: &str, needle: &str) -> Option<String> {
+    let name = needle.to_ascii_lowercase();
+    let collapse = |line: &str| -> String { line.split_whitespace().collect::<Vec<_>>().join(" ") };
+    let chosen = text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("version"))
+        .or_else(|| {
+            text.lines()
+                .find(|line| line.to_ascii_lowercase().contains(&name))
+        })?;
+    let collapsed = collapse(chosen);
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(120).collect())
 }
 
 /// Whether the prebuilt rung may hit the network for a release HEAD probe.
@@ -2030,9 +2056,9 @@ mod tests {
                 devmap_store::schema::CURRENT_SCHEMA_VERSION
             ),
         );
-        crate::devmap::cli::set_test_binary(Some(binary));
+        let bound = crate::devmap::cli::bind_test_binary(binary);
         let report = verify_devmap();
-        crate::devmap::cli::set_test_binary(None);
+        drop(bound);
         assert!(!report.ok, "failed command approved: {report:?}");
     }
 

@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 40 contracts over
- * 57 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 61 contracts over
+ * 150 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -163,6 +163,20 @@ export const CONTRACTS = Object.freeze([
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
+  // Per-repository DevCouncil setup, and the inventory behind it. These land
+  // on every repository the user opens, so a rename that made `exclude` or
+  // `workspace_registry` read as undefined would silently turn "we hid the
+  // index from git status" into a claim nothing backs.
+  { label: "devcouncil-init", rustPath: rust("devmap", "init.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["InitReport"] },
+  { label: "devcouncil-components", rustPath: rust("tool_install", "components.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["ComponentStatus", "PresetStatus", "SuiteStatus", "SuiteReport"] },
+  { label: "devmap-doctor", rustPath: rust("devmap", "cli.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["DoctorReport"] },
+  { label: "devmap-integrate", rustPath: rust("devmap", "integrate.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["IntegrationEntry", "IntegrationPlan"] },
+  // The live gate's own facts. Unguarded until a `daemon_pending` field was
+  // added to it: every field here is a reason the index did or did not
+  // rebuild, so a mirror that drops one turns the strip's explanation into a
+  // guess. The TS interface is named for the DTO, not the internal gate input
+  // of the same stem, because the DTO is what crosses the wire.
+  { label: "devmap-live-facts", rustPath: rust("devmap", "live.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["LiveRefreshFactsDto"] },
   // The repository-surface payloads. Each has a hand-written TypeScript mirror
   // the UI branches on, so they are checked rather than excused: a renamed
   // Rust field would otherwise surface as a silently `undefined` property in

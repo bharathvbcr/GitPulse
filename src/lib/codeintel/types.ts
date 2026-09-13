@@ -509,6 +509,213 @@ export interface DevmapPreviewOutcome {
   files_omitted?: number;
 }
 
+/** Payload of the `devmap-build-progress` event. */
+export interface DevmapBuildProgress {
+  repository: string;
+  stage: number;
+  total_stages: number;
+}
+
+/**
+ * Unwrap `cmd_devcouncil_init`. A null or non-conforming payload is a failed
+ * read, not a repository that happens to be uninitialized: `autoInit` records
+ * the throw and retries on the next scope change, where silently accepting
+ * `null` would leave the caller reading `undefined.status` and calling that a
+ * clean result.
+ */
+export function parseInitReport(value: unknown, command = "devcouncil"): InitReport {
+  if (!isRecord(value)) throw new Error(`${command} returned no payload`);
+  const exclude = value.exclude;
+  if (!isRecord(exclude) || typeof exclude.status !== "string") {
+    throw new Error(`${command} returned no exclude outcome`);
+  }
+  if (typeof value.repo !== "string" || typeof value.state_dir !== "string") {
+    throw new Error(`${command} omitted the repository it acted on`);
+  }
+  return {
+    repo: value.repo,
+    state_dir: value.state_dir,
+    exclude: exclude as unknown as ExcludeOutcome,
+    workspace_registry: optionalString(value.workspace_registry) ?? null,
+    workspace_reason: optionalString(value.workspace_reason) ?? null,
+    devmap_available: value.devmap_available === true,
+  };
+}
+
+/**
+ * Unwrap `cmd_devcouncil_suite_status`.
+ *
+ * `warnings` is the field that must never be invented: an absent or malformed
+ * list is a probe that did not report, so it becomes an empty list *and* a
+ * `doctor_reason`, which `healthSummary` renders as unchecked rather than
+ * clean.
+ */
+export function parseSuiteReport(value: unknown, command = "devcouncil"): SuiteReport {
+  if (!isRecord(value)) throw new Error(`${command} returned no payload`);
+  const suite = value.suite;
+  if (!isRecord(suite) || !Array.isArray(suite.components) || !Array.isArray(suite.presets)) {
+    throw new Error(`${command} returned no component inventory`);
+  }
+  const warnings = Array.isArray(value.warnings)
+    ? value.warnings.filter((entry): entry is string => typeof entry === "string")
+    : null;
+  const reason = optionalString(value.doctor_reason) ?? null;
+  return {
+    suite: {
+      components: suite.components as ComponentStatus[],
+      presets: suite.presets as PresetStatus[],
+      complete: suite.complete === true,
+    },
+    doctor: isRecord(value.doctor) ? (value.doctor as unknown as DoctorReport) : null,
+    doctor_reason:
+      reason ?? (warnings === null ? `${command} returned no warning list` : null),
+    warnings: warnings ?? [],
+  };
+}
+
+/**
+ * Unwrap an integration plan. `entries` defaulting to `[]` on a malformed
+ * payload would present a write as a no-op, so an absent list is an error —
+ * and `available: false` keeps `is_current` from reading as "already set up".
+ */
+export function parseIntegrationPlan(value: unknown, command = "devmap"): IntegrationPlan {
+  if (!isRecord(value)) throw new Error(`${command} returned no payload`);
+  if (typeof value.host !== "string") throw new Error(`${command} returned no host`);
+  if (value.available === true && !Array.isArray(value.entries)) {
+    throw new Error(`${command} claimed availability without an entry list`);
+  }
+  const count = (raw: unknown) =>
+    typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : 0;
+  return {
+    available: value.available === true,
+    host: value.host,
+    repo: optionalString(value.repo) ?? "",
+    applied: value.applied === true,
+    reason: optionalString(value.reason) ?? null,
+    entries: Array.isArray(value.entries) ? (value.entries as IntegrationEntry[]) : [],
+    notes: Array.isArray(value.notes)
+      ? value.notes.filter((note): note is string => typeof note === "string")
+      : [],
+    repo_changes: count(value.repo_changes),
+    outside_changes: count(value.outside_changes),
+    protected: Array.isArray(value.protected)
+      ? value.protected.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  };
+}
+
+/* ── DevCouncil component inventory ────────────────────────────────────── */
+
+/** How much GitPulse depends on one DevCouncil component. */
+export type ComponentNeed = "required" | "host_resolved" | "optional";
+
+/**
+ * How a component's version was established — or why it could not be.
+ * `dcstore`, `dcverify` and `dcgrep` expose no version flag, so "installed"
+ * and "version known" are separate facts and must render differently.
+ */
+export type VersionReading =
+  | { kind: "reported"; version: string }
+  | { kind: "not_exposed"; detail: string }
+  | { kind: "unavailable"; detail: string };
+
+export interface ComponentStatus {
+  id: string;
+  label: string;
+  need: ComponentNeed;
+  purpose: string;
+  installed: boolean;
+  path: string | null;
+  version: VersionReading;
+  reason: string | null;
+  presets: string[];
+}
+
+export interface PresetStatus {
+  id: string;
+  present: number;
+  total: number;
+  missing: string[];
+}
+
+/** Installation warnings from `devmap doctor`. */
+export interface DoctorReport {
+  available: boolean;
+  binary: string | null;
+  reason: string | null;
+  binary_skew_warning: string | null;
+  duplicate_mcp_registration_warning: string | null;
+  stale_server_warning: string | null;
+  plugin_warning: string | null;
+  missing_binary_warning: string | null;
+  expected_schema_version: number | null;
+  code_graph_schema_version: number | null;
+  linked_grammar_count: number | null;
+  version: string | null;
+}
+
+export interface SuiteStatus {
+  components: ComponentStatus[];
+  presets: PresetStatus[];
+  /** Every required and host-resolved component is present. */
+  complete: boolean;
+}
+
+export interface SuiteReport {
+  suite: SuiteStatus;
+  doctor: DoctorReport | null;
+  /** Why `doctor` is absent. An absent doctor is never "no warnings". */
+  doctor_reason: string | null;
+  warnings: string[];
+}
+
+/* ── Agent-host integration ────────────────────────────────────────────── */
+
+export type IntegrationHost = "claude" | "cursor" | "codex";
+
+export type IntegrationKind = "guide" | "project_mcp" | "global_mcp" | "hook" | "skill";
+
+export interface IntegrationEntry {
+  kind: IntegrationKind;
+  path: string;
+  disposition: string;
+  note: string | null;
+  changed: boolean;
+  /** Outside the repository — the user's home directory. */
+  outside_repo: boolean;
+}
+
+export interface IntegrationPlan {
+  available: boolean;
+  host: string;
+  repo: string;
+  applied: boolean;
+  reason: string | null;
+  entries: IntegrationEntry[];
+  notes: string[];
+  repo_changes: number;
+  outside_changes: number;
+  /** Guides an existing hand-written file owns; applying leaves them alone. */
+  protected: string[];
+}
+
+/** Ignore hygiene for one repository's DevMap state directory. */
+export type ExcludeOutcome =
+  | { status: "already_ignored"; source: string }
+  | { status: "added"; file: string; pattern: string }
+  | { status: "not_needed"; reason: string }
+  | { status: "refused"; reason: string };
+
+/** What `cmd_devcouncil_init` did, or declined to do, for one repository. */
+export interface InitReport {
+  repo: string;
+  state_dir: string;
+  exclude: ExcludeOutcome;
+  workspace_registry: string | null;
+  workspace_reason: string | null;
+  devmap_available: boolean;
+}
+
 /** Decision from the live-index gate (`decide_live_refresh`). */
 export type LiveRefreshDecision =
   | "refresh"
@@ -516,22 +723,39 @@ export type LiveRefreshDecision =
   | "skip_building"
   | "skip_schema_outdated"
   | "skip_unavailable"
-  | "skip_cooldown";
+  | "skip_cooldown"
+  | "skip_daemon";
 
-export interface LiveRefreshFacts {
+export interface LiveRefreshFactsDto {
   available: boolean;
   is_fresh: boolean;
   schema_ok: boolean;
   already_building: boolean;
+  /** A full `devmap build` can repair this store (the CLI's own judgement). */
+  rebuild_required?: boolean;
+  /** `repo_map.json` / `code_graph.json` absent from the resolved state dir. */
+  artifacts_missing?: boolean;
+  /**
+   * Paths a `devmap serve` daemon has queued and not yet folded in. `null` is
+   * "no daemon answered, or we did not ask" — never "a daemon with nothing to
+   * do", which is `0`, and which does *not* excuse a stale store.
+   */
+  daemon_pending?: number | null;
 }
 
 export interface LiveRefreshOutcome {
   decision: LiveRefreshDecision;
-  facts: LiveRefreshFacts;
+  facts: LiveRefreshFactsDto;
   build?: DevmapBuildOutcome | null;
   reason?: string | null;
   /** Remaining echo/failure backoff when `decision` is `skip_cooldown`. */
   cooldown_remaining_ms?: number | null;
+  /**
+   * The build wrote consumer artifacts that were missing beforehand. Such a
+   * build reports the *store* `unchanged` whenever the database was already
+   * current, so this is the only signal that a new map was published.
+   */
+  artifacts_restored?: boolean;
 }
 
 /** Envelope from `cmd_devmap_viz` / `cmd_devmap_map_preview` / docs graph. */

@@ -7,6 +7,7 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
+import { autoInit } from "../codeintel/autoInit";
 
 export type ExternalTool = "devmap" | "manvi";
 
@@ -125,8 +126,24 @@ export interface LadderAssessment {
   rungs: RungStatus[];
 }
 
-export function getExternalToolsStatus(): Promise<ToolsStatus> {
-  return invoke<ToolsStatus>("cmd_external_tools_status");
+/**
+ * Probe both tools.
+ *
+ * Also the app's one signal that devmap became available. Per-repository
+ * initialization skips whatever needs devmap when the binary is absent and
+ * remembers that skip, so every repository opened before an install would stay
+ * absent from the workspace registry until its tab set changed. Every install
+ * path and every surface that cares about the tools ends up here, so this is
+ * the one place that can un-stick them — and it covers an install made in a
+ * terminal, which no in-app callback would see.
+ *
+ * Only a *present* devmap notifies: if it is still missing nothing has
+ * changed, and re-running initialization on every probe would be pure cost.
+ */
+export async function getExternalToolsStatus(): Promise<ToolsStatus> {
+  const status = await invoke<ToolsStatus>("cmd_external_tools_status");
+  if (status?.devmap?.installed) autoInit.onToolsChanged();
+  return status;
 }
 
 export async function installExternalTool(

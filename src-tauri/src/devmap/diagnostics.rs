@@ -1,6 +1,12 @@
 //! DevMap command diagnostics. No stdin or successful query payload is logged.
 //! Only stage numbers are logged live. Raw stderr is redacted as a whole at
 //! completion so multiline credentials cannot leak through per-line records.
+//!
+//! Those stage numbers are also the only progress a build ever produces. A
+//! cold index of a large repository is minutes of an empty pane otherwise, so
+//! the same parser that records a stage emits it — the stage *number* and
+//! nothing else, never the line it came from, because a stderr line is exactly
+//! the surface this module redacts at completion rather than forwards live.
 
 use super::cli::ResolvedDevmap;
 use crate::engine::git_cli::{BoundedRun, OutputStream, ProcessObserver};
@@ -12,8 +18,27 @@ use std::time::{Duration, Instant};
 const PROGRESS_LINES: usize = 64;
 const LINE_BYTES: usize = 4096;
 
+/// Per-build stage progress, for the Map pane's status strip.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DevmapBuildProgress {
+    /// Absolute repository path this build is for.
+    pub repository: String,
+    /// 1-based stage the kernel has reached.
+    pub stage: u8,
+    pub total_stages: u8,
+}
+
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// Wired once at startup, beside the other emitters.
+pub fn set_app_handle(handle: tauri::AppHandle) {
+    let _ = APP.set(handle);
+}
+
 pub(super) struct CommandLog {
     id: String,
+    /// Only builds report stages; status and preview runs never emit progress.
+    repository: Option<String>,
     started: Instant,
     pending: Vec<u8>,
     stderr: Vec<u8>,
@@ -32,6 +57,13 @@ impl CommandLog {
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let log = Self {
+            // A `--json` status run has no stages and a preview must not
+            // masquerade as a build in the UI; only the command that reports
+            // `[n/5]` gets an identity to emit under.
+            repository: args
+                .first()
+                .filter(|first| *first == "build")
+                .map(|_| repo.to_string_lossy().into_owned()),
             id: format!(
                 "{}-{}",
                 std::process::id(),
@@ -63,14 +95,33 @@ impl CommandLog {
             {
                 self.stages = self.stages.saturating_add(1);
                 if self.stages <= PROGRESS_LINES {
-                    self.record(
-                        json!({"event": "stage", "stage": stage - b'0', "total_stages": 5}),
-                    );
+                    let stage = stage - b'0';
+                    self.record(json!({"event": "stage", "stage": stage, "total_stages": 5}));
+                    self.emit_stage(stage);
                 }
             }
         }
         self.pending.clear();
         self.oversized = false;
+    }
+
+    /// Publish one stage to the UI. Bounded by the same `PROGRESS_LINES` cap as
+    /// the log, and silent when no app handle exists (tests, the MCP binary).
+    fn emit_stage(&self, stage: u8) {
+        let Some(repository) = self.repository.as_ref() else {
+            return;
+        };
+        use tauri::Emitter;
+        if let Some(app) = APP.get() {
+            let _ = app.emit(
+                "devmap-build-progress",
+                DevmapBuildProgress {
+                    repository: repository.clone(),
+                    stage,
+                    total_stages: 5,
+                },
+            );
+        }
     }
 
     pub(super) fn finish(

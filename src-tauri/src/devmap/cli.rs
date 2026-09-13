@@ -182,11 +182,61 @@ fn build_guards() -> &'static Mutex<HashSet<String>> {
 #[cfg(test)]
 static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 
+/// Serializes every test that installs a global `devmap` override.
+///
+/// `TEST_BINARY` is process-wide, so two tests that bind their own stub at the
+/// same time resolve each other's binary. The symptom is not a clean failure:
+/// each stub appends argv to a log inside *its own* fixture, so one test
+/// asserts against a log that is missing a spawn while another test's log
+/// quietly holds it — and which test fails moves from run to run. Latent for as
+/// long as the override has existed; anything that lengthens the window between
+/// binding and unbinding makes it likelier.
+///
+/// Poison-tolerant, following [`crate::harness::sidecar::test_serial`]: a
+/// panicking test must not wedge every later one, and the data behind this lock
+/// is the emptiness of `()`.
 #[cfg(test)]
-pub(crate) fn set_test_binary(path: Option<String>) {
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+fn set_test_binary(path: Option<String>) {
     *TEST_BINARY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+}
+
+/// An installed override, held for as long as the test needs it.
+///
+/// The only way to bind one, which is the point: `set_test_binary` is private
+/// so a test cannot install a global override without also taking the serial
+/// that makes owning it exclusive. Unbinding is this type's `Drop`, so it also
+/// cannot be forgotten on an early return or a panic.
+#[cfg(test)]
+pub(crate) struct TestBinaryBinding(
+    /// Held, never read: the serial's whole job is to be released on drop.
+    #[allow(dead_code)]
+    std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+impl Drop for TestBinaryBinding {
+    fn drop(&mut self) {
+        set_test_binary(None);
+    }
+}
+
+/// Install `path` as the binary every lookup resolves, until the returned
+/// binding is dropped.
+#[cfg(test)]
+pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
+    let serial = test_serial();
+    set_test_binary(Some(path.into()));
+    TestBinaryBinding(serial)
 }
 
 /// Resolves the `devmap` binary (cached, including negative answers).
@@ -415,6 +465,21 @@ fn run_devmap(
     result?.require_complete("devmap")
 }
 
+/// Run `devmap` for a sibling module in this package.
+///
+/// `run_devmap` stays private because every caller in this file pairs it with
+/// its own deadline, argument set and outcome shape; this is the single seam
+/// `integrate` needs, with the same bounded-run, protocol-check and diagnostic
+/// logging behaviour.
+pub(super) fn run_devmap_public(
+    binary: &ResolvedDevmap,
+    repo: &Path,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<BoundedRun, String> {
+    run_devmap(binary, repo, args, None, deadline)
+}
+
 fn parse_json_stdout(stdout: &str) -> Option<Value> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -442,18 +507,39 @@ fn build_outcome_from_run(binary: &ResolvedDevmap, run: BoundedRun) -> BuildOutc
     }
 }
 
-/// Cold or full rebuild (`devmap build --manifest --json`).
-pub fn build(repo_path: &str) -> Result<BuildOutcome, String> {
+/// Spawn a build, having first made sure it cannot dirty `git status`.
+///
+/// The ignore hygiene lives here, at the one point every build path passes
+/// through, because *building* is what creates the state directory. Doing it
+/// only when a repository is opened was not enough: the live gate indexes
+/// every retained tab while initialization runs for the active one, so a
+/// repository sitting in a background tab was indexed by a rule that had never
+/// been written for it and gained a permanent untracked `.devmap/`. The manual
+/// **Build index** button reaches the same code from the other direction.
+///
+/// Idempotent and cheap — an already-ignored directory costs one
+/// `git check-ignore` and returns — so it is affordable on a path that is
+/// about to spawn a full index build.
+///
+/// A refusal does not stop the build. Hiding the directory is hygiene; the
+/// index is what the user or the gate actually asked for, and a repository
+/// with an unusual ignore setup must not silently lose its code intelligence
+/// over a cosmetic concern. It is logged rather than swallowed, and
+/// initialization surfaces the same refusal in the UI for the active tab.
+fn spawn_build(repo_path: &str, args: &[&str]) -> Result<BuildOutcome, String> {
     let repo = validate_repo(repo_path)?;
     let _guard = BuildGuard::try_acquire(&repo)?;
     let binary = resolve_binary()?;
-    match run_devmap(
-        &binary,
-        &repo,
-        &["build", "--manifest", "--json"],
-        None,
-        BUILD_DEADLINE,
-    ) {
+    if let super::init::ExcludeOutcome::Refused { reason } =
+        super::init::ensure_state_dir_excluded(&repo)
+    {
+        log::warn!(
+            target: "devmap",
+            "{}: building an index whose state directory git will show as untracked — {reason}",
+            repo.display()
+        );
+    }
+    match run_devmap(&binary, &repo, args, None, BUILD_DEADLINE) {
         Ok(run) => Ok(build_outcome_from_run(&binary, run)),
         Err(e) if timed_out(&e) => Ok(BuildOutcome {
             ok: false,
@@ -469,24 +555,131 @@ pub fn build(repo_path: &str) -> Result<BuildOutcome, String> {
     }
 }
 
+/// Cold or full rebuild (`devmap build --manifest --json`).
+///
+/// The manifest flag is what writes the consumer artifacts `repo_map.json` and
+/// `code_graph.json`; a plain build updates the database only.
+pub fn build(repo_path: &str) -> Result<BuildOutcome, String> {
+    spawn_build(repo_path, &["build", "--manifest", "--json"])
+}
+
 /// Incremental rebuild (`devmap build --json` without `--full`).
 pub fn refresh(repo_path: &str) -> Result<BuildOutcome, String> {
-    let repo = validate_repo(repo_path)?;
-    let _guard = BuildGuard::try_acquire(&repo)?;
-    let binary = resolve_binary()?;
-    match run_devmap(&binary, &repo, &["build", "--json"], None, BUILD_DEADLINE) {
-        Ok(run) => Ok(build_outcome_from_run(&binary, run)),
-        Err(e) if timed_out(&e) => Ok(BuildOutcome {
-            ok: false,
-            binary: binary.path,
-            lookup: binary.lookup,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: e,
-            timed_out: true,
-            report: None,
-        }),
-        Err(e) => Err(e),
+    spawn_build(repo_path, &["build", "--json"])
+}
+
+/// Installation health `devmap doctor --json` already measures and GitPulse
+/// never showed.
+///
+/// Each field is a warning the kernel emits about the *installation* rather
+/// than about any one repository: a second `devmap` on `PATH` shadowing the
+/// one hooks call, the same unpinned MCP server registered in several hosts,
+/// long-lived `devmap mcp` processes started before the current binary, and a
+/// host plugin bundle whose version or hook shape no longer matches. Every one
+/// of them makes a correct-looking answer come from the wrong binary, which is
+/// precisely the failure a silent field cannot be debugged from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub available: bool,
+    pub binary: Option<String>,
+    pub reason: Option<String>,
+    /// Two or more `devmap` binaries of different builds were found.
+    pub binary_skew_warning: Option<String>,
+    /// The same unpinned `devmap mcp` command registered more than once.
+    pub duplicate_mcp_registration_warning: Option<String>,
+    /// `devmap mcp` processes older than the installed binary's mtime.
+    pub stale_server_warning: Option<String>,
+    /// An installed host plugin bundle that no longer matches this binary.
+    pub plugin_warning: Option<String>,
+    /// A registration naming a `devmap` that is not there.
+    pub missing_binary_warning: Option<String>,
+    /// Schema this binary speaks, for the compatibility strip.
+    pub expected_schema_version: Option<i64>,
+    pub code_graph_schema_version: Option<i64>,
+    pub linked_grammar_count: Option<i64>,
+    pub version: Option<String>,
+}
+
+/// Read `devmap doctor --json`.
+///
+/// `repo` is where the probe runs. Doctor is documented read-only — it refuses
+/// to create a store — so a scratch directory is a valid place to ask when no
+/// repository is open, and is what the caller should pass rather than reaching
+/// into an arbitrary checkout.
+pub fn doctor(repo_path: &str) -> DoctorReport {
+    let unavailable = |reason: String, binary: Option<String>| DoctorReport {
+        available: false,
+        binary,
+        reason: Some(reason),
+        ..DoctorReport::default()
+    };
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(e) => return unavailable(e, None),
+    };
+    let binary = match resolve_binary() {
+        Ok(b) => b,
+        Err(e) => return unavailable(e, None),
+    };
+    let run = match run_devmap(&binary, &repo, &["doctor", "--json"], None, STATUS_DEADLINE) {
+        Ok(run) => run,
+        Err(e) => return unavailable(e, Some(binary.path)),
+    };
+    let stdout = bytes_to_string(run.stdout);
+    let stderr = bytes_to_string(run.stderr);
+    if !run.success {
+        let detail = if stderr.trim().is_empty() {
+            format!("devmap doctor exited {}", run.status_code)
+        } else {
+            stderr.trim().to_string()
+        };
+        return unavailable(detail, Some(binary.path));
+    }
+    let Some(payload) = parse_json_stdout(&stdout) else {
+        return unavailable(
+            "devmap doctor returned non-JSON stdout".into(),
+            Some(binary.path),
+        );
+    };
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let number = |key: &str| payload.get(key).and_then(Value::as_i64);
+    DoctorReport {
+        available: true,
+        binary: Some(binary.path),
+        reason: None,
+        binary_skew_warning: text("binary_skew_warning"),
+        duplicate_mcp_registration_warning: text("duplicate_mcp_registration_warning"),
+        stale_server_warning: text("stale_server_warning"),
+        plugin_warning: text("plugin_warning"),
+        missing_binary_warning: text("missing_binary_warning"),
+        expected_schema_version: number("expected_schema_version"),
+        code_graph_schema_version: number("code_graph_schema_version"),
+        linked_grammar_count: number("linked_grammar_count"),
+        version: text("version"),
+    }
+}
+
+impl DoctorReport {
+    /// Every warning this report carries, in the order a reader should see
+    /// them: the ones that change which binary answers come first.
+    pub fn warnings(&self) -> Vec<String> {
+        [
+            self.missing_binary_warning.as_ref(),
+            self.binary_skew_warning.as_ref(),
+            self.stale_server_warning.as_ref(),
+            self.duplicate_mcp_registration_warning.as_ref(),
+            self.plugin_warning.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
     }
 }
 
@@ -963,20 +1156,33 @@ exit 2
         path
     }
 
+    /// Bind the argv-recording stub for the rest of this test.
+    ///
+    /// Returns the binding itself rather than a local guard: `TestBinaryBinding`
+    /// already owns both the override and the serial, and wrapping it in a
+    /// second guard that also took the serial was a deadlock waiting to be
+    /// found — the helper acquired it, then the binding acquired it again.
     #[cfg(unix)]
-    struct ResetTestBinary;
-    #[cfg(unix)]
-    impl Drop for ResetTestBinary {
-        fn drop(&mut self) {
-            set_test_binary(None);
-        }
+    fn bind_recording_devmap(repo: &Path) -> TestBinaryBinding {
+        let bin = write_recording_devmap(repo);
+        bind_test_binary(bin.to_string_lossy().into_owned())
     }
 
+    /// Give a fixture the consumer artifacts a real `--manifest` build writes.
+    ///
+    /// The recording stub answers `build` without touching the filesystem, so
+    /// without this a fixture looks like a repository whose map was never
+    /// written — which is its own reason to take the `--manifest` path, and
+    /// would quietly change what an "incremental" assertion is measuring.
     #[cfg(unix)]
-    fn bind_recording_devmap(repo: &Path) -> ResetTestBinary {
-        let bin = write_recording_devmap(repo);
-        set_test_binary(Some(bin.to_string_lossy().into_owned()));
-        ResetTestBinary
+    fn write_stub_artifacts(root: &Path) {
+        for path in [
+            super::super::repo_map::repo_map_path(root),
+            super::super::viz::code_graph_path(root),
+        ] {
+            fs::create_dir_all(path.parent().expect("artifact parent")).expect("artifact dir");
+            fs::write(&path, "{}").expect("artifact");
+        }
     }
 
     #[cfg(unix)]
@@ -1008,7 +1214,15 @@ exit 2
     #[test]
     fn explicit_env_that_does_not_resolve_is_refused() {
         let _lock = crate::harness::sidecar::test_serial();
-        set_test_binary(None);
+        // Two different things are process-global here and each has its own
+        // serial: the sidecar's guards the environment, this one guards the
+        // binary override. This test asserts on *resolution order*, and the
+        // override is consulted before `GITPULSE_DEVMAP_BIN` — so a binding
+        // held by any concurrent test would satisfy the lookup and the refusal
+        // under test would never happen. Acquired after the sidecar's, which is
+        // the order every binding site uses; reversing it anywhere would be a
+        // lock-order inversion.
+        let _no_override = test_serial();
         // SAFETY: serialized behind the sidecar test guard; restored below.
         std::env::set_var("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary");
         let err = resolve_binary().expect_err("must refuse");
@@ -1024,12 +1238,11 @@ exit 2
         let repo = git_repo();
         let bin_dir = tempfile::TempDir::new().expect("bindir");
         let bin = write_fake_devmap(bin_dir.path());
-        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
         let files: Vec<(String, String)> = (0..20)
             .map(|i| (format!("src/f{i}.rs"), "fn x() {}\n".into()))
             .collect();
         let out = preview_many(&repo.path().to_string_lossy(), &files, || false);
-        set_test_binary(None);
         clear_preview_debounces();
         let walked = out.files.iter().filter(|file| file.available).count();
         assert_eq!(walked, 16, "preview_many walked {walked} available files");
@@ -1046,13 +1259,12 @@ exit 2
         let repo = git_repo();
         let bin_dir = tempfile::TempDir::new().expect("bindir");
         let bin = write_fake_devmap(bin_dir.path());
-        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
         let result = preview(
             &repo.path().to_string_lossy(),
             "src/lib.rs",
             "fn main() {}\n",
         );
-        set_test_binary(None);
         clear_preview_debounces();
         assert!(result.available, "{:?}", result.reason);
         let report = result.report.expect("report");
@@ -1083,7 +1295,7 @@ exit 2
         let repo = git_repo();
         let bin_dir = tempfile::TempDir::new().expect("bindir");
         let bin = write_fake_devmap(bin_dir.path());
-        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
         // Twenty fixture/json paths plus one real source — without the
         // pre-cap filter the fan-out budget would be spent on fixtures and
         // `src/lib.rs` would never be previewed.
@@ -1097,7 +1309,6 @@ exit 2
             .collect();
         files.push(("src/lib.rs".into(), "fn main() {}\n".into()));
         let out = preview_many(&repo.path().to_string_lossy(), &files, || false);
-        set_test_binary(None);
         clear_preview_debounces();
         let available: Vec<_> = out
             .files
@@ -1141,11 +1352,10 @@ exit 2
         let mut perms = fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&bin, perms).unwrap();
-        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                set_test_binary(None);
                 clear_preview_debounces();
             }
         }
@@ -1201,14 +1411,7 @@ exit 2
         let canonical = repo.path().canonicalize().unwrap();
         let bin = write_fake_devmap(repo.path());
         fs::write(&bin, "#!/bin/sh\necho called >> status-calls\necho '{\"is_fresh\":false,\"schema_outdated\":false}'\n").unwrap();
-        struct ResetBinary;
-        impl Drop for ResetBinary {
-            fn drop(&mut self) {
-                set_test_binary(None);
-            }
-        }
-        let _reset = ResetBinary;
-        set_test_binary(Some(bin.to_string_lossy().into_owned()));
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
         let _guard = BuildGuard::try_acquire(&canonical).unwrap();
         for _ in 0..32 {
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
@@ -1293,6 +1496,7 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
+        write_stub_artifacts(repo.path());
         let _reset = bind_recording_devmap(repo.path());
         for reason in [
             "source tree differs from the indexed generation; rebuild or drain watcher edits",
@@ -1324,6 +1528,7 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
+        write_stub_artifacts(repo.path());
         let _reset = bind_recording_devmap(repo.path());
         for payload in [
             r#"{"is_fresh":false,"schema_outdated":false}"#,
@@ -1343,6 +1548,67 @@ exit 2
             );
             assert_build_argv(&argv_log(repo.path()), false);
         }
+    }
+
+    /// A schema-behind store the kernel says it can migrate must be rebuilt,
+    /// with `--manifest`, rather than refused forever. Before this, nothing in
+    /// the app ever rebuilt such a store: the gate skipped and the skip was
+    /// permanent.
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_migrates_a_schema_the_kernel_says_it_can_rebuild() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        write_stub_artifacts(repo.path());
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":false,"schema_outdated":true,"rebuild_required":true,"rebuild_reason":"schema-behind","schema_relation":"upgradeable","degraded_reason":"store schema is 19, this binary speaks 20; run `devmap build` to migrate it"}"#,
+        )
+        .unwrap();
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::Refresh
+        );
+        assert_build_argv(&argv_log(repo.path()), true);
+    }
+
+    /// The other side of the same rule: a store the kernel does *not* say it
+    /// can rebuild stays refused, and no build is spawned. `newer` is the case
+    /// that matters — rebuilding it would downgrade a database a newer reader
+    /// owns.
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_never_rebuilds_a_newer_store() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        write_stub_artifacts(repo.path());
+        let _reset = bind_recording_devmap(repo.path());
+        fs::write(
+            repo.path().join("status.json"),
+            r#"{"is_fresh":false,"schema_outdated":true,"rebuild_required":false,"schema_relation":"newer","degraded_reason":"store schema is 21, newer than the 20 this binary speaks; install a matching or newer devmap binary"}"#,
+        )
+        .unwrap();
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::SkipSchemaOutdated
+        );
+        let log = argv_log(repo.path());
+        assert!(
+            !log.lines().any(|line| line.starts_with("build ")),
+            "a newer store must never be rebuilt:\n{log}"
+        );
+        // The refusal carries the CLI's own remedy rather than advice the user
+        // cannot act on.
+        let reason = outcome.reason.unwrap_or_default();
+        assert!(
+            reason.contains("install a matching or newer devmap binary"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1416,5 +1682,90 @@ exit 2
                 "{command} accepted an explicit failure with exit 0"
             );
         }
+    }
+    /// A repository is indexed by the live gate whenever it is a retained tab,
+    /// but initialization runs only for the *active* one. So the build path
+    /// itself has to guarantee the hygiene, or a background tab silently gains
+    /// an untracked `.devmap/` that nothing ever wrote a rule for.
+    #[test]
+    #[cfg(unix)]
+    fn building_an_unopened_repository_still_hides_its_state_directory() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init");
+        assert!(out.status.success());
+        crate::test_support::trust_repo(repo.path());
+
+        // Deliberately *not* calling `devmap::init::initialize` first: this is
+        // the repository nobody activated.
+        let bin = write_fake_devmap(repo.path());
+        fs::write(
+            &bin,
+            "#!/bin/sh
+printf '%s\n' '{\"ok\":true}'
+",
+        )
+        .unwrap();
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
+
+        let built = refresh(&repo.path().to_string_lossy()).expect("refresh");
+        assert!(built.ok, "{built:?}");
+
+        // Asked behaviourally rather than by matching the file's text: after a
+        // build, git must already ignore the directory. Before this moved into
+        // the build path the answer here was `Added` — proof that the very
+        // first thing to hide it was this assertion, long after the index had
+        // been written.
+        let after = super::super::init::ensure_state_dir_excluded(repo.path());
+        assert!(
+            matches!(
+                after,
+                super::super::init::ExcludeOutcome::AlreadyIgnored { .. }
+            ),
+            "the build path left the state directory visible: {after:?}"
+        );
+    }
+
+    /// Hygiene is not a precondition for code intelligence. A repository whose
+    /// exclude file cannot be written must still get its index — losing every
+    /// answer over an untracked directory would be the worse trade.
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_exclude_does_not_cancel_the_build() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git init");
+        assert!(out.status.success());
+        crate::test_support::trust_repo(repo.path());
+
+        // A symlinked exclude file is refused by design: writing through it
+        // would redirect the append outside the git directory.
+        let info = repo.path().join(".git").join("info");
+        fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        let _ = fs::remove_file(&exclude);
+        std::os::unix::fs::symlink(repo.path().join("elsewhere"), &exclude).unwrap();
+
+        let bin = write_fake_devmap(repo.path());
+        fs::write(
+            &bin,
+            "#!/bin/sh
+printf '%s\n' '{\"ok\":true}'
+",
+        )
+        .unwrap();
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
+
+        let built = build(&repo.path().to_string_lossy()).expect("build");
+        assert!(
+            built.ok,
+            "a refused exclude must not cancel the build: {built:?}"
+        );
     }
 }

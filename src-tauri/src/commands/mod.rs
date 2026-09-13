@@ -3788,6 +3788,71 @@ pub async fn cmd_workspace_list(
     off_thread(move || crate::workspace_registry::list(&registry_root)).await
 }
 
+/// Initialize one opened repository for DevCouncil: ignore hygiene for the
+/// DevMap state directory, then the workspace registry.
+///
+/// Writes only inside `.git/info/exclude` and the resolved state directory, so
+/// nothing it does can appear in a diff or a commit. Agent guides, editor rules
+/// and MCP files are not touched here — those are `cmd_devmap_integrate`.
+#[tauri::command(async)]
+pub async fn cmd_devcouncil_init(
+    repo_path: String,
+    open_repos: Vec<String>,
+) -> Result<crate::devmap::InitReport, String> {
+    off_thread(move || crate::devmap::initialize_repository(&repo_path, &open_repos)).await
+}
+
+/// What of DevCouncil is installed, plus the installation warnings `devmap
+/// doctor` already measures.
+///
+/// `repo_path` is only where the doctor probe runs — it is read-only and
+/// repository-independent. Without a trusted repository the component
+/// inventory is still returned and the doctor section says why it is absent,
+/// rather than presenting a warning-free report nothing checked.
+#[tauri::command(async)]
+pub async fn cmd_devcouncil_suite_status(
+    repo_path: Option<String>,
+) -> Result<crate::tool_install::components::SuiteReport, String> {
+    off_thread(move || {
+        Ok(crate::tool_install::components::suite_report(
+            repo_path.as_deref(),
+        ))
+    })
+    .await
+}
+
+/// What registering DevMap with one agent host would change in this
+/// repository. Writes nothing.
+#[tauri::command(async)]
+pub async fn cmd_devmap_integration_preview(
+    repo_path: String,
+    host: crate::devmap::IntegrationHost,
+) -> Result<crate::devmap::IntegrationPlan, String> {
+    off_thread(move || Ok(crate::devmap::preview_integration(&repo_path, host))).await
+}
+
+/// The same preview for every host at once, for the "is this repository set up
+/// for agents" strip. Still writes nothing, so it is safe on repository open.
+#[tauri::command(async)]
+pub async fn cmd_devmap_integration_survey(
+    repo_path: String,
+) -> Result<Vec<crate::devmap::IntegrationPlan>, String> {
+    off_thread(move || Ok(crate::devmap::survey_integrations(&repo_path))).await
+}
+
+/// Write the integration assets for one host.
+///
+/// This edits tracked files in the repository and a machine-wide MCP
+/// registration in the user's home directory, so it must only ever be reached
+/// from an explicit user action that has seen `cmd_devmap_integration_preview`.
+#[tauri::command(async)]
+pub async fn cmd_devmap_integration_apply(
+    repo_path: String,
+    host: crate::devmap::IntegrationHost,
+) -> Result<crate::devmap::IntegrationPlan, String> {
+    off_thread(move || Ok(crate::devmap::apply_integration(&repo_path, host))).await
+}
+
 /// Replace the registry so it matches the open-tab set (plus the registry host).
 #[tauri::command(async)]
 pub async fn cmd_workspace_sync(

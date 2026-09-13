@@ -74,6 +74,137 @@ documented scripts (copy, or Run in Terminal). Disable hides a tool without
 deleting it; Uninstall removes only a binary GitPulse placed in its app bin
 directory. There is no uv / Python install path.
 
+## Per-repository initialization
+
+Opening a repository is the whole setup. When a repository is trusted and
+becomes an open tab, GitPulse does three things without asking, because none of
+them can appear in that repository's `git status`, its diff, or a commit:
+
+1. **Ignore hygiene.** `devmap build` leaves its state directory untracked and
+   nothing in the toolchain ignores it, so an automatic index would put a
+   permanent `?? .devmap/` in the view this application exists to render. The
+   resolved state directory — whichever `devmap_extract::paths` selects, so a
+   legacy `.devcouncil` tree is handled where the CLI actually writes — is
+   added to `$GIT_COMMON_DIR/info/exclude`, which is per-clone, never
+   committed, and reaches linked worktrees through the common directory.
+   `.gitignore` is deliberately not touched: it is tracked content in a
+   repository the application does not own. An existing project rule that
+   already covers the directory is honoured rather than duplicated, the pattern
+   is anchored to the repository root so a nested directory of the same name
+   stays visible, and git is asked again after the write — a pattern a later
+   rule re-includes is reported as a refusal, never as a success.
+2. **The index itself.** The live gate escalates to `devmap build --manifest`
+   whenever a consumer artifact is absent or the CLI sets `rebuild_required`.
+   A plain `devmap build` writes the database only, so the incremental path
+   could previously run to completion and leave Code → Map with no document —
+   including on the first build of every newly opened repository. Store
+   freshness is not evidence about the artifacts beside it: a repository whose
+   `repo_map.json` is deleted still reports `is_fresh: true`.
+3. **The workspace registry.** The open-tab set is written into the active
+   repository's registry, which is what cross-repository symbol search and
+   import-link candidates read.
+
+Initialization writes no state for a tool that is not installed, and writes
+none at all when the state directory could not be hidden — creating exactly the
+untracked directory the first step failed to prevent would be worse than
+declining.
+
+That refusal is remembered, but only as far as it stays true. A run that
+stopped short because `devmap` was absent still *succeeds*, so treating it like
+a finished one made installing devmap a no-op for every repository already
+open: cross-repository search kept answering "nothing" for the rest of the
+session. The tool probe — the one call every install path and every tool-aware
+surface makes — drops those results as soon as it sees devmap present, which
+covers an install made in this app and one made in a terminal alike. Shortfalls
+an install cannot fix, such as a refused exclude, are deliberately left alone
+by that signal and retried when the open-tab set next changes; clearing them on
+every probe would re-initialize an unfixable repository each time a panel
+opened.
+
+## Indexing the whole fleet, once
+
+The automatic path indexes what you are looking at. That is the right default —
+`devmap build` saturates its cores, and nobody wants eleven graphs rebuilt
+because eleven tabs are open — but it serves the first run badly: installing
+devmap against a workspace that is already full of tabs leaves every one of
+them un-indexed until it is visited. **Fleet → Index all** does them in one
+pass, one at a time, abortable between repositories.
+
+Sequential is not timidity. A build takes the store's writer lock, which
+`devmap serve` also takes, so overlapping builds queue on the lock instead of
+finishing sooner. Repositories that are already current are reported as such
+rather than rebuilt, a build that fails carries the kernel's own reason, and a
+sweep that could not run at all — no devmap — says that for every repository
+instead of reporting zero indexed. The sweep never claims the whole fleet when
+it did part of it: the summary carries both numbers whenever they differ.
+
+## Where a `devmap serve` daemon is running, the gate stands down
+
+`devmap serve` watches the tree itself, enqueues what changed, and rebuilds
+inside its own process. Where one is serving, GitPulse's poll-and-build loop is
+not merely redundant — it is a *second writer* for the same store lock. The
+live gate therefore probes the daemon over its IPC endpoint (one JSON line in,
+one out; the endpoint path comes from `serve --print-socket-path`, never
+re-derived here, because two implementations of that hash which disagree each
+start a daemon against the same store and neither side can see it) and answers
+`skip_daemon` when it finds work already queued.
+
+Three deliberate limits, each measured against a running daemon rather than
+assumed:
+
+* The stand-down is gated on **queued work**, not on the daemon being alive. If
+  the CLI says the store is stale and the daemon reports nothing pending, the
+  two disagree — the daemon's watcher did not see the change — and standing
+  down would leave the index stale with nobody rebuilding it.
+* **Schema decisions stay with the CLI.** A daemon's `status` reply carries
+  `is_fresh`, `degraded_reason` and the generation counts, but not
+  `schema_outdated`, `rebuild_required` or `schema_relation`. Trusting it for
+  everything would blind the gate to exactly the state it exists to see.
+* **Consumer artifacts stay with us.** The daemon persists generations to the
+  store; it never writes `repo_map.json`. A missing artifact still takes
+  `build --manifest`, whatever the daemon is doing.
+
+On Windows the daemon speaks a named pipe, and GitPulse has no client for it
+yet; the probe says so rather than reporting "no daemon", because those are
+different claims.
+
+A schema-behind store is migrated by a full rebuild when, and only when, the
+CLI's `rebuild_required` says a rebuild fixes it. `newer`, `foreign` and
+`unsupported` stores are refused with the CLI's own remedy, because rebuilding
+a newer store would downgrade a database a newer reader owns. The degraded-text
+fallbacks that let an older binary report an obsolete payload never authorize a
+rebuild of an *outdated schema*: that field is the only thing that carries
+migratability.
+
+## Agent-host integration is separate, and previewed
+
+`devmap integrate <host>` writes `AGENTS.md`, `CLAUDE.md`,
+`.cursor/rules/devmap.mdc`, project MCP entries, skills and hook configuration
+— tracked content — plus a machine-wide MCP registration in the user's home
+directory. None of that happens because a tab was opened. **Settings → Agents**
+runs `--dry-run` and renders the resulting change list; applying is a separate
+click. The two counts stay separate, because the command has no flag to write
+the project assets without the global registration and agreeing to add guides
+to a project is not agreeing to edit `~/.claude.json`. A guide the kernel
+reports as `not_ours` is a file the user wrote; it is surfaced as protected and
+left alone.
+
+## What is installed, and whether it is what answers
+
+`devmap` and `manvi` are the two binaries GitPulse installs and manages. The
+setup wizard also offers `dcstore`, `dcverify`, `dcgrep` and the Go host, and
+those are probed too — by running them, not by stat-ing a path. `dcstore` is
+not cosmetic: `manvi serve --workbench-db` resolves it from `PATH`, so the
+profile workbench and managed runs fail without it.
+
+Three of those components reject `--version`, so presence and version are
+reported as separate facts and a component that ran but cannot name itself is
+not shown the same as one that is absent. `devmap doctor`'s installation
+warnings — binary skew, duplicate MCP registrations, `devmap mcp` processes
+older than the installed binary, a stale plugin bundle — are surfaced beside
+the inventory. Doctor needs a trusted repository to run in; without one the
+panel says health was not checked rather than showing an empty list.
+
 ## Compatibility and evidence
 
 Devmap's JSON status includes `host_contract_version`, `binary_version`,
