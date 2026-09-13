@@ -1530,7 +1530,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             let was_timeout = timed_out(&err);
             // The source module may itself be a nested checkout. The approval
             // flow must name the same repository that process admission checks.
-            let source = if err.contains(crate::repository_trust::REQUIRED) {
+            let source = if crate::repository_trust::refused(&err) {
                 git_cli::find_git_root(&target).unwrap_or_else(|| root.clone())
             } else {
                 root.clone()

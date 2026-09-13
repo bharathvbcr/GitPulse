@@ -240,6 +240,22 @@ pub fn require(repo: &Path) -> Result<(), String> {
     Err(format!("{REQUIRED}: Open {} in GitPulse and explicitly trust this checkout before running repository commands.", current.checkout.path.display()))
 }
 
+/// Whether `message` is — or carries, once a caller has wrapped it — the
+/// refusal [`require`] returns.
+///
+/// A refusal is not a verdict about the repository. It says this process was
+/// never allowed to look, so nothing was examined and nothing was found
+/// wanting. Callers that turn an error string into a category must ask here
+/// rather than matching [`REQUIRED`] themselves: the one classifier that did
+/// not ask fell through to its "we looked, and it is broken" arm and told
+/// users that six perfectly valid checkouts were `[invalid_worktree]`.
+///
+/// A substring rather than a prefix test because the marker travels inside
+/// whatever context its caller wrapped around it.
+pub fn refused(message: &str) -> bool {
+    message.contains(REQUIRED)
+}
+
 fn save_grant(root: &Path, current: &Identity) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
