@@ -15,7 +15,9 @@ npm run mcp:install
 npm run mcp:doctor
 ```
 
-`mcp:install` puts this tree's `gitpulse-mcp` on `PATH`. `mcp:doctor` distinguishes **absent**, **unresponsive**, and **stale** from **matching**. A missing server must not look like a current one.
+`mcp:install` puts this tree's `gitpulse-mcp` **and** `gitpulse-hook` on `PATH`. `mcp:doctor` reports each separately, distinguishing **absent**, **unresponsive**, and **stale** from **matching**. A missing binary must not look like a current one.
+
+Both are required, and the hook is the one that fails quietly. A client that cannot spawn the server shows a failed MCP connection; a host that cannot spawn a hook records a non-blocking error and runs the tool call anyway, so an absent `gitpulse-hook` leaves the collision guard and command gate permanently disabled while every session looks normal. `mcp:doctor` exits non-zero if either is missing.
 
 The packaged app copies `plugins/gitpulse/` into `Contents/Resources/plugin`. Settings can copy the Codex / MCP manifests and will name the binary path, or why it could not be found.
 
@@ -31,6 +33,24 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
   }
 }
 ```
+
+## Hooks
+
+`plugins/gitpulse/hooks/hooks.json` registers three hooks, all spawning `gitpulse-hook`:
+
+| Event | Subcommand | What it does |
+| --- | --- | --- |
+| `PreToolUse` on `Edit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file. |
+| `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push. |
+| `SessionStart` | `session-brief` | Adds a repository snapshot to the session's context. |
+
+Three properties are deliberate:
+
+- **No hook ever answers `allow`.** An approval GitPulse did not earn would override the user's own permission rules. The gate can refuse or escalate; it cannot wave anything through.
+- **Every hook exits 0.** Exit 2 blocks a tool call whatever the JSON says, and a hook that crashed must never be the reason an edit is refused. Failures degrade to "no decision".
+- **A check that could not run says so.** Anything that did not scan, scanned partially, or could not reach the harness emits a `systemMessage` naming the gap, rather than the silence that means "clean".
+
+The command gate runs without a bound task scope, so it reaches the hard rungs (force-push, destructive commands) and not the scope rungs. That is a smaller gate than the desktop app's, and a real one.
 
 ## Package layout
 

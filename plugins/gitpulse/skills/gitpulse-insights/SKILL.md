@@ -2,7 +2,7 @@
 name: gitpulse-insights
 description: Read GitPulse repository insights over MCP — worktrees, agent sessions, uncommitted changes, overlapping dirty files, ledger verdicts, and code-graph availability. Use when an agent needs a honest snapshot of a checkout before editing, when multiple worktrees or coding agents are in flight, or when the user asks what is happening in a GitPulse-managed repo.
 license: MIT
-compatibility: Requires the gitpulse-mcp binary on PATH (or GITPULSE_MCP_PATH) and an absolute git repository path.
+compatibility: Requires the gitpulse-mcp binary on PATH and an absolute git repository path.
 metadata:
   mcp-protocol: "2026-07-28"
   agent-plugins: "1.0.0"

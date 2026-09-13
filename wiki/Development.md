@@ -70,7 +70,7 @@ While iterating:
 | `npm run check:vendor-schema` | Vendored store schema ↔ installed `devmap` CLI |
 | `npm run check:types` | serde structs ↔ TypeScript interfaces |
 | `npm run check:release` | Version manifests agree |
-| `npm run mcp:install` | Put this tree's `gitpulse-mcp` on PATH |
+| `npm run mcp:install` | Put this tree's `gitpulse-mcp` and `gitpulse-hook` on PATH |
 | `npm run mcp:doctor` | PATH binary matches this tree (not in ci:local) |
 
 Every bug fix ships with a test that fails against the unfixed code.

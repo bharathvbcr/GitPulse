@@ -309,3 +309,166 @@ describe("Claude Code marketplace manifest", () => {
     });
   }
 });
+
+/**
+ * Every executable the package spawns must be one `npm run mcp:install` puts
+ * on PATH.
+ *
+ * This is the half of the contract that lives outside the package. The files
+ * above prove the manifests are internally consistent; none of them can see
+ * whether the binaries those manifests name will exist on the machine that
+ * installs them. They did not: `mcp:install` built only `gitpulse-mcp` while
+ * `hooks/hooks.json` spawned `gitpulse-hook`, so a correct, validated,
+ * fully-tested plugin shipped with its collision guard and command gate
+ * permanently disabled.
+ *
+ * The two failures are not symmetric, which is why this is worth a test rather
+ * than a line in a README. A missing MCP server shows up in the client as a
+ * server that would not connect. A missing hook binary does not: the Claude
+ * Code hook reference is explicit that a hook which cannot start is a
+ * non-blocking error and the tool call proceeds — "a mistyped path in
+ * settings.json leaves the gate silently disabled". An uninstallable server is
+ * loud; an uninstallable hook is indistinguishable from a hook that ran and
+ * found nothing.
+ *
+ * Both sides are derived. The executables come from the manifests a client
+ * reads, and the installed list from the script a developer runs, so adding a
+ * hook or renaming a binary fails here instead of shipping.
+ */
+describe("the package's executables are installable", () => {
+  /** Every bare executable token the shipped manifests ask a host to spawn. */
+  function spawnedExecutables(): Set<string> {
+    const found = new Set<string>();
+
+    const hooks = JSON.parse(
+      readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8"),
+    ) as { hooks: Record<string, Array<{ hooks: Array<{ command?: string }> }>> };
+    for (const groups of Object.values(hooks.hooks)) {
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          const bin = String(handler.command ?? "").trim().split(/\s+/)[0];
+          if (bin) found.add(bin);
+        }
+      }
+    }
+
+    for (const manifest of [".mcp.json", "mcp.json"]) {
+      const servers = (loadJson(manifest).mcpServers ?? {}) as Record<string, { command?: string }>;
+      for (const server of Object.values(servers)) {
+        if (typeof server.command === "string" && server.command) found.add(server.command);
+      }
+    }
+    return found;
+  }
+
+  /** The `--bin` names `npm run mcp:install` actually installs. */
+  function installedExecutables(): Set<string> {
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    const script = pkg.scripts["mcp:install"];
+    expect(script, "package.json has no mcp:install script").toBeTruthy();
+    return new Set([...script.matchAll(/--bin\s+(\S+)/g)].map((match) => match[1]));
+  }
+
+  it("finds executables on both sides, so the comparison is not vacuous", () => {
+    expect(spawnedExecutables().size).toBeGreaterThan(0);
+    expect(installedExecutables().size).toBeGreaterThan(0);
+  });
+
+  it("installs every executable the manifests spawn", () => {
+    const installed = installedExecutables();
+    for (const bin of spawnedExecutables()) {
+      expect(
+        installed,
+        `the package spawns ${bin} but npm run mcp:install does not install it; a host would get "command not found"`,
+      ).toContain(bin);
+    }
+  });
+
+  it("only installs binaries this crate actually builds", () => {
+    // A `--bin` naming a target that does not exist fails the install outright,
+    // which would leave the other binary uninstalled too.
+    const cargo = readFileSync(path.join(ROOT, "src-tauri", "Cargo.toml"), "utf8");
+    const targets = new Set(
+      [...cargo.matchAll(/\[\[bin\]\]\s*\nname\s*=\s*"([^"]+)"/g)].map((match) => match[1]),
+    );
+    expect(targets.size).toBeGreaterThan(0);
+    for (const bin of installedExecutables()) {
+      expect(targets, `mcp:install names ${bin}, which is not a [[bin]] in Cargo.toml`).toContain(bin);
+    }
+  });
+
+  it("is the install command the docs tell people to run", () => {
+    // A second, undocumented install path is how the first one goes stale.
+    const contributing = readFileSync(path.join(ROOT, "CONTRIBUTING.md"), "utf8");
+    expect(contributing).toContain("npm run mcp:install");
+  });
+});
+
+/**
+ * The hook must give up before the host does.
+ *
+ * `hooks::BUDGET` is how long one hook invocation waits for the work behind it
+ * — a worktree sweep, a harness verdict — before abandoning it. `timeout` in
+ * `hooks.json` is how long the host waits for the whole process. The order
+ * between them is load-bearing and invisible:
+ *
+ * - budget first, and a check that could not finish still prints its
+ *   "this ran UNGATED" notice, which is the entire honesty contract of the
+ *   module. Measured against a deliberately wedged `manvi`: the hook answers
+ *   at 5.1s and the user is told.
+ * - host first, and the Claude Code hook reference says the output is
+ *   discarded and the tool call proceeds. The notice is never written, so a
+ *   check that did not run becomes indistinguishable from one that ran and
+ *   found nothing — the exact substitution `src/hooks/mod.rs` exists to
+ *   prevent, defeated by a number in a JSON file nobody would think to read
+ *   alongside it.
+ *
+ * Nothing else relates these two constants, and they live in different
+ * languages in different files, so this is the only place the ordering can be
+ * stated. Both sides are parsed rather than repeated.
+ */
+describe("hook budgets sit inside the host's timeouts", () => {
+  function hookBudgetSeconds(): number {
+    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"), "utf8");
+    const match = /pub const BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+    expect(match, "hooks::BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
+    return Number(match![1]);
+  }
+
+  function declaredTimeouts(): Array<{ event: string; command: string; timeout: number }> {
+    const hooks = JSON.parse(
+      readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8"),
+    ) as { hooks: Record<string, Array<{ hooks: Array<{ command?: string; timeout?: number }> }>> };
+    const rows: Array<{ event: string; command: string; timeout: number }> = [];
+    for (const [event, groups] of Object.entries(hooks.hooks)) {
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          rows.push({
+            event,
+            command: String(handler.command),
+            timeout: Number(handler.timeout),
+          });
+        }
+      }
+    }
+    return rows;
+  }
+
+  it("reads a budget and at least one declared timeout", () => {
+    expect(hookBudgetSeconds()).toBeGreaterThan(0);
+    expect(declaredTimeouts().length).toBeGreaterThan(0);
+  });
+
+  it("gives every hook longer than the work inside it is allowed to take", () => {
+    const budget = hookBudgetSeconds();
+    for (const { event, command, timeout } of declaredTimeouts()) {
+      expect(Number.isFinite(timeout), `${event} ${command} has no numeric timeout`).toBe(true);
+      expect(
+        timeout,
+        `${event} "${command}" is killed by the host after ${timeout}s, but the hook waits ${budget}s before reporting that its check could not run — the host discards the output of a timed-out hook, so that notice would never be delivered`,
+      ).toBeGreaterThan(budget);
+    }
+  });
+});

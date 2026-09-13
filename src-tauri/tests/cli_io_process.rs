@@ -48,6 +48,59 @@ fn hook_bounds_an_open_input_pipe_without_emitting_a_decision() {
         .contains("stdin"));
 }
 
+#[test]
+fn hook_identity_answers_without_waiting_for_stdin() {
+    // `npm run mcp:doctor` asks the installed binary who it is. Every other
+    // invocation of this executable reads a hook payload to EOF, so if the
+    // identity path shared that read, a doctor whose stdin nobody closes would
+    // hang for the whole 4 MiB budget instead of answering.
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("stdout");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+        .arg("--version")
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        // Held open and never written to: the state a probe leaves stdin in.
+        .stdin(Stdio::piped())
+        .stdout(File::create(&output).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let held_input = child.stdin.take().unwrap();
+    assert_eq!(wait(&mut child, Duration::from_secs(8)).code(), Some(0));
+    drop(held_input);
+
+    let printed = fs::read_to_string(&output).unwrap();
+    assert!(
+        printed.starts_with(&format!("gitpulse-hook {}", gitpulse_lib::hooks::VERSION)),
+        "identity did not lead with this build's version: {printed:?}"
+    );
+    for name in gitpulse_lib::hooks::SUBCOMMANDS {
+        assert!(
+            printed.contains(name),
+            "identity does not advertise {name}: {printed:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_argument_stays_silent_rather_than_answering_like_an_identity() {
+    // Exit 0 with empty stdout is the documented "no decision". A build that
+    // printed something here would put non-protocol bytes on the channel a
+    // host parses as hook JSON.
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("stdout");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gitpulse-hook"))
+        .arg("--not-a-flag")
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
+        .stdin(Stdio::null())
+        .stdout(File::create(&output).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert_eq!(wait(&mut child, Duration::from_secs(8)).code(), Some(0));
+    assert!(fs::read(output).unwrap().is_empty());
+}
+
 #[cfg(unix)]
 fn pipe_output(full: bool) -> (Stdio, Option<File>) {
     use std::io::Write;

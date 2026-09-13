@@ -338,8 +338,8 @@ npm run tauri dev
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
 | `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 57 contracts (1022 fields) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
-| `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |
-| `npm run mcp:doctor` | Assert the `gitpulse-mcp` on PATH is this tree's build, not a stale copy |
+| `npm run mcp:install` | Install/refresh `gitpulse-mcp` **and** `gitpulse-hook` on PATH, which is what agent clients spawn |
+| `npm run mcp:doctor` | Assert the `gitpulse-mcp` and `gitpulse-hook` on PATH are this tree's build, not stale or absent copies |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
 | `npm test` | Run Vitest unit and integration test suite (2,000+ tests) |
 | `npm run coverage` | Generate Vitest v8 code coverage report |

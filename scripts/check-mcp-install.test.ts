@@ -5,11 +5,16 @@ import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   DEFAULT_TIMEOUT_MS,
+  HOOK_BIN,
   SERVER_BIN,
   classify,
+  classifyHook,
+  declaredHookSubcommands,
   parseArgs,
+  parseHookIdentity,
   parseServerVersion,
   parseServerManifest,
+  probeHook,
   probeServer,
   resolveOnPath,
 } from "./check-mcp-install.mjs";
@@ -254,5 +259,153 @@ describe("parseArgs", () => {
   it("refuses a flag with no value, and an unknown flag", () => {
     expect(() => parseArgs(["--expect"])).toThrow(/requires a value/);
     expect(() => parseArgs(["--nope"])).toThrow(/unknown argument: --nope/);
+  });
+});
+
+/** An executable stand-in for `gitpulse-hook --version`. */
+async function fakeHook(prefix: string, stdout: string) {
+  const dir = await scratchDir(prefix);
+  const file = path.join(dir, "fake-hook.mjs");
+  await writeFile(file, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(stdout)});\n`);
+  await chmod(file, 0o755);
+  return file;
+}
+
+describe("parseHookIdentity", () => {
+  it("reads the version and the subcommand list", () => {
+    expect(parseHookIdentity("gitpulse-hook 1.0.1\nsubcommands: a, b, c\n")).toEqual({
+      version: "1.0.1",
+      subcommands: ["a", "b", "c"],
+    });
+  });
+
+  it("survives log noise on stderr-shaped lines without throwing", () => {
+    expect(
+      parseHookIdentity("warning: something\ngitpulse-hook 2.0.0\nsubcommands: only-one\n"),
+    ).toEqual({ version: "2.0.0", subcommands: ["only-one"] });
+  });
+
+  it("keeps a half-answer half, rather than inventing the missing side", () => {
+    // A binary that printed a version and no subcommands has not identified
+    // itself; defaulting the list to empty would read as "serves nothing" and
+    // defaulting it to the declared set would read as a pass.
+    expect(parseHookIdentity("gitpulse-hook 1.0.1\n")).toEqual({ version: "1.0.1", subcommands: null });
+    expect(parseHookIdentity("subcommands: a\n")).toEqual({ version: null, subcommands: ["a"] });
+    expect(parseHookIdentity("")).toEqual({ version: null, subcommands: null });
+  });
+
+  it("does not mistake another binary's version line for ours", () => {
+    expect(parseHookIdentity("gitpulse-mcp 1.0.1\n").version).toBeNull();
+  });
+});
+
+describe("declaredHookSubcommands", () => {
+  it("derives the subcommands from the shipped manifest", () => {
+    const declared = declaredHookSubcommands();
+    expect(declared.length).toBeGreaterThan(0);
+    expect(declared).toEqual([...declared].sort());
+    // Spelled out once, so a manifest that silently loses a hook is caught
+    // here as well as by the plugin contract.
+    expect(declared).toContain("collision-guard");
+    expect(declared).toContain("command-gate");
+    expect(declared).toContain("session-brief");
+  });
+
+  it("throws rather than returning an empty list when the manifest is unreadable", async () => {
+    // "We could not find out what the manifest declares" must never be served
+    // as "it declares nothing", which would make every binary pass.
+    const dir = await scratchDir("no-manifest");
+    expect(() => declaredHookSubcommands(dir)).toThrow();
+  });
+});
+
+describe("classifyHook", () => {
+  const base = { expected: "1.0.1", declared: ["collision-guard", "command-gate"], error: null };
+
+  it("separates absent from ok — the collapse that shipped a dead gate", () => {
+    const absent = classifyHook({ ...base, binPath: null, version: null, subcommands: null });
+    expect(absent.status).toBe("absent");
+    expect(absent.violations.join(" ")).toContain("silently disabled");
+
+    expect(
+      classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "1.0.1", subcommands: ["collision-guard", "command-gate"] }).status,
+    ).toBe("ok");
+  });
+
+  it("reports a binary that answered nothing as unresponsive, not absent", () => {
+    expect(
+      classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: null, subcommands: null, error: "no identity" }).status,
+    ).toBe("unresponsive");
+  });
+
+  it("names both versions when the installed hook is stale", () => {
+    const stale = classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "0.9.0", subcommands: ["collision-guard", "command-gate"] });
+    expect(stale.status).toBe("stale");
+    expect(stale.violations[0]).toContain("0.9.0");
+    expect(stale.violations[0]).toContain("1.0.1");
+  });
+
+  it("refuses a current binary that cannot serve a declared hook", () => {
+    // The drift a source-only contract test cannot see: the manifest a client
+    // reads asks for a subcommand the executable on PATH does not implement,
+    // and an unknown subcommand answers with silence by design.
+    const drifted = classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "1.0.1", subcommands: ["collision-guard"] });
+    expect(drifted.status).toBe("stale");
+    expect(drifted.violations[0]).toContain("command-gate");
+  });
+
+  it("ignores extra subcommands the manifest does not ask for", () => {
+    expect(
+      classifyHook({ ...base, binPath: "/usr/bin/gitpulse-hook", version: "1.0.1", subcommands: ["collision-guard", "command-gate", "future-hook"] }).status,
+    ).toBe("ok");
+  });
+});
+
+describe("probeHook", () => {
+  it("reads a complete identity split across writes", async () => {
+    const bin = await fakeHook("ok", "gitpulse-hook 1.0.1\nsubcommands: collision-guard, command-gate, session-brief\n");
+    await expect(probeHook(bin, 5000)).resolves.toEqual({
+      version: "1.0.1",
+      subcommands: ["collision-guard", "command-gate", "session-brief"],
+      error: null,
+    });
+  });
+
+  it("reports a binary that prints nothing rather than hanging on it", async () => {
+    const bin = await fakeHook("silent", "");
+    const result = await probeHook(bin, 5000);
+    expect(result.version).toBeNull();
+    expect(result.error).toContain("identity");
+  });
+
+  it("reports a missing executable instead of throwing", async () => {
+    const dir = await scratchDir("missing");
+    const result = await probeHook(path.join(dir, "not-here"), 5000);
+    expect(result.version).toBeNull();
+    expect(result.error).toBeTruthy();
+  });
+
+  it("bounds a binary that never exits", async () => {
+    // The identity path reads no stdin, so a build that blocks on it would
+    // hang this probe forever without the deadline.
+    const dir = await scratchDir("hang");
+    const file = path.join(dir, "hang.mjs");
+    await writeFile(file, "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n");
+    await chmod(file, 0o755);
+    const started = Date.now();
+    const result = await probeHook(file, 400);
+    expect(result.error).toContain("within 400ms");
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+});
+
+describe("the doctor covers both executables the package spawns", () => {
+  it("names the hook binary, not only the server", () => {
+    expect(SERVER_BIN).toBe("gitpulse-mcp");
+    expect(HOOK_BIN).toBe("gitpulse-hook");
+  });
+
+  it("accepts a hook binary path so the probe is drivable without an install", () => {
+    expect(parseArgs(["--hook-bin", "/tmp/h"]).hookBin).toBe(path.resolve("/tmp/h"));
   });
 });

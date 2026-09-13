@@ -7,12 +7,14 @@
 //!
 //! Two rules shape this file:
 //!
-//! * **stdout is the protocol channel.** Nothing but the hook JSON goes down
-//!   it. Diagnostics go to stderr, where a hook that exits 0 has them recorded
-//!   in the host's debug log and shown to nobody else. The git and harness
-//!   subprocesses underneath already pipe their own stdout
+//! * **stdout is the protocol channel.** On a hook invocation nothing but the
+//!   hook JSON goes down it. Diagnostics go to stderr, where a hook that exits
+//!   0 has them recorded in the host's debug log and shown to nobody else. The
+//!   git and harness subprocesses underneath already pipe their own stdout
 //!   (`engine::git_cli::git_command`, `harness::sidecar`), so none of them can
-//!   leak into ours.
+//!   leak into ours. The one argument that is not a hook invocation —
+//!   `--version`, which no host sends — prints plain text there instead, and
+//!   deliberately prints nothing a host could parse as a decision.
 //! * **Always exit 0.** Exit 2 blocks the tool call whatever the JSON says. A
 //!   hook that crashed, timed out or could not read its input must never be the
 //!   reason a user's edit is refused, so every failure path here degrades to
@@ -23,7 +25,7 @@
 
 use std::io;
 
-use gitpulse_lib::hooks::{self, SUBCOMMANDS};
+use gitpulse_lib::hooks::{self, IDENTITY_FLAGS, SUBCOMMANDS};
 
 fn main() {
     decide();
@@ -52,6 +54,17 @@ fn decide() {
         return;
     };
 
+    // Asked who we are rather than to judge anything. No host sends this — it
+    // is what `npm run mcp:doctor` uses to tell an absent or stale hook binary
+    // from a current one, which no hook invocation can reveal because silence
+    // is a legitimate answer to every one of them. Handled before the
+    // subcommand check so it is never reported as an unknown subcommand, and
+    // it reads no stdin: there is none to read.
+    if IDENTITY_FLAGS.contains(&subcommand.as_str()) {
+        emit(hooks::identity());
+        return;
+    }
+
     if !SUBCOMMANDS.contains(&subcommand.as_str()) {
         log::warn!(target: "hook", "unknown hook subcommand {subcommand:?}; no decision");
         return;
@@ -72,18 +85,30 @@ fn decide() {
     match hooks::dispatch(&subcommand, &input) {
         Ok(output) => {
             if let Some(json) = output.render() {
-                let result = gitpulse_lib::output::BoundedOutput::new(
-                    io::stdout(),
-                    "gitpulse-hook-stdout",
-                    hooks::MAX_INPUT_BYTES,
-                    std::time::Duration::from_secs(1),
-                )
-                .and_then(|output| output.write(format!("{json}\n").as_bytes()));
-                if let Err(error) = result {
-                    log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
-                }
+                emit(format!("{json}\n"));
             }
         }
         Err(error) => log::warn!(target: "hook", "gitpulse-hook: {error}"),
+    }
+}
+
+/// The one place this binary writes to stdout.
+///
+/// Bounded and deadlined for the same reason every other stdout in this
+/// repository is: a host that has gone away leaves a pipe nobody drains, and
+/// Rust ignores SIGPIPE, so an unchecked write is a hang rather than an error.
+/// A failed write is logged and not retried — there is no second channel to
+/// deliver it on, and exiting non-zero would block the user's tool call over a
+/// message we could not send.
+fn emit(payload: String) {
+    let result = gitpulse_lib::output::BoundedOutput::new(
+        io::stdout(),
+        "gitpulse-hook-stdout",
+        hooks::MAX_INPUT_BYTES,
+        std::time::Duration::from_secs(1),
+    )
+    .and_then(|output| output.write(payload.as_bytes()));
+    if let Err(error) = result {
+        log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
     }
 }
