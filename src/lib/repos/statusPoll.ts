@@ -32,7 +32,53 @@ export interface StatusLike {
 }
 
 /**
- * Element-wise equality over the fields the UI renders. Deliberately strictly
+ * Absent and empty are the same fact. Rust carries `warnings` with
+ * `skip_serializing_if = "Vec::is_empty"`, so a row with nothing to say omits
+ * the key rather than sending `[]`, and a locally-built row may do either.
+ * Treating them as different would publish on every tick for no change.
+ */
+function stringListEqual(a: unknown, b: unknown): boolean {
+  const left = Array.isArray(a) ? a : [];
+  const right = Array.isArray(b) ? b : [];
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+/**
+ * Whether two rows carry the same facts.
+ *
+ * Every own key participates, for the same reason `shallowRecordListEqual`
+ * compares all of them by default: a hand-written field list is a promise to
+ * remember, and this one was already broken once. `warnings` arrived from Rust
+ * and the list kept comparing the other eleven fields, so a row whose churn
+ * stopped being partial compared equal and never republished — the explorer
+ * went on showing "counts may understate reality" for numbers that had since
+ * parsed cleanly. Deriving the keys means the next field Rust adds is compared
+ * without anyone noticing it needs to be.
+ *
+ * Array-valued fields compare by content; `!==` on them is identity, and two
+ * separate invokes never share an array, which would defeat the gate entirely.
+ */
+function statusEqual(left: StatusLike, right: StatusLike): boolean {
+  const leftRecord = left as unknown as Record<string, unknown>;
+  const rightRecord = right as unknown as Record<string, unknown>;
+  // The union, not one side's keys plus a count check: an omitted `warnings`
+  // and an empty one are the same fact carried by a different number of keys,
+  // so comparing key counts first reports a quiet repo as changed every tick.
+  for (const key of new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])) {
+    const leftValue = leftRecord[key];
+    const rightValue = rightRecord[key];
+    if (Array.isArray(leftValue) || Array.isArray(rightValue)) {
+      if (!stringListEqual(leftValue, rightValue)) return false;
+    } else if (leftValue !== rightValue) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Element-wise equality over everything the wire carries. Deliberately strictly
  * index-wise — `[a, b]` vs `[b, a]` counts as DIFFERENT. The gate only skips
  * publishes, so a reorder costing one extra publish is the safe direction;
  * multiset matching could miss a duplicate-path entry flipping sides. Kept
@@ -42,23 +88,7 @@ export interface StatusLike {
 export function statusesEqual(a: readonly StatusLike[], b: readonly StatusLike[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
-    const left = a[i];
-    const right = b[i];
-    if (
-      left.path !== right.path ||
-      left.old_path !== right.old_path ||
-      left.status_code !== right.status_code ||
-      left.is_staged !== right.is_staged ||
-      left.is_conflicted !== right.is_conflicted ||
-      left.additions !== right.additions ||
-      left.deletions !== right.deletions ||
-      left.staged_additions !== right.staged_additions ||
-      left.staged_deletions !== right.staged_deletions ||
-      left.unstaged_additions !== right.unstaged_additions ||
-      left.unstaged_deletions !== right.unstaged_deletions
-    ) {
-      return false;
-    }
+    if (!statusEqual(a[i], b[i])) return false;
   }
   return true;
 }

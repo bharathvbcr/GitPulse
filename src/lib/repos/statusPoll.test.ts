@@ -47,21 +47,66 @@ describe("statusesEqual", () => {
     expect(statusesEqual(a, b)).toBe(true);
   });
 
-  it("detects every compared field changing", () => {
-    const base = [status({ path: "a.ts", old_path: "z.ts" })];
-    const variants: Array<Partial<StatusLike>> = [
-      { path: "b.ts" },
-      { old_path: "y.ts" },
-      { status_code: "D" },
-      { is_staged: true },
-      { is_conflicted: true },
-      { additions: 9 },
-      { deletions: 9 },
-    ];
-    for (const variant of variants) {
-      const changed = [status({ path: "a.ts", old_path: "z.ts", ...variant })];
-      expect(statusesEqual(base, changed), JSON.stringify(variant)).toBe(false);
+  /**
+   * Derived from the type, not hand-listed. The hand-listed version of this
+   * test fell behind the wire the moment Rust grew `warnings`: the gate kept
+   * comparing the other eleven fields, so a row whose churn stopped being
+   * partial compared equal, the publish was skipped, and the explorer went on
+   * rendering "counts may understate" for numbers that were now known-good.
+   * Walking a fully populated row means the next field added is covered here
+   * without anyone remembering to edit this list.
+   */
+  it("detects a change in every field the wire carries", () => {
+    const populated: Required<StatusLike> = {
+      path: "a.ts",
+      old_path: "z.ts",
+      status_code: "M",
+      is_staged: true,
+      is_conflicted: true,
+      additions: 3,
+      deletions: 4,
+      staged_additions: 1,
+      staged_deletions: 2,
+      unstaged_additions: 5,
+      unstaged_deletions: 6,
+      warnings: ["numstat record had unparseable counts"],
+    };
+    const keys = Object.keys(populated) as Array<keyof StatusLike>;
+    expect(keys.length, "populate every field of StatusLike").toBe(12);
+
+    for (const key of keys) {
+      const value = populated[key];
+      const changed =
+        typeof value === "string"
+          ? `${value}-other`
+          : typeof value === "number"
+            ? value + 1
+            : typeof value === "boolean"
+              ? !value
+              : Array.isArray(value)
+                ? []
+                : value;
+      expect(statusesEqual([populated], [{ ...populated, [key]: changed }]), key).toBe(false);
     }
+  });
+
+  /**
+   * The exact shape the gate has to catch. Rust falls back to `(0, 0)` churn
+   * for a numstat record it cannot parse and attaches a warning, so when that
+   * record later parses on a genuinely zero-churn row — a mode-only change —
+   * every other field is identical and only `warnings` empties.
+   */
+  it("republishes when churn stops being partial but the counts do not move", () => {
+    const partial = [status({ path: "a.ts", warnings: ["numstat record had unparseable counts"] })];
+    const trustworthy = [status({ path: "a.ts" })];
+    expect(statusesEqual(partial, trustworthy)).toBe(false);
+  });
+
+  /** Rust omits the key entirely while empty, so absent and `[]` mean the same. */
+  it("treats an absent warnings list and an empty one as equal", () => {
+    const absent = [status({ path: "a.ts" })];
+    const empty = [status({ path: "a.ts", warnings: [] })];
+    expect(statusesEqual(absent, empty)).toBe(true);
   });
 
   it("keeps a missing old_path distinct from an empty rename source", () => {
