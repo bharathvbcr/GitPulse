@@ -309,7 +309,17 @@
     --glass-shade-bottom:rgb(0 0 0 / .22);
     --glass-tint:rgb(23 76 176 / .07);
     padding:0;
-    --bg:rgb(var(--base) / .55);
+    /* 0.8 is a floor, not a taste choice. This panel floats over an arbitrary
+       desktop, so every foreground token has to clear 4.5:1 against BOTH a
+       pure-white and a pure-black wallpaper, and panel opacity is the only
+       thing decoupling the text from it. Solved against the model in
+       harness/statusChecks.ts: the minimum passing alpha is .787 light and
+       .795 dark. At .55 the accents land at 2.1-2.5:1 — and no single colour
+       can clear 4.5:1 at both extremes once the panel is that thin, so
+       darkening the tokens instead is not available. The glass still reads:
+       20% of the desktop shows through, under the hue field and the sheen and
+       tint passes below. */
+    --bg:rgb(var(--base) / .8);
     --surface:rgb(var(--card-base) / .4);
     --soft:rgb(var(--card-base) / .28);
     --line:var(--glass-edge);
@@ -330,7 +340,8 @@
   .status-shell[data-material="native"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *) {
     --hue-a:120 152 255; --hue-b:46 196 214; --hue-c:168 136 252; --hue-d:240 122 186;
     --hue-gain:.5;
-    --bg:rgb(var(--base) / .62);
+    /* Same floor as the dark arm above; light solves to .787. */
+    --bg:rgb(var(--base) / .8);
     --surface:rgb(var(--card-base) / .58);
     --soft:rgb(var(--card-base) / .36);
     --glass-edge:rgb(var(--card-base) / .24);
@@ -374,7 +385,10 @@
       --glass-sheen-top:rgb(255 255 255 / .05);
       --glass-shade-bottom:rgb(0 0 0 / .22);
       --glass-tint:rgb(23 76 176 / .07);
-      --bg:rgb(var(--base) / .55);
+      /* Matches the native arm: the fixture must not look more transparent
+         than the material it stands in for, or it validates a surface that
+         never ships. Same 4.5:1 floor, same .8. */
+      --bg:rgb(var(--base) / .8);
       --surface:rgb(var(--card-base) / .4);
       --soft:rgb(var(--card-base) / .28);
       --line:var(--glass-edge);

@@ -30,6 +30,21 @@ export async function checkStatusPopover() {
     return panel.scrollWidth <= panel.clientWidth + 1 && panel.getBoundingClientRect().height < 624;
   };
   const backdrop = () => getComputedStyle(element(".panel")).getPropertyValue("backdrop-filter");
+  /**
+   * Whether any shadow in a computed `box-shadow` paints OUTSIDE the panel.
+   *
+   * The invariant on native material is that the window server owns the
+   * window's shadow; a second one painted by the page shows up as a doubled,
+   * offset gutter around the popover. This used to be asserted as
+   * `boxShadow === "none"`, which was exact only while the panel drew no
+   * shadow at all — an `inset` shadow is clipped to the border box and cannot
+   * produce a gutter, so that spelling rejected the glass edge while
+   * protecting nothing extra. Colours carry their own commas
+   * (`rgba(0, 0, 0, .22)`), so the parenthesised groups come out before the
+   * list is split.
+   */
+  const paintsOuterShadow = (value: string) =>
+    value !== "none" && value.replace(/\([^)]*\)/g, "").split(",").some(part => !part.includes("inset"));
   const contrastOnGlass = () => {
     const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
     const context = canvas.getContext("2d");
@@ -132,7 +147,7 @@ export async function checkStatusPopover() {
     const shell = element(".status-shell");
     shell.setAttribute("data-material", "native"); await settle();
     check("native material does not pay for a second CSS blur", backdrop() === "none" && getComputedStyle(element(".panel")).backgroundColor.endsWith("0.8)"));
-    check("native material has no outer painted gutter", getComputedStyle(shell).padding === "0px" && getComputedStyle(element(".panel")).boxShadow === "none");
+    check("native material has no outer painted gutter", getComputedStyle(shell).padding === "0px" && !paintsOuterShadow(getComputedStyle(element(".panel")).boxShadow));
     shell.setAttribute("data-material", "preview"); await settle();
     await select(0, "dark");
     await select(1, "busy");

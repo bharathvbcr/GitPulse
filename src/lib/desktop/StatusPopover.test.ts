@@ -82,8 +82,18 @@ describe("compact status popover", () => {
     expect(nativeBlock).toContain("--glass-shade-bottom");
     expect(nativeBlock).toContain("inset 0 1px 0 var(--glass-sheen-top)");
     expect(nativeBlock).toContain("inset 0 -1px 0 var(--glass-shade-bottom)");
-    // Glass surface variables with translucent fills (not the old opaque .8/.64).
-    expect(nativeBlock).toContain("--bg:rgb(var(--base) / .55)");
+    // The panel alpha is a contrast floor, not a style knob, and this
+    // assertion exists to stop it drifting down again. It read `.55` when the
+    // glass landed — chosen as "not the old opaque .8" — which put the accent
+    // tokens at 2.1-2.5:1 over a white or black desktop, against the 4.5:1
+    // this popover has to hold anywhere it is opened. Solved against the model
+    // in harness/statusChecks.ts, the minimum is .787 light / .795 dark, so .8
+    // is the lowest round value that clears both. The glass is unaffected: the
+    // hue field, sheen and tint above all still paint, and a fifth of the
+    // desktop still shows through.
+    expect(nativeBlock).toContain("--bg:rgb(var(--base) / .8)");
+    // The inner cards sit ON the panel rather than on the desktop, so they are
+    // free to stay thin — their backdrop is already the panel above.
     expect(nativeBlock).toContain("--surface:rgb(var(--card-base) / .4)");
     // Liquid-ease cubic-bezier on interactive elements.
     expect(nativeBlock).toContain("--liquid-ease:cubic-bezier(0.22, 1, 0.36, 1)");
