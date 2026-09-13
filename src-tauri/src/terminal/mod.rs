@@ -638,8 +638,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
     let size = bounded_pty_size(rows, cols);
-    let pair = pty_system
-        .openpty(size)
+    // `openpty` sets `FD_CLOEXEC` on the master and slave in two `fcntl` calls
+    // after the descriptors exist, and `spawn_command` below forks. Both halves
+    // of `procguard`'s inheritance race live in this function, and the shell
+    // this starts is the longest-lived thief the app has: a stolen `git` pipe
+    // end is held for the whole session rather than the next millisecond.
+    let pair = crate::procguard::with_inheritance_lock(|| pty_system.openpty(size))
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
     let requested = program.filter(|p| !p.trim().is_empty());
@@ -684,9 +688,10 @@ fn spawn_session_inner<R: tauri::Runtime>(
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }
+    // Trust resolution touches the filesystem and stays outside the lock; only
+    // the fork itself is serialized.
     let spawn_result = crate::repository_trust::require(&repo).and_then(|_| {
-        pair.slave
-            .spawn_command(cmd)
+        crate::procguard::with_inheritance_lock(|| pair.slave.spawn_command(cmd))
             .map_err(|error| format!("Failed to spawn process '{shell}': {error}"))
     });
     let child = match spawn_result {

@@ -115,6 +115,65 @@ fn no_production_code_spawns_outside_the_gated_seam() {
     );
 }
 
+/// Creating a process, or a descriptor that is about to be made `FD_CLOEXEC`,
+/// must happen under `procguard::with_inheritance_lock`.
+///
+/// `std` has no `pipe2` on macOS or the BSDs, so its pipes are `pipe()`
+/// followed by two `fcntl(F_SETFD, FD_CLOEXEC)` calls. A process created on
+/// another thread in between inherits the pipe for life, and a stolen *write*
+/// end means the owner's pipe never reaches EOF — the "could not be read to
+/// the end" loss the app's own diagnostics reported against `git diff`,
+/// `show`, `rev-list` and `for-each-ref`.
+///
+/// `Command::new` is covered by the seam above, which funnels every one of
+/// those into `procguard::spawn`. The PTY is the other creator, and it is
+/// invisible to that check: it builds a `CommandBuilder`, not a `Command`.
+/// It is also the one whose children live for hours, so a theft there is not
+/// repaid in the next millisecond. Asserted by shape rather than trusted:
+/// `openpty` and `spawn_command` must name the lock on their own line.
+#[test]
+fn pty_creation_runs_under_the_inheritance_lock() {
+    const CREATORS: &[&str] = &[".openpty(", ".spawn_command("];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs(&root, &mut files);
+
+    let mut unguarded: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut guarded = 0usize;
+    for file in &files {
+        let rel = file
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(file).expect("read source");
+        for (line_no, line) in strip_test_items(&text) {
+            if line.trim_start().starts_with("//") || !CREATORS.iter().any(|c| line.contains(c)) {
+                continue;
+            }
+            if line.contains("with_inheritance_lock") {
+                guarded += 1;
+            } else {
+                unguarded.entry(rel.clone()).or_default().push(line_no);
+            }
+        }
+    }
+
+    assert!(
+        unguarded.is_empty(),
+        "these create a process or a PTY descriptor outside \
+         `procguard::with_inheritance_lock`, so they can be handed — or hand \
+         away — a descriptor that is not yet `FD_CLOEXEC`: {unguarded:?}",
+    );
+    // A scan that found nothing to check must not read like a scan that found
+    // everything guarded.
+    assert_eq!(
+        guarded, 2,
+        "expected the PTY's `openpty` and `spawn_command` and nothing else; \
+         found {guarded} guarded creation sites"
+    );
+}
+
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
