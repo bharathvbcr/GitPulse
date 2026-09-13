@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { SETTINGS_CATALOG, matchSettings } from "./settingsCatalog";
+import {
+  SETTINGS_CATALOG,
+  matchSettings,
+  unsupportedSettingIds,
+  type SettingRequirement,
+} from "./settingsCatalog";
 import { SETTINGS_SECTION_IDS, SETTINGS_SECTIONS } from "./settingsSections";
 
 describe("the settings catalog", () => {
@@ -98,5 +103,99 @@ describe("matchSettings", () => {
       ),
     );
     expect(new Set(result.sections)).toEqual(sectionsWithHits);
+  });
+});
+
+describe("host-gated settings", () => {
+  /** Every capability named by an entry, derived so a new one is covered. */
+  const REQUIREMENTS = [
+    ...new Set(
+      SETTINGS_CATALOG.flatMap((entry) => (entry.requires ? [entry.requires] : [])),
+    ),
+  ];
+
+  /**
+   * Every requirement the catalog names, all set to `value`.
+   *
+   * Derived rather than written out, so adding a requirement to the catalog
+   * cannot leave these cases silently exercising a stale subset.
+   */
+  function capabilities(value: boolean): Readonly<Record<SettingRequirement, boolean>> {
+    return Object.fromEntries(REQUIREMENTS.map((name) => [name, value])) as Record<
+      SettingRequirement,
+      boolean
+    >;
+  }
+
+  it("gates the Dock toggle and on-device drafting on host capabilities", () => {
+    expect(REQUIREMENTS).toContain("dockHiding");
+    expect(REQUIREMENTS).toContain("appleIntelligence");
+  });
+
+  it("reports nothing unsupported when the host has every capability", () => {
+    expect(unsupportedSettingIds(capabilities(true)).size).toBe(0);
+  });
+
+  it("reports exactly the entries whose requirement is unmet", () => {
+    const unsupported = unsupportedSettingIds(capabilities(false));
+    const expected = SETTINGS_CATALOG.filter((entry) => entry.requires !== undefined).map(
+      (entry) => entry.id,
+    );
+    expect([...unsupported].sort()).toEqual([...expected].sort());
+    expect(unsupported.has("hide-dock")).toBe(true);
+    expect(unsupported.has("apple-intelligence")).toBe(true);
+  });
+
+  it("never gates a setting that works on every host", () => {
+    const unsupported = unsupportedSettingIds(capabilities(false));
+    // A portable setting caught by the gate would vanish from a host that can
+    // run it perfectly well.
+    for (const id of ["theme", "accent", "tab-width", "status-bar", "update-check"]) {
+      expect(unsupported.has(id)).toBe(false);
+    }
+  });
+});
+
+describe("search on a host missing a capability", () => {
+  const WITHOUT_DOCK = unsupportedSettingIds({ dockHiding: false, appleIntelligence: true });
+
+  it("omits the unsupported control from an unfiltered listing", () => {
+    const listed = matchSettings("", WITHOUT_DOCK);
+    expect(listed.all).toBe(true);
+    expect(listed.settings).not.toContain("hide-dock");
+    // Everything else still listed: the gate is narrow, not a blanket.
+    expect(listed.settings).toContain("status-icon");
+  });
+
+  /**
+   * The defect this closes: searching "dock" on Windows previously matched the
+   * Dock toggle and opened the Layout section around a control that the page
+   * then rendered hidden — a result that shows nothing.
+   */
+  it("does not return a section whose only match is unsupported", () => {
+    const result = matchSettings("dock accessory", WITHOUT_DOCK);
+    expect(result.settings).not.toContain("hide-dock");
+    expect(result.settings).toHaveLength(0);
+    expect(result.sections).toHaveLength(0);
+  });
+
+  it("still finds the control on a host that supports it", () => {
+    const result = matchSettings(
+      "dock accessory",
+      unsupportedSettingIds({ dockHiding: true, appleIntelligence: true }),
+    );
+    expect(result.settings).toContain("hide-dock");
+    expect(result.sections).toContain("layout");
+  });
+
+  it("keeps a whole-section match free of unsupported controls", () => {
+    // "layout" matches the section by name, which keeps all of its controls —
+    // that shortcut must still not resurrect a gated one.
+    const result = matchSettings("layout", WITHOUT_DOCK);
+    expect(result.settings).not.toContain("hide-dock");
+  });
+
+  it("defaults to gating nothing when no capability set is supplied", () => {
+    expect(matchSettings("dock accessory").settings).toContain("hide-dock");
   });
 });

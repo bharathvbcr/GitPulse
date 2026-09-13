@@ -1,5 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import type { BlameLine } from "../files/types";
   import { densityStore } from "../stores/densityStore";
   import { rowHeight } from "../ui/density";
@@ -182,7 +184,7 @@
       <button
         type="button"
         onclick={() => (explorerOpen = !explorerOpen)}
-        title="{explorerOpen ? 'Hide' : 'Show'} Explorer (⌘B)"
+        title="{explorerOpen ? 'Hide' : 'Show'} Explorer ({shortcutTextLabel('⌘B', $hostPlatform.os)})"
         class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-surfaceHover transition-colors"
       >
         {#if explorerOpen}
@@ -274,7 +276,7 @@
           title={filePath ? "Empty file" : "No blame loaded"}
           hint={filePath ? "This file has no lines to annotate." : explorerOpen
             ? "Pick a file in the explorer to see line authorship and code age."
-            : "Open the explorer (⌘B), or pick a file in Code → Explorer."}
+            : `Open the explorer (${shortcutTextLabel("⌘B", $hostPlatform.os)}), or pick a file in Code → Explorer.`}
         />
       {/if}
     </div>

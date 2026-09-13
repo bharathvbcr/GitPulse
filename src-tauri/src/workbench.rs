@@ -229,6 +229,26 @@ impl WorkbenchState {
                 | "enhancements.worker"
         ) {
             let HostControl { params, selection } = generation_input(method, input)?;
+            // Routing is decided only after the input has been validated, and
+            // never before: `is_apple_enhancement` reads the store, and opening
+            // the store creates the profile on disk. Deciding first would let a
+            // malformed request bring a profile into existence — which is the
+            // one thing `invalid_generation_never_creates_a_profile_or_starts_a_worker`
+            // exists to prevent.
+            //
+            // On-device generation runs in this process, so it must not be
+            // forwarded to the sidecar. It also never calls the store's
+            // `enhancements.generate`: that transition hands a proposal to an
+            // external worker and takes a lease against it, and there is no
+            // external worker here. Completing straight from `pending` is the
+            // supported shape — `complete` skips its worker check for exactly
+            // that state so a host can run the model itself — and it inherits
+            // accept, undo, history and field locks unchanged.
+            if method == "enhancements.generate" {
+                if let Some(proposal) = self.apple_enhancement(&params)? {
+                    return self.generate_on_device(&params, &proposal);
+                }
+            }
             return self.worker_call(&format!("work.{method}"), params, selection);
         }
         let result = self.with_store(|store| query(store, method, input));
@@ -238,6 +258,130 @@ impl WorkbenchState {
             }
         }
         result
+    }
+
+    /// The provider name that routes an enhancement to Apple's on-device model.
+    pub const APPLE_PROVIDER: &str = "apple";
+
+    /// The stored proposal, when it asked for on-device generation.
+    ///
+    /// Returns the record rather than a boolean so the routing decision and the
+    /// data it needs come from ONE read: a second `enhancements.get` would take
+    /// the store lock again and could see a different snapshot, since another
+    /// request can complete or dismiss the proposal in between.
+    ///
+    /// The provider is read from the stored proposal, never from the request, so
+    /// a caller cannot redirect someone else's enhancement to a different
+    /// provider by asking nicely — it was fixed at `enhancements.create`.
+    fn apple_enhancement(&self, params: &Value) -> Result<Option<Value>, WorkbenchError> {
+        let Some(id) = params.get("id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let envelope = self.with_store(|store| {
+            query(store, "enhancements.get", &json!({ "id": id }).to_string())
+        })?;
+        // Record queries answer with an envelope; the row itself is under `item`.
+        // Reading `provider` off the envelope root silently yields None, which
+        // would route every on-device enhancement to the sidecar instead.
+        let Some(proposal) = envelope.get("item") else {
+            return Ok(None);
+        };
+        Ok(proposal
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider == Self::APPLE_PROVIDER)
+            .then(|| proposal.clone()))
+    }
+
+    /// Runs one enhancement through the on-device model and publishes the result.
+    ///
+    /// The store lock is taken twice, briefly, and never across the model call:
+    /// generation takes seconds, and holding the lock through it would stall
+    /// every other workbench request for the duration.
+    ///
+    /// A failure is published as a `failure` completion rather than returned as
+    /// an error, so the proposal reaches a terminal state the UI can show and
+    /// the reader can dismiss. A completion carries a proposal or a failure,
+    /// never both.
+    fn generate_on_device(
+        &self,
+        params: &Value,
+        proposal: &Value,
+    ) -> Result<Value, WorkbenchError> {
+        let id = params.get("id").and_then(Value::as_str).ok_or_else(|| {
+            WorkbenchError::new("invalid_input", "Generation request has no enhancement id.")
+        })?;
+        let request_id = params
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WorkbenchError::new("invalid_input", "Generation request has no request id.")
+            })?;
+
+        // 1. Read what the model needs from the snapshot the routing decision
+        //    was made on. No lock is held here.
+        let revision = proposal
+            .get("revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                WorkbenchError::new("worker_error", "The enhancement has no revision.")
+            })?;
+        let source = proposal.get("source").cloned().unwrap_or(Value::Null);
+        let title = source.get("title").and_then(Value::as_str).unwrap_or("");
+        let description = source
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let requested: Vec<String> = proposal
+            .get("fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 2. Generate. Still no lock held: a generation takes seconds, and the
+        //    store lock serialises every other workbench request.
+        let outcome = crate::ai::apple::generate(
+            &crate::ai::prompt::task_draft_system(),
+            &crate::ai::prompt::task_draft_user(title, description),
+        );
+
+        // 3. Publish, taking the lock once more. Only fields the proposal asked for may be sent: the store
+        //    refuses a completion naming any other, and silently widening the
+        //    scope would edit a field the reader never offered up.
+        let mut completion = json!({
+            "id": id,
+            "request_id": request_id,
+            "expected_revision": revision,
+        });
+        // A draft that cannot satisfy the store's completion rules becomes a
+        // failure completion, not a refused write: a refused write would leave
+        // the proposal stuck in `pending` until its lease expired, showing the
+        // reader an error instead of an outcome they can dismiss.
+        let object = completion.as_object_mut().expect("a JSON object");
+        match outcome.and_then(|draft| {
+            draft
+                .proposal_for(&requested)
+                .map(|fields| (fields, draft.rationale))
+        }) {
+            Ok((fields, rationale)) => {
+                for (name, value) in fields {
+                    object.insert(name.into(), Value::String(value));
+                }
+                if !rationale.trim().is_empty() {
+                    object.insert("rationale".into(), Value::String(rationale));
+                }
+            }
+            Err(failure) => {
+                object.insert("failure".into(), Value::String(failure));
+            }
+        }
+        self.with_store(|store| query(store, "enhancements.complete", &completion.to_string()))
     }
 
     fn worker_call(
@@ -704,6 +848,109 @@ done
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// The on-device path must reach a terminal state without a model worker.
+    ///
+    /// `state()` here has no test sidecar binary set, so any attempt to forward
+    /// this to Manvi would fail as a worker error rather than completing. That
+    /// is the assertion that matters: the proposal leaves `pending` either way,
+    /// and on a Mac without Apple Intelligence it lands in `failed` with a
+    /// reason — which is a correct outcome, not a broken test.
+    #[test]
+    fn on_device_enhancements_complete_without_a_model_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = state(&dir.path().join("apple/workbench.sqlite"));
+        host.request("repositories.put", r#"{"id":"r1","request_id":"r1","expected_revision":0,"name":"Primary","identity_key":"clone:r1","remote_url":"https://example.test"}"#).unwrap();
+        host.request(
+            "items.put",
+            r#"{"id":"t","request_id":"t","expected_revision":0,"title":"fix thing","description":"the dock toggle shows up where there is no dock","repository_ids":["r1"],"primary_repository_id":"r1"}"#,
+        )
+        .unwrap();
+        host.request(
+            "enhancements.create",
+            &json!({
+                "id": "e", "request_id": "e", "expected_revision": 0,
+                "task_id": "t", "source_revision": 1,
+                "fields": ["title", "description"],
+                "provider": WorkbenchState::APPLE_PROVIDER,
+                "model": "system-language-model",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let completed = host
+            .request(
+                "enhancements.generate",
+                r#"{"id":"e","request_id":"g","expected_revision":1}"#,
+            )
+            .expect("on-device generation should complete or fail, not error out");
+
+        // Record queries answer with an envelope; the row is under `item`.
+        let record = &completed["item"];
+        let state_name = record["state"].as_str().unwrap_or_default();
+        assert!(
+            matches!(state_name, "ready" | "failed"),
+            "expected a terminal state, got {state_name:?}: {completed}"
+        );
+        assert!(
+            record["worker_id"].is_null(),
+            "on-device generation must not take a worker lease: {completed}"
+        );
+        if state_name == "ready" {
+            // A proposal must fill the fields it was asked for and nothing else.
+            assert!(
+                record["proposed"]["title"]
+                    .as_str()
+                    .is_some_and(|t| !t.trim().is_empty()),
+                "a ready proposal needs a title: {completed}"
+            );
+            assert!(
+                record["failure"].is_null(),
+                "a proposal and a failure cannot both be present: {completed}"
+            );
+        } else {
+            assert!(
+                record["failure"]
+                    .as_str()
+                    .is_some_and(|f| !f.trim().is_empty()),
+                "a failed proposal needs a reason: {completed}"
+            );
+        }
+        host.shutdown();
+    }
+
+    /// The provider is read from the stored proposal, so a request cannot
+    /// redirect a sidecar-backed enhancement to the on-device path.
+    #[test]
+    fn a_request_cannot_redirect_an_enhancement_to_the_on_device_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = state(&dir.path().join("provider/workbench.sqlite"));
+        host.request("repositories.put", r#"{"id":"r1","request_id":"r1","expected_revision":0,"name":"Primary","identity_key":"clone:r1","remote_url":"https://example.test"}"#).unwrap();
+        host.request(
+            "items.put",
+            r#"{"id":"t","request_id":"t","expected_revision":0,"title":"a task","description":"prose","repository_ids":["r1"],"primary_repository_id":"r1"}"#,
+        )
+        .unwrap();
+        host.request(
+            "enhancements.create",
+            &json!({
+                "id": "e", "request_id": "e", "expected_revision": 0,
+                "task_id": "t", "source_revision": 1, "fields": ["title"],
+                "provider": "local", "model": "model-a",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Naming the on-device provider in the *request* must change nothing.
+        assert!(host
+            .apple_enhancement(
+                &json!({"id":"e","request_id":"g","expected_revision":1,"provider":"apple"})
+            )
+            .unwrap()
+            .is_none());
+        host.shutdown();
     }
 
     #[test]

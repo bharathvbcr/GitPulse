@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { isTauri } from "../platform";
+  import { hostPlatform } from "../stores/platformStore";
+  import { desktopNotificationsSupported, notificationPermissionHint, notificationUnavailableReason, osDisplayName, systemSettingsName } from "../ui/platformCopy";
   import { explainError, getNotificationSettings, nativeNotificationStatus, newID, notificationDraft, putNotificationSettings, type NativeNotificationStatus, type NotificationDraft, type NotificationSettings, type NotificationWrite, type Scope } from "../workbench/client";
   let { scope, taskID }: { scope: Scope; taskID?: string } = $props();
   let saved = $state<NotificationSettings | null>(null), draft = $state<NotificationDraft | null>(null), native = $state<NativeNotificationStatus | null>(null);
@@ -8,6 +10,30 @@
   let quiet = $state(false), start = $state("22:00"), end = $state("07:00");
   let disposed = false, loaded = false;
   let expanded = $state(false);
+  /**
+   * Whether this host can deliver OS banners at all.
+   *
+   * `native.available` is the backend's runtime probe, not a guess from the OS
+   * name — on macOS it is false when the notification centre failed to install,
+   * which is a fault worth reporting rather than a platform limit. Outside Tauri
+   * the browser preview keeps its controls so settings remain editable.
+   *
+   * Every control in this panel shapes native delivery only: the eligibility
+   * query behind `enabled`, `sound`, quiet hours and the mute lists feeds the
+   * native queue, and `local_minute()` (which quiet hours need) errors off
+   * macOS. So where delivery is impossible the controls are not merely
+   * decorative, they are inert — and showing them would promise an effect.
+   */
+  const supported = $derived(desktopNotificationsSupported(isTauri(), $hostPlatform.os, native));
+  // Derived from `supported` rather than from the probe, so that withdrawing the
+  // controls and explaining why are one decision and cannot disagree. Keying the
+  // reason off `native` instead left the two cases that hide without a probe --
+  // Windows and Linux -- hidden and silent.
+  const unavailable = $derived(
+    supported
+      ? null
+      : notificationUnavailableReason($hostPlatform.os, native?.available ?? false, native?.error ?? null),
+  );
   const muteField = $derived(taskID ? "muted_task_ids" : scope.kind === "workspace" ? "muted_workspace_ids" : "muted_repository_ids");
   const muted = $derived(!!draft?.[muteField].includes(taskID ?? (scope.kind !== "global" ? scope.id : "")));
   const muteCount = $derived(draft ? draft.muted_workspace_ids.length + draft.muted_repository_ids.length + draft.muted_task_ids.length : 0);
@@ -38,7 +64,7 @@
         if (quiet && next.quiet_start === next.quiet_end) throw new Error("Quiet-hour start and end must differ.");
         if (next.enabled && isTauri() && (!native || !["authorized", "provisional"].includes(native.authorization))) {
           const status = await nativeNotificationStatus(true); if (disposed) return; native = status;
-          if (!status.available || !["authorized", "provisional"].includes(status.authorization)) throw new Error(status.error ?? "Allow GitPulse notifications in macOS Settings, then try again.");
+          if (!status.available || !["authorized", "provisional"].includes(status.authorization)) throw new Error(status.error ?? notificationPermissionHint($hostPlatform.os));
         }
         pending = { ...next, id: "profile", expected_revision: saved.revision, request_id: newID() };
       }
@@ -54,20 +80,21 @@
 </script>
 
 <details class="native-settings" bind:open={expanded}>
-  <summary>Desktop notifications{saved ? saved.enabled ? " · Enabled" : " · Off" : ""}</summary>
+  <summary>Desktop notifications{!supported ? " · Unavailable" : saved ? saved.enabled ? " · Enabled" : " · Off" : ""}</summary>
   {#if !isTauri()}<p>This preview can save settings. OS banners require the desktop app.</p>{/if}
-  {#if native}<p>macOS permission: {native.authorization.replaceAll("_", " ")}{native.error ? ` · ${native.error}` : ""}</p>{/if}
-  {#if draft}
+  {#if unavailable}<p data-testid="notify-unavailable">{unavailable}</p>{/if}
+  {#if native && supported}<p>{systemSettingsName($hostPlatform.os)} permission: {native.authorization.replaceAll("_", " ")}{native.error ? ` · ${native.error}` : ""}</p>{/if}
+  {#if draft && supported}
     <fieldset disabled={busy || !!pending}>
-      <label><input type="checkbox" bind:checked={draft.enabled} disabled={!draft.enabled && isTauri() && native?.available === false} /> Enable desktop notifications</label>
+      <label><input type="checkbox" bind:checked={draft.enabled} /> Enable desktop notifications</label>
       <label><input type="checkbox" bind:checked={draft.sound} /> Play a sound</label>
       <label><input type="checkbox" bind:checked={draft.background} /> Notify while GitPulse is hidden or minimized</label>
-      <label><input type="checkbox" bind:checked={quiet} /> Quiet hours in this Mac’s local time</label>
+      <label><input type="checkbox" bind:checked={quiet} /> Quiet hours in this computer’s local time</label>
       {#if quiet}<div class="times"><label>From <input class="gp-field" type="time" bind:value={start} /></label><label>Until <input class="gp-field" type="time" bind:value={end} /></label></div>{/if}
       {#if taskID || scope.kind !== "global"}<label><input type="checkbox" checked={muted} onchange={toggleMute} /> Mute this {taskID ? "task" : scope.kind}</label>{/if}
       {#if draft && muteCount > 0}<div><p>{muteCount} saved scope mutes, including any deleted tasks or workspaces.</p><button class="gp-btn" type="button" onclick={() => { if (draft) draft = { ...draft, muted_workspace_ids: [], muted_repository_ids: [], muted_task_ids: [] }; }}>Clear saved scope mutes</button></div>{/if}
     </fieldset>
-    <p>New activity only when enabled. Generic previews keep task content private. Submitted means macOS accepted the request; Focus and system settings can suppress display.</p>
+    <p>New activity only when enabled. Generic previews keep task content private. Submitted means {osDisplayName($hostPlatform.os)} accepted the request; Focus and system settings can suppress display.</p>
     <button class="gp-btn" onclick={save} disabled={busy}>{pending ? "Retry saved settings" : "Save notification settings"}</button>
   {/if}
   <button class="gp-btn" onclick={refresh} disabled={busy || !!pending}>Recheck settings</button>

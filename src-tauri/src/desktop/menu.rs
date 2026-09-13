@@ -356,8 +356,13 @@ pub fn build_native_menu<R: Runtime>(
             &item(
                 app,
                 actions::REVEAL_REPO,
+                // Each host's own name for its file manager. "File Manager" is
+                // not what a Windows reader calls File Explorer, and the menu is
+                // the one place GitPulse speaks the OS's vocabulary natively.
                 if cfg!(target_os = "macos") {
                     "Reveal Repository in Finder"
+                } else if cfg!(target_os = "windows") {
+                    "Reveal Repository in File Explorer"
                 } else {
                     "Reveal Repository in File Manager"
                 },

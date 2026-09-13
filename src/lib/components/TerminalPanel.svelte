@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
+  import { hostPlatform } from "../stores/platformStore";
+  import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { terminalSessions } from "../terminal/sessionRegistry";
@@ -527,7 +529,7 @@
         </button>
       </div>
       {#if mode === "shell"}
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Find in terminal" title="Find in terminal (⌘F / Ctrl+Shift+F)" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Find in terminal" title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', $hostPlatform.os)})" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
         <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
       {/if}
       {#if mode === "console" && executions.length > 0}
@@ -549,7 +551,7 @@
         </button>
       {/if}
       {#if onClose}
-        <button type="button" class="gp-icon-btn" aria-label="Hide the terminal dock" title="Hide the terminal (⌃`) — sessions keep running" onclick={onClose}><ChevronDown size={14} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Hide the terminal dock" title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — sessions keep running" onclick={onClose}><ChevronDown size={14} /></button>
       {/if}
     </div>
   </div>
@@ -570,10 +572,10 @@
       <span><kbd>Ctrl+Shift+T</kbd> New shell</span>
       <span><kbd>Ctrl+Shift+W</kbd> Close session</span>
       <span><kbd>Ctrl+Tab / Ctrl+Shift+Tab</kbd> Next / previous tab</span>
-      <span><kbd>⌘F / Ctrl+Shift+F</kbd> Find</span>
+      <span><kbd>{platformChord("⌘F", "Ctrl+Shift+F", $hostPlatform.os)}</kbd> Find</span>
       <span><kbd>Enter / Shift+Enter</kbd> Next / previous match</span>
       <span><kbd>Esc</kbd> Close find</span>
-      <span><kbd>⌘ + / − / 0</kbd> Text size (Ctrl+Shift on Windows/Linux)</span>
+      <span><kbd>{platformChord("⌘ + / − / 0", "Ctrl+Shift+ + / − / 0", $hostPlatform.os)}</kbd> Text size</span>
       <span><kbd>← / → / Home / End</kbd> Navigate focused tabs</span>
       <span>Shell commands run outside the MANVI gate. Console git commands are MANVI-gated.</span>
     </div>
@@ -623,7 +625,7 @@
             class="p-0.5 rounded opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surfaceHover text-textMuted hover:text-rose-300"
             onclick={() => dropTab(tab.id)}
             aria-label={`Close ${tabLabel(tab)}`}
-            title="Close this session (⌃⇧W) — the process is terminated"
+            title="Close this session ({shortcutTextLabel('⌃⇧W', $hostPlatform.os)}) — the process is terminated"
           >
             <X size={11} />
           </button>

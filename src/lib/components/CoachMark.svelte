@@ -2,6 +2,8 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { Sparkles, X } from "@lucide/svelte";
   import { fade, scale } from "svelte/transition";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
 
   let {
     id,
@@ -16,6 +18,13 @@
     shortcut?: string;
     class?: string;
   } = $props();
+
+  // Callers author chords in macOS notation, as every other shortcut table in
+  // the app does, and the translation happens once here rather than at each
+  // call site. Both fields are mapped: the chord sits in the keycap AND is
+  // usually named again in the prose ("Press ⌘K anytime to…").
+  const shownShortcut = $derived(shortcut ? shortcutTextLabel(shortcut, $hostPlatform.os) : shortcut);
+  const shownDescription = $derived(shortcutTextLabel(description, $hostPlatform.os));
 
   let isSeen = $derived(Boolean($interfaceStore.seenCoachMarks?.[id]));
 
@@ -51,12 +60,12 @@
         </div>
 
         <p class="text-[11px] text-textMuted leading-relaxed">
-          {description}
+          {shownDescription}
         </p>
 
         <div class="mt-2.5 flex items-center justify-between gap-2">
           {#if shortcut}
-            <kbd class="gp-keycap text-[10px]">{shortcut}</kbd>
+            <kbd class="gp-keycap text-[10px]">{shownShortcut}</kbd>
           {:else}
             <span></span>
           {/if}

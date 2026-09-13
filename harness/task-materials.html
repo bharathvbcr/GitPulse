@@ -66,6 +66,12 @@
           detail: "Fixture model ready.",
         };
       }
+      // TaskManviAssist probes on-device availability when it mounts. A build
+      // with no bridge is what `showsAppleOption` hides, so these material
+      // checks keep measuring the Manvi board rather than a second engine.
+      if (command === "cmd_apple_intelligence_status") {
+        return { available: false, state: { state: "not_compiled" }, explanation: "This build has no on-device bridge." };
+      }
       if (command !== "cmd_workbench_request") throw new Error(`Unconfigured fixture command: ${command}`);
       const input = JSON.parse(args.input);
       switch (args.method) {
@@ -80,7 +86,12 @@
         }
         case "automation.get": return record(automation);
         case "notifications.settings.get": return record(notifications);
-        case "notifications.native.status": return JSON.stringify({ available: false, authorization: "unavailable", error: "OS notifications are unavailable in this disposable fixture." });
+        // Reports a host that can deliver, because the checks below measure the
+        // MATERIAL of the notification controls and those controls exist only on
+        // such a host: the panel now withdraws them, naming the reason, when the
+        // probe says delivery is impossible. The withdrawn state has its own
+        // coverage in platformCopy.test.ts and in the settings harness.
+        case "notifications.native.status": return JSON.stringify({ available: true, authorization: "authorized", error: null });
         case "automation.put": Object.assign(automation, input, { revision: automation.revision + 1 }); return record(automation);
         case "notifications.settings.put": Object.assign(notifications, input, { revision: notifications.revision + 1 }); return record(notifications);
         case "enhancements.configuration": return JSON.stringify({ ok: true, provider: "fixture", model: "fixture-model", model_source: "fixture", providers: ["fixture"] });

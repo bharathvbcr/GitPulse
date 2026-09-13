@@ -112,6 +112,8 @@
 
 <script lang="ts">
   import { repoStore, type DiffPayload } from "../stores/repoStore";
+  import { hostPlatform } from "../stores/platformStore";
+  import { platformChord } from "../ui/platformCopy";
   import { tick, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
@@ -515,7 +517,7 @@
           {/each}
           {#if visibleFiles.length === 0}<p class="rail-empty">No matching files.<button class="text-action" onclick={() => fileFilter = ""}>Clear filter</button></p>{/if}
         </nav>
-        <p class="rail-note">Drafts survive view changes. ⌘/Ctrl S saves; Alt ↑/↓ navigates. Add Shift to skip resolved blocks.</p>
+        <p class="rail-note">Drafts survive view changes. {platformChord("⌘S", "Ctrl+S", $hostPlatform.os)} saves; Alt ↑/↓ navigates. Add Shift to skip resolved blocks.</p>
       </aside>
       <main class="editor-main">
         <div class="file-toolbar">

@@ -87,6 +87,31 @@ export function expectWithinBudget(actualMs: number, units: number, label: strin
 }
 
 /**
+ * Milliseconds for the fastest of `samples` runs of `body`.
+ *
+ * The minimum, not the mean or median. A timing is the true cost PLUS whatever
+ * the machine stole during it, so noise only ever pushes a sample upward: the
+ * fastest run is the one least disturbed, and it is the closest estimate of
+ * what the code actually costs. Crucially this weakens nothing — work that got
+ * genuinely slower is slower in its fastest run too, so a real regression still
+ * fails; only the "unlucky single sample under a concurrent build" failure is
+ * removed.
+ *
+ * Uses `performance.now()`, which is sub-millisecond. `Date.now()` truncates to
+ * whole milliseconds, so short work reads as 0 and any ratio taken against it
+ * needs a floor — which then silently changes what the ratio means.
+ */
+export function fastestOf(samples: number, body: () => void): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let sample = 0; sample < samples; sample += 1) {
+    const started = performance.now();
+    body();
+    best = Math.min(best, performance.now() - started);
+  }
+  return best;
+}
+
+/**
  * Timeout for stress and fuzz cases whose assertions are invariants, not speed.
  *
  * Vitest's 5s default is an infrastructure limit, not a guard: these cases

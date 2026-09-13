@@ -3,6 +3,8 @@
   // changes, so unrelated store publications cost O(1) and the exact parsed
   // row objects survive (keeping memoized word-diff segments attached).
   import { createParseCache, type AnnotatedDiffLine } from "../diff/wordDiff";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import { composeLineSpans, shiftMatches, type DiffSpan, type Range } from "../diff/highlight";
   import type { SupportedLanguage } from "../files/syntaxHighlight";
   import { get } from "svelte/store";
@@ -1214,7 +1216,7 @@
         : 'text-textMuted'}"
       aria-pressed={searchOpen}
       onclick={() => (searchOpen ? closeSearch() : openSearch())}
-      title="Find in this diff (⌘F)"
+      title="Find in this diff ({shortcutTextLabel('⌘F', $hostPlatform.os)})"
     >
       <Search size={13} />
       <span class="hidden sm:inline">Find</span>

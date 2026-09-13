@@ -1,5 +1,7 @@
 <script lang="ts" module>
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import { hasDirtyEditorTabs, type EditorTabState } from "../files/editorTabs";
   import type { FileSidePane } from "../files/filePaneLayout";
   import type { FileBlob } from "../files/types";
@@ -569,7 +571,7 @@
       onclick={() => toggleSidePane("explorer")}
       aria-label="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer"
       aria-pressed={paneLayout.explorerVisible}
-      title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer (⌘B)"
+      title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer ({shortcutTextLabel('⌘B', $hostPlatform.os)})"
       class="gp-icon-btn p-1.5! shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
     >
       {#if paneLayout.explorerVisible}
@@ -682,7 +684,7 @@
         onclick={() => toggleSidePane("dashboard")}
         aria-pressed={paneLayout.dashboardVisible}
         aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse dashboard"
-        title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard (⌘⇧D)"
+        title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard ({shortcutTextLabel('⌘⇧D', $hostPlatform.os)})"
         class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px] {paneLayout.dashboardVisible
           ? 'border-accent/60 bg-accent/15 text-accent font-semibold'
           : ''}"

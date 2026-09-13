@@ -42,7 +42,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "views",
     label: "Views",
-    summary: "Which views the header lists. Hidden ones stay in ⌘K.",
+    summary: "Which views the header lists. Hidden ones stay in the command palette.",
   },
   {
     id: "graph",

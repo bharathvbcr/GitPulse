@@ -15,6 +15,7 @@ pub mod grants;
 pub mod graph;
 pub mod harness;
 pub mod hooks;
+pub mod host_platform;
 pub mod ingest;
 pub mod insights;
 pub mod ledger;
@@ -136,6 +137,8 @@ pub fn run() {
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
             workbench::cmd_workbench_launch_terminal,
+            host_platform::cmd_host_platform,
+            ai::apple::cmd_apple_intelligence_status,
             cmd_pick_folder,
             cmd_list_branches,
             cmd_branch_stats,

@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import { ChevronDown, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { repoStore } from "../stores/repoStore";
@@ -186,7 +188,7 @@
         type="button"
         onclick={onClose}
         class="gp-icon-btn p-0.5!"
-        title="Hide the terminal (⌃`) — the session keeps running"
+        title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — the session keeps running"
         aria-label="Hide the terminal dock"
       >
         <ChevronDown size={13} />
