@@ -11,9 +11,25 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.1.0] - 2026-09-13
+
+A feature release that began as a patch. What was staged as 1.0.1 — the
+repository-trust gate and the hardened file saves — was never published, and
+ships here instead of on its own.
+
 The tasks page was rebuilt around the work you do most: adding a task, finding
 one, and handing one to an agent. Nothing on the board is hidden without saying
 so, and the agent handoff is one form rather than two that had drifted apart.
+Branch names get a line to themselves, drafting can run on the Mac instead of
+over a socket, and DevMap builds its own index rather than answering every
+question with an empty result.
+
+The fixes are mostly of one kind: failures the app was *misreporting* rather
+than merely failing. Truncated Git output that read as a complete short answer,
+a plugin whose hooks were installed nowhere while its doctor said `ok`, and an
+untrusted checkout described as a broken one.
 
 ### Added
 
@@ -30,6 +46,17 @@ so, and the agent handoff is one form rather than two that had drifted apart.
   instead of blaming the hardware.
 - A handoff sheet on the board: launch an agent in two clicks, with the checkout
   already resolved, without opening the task.
+- DevMap builds its own store on first use. Opening a repository with no index
+  used to answer every code-intelligence question with an empty result, which
+  reads exactly like a clean one. Component status is reported per component
+  with its warnings kept separate, so a partial DevCouncil install is never
+  rendered as a complete one, and a rebuild chooses between a full manifest
+  pass and an incremental one instead of rebuilding on every change. The suite
+  and agent-integration panels and a fleet-wide index sweep come with it.
+- `gitpulse-hook --version` answers with its build and every subcommand it
+  serves. No host sends it; `mcp:doctor` needs it because silence is a
+  legitimate answer to every real hook invocation, so nothing else can tell an
+  absent binary from a current one.
 
 ### Changed
 
@@ -56,6 +83,19 @@ so, and the agent handoff is one form rather than two that had drifted apart.
   a narrow sidebar runs out of room. Counts are never clipped.
 - **Appearance › Sidebar branch rows** switches back to the dense single-line
   list, which fits roughly 45% more refs on screen.
+- Four macOS-only surfaces that shipped on every platform are hidden where they
+  cannot work, decided by a capability the host reports once rather than a
+  platform test repeated at each call site. Hidden rather than disabled: a
+  permanently greyed control invites a hunt for the setting that enables it.
+  The settings catalog still declares them, so they are provably hidden rather
+  than quietly deleted.
+- RUSTSEC-2024-0429 (`glib 0.18.5`) no longer applies: the September 2026 GTK
+  migration moved the Linux stack to `glib 0.22.9`. On 2026-09-13 the tree
+  passed `cargo audit --deny warnings` across 550 Rust dependencies and
+  `npm audit` across 175 npm dependencies with no reported advisories. These are
+  dated advisory-database checks, not exhaustive source or runtime verification.
+- The IPC surface grows to 220 handlers, and the Rust/TypeScript contract check
+  to 65 contracts across 1,104 fields.
 
 ### Fixed
 
@@ -69,14 +109,65 @@ so, and the agent handoff is one form rather than two that had drifted apart.
   writing nothing.
 - The editor offered to let Manvi draft a task while Apple Intelligence was the
   selected engine.
-
-## [1.0.1] - 2026-09-12
-
-Security hardening release. Opening a repository is now an explicit decision,
-and ordinary file saves no longer follow links out of the entry they target.
-Both changes narrow what GitPulse does on your behalf; no surface is widened.
+- Concurrent Git commands could return a truncated answer that looked like a
+  complete short one. macOS has no `pipe2`, so a pipe is created and *then*
+  marked close-on-exec in two separate steps; a process started on another
+  thread in between inherits the half-built pipe and keeps that copy for its
+  whole life. A stolen write end means the pipe never reaches EOF, so the read
+  burns its grace window and hands up a prefix. Diffs failed to load, branch
+  and tag labels went missing from the graph, and commit details came back
+  empty — twenty-one of the forty-three events in one diagnostics report were
+  this single bug. Child creation is now serialized across both spawn seams:
+  measured on eight threads, 147 of 25,415 children (0.58%) inherited a foreign
+  descriptor before the fix and 0 of 12,944 after, at a cost of one spawn
+  syscall behind the lock (321µs median, 614µs worst over 300 `git` spawns).
+- The repository status publish gate compared a hand-written list of eleven
+  fields and silently ignored `warnings`. A repository whose churn had stopped
+  being partial compared equal and never republished, so the explorer kept
+  showing "counts may understate reality" for numbers that had since parsed
+  cleanly. The gate now derives its comparison from every field the wire
+  carries, treats an omitted and an empty list as the same fact, and compares
+  array values element-wise instead of by identity.
+- The plugin package installed only its MCP server, while its own manifests
+  spawn `gitpulse-hook` for the collision guard, the command gate and the
+  session brief — so a validated, fully tested plugin shipped with two gates
+  permanently disabled and `mcp:doctor` reported `ok` throughout. The two
+  failures are not symmetric: a missing server surfaces as a server that will
+  not connect, but a hook that cannot start is a non-blocking error the host
+  swallows, making it indistinguishable from a gate that ran and found nothing.
+  Both binaries are now installed and given separate verdicts, and a derived
+  contract test reads the executables out of the shipped manifests.
+- An untrusted checkout was reported as `[invalid_worktree]` — the code said the
+  opposite of the message it carried. Resolution runs Git, so a trust refusal
+  happens before a single fact about the worktree has been established; the
+  trust test now runs ahead of the arms that are verdicts about something
+  actually examined. A path that is not a repository at all still reports
+  `invalid_worktree`.
+- The status popover's panel had been thinned to .55 alpha during the glass
+  pass, which put its accent tokens at 2.1–2.5:1 against a white or black
+  desktop. The panel floats over an arbitrary wallpaper, so its opacity is the
+  only thing decoupling the text from it, and .8 is the lowest value clearing
+  4.5:1 at both extremes. No glass is lost: a fifth of the desktop still shows
+  through, under the hue field, the sheen and the tint.
+- Three developer-facing guards were measuring the wrong thing, each now fixed
+  with a test that fails against the pre-fix code: the custom-property sweep
+  matched only the first declaration on a line, so three of the status
+  popover's four hue channels read as undefined; the status browser fixture
+  carried its own copy of the glass ladder and neither appearance arm, so it
+  validated a surface that never ships; and the vendored macOS ports warned
+  only in release builds, where a debug run could not see it.
+- The code-intelligence browser fixtures had drifted from the wire shape they
+  claim to speak, so three harnesses were exercising failure paths instead of
+  the behaviour they name, and a field-name contract check could not see it.
+  The palette harness had been failing, unrun, through a release because every
+  caller hand-listed which harnesses to run and none named it; runs are now
+  derived from the registry.
 
 ### Security
+
+These narrow what GitPulse does on your behalf; no surface is widened. Opening
+a repository is an explicit decision, and ordinary file saves no longer follow
+links out of the entry they target.
 
 - Opening a checkout requires an explicit **Trust and Open** decision before
   GitPulse runs Git against it. Path inspection is filesystem-only: a canceled
@@ -116,26 +207,18 @@ Both changes narrow what GitPulse does on your behalf; no surface is widened.
 - A save that loses a race to a concurrent change fails with an error naming the
   retained recovery content. This is not an OS sandbox against a process already
   running with your rights.
-
-### Fixed
-
-- The repository status publish gate compared a hand-written list of eleven
-  fields and silently ignored `warnings`. A repository whose churn had stopped
-  being partial compared equal and never republished, so the explorer kept
-  showing "counts may understate reality" for numbers that had since parsed
-  cleanly. The gate now derives its comparison from every field the wire
-  carries, treats an omitted and an empty list as the same fact, and compares
-  array values element-wise instead of by identity.
-
-### Changed
-
-- RUSTSEC-2024-0429 (`glib 0.18.5`) no longer applies: the September 2026 GTK
-  migration moved the Linux stack to `glib 0.22.9`. On 2026-09-12 the tree
-  passed `cargo audit --deny warnings` across 550 Rust dependencies and
-  `npm audit` across 175 npm dependencies with no reported advisories. These are
-  dated advisory-database checks, not exhaustive source or runtime verification.
-- The IPC surface grows to 212 handlers, and the Rust/TypeScript contract check
-  to 57 contracts across 1,022 fields.
+- The working directory a child process is spawned in is pinned by descriptor at
+  admission, and the child is re-anchored against that pin. The directory the
+  trust gate admitted could previously be substituted between the check and the
+  child starting. The re-anchor costs +123% per spawn, so a privately held path
+  skips it.
+- Dependency scanners no longer load repository-controlled code while scanning.
+  Composer ran the project's own plugins and scripts, a Go scan let the module
+  pick its toolchain, and `cargo-audit` went through the repository's alias
+  table. Each is now invoked so that scanning a tree cannot execute it.
+- The reserved harness policy endpoint forwarded the caller's string to the
+  sidecar as `root`, so it answered for a path this process had never resolved.
+  It resolves first, and returns `unchecked` carrying the resolution failure.
 
 ## [1.0.0] - 2026-09-11
 
@@ -1409,8 +1492,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.1...HEAD
-[1.0.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.0.1
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
 [0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
