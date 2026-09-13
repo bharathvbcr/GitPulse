@@ -105,16 +105,25 @@ npm test -- scripts/architecture-docs-contract.test.ts scripts/documented-counts
 npm run ci:local
 ```
 
-That is the gate. If `npm run ci:local` is green, `.github/workflows/ci.yml` and
-`.github/workflows/coverage.yml` will both be green on all three platforms. Run it
-before opening a pull request.
+This validates the current host. Run it before opening a pull request; the
+platform jobs in `.github/workflows/ci.yml` and `.github/workflows/coverage.yml`
+must still pass on their respective operating systems.
 
 It expands to the full suite — frontend type check, Vitest under V8 coverage, Vite
 build, `cargo fmt`, `cargo clippy -D warnings`, the Rust suites under `cargo llvm-cov`,
 and `npm run check:coverage` to enforce the floors against the two LCOV reports those
 runs just produced. It regenerates both reports rather than trusting whatever is left
-on disk, so a stale `lcov.info` can never be mistaken for a passing check. While
-iterating you will usually want the narrower commands instead:
+on disk. Run only one full gate per checkout: frontend reports and `dist/` are
+shared outputs. Concurrent native coverage runs also need separate
+`CARGO_LLVM_COV_TARGET_DIR` directories. The coverage tool cleans its artifacts
+before building; sharing that directory can remove another run's still-running
+test executable and cause cascading process-directory and harness-copy errors.
+Use a separate `CARGO_TARGET_DIR` for builds as well. For standalone coverage,
+write each report to its own `--output-path` and pass that exact file to
+`node scripts/check-coverage-floor.mjs --rust <report>`; never treat a report
+left by a different run as verification of the current one.
+
+While iterating you will usually want the narrower commands instead:
 
 | Command | Scope | Typical runtime |
 | --- | --- | --- |
@@ -235,6 +244,7 @@ several were added after the drift had already happened.
 | `portable-paths.contract` | A `file:` URL's `pathname` used as a filesystem path. It is a real path on macOS and Linux and "/D:/a/repo/…" on Windows, so it passes review and every local run, then fails only on the Windows runner — and fails silently in the worse half of the cases: fed to a directory scan it returns `[]`, and the assertions built on it pass while checking nothing. Two of the three Windows CI failures on 2026-09-03 were this. |
 | `fleet-surface-contract` | The workspace-wide Fleet dashboard becoming unreachable. Every repository view is kept reachable by `view-menu-contract`, which walks the view registry — but Fleet is deliberately not a `ViewTab` (a ViewTab is stored on the active repository's session and its pane lives inside `{#key currentPath}`), so none of that machinery covers it. This pins its three entry points, the Rust/TypeScript agreement on its action id, and the rule that it is swapped by hiding rather than unmounting: an `{#if}`/`{:else}` swap would destroy the repository subtree on every toggle and kill the live terminal PTY inside it. |
 | `advisory-lockfile-contract` | Cargo.lock rolling back to urlpattern 0.3 (and the unic-* crates cargo-audit flags) or the frontend returning to the deprecated `lucide-svelte` package. The Health scan would catch this only after the next advisory refresh. |
+| `onboarding-contract` | First-run tour entry points becoming unwired, missing repository-folder purpose strings, or unrelated privacy requests entering the bundle. |
 | `documented-counts-contract` | A count in the docs drifting from the code. The Rust test total was understated fourfold before this existed. |
 | `apple-bridge-contract` | The Apple Intelligence bridge linking in a way that changes the rest of the process, or the whole app. Two rules, neither visible from the Rust or Swift source. Building the Swift shim for the crate's floor instead of macOS 26 force-links Swift's back-deployment shims, and `swiftCompatibilityConcurrency` installs global executor hooks process-wide: `terminal_pty_stress`'s blocked-reader case stopped receiving its 252 KiB flood within five seconds, reproducibly, in a tree whose Rust diff touched no terminal code. And `-framework FoundationModels` is an `LC_LOAD_DYLIB` for a framework that first exists on macOS 26, so every user below it would fail to launch GitPulse at all — for a feature they cannot reach. Weak-linked instead, with every entry point behind `#available`. |
 | `each-key-contract` | Duplicate external rows crashing a keyed Svelte list. Evaluates the actual template expressions with repeated documentation links, backlinks, operation warnings, CI steps, and storage recommendations. Runtime races and reconciliation are covered by the diagnostics browser harness. |

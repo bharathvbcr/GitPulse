@@ -41,6 +41,12 @@ catalog is in [Features](docs/FEATURES.md).
 
 ---
 
+## Getting started
+
+The first-run walkthrough introduces repositories, views, Tasks, and platform
+access. Resume or replay it from **Walkthrough** in the title bar. Tool installation
+and launch at login are optional. See [Onboarding and permissions](docs/ONBOARDING.md).
+
 ## Screenshots
 
 Captured from GitPulse running on macOS against its own repository.

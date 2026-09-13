@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { HostOS } from "../platform";
 import {
+  repositoryAccessGuidance,
   closedAppSchedulingReason,
   desktopNotificationsSupported,
   fileManagerName,
@@ -28,6 +29,7 @@ const MAC_WORDS = [/\bmacOS\b/, /\bMac\b/, /\bFinder\b/, /\bDock\b/, /LaunchAgen
 describe("platform vocabulary", () => {
   it.each(NON_MAC)("leaks no macOS words into copy for %s", (os) => {
     const strings = [
+      repositoryAccessGuidance(os),
       fileManagerName(os),
       statusIconLocationName(os),
       systemSettingsName(os),
@@ -288,5 +290,17 @@ describe("whether the desktop-notification controls may be shown", () => {
         : notificationUnavailableReason(os, native?.available ?? false, native?.error ?? null);
       expect(supported ? reason === null : Boolean(reason?.trim()), `${os} / ${JSON.stringify(native)}`).toBe(true);
     }
+  });
+});
+
+
+describe("repository access guidance", () => {
+  it.each([
+    ["macos", "Files and Folders"],
+    ["windows", "Windows Security"],
+    ["linux", "folder ownership"],
+    ["unknown", "does not verify access"],
+  ] as const)("describes %s recovery without claiming access", (os, expected) => {
+    expect(repositoryAccessGuidance(os)).toContain(expected);
   });
 });

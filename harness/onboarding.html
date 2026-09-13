@@ -1,0 +1,121 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>GitPulse walkthrough checks</title></head>
+<body><button id="replay">Walkthrough</button><div id="app"></div><pre id="result"></pre>
+<script type="module">
+  import "../src/app.css";
+  import { mount, unmount, tick } from "svelte";
+  import { get } from "svelte/store";
+  import ProductTour from "../src/lib/components/onboarding/ProductTour.svelte";
+  import { createProductTour } from "../src/lib/tools/productTour";
+  import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
+  const params = new URLSearchParams(location.search);
+  const errors = [];
+  addEventListener("error", e => errors.push(e.message));
+  addEventListener("unhandledrejection", e => errors.push(String(e.reason)));
+  let saved = null, fail = false, opened = 0, settings = 0, tools = 0;
+  const storage = { getItem: () => saved, setItem: (_key, value) => { if (fail) throw Error("quota"); saved = value; } };
+  let tour = createProductTour(() => storage);
+  let app;
+  const settle = async () => { await tick(); await new Promise(r => requestAnimationFrame(r)); await tick(); };
+  const mountTour = async () => {
+    app = mount(ProductTour, { target: document.getElementById("app"), props: {
+      tour, onOpenRepository: () => opened++, onSettings: () => settings++, onTools: () => tools++,
+    }});
+    await settle();
+  };
+  document.getElementById("replay").onclick = () => tour.open();
+  resetHostPlatformForTests({ os: "macos", dock_hiding: true });
+  document.getElementById("replay").focus();
+  await mountTour();
+  if (params.get("theme") === "light") document.documentElement.classList.add("light");
+  if (!params.has("check")) {
+    // Manual preview uses exactly the same component and controller as the checks.
+  } else {
+    const results = [];
+    const check = (name, pass) => { results.push({ name, pass: !!pass }); if (!pass) throw Error(name); };
+    const body = () => document.querySelector('[role="dialog"]');
+    const text = () => body()?.textContent ?? "";
+    const click = async label => {
+      const button = [...document.querySelectorAll("button")].find(b => b.textContent.trim() === label);
+      if (!button || button.disabled) throw Error(`Unavailable button ${label}`);
+      button.click(); await settle();
+    };
+    try {
+      check("first launch opens", body());
+      check("accessible modal", body().getAttribute("aria-modal") === "true");
+      check("initial heading focus", document.activeElement.id === "product-tour-title");
+      check("progress visible", text().includes("1 of 6"));
+      check("back disabled at start", [...body().querySelectorAll("button")].find(b => b.textContent === "Back").disabled);
+      await click("Next");
+      check("repository step", text().includes("Start with a repository"));
+      check("focus follows step", document.activeElement.id === "product-tour-title");
+      await click("Choose a repository");
+      check("picker callback once", opened === 1);
+      check("picker closes tour", !body());
+      check("action defers completion", JSON.parse(saved).status === "deferred");
+      check("focus restored", document.activeElement.id === "replay");
+      await click("Walkthrough");
+      check("reopen resumes", text().includes("Start with a repository"));
+      await click("Next");
+      check("view descriptions rendered", body().querySelectorAll("dt").length === 4);
+      check("mac shortcut", text().includes("⌘K"));
+      resetHostPlatformForTests({ os: "windows", dock_hiding: false }); await settle();
+      check("Windows shortcut", text().includes("Ctrl+K"));
+      await click("Next");
+      check("task step", text().includes("Turn an idea into a task"));
+      await click("Set up optional tools");
+      check("tool setup callback", tools === 1 && !body());
+      await click("Walkthrough"); await click("Next");
+      check("Windows permission guidance", text().includes("Windows Security"));
+      resetHostPlatformForTests({ os: "linux", dock_hiding: false }); await settle();
+      check("Linux permission guidance", text().includes("folder ownership"));
+      resetHostPlatformForTests({ os: "unknown", dock_hiding: false }); await settle();
+      check("unknown host remains unknown", text().includes("permission controls are unknown"));
+      resetHostPlatformForTests({ os: "macos", dock_hiding: true }); await settle();
+      check("mac permission recovery", text().includes("Files and Folders"));
+      check("trust distinct from OS access", text().includes("does not override denied folder access"));
+      await click("Open Settings");
+      check("Settings callback", settings === 1 && !body());
+      await click("Walkthrough"); await click("Next");
+      check("final step", text().includes("Ready when you are"));
+      // Exercise the actual focus trap at the end of the button ring.
+      const buttons = [...body().querySelectorAll("button")].filter(b => !b.disabled);
+      buttons.at(-1).focus();
+      buttons.at(-1).dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
+      check("Tab wraps inside dialog", document.activeElement === buttons[0]);
+      buttons[0].dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }));
+      check("Shift Tab wraps inside dialog", document.activeElement === buttons.at(-1));
+      fail = true; await click("Finish");
+      check("save failure stays open", body());
+      check("save failure announced", body().querySelector('[role="alert"]')?.textContent.includes("could not be saved"));
+      check("failed finish not persisted", JSON.parse(saved).status !== "completed");
+      fail = false; await click("Finish");
+      check("finish closes", !body());
+      check("completion saved", JSON.parse(saved).status === "completed");
+      await unmount(app); tour = createProductTour(() => storage); await mountTour();
+      check("completed relaunch stays closed", !body());
+      await click("Walkthrough");
+      check("replay starts at beginning", text().includes("Your work, in one place"));
+      body().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
+      check("Escape defers", !body() && JSON.parse(saved).status === "deferred");
+      await click("Walkthrough"); await click("Next"); await click("Back");
+      check("Back returns to previous step", text().includes("Your work, in one place"));
+      fail = true; await click("Later"); await click("Close without saving");
+      check("explicit session exit", !body());
+      fail = false; await click("Walkthrough");
+      const dialog = body();
+      check("dialog fits viewport", dialog.getBoundingClientRect().height <= innerHeight && dialog.getBoundingClientRect().width <= innerWidth);
+      for (let i = get(tour).step; i < 5; i++) await click("Next");
+      await click("Finish and open a repository");
+      check("final repository callback", opened === 2 && !body());
+      check("final action records tour completion", JSON.parse(saved).status === "completed");
+      check("no runtime errors", errors.length === 0);
+      document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
+    } catch (error) {
+      results.push({ name: String(error), pass: false });
+      document.getElementById("result").textContent = String(error);
+    }
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+    if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+  }
+</script></body></html>

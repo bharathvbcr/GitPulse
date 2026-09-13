@@ -60,6 +60,8 @@
   import NativeNotificationBridge from "./lib/components/NativeNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
+  import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
+  import { productTour } from "./lib/tools/productTour";
   import SetupWizard from "./lib/components/onboarding/SetupWizard.svelte";
   import {
     dismissFirstRun,
@@ -913,6 +915,7 @@
 
     <!-- Right Actions -->
     <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
+      <button class="gp-btn" title="Resume or replay the walkthrough" onclick={() => productTour.open()}>Walkthrough</button>
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
       {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}
@@ -1110,6 +1113,8 @@
   {/if}
   </div>
 
+  <ProductTour onOpenRepository={() => void repoStore.pickAndOpenRepo()}
+    onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")} />
   <SetupWizard />
 
   {#if tasksMounted}

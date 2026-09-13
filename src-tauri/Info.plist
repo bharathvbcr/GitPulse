@@ -8,5 +8,11 @@
   <true/>
   <key>NSRequiresAquaSystemAppearance</key>
   <false/>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>GitPulse accesses repositories you open on your Desktop to read changes and perform the Git operations you request.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>GitPulse accesses repositories you open in Documents to read changes and perform the Git operations you request.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>GitPulse accesses repositories you open in Downloads to read changes and perform the Git operations you request.</string>
 </dict>
 </plist>

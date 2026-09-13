@@ -255,3 +255,17 @@ export function platformChord(macChord: string, otherChord: string, os: HostOS):
 export function shortcutKeyLabels(keys: readonly string[], os: HostOS): string[] {
   return keys.map((key) => shortcutKeyLabel(key, os));
 }
+
+/** Folder access guidance is descriptive; it never claims an OS permission probe. */
+export function repositoryAccessGuidance(os: HostOS): string {
+  switch (os) {
+    case "macos":
+      return "macOS may ask for access when you open repositories in Desktop, Documents, or Downloads. If denied, review GitPulse under System Settings → Privacy & Security → Files and Folders, then open the repository again.";
+    case "windows":
+      return "On Windows, choose a folder your account can read and write. If access is blocked, review its folder permissions and Windows Security protection, then try opening it again.";
+    case "linux":
+      return "On Linux, your account needs permission to read the repository and write Git data. Check folder ownership, permissions, and any application confinement if access is denied.";
+    default:
+      return "This host’s permission controls are unknown. If opening a folder fails, review your operating system’s folder-access controls. This tour does not verify access.";
+  }
+}

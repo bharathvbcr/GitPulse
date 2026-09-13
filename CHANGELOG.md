@@ -57,6 +57,9 @@ untrusted checkout described as a broken one.
   serves. No host sends it; `mcp:doctor` needs it because silence is a
   legitimate answer to every real hook invocation, so nothing else can tell an
   absent binary from a current one.
+- First-run walkthrough: an interactive tour introducing repositories, views,
+  tasks, and platform folder access, replayable at any time from **Walkthrough**
+  in the title bar.
 
 ### Changed
 
