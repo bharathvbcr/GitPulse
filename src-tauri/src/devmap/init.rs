@@ -546,6 +546,7 @@ mod tests {
 
     #[test]
     fn initialize_registers_the_open_tab_set() {
+        let _stub = super::super::cli::bind_test_binary("devmap");
         let repo = init_repo();
         let other = init_repo();
         let repo_path = repo.path().to_string_lossy().into_owned();
