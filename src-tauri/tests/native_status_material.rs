@@ -1,5 +1,8 @@
-//! Exercise the production popover constructor on AppKit's real main thread.
-//! This checks the actual native effect view, not only the builder's options.
+//! Exercise the production status item and popover constructor on AppKit's real
+//! main thread. This checks the actual native objects — the effect view, and the
+//! `NSStatusItem` invariants that only a real status item can show (no menu
+//! attached at rest, and a count beside the glyph that can be cleared again) —
+//! not only the builder's options.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -51,6 +54,29 @@ fn main() {
                         }
                     }
                 })?;
+            }
+            // Phase 2: the optional count beside the glyph has to be able to go
+            // away again. tray-icon's macOS `set_title` only calls `setTitle:`
+            // inside an `if let Some`, so `None` clears nothing: before the fix
+            // the last count stayed on the button for the rest of the session,
+            // and turning the preference off — or closing the last repository —
+            // looked like it had done nothing at all. Only a real NSStatusItem
+            // can show that, which is why this check lives here.
+            for (tray_title, expected) in [(Some("12 · ⚠3".to_string()), "12 · ⚠3"), (None, "")]
+            {
+                set_menu_state(
+                    app.handle(),
+                    MenuState {
+                        show_status_icon: true,
+                        tray_title,
+                        ..Default::default()
+                    },
+                )?;
+                assert_eq!(
+                    status_item_title(app.handle()),
+                    expected,
+                    "the status item's count must follow the presentation it was given"
+                );
             }
             Ok(())
         })
@@ -138,6 +164,39 @@ fn main() {
             }
         });
     });
+}
+
+/// The text the real `NSStatusItem` button is showing beside the glyph.
+#[cfg(target_os = "macos")]
+fn status_item_title(app: &tauri::AppHandle) -> String {
+    let tray = app
+        .tray_by_id("gitpulse-status")
+        .expect("the status item exists while the icon preference is on");
+    tray.with_inner_tray_icon(|inner| {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+
+        let item = inner.ns_status_item().expect("status item");
+        // SAFETY: tray-icon owns this status item for the icon's lifetime, and
+        // this closure runs on AppKit's main thread. Only the title is read.
+        unsafe {
+            let item_ptr = objc2::rc::Retained::as_ptr(&item).cast::<AnyObject>();
+            let button: *mut AnyObject = msg_send![item_ptr, button];
+            assert!(!button.is_null(), "the status item has a button");
+            let text: *mut AnyObject = msg_send![button, title];
+            if text.is_null() {
+                return String::new();
+            }
+            let utf8: *const std::ffi::c_char = msg_send![text, UTF8String];
+            if utf8.is_null() {
+                return String::new();
+            }
+            std::ffi::CStr::from_ptr(utf8)
+                .to_string_lossy()
+                .into_owned()
+        }
+    })
+    .expect("read the native status item on the main thread")
 }
 
 #[cfg(target_os = "macos")]

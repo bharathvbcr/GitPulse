@@ -203,6 +203,18 @@ untrusted checkout described as a broken one.
   The palette harness had been failing, unrun, through a release because every
   caller hand-listed which harnesses to run and none named it; runs are now
   derived from the registry.
+- **Menu bar status icon: the glyph is drawn at menu-bar weight.** The pulse was
+  stroked at 2px in a 36px template shown at 18pt, which measured 1pt on screen —
+  thinner than the count printed beside it and than every neighbouring icon, with
+  over half the mark left as anti-aliasing fringe. It is now a 3px stroke, the
+  ~1.5–2pt weight macOS menu-bar glyphs carry.
+- **Menu bar status icon: the count beside the glyph can be cleared again.**
+  Turning "Show counts beside the icon" off, closing the last repository or
+  opening a bare one stopped updating the count but left the last value on screen
+  for the rest of the session: `tray-icon`'s macOS `set_title` ignores `None`
+  outright, so nothing cleared the button. GitPulse now sends the empty title
+  that actually clears it — already what `None` meant on Linux, and ignored on
+  Windows, so no behaviour changes there.
 
 ### Security
 

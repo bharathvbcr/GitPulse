@@ -74,6 +74,14 @@ fn pulse_icon(variant: GlyphVariant) -> tauri::image::Image<'static> {
     const SIZE: u32 = 36;
     const SUPER: u32 = 4;
     const HI: u32 = SIZE * SUPER;
+    // Stroke weight in final pixels. tray-icon hands this 36px canvas to AppKit
+    // at an 18pt size, so one final pixel is half a point: 3px is the ~1.5–2pt
+    // weight macOS menu-bar glyphs carry. A 1px-radius brush drew a 2px stroke,
+    // which measured 1pt on screen — thinner than the count digit printed beside
+    // it, and over half of it anti-aliasing fringe. That is what made the mark
+    // read as a washed-out hairline rather than a rendered glyph, and it all but
+    // disappeared on a 1× display, where the 36px bitmap is halved.
+    const STROKE_PX: u32 = 3;
     let mut hi = vec![0u8; (HI * HI) as usize];
     let points = [
         (5i32 * SUPER as i32, 19i32 * SUPER as i32),
@@ -83,7 +91,8 @@ fn pulse_icon(variant: GlyphVariant) -> tauri::image::Image<'static> {
         (25 * SUPER as i32, 19 * SUPER as i32),
         (31 * SUPER as i32, 19 * SUPER as i32),
     ];
-    let stroke = SUPER as i32;
+    // Disc-brush radius in supersampled units for that final stroke weight.
+    let stroke = (STROKE_PX * SUPER / 2) as i32;
     for pair in points.windows(2) {
         let (x0, y0) = pair[0];
         let (x1, y1) = pair[1];
@@ -307,7 +316,15 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), St
         state.tray_detail, state.tray_summary.text
     );
     let variant = glyph_variant(state);
-    let title = state.tray_title.as_deref();
+    // tray-icon's macOS `set_title` ignores `None` outright — it only calls
+    // `setTitle:` inside an `if let Some`. Sending `None` to clear the count
+    // therefore left the previous number beside the glyph for the rest of the
+    // session: switching the pref off, closing the last repository or opening a
+    // bare one all stopped updating a count that stayed on screen. An empty
+    // title is what actually clears the button, and it is what `None` already
+    // means on the other two platforms (GTK maps it to `""`; Windows ignores
+    // titles entirely), so this is the value every platform gets.
+    let title = state.tray_title.as_deref().unwrap_or_default();
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         // Never leave a menu attached at rest — that is what steals left clicks on macOS.
         tray.set_menu(None::<Menu<R>>)
@@ -325,7 +342,8 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), St
             *glyph = Some(variant);
         }
         drop(glyph);
-        tray.set_title(title).map_err(|error| error.to_string())?;
+        tray.set_title(Some(title))
+            .map_err(|error| error.to_string())?;
     } else {
         tauri::tray::TrayIconBuilder::with_id(TRAY_ID)
             .icon(pulse_icon(variant))
@@ -344,7 +362,8 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), St
             *glyph = Some(variant);
         }
         if let Some(tray) = app.tray_by_id(TRAY_ID) {
-            tray.set_title(title).map_err(|error| error.to_string())?;
+            tray.set_title(Some(title))
+                .map_err(|error| error.to_string())?;
             #[cfg(all(debug_assertions, target_os = "macos"))]
             dump_status_item_frames(&tray);
         }
@@ -368,6 +387,71 @@ mod tests {
             .iter()
             .any(|pixel| pixel[3] == 255));
         assert!(icon.rgba()[..36 * 4].iter().all(|byte| *byte == 0));
+    }
+
+    /// Longest run of at-least-half-covered pixels in each column that has ink.
+    /// This is the same statistic a screen capture of the menu bar yields, so the
+    /// numbers below are comparable with what the glyph actually measures there.
+    fn column_thicknesses(icon: &tauri::image::Image<'_>) -> Vec<u32> {
+        let size = icon.width();
+        let alpha = |x: u32, y: u32| icon.rgba()[((y * size + x) * 4 + 3) as usize];
+        let mut runs = Vec::new();
+        for x in 0..size {
+            let (mut best, mut run) = (0u32, 0u32);
+            for y in 0..size {
+                if alpha(x, y) >= 128 {
+                    run += 1;
+                    best = best.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            if best > 0 {
+                runs.push(best);
+            }
+        }
+        runs.sort_unstable();
+        runs
+    }
+
+    #[test]
+    fn status_glyph_carries_menu_bar_stroke_weight() {
+        // The canvas is 36px shown at 18pt, so one pixel is half a point. macOS
+        // menu-bar glyphs — and the count digit GitPulse prints beside this one —
+        // measure 1.5–2pt, i.e. 3–4px here. A 2px stroke rendered as a hairline
+        // that read as a failure to draw the glyph at all.
+        for variant in [GlyphVariant::Plain, GlyphVariant::Attention] {
+            let runs = column_thicknesses(&pulse_icon(variant));
+            assert!(!runs.is_empty(), "{variant:?} glyph must have ink");
+            // Round ends taper, so the thinnest single column is not the weight.
+            // The quarter-point is: three quarters of the mark is at least this thick.
+            let quartile = runs[runs.len() / 4];
+            assert!(
+                quartile >= 3,
+                "{variant:?} stroke is {quartile}px where it is thinnest, \
+                 under the 3px (1.5pt) menu-bar weight; runs were {runs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_glyph_stays_inside_its_template_box() {
+        // A thicker stroke must not push ink off the canvas: tray-icon scales the
+        // whole 36px square to 18pt, so a clipped edge is a clipped glyph.
+        for variant in [GlyphVariant::Plain, GlyphVariant::Attention] {
+            let icon = pulse_icon(variant);
+            let size = icon.width();
+            let alpha = |x: u32, y: u32| icon.rgba()[((y * size + x) * 4 + 3) as usize];
+            for edge in 0..size {
+                for (x, y) in [(edge, 0), (edge, size - 1), (0, edge), (size - 1, edge)] {
+                    assert_eq!(
+                        alpha(x, y),
+                        0,
+                        "{variant:?} glyph touches the canvas edge at ({x},{y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
