@@ -1,5 +1,45 @@
 # Repository hygiene and cache maintenance
 
+## Which setting reaches which repository
+
+Hygiene has three settings scopes. They are separate mechanisms, not three
+views of one number, so each control names the scope it governs.
+
+| Scope | Where you set it | What it reaches | Where it is stored |
+| --- | --- | --- | --- |
+| **Host-wide default** | Settings → Repo hygiene → Hygiene defaults | Every repository you preview cleanup in, unless that repository overrides it | `gitpulse:hygiene:defaults:v2` in app storage |
+| **Repository override** | Insights → Storage → Repository hygiene | That one repository. Never the default, never the schedule | `gitpulse:hygiene:repo:v2:<repo>` in app storage |
+| **Scheduled cleaner policy** | Fleet → Global build cleaner, or Settings → Repo hygiene | Every repository beneath its project roots, including ones not open in GitPulse | `hygiene/state.json` in GitPulse's config folder |
+
+The scheduled cleaner keeps its own retention deliberately. Its sweep runs from
+a headless worker with no window — on macOS from a launchd job while GitPulse is
+closed — so it cannot read the app storage the other two layers live in. A
+repository override changes previews in that repository and nothing else.
+
+A retention control shows `Use the default · N days` until you choose otherwise;
+choosing a value pins that repository and says so. Clearing it back to the
+default restores inheritance, so moving the default later moves that repository
+with it.
+
+The **shared-cache review** is host-wide, not per repository. It measures caches
+owned by the host — the Cargo registry, `GOCACHE`, the npm cache and their peers
+— which `cmd_cache_inventory` reports without taking a repository argument.
+One switch and one weekly stamp therefore serve the whole host: enabling it
+anywhere enables it everywhere, and reviewing from one repository satisfies the
+week for all of them. It is measurement only; nothing is removed without a
+preview you accept.
+
+Settings written by an earlier build were a single flat record per repository.
+Each one is adopted the next time its repository is opened: a retention that
+differed from the old hardcoded 30 days becomes that repository's override, a
+retention left at 30 becomes inheritance, and a weekly review that was on
+promotes the host-wide switch, carrying the most recent measurement stamp so
+adoption does not force an immediate rescan. The legacy record is removed as it
+is adopted, so a stale record cannot switch the review back on after you turn
+it off.
+
+## Scheduled cleanup
+
 Open **Fleet → Global build cleaner** or **Settings → Repo hygiene** to maintain
 repositories beneath selected project roots, including repositories that are not
 open in GitPulse. Save roots, exclusions, retention, byte/target limits and an
@@ -8,7 +48,7 @@ optional schedule. Defaults are off, 30-day retention, a weekly interval,
 roots before an immediate run; incomplete inventories block cleanup.
 
 **Insights → Storage → Repository hygiene** provides individual expiring
-previews and tool-owned shared-cache maintenance. Its optional weekly review is
+previews and tool-owned shared-cache maintenance. Its shared-cache review is
 read-only and runs while the page is visible; it is separate from the native
 global cleanup schedule.
 
@@ -128,7 +168,9 @@ Pruning packages can require downloads when switching branches or reinstalling.
 2. A preview validates a literal relative path, the producer, ignore rules, the
    Git index, nested repository boundaries, protected names, symlinks, recent
    modifications, active build processes and open files. A failed check refuses
-   preparation. The default retention is 30 days; the UI offers 7/14/30/90 days.
+   preparation. Retention comes from the host-wide default, which ships at
+   30 days, unless the repository carries an override; the UI offers
+   7/14/30/90 days for either.
 3. A complete snapshot records file identities, lengths, modification/change
    times, directories and logical sizes. Preview storage is bounded to four
    plans, each valid for five minutes and bound to one canonical repository.
@@ -193,9 +235,12 @@ MANVI workflow for branch cleanup. Git history/reflog pruning is not automated.
   discovery orchestration, scheduling, locks, journal and macOS job integration.
 - `src/lib/components/GlobalCleaner.svelte`: shared Fleet/Settings controls,
   saved policy, inventory, cancellation and run history.
+- `src/lib/components/HygieneDefaultsPanel.svelte`: the host-wide default and
+  shared-cache review, and the scope table naming what reaches which repository.
 - `src/lib/components/HygienePanel.svelte`: review, execution, cancellation,
-  recovery, shared-cache inventory and saved preferences within Storage.
-- `src/lib/storage/hygiene/`: wire types and preference/ignore-rule helpers.
+  recovery, shared-cache inventory and this repository's override within Storage.
+- `src/lib/storage/hygiene/`: wire types, the default/override resolution and
+  legacy adoption, and ignore-rule helpers.
 - `harness/hygiene.html`: rendered interaction regressions using controlled IPC
   fixtures; these are UI tests, not proof of real cache deletion.
 
