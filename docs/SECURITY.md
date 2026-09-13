@@ -48,16 +48,40 @@ flowchart TD
 - Opening a checkout first requires an explicit **Trust and Open** decision.
   Path inspection does not run Git; canceled or failed approval does not start
   watchers, status hydration, dependency scans, or code indexing.
-- Trust permits this checkout's Git hooks, helpers, and project tools to run
+- Trust permits the repository's Git hooks, helpers, and project tools to run
   with the user's account permissions, including code in submodules. It is an
   execution decision, not an OS sandbox or a claim that the project is safe.
 - GitPulse stores remembered grants in its application configuration directory,
-  outside repository policy and task files. Grants bind canonical checkout,
-  private Git directory, common Git directory, and filesystem identities.
-  Replacing the checkout or redirecting a gitfile requires fresh approval.
-- Linked worktrees need separate approval. Shared Git-directory discovery is
-  filesystem-only; removing a worktree requires trust for the target as well
-  as the parent because Git may scan the target internally.
+  outside repository policy and task files. A grant binds the repository — the
+  common Git directory, by canonical path and filesystem identity — together
+  with the checkout that was approved. Replacing either, or redirecting a
+  gitfile at a different repository, requires fresh approval.
+- One approval covers the repository, so a linked worktree is not a second
+  decision. Every working tree shares one configuration, one hook directory and
+  one object database, and that shared surface is the whole of what the
+  decision is about; approving per checkout would ask the same question again
+  for no additional authority. The approval dialog names that scope before it
+  is granted.
+- A checkout is covered only when the approved Git directory itself vouches for
+  it: the repository is held inside it as a real `.git` directory, or its
+  private Git directory is a registered entry under that common directory's
+  `worktrees/` whose `gitdir` names this checkout back. A directory that merely
+  points a gitfile or a symlink at a trusted common directory is making a
+  claim, not presenting evidence, and is refused — forging what is read instead
+  requires write access to the approved repository's own Git directory, where a
+  `core.fsmonitor` would already run.
+- Shared Git-directory discovery stays filesystem-only, and removing a worktree
+  still admits the target in its own right because Git scans it internally. A
+  target in the approved repository is answered by that same grant; a target in
+  a repository nobody approved is refused before Git starts.
+- Revocation reaches the whole repository, including approvals recorded
+  separately for its other working trees, so it is never partial.
+- Approvals stored before the repository became the unit are still honoured and
+  are not widened by the change: each authorizes only the checkout it named,
+  read from its own filename namespace so it cannot be replayed as a
+  repository-wide one. Widening a decision taken under narrower terms is a
+  decision to re-take, not to reinterpret, so the first approval granted after
+  upgrading is the one that covers the family.
 - Native Git, background analysis, DevMap, PTY startup, and MCP reads enforce
   trust. MCP cannot grant it. A refusal is an explicit error or unavailable
   result, never a successful empty scan.
@@ -84,8 +108,9 @@ flowchart TD
   and is deliberately distinct from a trust refusal: approving the repository
   again cannot resolve it.
 - Use the repository tab's **Revoke repository trust** action to close the tab
-  and block subsequent operations. Already-started terminals and agent tasks
-  retain the authority they were given; stop them separately when needed.
+  and block subsequent operations for that repository and every worktree of it.
+  Already-started terminals and agent tasks retain the authority they were
+  given; stop them separately when needed.
 - Filesystems that cannot supply a stable creation identity are refused with
   an explanation. Trust decisions are local to this installation and are not
   portable project metadata.

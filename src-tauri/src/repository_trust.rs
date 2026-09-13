@@ -1,8 +1,12 @@
-//! Explicit execution authority for a checkout, independent of repository data.
+//! Explicit execution authority for a repository, independent of its data.
 //!
-//! Inspection never starts Git. Grants bind canonical checkout/private/common
-//! Git directories and their filesystem identities. The desktop is the only
-//! IPC surface that can grant trust; MCP and repository-local policy cannot.
+//! Inspection never starts Git. A grant binds the *repository* — the common
+//! Git directory, by canonical path and filesystem identity — and covers every
+//! working tree that repository itself vouches for, so a linked worktree is
+//! not a second decision. Membership is proved from the approved Git
+//! directory's own records, never from what a candidate directory claims about
+//! itself. The desktop is the only IPC surface that can grant trust; MCP and
+//! repository-local policy cannot.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap};
@@ -45,6 +49,22 @@ struct Identity {
     common_dir: DirectoryIdentity,
 }
 
+/// What an approval binds.
+///
+/// The unit is the repository, because that is the unit of everything trust
+/// decides about: one `config`, one set of hooks, one object database, shared
+/// by every working tree. `approved` is not a second condition — it records
+/// which checkout the human was looking at, and keeps that exact checkout
+/// covered even in a layout the repository cannot vouch for.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Grant {
+    version: u32,
+    repository: DirectoryIdentity,
+    approved: DirectoryIdentity,
+}
+
+const GRANT_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrustPreview {
     pub path: String,
@@ -55,8 +75,9 @@ pub struct TrustPreview {
     pub trusted: bool,
 }
 
-fn sessions() -> &'static Mutex<HashMap<PathBuf, Identity>> {
-    static GRANTS: OnceLock<Mutex<HashMap<PathBuf, Identity>>> = OnceLock::new();
+/// Session grants, keyed by canonical repository (common Git directory) path.
+fn sessions() -> &'static Mutex<HashMap<PathBuf, Grant>> {
+    static GRANTS: OnceLock<Mutex<HashMap<PathBuf, Grant>>> = OnceLock::new();
     GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -179,42 +200,138 @@ fn identity(repo_path: &str) -> Result<Identity, String> {
     })
 }
 
-fn record_path(root: &Path, checkout: &Path) -> PathBuf {
-    // This hash is only a bounded filename, never an authentication check.
-    // A collision cannot grant trust: the entire Identity must match below.
+/// Whether the repository itself vouches for this checkout.
+///
+/// Filesystem metadata only, and every fact is read from *inside* the
+/// directory the human approved. A checkout that merely names a trusted common
+/// directory is making a claim, and a claim must never be its own evidence:
+/// forging what is read here costs write access to the approved repository's
+/// own Git directory, where a `core.fsmonitor` would already run, so it buys
+/// an attacker nothing they did not already have.
+///
+/// An unreadable or unexpected layout answers "not a member" rather than
+/// failing: the caller's next step is to ask the human about this exact
+/// checkout, which is a better outcome than an error no approval can clear.
+fn member_of_repository(current: &Identity) -> bool {
+    // A bare repository is its own single member; there is no work tree to
+    // distinguish from it.
+    if current.checkout == current.common_dir {
+        return true;
+    }
+    if current.git_dir == current.common_dir {
+        // The shape of a main work tree — but *holding* the repository is what
+        // makes one, and a gitfile or a symlink names it from outside instead.
+        // Only a real directory at `.git` is possession.
+        return fs::symlink_metadata(current.checkout.path.join(".git"))
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+    }
+    // A linked work tree: its Git directory must live in the approved
+    // repository's own registry, and that registry entry must name this
+    // checkout back. Containment is what makes the back-pointer mean anything
+    // — a Git directory the claimant fabricates elsewhere can say `commondir:
+    // <trusted>` and point its `gitdir` wherever it likes.
+    let Ok(registry) = current.common_dir.path.join("worktrees").canonicalize() else {
+        return false;
+    };
+    if current.git_dir.path.parent() != Some(registry.as_path()) {
+        return false;
+    }
+    let pointer = current.git_dir.path.join("gitdir");
+    let Ok(raw) = bounded_text(&pointer, MAX_METADATA) else {
+        return false;
+    };
+    let Ok(named) = metadata_target(&current.git_dir.path, &raw) else {
+        return false;
+    };
+    // Git registers the work tree's gitfile, so compare that entry rather than
+    // what it resolves to.
+    if named.file_name() != Some(std::ffi::OsStr::new(".git")) {
+        return false;
+    }
+    named
+        .parent()
+        .and_then(|holder| holder.canonicalize().ok())
+        .is_some_and(|holder| holder == current.checkout.path)
+}
+
+/// Where a repository's approval is stored.
+///
+/// These hashes are only bounded filenames, never authentication checks. A
+/// collision cannot grant trust: the stored identity must match below. The
+/// suffix keeps this namespace disjoint from [`legacy_record`], so a
+/// pre-repository approval can never be read back as a repository one.
+fn repository_record(root: &Path, repository: &Path) -> PathBuf {
+    let mut key = DefaultHasher::new();
+    repository.hash(&mut key);
+    root.join(format!("{:016x}.repository.json", key.finish()))
+}
+
+/// Where approvals were stored before the unit of trust became the repository:
+/// one record per checkout, holding the whole inspected [`Identity`].
+///
+/// Still honoured, so upgrading does not silently re-prompt for every
+/// repository a user already approved. It authorizes exactly the checkout it
+/// named and nothing else — the family is only ever extended by a grant made
+/// under the current scheme.
+fn legacy_record(root: &Path, checkout: &Path) -> PathBuf {
     let mut key = DefaultHasher::new();
     checkout.hash(&mut key);
     root.join(format!("{:016x}.json", key.finish()))
 }
 
-fn persistent_root() -> Result<PathBuf, String> {
-    crate::tool_config::default_config_dir()
-        .map(|dir| dir.join("repository-trust-v1"))
-        .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
-}
-
-fn read_grant(root: &Path, current: &Identity) -> Result<bool, String> {
-    let path = record_path(root, &current.checkout.path);
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+/// Reads a stored record, refusing anything that is not a plain regular file.
+fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("Cannot read repository trust: {error}")),
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
             return Err("Repository trust record is not a regular file".into())
         }
         Ok(_) => {}
     }
-    let saved: Identity = serde_json::from_str(&bounded_text(&path, MAX_RECORD)?)
-        .map_err(|e| format!("Invalid repository trust record: {e}"))?;
+    serde_json::from_str(&bounded_text(path, MAX_RECORD)?)
+        .map(Some)
+        .map_err(|e| format!("Invalid repository trust record: {e}"))
+}
+
+/// The `-v1` names the *storage layout* — a directory of per-record JSON files
+/// — which has not changed; what a record contains carries its own version.
+/// Renaming this would orphan the approvals [`legacy_record`] deliberately
+/// still reads, which is the whole of the upgrade path.
+fn persistent_root() -> Result<PathBuf, String> {
+    crate::tool_config::default_config_dir()
+        .map(|dir| dir.join("repository-trust-v1"))
+        .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
+}
+
+/// Whether `grant` reaches `current`: the same repository, and either the
+/// exact checkout that was approved or one that repository vouches for.
+fn covers(grant: &Grant, current: &Identity) -> bool {
+    grant.version == GRANT_VERSION
+        && grant.repository == current.common_dir
+        && (grant.approved == current.checkout || member_of_repository(current))
+}
+
+fn read_grant(root: &Path, current: &Identity) -> Result<bool, String> {
+    if let Some(grant) = stored::<Grant>(&repository_record(root, &current.common_dir.path))? {
+        if covers(&grant, current) {
+            return Ok(true);
+        }
+    }
+    let Some(saved) = stored::<Identity>(&legacy_record(root, &current.checkout.path))? else {
+        return Ok(false);
+    };
     Ok(saved.version == 1 && saved == *current)
 }
 
 fn trusted(current: &Identity) -> Result<bool, String> {
-    if sessions()
+    let session = sessions()
         .lock()
         .map_err(|_| "Repository trust state is unavailable")?
-        .get(&current.checkout.path)
-        == Some(current)
-    {
+        .get(&current.common_dir.path)
+        .cloned();
+    if session.is_some_and(|grant| covers(&grant, current)) {
         return Ok(true);
     }
     read_grant(&persistent_root()?, current)
@@ -255,7 +372,23 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
     if trusted(&current)? {
         return Ok(current);
     }
-    Err(format!("{REQUIRED}: Open {} in GitPulse and explicitly trust this checkout before running repository commands.", current.checkout.path.display()))
+    // Name the repository too when this is a linked worktree. One approval
+    // covers the family, and the checkout a user can actually reach for is
+    // more often the one the repository lives in than an agent's scratch
+    // worktree — so saying only "open this path" sends them the long way
+    // round, or nowhere at all when the worktree is gone by the time they read
+    // it.
+    let mut refusal = format!(
+        "{REQUIRED}: Open {} in GitPulse and trust it before running repository commands.",
+        current.checkout.path.display()
+    );
+    if current.git_dir != current.common_dir {
+        refusal.push_str(&format!(
+            " This is a linked worktree: approving any working tree of the repository at {} covers all of them.",
+            current.common_dir.path.display()
+        ));
+    }
+    Err(refusal)
 }
 
 /// Whether `message` is — or carries, once a caller has wrapped it — the
@@ -274,11 +407,11 @@ pub fn refused(message: &str) -> bool {
     message.contains(REQUIRED)
 }
 
-fn save_grant(root: &Path, current: &Identity) -> Result<(), String> {
+fn save_grant(root: &Path, current: &Grant) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fs::create_dir_all(root).map_err(|e| format!("Cannot create repository trust storage: {e}"))?;
-    let path = record_path(root, &current.checkout.path);
+    let path = repository_record(root, &current.repository.path);
     let temporary = root.join(format!(
         ".grant-{}-{}",
         std::process::id(),
@@ -326,33 +459,87 @@ pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result
                 .into(),
         );
     }
+    let granted = Grant {
+        version: GRANT_VERSION,
+        repository: current.common_dir,
+        approved: current.checkout,
+    };
     if remember {
-        save_grant(&persistent_root()?, &current)
+        save_grant(&persistent_root()?, &granted)
     } else {
         let mut grants = sessions()
             .lock()
             .map_err(|_| "Repository trust state is unavailable")?;
-        if grants.len() >= MAX_SESSION_GRANTS && !grants.contains_key(&current.checkout.path) {
+        if grants.len() >= MAX_SESSION_GRANTS && !grants.contains_key(&granted.repository.path) {
             return Err("Too many session repository grants".into());
         }
-        grants.insert(current.checkout.path.clone(), current);
+        grants.insert(granted.repository.path.clone(), granted);
         Ok(())
     }
 }
 
 /// Revocation blocks subsequent operations; already-started processes retain
 /// the authority granted when they started and must be stopped separately.
+///
+/// It reaches the whole repository, because the grant did. Leaving one working
+/// tree approved because it was approved under an older scheme, or before its
+/// siblings, would make "revoked" mean "revoked except where you forgot" —
+/// so every record naming this repository goes, not only the one keyed by it.
 pub fn revoke(repo_path: &str) -> Result<(), String> {
     let repo = crate::engine::git_cli::validate_repo_path(repo_path)?;
+    // A checkout that has already been removed cannot name its family any
+    // more; revoking then falls back to the path itself, which is all that is
+    // left to identify.
+    let repository = identity(repo_path).ok().map(|id| id.common_dir.path);
     sessions()
         .lock()
         .map_err(|_| "Repository trust state is unavailable")?
-        .remove(&repo);
-    match fs::remove_file(record_path(&persistent_root()?, &repo)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("Cannot revoke repository trust: {error}")),
+        .retain(|key, grant| {
+            Some(key.as_path()) != repository.as_deref() && grant.approved.path != repo
+        });
+    forget_records(&persistent_root()?, repository.as_deref(), &repo)
+}
+
+/// Deletes every stored approval that names this repository or this checkout.
+///
+/// Unreadable entries are left alone deliberately: a record this cannot parse
+/// is one [`read_grant`] cannot parse either, so it authorizes nothing and
+/// removing it would only be tidying. A directory that cannot be listed is a
+/// different matter — the revocation would be silently partial, so it fails.
+fn forget_records(root: &Path, repository: Option<&Path>, checkout: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Cannot revoke repository trust: {error}")),
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("Cannot revoke repository trust: {error}"))?
+            .path();
+        let named = match stored::<Grant>(&path) {
+            Ok(Some(grant)) => {
+                Some(grant.repository.path.as_path()) == repository
+                    || grant.approved.path == checkout
+            }
+            // Not a repository record, or not readable as one. A pre-repository
+            // record still authorizes the single checkout it names.
+            _ => matches!(
+                stored::<Identity>(&path),
+                Ok(Some(saved))
+                    if Some(saved.common_dir.path.as_path()) == repository
+                        || saved.checkout.path == checkout
+            ),
+        };
+        if !named {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("Cannot revoke repository trust: {error}"));
+            }
+        }
     }
+    Ok(())
 }
 
 /// Whatever must outlive admission for the spawn to land where it was
@@ -603,16 +790,24 @@ mod tests {
         dir
     }
 
+    fn approval_for(current: &Identity) -> Grant {
+        Grant {
+            version: GRANT_VERSION,
+            repository: current.common_dir.clone(),
+            approved: current.checkout.clone(),
+        }
+    }
+
     #[test]
-    fn persistent_records_require_a_complete_matching_identity() {
+    fn persistent_records_require_a_complete_matching_repository() {
         let repo = fixture();
         let other = fixture();
         let storage = tempfile::tempdir().unwrap();
         let current = identity(repo.path().to_str().unwrap()).unwrap();
         assert!(!read_grant(storage.path(), &current).unwrap());
-        save_grant(storage.path(), &current).unwrap();
+        save_grant(storage.path(), &approval_for(&current)).unwrap();
         assert!(read_grant(storage.path(), &current).unwrap());
-        let record = record_path(storage.path(), &current.checkout.path);
+        let record = repository_record(storage.path(), &current.common_dir.path);
         for content in [
             "{".to_owned(),
             "null".to_owned(),
@@ -621,13 +816,61 @@ mod tests {
             fs::write(&record, content).unwrap();
             assert!(read_grant(storage.path(), &current).is_err());
         }
-        let mut changed = current.clone();
-        changed.version = 2;
+        let mut changed = approval_for(&current);
+        changed.version = GRANT_VERSION + 1;
         fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert!(!read_grant(storage.path(), &current).unwrap());
         let foreign = identity(other.path().to_str().unwrap()).unwrap();
-        fs::write(&record, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        fs::write(
+            &record,
+            serde_json::to_vec(&approval_for(&foreign)).unwrap(),
+        )
+        .unwrap();
         assert!(!read_grant(storage.path(), &current).unwrap());
+
+        // `approved` is an audit trail, not a second lock. A record for *this*
+        // repository covers a member of it whichever checkout the human was
+        // looking at — that is the whole point of binding the repository, and
+        // a later "tightening" back to an exact-checkout match would quietly
+        // restore the per-worktree prompt.
+        let mut elsewhere = approval_for(&current);
+        elsewhere.approved = foreign.checkout.clone();
+        fs::write(&record, serde_json::to_vec(&elsewhere).unwrap()).unwrap();
+        assert!(read_grant(storage.path(), &current).unwrap());
+    }
+
+    /// Upgrading must not re-prompt for every repository already approved, and
+    /// must not retroactively widen those approvals either: a record written
+    /// before the repository became the unit authorizes the one checkout it
+    /// named, and is read from its own filename namespace so it can never be
+    /// mistaken for a repository-wide one.
+    #[test]
+    fn a_pre_repository_record_still_authorizes_exactly_its_checkout() {
+        let repo = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let legacy = legacy_record(storage.path(), &current.checkout.path);
+        fs::write(&legacy, serde_json::to_vec(&current).unwrap()).unwrap();
+        assert!(read_grant(storage.path(), &current).unwrap());
+
+        // Deliberately the *current* grant version: a record in the legacy
+        // namespace claiming to be a newer one is still refused there, so the
+        // two schemes cannot be crossed by editing a version number.
+        let mut stale = current.clone();
+        stale.version = GRANT_VERSION;
+        fs::write(&legacy, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(!read_grant(storage.path(), &current).unwrap());
+
+        // The same bytes at the repository key authorize nothing: the two
+        // namespaces are disjoint, so an old record cannot be replayed as a
+        // family-wide one.
+        fs::remove_file(&legacy).unwrap();
+        fs::write(
+            repository_record(storage.path(), &current.common_dir.path),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        assert!(read_grant(storage.path(), &current).is_err());
     }
 
     #[test]
@@ -851,8 +1094,17 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let current = identity(repo.path().to_str().unwrap()).unwrap();
         let data = storage.path().join("forged");
-        fs::write(&data, serde_json::to_vec(&current).unwrap()).unwrap();
-        symlink(&data, record_path(storage.path(), &current.checkout.path)).unwrap();
+        fs::write(&data, serde_json::to_vec(&approval_for(&current)).unwrap()).unwrap();
+        symlink(
+            &data,
+            repository_record(storage.path(), &current.common_dir.path),
+        )
+        .unwrap();
+        assert!(read_grant(storage.path(), &current).is_err());
+        // The same refusal for a pre-repository record, which is read through
+        // the same guard rather than a second, laxer one.
+        fs::remove_file(repository_record(storage.path(), &current.common_dir.path)).unwrap();
+        symlink(&data, legacy_record(storage.path(), &current.checkout.path)).unwrap();
         assert!(read_grant(storage.path(), &current).is_err());
         let pointer = repo.path().join(".git/commondir");
         let cpath = std::ffi::CString::new(pointer.as_os_str().as_encoded_bytes()).unwrap();

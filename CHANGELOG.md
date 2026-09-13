@@ -111,6 +111,32 @@ untrusted checkout described as a broken one.
   dated advisory-database checks, not exhaustive source or runtime verification.
 - The IPC surface grows to 220 handlers, and the Rust/TypeScript contract check
   to 65 contracts across 1,104 fields.
+- Repository trust is granted to the repository, not to one checkout. A linked
+  worktree is no longer a second decision: approving any working tree covers
+  the checkout the repository lives in and every worktree of it, including ones
+  created later. Agent worktrees under `.claude/worktrees/` now open, index and
+  report without a prompt each, and removing a worktree no longer asks for the
+  target separately.
+
+  The shared surface a trust decision is actually about — one configuration,
+  one hook directory, one object database — was always repository-wide, so
+  asking per checkout bought no authority it did not already grant. What
+  membership means is now proved rather than assumed: a checkout is covered
+  only when the approved Git directory vouches for it, by holding the
+  repository as a real `.git` directory or by carrying a registered
+  `worktrees/` entry whose `gitdir` names that checkout back. Pointing a
+  gitfile or a symlink at a trusted common directory is a claim, not evidence,
+  and is refused.
+
+  Revoking now reaches the whole repository, including approvals recorded
+  separately for its other worktrees, so a revocation cannot be partial.
+
+  Approvals made before this release keep working and are *not* widened: each
+  authorizes exactly the checkout it named, so upgrading re-prompts for nothing
+  and silently grants nothing either. The scope of the decision changed, and a
+  decision taken under narrower terms should be re-taken rather than
+  reinterpreted — so the first approval after upgrading is the one that covers
+  the family, granted through a dialog that now names that scope.
 
 ### Fixed
 

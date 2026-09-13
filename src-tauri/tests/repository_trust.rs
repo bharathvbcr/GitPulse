@@ -27,6 +27,25 @@ fn fixture() -> tempfile::TempDir {
     dir
 }
 
+/// `git worktree add` needs a commit to check out.
+fn commit(repo: &Path) {
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+    );
+}
+
 fn approve(repo: &Path) {
     let path = repo.to_str().unwrap();
     let view = repository_trust::inspect(path).unwrap();
@@ -141,41 +160,87 @@ fn symlink_aliases_match_but_replacements_and_stale_approvals_do_not() {
     );
 }
 
+/// What a worktree adds is a second *working tree*, not a second repository:
+/// the configuration, the hooks and the object database a trust decision is
+/// actually about are one shared common directory. So one approval covers the
+/// family, in whichever order its members are opened, including members that
+/// did not exist when the human approved.
 #[test]
-fn linked_worktrees_and_bare_repositories_need_their_own_approval() {
+fn one_approval_covers_every_working_tree_of_that_repository() {
     let repo = fixture();
+    commit(repo.path());
     approve(repo.path());
-    git(
-        repo.path(),
-        &[
-            "-c",
-            "user.name=test",
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "fixture",
-        ],
-    );
+
+    // Added *after* the approval: the grant names the repository, so there is
+    // no moment at which this checkout is a stranger to it.
     let parent = tempfile::tempdir().unwrap();
     let linked = parent.path().join("linked");
     git(
         repo.path(),
         &["worktree", "add", "--detach", linked.to_str().unwrap()],
     );
-    assert!(repository_trust::require(&linked).is_err());
-    approve(&linked);
+    repository_trust::require(&linked).expect("a worktree of an approved repository");
     git_cli::git(&linked, &["status"]).unwrap();
-    let other = fixture();
-    std::fs::write(
-        linked.join(".git"),
-        format!("gitdir: {}\n", other.path().join(".git").display()),
-    )
-    .unwrap();
+
+    let sibling = parent.path().join("sibling");
+    git(
+        repo.path(),
+        &["worktree", "add", "--detach", sibling.to_str().unwrap()],
+    );
+    repository_trust::require(&sibling).expect("a second worktree of the same repository");
+
+    // The shape agents actually produce: a worktree *inside* the checkout it
+    // was made from, as `.claude/worktrees/<branch>`. Being nested is not what
+    // makes it a member and must not be what admits it either — the registry
+    // entry is, exactly as for one parked in a temporary directory.
+    let nested = repo.path().join(".claude/worktrees/agent");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    git(
+        repo.path(),
+        &["worktree", "add", "--detach", nested.to_str().unwrap()],
+    );
+    repository_trust::require(&nested).expect("a worktree nested inside its own repository");
+    git_cli::git(&nested, &["status"]).unwrap();
+
+    // And in the other direction, because which member a human happened to
+    // open first is not a security property: approving the worktree alone
+    // covers the checkout the repository lives in.
+    repository_trust::revoke(repo.path().to_str().unwrap()).unwrap();
     assert!(repository_trust::require(&linked).is_err());
+    assert!(repository_trust::require(repo.path()).is_err());
+    approve(&linked);
+    repository_trust::require(repo.path()).expect("the main checkout of an approved worktree");
+    repository_trust::require(&sibling).expect("a sibling of an approved worktree");
+}
+
+/// Revocation is family-wide for the same reason the grant is: leaving one
+/// member trusted would make "revoked" mean "mostly revoked".
+#[test]
+fn revoking_any_member_revokes_the_whole_repository() {
+    let repo = fixture();
+    commit(repo.path());
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    git(
+        repo.path(),
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    approve(repo.path());
+    approve(&linked);
+    repository_trust::revoke(linked.to_str().unwrap()).unwrap();
+    assert!(repository_trust::require(&linked).is_err());
+    assert!(
+        repository_trust::require(repo.path()).is_err(),
+        "the main checkout kept an approval that was revoked through its worktree"
+    );
+}
+
+/// A separate repository is separate however much it resembles one already
+/// approved, and a bare repository is its own family of exactly one.
+#[test]
+fn a_bare_repository_needs_its_own_approval() {
+    let repo = fixture();
+    approve(repo.path());
     let bare = tempfile::tempdir().unwrap();
     git(bare.path(), &["init", "--bare", "-q"]);
     assert!(git_cli::resolve_repo(bare.path().to_str().unwrap()).is_err());
@@ -185,6 +250,93 @@ fn linked_worktrees_and_bare_repositories_need_their_own_approval() {
             .unwrap()
             .is_bare
     );
+}
+
+/// THE CLASS the family grant could have opened: a directory naming a trusted
+/// common directory is making a *claim*, and a claim must never be its own
+/// evidence. Membership is read out of the approved repository's own records,
+/// so forging it costs write access to that repository's Git directory —
+/// where a `core.fsmonitor` would already run, so nothing is gained.
+///
+/// Each arm below is a different way to point at the trusted repository from
+/// outside it. All four must be refused, and the fabricated git directory is
+/// the one that survives every check except containment.
+#[test]
+fn claiming_a_trusted_repository_does_not_make_a_directory_a_member() {
+    let repo = fixture();
+    commit(repo.path());
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    git(
+        repo.path(),
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    approve(repo.path());
+    repository_trust::require(&linked).unwrap();
+
+    let common = repo.path().join(".git");
+    let outsider = parent.path().join("outsider");
+
+    // A gitfile naming the trusted repository's own git directory: this is the
+    // shape of a main working tree, but possession is what makes one, and this
+    // directory does not hold the repository, it only names it.
+    std::fs::create_dir(&outsider).unwrap();
+    std::fs::write(
+        outsider.join(".git"),
+        format!("gitdir: {}\n", common.display()),
+    )
+    .unwrap();
+    assert!(repository_trust::require(&outsider).is_err());
+
+    // The same claim made by a symlink rather than a gitfile.
+    std::fs::remove_file(outsider.join(".git")).unwrap();
+    std::os::unix::fs::symlink(&common, outsider.join(".git")).unwrap();
+    assert!(repository_trust::require(&outsider).is_err());
+
+    // A git directory the claimant builds itself, outside the repository, whose
+    // `commondir` names the trusted one and whose `gitdir` points back here. It
+    // satisfies the back-pointer; only refusing to look outside
+    // `<common>/worktrees/` refuses it.
+    let forged = parent.path().join("forged.git");
+    std::fs::create_dir(&forged).unwrap();
+    std::fs::write(forged.join("commondir"), format!("{}\n", common.display())).unwrap();
+    std::fs::write(forged.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        forged.join("gitdir"),
+        format!("{}\n", outsider.join(".git").display()),
+    )
+    .unwrap();
+    std::fs::remove_file(outsider.join(".git")).unwrap();
+    std::fs::write(
+        outsider.join(".git"),
+        format!("gitdir: {}\n", forged.display()),
+    )
+    .unwrap();
+    assert!(repository_trust::require(&outsider).is_err());
+
+    // A registry entry that *is* contained, and genuine — but belongs to a
+    // different checkout. Nothing outside the repository gets to adopt one of
+    // its worktree entries, and a stale entry left by a removed worktree is
+    // this same shape.
+    let entry = common.join("worktrees").join("linked");
+    assert!(entry.is_dir(), "fixture must have a real registry entry");
+    std::fs::remove_file(outsider.join(".git")).unwrap();
+    std::fs::write(
+        outsider.join(".git"),
+        format!("gitdir: {}\n", entry.display()),
+    )
+    .unwrap();
+    assert!(repository_trust::require(&outsider).is_err());
+
+    // And a real worktree whose gitfile is redirected at a repository nobody
+    // approved stops being covered, because the family it names has changed.
+    let other = fixture();
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", other.path().join(".git").display()),
+    )
+    .unwrap();
+    assert!(repository_trust::require(&linked).is_err());
 }
 
 #[test]
@@ -315,17 +467,17 @@ fn linked_fixture(main: &Path, linked: &Path) {
 
 #[test]
 fn worktree_removal_cannot_execute_an_unapproved_targets_configuration() {
-    let main = fixture();
-    approve(main.path());
-    let parent = tempfile::tempdir().unwrap();
-    let linked = parent.path().join("linked");
-    linked_fixture(main.path(), &linked);
-    git(
-        main.path(),
-        &["config", "extensions.worktreeConfig", "true"],
-    );
-    let marker = parent.path().join("remove-helper-executed");
-    let hook = parent.path().join("probe.sh");
+    // Git reads the *target's* status internally, so its per-worktree
+    // `core.fsmonitor` can run even though the process directory is the
+    // parent. The target therefore has to be admitted in its own right — and
+    // what admits it is the repository it belongs to, not a second decision
+    // about the same one.
+    let stranger_repo = fixture();
+    let stranger_parent = tempfile::tempdir().unwrap();
+    let stranger = stranger_parent.path().join("stranger");
+    linked_fixture(stranger_repo.path(), &stranger);
+    let marker = stranger_parent.path().join("remove-helper-executed");
+    let hook = stranger_parent.path().join("probe.sh");
     std::fs::write(
         &hook,
         format!("#!/bin/sh\n: > '{}'\nprintf 'token\\0'\n", marker.display()),
@@ -333,7 +485,11 @@ fn worktree_removal_cannot_execute_an_unapproved_targets_configuration() {
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
     git(
-        &linked,
+        stranger_repo.path(),
+        &["config", "extensions.worktreeConfig", "true"],
+    );
+    git(
+        &stranger,
         &[
             "config",
             "--worktree",
@@ -341,18 +497,27 @@ fn worktree_removal_cannot_execute_an_unapproved_targets_configuration() {
             hook.to_str().unwrap(),
         ],
     );
+
+    let main = fixture();
+    approve(main.path());
     let result = gitpulse_lib::engine::worktree::remove_worktree(
         main.path().to_str().unwrap(),
-        linked.to_str().unwrap(),
+        stranger.to_str().unwrap(),
         false,
     );
     assert!(
         !marker.exists(),
-        "removing an unapproved worktree executed its helper: {result:?}"
+        "removing a worktree of an unapproved repository executed its helper: {result:?}"
     );
     assert!(result.unwrap_err().contains(repository_trust::REQUIRED));
-    assert!(linked.exists());
-    approve(&linked);
+    assert!(stranger.exists());
+
+    // A target inside the approved repository needs no second approval. Its
+    // `config.worktree` lives under the common directory the human approved,
+    // so whatever it runs was already inside that decision.
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    linked_fixture(main.path(), &linked);
     gitpulse_lib::engine::worktree::remove_worktree(
         main.path().to_str().unwrap(),
         linked.to_str().unwrap(),
@@ -363,7 +528,7 @@ fn worktree_removal_cannot_execute_an_unapproved_targets_configuration() {
 }
 
 #[test]
-fn trusting_a_linked_checkout_preserves_shared_ledger_without_authorizing_main() {
+fn trusting_a_linked_checkout_preserves_its_shared_ledger() {
     let main = fixture();
     let parent = tempfile::tempdir().unwrap();
     let linked = parent.path().join("linked");
@@ -374,7 +539,9 @@ fn trusting_a_linked_checkout_preserves_shared_ledger_without_authorizing_main()
         address.is_ok(),
         "approved linked checkout lost its ledger: {address:?}"
     );
-    assert!(repository_trust::require(main.path()).is_err());
+    // The ledger is shared because the repository is shared, which is the same
+    // reason the approval reaches the checkout that repository lives in.
+    repository_trust::require(main.path()).expect("the repository the ledger belongs to");
 }
 
 #[test]
