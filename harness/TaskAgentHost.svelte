@@ -1,9 +1,10 @@
 <script lang="ts">
-  import TaskRuns from "../src/lib/components/TaskRuns.svelte";
+  import TaskAgentPanel from "../src/lib/components/TaskAgentPanel.svelte";
   import TerminalDock from "../src/lib/components/TerminalDock.svelte";
   import { interfaceStore } from "../src/lib/stores/interfaceStore";
+  import type { OpenTabRef } from "../src/lib/workbench/openMembership";
   import type { Repository, Task } from "../src/lib/workbench/client";
-  let { task, repositories }: { task: Task; repositories: Repository[] } = $props();
+  let { task, repositories, openTabs = [] }: { task: Task; repositories: Repository[]; openTabs?: OpenTabRef[] } = $props();
   let active = $state(true);
   const load = () => import("../src/lib/components/TerminalPanel.svelte");
 </script>
@@ -13,7 +14,7 @@
     <h2>Preserve the task’s repository and permissions</h2>
     <p>Disposable browser fixture. Native process and database transport are simulated.</p>
     <button class="gp-btn" onclick={() => active = !active}>{active ? "Suspend run updates" : "Resume run updates"}</button>
-    <TaskRuns {task} {repositories} {active} />
+    <TaskAgentPanel {task} {repositories} {openTabs} {active} />
   </aside>
   <div class="flex flex-col flex-1 min-w-0 min-h-0">
     <div class="flex-1 p-4 text-textMuted">The selected task’s terminal opens here.</div>

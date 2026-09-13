@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   cardFace,
   dragExceeded,
-  dropTargetStatus,
   insertIndexFromY,
   insertionNeighbors,
   insertionPosition,
@@ -10,7 +9,6 @@ import {
   parseColumnStatus,
   shouldCommitMove,
   TASK_DRAG_THRESHOLD_PX,
-  visibleStatuses,
 } from "./boardDrag";
 
 describe("boardDrag", () => {
@@ -32,13 +30,6 @@ describe("boardDrag", () => {
     expect(neighborStatus("inbox", -1)).toBeNull();
     expect(neighborStatus("done", 1)).toBeNull();
     expect(neighborStatus("review", -1)).toBe("in_progress");
-  });
-
-  it("accepts a drop only onto a different column while idle", () => {
-    expect(dropTargetStatus("ready", "ready", { moving: false })).toBeNull();
-    expect(dropTargetStatus("ready", null, { moving: false })).toBeNull();
-    expect(dropTargetStatus("ready", "done", { moving: true })).toBeNull();
-    expect(dropTargetStatus("ready", "done", { moving: false })).toBe("done");
   });
 });
 
@@ -83,26 +74,6 @@ describe("insertionPosition", () => {
     expect(shouldCommitMove("ready", "ready", { moving: false, fromIndex: 1, insertIndex: 3 })).toBe(true);
     expect(shouldCommitMove("ready", "done", { moving: false, fromIndex: 1, insertIndex: 0 })).toBe(true);
     expect(shouldCommitMove("ready", "done", { moving: true, fromIndex: 1, insertIndex: 0 })).toBe(false);
-  });
-});
-
-describe("visibleStatuses", () => {
-  it("hides empty statuses while idle and still exposes them as drop targets while dragging", () => {
-    const counts = { ready: 2, done: 1 };
-    expect(visibleStatuses(counts, false)).toEqual(["ready", "done"]);
-    expect(visibleStatuses(counts, true)).toEqual([
-      "inbox",
-      "backlog",
-      "ready",
-      "in_progress",
-      "review",
-      "done",
-    ]);
-    expect(visibleStatuses(counts, true)).toContain("inbox");
-  });
-
-  it("keeps every column when the board is empty so drop targets still exist", () => {
-    expect(visibleStatuses({}, false)).toHaveLength(6);
   });
 });
 

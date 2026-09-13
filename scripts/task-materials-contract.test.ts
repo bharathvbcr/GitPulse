@@ -4,7 +4,7 @@ import { compile } from "svelte/compiler";
 import { render } from "svelte/server";
 import TaskBoard from "../src/lib/components/TaskBoard.svelte";
 
-const panels = ["TaskEditor", "WorkspaceEditor", "AutomaticEnhancements", "AttentionInbox", "TaskManviAssist", "TaskRuns", "AgentDecisions", "NativeNotificationSettings", "NativeNotificationBridge"];
+const panels = ["TaskEditor", "WorkspaceEditor", "AutomaticEnhancements", "AttentionInbox", "TaskManviAssist", "TaskAgentPanel", "TaskHandoffForm", "TaskHandoffSheet", "AgentDecisions", "NativeNotificationSettings", "NativeNotificationBridge"];
 const read = (name: string) => readFileSync(new URL(`../src/lib/components/${name}.svelte`, import.meta.url), "utf8");
 
 describe("Tasks material coverage", () => {
@@ -49,7 +49,7 @@ describe("Tasks material coverage", () => {
     expect(footer).not.toContain("position:sticky");
     expect(footer).not.toMatch(/background(?:-color)?:/);
     expect(source).toContain('form="task-editor-form-{id}"');
-    expect(source).toMatch(/\{#if current\}<TaskRuns[\s\S]*?<\/div>\s*<footer>/);
+    expect(source).toMatch(/<TaskAgentPanel[\s\S]*?<\/div>\s*\{\/if\}\s*<\/div>\s*<footer>/);
   });
 
   it("renders one decorative liquid scope selection with an accessible selected state", () => {

@@ -6,11 +6,13 @@ import {
   duplicateTitle,
   flattenVisibleIds,
   isContextMenuKey,
+  MAX_MENU_VALUES,
   menuPageItems,
   rangeSelect,
   submenuTitle,
   taskMenuItems,
   toggleSelection,
+  typeAheadIndex,
 } from "./taskMenu";
 
 function card(over: Partial<TaskCard> = {}): TaskCard {
@@ -68,14 +70,19 @@ describe("taskMenuItems", () => {
     expect(menuPageItems(items, "copy").map((item) => item.id)).toContain("copy-agent");
     expect(ids).toContain("move-menu");
     expect(ids).toContain("move-inbox");
-    expect(ids).not.toContain("move-ready");
     expect(ids).toContain("priority-menu");
     expect(ids).toContain("priority-0");
-    expect(ids).not.toContain("priority-1");
+    // Every value is listed. The one the task already has is marked and
+    // disabled rather than omitted, so the menu keeps the same shape whichever
+    // card it opened on — and the card's current value is readable from it.
+    expect(items.find((item) => item.id === "move-ready")).toMatchObject({ checked: true, disabled: true });
+    expect(items.find((item) => item.id === "move-inbox")).toMatchObject({ checked: false, disabled: false });
+    expect(items.find((item) => item.id === "priority-1")).toMatchObject({ checked: true, disabled: true });
+    expect(items.find((item) => item.id === "priority-0")).toMatchObject({ checked: false });
     expect(ids).toContain("select-column");
     expect(ids).toContain("delete");
     expect(items.find((item) => item.id === "delete")?.danger).toBe(true);
-    expect(items.find((item) => item.id === "enhance")?.hint).toBe("Manvi");
+    expect(items.find((item) => item.id === "enhance")?.hint).toBe("E");
     expect(menuPageItems(items, "root").map((item) => item.id)).not.toContain("move-inbox");
     expect(menuPageItems(items, "move").map((item) => item.id)).toContain("move-inbox");
     expect(submenuTitle("copy")).toBe("Copy");
@@ -126,5 +133,131 @@ describe("column flattening", () => {
     };
     expect(flattenVisibleIds(columns, ["inbox", "ready"], (c) => c.id !== "skip")).toEqual(["a", "b"]);
     expect(cardsById(columns, new Set(["b", "missing"])).map((c) => c.id)).toEqual(["b"]);
+  });
+});
+
+describe("value submenus", () => {
+  it("marks a value the whole selection shares, and mixes when it does not", () => {
+    const items = taskMenuItems({
+      cards: [card({ id: "a", status: "ready", priority: 1 }), card({ id: "b", status: "ready", priority: 3 })],
+    });
+    expect(items.find((item) => item.id === "move-ready")).toMatchObject({ checked: true, disabled: true });
+    expect(items.find((item) => item.id === "priority-1")).toMatchObject({ checked: "mixed" });
+    expect(items.find((item) => item.id === "priority-3")).toMatchObject({ checked: "mixed" });
+    expect(items.find((item) => item.id === "priority-0")).toMatchObject({ checked: false });
+    // A mixed value is still choosable: picking it is how you make them agree.
+    expect(items.find((item) => item.id === "priority-1")?.disabled).toBe(false);
+  });
+
+  it("offers relative due dates and marks a selection that already has none", () => {
+    const none = taskMenuItems({ cards: [card()] });
+    expect(menuPageItems(none, "due").map((item) => item.id)).toEqual([
+      "due-today", "due-tomorrow", "due-next_week", "due-clear",
+    ]);
+    expect(none.find((item) => item.id === "due-clear")?.checked).toBe(true);
+    const dated = taskMenuItems({ cards: [card({ due_at: 1_800_000_000 })] });
+    expect(dated.find((item) => item.id === "due-clear")?.checked).toBe(false);
+  });
+
+  it("always offers Unassigned and lists the owners the board has loaded", () => {
+    const items = taskMenuItems({
+      cards: [card({ owner: "Ada" })],
+      vocabulary: { owners: ["Ada", "Grace"] },
+    });
+    const owners = menuPageItems(items, "owner");
+    expect(owners.map((item) => item.label)).toEqual(["Unassigned", "Ada", "Grace"]);
+    expect(owners.find((item) => item.label === "Ada")?.checked).toBe(true);
+    expect(owners.find((item) => item.label === "Unassigned")?.checked).toBe(false);
+    expect(owners.find((item) => item.label === "Grace")?.action).toEqual({ kind: "owner", owner: "Grace" });
+    // With no loaded owners the page still exists, so a task can be unassigned.
+    expect(menuPageItems(taskMenuItems({ cards: [card()] }), "owner")).toHaveLength(1);
+  });
+
+  it("turns a label item into add or remove depending on what the selection has", () => {
+    const items = taskMenuItems({
+      cards: [card({ labels: ["ui"] }), card({ id: "b", labels: ["ui", "ux"] })],
+      vocabulary: { labels: ["ui", "ux", "docs"] },
+    });
+    const labels = menuPageItems(items, "label");
+    expect(labels.find((item) => item.label === "ui")).toMatchObject({ checked: true, action: { kind: "label", label: "ui", add: false } });
+    expect(labels.find((item) => item.label === "ux")).toMatchObject({ checked: "mixed", action: { kind: "label", label: "ux", add: true } });
+    expect(labels.find((item) => item.label === "docs")).toMatchObject({ checked: false, action: { kind: "label", label: "docs", add: true } });
+  });
+
+  it("omits the labels page entirely when the board has loaded no labels", () => {
+    const items = taskMenuItems({ cards: [card()] });
+    expect(items.map((item) => item.id)).not.toContain("label-menu");
+    expect(menuPageItems(items, "label")).toEqual([]);
+  });
+
+  it("bounds how many owners and labels one menu will list", () => {
+    const many = Array.from({ length: MAX_MENU_VALUES + 20 }, (_, i) => `v${i}`);
+    const items = taskMenuItems({ cards: [card()], vocabulary: { owners: many, labels: many } });
+    expect(menuPageItems(items, "owner")).toHaveLength(MAX_MENU_VALUES + 1);
+    expect(menuPageItems(items, "label")).toHaveLength(MAX_MENU_VALUES);
+  });
+
+  it("drops blank, oversized and duplicate vocabulary entries", () => {
+    const items = taskMenuItems({
+      cards: [card()],
+      vocabulary: { labels: ["ui", "ui", "  ", "x".repeat(400), " ux "] },
+    });
+    expect(menuPageItems(items, "label").map((item) => item.label)).toEqual(["ui", "ux"]);
+  });
+});
+
+describe("agent handoff entry", () => {
+  it("offers one submenu with each provider and connection for a single task", () => {
+    const items = taskMenuItems({ cards: [card()], canHandoff: true });
+    expect(items.map((item) => item.id)).toContain("agent-menu");
+    expect(menuPageItems(items, "agent").map((item) => [item.label, item.hint])).toEqual([
+      ["Claude Code", "Terminal"],
+      ["Codex", "Terminal"],
+      ["Codex", "Managed"],
+    ]);
+    expect(items.find((item) => item.id === "agent-codex-managed")?.action).toEqual({
+      kind: "agent",
+      target: { provider: "codex", kind: "managed" },
+    });
+    expect(submenuTitle("agent")).toBe("Send to agent");
+  });
+
+  it("offers no handoff for a multi-selection or when no repository is registered", () => {
+    expect(taskMenuItems({ cards: [card(), card({ id: "b" })] }).map((i) => i.id)).not.toContain("agent-menu");
+    expect(taskMenuItems({ cards: [card()], canHandoff: false }).map((i) => i.id)).not.toContain("agent-menu");
+  });
+
+  it("disables the handoff entries while another task action is in flight", () => {
+    const items = taskMenuItems({ cards: [card()], busy: true, canHandoff: true });
+    expect(menuPageItems(items, "agent").every((item) => item.disabled)).toBe(true);
+  });
+});
+
+describe("typeAheadIndex", () => {
+  const items = [{ label: "Inbox" }, { label: "Backlog" }, { label: "Ready" }, { label: "Review" }, { label: "Done" }];
+
+  it("jumps to the next item starting with the typed letter", () => {
+    expect(typeAheadIndex(items, "b", -1)).toBe(1);
+    expect(typeAheadIndex(items, "R", -1)).toBe(2);
+    expect(typeAheadIndex(items, "in", -1)).toBe(0);
+  });
+
+  it("cycles through repeated matches instead of sticking on the first", () => {
+    expect(typeAheadIndex(items, "r", 2)).toBe(3);
+    expect(typeAheadIndex(items, "r", 3)).toBe(2);
+  });
+
+  it("skips disabled rows so focus never lands somewhere unusable", () => {
+    const withDisabled = [{ label: "Ready", disabled: true }, { label: "Review" }];
+    expect(typeAheadIndex(withDisabled, "re", -1)).toBe(1);
+  });
+
+  it("returns -1 rather than moving focus when nothing matches", () => {
+    expect(typeAheadIndex(items, "z", -1)).toBe(-1);
+    expect(typeAheadIndex(items, "", -1)).toBe(-1);
+    expect(typeAheadIndex(items, "   ", 0)).toBe(-1);
+    expect(typeAheadIndex([], "a", 0)).toBe(-1);
+    expect(typeAheadIndex(items, "b", Number.NaN)).toBe(1);
+    expect(typeAheadIndex(items, "b", -99)).toBe(1);
   });
 });

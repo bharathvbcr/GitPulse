@@ -1,102 +1,175 @@
-import { isTauri, type HostOS } from "../platform";
-
 /**
- * Apple Intelligence availability, as the backend reports it.
+ * Apple Intelligence, as the task sheet sees it.
  *
- * `state` is deliberately a tagged union rather than a boolean plus a message:
- * the four ways this can be unavailable are not interchangeable, and the UI has
- * to be able to tell them apart without parsing prose.
+ * GitPulse already had one way to write a task from notes: a local model
+ * server, discovered over loopback and driven by the Manvi worker. On a Mac
+ * that can run Apple Intelligence there is a second, and it is better in the
+ * two ways that matter here — there is nothing to install, and the text never
+ * reaches a socket.
  *
- *   - `not_compiled` — this build has no bridge. A fact about the binary. Says
- *     nothing about the machine, so it must never be shown as a hardware limit.
- *   - `unsupported_os` — not macOS. Nothing the reader can do.
- *   - `unavailable` — the framework answered with a reason. Some of those the
- *     reader can fix (turn Apple Intelligence on) and some resolve themselves
- *     (the model is still downloading).
- *   - `available` — ready now.
+ * ## It is an engine, not a second lifecycle
+ *
+ * The proposal is still created in the local store, still has an id, a
+ * revision and a source revision, and is still published with
+ * `enhancements.complete`. Only the middle step changes: instead of
+ * `enhancements.generate` reaching the Manvi sidecar, `draftWithApple` runs
+ * the on-device model and the caller completes the proposal itself. Accept,
+ * undo, dismiss, history and field locks never knew which engine wrote the
+ * text and still do not.
+ *
+ * ## Three different "no"
+ *
+ * `AppleIntelligenceStatus` refuses to collapse them, because they call for
+ * different things from the reader: a build with no bridge is not something
+ * they can fix, Apple Intelligence switched off is one setting away, and a
+ * model still downloading just needs a minute.
  */
-export type AppleAvailability =
-  | { readonly state: "available" }
-  | { readonly state: "not_compiled" }
-  | { readonly state: "unsupported_os"; readonly os: string }
-  | { readonly state: "unavailable"; readonly reason: string };
+
+import { invoke } from "@tauri-apps/api/core";
 
 export interface AppleIntelligenceStatus {
-  readonly available: boolean;
-  readonly state: AppleAvailability;
-  readonly explanation: string;
+  /** False when this build has no Foundation Models bridge at all. */
+  compiled: boolean;
+  state: "available" | "unavailable" | "unsupported_os";
+  reason: string | null;
+  detail: string;
+}
+
+export interface AppleIntelligenceRequest {
+  kind: "draft" | "improve" | "extract";
+  fields: string[];
+  notes: string;
+  title: string;
+  description: string;
+  context: string;
+}
+
+export interface AppleIntelligenceDraft {
+  title: string | null;
+  description: string | null;
+  rationale: string;
+}
+
+export interface AppleIntelligenceError {
+  code: string;
+  message: string;
+}
+
+/** Matches `MAX_INPUT_CHARS` in `src-tauri/src/ai/apple.rs`. */
+export const MAX_APPLE_INPUT_CHARS = 12_000;
+
+export const APPLE_ENGINE = "apple-intelligence";
+export const APPLE_MODEL = "on-device";
+
+const UNKNOWN: AppleIntelligenceStatus = {
+  compiled: false,
+  state: "unsupported_os",
+  reason: "not_compiled",
+  detail: "Apple Intelligence is not available in this build.",
+};
+
+export function isAppleStatus(value: unknown): value is AppleIntelligenceStatus {
+  if (!value || typeof value !== "object") return false;
+  const raw = value as Partial<AppleIntelligenceStatus>;
+  return typeof raw.compiled === "boolean"
+    && (raw.state === "available" || raw.state === "unavailable" || raw.state === "unsupported_os")
+    && (raw.reason === null || typeof raw.reason === "string")
+    && typeof raw.detail === "string";
+}
+
+export function appleReady(status: AppleIntelligenceStatus | null): boolean {
+  return status?.state === "available";
 }
 
 /**
- * The answer used before the backend replies, and whenever it cannot.
+ * A short line for the engine picker, or "" when there is nothing to say.
  *
- * Unavailable, always. Offering on-device drafting because a probe failed would
- * put the reader through a generation that cannot run.
+ * Deliberately does not repeat `detail` — that is the sentence shown when the
+ * engine is chosen and cannot run. This is the one word beside its name.
  */
-export function unknownAppleStatus(os: HostOS): AppleIntelligenceStatus {
-  return os === "macos"
-    ? {
-        available: false,
-        state: { state: "unavailable", reason: "not_probed" },
-        explanation: "Checking whether Apple Intelligence is available…",
-      }
-    : {
-        available: false,
-        state: { state: "unsupported_os", os },
-        explanation: `Apple Intelligence is a macOS feature and is not available on ${os}.`,
-      };
-}
-
-function isAvailabilityState(value: unknown): value is AppleAvailability {
-  if (typeof value !== "object" || value === null) return false;
-  const state = (value as { state?: unknown }).state;
-  return (
-    state === "available" ||
-    state === "not_compiled" ||
-    state === "unsupported_os" ||
-    state === "unavailable"
-  );
-}
-
-/** Parses the `cmd_apple_intelligence_status` envelope, denying on anything odd. */
-export function parseAppleStatus(value: unknown, os: HostOS): AppleIntelligenceStatus {
-  if (typeof value !== "object" || value === null) return unknownAppleStatus(os);
-  const raw = value as Record<string, unknown>;
-  if (!isAvailabilityState(raw.state)) return unknownAppleStatus(os);
-  const explanation =
-    typeof raw.explanation === "string" && raw.explanation.trim().length > 0
-      ? raw.explanation
-      : unknownAppleStatus(os).explanation;
-  // `available` must be exactly `true` AND agree with the tagged state. A
-  // mismatch between the two is a backend fault, and the safe reading of a
-  // fault is "not available".
-  const available = raw.available === true && raw.state.state === "available";
-  return { available, state: raw.state, explanation };
+export function appleBadge(status: AppleIntelligenceStatus | null): string {
+  if (!status) return "";
+  if (status.state === "available") return "On this Mac";
+  if (!status.compiled) return "Not in this build";
+  if (status.reason === "apple_intelligence_not_enabled") return "Turned off";
+  if (status.reason === "model_not_ready") return "Preparing";
+  if (status.reason === "device_not_eligible") return "Unsupported Mac";
+  return "Unavailable";
 }
 
 /**
- * Whether to offer on-device drafting in the UI at all.
+ * The context line handed to the model.
  *
- * Hidden rather than disabled on hosts that can never support it: a permanently
- * greyed control invites a reader to hunt for the setting that enables it. On
- * macOS the option is shown even when unavailable, because there the reason is
- * usually actionable — the explanation tells them what to do.
+ * Kept to facts the task already carries. The model is explicitly told not to
+ * invent file names or ticket numbers, and giving it a repository name it can
+ * echo is the difference between a generic brief and a specific one.
  */
-export function showsAppleOption(os: HostOS, status: AppleIntelligenceStatus): boolean {
-  if (status.state.state === "unsupported_os") return false;
-  if (os !== "macos") return false;
-  // A build with no bridge cannot be fixed from the UI, so saying so once in
-  // settings is enough; the per-task control stays out of the way.
-  return status.state.state !== "not_compiled";
+export function appleContext(input: {
+  kind?: string;
+  repositories?: readonly string[];
+  labels?: readonly string[];
+}): string {
+  const parts: string[] = [];
+  const repositories = (input.repositories ?? []).filter((name) => name.trim()).slice(0, 8);
+  if (repositories.length) parts.push(`Repository: ${repositories.join(", ")}`);
+  if (input.kind?.trim()) parts.push(`Task type: ${input.kind.trim()}`);
+  const labels = (input.labels ?? []).filter((label) => label.trim()).slice(0, 12);
+  if (labels.length) parts.push(`Labels: ${labels.join(", ")}`);
+  return parts.join(". ");
 }
 
-/** Reads the live status, or a denying answer if the probe cannot run. */
-export async function appleIntelligenceStatus(os: HostOS): Promise<AppleIntelligenceStatus> {
-  if (!isTauri()) return unknownAppleStatus(os);
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return parseAppleStatus(await invoke("cmd_apple_intelligence_status"), os);
-  } catch {
-    return unknownAppleStatus(os);
+/**
+ * Whether this request is worth sending, and what to say if not.
+ *
+ * The same rules run again in Rust, which is where they are enforced; this
+ * copy exists so the button can be disabled with a reason instead of the
+ * reader pressing it and waiting for a refusal.
+ */
+export function appleGate(
+  status: AppleIntelligenceStatus | null,
+  request: Pick<AppleIntelligenceRequest, "fields" | "notes" | "title" | "description" | "context">,
+): { ok: boolean; reason: string } {
+  if (!status) return { ok: false, reason: "Checking Apple Intelligence…" };
+  if (status.state !== "available") return { ok: false, reason: status.detail };
+  if (!request.fields.length) return { ok: false, reason: "Choose a field to write." };
+  const size = [request.notes, request.title, request.description, request.context]
+    .reduce((total, text) => total + [...text].length, 0);
+  if (size > MAX_APPLE_INPUT_CHARS) {
+    return { ok: false, reason: `Keep the task below ${MAX_APPLE_INPUT_CHARS.toLocaleString()} characters for the on-device model.` };
   }
+  if (!request.notes.trim() && !request.title.trim() && !request.description.trim()) {
+    return { ok: false, reason: "Write some notes first." };
+  }
+  return { ok: true, reason: "" };
+}
+
+export function explainAppleError(cause: unknown): string {
+  if (cause && typeof cause === "object" && "message" in cause) {
+    const error = cause as AppleIntelligenceError;
+    if (typeof error.message === "string" && error.message.trim()) return error.message;
+  }
+  if (cause instanceof Error && cause.message) return cause.message;
+  return "Apple Intelligence could not finish.";
+}
+
+export function appleErrorCode(cause: unknown): string {
+  if (cause && typeof cause === "object" && "code" in cause) {
+    const code = (cause as AppleIntelligenceError).code;
+    if (typeof code === "string" && code) return code;
+  }
+  return "worker_error";
+}
+
+export async function appleIntelligenceStatus(): Promise<AppleIntelligenceStatus> {
+  try {
+    const status = await invoke<unknown>("cmd_apple_intelligence_status");
+    return isAppleStatus(status) ? status : UNKNOWN;
+  } catch {
+    // An unreachable command is a fact about this build, not about the Mac.
+    return UNKNOWN;
+  }
+}
+
+export async function draftWithApple(request: AppleIntelligenceRequest): Promise<AppleIntelligenceDraft> {
+  return await invoke<AppleIntelligenceDraft>("cmd_apple_intelligence_draft", { request });
 }

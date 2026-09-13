@@ -20,12 +20,18 @@
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, startOnDeviceEnhance, startQuickEnhance, EnhancementAction, liveEnhancement } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, assistEngineName, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, EnhancementAction, liveEnhancement, type AssistEngine } from "../workbench/taskEnhance";
+  import {
+    appleBadge,
+    appleContext,
+    appleGate,
+    appleIntelligenceStatus,
+    appleReady,
+    type AppleIntelligenceStatus,
+  } from "../ai/appleIntelligence";
   import { bounded } from "../workbench/taskActions";
   import { canAskManvi, suggestionDiffers } from "../workbench/taskCompose";
-  import { canEnhanceOnDevice, canQuickEnhance } from "../workbench/taskOrganize";
-  import { appleIntelligenceStatus, showsAppleOption, unknownAppleStatus, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
-  import { hostPlatform } from "../stores/platformStore";
+  import { canQuickEnhance } from "../workbench/taskOrganize";
   import {
     describeSelection,
     effectiveSelection,
@@ -43,6 +49,7 @@
     title = $bindable(""),
     description = $bindable(""),
     repositoryIds = [],
+    repositoryNames = [],
     lockedFields = $bindable<EnhancementField[]>([]),
     prepareTask = async (): Promise<Task | null> => task,
     onApplied,
@@ -53,6 +60,9 @@
     autofocus = false,
     quick = false,
     startRequest = 0,
+    onSuggestion = (_state: AssistSuggestion) => {},
+    onCount = (_total: number) => {},
+    onEngine = (_name: string) => {},
   }: {
     task: Task | null;
     notes?: string;
@@ -60,6 +70,14 @@
     title?: string;
     description?: string;
     repositoryIds?: readonly string[];
+    /**
+     * Repository names, for the on-device model's context line.
+     *
+     * Names, never ids: "GitPulse" tells a model something, and "repo-0" is
+     * noise that a model asked to be specific will happily build a sentence
+     * around. A caller that has no names passes none and the line is omitted.
+     */
+    repositoryNames?: readonly string[];
     lockedFields?: EnhancementField[];
     prepareTask?: () => Promise<Task | null>;
     onApplied: (task: Task) => void;
@@ -70,7 +88,53 @@
     autofocus?: boolean;
     quick?: boolean;
     startRequest?: number;
+    /**
+     * Reports the reviewable suggestion outward.
+     *
+     * The title and description inputs live in the task sheet, above this
+     * section, because that is where a reader writes them. This component
+     * still owns the enhancement lifecycle — creating, polling, accepting,
+     * undoing — and hands the sheet just enough to draw the two "use this"
+     * affordances beside the fields they would change.
+     */
+    onSuggestion?: (state: AssistSuggestion) => void;
+    /** How many proposals this task has, for the sheet's tab badge. */
+    onCount?: (total: number) => void;
+    /**
+     * Which engine the ask button would actually use, by display name.
+     *
+     * The picker lives here, but the sheet around this section writes about
+     * the same engine — placeholders, and the message that refuses a shortcut
+     * mid-generation. It reads the name from here rather than deriving its
+     * own, so the two cannot disagree about which one is running.
+     */
+    onEngine?: (name: string) => void;
   } = $props();
+
+  /** What the sheet needs to render an inline suggestion beside a field. */
+  export interface AssistSuggestion {
+    title: string;
+    description: string;
+    /** True when a suggestion is ready and differs from what is typed. */
+    showTitle: boolean;
+    showDescription: boolean;
+    /** Why accepting is refused right now, or "" when it is allowed. */
+    blocked: string;
+    /** Fields just accepted, for the sheet to flash. */
+    flash: EnhancementField[];
+  }
+
+  /** Accept one or both suggested fields. Called by the sheet's buttons. */
+  export function acceptFields(fields: EnhancementField[]) {
+    void accept(fields);
+  }
+
+  /** Hide the current suggestion without dismissing it in Manvi's history. */
+  export function hideSuggestion() {
+    epoch++;
+    proposal = null;
+    note = "Suggestion hidden. It stays in Manvi history.";
+  }
 
   const labels: Record<Enhancement["state"], string> = {
     pending: "Waiting to start", running: "Generating", cancel_requested: "Cancellation requested",
@@ -108,6 +172,17 @@
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   let notesEl: HTMLTextAreaElement | undefined = $state();
   let visible = $state(true);
+  /**
+   * Which engine writes the text.
+   *
+   * Not a preference that survives the sheet: the two engines fail in
+   * different ways and on different machines, and a remembered choice would
+   * mean a reader who once tried Apple Intelligence on a Mac that later turned
+   * it off finds a disabled button with no idea why. `engine` falls back to
+   * Manvi the moment Apple stops being available.
+   */
+  let requestedEngine = $state<AssistEngine>(DEFAULT_ASSIST_ENGINE);
+  let apple = $state<AppleIntelligenceStatus | null>(null);
 
   // Re-subscribe so preferred / ai.selected updates re-render.
   let harnessTick = $state(0);
@@ -126,24 +201,23 @@
   const descriptionSuggestion = $derived(ready && proposal ? proposal.proposed.description ?? "" : "");
   const showTitleSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("title") && suggestionDiffers(title, titleSuggestion)));
   const showDescriptionSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("description") && suggestionDiffers(description, descriptionSuggestion)));
-  /**
-   * Which engine drafts the task.
-   *
-   * On-device generation runs in this process through Apple's Foundation
-   * Models, so it needs no local model server and no Manvi provider selection —
-   * which is why it has its own gate rather than reusing Manvi's.
-   */
-  let engine = $state<"manvi" | "on-device">("manvi");
-  let apple = $state<AppleIntelligenceStatus | null>(null);
-  const appleStatus = $derived(apple ?? unknownAppleStatus($hostPlatform.os));
-  const showsOnDevice = $derived(showsAppleOption($hostPlatform.os, appleStatus));
-  // An engine that stopped being offered must not stay selected.
-  const activeEngine = $derived(engine === "on-device" && showsOnDevice ? "on-device" : "manvi");
-  const onDeviceGate = $derived(canEnhanceOnDevice({ locked_fields: lockedFields }, appleStatus));
   const gate = $derived(canAskManvi({ title, description, repository_ids: repositoryIds }, notes));
   const manviGate = $derived(canQuickEnhance({ locked_fields: lockedFields }, configuration, configurationError));
   const available = $derived(requested.filter((field) => !lockedFields.includes(field)));
-  const engineName = $derived(activeEngine === "on-device" ? "Apple Intelligence" : "Manvi");
+  // Offered only where it could ever work: a build with the bridge linked in.
+  // A picker whose second option is permanently "not in this build" teaches
+  // the reader to ignore the picker.
+  const appleOffered = $derived(Boolean(apple?.compiled));
+  const engine = $derived<AssistEngine>(requestedEngine === "apple" && appleReady(apple) ? "apple" : DEFAULT_ASSIST_ENGINE);
+  const engineName = $derived(assistEngineName(engine));
+  const appleRequest = $derived({
+    fields: available as string[],
+    notes,
+    title,
+    description,
+    context: appleContext({ kind: task?.kind, repositories: [...repositoryNames], labels: task?.labels ?? [] }),
+  });
+  const appleAsk = $derived(appleGate(apple, appleRequest));
   const askLabel = $derived(busy || preparing
     ? (quick ? "Enhancing…" : `Asking ${engineName}…`)
     : notes.trim() ? `Draft with ${engineName}` : quick ? `Enhance with ${engineName}` : `Improve with ${engineName}`);
@@ -157,25 +231,18 @@
       ? "Title and description are locked"
       : available.length === 0
         ? "Choose title, description, or both"
-        : activeEngine === "on-device"
-          // The on-device refusal is already specific to its cause — an
-          // ineligible Mac, a switched-off setting, a model still downloading —
-          // so it is shown as-is rather than replaced by a Manvi reason that
-          // does not apply to this engine.
-          ? (onDeviceGate.ok ? undefined : onDeviceGate.reason)
-          : !liveSelection
-            ? "Pick a local model in Local model servers"
-            : !manviReady
-              ? (configurationError ?? "Manvi has no provider and model selected.")
-              : !manviGate.ok
-                ? manviGate.reason
-                : undefined,
+        : !liveSelection
+          ? "Pick a local model in Local model servers"
+          : !manviReady
+            ? (configurationError ?? "Manvi has no provider and model selected.")
+            : !manviGate.ok
+              ? manviGate.reason
+              : undefined,
   );
   const askDisabled = $derived(
-    disabled || acting || liveAttempt || available.length === 0 || Boolean(gate) ||
-      (activeEngine === "on-device"
-        ? !onDeviceGate.ok
-        : configPending || !manviReady || !manviGate.ok),
+    engine === "apple"
+      ? disabled || acting || liveAttempt || available.length === 0 || Boolean(gate) || !appleAsk.ok || !manviGate.ok
+      : disabled || acting || liveAttempt || configPending || available.length === 0 || Boolean(gate) || !manviReady || !manviGate.ok,
   );
   const revisionDirty = $derived(proposal?.fields.some((field) => revisionDraft[field] !== proposal?.proposed[field]) ?? false);
   const failureAdvice = $derived(proposal?.failure ? explainEnhancementFailure(proposal.failure) : null);
@@ -199,12 +266,7 @@
     update();
     document.addEventListener("visibilitychange", update);
     void loadConfig();
-    // Availability genuinely changes while the app runs — a model finishes
-    // downloading, or Apple Intelligence is switched off — so this is probed
-    // rather than read from the session-long platform snapshot.
-    void appleIntelligenceStatus(get(hostPlatform).os).then((status) => {
-      if (!disposed) apple = status;
-    });
+    void appleIntelligenceStatus().then((status) => { if (!disposed) apple = status; });
     if (task) void history();
     if (autofocus && !quick) queueMicrotask(() => notesEl?.focus());
     const tick = window.setInterval(() => { now = Date.now() / 1000; }, 1000);
@@ -219,6 +281,18 @@
   });
 
   $effect(() => { onBusy(controlsLocked); });
+  $effect(() => { onCount(total); });
+  $effect(() => { onEngine(engineName); });
+  $effect(() => {
+    onSuggestion({
+      title: titleSuggestion,
+      description: descriptionSuggestion,
+      showTitle: showTitleSuggestion,
+      showDescription: showDescriptionSuggestion,
+      blocked: acceptDisabled ? (dirty ? "Save or reload your edits before accepting a suggestion." : stale ? "This suggestion is for an older task revision. Request a fresh suggestion." : "") : "",
+      flash: [...flash],
+    });
+  });
   $effect(() => {
     // Configuration belongs to the shared model selection. A picker change
     // must recover this editor without closing it or losing the draft.
@@ -335,24 +409,21 @@
 
   async function generate() {
     if (askDisabled && !quick) {
-      error = gate ?? fieldReason ?? (liveAttempt ? "A suggestion is already in progress." : "Manvi cannot draft this task yet.");
+      error = gate ?? (engine === "apple" ? appleAsk.reason : fieldReason)
+        ?? (liveAttempt ? "A suggestion is already in progress." : `${engineName} cannot draft this task yet.`);
       return;
     }
-    if (quick && (liveAttempt || disabled || controlsLocked || !manviReady || !available.length || !task)) return;
+    if (quick && (liveAttempt || disabled || controlsLocked || !available.length || !task)) return;
+    if (quick && engine !== "apple" && !manviReady) return;
     busy = true; epoch++; error = ""; note = "";
     try {
       const saved = quick ? task : await prepareTask();
       if (disposed) return;
       if (!saved) {
-        if (!error) error = gate ?? "Could not save a draft for Manvi.";
+        if (!error) error = gate ?? `Could not save a draft for ${engineName}.`;
         return;
       }
-      // On-device generation needs neither a Manvi configuration nor a local
-      // model server, so these two checks belong to the Manvi engine only.
-      // `manviConfiguration` carries the narrowed value past the branch, so the
-      // start call below needs no non-null assertion to see it.
-      let manviConfiguration: EnhancementConfiguration | null = null;
-      if (activeEngine === "manvi") {
+      if (engine !== "apple") {
         if (!configuration) {
           error = configurationError ?? "Manvi configuration has not been loaded.";
           return;
@@ -361,11 +432,9 @@
           error = "Pick a local model in Local model servers.";
           return;
         }
-        manviConfiguration = configuration;
-      } else if (!onDeviceGate.ok) {
-        error = onDeviceGate.reason;
-        return;
       }
+      // Both engines share the store's "one live attempt per task" rule, so
+      // this check belongs to neither of them in particular.
       const page = await bounded(listEnhancements(saved.id));
       if (disposed) return;
       const existing = page.items.find(liveEnhancement);
@@ -374,17 +443,23 @@
         if (!disposed) { proposal = current; note = "A suggestion is already in progress."; await history(); }
         return;
       }
-      const started = manviConfiguration
-        ? await startQuickEnhance(saved, available, manviConfiguration, action)
-        : await startOnDeviceEnhance(saved, available, appleStatus, action);
+      const result = engine === "apple"
+        ? await runAppleEnhancement(saved, available, {
+            kind: notes.trim() ? "extract" : title.trim() || description.trim() ? "improve" : "draft",
+            notes,
+            title,
+            description,
+            context: appleContext({ kind: saved.kind, repositories: [...repositoryNames], labels: saved.labels }),
+          })
+        : (await startQuickEnhance(saved, available, configuration!, action)).proposal;
       if (disposed) return;
-      proposal = started.proposal;
-      selected = started.proposal.fields.filter((field) => !lockedFields.includes(field));
-      const changed = started.proposal.state === "ready" && (
-        suggestionDiffers(title, started.proposal.proposed.title ?? "") ||
-        suggestionDiffers(description, started.proposal.proposed.description ?? "")
+      proposal = result;
+      selected = result.fields.filter((field) => !lockedFields.includes(field));
+      const changed = result.state === "ready" && (
+        suggestionDiffers(title, result.proposed.title ?? "") ||
+        suggestionDiffers(description, result.proposed.description ?? "")
       );
-      note = started.proposal.state === "ready"
+      note = result.state === "ready"
         ? (changed ? "Suggestions ready under the fields they change." : `${engineName} kept your wording.`)
         : `${engineName} is drafting title and description.`;
       await history();
@@ -506,32 +581,23 @@
     </label>
   {/if}
 
-  <!-- The engine choice appears only where on-device drafting can exist at all.
-       On a non-Mac there is no second option, so a disabled control would be
-       nothing but a question the reader cannot answer. -->
-  {#if showsOnDevice}
-    <div class="engine-row" role="radiogroup" aria-label="Drafting engine">
-      <button type="button" class="engine" role="radio" aria-checked={activeEngine === "manvi"}
-        class:picked={activeEngine === "manvi"} disabled={disabled || acting || busy}
-        onclick={() => (engine = "manvi")}>Manvi</button>
-      <button type="button" class="engine" role="radio" aria-checked={activeEngine === "on-device"}
-        class:picked={activeEngine === "on-device"} disabled={disabled || acting || busy}
-        onclick={() => (engine = "on-device")}>On-device</button>
+  {#if appleOffered}
+    <div class="gp-segmented engine-picks" role="group" aria-label="Which model writes this" data-testid="task-assist-engine">
+      <button type="button" class="gp-seg-btn" data-active={engine === "manvi"} aria-pressed={engine === "manvi"} disabled={disabled || acting} onclick={() => { requestedEngine = "manvi"; }}>{assistEngineName("manvi")}</button>
+      <button
+        type="button"
+        class="gp-seg-btn"
+        data-active={engine === "apple"}
+        aria-pressed={engine === "apple"}
+        disabled={disabled || acting || !appleReady(apple)}
+        title={apple?.detail ?? ""}
+        onclick={() => { requestedEngine = "apple"; }}
+      >{assistEngineName("apple")}<span class="engine-badge">{appleBadge(apple)}</span></button>
     </div>
   {/if}
 
-  {#if activeEngine === "on-device"}
-    <div class="model-row">
-      {#if appleStatus.available}
-        <p class="meta" data-testid="apple-status">Using Apple Intelligence on this computer. Nothing is sent to a server.</p>
-      {:else}
-        <!-- Already specific to the cause: an ineligible Mac, Apple Intelligence
-             switched off, or a model still downloading are different problems. -->
-        <p class="warn" data-testid="apple-status">{appleStatus.explanation}</p>
-      {/if}
-      <button type="button" class="change-link" disabled={busy || acting}
-        onclick={() => void appleIntelligenceStatus($hostPlatform.os).then((status) => { apple = status; })}>Recheck</button>
-    </div>
+  {#if engine === "apple"}
+    <p class="meta">{apple?.detail ?? "Runs on this Mac."}</p>
   {:else}
     <div class="model-row">
       {#if confirmedModel}
@@ -546,21 +612,25 @@
       <button type="button" class="gp-btn" disabled={configPending || acting || disabled} onclick={() => void loadConfig()}>Retry Manvi configuration</button>
     {/if}
   {/if}
+  {#if appleOffered && requestedEngine === "apple" && !appleReady(apple)}
+    <p class="warn" role="status">{apple?.detail}</p>
+  {/if}
 
   <div class="locks">
     <SettingToggle label="Keep title" checked={lockedFields.includes("title")} disabled={disabled || acting} onchange={(next) => setLock("title", next)} />
     <SettingToggle label="Keep description" checked={lockedFields.includes("description")} disabled={disabled || acting} onchange={(next) => setLock("description", next)} />
   </div>
 
-  <div class="gp-segmented field-picks" role="group" aria-label="Fields Manvi may change">
+  <div class="gp-segmented field-picks" role="group" aria-label="Fields {engineName} may change">
     <button type="button" class="gp-seg-btn" data-active={available.includes("title")} aria-pressed={available.includes("title")} disabled={disabled || acting || lockedFields.includes("title")} title={lockedFields.includes("title") ? "Title is locked against enhancement" : "Include title"} onclick={() => toggleField("title", !available.includes("title"))}>Title</button>
     <button type="button" class="gp-seg-btn" data-active={available.includes("description")} aria-pressed={available.includes("description")} disabled={disabled || acting || lockedFields.includes("description")} title={lockedFields.includes("description") ? "Description is locked against enhancement" : "Include description"} onclick={() => toggleField("description", !available.includes("description"))}>Description</button>
   </div>
 
   {#if gate && (notes.trim() || title.trim() || task)}<p class="meta">{gate}</p>{/if}
-  {#if !manviGate.ok && manviReady && !gate}<p class="warn">{manviGate.reason}</p>{/if}
+  {#if !manviGate.ok && (manviReady || engine === "apple") && !gate}<p class="warn">{manviGate.reason}</p>{/if}
+  {#if engine === "apple" && !appleAsk.ok && !gate && appleReady(apple)}<p class="warn">{appleAsk.reason}</p>{/if}
 
-  <button type="button" class="gp-btn-primary ask" disabled={askDisabled} title={gate ?? fieldReason} onclick={() => void generate()}>
+  <button type="button" class="gp-btn-primary ask" disabled={askDisabled} title={gate ?? (engine === "apple" ? appleAsk.reason : fieldReason)} onclick={() => void generate()}>
     <Sparkles size={12} />
     {askLabel}
   </button>
@@ -584,38 +654,6 @@
     {/if}
   {/if}
   {#if proposal?.rationale && ready}<p class="meta">{proposal.rationale}</p>{/if}
-
-  {#if !quick}
-    <label class:flash={flash.includes("title")}>Title
-      <input class="gp-field" name="task-title" bind:value={title} disabled={disabled || acting} required maxlength="300" placeholder="Or let Manvi draft this from your notes" />
-    </label>
-    {#if showTitleSuggestion}
-      <div class="inline-suggestion">
-        <p class="meta">Manvi title</p>
-        <p class="suggestion-body suggested">{titleSuggestion}</p>
-        <button type="button" class="gp-btn" disabled={acceptDisabled} onclick={() => void accept(["title"])}>Use this title</button>
-      </div>
-    {/if}
-
-    <label class:flash={flash.includes("description")}>Description
-      <textarea class="gp-field" bind:value={description} disabled={disabled || acting} rows="6" maxlength="65536" placeholder="Or let Manvi draft this from your notes"></textarea>
-    </label>
-    {#if showDescriptionSuggestion}
-      <div class="inline-suggestion">
-        <p class="meta">Manvi description</p>
-        <pre class="suggestion-body suggested">{descriptionSuggestion}</pre>
-        <button type="button" class="gp-btn" disabled={acceptDisabled} onclick={() => void accept(["description"])}>Use this description</button>
-      </div>
-    {/if}
-    {#if showTitleSuggestion || showDescriptionSuggestion}
-      <div class="review-actions">
-        {#if showTitleSuggestion && showDescriptionSuggestion}
-          <button type="button" class="gp-btn-primary" disabled={acceptDisabled} onclick={() => void accept(["title", "description"])}>Use both</button>
-        {/if}
-        <button type="button" class="gp-btn" disabled={acting || disabled} onclick={() => { epoch++; proposal = null; note = "Suggestion hidden. It stays in Manvi history."; }}>Not now</button>
-      </div>
-    {/if}
-  {/if}
 
   {#if task}
     <details class="history-drawer" bind:open={historyOpen}>
@@ -688,24 +726,18 @@
   .assist-title{margin:0;font-size:12px;font-weight:650}
   .assist-hint,.meta{margin:4px 0 0;font-size:11px;color:rgb(var(--c-text-muted));line-height:1.45}
   .notes-label{display:block;margin:8px 0}
-  textarea,pre.suggestion-body,pre{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
+  textarea,pre{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
   textarea{resize:vertical}
   .field-picks{margin:0 0 8px}
+  .engine-picks{margin:0 0 8px}
+  .engine-badge{margin-left:5px;font-size:9px;opacity:.75}
   .ask{margin-top:8px}
   label{display:flex;flex-direction:column;gap:6px;margin:12px 0 8px;font-size:12px}
   input,textarea{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
-  .inline-suggestion{margin:-4px 0 12px;padding:8px;border:1px solid rgb(var(--c-accent) / 0.4);border-radius:8px}
-  .suggestion-body{margin:4px 0 8px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:7rem;overflow:auto;font:12px/1.45 inherit}
-  .suggested{border:1px solid rgb(var(--c-accent) / 0.45);border-radius:7px;padding:8px;background:rgb(var(--c-bg) / 0.45)}
-  .review-actions,.actions,.history-heading,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-  .engine-row{display:flex;gap:6px;margin:8px 0}
-  .engine{font:inherit;font-size:11px;padding:4px 10px;border-radius:999px;border:1px solid rgb(var(--c-border));background:transparent;color:rgb(var(--c-text-muted));cursor:pointer}
-  .engine.picked{background:rgb(var(--c-accent) / 0.14);border-color:rgb(var(--c-accent) / 0.5);color:rgb(var(--c-text))}
-  .engine:disabled{opacity:.5;cursor:default}
+  .actions,.history-heading,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
   .model-row{justify-content:space-between;margin:4px 0 8px}
   .change-link{background:none;border:0;color:rgb(var(--c-accent));font-size:11px;padding:0;cursor:pointer;text-decoration:underline}
   .locks{margin:4px 0 8px}
-  .flash :is(input,textarea){outline:2px solid rgb(var(--c-accent));outline-offset:1px}
   .error{color:#dc6565}
   .warn{color:#d4a017;font-size:11px;margin:4px 0}
   .history-drawer{margin-top:12px;border-top:1px solid rgb(var(--c-border) / 0.55);padding-top:8px}

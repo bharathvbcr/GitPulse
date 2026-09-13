@@ -2467,6 +2467,47 @@ pub async fn cmd_ai_status(base_url: Option<String>, model: Option<String>) -> c
         })
 }
 
+/// Whether Apple Intelligence can write a task on this Mac, and if not, why.
+///
+/// Infallible by design. Every negative answer is a *state* the reader may be
+/// able to act on ("turn it on in Settings"), not an error to be swallowed by
+/// a catch, and a command that could reject would let a caller lose the
+/// difference between "off" and "this build has no bridge".
+#[tauri::command(async)]
+pub async fn cmd_apple_intelligence_status() -> crate::ai::apple::AppleIntelligenceStatus {
+    // The framework's availability check can touch the model assets.
+    off_thread(move || Ok::<_, String>(crate::ai::apple::status()))
+        .await
+        .unwrap_or_else(|error| crate::ai::apple::AppleIntelligenceStatus {
+            compiled: true,
+            state: "unavailable".to_string(),
+            reason: Some("worker_error".to_string()),
+            detail: error,
+        })
+}
+
+/// Writes one task's title and/or description with the on-device model.
+///
+/// The caller has already created the enhancement in the local store and
+/// publishes this result with `enhancements.complete`, so this command owns
+/// exactly one thing: producing text without it leaving the Mac.
+#[tauri::command(async)]
+pub async fn cmd_apple_intelligence_draft(
+    request: crate::ai::apple::AppleIntelligenceRequest,
+) -> Result<crate::ai::apple::AppleIntelligenceDraft, crate::ai::apple::AppleIntelligenceError> {
+    // `off_thread` reports a lost worker as a String; a generation refusal is
+    // already a coded error. Both have to arrive as the same type, and the
+    // join failure keeps its own code rather than borrowing a model's.
+    off_thread(move || Ok::<_, String>(crate::ai::apple::generate(&request)))
+        .await
+        .unwrap_or_else(|error| {
+            Err(crate::ai::apple::AppleIntelligenceError {
+                code: "worker_error".to_string(),
+                message: error,
+            })
+        })
+}
+
 fn selection(base_url: Option<String>, model: Option<String>) -> Option<crate::ai::AiSelection> {
     match (base_url, model) {
         (Some(base_url), Some(model)) if !base_url.is_empty() && !model.is_empty() => {

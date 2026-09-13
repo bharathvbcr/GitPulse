@@ -6,7 +6,7 @@
   import { emit } from "@tauri-apps/api/event";
   import "../src/app.css";
   const task = { id:"task", revision:2, updated_at:1, title:"Preserve E42 when reconnecting", description:"Retain the original process and repository.", acceptance_criteria:["No duplicate process"], kind:"bug", status:"ready", priority:1, severity:null, owner:null, due_at:null, labels:[], repository_ids:["repo"], primary_repository_id:"repo", home_workspace_id:null, position:0 };
-  const repository = { id:"repo", revision:3, updated_at:1, name:"GitPulse", identity_key:"fixture", remote_url:null };
+  const repository = { id:"repo", revision:3, updated_at:1, name:"GitPulse", identity_key:"local:/fixture/GitPulse/.git", remote_url:null };
   const runs = new Map(), sessions = new Map(), prepared = new Map();
   const decisions = new Map(), decisionReceipts = new Map(), decisionWrites = [];
   let loseDecision = false;
@@ -36,6 +36,7 @@
         if(loseDecision){loseDecision=false;throw {code:"transport_error",message:"Decision committed; fixture reply lost"};}
         return receipt;
       }
+      if (args.method === "items.get") return record(task);
       if (args.method === "repositories.get") return record(repository);
       if (args.method === "runs.list") {
         report.lists++; show();
@@ -89,30 +90,52 @@
   },{shouldMockEvents:true});
   const {mount}=await import("svelte");
   const {interfaceStore}=await import("../src/lib/stores/interfaceStore");
+  const {sanitizeHandoff}=await import("../src/lib/workbench/taskHandoff");
   interfaceStore.setTerminalDockOpen(false);interfaceStore.setTerminalDockHeight(500);
-  const Host=(await import("./TaskRunsHost.svelte")).default;
-  mount(Host,{target:document.getElementById("app"),props:{task,repositories:[repository]}});
+  const Host=(await import("./TaskAgentHost.svelte")).default;
+  mount(Host,{target:document.getElementById("app"),props:{task,repositories:[repository],openTabs:[{path:"/fixture/GitPulse",label:"GitPulse"}]}});
   show();
-  const wait=async condition => {const deadline=performance.now()+6000;while(!condition()){if(performance.now()>deadline)throw new Error("UI condition timed out");await new Promise(r=>setTimeout(r,25));}};
+  const wait=async condition => {const deadline=performance.now()+6000;while(!condition()){
+    if(performance.now()>deadline){
+      const alert=[...document.querySelectorAll('[role="alert"]')].map(el=>el.textContent.trim()).filter(Boolean).join(" | ");
+      throw new Error(alert?`UI condition timed out while showing: ${alert}`:"UI condition timed out");
+    }
+    await new Promise(r=>setTimeout(r,25));}};
   const pause=ms=>new Promise(r=>setTimeout(r,ms));
   const button=name=>[...document.querySelectorAll("button")].find(el=>el.textContent.trim()===name);
-  const field=name=>[...document.querySelectorAll("label")].find(el=>el.textContent.trim().startsWith(name))?.querySelector("select,input");
+  const field=name=>document.querySelector(`[aria-label="${name}"]`)?.matches("select,input")
+    ? document.querySelector(`[aria-label="${name}"]`)
+    : [...document.querySelectorAll("label")].find(el=>el.textContent.trim().startsWith(name))?.querySelector("select,input");
+  const group=name=>document.querySelector(`[role="group"][aria-label="${name}"]`);
+  const seg=(name,text)=>[...(group(name)?.querySelectorAll("button")??[])].find(el=>el.textContent.trim()===text);
+  const launchForm=()=>document.getElementById("task-agent-launch");
+  const formToggle=()=>document.querySelector('[data-testid="task-agent-toggle"]');
+  const toggleLabel=()=>document.querySelector('[data-testid="task-agent-toggle-label"]').textContent.trim();
+  const openLaunchForm=async()=>{if(launchForm().hidden){formToggle().click();await wait(()=>!launchForm().hidden);}};
   const set=(name,value)=>{const el=field(name);if(!el)throw new Error(`Missing ${name}`);el.value=value;el.dispatchEvent(new Event("change",{bubbles:true}));};
-  const check=(name,pass)=>{if(!pass)throw new Error(name);report.checks.push(name);show();};
+  const results=[];
+  const check=(name,pass)=>{if(!pass){results.push({name,pass:false});throw new Error(name);}report.checks.push(name);results.push({name,pass:true});show();};
   const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emit("terminal-exit",{id:run.session_id,exit_code:0,signal:"",error:null,reaped:true});}};
-  document.getElementById("check").onclick=async event=>{
-    event.currentTarget.disabled=true;
+  const params=new URLSearchParams(location.search);
+  const runChecks=async()=>{
     try {
       await wait(()=>report.lists>0);const idle=report.lists;await pause(250);
       check("Idle run history performs no repeated fetches",report.lists===idle);
-      button("Browse…").click();await wait(()=>field("Checkout path").value==="/fixture/GitPulse");
+      check("An open checkout for this repository is offered without being typed",field("Checkout path").value==="/fixture/GitPulse");
+      check("The open tab and the folder derived from the git directory are one entry, not two",
+        [...field("Known checkouts").options].map(o=>o.textContent.trim()).join("|")==="GitPulse|Another folder…");
+      const typed=field("Checkout path");typed.value="/fixture/elsewhere";typed.dispatchEvent(new Event("input",{bubbles:true}));await pause(30);
+      button("Browse").click();await wait(()=>field("Checkout path").value==="/fixture/GitPulse");
+      check("Browse replaces a typed checkout with the folder that was picked",true);
       button("Launch in Codex").click();await wait(()=>button("Reconnect attempt"));
       check("Lost launch response retains one task process and starts no shell",report.taskSpawns===1&&report.shellSpawns===0);
       button("Reconnect attempt").click();await wait(()=>document.querySelector('textarea[aria-label="Terminal input"]')&&!button("Reconnect attempt"));
       check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
       button("Open terminal").click();await pause(250);
       check("Repeated Open terminal focuses its existing tab",report.launchCalls===2&&report.taskSpawns===1);
-      check("Requested settings reset to Ask after launch",field("Permission mode").value==="ask");
+      check("A launched attempt folds its form away and keeps the run in view",launchForm().hidden&&toggleLabel()==="New attempt"&&formToggle().getAttribute("aria-expanded")==="false");
+      await openLaunchForm();
+      check("An ordinary permission mode survives its launch",field("Permission mode").value==="ask");
       button("Suspend run updates").click();await pause(100);const suspended=report.lists;await pause(1700);
       check("Hidden task inspector stops run polling",report.lists===suspended);
       button("Resume run updates").click();await wait(()=>report.lists>suspended);
@@ -143,19 +166,26 @@
       button("Hide requests").click();
       await finish();button("Refresh").click();await wait(()=>document.body.textContent.includes("Process exited"));
       check("Process completion remains separate from task acceptance",task.status==="ready");
-      set("Permission mode","bypass");await pause(30);
-      check("Bypass requires acknowledgment on this attempt",button("Launch in Codex").disabled);
-      document.querySelector('label.bypass input').click();await pause(30);
+      await openLaunchForm();set("Permission mode","edit");await pause(30);
       button("Launch in Codex").click();await wait(()=>report.taskSpawns===2);
-      check("Bypass acknowledgment resets after its explicit launch",field("Permission mode").value==="ask"&&!document.querySelector('label.bypass input'));
+      await openLaunchForm();
+      check("A deliberate permission mode is remembered for the next launch",field("Permission mode").value==="edit");
       await finish();button("Refresh").click();await pause(100);
-      losePreparation=true;button("Launch in Codex").click();await wait(()=>button("Retry preparation"));
+      await openLaunchForm();set("Permission mode","bypass");await pause(30);
+      check("Bypass requires acknowledgment on this attempt",button("Launch in Codex").disabled);
+      document.querySelector('label.ack input').click();await pause(30);
+      button("Launch in Codex").click();await wait(()=>report.taskSpawns===3);
+      await openLaunchForm();
+      check("Bypass never survives the attempt it was authorized for",field("Permission mode").value==="ask"&&!document.querySelector('label.ack input'));
+      await finish();button("Refresh").click();await pause(100);
+      await openLaunchForm();losePreparation=true;button("Launch in Codex").click();await wait(()=>button("Retry preparation"));
       const uncertain=preparations.at(-1);
-      check("Lost preparation reply locks launch fields",field("Coding agent").matches(":disabled"));
-      button("Retry preparation").click();await wait(()=>report.taskSpawns===3);
+      check("Lost preparation reply locks every launch field",
+        [...group("Coding agent").querySelectorAll("button"),...group("Connection").querySelectorAll("button"),field("Permission mode"),field("Checkout path")].every(el=>el.matches(":disabled")));
+      button("Retry preparation").click();await wait(()=>report.taskSpawns===4);
       check("Preparation retry preserves the exact saved request",preparations.at(-1)===uncertain);
       await finish();button("Refresh").click();await pause(100);
-      set("Connection","managed");await pause(30);
+      await openLaunchForm();seg("Connection","Managed").click();await pause(30);
       button("Start managed Codex").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
       check("A lost managed launch response retains one provider session",report.managedSpawns===1);
       button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Codex started"));
@@ -181,9 +211,23 @@
       check("Initialization failure renders without a fabricated provider thread",document.body.textContent.includes("Provider turn: failed"));
       check("Reading failed initialization starts no replacement agent",report.managedSpawns===1&&task.status==="ready"&&task.revision===2);
       check("No unrelated shell was started",report.shellSpawns===0);
-      check("No browser runtime errors",report.errors.length===0);
+      check("The remembered handoff never carries bypass into storage",sanitizeHandoff({provider:"codex",kind:"managed",permission:"bypass"}).permission==="ask");
+      check("No browser runtime errors after every handoff path",report.errors.length===0);
       document.documentElement.dataset.gpTaskRunsResult="passed";
-    }catch(error){report.errors.push(error.message);document.documentElement.dataset.gpTaskRunsResult="failed";show();}
-    finally{await finish();show();}
+    }catch(error){
+      if(!results.some(row=>row.pass===false))results.push({name:error.message,stack:error.stack,pass:false});
+      report.errors.push(error.message);document.documentElement.dataset.gpTaskRunsResult="failed";show();
+    }
+    finally{
+      await finish();show();
+      document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify({results,counters:{...report,checks:report.checks.length,preparations:preparations.length}})));
+      if(params.has("report"))await fetch(params.get("report"),{method:"POST",body:document.documentElement.outerHTML});
+    }
   };
+  document.getElementById("check").onclick=event=>{event.currentTarget.disabled=true;return runChecks();};
+  // `?check=1` is the automated contract shared with every other harness here:
+  // run unattended, publish a verdict, POST it. Without it this page could
+  // only be run by a person clicking a button, which is indistinguishable
+  // from nobody running it at all.
+  if(params.has("check")){document.getElementById("check").disabled=true;await runChecks();}
 </script></body></html>

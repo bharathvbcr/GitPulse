@@ -324,56 +324,6 @@ pub fn coverage_report_user(report: &str) -> String {
 }
 
 /// System prompt for branch-name suggestion.
-/// How much of a task's own prose is offered to the on-device model.
-///
-/// The system model's context is small compared with a hosted one, and a task
-/// description is the only unbounded field here. Bounded through `budget_text`
-/// so an enormous description is cut with the cut announced, rather than
-/// silently pushing the instructions out of the window.
-pub const TASK_DRAFT_FIELD_BYTES: usize = 4096;
-
-/// Instructions for drafting a task's title and description.
-///
-/// Deliberately strict about invention: the model sees only what the task
-/// already says, so anything it adds beyond rephrasing is a guess the reader
-/// would have no way to check. The proposal is a suggestion a person accepts or
-/// rejects, never an edit applied on its own.
-pub fn task_draft_system() -> String {
-    "You improve engineering task descriptions. You are given a task's current \
-title and description. Rewrite them to be clearer and more actionable.\n\n\
-Rules:\n\
-- Use only the information given. Never invent file names, commands, metrics, \
-dates, or people.\n\
-- The title is imperative, at most 80 characters, with no trailing period.\n\
-- The description is two to four sentences of plain prose. No markdown \
-headings, no bullet lists.\n\
-- If the input is already clear, make only small improvements rather than \
-padding it.\n\
-- The rationale names which part of the given text your draft is based on."
-        .into()
-}
-
-/// The task as the model sees it.
-pub fn task_draft_user(title: &str, description: &str) -> String {
-    let title = budget_text(title.trim(), 512);
-    let description = budget_text(description.trim(), TASK_DRAFT_FIELD_BYTES);
-    let mut prompt = String::with_capacity(title.text.len() + description.text.len() + 64);
-    prompt.push_str("Current title:\n");
-    prompt.push_str(if title.text.is_empty() {
-        "(none)"
-    } else {
-        &title.text
-    });
-    prompt.push_str("\n\nCurrent description:\n");
-    prompt.push_str(if description.text.is_empty() {
-        "(none)"
-    } else {
-        &description.text
-    });
-    prompt.push('\n');
-    prompt
-}
-
 pub fn branch_name_system() -> String {
     String::from(
         "You name Git branches. Reply with one branch name and nothing else.\n\

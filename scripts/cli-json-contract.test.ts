@@ -28,7 +28,12 @@ function capture(run: () => number): { code: number; text: string } {
   }
 }
 
-describe("CLI --json contract", () => {
+// Each case runs one whole-tree checker twice, once for JSON and once for
+// prose. Under `--coverage` the checkers are instrumented as well (measured
+// 5.6 s -> 15.3 s for this file), so vitest's 5 s default fails cases that
+// assert nothing about speed. The budget is set per block rather than
+// globally: a slow test under src/ should still be loud.
+describe("CLI --json contract", { timeout: 30_000 }, () => {
   for (const [name, module] of CHECKERS) {
     it(`${name} emits parseable JSON and suppresses the text report`, () => {
       const json = capture(() => module.main(["--json"]));

@@ -3,7 +3,7 @@
   import { bounded } from "../workbench/taskActions";
   import { Clipboard } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
-  import TaskRuns from "./TaskRuns.svelte";
+  import TaskAgentPanel from "./TaskAgentPanel.svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import TaskManviAssist from "./TaskManviAssist.svelte";
   import SettingToggle from "./SettingToggle.svelte";
@@ -15,6 +15,17 @@
   import { addableOpenTabs, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
   import { dueInputValue, parseDueInput } from "../workbench/taskOrganize";
   import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
+  import { editorTabBadge, editorTabHint, editorTabs, resolveEditorTab, type TaskEditorTab } from "../workbench/taskEditorTabs";
+  import { handleTablistKeydown, focusTabAt, panelId, tabId, tabProps } from "../dom/tablist";
+  import { crossfade } from "svelte/transition";
+  import { isMacOS } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
+
+  // Same material as every other section strip in the app: the selected pane
+  // carries one glass pill that crossfades between tabs on macOS.
+  const macos = isMacOS();
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   const KIND_OPTIONS = ["issue", "bug", "feature", "improvement", "maintenance", "research", "documentation"] as const;
   const SEVERITY_OPTIONS = [
@@ -53,8 +64,7 @@
   let copying = $state(false);
   let extras = $state<Repository[]>([]);
   let adding = $state(false);
-  let showDetails = $state(Boolean(initial.seed));
-  let showOrganize = $state(true);
+  let showOrganize = $state(untrack(() => Boolean(initial.seed)));
   let notes = $state("");
   let copied = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -63,6 +73,26 @@
   let shortcutBlocked = $state("");
   let customKind = $state(false);
   let sheet: HTMLElement;
+  let tabStrip: HTMLDivElement | undefined = $state();
+  /**
+   * The pane on screen.
+   *
+   * A draft has one pane and no strip; saving grows the strip to four and
+   * leaves the reader on Task. `resolveEditorTab` is what makes that safe —
+   * it refuses a pane this sheet does not offer instead of rendering nothing.
+   */
+  let requestedTab = $state<TaskEditorTab>("task");
+  let suggestion = $state<{ title: string; description: string; showTitle: boolean; showDescription: boolean; blocked: string; flash: EnhancementField[] }>({
+    title: "", description: "", showTitle: false, showDescription: false, blocked: "", flash: [],
+  });
+  let assist = $state<{ acceptFields: (fields: EnhancementField[]) => void; hideSuggestion: () => void }>();
+  let runCount = $state(0);
+  let suggestionCount = $state(0);
+  /** Display name of the engine the assist section would use; it owns the picker. */
+  let assistName = $state(assistEngineName(DEFAULT_ASSIST_ENGINE));
+  const tabs = $derived(editorTabs(Boolean(current)));
+  const tab = $derived(resolveEditorTab(requestedTab, Boolean(current)));
+  const reviewable = $derived(suggestion.showTitle || suggestion.showDescription);
   let disposed = false;
   const kindIsCustom = $derived(!KIND_OPTIONS.includes(draft.kind as typeof KIND_OPTIONS[number]));
   $effect(() => { if (kindIsCustom) customKind = true; });
@@ -75,6 +105,7 @@
   onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
   const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim()));
   const id = initial.value?.id ?? newID();
+  const group = `task-sheet-${id}`;
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const known = $derived.by(() => {
     const map = new Map(repositories.map((repo) => [repo.id, repo]));
@@ -104,7 +135,7 @@
     finally { confirming = false; }
   }
   async function close() {
-    if (enhancementBusy) { shortcutBlocked = "Wait for Manvi to finish before closing."; return; }
+    if (enhancementBusy) { shortcutBlocked = `Wait for ${assistName} to finish before closing.`; return; }
     if (await canLeave()) onClose();
   }
   function membership(id: string, checked: boolean) {
@@ -160,7 +191,7 @@
     if (!current || dirty || pending) {
       const saved = await save(true);
       if (disposed) return null;
-      if (!saved) throw new Error(error || "Could not save a draft for Manvi.");
+      if (!saved) throw new Error(error || `Could not save a draft for ${assistName}.`);
       return saved;
     }
     return current;
@@ -241,6 +272,17 @@
     current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [] }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels];
     dirty = false; pending = null; note = `Saved revision ${saved.revision}`; onSaved(saved);
   }
+  function onTabKeydown(event: KeyboardEvent) {
+    const index = tabs.findIndex((entry) => entry.id === tab);
+    const move = handleTablistKeydown(event.key, index, tabs.length);
+    if (!move) return;
+    event.preventDefault();
+    const next = tabs[move.index];
+    if (!next) return;
+    requestedTab = next.id;
+    focusTabAt(tabStrip, move.index);
+  }
+
   function onKindSelect(value: string) {
     if (value === "__custom__") { customKind = true; return; }
     customKind = false;
@@ -253,13 +295,13 @@
     if (!active || !(e.target instanceof Node) || !sheet?.contains(e.target)) return;
     if (e.key === "Escape") {
       e.preventDefault();
-      if (enhancementBusy) { shortcutBlocked = "Wait for Manvi to finish before closing."; return; }
+      if (enhancementBusy) { shortcutBlocked = `Wait for ${assistName} to finish before closing.`; return; }
       void close();
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
       e.preventDefault();
-      if (enhancementBusy) { shortcutBlocked = "Wait for Manvi to finish before saving."; return; }
+      if (enhancementBusy) { shortcutBlocked = `Wait for ${assistName} to finish before saving.`; return; }
       void save();
     }
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "c") {
@@ -281,6 +323,48 @@
       <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementBusy || saving || adding || reloading || confirming || pending !== null || pendingDelete !== null} aria-label="Close task details">✕</button>
     </div>
   </header>
+  {#if tabs.length > 1}
+    <div
+      bind:this={tabStrip}
+      class="sheet-tabs gp-segmented"
+      class:gp-liquid-tabs={macos}
+      role="tablist"
+      aria-label="Task sections"
+      tabindex="-1"
+      onkeydown={onTabKeydown}
+    >
+      {#each tabs as entry, index (entry.id)}
+        {@const props = tabProps(group, entry.id, tab === entry.id)}
+        {@const badge = editorTabBadge(entry.id, { runs: runCount, suggestions: suggestionCount })}
+        <button
+          type="button"
+          class="gp-seg-btn text-[11px]! py-1!"
+          role={props.role}
+          id={props.id}
+          aria-selected={props["aria-selected"]}
+          aria-controls={props["aria-controls"]}
+          tabindex={props.tabindex}
+          data-active={tab === entry.id ? "true" : "false"}
+          data-sheet-tab={entry.id}
+          title={editorTabHint(entry.id)}
+          onclick={() => { requestedTab = entry.id; focusTabAt(tabStrip, index); }}
+        >
+          {#if macos && tab === entry.id}
+            <span
+              class="gp-liquid-selection gp-gpu"
+              aria-hidden="true"
+              in:receiveSelection={{ key: `task-sheet-pane-${id}` }}
+              out:sendSelection={{ key: `task-sheet-pane-${id}` }}
+            ></span>
+          {/if}
+          <span>{entry.label}</span>
+          {#if badge}<span class="tab-badge tabular-nums">{badge}</span>{/if}
+          {#if entry.id === "ai" && reviewable}<span class="tab-dot" aria-label="Suggestion ready"></span>{/if}
+        </button>
+      {/each}
+    </div>
+    <p class="tab-hint">{editorTabHint(tab)}</p>
+  {/if}
   <div class="sheet-body">
   <form id="task-editor-form-{id}" novalidate
     onsubmit={(e) => { e.preventDefault(); void save(); }}
@@ -288,85 +372,131 @@
     onchange={() => { dirty = true; }}
   >
     <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
-      <TaskManviAssist
-        task={current}
-        {notes}
-        {dirty}
-        {active}
-        onNotes={(value) => { notes = value; dirty = true; }}
-        bind:title={draft.title}
-        bind:description={draft.description}
-        bind:lockedFields={draft.locked_fields!}
-        repositoryIds={draft.repository_ids}
-        prepareTask={prepareForManvi}
-        onApplied={applied}
-        onBusy={(busy) => { enhancementBusy = busy; }}
-        disabled={saving || reloading || pending !== null || pendingDelete !== null}
-        autofocus={!current}
-      />
-      <fieldset disabled={enhancementBusy}>
-      <div class="pair">
-        <label>Type
-          {#if customKind || kindIsCustom}
-            <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
-            <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
-          {:else}
-            <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
-              {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
-              <option value="__custom__">Custom…</option>
-            </select>
-          {/if}
-        </label>
-        <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
+      <!-- The assist owns the enhancement lifecycle (polling, history,
+           accept/undo) and must stay mounted whichever pane is on screen.
+           Only its own controls move to the AI pane; the suggestions it
+           produces are drawn beside the fields they would change. -->
+      <div class="pane" hidden={Boolean(current) && tab !== "ai"} id={panelId(group, "ai")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "ai") : undefined}>
+        <TaskManviAssist
+          bind:this={assist}
+          task={current}
+          {notes}
+          {dirty}
+          {active}
+          onNotes={(value) => { notes = value; dirty = true; }}
+          bind:title={draft.title}
+          bind:description={draft.description}
+          bind:lockedFields={draft.locked_fields!}
+          repositoryIds={draft.repository_ids}
+          repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
+          prepareTask={prepareForManvi}
+          onApplied={applied}
+          onBusy={(busy) => { enhancementBusy = busy; }}
+          onSuggestion={(state) => { suggestion = state; }}
+          onCount={(count) => { suggestionCount = count; }}
+          onEngine={(name) => { assistName = name; }}
+          disabled={saving || reloading || pending !== null || pendingDelete !== null}
+          autofocus={!current}
+        />
       </div>
-      <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
-      <SettingToggle
-        label="Schedule and labels"
-        description="Priority, due date, owner, labels, and home workspace."
-        checked={showOrganize}
-        onchange={(next) => { showOrganize = next; }}
-      />
-      {#if showOrganize}
+      <fieldset disabled={enhancementBusy}>
+      <div class="pane" hidden={Boolean(current) && tab !== "task"} id={panelId(group, "task")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "task") : undefined}>
         <div class="pair">
+          <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
           <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
-          <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
-        </div>
-        <div class="pair">
-          <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
-          <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
-        </div>
-        <label>Labels
-          <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
-        </label>
-        <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as group (group.id)}<option value={group.id}>{group.name}{group.archived ? " (archived)" : ""}</option>{/each}</select></label>
-      {/if}
-      <fieldset class="repositories"><legend>Linked repositories</legend>{#each known as repo (repo.id)}<label class="check"><input type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => membership(repo.id, e.currentTarget.checked)} />{repo.name}</label>{/each}
-      {#if addable.length}
-        <small>Open in GitPulse</small>
-        {#each addable as tab (tab.path)}
-          <label class="check" title={tab.path}>
-            <input type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([tab.path]); }} />
-            {tab.label}<span class="open-mark">Open</span>
+          <label>Type
+            {#if customKind || kindIsCustom}
+              <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
+              <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
+            {:else}
+              <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
+                {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
+                <option value="__custom__">Custom…</option>
+              </select>
+            {/if}
           </label>
-        {/each}
-        {#if addable.length > 1}<button type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((tab) => tab.path))}>Add all open</button>{/if}
-      {/if}
-      {#each draft.repository_ids.filter((id) => !known.some((r) => r.id === id)) as missing (missing)}<small>Linked repository {missing} (load more repositories to edit)</small>{/each}</fieldset>
-      <label>Primary repository<select class="gp-select" bind:value={draft.primary_repository_id} required><option value="" disabled>Select a linked repository</option>{#each draft.repository_ids as repo (repo)}<option value={repo}>{known.find((r) => r.id === repo)?.name ?? repo}</option>{/each}</select></label>
-      {#if current}
-        <div class="notifications-row">
-          <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
-          <NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />
         </div>
-      {/if}
-      <SettingToggle
-        label="More details"
-        description="Saved brief extras."
-        checked={showDetails}
-        onchange={(next) => { showDetails = next; }}
-      />
-      {#if showDetails}
-        <p class="meta">Field locks live in the Manvi section above.</p>
+        <label class:flash={suggestion.flash.includes("title")}>Title
+          <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
+        </label>
+        {#if suggestion.showTitle}
+          <div class="inline-suggestion">
+            <p class="meta">Suggested title</p>
+            <p class="suggestion-body suggested">{suggestion.title}</p>
+            <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title"])}>Use this title</button>
+          </div>
+        {/if}
+        <label class:flash={suggestion.flash.includes("description")}>Description
+          <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+        </label>
+        {#if suggestion.showDescription}
+          <div class="inline-suggestion">
+            <p class="meta">Suggested description</p>
+            <pre class="suggestion-body suggested">{suggestion.description}</pre>
+            <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["description"])}>Use this description</button>
+          </div>
+        {/if}
+        {#if reviewable}
+          <div class="review-actions">
+            {#if suggestion.showTitle && suggestion.showDescription}
+              <button type="button" class="gp-btn-primary" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title", "description"])}>Use both</button>
+            {/if}
+            <button type="button" class="gp-btn" disabled={enhancementBusy} onclick={() => assist?.hideSuggestion()}>Not now</button>
+            {#if suggestion.blocked}<p class="warn">{suggestion.blocked}</p>{/if}
+          </div>
+        {/if}
+        <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
+        <fieldset class="repositories"><legend>Linked repositories</legend>{#each known as repo (repo.id)}<label class="check"><input type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => membership(repo.id, e.currentTarget.checked)} />{repo.name}</label>{/each}
+        {#if addable.length}
+          <small>Open in GitPulse</small>
+          {#each addable as openTab (openTab.path)}
+            <label class="check" title={openTab.path}>
+              <input type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([openTab.path]); }} />
+              {openTab.label}<span class="open-mark">Open</span>
+            </label>
+          {/each}
+          {#if addable.length > 1}<button type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((item) => item.path))}>Add all open</button>{/if}
+        {/if}
+        {#each draft.repository_ids.filter((id) => !known.some((r) => r.id === id)) as missing (missing)}<small>Linked repository {missing} (load more repositories to edit)</small>{/each}</fieldset>
+        <label>Primary repository<select class="gp-select" bind:value={draft.primary_repository_id} required><option value="" disabled>Select a linked repository</option>{#each draft.repository_ids as repo (repo)}<option value={repo}>{known.find((r) => r.id === repo)?.name ?? repo}</option>{/each}</select></label>
+      </div>
+
+      {#if current}
+        <div class="pane" hidden={tab !== "organize"} id={panelId(group, "organize")} role="tabpanel" aria-labelledby={tabId(group, "organize")}>
+          <div class="pair">
+            <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
+            <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
+          </div>
+          <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
+          <label>Labels
+            <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
+          </label>
+          <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
+          <div class="notifications-row">
+            <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
+            <NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />
+          </div>
+        </div>
+      {:else}
+        <!-- A draft carries the same scheduling fields; it just has nowhere to
+             hide them, so they sit under one disclosure instead of a pane. -->
+        <SettingToggle
+          label="Schedule and labels"
+          description="Priority, due date, owner, labels, and home workspace."
+          checked={showOrganize}
+          onchange={(next) => { showOrganize = next; }}
+        />
+        {#if showOrganize}
+          <div class="pair">
+            <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
+            <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
+          </div>
+          <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
+          <label>Labels
+            <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
+          </label>
+          <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
+        {/if}
       {/if}
       </fieldset>
     </fieldset>
@@ -375,7 +505,19 @@
     {#if pending}<p role="status">Save result uncertain. Retry the same write before editing further.</p>{/if}
     {#if pendingDelete}<p role="status">Delete result uncertain. Retry the same delete before editing further.</p>{/if}
   </form>
-  {#if current}<TaskRuns task={current} {repositories} {active} disabled={dirty || saving || pending !== null || pendingDelete !== null || enhancementBusy} />{/if}
+  {#if current}
+    <div class="pane" hidden={tab !== "agent"} id={panelId(group, "agent")} role="tabpanel" aria-labelledby={tabId(group, "agent")}>
+      <TaskAgentPanel
+        task={current}
+        {repositories}
+        {openTabs}
+        {active}
+        {dirty}
+        disabled={saving || reloading || confirming || pending !== null || pendingDelete !== null || enhancementBusy}
+        onCount={(count) => { runCount = count; }}
+      />
+    </div>
+  {/if}
   </div>
   <footer>
     <button class="gp-btn-primary" disabled={saving || adding || enhancementBusy || pendingDelete !== null || !draft.repository_ids.length || (!pending && ((!draft.title.trim() && !notes.trim()) || !draft.kind.trim()))} form="task-editor-form-{id}" type="submit">{saving && !pendingDelete ? "Saving…" : pending ? "Retry save" : "Save task"}</button>
@@ -388,6 +530,23 @@
 </aside>
 
 <style>
+  /* `[hidden]` is Tailwind preflight's zero-specificity rule, so any
+     `display` this file sets on `.pane` would silently beat it and leave
+     every pane on screen at once. The explicit rule below is the guard. */
+  .pane[hidden]{display:none}
+  .sheet-tabs{flex-shrink:0;margin:0 18px 8px;width:calc(100% - 36px)}
+  .tab-hint{flex-shrink:0;margin:0 18px 10px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .tab-badge{margin-left:5px;padding:0 4px;border-radius:999px;font-size:9px;line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
+  .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:999px;background:rgb(var(--c-accent));display:inline-block}
+  .inline-suggestion{margin:-6px 0 13px;padding:9px 10px;border:1px solid rgb(var(--c-border) / 0.7);border-radius:8px;background:rgb(var(--c-bg) / 0.45)}
+  .inline-suggestion .meta{margin:0 0 5px}
+  .suggestion-body{margin:0 0 8px;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:11rem;overflow:auto;font-family:inherit}
+  .suggested{color:rgb(var(--c-text))}
+  .review-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:13px}
+  .warn{margin:0;color:rgb(var(--c-text-muted));font-size:11px;flex-basis:100%}
+  .flash :is(input,textarea){animation:gp-task-flash 1.1s ease-out}
+  @keyframes gp-task-flash{from{border-color:rgb(var(--c-accent));box-shadow:0 0 0 3px rgb(var(--c-accent) / 0.18)}to{border-color:rgb(var(--c-border));box-shadow:none}}
+  @media (prefers-reduced-motion: reduce){.flash :is(input,textarea){animation:none}}
   .task-editor{width:min(430px,48vw);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
   .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}
   header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}

@@ -35,7 +35,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (219 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (220 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -183,7 +183,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +219 Registered Handlers
+        +220 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -362,8 +362,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 219 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1088 data fields, over 153 structs, in 64 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 220 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1104 data fields, over 157 structs, in 65 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree. Missing schema identity is unresponsive, never a pass. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 
@@ -540,6 +540,31 @@ without adding a storage or provider endpoint. Field locks exclude title and/or
 description from enhancement. Generation, acceptance and dismissal remain
 separate operations owned by Manvi.
 
+Apple Intelligence is a second engine for that same lifecycle, not a second
+lifecycle. `src-tauri/swift/AppleIntelligence.swift` is the whole Swift side:
+three C entry points over Apple's Foundation Models framework, compiled by
+`build.rs` only when the selected macOS SDK actually contains
+`FoundationModels.framework`, and linked behind the `apple_intelligence` cfg.
+`ai/apple.rs` bounds and validates a request before any model runs, and keeps
+three negatives apart that a single boolean would merge: **not compiled in**
+(a fact about the build), **unsupported OS** (this Mac is below macOS 26), and
+**unavailable** with the framework's own reason (Apple Intelligence switched
+off, device not eligible, model not ready). `cmd_apple_intelligence_status` is
+infallible for the same reason — every "no" is a state a reader may be able to
+act on.
+
+`runAppleEnhancement` in `taskEnhance.ts` creates the proposal in the local
+store exactly as Manvi does, runs the model on this thread instead of routing
+`enhancements.generate` to the sidecar, then publishes the result with
+`enhancements.complete`. The proposal keeps its id, revision, source revision
+and history, so acceptance, undo, dismissal, the history drawer and field locks
+never learn which engine wrote the text. A generation that fails is written
+back as a failed proposal before the error is rethrown: a `pending` record
+holds the store's one-live-attempt lock for its whole 180-second lease. Nothing
+in a request reaches a socket — no model selection travels with it, and the
+`GITPULSE_DISABLE_APPLE_INTELLIGENCE=1` build reports "not compiled in" rather
+than claiming anything about the reader's Mac.
+
 `taskCompose.ts` formats new, unsaved drafts with an explicit draft label. Saved
 tasks always copy `items.brief.get` at their saved revision; unsaved editor changes
 are excluded and named. Board copying attempts at most eight saved tasks and
@@ -563,8 +588,17 @@ checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise
 identical clone substituted at the same path.
 
-`TaskRuns.svelte` prepares a selected saved revision and opens a task-bound tab in
-the existing terminal dock. `cmd_workbench_launch_terminal` probes the installed
+`TaskHandoffForm.svelte` prepares a selected saved revision and opens a task-bound
+tab in the existing terminal dock. It is the single implementation of a handoff:
+`TaskAgentPanel.svelte` renders it in the task sheet's Agent pane above that
+task's run history, and `TaskHandoffSheet.svelte` renders it in a modal reached
+from a board card's context menu. The form resolves the working checkout from
+the repository tabs GitPulse already has open (falling back to the folder beside
+the repository's git common directory, labelled as derived), re-reads the saved
+task and refuses a revision that moved, and locks every control while a
+preparation outcome is unknown so a retry replays the request it was given.
+Settings are remembered across launches except `bypass`, which is downgraded
+before it can be stored. `cmd_workbench_launch_terminal` probes the installed
 provider's version/help and requested option values, writes a private temporary
 brief, and delegates to the existing PTY manager with a native run observer.
 The observer consumes the one-use claim immediately before spawn and records the

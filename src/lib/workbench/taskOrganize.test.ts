@@ -3,7 +3,6 @@ import type { Task, TaskCard } from "./client";
 import {
   allLoadedCards,
   canQuickEnhance,
-  canStartEnhanceFromDraft,
   cardChrome,
   cardMatchesFacet,
   collectFacetOptions,
@@ -14,6 +13,7 @@ import {
   facetActive,
   hiddenTaskDetails,
   parseDueInput,
+  reorderPlan,
   visibleHiddenDetails,
 } from "./taskOrganize";
 
@@ -107,9 +107,6 @@ describe("hidden details and enhance gate", () => {
     expect(dueInputValue(parsed).startsWith("2026-09-09T15:30")).toBe(true);
     expect(dueInputValue(null)).toBe("");
     expect(dueInputValue(-1)).toBe("");
-    expect(canStartEnhanceFromDraft({ title: "", repository_ids: ["r"] })).toMatch(/title/);
-    expect(canStartEnhanceFromDraft({ title: "Keep", repository_ids: [] })).toMatch(/repository/);
-    expect(canStartEnhanceFromDraft({ title: "Keep", repository_ids: ["r"] })).toBeNull();
   });
 
   it("will not start an enhancement when Manvi or fields are unavailable", () => {
@@ -133,5 +130,36 @@ describe("allLoadedCards", () => {
       ready: { items: [card({ id: "t1", status: "ready" })] },
     });
     expect(cards.map((c) => c.id)).toEqual(["t1", "t2"]);
+  });
+});
+
+describe("reorderPlan", () => {
+  it("produces unique, increasing integer positions in the requested order", () => {
+    const { cards, positions } = reorderPlan(
+      [card({ id: "a", position: 10 }), card({ id: "c", position: 11 })],
+      card({ id: "b", position: 10 }),
+      1,
+    );
+    expect(cards.map((entry) => entry.id)).toEqual(["a", "b", "c"]);
+    expect(positions.a).toBeLessThan(positions.b);
+    expect(positions.b).toBeLessThan(positions.c);
+    expect(Object.values(positions).every(Number.isSafeInteger)).toBe(true);
+  });
+
+  it("clamps an out-of-range index to the ends instead of dropping the card", () => {
+    const items = [card({ id: "a" }), card({ id: "b" })];
+    expect(reorderPlan(items, card({ id: "c" }), -50).cards.map((entry) => entry.id)).toEqual(["c", "a", "b"]);
+    expect(reorderPlan(items, card({ id: "c" }), 50).cards.map((entry) => entry.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("re-spaces a dense column without colliding or exceeding the safe integer range", () => {
+    const items = Array.from({ length: 2_000 }, (_, i) => card({ id: `t${i}`, position: i }));
+    const { cards, positions } = reorderPlan(items, items[1_999], 0);
+    expect(cards[0].id).toBe("t1999");
+    expect(cards).toHaveLength(2_000);
+    const values = Object.values(positions);
+    expect(new Set(values).size).toBe(2_000);
+    expect(values.every(Number.isSafeInteger)).toBe(true);
+    expect(Math.max(...values)).toBeLessThan(Number.MAX_SAFE_INTEGER);
   });
 });

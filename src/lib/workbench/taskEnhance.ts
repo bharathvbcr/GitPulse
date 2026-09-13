@@ -1,5 +1,6 @@
 import {
   changeEnhancement,
+  completeEnhancement,
   getTask,
   newID,
   WorkbenchError,
@@ -10,15 +11,43 @@ import {
   type ModelSelection,
   type Task,
 } from "./client";
-import {
-  APPLE_ENHANCEMENT_MODEL,
-  APPLE_ENHANCEMENT_PROVIDER,
-  canEnhanceOnDevice,
-  canQuickEnhance,
-  enhanceableFields,
-} from "./taskOrganize";
+import { canQuickEnhance, enhanceableFields } from "./taskOrganize";
 import { bounded } from "./taskActions";
 import { selectionWire } from "./taskModel";
+import {
+  APPLE_ENGINE,
+  APPLE_MODEL,
+  appleErrorCode,
+  draftWithApple,
+  explainAppleError,
+} from "../ai/appleIntelligence";
+
+/**
+ * The engines a task sheet can draft with, and the one name each is called by.
+ *
+ * This module already owns both paths — `startQuickEnhance` reaches Manvi and
+ * `runAppleEnhancement` runs on-device — so it owns what they are called too.
+ * The sheet writes about the engine in placeholders and in the message that
+ * refuses a shortcut mid-generation; the assist section draws the picker. A
+ * name spelled in either of those would be a second source of truth that drifts
+ * the moment an engine is added or renamed.
+ */
+export type AssistEngine = "manvi" | "apple";
+
+const ASSIST_ENGINE_NAMES: Readonly<Record<AssistEngine, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<AssistEngine, string>, {
+    manvi: "Manvi",
+    apple: "Apple Intelligence",
+  }),
+);
+
+/** Every engine, in the order the picker offers them. */
+export const ASSIST_ENGINE_LIST: readonly AssistEngine[] = Object.freeze(["manvi", "apple"] as const);
+
+/** The engine used until the reader picks otherwise, or Apple is not reachable. */
+export const DEFAULT_ASSIST_ENGINE: AssistEngine = "manvi";
+
+export const assistEngineName = (engine: AssistEngine): string => ASSIST_ENGINE_NAMES[engine];
 
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
   proposal !== null && ["pending", "running", "cancel_requested"].includes(proposal.state);
@@ -140,32 +169,69 @@ export async function startQuickEnhance(
 }
 
 /**
- * Starts an on-device draft.
+ * One Apple Intelligence enhancement, start to finish.
  *
- * Deliberately stops at `enhancements.create`, exactly as the Manvi path does.
- * The backend recognises the provider on the stored proposal and runs the model
- * in-process when generation is requested, so the two paths share the whole
- * accept / revise / undo / history lifecycle rather than forking it.
+ * The reason this is not a branch inside `startQuickEnhance` is the shape of
+ * the lifecycle, not the shape of the code. A Manvi enhancement is *handed
+ * off*: `create` then `generate`, and the sidecar completes it minutes later
+ * while the UI polls. An Apple Intelligence enhancement is *run here*: create,
+ * generate on this thread, complete. Sharing the entry point would mean one
+ * function whose second half is dead for one of its callers.
+ *
+ * What is shared is everything that matters — the proposal is a real record in
+ * the local store with an id, a revision and a source revision, so accepting,
+ * undoing, the history drawer and the field locks all work without knowing
+ * which engine wrote the text.
+ *
+ * A failure is written back as a failed proposal before it is rethrown. A
+ * generation that vanished without a trace would leave a `pending` record
+ * holding the "one live attempt" lock until its lease expired.
  */
-export async function startOnDeviceEnhance(
+export async function runAppleEnhancement(
   task: Task,
   fields: readonly EnhancementField[],
-  status: { available: boolean; explanation: string } | null,
-  action = new EnhancementAction(),
-): Promise<QuickEnhanceStart> {
-  const gate = canEnhanceOnDevice(task, status);
-  if (!gate.ok) throw new Error(gate.reason);
-  const requested = fields.filter((field) => gate.fields.includes(field));
-  const input = createEnhancementInput(
-    task,
-    requested,
-    APPLE_ENHANCEMENT_PROVIDER,
-    APPLE_ENHANCEMENT_MODEL,
-    { id: newID(), requestId: newID() },
-  );
-  if (!input) throw new Error("Nothing is available to enhance.");
-  const { proposal } = await action.run("enhancements.create", input, task.id);
-  return { task, proposal };
+  source: { kind: "draft" | "improve" | "extract"; notes: string; title: string; description: string; context: string },
+  io = { create: changeEnhancement, complete: completeEnhancement, draft: draftWithApple },
+): Promise<Enhancement> {
+  const requested = [...new Set(fields)].filter((field) => enhanceableFields(task).includes(field));
+  const input = createEnhancementInput(task, requested, APPLE_ENGINE, APPLE_MODEL, {
+    id: newID(),
+    requestId: newID(),
+  });
+  if (!input) throw new WorkbenchError("invalid_input", "Nothing is available to enhance.");
+  const proposal = await bounded(io.create("enhancements.create", input));
+  if (proposal.id !== input.id || proposal.task_id !== task.id || proposal.source_revision !== task.revision) {
+    throw new WorkbenchError("protocol_error", "Enhancement confirmation does not match the request.");
+  }
+  const identity = { id: proposal.id, request_id: newID(), expected_revision: proposal.revision };
+  try {
+    const draft = await io.draft({
+      kind: source.kind,
+      fields: [...requested],
+      notes: source.notes,
+      title: source.title,
+      description: source.description,
+      context: source.context,
+    });
+    const completed = await bounded(io.complete({
+      ...identity,
+      ...(draft.title !== null && requested.includes("title") ? { title: draft.title } : {}),
+      ...(draft.description !== null && requested.includes("description") ? { description: draft.description } : {}),
+      ...(draft.rationale ? { rationale: draft.rationale } : {}),
+    }));
+    if (completed.id !== proposal.id || completed.revision <= proposal.revision) {
+      throw new WorkbenchError("protocol_error", "Enhancement completion does not match the request.");
+    }
+    return completed;
+  } catch (cause) {
+    const message = explainAppleError(cause);
+    // Best effort: the record has a 180-second lease and will expire on its
+    // own, so a failed cleanup must not replace the real error with its own.
+    try {
+      await bounded(io.complete({ ...identity, request_id: newID(), failure: message.slice(0, 2048) }));
+    } catch { /* the original failure is the one worth reporting */ }
+    throw cause instanceof WorkbenchError ? cause : new WorkbenchError(appleErrorCode(cause), message);
+  }
 }
 
 export function acceptEnhancementInput(

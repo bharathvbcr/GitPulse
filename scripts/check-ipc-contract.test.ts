@@ -49,7 +49,11 @@ function countIn(stdout: string, label: string): number {
   return Number(stdout.match(new RegExp(`${label}\\s*:\\s*(\\d+)`))?.[1]);
 }
 
-describe("check:ipc contract", () => {
+// Every case here runs the real checker over the whole tree. Under
+// `--coverage` the checker module is instrumented too, so these cost ~2x and
+// vitest's 5 s default starts failing cases that assert nothing about speed.
+// Same budget, and same reason, as `vendor-crates` and `enum-variant`.
+describe("check:ipc contract", { timeout: 30_000 }, () => {
   it("passes on the current tree and reports both registry sides", async () => {
     const { code, stdout } = await runScript([]);
     expect(code).toBe(0);
@@ -289,7 +293,7 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    expect(found.size).toBe(219);
+    expect(found.size).toBe(220);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

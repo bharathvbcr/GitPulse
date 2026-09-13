@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { selectionWire, type ModelSelection } from "./taskModel";
+import { PERMISSION_MODES, STATUSES, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
 
-export const STATUSES = ["inbox", "backlog", "ready", "in_progress", "review", "done"] as const;
-export type TaskStatus = (typeof STATUSES)[number];
-export const STATUS_LABELS: Record<TaskStatus, string> = { inbox: "Inbox", backlog: "Backlog", ready: "Ready", in_progress: "In progress", review: "Review", done: "Done" };
+export { STATUSES, STATUS_LABELS, asTaskStatus, PERMISSION_MODES } from "./vocabulary";
+export type { TaskStatus, PermissionMode, RunKind } from "./vocabulary";
 export interface RecordVersion { id: string; revision: number; updated_at: number }
 export interface Repository extends RecordVersion { name: string; identity_key: string; remote_url: string | null }
 export interface WorkspaceCard extends RecordVersion { name: string; icon: string; color: string; position: number; pinned: boolean; archived: boolean; repository_count: number }
@@ -35,9 +35,6 @@ export interface Task extends TaskCard { description: string; acceptance_criteri
 export interface BriefReference extends RecordVersion { name: string }
 export interface TaskBrief extends RecordVersion { format_version: 1; task: Task; repositories: BriefReference[]; workspace: BriefReference | null; markdown: string }
 export const RUN_STATES = ["prepared", "starting", "running", "exited", "failed", "cancelled", "unresolved"] as const;
-export const PERMISSION_MODES = ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"] as const;
-export type PermissionMode = typeof PERMISSION_MODES[number];
-export type RunKind = "external_terminal" | "managed";
 export const PROVIDER_STATES = ["ready", "running", "completed", "failed", "interrupted", "unresolved"] as const;
 export interface TaskRun extends RecordVersion {
   kind: RunKind;
@@ -447,6 +444,30 @@ export async function listEnhancements(taskID: string, cursor?: string): Promise
 }
 export async function changeEnhancement(method: EnhancementMutation, input: Record<string, unknown>): Promise<Enhancement> {
   return record(await request(method, input), enhancement);
+}
+/**
+ * Publishes a result for a proposal this host generated itself.
+ *
+ * `enhancements.generate` hands a pending proposal to the Manvi sidecar, which
+ * later completes it. When GitPulse runs the model — Apple Intelligence is the
+ * only such engine today — nothing else will, so the host completes the
+ * proposal directly. Same store, same state machine, same accept/undo history;
+ * only the author of the text is different.
+ *
+ * Exactly one of a proposal or a `failure` may be sent: the store refuses a
+ * completion that carries both, which is what keeps a failed generation from
+ * quietly publishing half a suggestion.
+ */
+export async function completeEnhancement(input: {
+  id: string;
+  request_id: string;
+  expected_revision: number;
+  title?: string;
+  description?: string;
+  rationale?: string;
+  failure?: string;
+}): Promise<Enhancement> {
+  return record(await request("enhancements.complete", input), enhancement);
 }
 /** Start generation for a pending enhancement; optional model selects the sidecar env. */
 export async function generateEnhancement(

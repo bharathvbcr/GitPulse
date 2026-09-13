@@ -1,615 +1,579 @@
-//! On-device task drafting through Apple's Foundation Models.
+//! Apple Intelligence: the on-device model, for task titles and descriptions.
 //!
-//! Wraps the Swift bridge in `apple/GitPulseAppleIntelligence.swift`, which
-//! `build.rs` compiles into a static archive and which sets
-//! `cfg(apple_intelligence)` when it succeeds.
+//! GitPulse already had one way to write a task from notes — a local model
+//! server discovered over loopback, driven by the Manvi worker. That works,
+//! but it asks the reader to install and run a model first, and on a Mac that
+//! can run Apple Intelligence the answer is already on the machine, is faster,
+//! and never touches a socket at all.
 //!
-//! # Why there are three ways to be unavailable
+//! ## Where this sits in the lifecycle
 //!
-//! "Not compiled into this binary", "this is not macOS", and "the framework is
-//! here and reports a reason" are three different facts, and collapsing them
-//! misinforms whoever reads the result. A user whose Mac is perfectly capable
-//! but whose build lacks the bridge must not be told their hardware is
-//! ineligible; a Windows user must not be told to enable Apple Intelligence.
-//! [`AppleAvailability`] keeps them apart all the way to the UI.
+//! It does **not** replace the enhancement lifecycle; it replaces exactly one
+//! step of it. A proposal is still created in the local store
+//! (`enhancements.create`), so it has an id, a revision, a source revision and
+//! a history. Instead of routing `enhancements.generate` to the Manvi sidecar,
+//! the frontend calls [`generate`] here and then publishes the result with
+//! `enhancements.complete`. Accept, undo, dismiss, the history drawer and the
+//! field locks are all untouched, because none of them ever knew which engine
+//! wrote the text.
+//!
+//! ## What this module will not do
+//!
+//! It will not claim a capability it cannot observe. There are three distinct
+//! negative answers and they are kept distinct:
+//!
+//! * **not compiled in** — this binary has no bridge, because the SDK that
+//!   built it had no `FoundationModels.framework`. A fact about the build.
+//! * **unsupported OS** — the bridge exists but this Mac is below macOS 26.
+//! * **unavailable** — the framework answered, with a reason of its own
+//!   (Apple Intelligence switched off, device not eligible, model not ready).
+//!
+//! Collapsing those into one "unavailable" would tell a reader whose Mac is
+//! perfectly capable that their hardware is the problem.
 
-use std::ffi::{CStr, CString};
+#[cfg(apple_intelligence)]
+use std::time::Duration;
 
-/// How long a single on-device generation may take.
+use serde::{Deserialize, Serialize};
+
+/// Longest note text handed to the model in one request.
 ///
-/// Must stay comfortably under the store's pending-enhancement lease
-/// (`ENHANCEMENT_LEASE_SECONDS`, 180s in dc-store): a generation that finishes
-/// after the lease expires is refused on arrival as `expired`, so the model call
-/// would be spent for nothing. Measured cost of a task draft on an M-series Mac
-/// is a few seconds, so this is a safety bound, not a target.
-pub const GENERATION_TIMEOUT_MS: i32 = 90_000;
+/// The framework has its own context window and raises
+/// `exceededContextWindowSize` past it, but that error costs a round trip and
+/// arrives as a failed proposal. This bound is the cheap refusal in front of
+/// it, and it is generous: a task brief that needs more than this is not a
+/// task brief.
+pub const MAX_INPUT_CHARS: usize = 12_000;
+/// Wall-clock budget for one generation, including model load on first use.
+///
+/// Only the bridged build has anything to time; without it there is no call to
+/// bound. The store's own lease on a pending proposal is 180 seconds, so this
+/// has to stay comfortably under that or a slow generation would be refused on
+/// arrival with "expired" instead of being reported as slow.
+#[cfg(apple_intelligence)]
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The store's pending-enhancement lease, mirrored from
-/// `dc-store/src/workbench/enhancements.rs`.
-const ENHANCEMENT_LEASE_SECONDS: i32 = 180;
-
-// Checked at compile time rather than by a test: this is a relationship between
-// two constants, so the build is the right place to refuse a bad one. A timeout
-// at or past the lease means a slow generation is refused on arrival as
-// `expired` and the model call is spent for nothing. Half the lease leaves room
-// for the time between `create` (when the lease starts) and the call itself.
-const _: () = assert!(GENERATION_TIMEOUT_MS <= ENHANCEMENT_LEASE_SECONDS * 1000 / 2);
-
-/// Why on-device generation cannot run, or that it can.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum AppleAvailability {
-    /// Ready to generate now.
-    Available,
-    /// This build has no Swift bridge linked in — a fact about the binary, not
-    /// about the machine. Says nothing about whether the host could support it.
-    NotCompiled,
-    /// Not a macOS host. Nothing the reader can change.
-    UnsupportedOs {
-        /// The compiled target, so the message can name it.
-        os: &'static str,
-    },
-    /// The framework answered and gave a reason. Reported verbatim because the
-    /// reasons call for different actions: an ineligible device cannot be fixed,
-    /// Apple Intelligence being off is fixed in Settings, and a model still
-    /// downloading fixes itself.
-    Unavailable { reason: String },
+/// Whether the on-device model can be used, and if not, exactly why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppleIntelligenceStatus {
+    /// False when this binary was built without the framework.
+    pub compiled: bool,
+    /// `available` | `unavailable` | `unsupported_os`
+    pub state: String,
+    /// Machine-readable cause when `state` is not `available`.
+    pub reason: Option<String>,
+    /// One sentence a reader can act on.
+    pub detail: String,
 }
 
-impl AppleAvailability {
-    pub fn is_available(&self) -> bool {
-        matches!(self, Self::Available)
+impl AppleIntelligenceStatus {
+    pub fn ready(&self) -> bool {
+        self.state == "available"
     }
 
-    /// A sentence for the reader, distinct per cause.
-    pub fn explain(&self) -> String {
-        match self {
-            Self::Available => "On-device drafting is ready.".into(),
-            Self::NotCompiled => {
-                "This build of GitPulse was compiled without Apple Intelligence support.".into()
-            }
-            Self::UnsupportedOs { os } => {
-                format!("Apple Intelligence is a macOS feature and is not available on {os}.")
-            }
-            Self::Unavailable { reason } => match reason.as_str() {
-                "device_not_eligible" => "This Mac does not support Apple Intelligence.".into(),
-                "apple_intelligence_not_enabled" => {
-                    "Apple Intelligence is turned off. Enable it in System Settings.".into()
-                }
-                "model_not_ready" => {
-                    "The on-device model is still downloading. Try again shortly.".into()
-                }
-                "os_too_old" => "On-device drafting needs macOS 26 or later.".into(),
-                "framework_missing" => {
-                    "The Foundation Models framework is unavailable on this Mac.".into()
-                }
-                other => format!("Apple Intelligence is unavailable ({other})."),
-            },
+    /// Only the bridge-less build constructs this; with the bridge linked,
+    /// every status comes from the framework itself.
+    #[cfg(not(apple_intelligence))]
+    fn not_compiled(detail: &str) -> Self {
+        Self {
+            compiled: false,
+            state: "unsupported_os".to_string(),
+            reason: Some("not_compiled".to_string()),
+            detail: detail.to_string(),
         }
     }
 }
 
-/// One drafted task, as the model returned it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Draft {
+/// What the caller wants written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppleIntelligenceRequest {
+    /// `draft` (from notes), `improve` (rewrite what exists), `extract`.
+    pub kind: String,
+    /// Which of `title` / `description` to return.
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub description: String,
+    /// Repository, task type and labels, as one line.
+    #[serde(default)]
+    pub context: String,
+}
+
+/// One proposal from the on-device model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppleIntelligenceDraft {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// Why this can be trusted, in the reader's terms. Stored on the proposal.
     pub rationale: String,
 }
 
-impl Draft {
-    /// The store's hard limit on a proposed title.
-    ///
-    /// The prompt asks for 80 characters, but a guide is a preference and not a
-    /// contract: a model that overshoots must not produce a completion the store
-    /// refuses, because a refused completion leaves the proposal stuck in
-    /// `pending` and the reader with an error instead of an outcome.
-    pub const MAX_TITLE_CHARS: usize = 300;
-
-    /// The fields to publish, or why this draft cannot be published.
-    ///
-    /// Mirrors the store's completion rules exactly, because breaking any of
-    /// them turns a finished generation into a refused write:
-    ///
-    ///   - every requested field must be present and non-blank. A blank value
-    ///     is the dangerous case rather than the harmless one: accepting a
-    ///     proposal applies it to the task, so an empty description would erase
-    ///     prose the reader wrote.
-    ///   - a field that was NOT requested must be absent, or the completion is
-    ///     refused outright. That is how a field lock stays a lock.
-    pub fn proposal_for(
-        &self,
-        requested: &[String],
-    ) -> Result<Vec<(&'static str, String)>, String> {
-        let mut fields = Vec::new();
-        for (name, value) in [("title", &self.title), ("description", &self.description)] {
-            if !requested.iter().any(|field| field == name) {
-                continue;
-            }
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(format!(
-                    "On-device generation returned an empty {name}, which would erase the current one."
-                ));
-            }
-            if name == "title" && value.chars().count() > Self::MAX_TITLE_CHARS {
-                return Err(format!(
-                    "On-device generation returned a title of {} characters; the limit is {}.",
-                    value.chars().count(),
-                    Self::MAX_TITLE_CHARS
-                ));
-            }
-            fields.push((name, value.to_owned()));
-        }
-        if fields.is_empty() {
-            return Err("The enhancement requested no fields this model can fill.".into());
-        }
-        Ok(fields)
-    }
-}
-
-#[cfg(apple_intelligence)]
-unsafe extern "C" {
-    fn gitpulse_apple_availability() -> *mut std::ffi::c_char;
-    fn gitpulse_apple_generate(
-        instructions: *const std::ffi::c_char,
-        prompt: *const std::ffi::c_char,
-        timeout_ms: i32,
-    ) -> *mut std::ffi::c_char;
-    fn gitpulse_apple_string_free(pointer: *mut std::ffi::c_char);
-}
-
-/// Takes ownership of a string the Swift side allocated, freeing it through the
-/// matching export. Returns `None` for a null pointer or invalid UTF-8.
-#[cfg(apple_intelligence)]
-fn take_swift_string(pointer: *mut std::ffi::c_char) -> Option<String> {
-    if pointer.is_null() {
-        return None;
-    }
-    // SAFETY: `pointer` came from one of the bridge's `strdup` allocations, so
-    // it is NUL-terminated and must be released through the bridge's own `free`
-    // export. The copy is made before freeing.
-    let owned = unsafe { CStr::from_ptr(pointer) }
-        .to_str()
-        .ok()
-        .map(str::to_owned);
-    unsafe { gitpulse_apple_string_free(pointer) };
-    owned
-}
-
-/// Whether on-device generation can run right now.
-pub fn availability() -> AppleAvailability {
-    #[cfg(not(apple_intelligence))]
-    {
-        // Order matters: a non-macOS host is unsupported regardless of the
-        // build, but on macOS the only thing we can truthfully say is that this
-        // binary has no bridge.
-        if cfg!(target_os = "macos") {
-            return AppleAvailability::NotCompiled;
-        }
-        AppleAvailability::UnsupportedOs {
-            os: std::env::consts::OS,
-        }
-    }
-    #[cfg(apple_intelligence)]
-    {
-        // SAFETY: the bridge returns either null or a `strdup` string we own.
-        let raw = unsafe { gitpulse_apple_availability() };
-        let Some(text) = take_swift_string(raw) else {
-            return AppleAvailability::Unavailable {
-                reason: "bridge_returned_nothing".into(),
-            };
-        };
-        parse_availability(&text)
-    }
-}
-
-/// Parses the bridge's availability envelope.
+/// Everything the bridge can return, kept as one shape so a failure carries a
+/// code the frontend can branch on rather than a sentence it has to match.
 ///
-/// Separate from the FFI call so it can be tested on any host, including the
-/// malformed and hostile shapes a native test cannot easily produce.
-pub fn parse_availability(text: &str) -> AppleAvailability {
-    #[derive(serde::Deserialize)]
-    struct Wire {
-        available: bool,
-        reason: Option<String>,
-    }
-    match serde_json::from_str::<Wire>(text) {
-        Ok(wire) if wire.available => AppleAvailability::Available,
-        Ok(wire) => AppleAvailability::Unavailable {
-            reason: wire.reason.unwrap_or_else(|| "unknown".into()),
-        },
-        // Unparseable is not available. Failing open here would offer a feature
-        // that then errors on every use.
-        Err(_) => AppleAvailability::Unavailable {
-            reason: "bridge_reply_unreadable".into(),
-        },
+/// Gated on the bridge plus `test`: with no bridge there are no replies to
+/// read, but the rules for reading one are the same either way and the tests
+/// assert them on every platform.
+#[cfg(any(apple_intelligence, test))]
+#[derive(Debug, Deserialize)]
+struct BridgeReply {
+    ok: bool,
+    code: Option<String>,
+    message: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    rationale: Option<String>,
+}
+
+/// A refusal from this module or from the framework.
+///
+/// Crosses IPC as a struct rather than a string on purpose: "Apple
+/// Intelligence is busy" and "Apple Intelligence declined to write this" want
+/// different affordances, and a frontend matching on sentences would break the
+/// first time one is reworded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppleIntelligenceError {
+    pub code: String,
+    pub message: String,
+}
+
+impl AppleIntelligenceError {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+        }
     }
 }
 
-/// Parses the bridge's generation envelope into a draft or a failure reason.
-pub fn parse_generation(text: &str) -> Result<Draft, String> {
-    #[derive(serde::Deserialize)]
-    struct Wire {
-        ok: bool,
-        title: Option<String>,
-        description: Option<String>,
-        rationale: Option<String>,
-        failure: Option<String>,
+impl std::fmt::Display for AppleIntelligenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
     }
-    let wire: Wire = serde_json::from_str(text)
-        .map_err(|error| format!("The on-device bridge returned unreadable JSON: {error}"))?;
-    if !wire.ok {
-        return Err(wire
-            .failure
-            .filter(|reason| !reason.trim().is_empty())
-            .unwrap_or_else(|| "On-device generation failed without a reason.".into()));
+}
+
+impl std::error::Error for AppleIntelligenceError {}
+
+/// Rejects a request this module should not send, before any model runs.
+///
+/// Separate from the bridge so it is testable on every platform: the rules are
+/// about what GitPulse is willing to ask for, not about what Apple's model can
+/// do. Returns the request's total input size on success.
+pub fn validate(request: &AppleIntelligenceRequest) -> Result<usize, AppleIntelligenceError> {
+    if !matches!(request.kind.as_str(), "draft" | "improve" | "extract") {
+        return Err(AppleIntelligenceError::new(
+            "invalid_input",
+            "Unknown generation kind.",
+        ));
     }
-    // A success carrying no title is a failure: the store refuses a proposal
-    // whose fields are absent, so accepting it here would only move the error.
-    let title = wire
-        .title
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "On-device generation returned no title.".to_string())?;
-    Ok(Draft {
-        title,
-        description: wire.description.unwrap_or_default(),
-        rationale: wire.rationale.unwrap_or_default(),
+    let fields: Vec<&str> = request.fields.iter().map(String::as_str).collect();
+    if fields.is_empty()
+        || fields
+            .iter()
+            .any(|f| !matches!(*f, "title" | "description"))
+    {
+        return Err(AppleIntelligenceError::new(
+            "invalid_input",
+            "Only the title and description can be written.",
+        ));
+    }
+    if fields.len()
+        != fields
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    {
+        return Err(AppleIntelligenceError::new(
+            "invalid_input",
+            "A field was requested twice.",
+        ));
+    }
+    let size = request.notes.chars().count()
+        + request.title.chars().count()
+        + request.description.chars().count()
+        + request.context.chars().count();
+    if size > MAX_INPUT_CHARS {
+        return Err(AppleIntelligenceError::new(
+            "too_large",
+            format!("Keep the task below {MAX_INPUT_CHARS} characters for the on-device model."),
+        ));
+    }
+    if request.notes.trim().is_empty()
+        && request.title.trim().is_empty()
+        && request.description.trim().is_empty()
+    {
+        return Err(AppleIntelligenceError::new(
+            "invalid_input",
+            "Write some notes first; the on-device model is not given the repository.",
+        ));
+    }
+    Ok(size)
+}
+
+/// Turns a bridge reply into a draft, refusing one that contradicts the ask.
+///
+/// The framework fills every property of the generated type, so a reply always
+/// carries both fields; the bridge blanks the ones that were not requested.
+/// This is where that is *checked* rather than assumed, because
+/// `enhancements.complete` refuses a proposal that changes a field nobody
+/// asked for — and it would refuse it after the model had already run.
+#[cfg(any(apple_intelligence, test))]
+fn interpret(
+    reply: BridgeReply,
+    fields: &[String],
+) -> Result<AppleIntelligenceDraft, AppleIntelligenceError> {
+    if !reply.ok {
+        return Err(AppleIntelligenceError::new(
+            reply.code.as_deref().unwrap_or("worker_error"),
+            reply
+                .message
+                .unwrap_or_else(|| "The on-device model could not finish.".to_string()),
+        ));
+    }
+    let wants = |name: &str| fields.iter().any(|field| field == name);
+    let mut draft = AppleIntelligenceDraft {
+        rationale: reply.rationale.unwrap_or_default(),
+        ..Default::default()
+    };
+    for (name, value) in [("title", reply.title), ("description", reply.description)] {
+        let trimmed = value
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        if wants(name) {
+            let Some(text) = trimmed else {
+                return Err(AppleIntelligenceError::new(
+                    "worker_error",
+                    format!("The on-device model returned no {name}."),
+                ));
+            };
+            if name == "title" && text.chars().count() > 300 {
+                return Err(AppleIntelligenceError::new(
+                    "worker_error",
+                    "The on-device model returned a title that is too long.",
+                ));
+            }
+            match name {
+                "title" => draft.title = Some(text),
+                _ => draft.description = Some(text),
+            }
+        } else if trimmed.is_some() {
+            return Err(AppleIntelligenceError::new(
+                "worker_error",
+                format!("The on-device model returned a {name} that was not requested."),
+            ));
+        }
+    }
+    Ok(draft)
+}
+
+#[cfg(apple_intelligence)]
+mod bridge {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int};
+
+    unsafe extern "C" {
+        fn gitpulse_apple_intelligence_status() -> *mut c_char;
+        fn gitpulse_apple_intelligence_generate(
+            request: *const c_char,
+            timeout_ms: c_int,
+        ) -> *mut c_char;
+        fn gitpulse_apple_intelligence_free(pointer: *mut c_char);
+    }
+
+    /// Copies a bridge string out and frees the original.
+    ///
+    /// The Swift side allocates with `strdup`, so it must be released through
+    /// the matching free — never Rust's allocator, and never left to leak on
+    /// the error path, which is why the copy happens before any parsing.
+    fn take(pointer: *mut c_char) -> Option<String> {
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: the bridge returns either null or a NUL-terminated string it
+        // allocated with `strdup`, and this is the only place that frees one.
+        let owned = unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { gitpulse_apple_intelligence_free(pointer) };
+        Some(owned)
+    }
+
+    pub fn status() -> Option<String> {
+        take(unsafe { gitpulse_apple_intelligence_status() })
+    }
+
+    pub fn generate(request: &str, timeout_ms: i32) -> Option<String> {
+        let encoded = CString::new(request).ok()?;
+        take(unsafe { gitpulse_apple_intelligence_generate(encoded.as_ptr(), timeout_ms) })
+    }
+}
+
+/// Whether Apple Intelligence can write a task on this Mac, right now.
+#[cfg(apple_intelligence)]
+pub fn status() -> AppleIntelligenceStatus {
+    let Some(raw) = bridge::status() else {
+        return AppleIntelligenceStatus {
+            compiled: true,
+            state: "unavailable".to_string(),
+            reason: Some("worker_error".to_string()),
+            detail: "The Apple Intelligence bridge returned nothing.".to_string(),
+        };
+    };
+    serde_json::from_str(&raw).unwrap_or_else(|error| AppleIntelligenceStatus {
+        compiled: true,
+        state: "unavailable".to_string(),
+        reason: Some("worker_error".to_string()),
+        detail: format!("The Apple Intelligence bridge returned an unreadable status: {error}"),
     })
 }
 
-/// Runs one on-device generation, bounded by [`GENERATION_TIMEOUT_MS`].
-///
-/// Blocks the calling thread, so callers must be off the UI thread.
-pub fn generate(instructions: &str, prompt: &str) -> Result<Draft, String> {
-    #[cfg(not(apple_intelligence))]
-    {
-        let _ = (instructions, prompt);
-        Err(availability().explain())
-    }
-    #[cfg(apple_intelligence)]
-    {
-        // Interior NULs cannot cross a C string boundary. Refusing here beats
-        // silently truncating the prompt, which would spend a model call on
-        // less context than the caller believes it sent.
-        let instructions = CString::new(instructions)
-            .map_err(|_| "Instructions contain an interior NUL byte.".to_string())?;
-        let prompt = CString::new(prompt)
-            .map_err(|_| "The prompt contains an interior NUL byte.".to_string())?;
-        // SAFETY: both pointers stay alive for the call, and the reply is either
-        // null or a `strdup` string this process owns.
-        let raw = unsafe {
-            gitpulse_apple_generate(
-                instructions.as_ptr(),
-                prompt.as_ptr(),
-                GENERATION_TIMEOUT_MS,
-            )
-        };
-        let text = take_swift_string(raw)
-            .ok_or_else(|| "The on-device bridge returned no reply.".to_string())?;
-        parse_generation(&text)
-    }
+#[cfg(not(apple_intelligence))]
+pub fn status() -> AppleIntelligenceStatus {
+    AppleIntelligenceStatus::not_compiled(if cfg!(target_os = "macos") {
+        "This build has no Apple Intelligence support: it was compiled against an SDK without the Foundation Models framework."
+    } else {
+        "Apple Intelligence is a macOS feature."
+    })
 }
 
-/// Reports on-device generation availability to the frontend.
-///
-/// A command rather than a field on `cmd_host_platform`, because this answer
-/// genuinely changes while the app runs: `model_not_ready` becomes available
-/// once the download finishes, and Apple Intelligence can be switched off in
-/// System Settings. A session-long cache would strand the reader on a stale no.
-#[tauri::command]
-pub fn cmd_apple_intelligence_status() -> AppleIntelligenceStatus {
-    let state = availability();
-    AppleIntelligenceStatus {
-        explanation: state.explain(),
-        available: state.is_available(),
-        state,
+/// Runs one on-device generation.
+#[cfg(apple_intelligence)]
+pub fn generate(
+    request: &AppleIntelligenceRequest,
+) -> Result<AppleIntelligenceDraft, AppleIntelligenceError> {
+    validate(request)?;
+    let current = status();
+    if !current.ready() {
+        return Err(AppleIntelligenceError::new(
+            current.reason.as_deref().unwrap_or("unavailable"),
+            current.detail,
+        ));
     }
+    let encoded = serde_json::to_string(request)
+        .map_err(|error| AppleIntelligenceError::new("invalid_input", error.to_string()))?;
+    let timeout = i32::try_from(GENERATION_TIMEOUT.as_millis()).unwrap_or(i32::MAX);
+    let raw = bridge::generate(&encoded, timeout).ok_or_else(|| {
+        AppleIntelligenceError::new(
+            "worker_error",
+            "The Apple Intelligence bridge returned nothing.",
+        )
+    })?;
+    let reply: BridgeReply = serde_json::from_str(&raw).map_err(|error| {
+        AppleIntelligenceError::new(
+            "worker_error",
+            format!("The Apple Intelligence bridge returned an unreadable reply: {error}"),
+        )
+    })?;
+    interpret(reply, &request.fields)
 }
 
-/// The availability answer plus its reader-facing sentence.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct AppleIntelligenceStatus {
-    /// True only when a generation can run right now.
-    pub available: bool,
-    /// Which of the distinct causes applies.
-    pub state: AppleAvailability,
-    /// The sentence to show, already specific to the cause.
-    pub explanation: String,
+#[cfg(not(apple_intelligence))]
+pub fn generate(
+    request: &AppleIntelligenceRequest,
+) -> Result<AppleIntelligenceDraft, AppleIntelligenceError> {
+    validate(request)?;
+    let current = status();
+    Err(AppleIntelligenceError::new(
+        current.reason.as_deref().unwrap_or("not_compiled"),
+        current.detail,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The status envelope must agree with itself: `available` is derived from
-    /// the same state the explanation describes, so the two cannot disagree.
-    #[test]
-    fn the_status_envelope_is_self_consistent() {
-        let status = cmd_apple_intelligence_status();
-        assert_eq!(status.available, status.state.is_available());
-        assert_eq!(status.explanation, status.state.explain());
-        assert!(!status.explanation.trim().is_empty());
-    }
-
-    #[test]
-    fn parses_an_available_reply() {
-        assert_eq!(
-            parse_availability(r#"{"available":true,"reason":null}"#),
-            AppleAvailability::Available
-        );
-    }
-
-    /// Each framework reason must survive to the UI verbatim, because each one
-    /// asks the reader to do something different.
-    #[test]
-    fn keeps_each_framework_reason_distinct() {
-        for reason in [
-            "device_not_eligible",
-            "apple_intelligence_not_enabled",
-            "model_not_ready",
-            "os_too_old",
-            "framework_missing",
-        ] {
-            let parsed =
-                parse_availability(&format!(r#"{{"available":false,"reason":"{reason}"}}"#));
-            assert_eq!(
-                parsed,
-                AppleAvailability::Unavailable {
-                    reason: reason.into()
-                }
-            );
-            assert!(!parsed.is_available());
+    fn request() -> AppleIntelligenceRequest {
+        AppleIntelligenceRequest {
+            kind: "draft".to_string(),
+            fields: vec!["title".to_string(), "description".to_string()],
+            notes: "the board menu cannot set a due date".to_string(),
+            title: String::new(),
+            description: String::new(),
+            context: "Repository: GitPulse".to_string(),
         }
-        // And the sentences differ, or the distinction is lost on the way out.
-        let explanations: std::collections::HashSet<String> = [
-            "device_not_eligible",
-            "apple_intelligence_not_enabled",
-            "model_not_ready",
-            "os_too_old",
-            "framework_missing",
-        ]
-        .into_iter()
-        .map(|reason| {
-            AppleAvailability::Unavailable {
-                reason: reason.into(),
-            }
-            .explain()
-        })
-        .collect();
-        assert_eq!(explanations.len(), 5, "reasons collapsed into one message");
     }
 
-    /// The invariant this module exists to protect: a build without the bridge,
-    /// a non-macOS host, and a framework refusal must never read alike.
     #[test]
-    fn the_three_negatives_never_collapse() {
-        let states = [
-            AppleAvailability::NotCompiled,
-            AppleAvailability::UnsupportedOs { os: "windows" },
-            AppleAvailability::Unavailable {
-                reason: "device_not_eligible".into(),
-            },
-        ];
-        let messages: std::collections::HashSet<String> =
-            states.iter().map(AppleAvailability::explain).collect();
-        assert_eq!(messages.len(), 3, "distinct causes produced one message");
-        for state in &states {
-            assert!(!state.is_available());
-        }
-        // "Not compiled" is a statement about the build, so it must not blame
-        // the machine or the OS.
-        let not_compiled = AppleAvailability::NotCompiled.explain();
-        assert!(not_compiled.contains("build"), "{not_compiled}");
+    fn status_always_says_which_of_the_three_negatives_it_means() {
+        let current = status();
         assert!(
-            !not_compiled.contains("Mac does not support"),
-            "{not_compiled}"
+            matches!(
+                current.state.as_str(),
+                "available" | "unavailable" | "unsupported_os"
+            ),
+            "unexpected state {current:?}"
         );
-    }
-
-    #[test]
-    fn unreadable_or_missing_replies_are_unavailable() {
-        for text in ["", "not json", "{}", "[]", r#"{"available":"yes"}"#, "null"] {
-            assert!(
-                !parse_availability(text).is_available(),
-                "{text} read as available"
-            );
+        assert!(
+            !current.detail.trim().is_empty(),
+            "every state explains itself"
+        );
+        assert_eq!(current.ready(), current.state == "available");
+        // A build without the bridge must never look like a Mac that said no.
+        if !current.compiled {
+            assert_eq!(current.reason.as_deref(), Some("not_compiled"));
+            assert_ne!(current.state, "unavailable");
         }
     }
 
-    /// An absent `reason` must still produce an unavailable answer rather than
-    /// defaulting to available.
     #[test]
-    fn an_unavailable_reply_without_a_reason_stays_unavailable() {
-        assert_eq!(
-            parse_availability(r#"{"available":false,"reason":null}"#),
-            AppleAvailability::Unavailable {
-                reason: "unknown".into()
-            }
-        );
+    fn refuses_a_request_it_should_not_send() {
+        for (mutate, code) in [
+            (
+                Box::new(|r: &mut AppleIntelligenceRequest| r.kind = "summarize".into())
+                    as Box<dyn Fn(&mut AppleIntelligenceRequest)>,
+                "invalid_input",
+            ),
+            (
+                Box::new(|r: &mut AppleIntelligenceRequest| r.fields.clear()),
+                "invalid_input",
+            ),
+            (
+                Box::new(|r: &mut AppleIntelligenceRequest| r.fields = vec!["owner".into()]),
+                "invalid_input",
+            ),
+            (
+                Box::new(|r: &mut AppleIntelligenceRequest| {
+                    r.fields = vec!["title".into(), "title".into()]
+                }),
+                "invalid_input",
+            ),
+            (
+                Box::new(|r: &mut AppleIntelligenceRequest| {
+                    r.notes = String::new();
+                    r.context = "x".into();
+                }),
+                "invalid_input",
+            ),
+            (
+                Box::new(|r: &mut AppleIntelligenceRequest| {
+                    r.notes = "x".repeat(MAX_INPUT_CHARS + 1)
+                }),
+                "too_large",
+            ),
+        ] {
+            let mut input = request();
+            mutate(&mut input);
+            assert_eq!(validate(&input).unwrap_err().code, code, "{input:?}");
+        }
+        assert!(validate(&request()).is_ok());
     }
 
-    fn draft(title: &str, description: &str) -> Draft {
-        Draft {
-            title: title.into(),
-            description: description.into(),
-            rationale: "because".into(),
+    #[test]
+    fn counts_characters_rather_than_bytes_so_prose_is_not_penalised() {
+        let mut input = request();
+        // 11 999 astral characters is 48 KB of UTF-8 and still one under the cap.
+        input.notes = "𝄞".repeat(MAX_INPUT_CHARS - 12);
+        input.context = "x".repeat(12);
+        assert_eq!(validate(&input).unwrap(), MAX_INPUT_CHARS);
+        input.context.push('x');
+        assert_eq!(validate(&input).unwrap_err().code, "too_large");
+    }
+
+    fn reply(title: Option<&str>, description: Option<&str>) -> BridgeReply {
+        BridgeReply {
+            ok: true,
+            code: None,
+            message: None,
+            title: title.map(str::to_string),
+            description: description.map(str::to_string),
+            rationale: Some("on device".to_string()),
         }
     }
 
-    fn requested(fields: &[&str]) -> Vec<String> {
-        fields.iter().map(|f| (*f).to_string()).collect()
+    #[test]
+    fn keeps_a_proposal_to_the_fields_that_were_requested() {
+        let only_title = vec!["title".to_string()];
+        let draft = interpret(reply(Some("Fix the menu"), None), &only_title).unwrap();
+        assert_eq!(draft.title.as_deref(), Some("Fix the menu"));
+        assert_eq!(draft.description, None);
+        // The store refuses a proposal that changes an unrequested field, and
+        // it refuses it after the model has already run. Catch it here.
+        let extra = interpret(reply(Some("Fix the menu"), Some("Also this")), &only_title);
+        assert_eq!(extra.unwrap_err().code, "worker_error");
+        // Blank is the same as missing: `enhancements.complete` rejects an
+        // empty title, so an empty one must not travel as a success.
+        assert_eq!(
+            interpret(reply(Some("   "), None), &only_title)
+                .unwrap_err()
+                .code,
+            "worker_error"
+        );
+        assert_eq!(
+            interpret(reply(None, None), &only_title).unwrap_err().code,
+            "worker_error"
+        );
     }
 
     #[test]
-    fn publishes_exactly_the_requested_fields() {
-        let value = draft("A title", "Some prose.");
+    fn refuses_a_title_the_store_would_refuse() {
+        let fields = vec!["title".to_string()];
+        let long = "t".repeat(301);
         assert_eq!(
-            value.proposal_for(&requested(&["title"])).unwrap(),
-            vec![("title", "A title".to_string())]
+            interpret(reply(Some(&long), None), &fields)
+                .unwrap_err()
+                .code,
+            "worker_error"
         );
+        let exact = "t".repeat(300);
         assert_eq!(
-            value.proposal_for(&requested(&["description"])).unwrap(),
-            vec![("description", "Some prose.".to_string())]
-        );
-        assert_eq!(
-            value
-                .proposal_for(&requested(&["title", "description"]))
+            interpret(reply(Some(&exact), None), &fields)
                 .unwrap()
-                .len(),
-            2
+                .title
+                .unwrap()
+                .chars()
+                .count(),
+            300
         );
     }
 
-    /// Accepting a proposal applies it to the task, so a blank value for a
-    /// requested field would erase prose the reader wrote. It must fail loudly
-    /// instead, and the store would refuse it anyway.
     #[test]
-    fn refuses_a_blank_value_for_a_requested_field() {
-        for (title, description, field) in [
-            ("", "prose", "title"),
-            ("   ", "prose", "title"),
-            ("title", "", "description"),
-            ("title", " \n ", "description"),
-        ] {
-            let error = draft(title, description)
-                .proposal_for(&requested(&["title", "description"]))
-                .expect_err("a blank requested field must not publish");
-            assert!(error.contains(field), "{error} should name {field}");
-            assert!(
-                error.contains("erase"),
-                "{error} should say what is at risk"
-            );
-        }
-    }
-
-    /// A blank value in a field nobody asked for is irrelevant — it is not sent.
-    #[test]
-    fn ignores_a_blank_value_in_an_unrequested_field() {
+    fn carries_the_bridge_failure_code_instead_of_flattening_it() {
+        let failed = BridgeReply {
+            ok: false,
+            code: Some("refused".to_string()),
+            message: Some("Apple Intelligence declined.".to_string()),
+            title: None,
+            description: None,
+            rationale: None,
+        };
+        let error = interpret(failed, &["title".to_string()]).unwrap_err();
+        assert_eq!(error.code, "refused");
+        assert_eq!(error.message, "Apple Intelligence declined.");
+        let bare = BridgeReply {
+            ok: false,
+            code: None,
+            message: None,
+            title: None,
+            description: None,
+            rationale: None,
+        };
         assert_eq!(
-            draft("A title", "")
-                .proposal_for(&requested(&["title"]))
-                .unwrap(),
-            vec![("title", "A title".to_string())]
+            interpret(bare, &["title".to_string()]).unwrap_err().code,
+            "worker_error"
         );
     }
 
-    /// The store refuses a title over 300 characters, and a refused completion
-    /// strands the proposal in `pending`. Catch it here, where the cause can be
-    /// named, and publish a failure instead.
     #[test]
-    fn refuses_a_title_longer_than_the_store_allows() {
-        let long = "x".repeat(Draft::MAX_TITLE_CHARS + 1);
-        let error = draft(&long, "prose")
-            .proposal_for(&requested(&["title"]))
-            .expect_err("an over-long title must not publish");
-        assert!(
-            error.contains(&(Draft::MAX_TITLE_CHARS + 1).to_string()),
-            "{error}"
-        );
-
-        // Exactly at the limit is allowed: the prompt asks for 80, but the guide
-        // is a preference and the store's bound is the contract.
-        let exact = "y".repeat(Draft::MAX_TITLE_CHARS);
-        assert!(draft(&exact, "prose")
-            .proposal_for(&requested(&["title"]))
-            .is_ok());
-    }
-
-    /// Counted in characters, not bytes: a 300-emoji title is within the store's
-    /// limit even though it is far more than 300 bytes.
-    #[test]
-    fn measures_the_title_in_characters_not_bytes() {
-        let emoji = "🙂".repeat(Draft::MAX_TITLE_CHARS);
-        assert!(emoji.len() > Draft::MAX_TITLE_CHARS);
-        assert!(draft(&emoji, "prose")
-            .proposal_for(&requested(&["title"]))
-            .is_ok());
-    }
-
-    #[test]
-    fn refuses_a_proposal_with_nothing_to_publish() {
-        assert!(draft("t", "d").proposal_for(&[]).is_err());
-        assert!(draft("t", "d")
-            .proposal_for(&requested(&["owner"]))
-            .is_err());
-    }
-
-    #[test]
-    fn parses_a_generated_draft() {
-        let draft = parse_generation(
-            r#"{"ok":true,"title":"Gate the Dock toggle","description":"Hide it off macOS.","rationale":"The policy path is macOS-only."}"#,
-        )
-        .expect("a draft");
-        assert_eq!(draft.title, "Gate the Dock toggle");
-        assert_eq!(draft.description, "Hide it off macOS.");
-        assert_eq!(draft.rationale, "The policy path is macOS-only.");
-    }
-
-    #[test]
-    fn surfaces_a_failure_reason_verbatim() {
-        let error = parse_generation(r#"{"ok":false,"failure":"exceeded its 90000 ms budget"}"#)
-            .expect_err("a failure");
-        assert!(error.contains("90000 ms"), "{error}");
-    }
-
-    #[test]
-    fn a_failure_without_a_reason_still_fails() {
-        for text in [r#"{"ok":false}"#, r#"{"ok":false,"failure":"  "}"#] {
-            assert!(parse_generation(text).is_err(), "{text} parsed as success");
-        }
-    }
-
-    /// A success with no usable title would be refused by the store anyway; the
-    /// error belongs here, where it can name the cause.
-    #[test]
-    fn a_success_without_a_title_is_an_error() {
-        for text in [
-            r#"{"ok":true}"#,
-            r#"{"ok":true,"title":""}"#,
-            r#"{"ok":true,"title":"   "}"#,
-        ] {
-            assert!(parse_generation(text).is_err(), "{text} parsed as a draft");
-        }
-    }
-
-    #[test]
-    fn a_draft_may_omit_the_optional_prose() {
-        let draft = parse_generation(r#"{"ok":true,"title":"Only a title"}"#).expect("a draft");
-        assert_eq!(draft.description, "");
-        assert_eq!(draft.rationale, "");
-    }
-
-    #[test]
-    fn unreadable_generation_replies_are_errors() {
-        for text in ["", "not json", "[]"] {
-            assert!(parse_generation(text).is_err(), "{text} parsed as a draft");
-        }
-    }
-
-    /// On a host with the bridge compiled in, availability must resolve to a
-    /// real answer rather than a bridge-level fault.
-    #[cfg(apple_intelligence)]
-    #[test]
-    fn the_compiled_bridge_answers() {
-        let state = availability();
-        assert!(
-            !matches!(&state, AppleAvailability::Unavailable { reason }
-                if reason == "bridge_returned_nothing" || reason == "bridge_reply_unreadable"),
-            "the linked bridge failed to answer: {state:?}"
-        );
-        assert!(!matches!(state, AppleAvailability::NotCompiled));
-    }
-
-    #[cfg(not(apple_intelligence))]
-    #[test]
-    fn a_bridge_less_build_says_so_without_blaming_the_host() {
-        let state = availability();
-        if cfg!(target_os = "macos") {
-            assert_eq!(state, AppleAvailability::NotCompiled);
+    fn generation_matches_what_status_reports() {
+        // The one invariant that holds on every host: a module that says it is
+        // not ready must not also produce a draft, and one that says it is
+        // ready must not fail for a reason that means "not ready".
+        let current = status();
+        let result = generate(&request());
+        if current.ready() {
+            if let Err(error) = &result {
+                assert!(
+                    !matches!(error.code.as_str(), "not_compiled" | "unsupported_os"),
+                    "a ready host failed with {error:?}"
+                );
+            }
         } else {
-            assert!(matches!(state, AppleAvailability::UnsupportedOs { .. }));
+            let error = result.expect_err("an unready host must not produce a draft");
+            assert_eq!(error.code, current.reason.unwrap_or_default());
         }
-        assert!(generate("i", "p").is_err());
     }
 }

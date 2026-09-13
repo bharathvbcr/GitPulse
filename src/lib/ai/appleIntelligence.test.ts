@@ -1,161 +1,136 @@
 import { describe, expect, it } from "vitest";
-import type { HostOS } from "../platform";
 import {
-  parseAppleStatus,
-  showsAppleOption,
-  unknownAppleStatus,
+  MAX_APPLE_INPUT_CHARS,
+  appleBadge,
+  appleContext,
+  appleErrorCode,
+  appleGate,
+  appleReady,
+  explainAppleError,
+  isAppleStatus,
   type AppleIntelligenceStatus,
 } from "./appleIntelligence";
 
-const ok: AppleIntelligenceStatus = {
-  available: true,
-  state: { state: "available" },
-  explanation: "On-device drafting is ready.",
+const available: AppleIntelligenceStatus = {
+  compiled: true,
+  state: "available",
+  reason: null,
+  detail: "The on-device model is ready. Nothing leaves this Mac.",
 };
 
-describe("the pre-probe answer", () => {
-  /**
-   * Denying is the only safe default. Offering on-device drafting because the
-   * probe has not answered yet would put the reader through a generation that
-   * cannot run.
-   */
-  it("denies availability on every host", () => {
-    for (const os of ["macos", "windows", "linux", "unknown"] as HostOS[]) {
-      expect(unknownAppleStatus(os).available).toBe(false);
+const request = {
+  fields: ["title", "description"],
+  notes: "the board menu cannot set a due date",
+  title: "",
+  description: "",
+  context: "Repository: GitPulse",
+};
+
+describe("isAppleStatus", () => {
+  it("accepts only the shape the command actually returns", () => {
+    expect(isAppleStatus(available)).toBe(true);
+    expect(isAppleStatus({ ...available, reason: "model_not_ready" })).toBe(true);
+    for (const bad of [
+      null,
+      undefined,
+      "available",
+      { ...available, state: "ready" },
+      { ...available, compiled: "true" },
+      { ...available, reason: 7 },
+      { ...available, detail: null },
+      {},
+    ]) {
+      expect(isAppleStatus(bad), JSON.stringify(bad)).toBe(false);
     }
-  });
-
-  it("does not blame a Mac for a probe that has not finished", () => {
-    const status = unknownAppleStatus("macos");
-    expect(status.state.state).toBe("unavailable");
-    expect(status.explanation).toMatch(/Checking/);
-    expect(status.explanation).not.toMatch(/does not support/);
-  });
-
-  it("names the platform on a host that can never support it", () => {
-    const status = unknownAppleStatus("windows");
-    expect(status.state).toEqual({ state: "unsupported_os", os: "windows" });
-    expect(status.explanation).toMatch(/windows/);
   });
 });
 
-describe("parsing the status envelope", () => {
-  it("accepts a well-formed available reply", () => {
-    const parsed = parseAppleStatus(
-      { available: true, state: { state: "available" }, explanation: "Ready." },
-      "macos",
-    );
-    expect(parsed.available).toBe(true);
-    expect(parsed.explanation).toBe("Ready.");
+describe("appleBadge", () => {
+  it("keeps the three kinds of no apart", () => {
+    // A reader can act on two of these and not on the third. One shared word
+    // would send someone to System Settings to fix their build.
+    expect(appleBadge(available)).toBe("On this Mac");
+    expect(appleBadge({ compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "x" })).toBe("Not in this build");
+    expect(appleBadge({ compiled: true, state: "unavailable", reason: "apple_intelligence_not_enabled", detail: "x" })).toBe("Turned off");
+    expect(appleBadge({ compiled: true, state: "unavailable", reason: "model_not_ready", detail: "x" })).toBe("Preparing");
+    expect(appleBadge({ compiled: true, state: "unavailable", reason: "device_not_eligible", detail: "x" })).toBe("Unsupported Mac");
+    // A reason this version has never heard of still gets an honest word.
+    expect(appleBadge({ compiled: true, state: "unavailable", reason: "invented_later", detail: "x" })).toBe("Unavailable");
+    expect(appleBadge(null)).toBe("");
   });
 
-  it("keeps each unavailable cause distinguishable", () => {
-    const notCompiled = parseAppleStatus(
-      { available: false, state: { state: "not_compiled" }, explanation: "No bridge." },
-      "macos",
-    );
-    expect(notCompiled.state.state).toBe("not_compiled");
+  it("treats a missing status as not ready", () => {
+    expect(appleReady(null)).toBe(false);
+    expect(appleReady({ compiled: true, state: "unavailable", reason: null, detail: "" })).toBe(false);
+    expect(appleReady(available)).toBe(true);
+  });
+});
 
-    const refused = parseAppleStatus(
-      {
-        available: false,
-        state: { state: "unavailable", reason: "apple_intelligence_not_enabled" },
-        explanation: "Turn it on.",
-      },
-      "macos",
-    );
-    expect(refused.state).toEqual({
+describe("appleContext", () => {
+  it("carries only facts the task already holds", () => {
+    expect(appleContext({ kind: "bug", repositories: ["GitPulse", "Manvi"], labels: ["ci", "flake"] }))
+      .toBe("Repository: GitPulse, Manvi. Task type: bug. Labels: ci, flake");
+    expect(appleContext({})).toBe("");
+    expect(appleContext({ repositories: ["", "  "], labels: [" "] })).toBe("");
+  });
+
+  it("bounds what it will hand to the model", () => {
+    const many = Array.from({ length: 40 }, (_, i) => `repo-${i}`);
+    const labels = Array.from({ length: 40 }, (_, i) => `label-${i}`);
+    const context = appleContext({ repositories: many, labels });
+    expect(context).toContain("repo-7");
+    expect(context).not.toContain("repo-8");
+    expect(context).toContain("label-11");
+    expect(context).not.toContain("label-12");
+  });
+});
+
+describe("appleGate", () => {
+  it("will not pretend to know before the status arrives", () => {
+    expect(appleGate(null, request)).toEqual({ ok: false, reason: "Checking Apple Intelligence…" });
+  });
+
+  it("repeats the framework's own reason rather than inventing one", () => {
+    const off: AppleIntelligenceStatus = {
+      compiled: true,
       state: "unavailable",
       reason: "apple_intelligence_not_enabled",
-    });
-    expect(notCompiled.state.state).not.toBe(refused.state.state);
+      detail: "Turn on Apple Intelligence in System Settings to use it here.",
+    };
+    expect(appleGate(off, request)).toEqual({ ok: false, reason: off.detail });
   });
 
-  /**
-   * `available: true` with a state that is not `available` is a backend fault.
-   * The safe reading of a fault is "not available", never the optimistic one.
-   */
-  it("refuses a reply whose flag contradicts its state", () => {
-    const parsed = parseAppleStatus(
-      { available: true, state: { state: "not_compiled" }, explanation: "Contradiction." },
-      "macos",
-    );
-    expect(parsed.available).toBe(false);
+  it("refuses an empty ask and an empty task", () => {
+    expect(appleGate(available, { ...request, fields: [] }).reason).toBe("Choose a field to write.");
+    expect(appleGate(available, { ...request, notes: "   " }).reason).toBe("Write some notes first.");
+    // A title alone is enough to improve; the model is not given the repo.
+    expect(appleGate(available, { ...request, notes: "", title: "Fix the menu" }).ok).toBe(true);
   });
 
-  it.each([
-    ["null", null],
-    ["a string", "available"],
-    ["an empty object", {}],
-    ["a missing state", { available: true, explanation: "x" }],
-    ["an unknown state tag", { available: true, state: { state: "maybe" }, explanation: "x" }],
-    ["a truthy non-boolean flag", { available: "yes", state: { state: "available" }, explanation: "x" }],
-  ])("denies availability given %s", (_label, value) => {
-    expect(parseAppleStatus(value, "macos").available).toBe(false);
+  it("counts characters, not bytes, exactly as the Rust side does", () => {
+    const astral = "𝄞".repeat(MAX_APPLE_INPUT_CHARS - 1);
+    expect(appleGate(available, { ...request, notes: astral, context: "" }).ok).toBe(true);
+    expect(appleGate(available, { ...request, notes: astral + "𝄞𝄞", context: "" }).ok).toBe(false);
+    expect(appleGate(available, { ...request, notes: astral + "𝄞𝄞", context: "" }).reason).toContain("12,000");
   });
 
-  it("falls back to a real sentence when the explanation is blank", () => {
-    const parsed = parseAppleStatus(
-      { available: false, state: { state: "not_compiled" }, explanation: "   " },
-      "macos",
-    );
-    expect(parsed.explanation.trim().length).toBeGreaterThan(0);
+  it("passes a task that fits", () => {
+    expect(appleGate(available, request)).toEqual({ ok: true, reason: "" });
   });
 });
 
-describe("whether the option is offered", () => {
-  it("offers it on a Mac that is ready", () => {
-    expect(showsAppleOption("macos", ok)).toBe(true);
+describe("explainAppleError", () => {
+  it("keeps the command's coded refusal intact", () => {
+    const refusal = { code: "refused", message: "Apple Intelligence declined to write this." };
+    expect(explainAppleError(refusal)).toBe(refusal.message);
+    expect(appleErrorCode(refusal)).toBe("refused");
   });
 
-  /**
-   * On macOS the reason is usually actionable — Apple Intelligence switched off,
-   * or a model still downloading — so the control stays visible to carry it.
-   */
-  it("still offers it on a Mac where the reason is actionable", () => {
-    for (const reason of ["apple_intelligence_not_enabled", "model_not_ready"]) {
-      expect(
-        showsAppleOption("macos", {
-          available: false,
-          state: { state: "unavailable", reason },
-          explanation: "…",
-        }),
-      ).toBe(true);
-    }
-  });
-
-  it("hides it on every non-macOS host", () => {
-    for (const os of ["windows", "linux", "unknown"] as HostOS[]) {
-      expect(showsAppleOption(os, ok)).toBe(false);
-      expect(
-        showsAppleOption(os, {
-          available: false,
-          state: { state: "unsupported_os", os },
-          explanation: "…",
-        }),
-      ).toBe(false);
-    }
-  });
-
-  /** A build with no bridge cannot be fixed from a per-task control. */
-  it("hides it when this build has no bridge", () => {
-    expect(
-      showsAppleOption("macos", {
-        available: false,
-        state: { state: "not_compiled" },
-        explanation: "…",
-      }),
-    ).toBe(false);
-  });
-
-  /** A backend that reports unsupported_os outranks the webview's guess. */
-  it("hides it when the backend says the OS is unsupported, even if the webview says macOS", () => {
-    expect(
-      showsAppleOption("macos", {
-        available: false,
-        state: { state: "unsupported_os", os: "linux" },
-        explanation: "…",
-      }),
-    ).toBe(false);
+  it("still says something useful for anything else", () => {
+    expect(explainAppleError(new Error("boom"))).toBe("boom");
+    expect(explainAppleError(null)).toBe("Apple Intelligence could not finish.");
+    expect(explainAppleError({ message: "   " })).toBe("Apple Intelligence could not finish.");
+    expect(appleErrorCode(new Error("boom"))).toBe("worker_error");
+    expect(appleErrorCode({ code: "" })).toBe("worker_error");
   });
 });

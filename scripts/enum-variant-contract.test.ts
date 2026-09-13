@@ -285,13 +285,23 @@ describe("Svelte enum contract extraction", () => {
   });
 });
 
-describe("serde enum variants match their TypeScript unions", () => {
+// Every case in this block parses the whole Rust and TypeScript tree. Under
+// `--coverage` the parsing modules are instrumented as well, which measured
+// ~2x for this file (18.7 s -> 29.8 s), so vitest's 5 s default fails cases
+// that assert nothing about speed. The budget is set here rather than
+// globally: a slow test elsewhere should still be loud.
+describe("serde enum variants match their TypeScript unions", { timeout: 30_000 }, () => {
   const enums = rustEnums();
 
   it("finds the enums to check at all", () => {
     expect(enums.size).toBeGreaterThan(8);
   });
 
+  // Each of these runs a whole-tree checker twice. Under `--coverage` the
+  // checker modules are instrumented too, which measured ~2x here
+  // (18.7 s -> 29.8 s for this file), so vitest's 5 s default fails a case that
+  // asserts nothing about speed. The budget is explicit rather than
+  // global: a slow test elsewhere should still be loud.
   it("spells every unit variant the same on both sides", () => {
     const drift: string[] = [];
     for (const [name, { unit, tag }] of enums) {
