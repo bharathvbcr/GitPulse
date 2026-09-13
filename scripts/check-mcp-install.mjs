@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 /**
- * MCP install doctor — is the `gitpulse-mcp` an agent would actually launch
- * the one this repo builds?
+ * Agent install doctor — are the executables an agent would actually launch
+ * the ones this repo builds?
+ *
+ * Two of them, because the plugin ships two. `.mcp.json` spawns
+ * `gitpulse-mcp`; `hooks/hooks.json` spawns `gitpulse-hook` for the collision
+ * guard, the command gate and the session brief. Checking only the server is
+ * how this doctor came to report `ok` on a machine where every hook the plugin
+ * declares was a `command not found`: the server's absence shows up as a
+ * failed MCP connection, but a hook that cannot start is a non-blocking error
+ * the host swallows, so the two gates simply stop running and nothing says so.
  *
  * `plugins/gitpulse/mcp.json` and `plugins/gitpulse/.mcp.json` both spawn the bare token
  * `gitpulse-mcp`, resolved off PATH. That indirection is correct for a
@@ -16,22 +24,28 @@
  * purpose — "no binary on PATH" and "binary matches" are the two that a
  * naive check would collapse into one silent pass:
  *
- *   ok           the server reports this repo's version and store schema
- *   stale        it answered, with a different version or store schema
- *   unresponsive it did not provide a usable handshake and schema identity
- *   absent       nothing named gitpulse-mcp is on PATH at all
+ *   ok           it reports this repo's version, and its schema or subcommands
+ *   stale        it answered, with a different version, schema or subcommands
+ *   unresponsive it did not provide a usable identity
+ *   absent       nothing by that name is on PATH at all
  *
- * Not part of `ci:local`: CI has no reason to install the server, and a check
- * that cannot run there must not be made to look like one that passed.
+ * Each binary carries its own verdict and both are printed. They are not
+ * merged into one line: a healthy server reporting a clean pass over silently
+ * disabled hooks is precisely the substitution this file exists to refuse.
+ * The process exit code is the whole package — 0 only when both are ok.
+ *
+ * Not part of `ci:local`: CI has no reason to install either binary, and a
+ * check that cannot run there must not be made to look like one that passed.
  * Refresh with `npm run mcp:install`.
  *
  * Exit codes: 0 ok · 1 absent/stale/unresponsive · 2 internal error.
  *
  * Flags:
- *   --bin <path>     probe this executable instead of resolving PATH
- *   --expect <ver>   compare against this version instead of package.json
- *   --timeout <ms>   handshake budget (default 10000)
- *   --json           machine-readable result
+ *   --bin <path>       probe this server instead of resolving PATH
+ *   --hook-bin <path>  probe this hook binary instead of resolving PATH
+ *   --expect <ver>     compare against this version instead of package.json
+ *   --timeout <ms>     identity budget (default 10000)
+ *   --json             machine-readable result
  */
 import { spawn } from "node:child_process";
 import { accessSync, constants, readFileSync } from "node:fs";
@@ -44,6 +58,23 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 
 /** The executable name both MCP manifests spawn. */
 export const SERVER_BIN = "gitpulse-mcp";
+
+/**
+ * The executable `plugins/gitpulse/hooks/hooks.json` spawns for every hook.
+ *
+ * It is checked here for the same reason the server is, and a sharper one. The
+ * server's absence is loud: a client that cannot spawn it shows a failed MCP
+ * connection. A hook's absence is silent by design — the host reports a
+ * non-blocking error and lets the tool call proceed, which the Claude Code
+ * hook reference states plainly: "a mistyped path in settings.json leaves the
+ * gate silently disabled". So a repository whose collision guard and command
+ * gate never run looks exactly like one where they ran and found nothing,
+ * which is the single confusion this whole package is built to avoid.
+ */
+export const HOOK_BIN = "gitpulse-hook";
+
+/** Where the shipped hook manifest lives, relative to the repo root. */
+const HOOKS_MANIFEST = path.join("plugins", "gitpulse", "hooks", "hooks.json");
 
 /** Handshake budget. An unresponsive server must fail, never hang a release. */
 export const DEFAULT_TIMEOUT_MS = 10_000;
@@ -290,7 +321,183 @@ export function classify({ binPath, version, storeSchema, error, expected, expec
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[] }} result
+ * The hook subcommands the shipped manifest actually asks a host to spawn.
+ *
+ * Read from `hooks/hooks.json` rather than listed here, so a subcommand added
+ * to the manifest is checked against the installed binary without anyone
+ * remembering to update this file. A manifest that cannot be read is an
+ * internal error, not an empty list: "we could not find out what the manifest
+ * declares" must never be served as "it declares nothing".
+ *
+ * @param {string} [root]
+ * @returns {string[]}
+ */
+export function declaredHookSubcommands(root = REPO_ROOT) {
+  const raw = readFileSync(path.join(root, HOOKS_MANIFEST), "utf8");
+  /** @type {unknown} */
+  const parsed = JSON.parse(raw);
+  if (!isRecord(parsed) || !isRecord(parsed.hooks)) {
+    throw new Error(`${HOOKS_MANIFEST} has no hooks object`);
+  }
+  /** @type {Set<string>} */
+  const found = new Set();
+  for (const groups of Object.values(parsed.hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!isRecord(group) || !Array.isArray(group.hooks)) continue;
+      for (const handler of group.hooks) {
+        if (!isRecord(handler) || typeof handler.command !== "string") continue;
+        const [bin, ...rest] = handler.command.trim().split(/\s+/);
+        if (bin !== HOOK_BIN) continue;
+        for (const word of rest) found.add(word);
+      }
+    }
+  }
+  if (found.size === 0) throw new Error(`${HOOKS_MANIFEST} declares no ${HOOK_BIN} subcommand`);
+  return [...found].sort();
+}
+
+/**
+ * Read `gitpulse-hook --version`: its version, and the subcommands it serves.
+ *
+ * Both halves must be present. A binary that printed one and not the other has
+ * not identified itself, and guessing the missing half is how a partial answer
+ * becomes a clean bill of health.
+ *
+ * @param {string} stdout
+ * @returns {{ version: string | null, subcommands: string[] | null }}
+ */
+export function parseHookIdentity(stdout) {
+  /** @type {string | null} */
+  let version = null;
+  /** @type {string[] | null} */
+  let subcommands = null;
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const versioned = /^gitpulse-hook\s+(\S+)$/.exec(trimmed);
+    if (versioned && version === null) version = versioned[1];
+    const listed = /^subcommands:\s*(.+)$/.exec(trimmed);
+    if (listed && subcommands === null) {
+      subcommands = listed[1]
+        .split(",")
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0)
+        .sort();
+    }
+  }
+  return { version, subcommands };
+}
+
+/**
+ * Ask the hook binary who it is.
+ *
+ * `--version` is the only argument that makes this binary answer at all: every
+ * other invocation is a hook, and silence is a legitimate reply to all of them,
+ * so no hook call can distinguish a working binary from a broken one. stdin is
+ * closed rather than piped — the identity path reads none, and leaving a pipe
+ * open would make this probe hang on a build that does.
+ *
+ * @param {string} binPath
+ * @param {number} timeoutMs
+ * @returns {Promise<{ version: string | null, subcommands: string[] | null, error: string | null }>}
+ */
+export function probeHook(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    // stdin is `null` here by construction: the identity path reads none, and
+    // handing it an open pipe would hang this probe against a build that does.
+    /** @type {import("node:child_process").ChildProcessByStdio<null, import("node:stream").Readable, import("node:stream").Readable>} */
+    let child;
+    try {
+      child = spawn(binPath, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      resolve({ version: null, subcommands: null, error: /** @type {Error} */ (err).message });
+      return;
+    }
+    let stdout = "";
+    let receivedBytes = 0;
+    let settled = false;
+    const finish = (/** @type {{ version: string | null, subcommands: string[] | null, error: string | null }} */ outcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+      resolve(outcome);
+    };
+    const timer = setTimeout(
+      () => finish({ version: null, subcommands: null, error: `no identity response within ${timeoutMs}ms` }),
+      timeoutMs,
+    );
+    child.on("error", (err) => finish({ version: null, subcommands: null, error: err.message }));
+    child.stderr.resume();
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      if (settled) return;
+      receivedBytes += Buffer.byteLength(chunk, "utf8");
+      if (receivedBytes > MAX_RESPONSE_BYTES) {
+        finish({ version: null, subcommands: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
+        return;
+      }
+      stdout += chunk;
+    });
+    // Read to EOF rather than settling on the first chunk: the two identity
+    // lines are not guaranteed to arrive in one write.
+    child.on("close", () => {
+      const { version, subcommands } = parseHookIdentity(stdout);
+      finish({
+        version,
+        subcommands,
+        error: version !== null && subcommands !== null
+          ? null
+          : "binary exited without a complete identity line",
+      });
+    });
+  });
+}
+
+/**
+ * @param {{ binPath: string | null, version: string | null, subcommands: string[] | null, error: string | null, expected: string, declared: string[] }} observed
+ * @returns {{ status: "ok" | "stale" | "unresponsive" | "absent", violations: string[] }}
+ */
+export function classifyHook({ binPath, version, subcommands, error, expected, declared }) {
+  if (binPath === null) {
+    return {
+      status: "absent",
+      violations: [
+        `no ${HOOK_BIN} on PATH — ${HOOKS_MANIFEST} spawns that bare name, so every hook it declares is a non-blocking error and the gate is silently disabled`,
+        "install it with: npm run mcp:install",
+      ],
+    };
+  }
+  if (version === null || subcommands === null) {
+    return {
+      status: "unresponsive",
+      violations: [`${binPath} did not identify itself${error ? ` (${error})` : ""}`],
+    };
+  }
+  if (version !== expected) {
+    return {
+      status: "stale",
+      violations: [
+        `${binPath} reports version ${JSON.stringify(version)} but this tree is ${JSON.stringify(expected)}`,
+        "refresh it with: npm run mcp:install",
+      ],
+    };
+  }
+  const missing = declared.filter((name) => !subcommands.includes(name));
+  if (missing.length > 0) {
+    return {
+      status: "stale",
+      violations: [
+        `${binPath} does not serve ${missing.join(", ")}, which ${HOOKS_MANIFEST} declares — those hooks would run and decide nothing`,
+        "refresh it with: npm run mcp:install",
+      ],
+    };
+  }
+  return { status: "ok", violations: [] };
+}
+
+/**
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] } }} result
  */
 export function formatReport(result) {
   const lines = ["MCP install doctor", ""];
@@ -303,12 +510,34 @@ export function formatReport(result) {
     lines.push("", "  violations:");
     for (const violation of result.violations) lines.push(`    - ${violation}`);
   }
+  const hook = result.hook;
+  if (hook) {
+    lines.push("", `  ${HOOK_BIN}`, "");
+    lines.push(`  ${"executable on PATH".padEnd(26)} : ${hook.binPath ?? "<not found>"}`);
+    lines.push(`  ${"version it reports".padEnd(26)} : ${hook.version ?? "<no identity>"}`);
+    lines.push(`  ${"subcommands it serves".padEnd(26)} : ${hook.subcommands?.join(", ") ?? "<unavailable>"}`);
+    lines.push(`  ${"subcommands hooks.json needs".padEnd(26)} : ${hook.declared.join(", ")}`);
+    if (hook.violations.length > 0) {
+      lines.push("", "  violations:");
+      for (const violation of hook.violations) lines.push(`    - ${violation}`);
+    }
+  }
+  // Each half gets its own verdict line. Collapsing them into one would let a
+  // healthy server report a clean pass over silently disabled hooks, which is
+  // the exact substitution this doctor exists to refuse.
   lines.push(
     "",
     result.status === "ok"
       ? `OK: the ${SERVER_BIN} on PATH matches version ${result.expected} and store schema ${result.expectedSchema}.`
       : `FAIL (${result.status}): the server an agent would connect to is not this tree's build.`,
   );
+  if (hook) {
+    lines.push(
+      hook.status === "ok"
+        ? `OK: the ${HOOK_BIN} on PATH is version ${result.expected} and serves every hook the plugin declares.`
+        : `FAIL (${hook.status}): the hooks the plugin declares would not run against this tree's build.`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -316,6 +545,8 @@ export function formatReport(result) {
 export function parseArgs(argv) {
   /** @type {string | undefined} */
   let bin;
+  /** @type {string | undefined} */
+  let hookBin;
   /** @type {string | undefined} */
   let expect;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
@@ -331,6 +562,7 @@ export function parseArgs(argv) {
     };
     if (arg === "--json") json = true;
     else if (arg === "--bin") bin = path.resolve(next(arg));
+    else if (arg === "--hook-bin") hookBin = path.resolve(next(arg));
     else if (arg === "--expect") expect = next(arg);
     else if (arg === "--timeout") {
       const raw = next(arg);
@@ -341,15 +573,16 @@ export function parseArgs(argv) {
       timeoutMs = parsed;
     } else throw new Error(`unknown argument: ${arg}`);
   }
-  return { bin, expect, timeoutMs, json };
+  return { bin, hookBin, expect, timeoutMs, json };
 }
 
 export function usage() {
   return formatUsage({
     name: "check-mcp-install",
-    summary: `Assert the ${SERVER_BIN} on PATH is the server this tree builds, not a stale copy.`,
+    summary: `Assert the ${SERVER_BIN} and ${HOOK_BIN} on PATH are the ones this tree builds, not stale copies.`,
     flags: [
       { flag: "--bin <path>", description: `probe this executable instead of resolving ${SERVER_BIN} on PATH` },
+      { flag: "--hook-bin <path>", description: `probe this executable instead of resolving ${HOOK_BIN} on PATH` },
       { flag: "--expect <ver>", description: "version to require instead of package.json's" },
       { flag: "--timeout <ms>", description: `handshake budget (default ${DEFAULT_TIMEOUT_MS})` },
       { flag: "--json", description: "print the result as JSON" },
@@ -380,7 +613,34 @@ export async function main(argv = process.argv.slice(2)) {
     const binPath = opts.bin ?? resolveOnPath(SERVER_BIN);
     const probe = binPath === null ? { version: null, storeSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
     const { status, violations } = classify({ binPath, ...probe, expected, expectedSchema });
-    const result = { binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema, status, violations, ok: status === "ok" };
+
+    // Derived from the shipped manifest, so a hook added there is checked
+    // against the installed binary without this file being touched.
+    const declared = declaredHookSubcommands();
+    const hookPath = opts.hookBin ?? resolveOnPath(HOOK_BIN);
+    const hookProbe = hookPath === null
+      ? { version: null, subcommands: null, error: null }
+      : await probeHook(hookPath, opts.timeoutMs);
+    const hookVerdict = classifyHook({ binPath: hookPath, ...hookProbe, expected, declared });
+    const hook = {
+      binPath: hookPath,
+      version: hookProbe.version,
+      subcommands: hookProbe.subcommands,
+      declared,
+      status: hookVerdict.status,
+      violations: hookVerdict.violations,
+      ok: hookVerdict.status === "ok",
+    };
+
+    const result = {
+      binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema,
+      status, violations,
+      // Kept as the server's own verdict so an existing reader of this field
+      // is not silently told something new; `ok` below is the whole package.
+      serverOk: status === "ok",
+      hook,
+      ok: status === "ok" && hook.ok,
+    };
     if (opts.json) console.log(JSON.stringify(result, null, 2));
     else console.log(formatReport(result));
     return result.ok ? 0 : 1;

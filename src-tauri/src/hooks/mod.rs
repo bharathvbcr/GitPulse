@@ -113,10 +113,11 @@ impl HookInput {
     pub fn from_value(value: &Value) -> Self {
         let tool_input = value.get("tool_input");
         // `file_path` is the documented field for Write and Edit and is always
-        // absolute. NotebookEdit is not in the documented `tool_input` table, so
-        // `notebook_path` is a defensive fallback rather than a verified name:
-        // if it is wrong we derive no path and report a non-check, which is the
-        // safe direction to be wrong in.
+        // absolute. `notebook_path` is NotebookEdit's, checked against that
+        // tool's own published input schema rather than the hook reference's
+        // `tool_input` table, which does not list it. Should either name ever
+        // move we derive no path and report a non-check, which is the safe
+        // direction to be wrong in.
         let file_path = string_at(tool_input, "file_path");
         let file_path = if file_path.is_empty() {
             string_at(tool_input, "notebook_path")
@@ -547,12 +548,24 @@ pub fn command_gate_decision(verdict: &PolicyVerdict) -> HookOutput {
             verdict.degraded.join(", ")
         )),
         // Demoted, Granted and Widened are allows that something deliberately
-        // waived. They are left silent on purpose: a hook cannot pass the task
-        // scope that `harness::guard_command` passes (`scope_for` is private to
-        // that module), so an unbound `task.absent` demotion is the *expected*
-        // answer for every command here. Reporting it on every Bash call would
-        // be noise that trains the reader to ignore this channel, which would
-        // cost more honesty than it buys.
+        // waived, and they are left silent on purpose.
+        //
+        // Measured, rather than reasoned about: against `manvi serve` at
+        // posture=host, every command outside the global allowlist comes back
+        // `Demoted` on `command.not_allowed`, waived by
+        // `serve.posture=host: allowlist not enforced (enforce_allowlist=false)`.
+        // That is the standing configuration of this posture, not a fact about
+        // the command — `git status` allows cleanly, `npm test` and `rm -rf /`
+        // both demote — so it fires on nearly every Bash call a session makes.
+        // Reporting it each time would be noise that trains the reader to
+        // ignore this channel, and this channel is where the *real*
+        // non-checks are announced.
+        //
+        // The scope rungs are a separate and additional gap: a hook cannot pass
+        // the task scope `harness::guard_command` passes (`scope_for` is
+        // private to that module), so `scope.unplanned` and friends are never
+        // reached here at all. What this gate does catch is the hard rungs —
+        // force-push and the destructive commands — which refuse above.
         PolicyStatus::Allowed
         | PolicyStatus::Demoted
         | PolicyStatus::Granted
@@ -834,6 +847,37 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
 
 /// Every subcommand `gitpulse-hook` answers to.
 pub const SUBCOMMANDS: [&str; 3] = ["collision-guard", "command-gate", "session-brief"];
+
+/// The arguments that ask this binary who it is instead of running a hook.
+pub const IDENTITY_FLAGS: [&str; 2] = ["--version", "-V"];
+
+/// This build's version, the same string `gitpulse-mcp` reports in its
+/// handshake.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What `gitpulse-hook --version` prints.
+///
+/// `gitpulse-mcp` can be asked what it is over its own protocol, which is what
+/// lets `check-mcp-install` tell a stale server from a current one. A hook
+/// binary had no such channel: a host only ever spawns it with a subcommand, an
+/// unknown subcommand is answered with silence by design, and a hook that
+/// cannot start at all is reported by the host as a non-blocking error while
+/// the tool call proceeds. So an out-of-date — or entirely absent —
+/// `gitpulse-hook` looked exactly like one that ran and found nothing, which is
+/// the confusion the rest of this module exists to prevent, one layer below
+/// where any of its code can see it.
+///
+/// Two lines, because the doctor has two questions. The version answers "is
+/// this the build this tree makes". The subcommand list answers "can the
+/// binary on PATH serve the manifest that ships beside it" — the drift a
+/// source-only contract test cannot see, because it reads the source rather
+/// than whatever executable a host will actually spawn.
+pub fn identity() -> String {
+    format!(
+        "gitpulse-hook {VERSION}\nsubcommands: {}\n",
+        SUBCOMMANDS.join(", ")
+    )
+}
 
 /// Routes one parsed payload to its handler.
 ///
@@ -1822,6 +1866,44 @@ mod tests {
             assert!(
                 dispatch(name, &HookInput::default()).is_ok(),
                 "{name} is advertised but does not dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_reports_this_build_and_every_subcommand_it_serves() {
+        let identity = identity();
+        let mut lines = identity.lines();
+        // The doctor parses these two lines. A reformat that drops either half
+        // turns a staleness check into an unresponsive binary.
+        assert_eq!(
+            lines.next(),
+            Some(format!("gitpulse-hook {VERSION}").as_str())
+        );
+        let listed = lines.next().expect("identity names its subcommands");
+        let listed = listed
+            .strip_prefix("subcommands: ")
+            .expect("the subcommand line keeps its prefix");
+        let served: Vec<&str> = listed.split(", ").collect();
+        // Derived from SUBCOMMANDS rather than spelled out, so a hook added to
+        // the dispatcher is advertised without anyone editing this test.
+        assert_eq!(served, SUBCOMMANDS.to_vec());
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn an_identity_flag_is_never_mistaken_for_a_subcommand() {
+        // The binary checks IDENTITY_FLAGS before SUBCOMMANDS. If the two sets
+        // ever overlapped, asking for a version would run a repository scan and
+        // print a hook decision onto a channel nobody is reading as one.
+        for flag in IDENTITY_FLAGS {
+            assert!(
+                !SUBCOMMANDS.contains(&flag),
+                "{flag} is both an identity flag and a subcommand"
+            );
+            assert!(
+                dispatch(flag, &HookInput::default()).is_err(),
+                "{flag} must not dispatch as a hook"
             );
         }
     }

@@ -67,7 +67,7 @@ npm run mcp:install
 npm run mcp:doctor
 ```
 
-Doctor reports absent / unresponsive / stale / matching. Agents need the binary on `PATH` (or `GITPULSE_MCP_PATH`). See [[MCP and Agents]].
+Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-mcp` and `gitpulse-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `GITPULSE_MCP_PATH` only moves the binary GitPulse's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
 
 ## Dev app will not start
 

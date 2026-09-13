@@ -330,6 +330,41 @@ fn shell_quote(arg: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `checked` and `Unchecked` must stay the same fact.
+    ///
+    /// Callers are allowed to branch on either one. `hooks::command_gate_decision`
+    /// branches on the status alone, so if a verdict could ever carry
+    /// `checked: false` with an allowing status, that hook would render silence
+    /// — indistinguishable from a gate that ran and permitted the command,
+    /// which is the one substitution this repository refuses to make.
+    ///
+    /// The coupling holds by construction today: `from_decision` is the only
+    /// constructor that sets `checked: true`, and `unchecked` is the only one
+    /// that sets it false, and it pins the status alongside. This pins the
+    /// property rather than the construction, so a third constructor cannot
+    /// quietly break it.
+    #[test]
+    fn checked_is_true_exactly_when_the_status_is_not_unchecked() {
+        for action in ["allow", "warn", "deny", "block", "something-new", ""] {
+            for demoted in ["", "posture=host"] {
+                let verdict = PolicyVerdict::from_decision("t", decision(action, demoted));
+                assert!(
+                    verdict.checked,
+                    "{action:?}/{demoted:?} came back from the harness but reads as unchecked"
+                );
+                assert_ne!(
+                    verdict.status,
+                    PolicyStatus::Unchecked,
+                    "{action:?}/{demoted:?} was judged but reports Unchecked"
+                );
+            }
+        }
+
+        let failed = PolicyVerdict::unchecked("t", &HarnessError::Unavailable("no harness".into()));
+        assert!(!failed.checked);
+        assert_eq!(failed.status, PolicyStatus::Unchecked);
+    }
+
     fn decision(action: &str, demoted: &str) -> RawDecision {
         RawDecision {
             action: action.into(),
