@@ -32,12 +32,8 @@ export function readBrowserVerdict(html) {
   return `${rows.length}/${rows.length} browser regressions passed`;
 }
 
-async function main() {
-  const webkit = process.argv.includes("--webkit");
-  const harnessIndex = process.argv.indexOf("--harness");
-  const harness = harnessIndex === -1 ? "diagnostics" : process.argv[harnessIndex + 1];
-  if (!BROWSER_HARNESSES.includes(harness)) throw new Error(`Unknown browser harness; use ${BROWSER_HARNESSES.join(", ")}`);
-  if (webkit && process.platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
+/** @param {string} harness @param {boolean} webkit */
+async function runHarness(harness, webkit) {
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-browser-"));
   /** @type {import('vite').ViteDevServer | undefined} */
   let server;
@@ -112,6 +108,27 @@ async function main() {
     await server?.close();
     await rm(profile, { recursive: true, force: true, maxRetries: 3 });
   }
+}
+
+/** `--all` derives the run from BROWSER_HARNESSES so a new harness is guarded the
+ * moment it is registered. Hand-listed subsets are how `palette` went unrun: it
+ * was runnable and failing for a release while no caller named it.
+ */
+async function main() {
+  const webkit = process.argv.includes("--webkit");
+  if (webkit && process.platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
+  const harnessIndex = process.argv.indexOf("--harness");
+  if (process.argv.includes("--all")) {
+    if (harnessIndex !== -1) throw new Error("Use either --all or --harness, not both");
+    for (const harness of BROWSER_HARNESSES) {
+      console.log(`--- ${harness} ---`);
+      await runHarness(harness, webkit);
+    }
+    return;
+  }
+  const harness = harnessIndex === -1 ? "diagnostics" : process.argv[harnessIndex + 1];
+  if (!BROWSER_HARNESSES.includes(harness)) throw new Error(`Unknown browser harness; use ${BROWSER_HARNESSES.join(", ")}`);
+  await runHarness(harness, webkit);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -14,7 +14,11 @@ const params = new URLSearchParams(location.search);
 const results = [], crashes = [], calls = [], pending = new Map();
 const branch = (name, current = false) => ({ name, is_current: current, is_remote: false, tip_commit_id: "abc123", ahead_count: 0, behind_count: 0, is_default: current, is_gone: false, last_commit_timestamp: 0, last_author: "Ada", last_summary: "Improve search", commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0 });
 const symbol = (name, repo) => ({ symbol_name: name, file_path: `src/${name}.ts`, kind: "Function", span_start_line: 12, span_end_line: 18, source_span: "", score: 1, ...(repo ? { repo } : {}) });
-const response = items => ({ available: true, items, shown: items.length, total: items.length, truncated: false });
+// Complete CodeintelResponse, per src-tauri/src/codeintel/mod.rs. `source_freshness`
+// is a mandatory object on the wire, and parseCodeintelResponse rejects a payload
+// without one — omitting it made every symbol answer a FAILED read, so the fixture
+// would have been testing the error path.
+const response = items => ({ source_freshness: { fresh: true, generation_id: 1 }, available: true, reason: null, items, shown: items.length, total: items.length, truncated: false });
 let failWorkspace = false, missingRegistry = false, partialWorkspace = false, failedRepo = false;
 let files = ["src/App.svelte", "src/lib/components/CommandPalette.svelte", "README.md"];
 const fixture = {

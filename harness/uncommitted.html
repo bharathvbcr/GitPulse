@@ -33,7 +33,10 @@ const fixtures={
  cmd_get_language_stats:()=>({stats:[],truncated:false}),
  cmd_last_fetch_at:()=>null,
  cmd_get_file_content:()=>"fixture content",
- cmd_codeintel_impact_at_rung:()=>({available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
+ // CodeintelResponse::unavailable still carries a freshness object; without one
+ // parseCodeintelResponse throws and DiffViewer reports "impact request failed"
+ // instead of the reason below.
+ cmd_codeintel_impact_at_rung:()=>({source_freshness:{fresh:null,reason:"this query did not verify whole-tree freshness; ask status for a live check"},available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
  cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
  cmd_devmap_preview_many:()=>[],
  cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>worktrees,
