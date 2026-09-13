@@ -26,6 +26,7 @@ import {
   type TabWidth,
 } from "../ui/codeDisplay";
 import { isTimestampStyle, type TimestampStyle } from "../ui/timestampStyle";
+import { isBranchRowLayout, type BranchRowLayout } from "../sidebar/metrics";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks";
 
@@ -44,6 +45,12 @@ export interface InterfacePrefs {
   reduceMotion: boolean;
   /** Whether commit times read as "3d ago" or as a `YYYY-MM-DD` date. */
   timestampStyle: TimestampStyle;
+  /**
+   * Whether a sidebar branch gets one line or two. Two is the default: on a
+   * default-width sidebar the single line handed the name whatever the chips
+   * and buttons left over, which was often three characters.
+   */
+  branchRowLayout: BranchRowLayout;
   /** Layout a diff opens in; the toolbar still switches the one on screen. */
   diffLayout: DiffLayout;
   /** Whether a diff opens with long lines wrapped. */
@@ -169,6 +176,7 @@ const DEFAULTS: InterfacePrefs = {
   accent: DEFAULT_ACCENT,
   reduceMotion: false,
   timestampStyle: "relative",
+  branchRowLayout: "two-line",
   diffLayout: "unified",
   diffWordWrap: false,
   diffSyntaxHighlight: true,
@@ -265,6 +273,9 @@ function readPrefs(): InterfacePrefs {
       timestampStyle: isTimestampStyle(parsed.timestampStyle)
         ? parsed.timestampStyle
         : DEFAULTS.timestampStyle,
+      branchRowLayout: isBranchRowLayout(parsed.branchRowLayout)
+        ? parsed.branchRowLayout
+        : DEFAULTS.branchRowLayout,
       diffLayout: isDiffLayout(parsed.diffLayout) ? parsed.diffLayout : DEFAULTS.diffLayout,
       diffWordWrap: bool(parsed.diffWordWrap, DEFAULTS.diffWordWrap),
       diffSyntaxHighlight: bool(
@@ -402,6 +413,7 @@ function createInterfaceStore() {
     setAccent: (accent: AccentId) => patch({ accent }),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
     setTimestampStyle: (style: TimestampStyle) => patch({ timestampStyle: style }),
+    setBranchRowLayout: (layout: BranchRowLayout) => patch({ branchRowLayout: layout }),
     setDiffLayout: (layout: DiffLayout) => patch({ diffLayout: layout }),
     setDiffWordWrap: (wrap: boolean) => patch({ diffWordWrap: wrap }),
     setDiffSyntaxHighlight: (on: boolean) => patch({ diffSyntaxHighlight: on }),

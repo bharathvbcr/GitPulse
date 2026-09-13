@@ -12,7 +12,17 @@ npm run test:browser -- --harness branches
 npm run test:webkit -- --harness branches
 ```
 
-The checks cover full-name copying and denial feedback, keyboard focus and
+The checks open with the two-line branch row, which is geometry and so can
+only be measured where real layout exists: each row is exactly as tall as the
+window math believes, headers stay one line, neither line paints under the
+hover actions or past the row's edge, the name owns line one and is shown in
+full, and line two clips — author first, never a count. A stale branch shows
+its tinted age rather than a chip. Fixture branches carry churn and divergence
+derived from their names, and `release/0.0.9` is deliberately 120 days old;
+without both, none of that chrome renders and the layout it used to break
+cannot be seen.
+
+The remaining checks cover full-name copying and denial feedback, keyboard focus and
 activation, context-menu preselection, local and remote source selection,
 fast-forward mode, fully qualified refs at the merge command boundary,
 in-progress controls, error retention, conflict navigation, deleted sources,

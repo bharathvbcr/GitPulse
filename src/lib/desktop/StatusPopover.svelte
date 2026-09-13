@@ -293,21 +293,118 @@
     --amber:#f1bb70;
   } }
   .panel { background:var(--bg); border:1px solid var(--line); border-radius:18px; overflow:hidden; box-shadow:0 6px 20px #00000012,0 1px 3px #00000008; }
-  /* The native window server supplies desktop blur. Only the browser fixture
-     uses a CSS filter, sampling its simulated background instead. */
-  .status-shell[data-material="native"] { padding:0; --bg:rgb(var(--base) / .8); --surface:rgb(var(--card-base) / .64); --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber); }
-  .status-shell[data-material="native"] .panel { box-shadow:none; background-image:linear-gradient(155deg,var(--sheen),transparent 46%); }
+  /* ── Liquid blur glass ──
+     The native window server supplies desktop blur via NSVisualEffectView.
+     On top of that the page paints the same hue field and glass fills as the
+     main app so the popover reads as part of the same surface language.
+     The browser fixture ("preview") approximates the effect with CSS filters. */
+  .status-shell[data-material="native"] {
+    --liquid-ease:cubic-bezier(0.22, 1, 0.36, 1);
+    /* Hue blobs — same four colours as .gp-shell in app.css, dark theme. */
+    --hue-a:52 78 200; --hue-b:12 150 170; --hue-c:110 66 210; --hue-d:180 50 130;
+    --hue-gain:1;
+    /* Glass surface ladder — mirrors --mac-glass-fill / --mac-fill-surface. */
+    --glass-edge:rgb(255 255 255 / .14);
+    --glass-sheen-top:rgb(255 255 255 / .05);
+    --glass-shade-bottom:rgb(0 0 0 / .22);
+    --glass-tint:rgb(23 76 176 / .07);
+    padding:0;
+    --bg:rgb(var(--base) / .55);
+    --surface:rgb(var(--card-base) / .4);
+    --soft:rgb(var(--card-base) / .28);
+    --line:var(--glass-edge);
+    --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber);
+    /* Hue field — scaled for the popover's small footprint. */
+    background-image:
+      radial-gradient(90% 80% at 2% 0%, rgb(var(--hue-a) / calc(.5 * var(--hue-gain))), rgb(var(--hue-a) / 0) 100%),
+      radial-gradient(80% 76% at 98% 6%, rgb(var(--hue-c) / calc(.42 * var(--hue-gain))), rgb(var(--hue-c) / 0) 100%),
+      radial-gradient(82% 78% at 88% 100%, rgb(var(--hue-b) / calc(.38 * var(--hue-gain))), rgb(var(--hue-b) / 0) 100%),
+      radial-gradient(72% 68% at 6% 96%, rgb(var(--hue-d) / calc(.3 * var(--hue-gain))), rgb(var(--hue-d) / 0) 100%);
+  }
+  :global(:where(.dark)) .status-shell[data-material="native"],
+  :global(:where(html:not(.light))) .status-shell[data-material="native"] {
+    --glass-sheen-top:rgb(255 255 255 / .05);
+    --glass-shade-bottom:rgb(0 0 0 / .22);
+    --glass-tint:rgb(182 206 255 / .07);
+  }
+  .status-shell[data-material="native"]:not(:global(:where(.dark)) *, :global(:where(html:not(.light))) *) {
+    --hue-a:120 152 255; --hue-b:46 196 214; --hue-c:168 136 252; --hue-d:240 122 186;
+    --hue-gain:.5;
+    --bg:rgb(var(--base) / .62);
+    --surface:rgb(var(--card-base) / .58);
+    --soft:rgb(var(--card-base) / .36);
+    --glass-edge:rgb(var(--card-base) / .24);
+    --glass-sheen-top:rgb(255 255 255 / .7);
+    --glass-shade-bottom:rgb(38 46 76 / .07);
+    --glass-tint:rgb(23 76 176 / .05);
+    --line:var(--glass-edge);
+  }
+  .status-shell[data-material="native"] .panel {
+    border-color:var(--glass-edge);
+    /* Two-pass glass treatment matching gp-glass: specular sheen + hue tint. */
+    background-image:
+      linear-gradient(155deg, var(--glass-sheen-top), transparent 46%),
+      linear-gradient(200deg, var(--glass-tint), transparent 72%);
+    box-shadow:
+      inset 0 1px 0 var(--glass-sheen-top),
+      inset 0 -1px 0 var(--glass-shade-bottom);
+  }
+  /* Inner surfaces thin so they read as glass cards inside the panel. */
+  .status-shell[data-material="native"] :is(.metric, .detail-action, .repositories, .chip, .mark) {
+    border-color:var(--glass-edge);
+    background:var(--surface);
+  }
+  /* Liquid-ease transitions on interactive elements. */
+  @media (prefers-reduced-motion: no-preference) {
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(button, .metric, .shortcut, .detail-action, .chip) {
+      transition-property:color, background-color, border-color, box-shadow, transform;
+      transition-duration:180ms;
+      transition-timing-function:var(--liquid-ease);
+    }
+    .status-shell[data-material="native"]:not(.reduce-motion) :is(.primary, .secondary, .icon-button, .metric, .shortcut, .detail-action):active:not(:disabled) {
+      transform:scale(0.97);
+    }
+  }
   @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
-    .status-shell[data-material="preview"] { --bg:rgb(var(--base) / .8); --surface:rgb(var(--card-base) / .64); --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber); }
+    .status-shell[data-material="preview"] {
+      --liquid-ease:cubic-bezier(0.22, 1, 0.36, 1);
+      --hue-a:52 78 200; --hue-b:12 150 170; --hue-c:110 66 210; --hue-d:180 50 130;
+      --hue-gain:1;
+      --glass-edge:rgb(255 255 255 / .14);
+      --glass-sheen-top:rgb(255 255 255 / .05);
+      --glass-shade-bottom:rgb(0 0 0 / .22);
+      --glass-tint:rgb(23 76 176 / .07);
+      --bg:rgb(var(--base) / .55);
+      --surface:rgb(var(--card-base) / .4);
+      --soft:rgb(var(--card-base) / .28);
+      --line:var(--glass-edge);
+      --muted:var(--glass-muted); --blue:var(--glass-blue); --green:var(--glass-green); --amber:var(--glass-amber);
+      background-image:
+        radial-gradient(90% 80% at 2% 0%, rgb(var(--hue-a) / calc(.5 * var(--hue-gain))), rgb(var(--hue-a) / 0) 100%),
+        radial-gradient(80% 76% at 98% 6%, rgb(var(--hue-c) / calc(.42 * var(--hue-gain))), rgb(var(--hue-c) / 0) 100%),
+        radial-gradient(82% 78% at 88% 100%, rgb(var(--hue-b) / calc(.38 * var(--hue-gain))), rgb(var(--hue-b) / 0) 100%),
+        radial-gradient(72% 68% at 6% 96%, rgb(var(--hue-d) / calc(.3 * var(--hue-gain))), rgb(var(--hue-d) / 0) 100%);
+    }
     .status-shell[data-material="preview"] .panel {
-      -webkit-backdrop-filter:blur(34px) saturate(135%);
-      backdrop-filter:blur(34px) saturate(135%);
-      background-image:linear-gradient(155deg,var(--sheen),transparent 46%);
+      -webkit-backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
+      backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
+      border-color:var(--glass-edge);
+      background-image:
+        linear-gradient(155deg, var(--glass-sheen-top), transparent 46%),
+        linear-gradient(200deg, var(--glass-tint), transparent 72%);
+      box-shadow:
+        inset 0 1px 0 var(--glass-sheen-top),
+        inset 0 -1px 0 var(--glass-shade-bottom);
+    }
+    .status-shell[data-material="preview"] :is(.metric, .detail-action, .repositories, .chip, .mark) {
+      border-color:var(--glass-edge);
+      background:var(--surface);
     }
   }
   @media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
-    .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); }
+    .status-shell[data-material] { --bg:rgb(var(--base)); --surface:rgb(var(--card-base)); --muted:var(--solid-muted); background-image:none; }
     .status-shell[data-material] .panel { -webkit-backdrop-filter:none; backdrop-filter:none; background-image:none; box-shadow:none; }
+    .status-shell[data-material] :is(.metric, .detail-action, .repositories, .chip, .mark) { background:var(--surface); border-color:var(--line); }
   }
   button { font:inherit; cursor:pointer; border:0; color:inherit; background:none; padding:0; }
   button:disabled { cursor:default; }

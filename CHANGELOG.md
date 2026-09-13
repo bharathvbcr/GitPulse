@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Sidebar branch rows are two lines. The name has the first line to itself and
+  every measured number — lines added and removed, files changed, ahead and
+  behind upstream, commits ahead of the base, provenance, author and commit
+  age — sits on the second. On a default-width sidebar the single line gave the
+  name whatever its row of counters and buttons left over, which was often
+  three characters: real branches rendered as `b..`, `d..`, `r..`. Measured on
+  a 320px sidebar with churn and divergence present, the name went from 52px to
+  198px — 8 characters to 31 — at a cost of 22 visible rows to 16.
+- The commit age carries staleness itself, tinted amber, instead of a separate
+  `stale` chip repeating the same verdict less precisely beside it.
+- Author and commit age were already on every branch record and shown on no
+  row; they are now on the second line, and are the first things dropped when
+  a narrow sidebar runs out of room. Counts are never clipped.
+- **Appearance › Sidebar branch rows** switches back to the dense single-line
+  list, which fits roughly 45% more refs on screen.
+
 ## [1.0.1] - 2026-09-12
 
 Security hardening release. Opening a repository is now an explicit decision,

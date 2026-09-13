@@ -1,7 +1,15 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import StatusPopover from "./StatusPopover.svelte";
 import { statusFixture } from "../../../harness/statusFixtures";
+
+const source = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "StatusPopover.svelte"),
+  "utf8",
+);
 
 describe("compact status popover", () => {
   it("matches the reference's three-card first glance and keeps secondary controls behind Details", () => {
@@ -56,5 +64,29 @@ describe("compact status popover", () => {
     const parked = render(StatusPopover, { props: { snapshot: statusFixture("operation"), onaction: () => {} } }).body;
     expect(parked).toContain("Merge in progress — on main");
     expect(parked).not.toContain('aria-label="Command palette"');
+  });
+  it("uses the app's liquid blur glass in the native material mode", () => {
+    // The native material block should contain the hue field, glass fills,
+    // specular edge treatment, and liquid-ease transitions so the popover
+    // reads as the same glass surface language as the main workspace.
+    const nativeBlock = source.slice(
+      source.indexOf('[data-material="native"]'),
+      source.indexOf("@supports"),
+    );
+    // Hue field (radial-gradient blobs matching .gp-shell in app.css).
+    expect(nativeBlock).toContain("radial-gradient");
+    expect(nativeBlock).toContain("--hue-a");
+    expect(nativeBlock).toContain("--hue-gain");
+    // Specular glass edge treatment (inset sheen + shade matching gp-glass).
+    expect(nativeBlock).toContain("--glass-sheen-top");
+    expect(nativeBlock).toContain("--glass-shade-bottom");
+    expect(nativeBlock).toContain("inset 0 1px 0 var(--glass-sheen-top)");
+    expect(nativeBlock).toContain("inset 0 -1px 0 var(--glass-shade-bottom)");
+    // Glass surface variables with translucent fills (not the old opaque .8/.64).
+    expect(nativeBlock).toContain("--bg:rgb(var(--base) / .55)");
+    expect(nativeBlock).toContain("--surface:rgb(var(--card-base) / .4)");
+    // Liquid-ease cubic-bezier on interactive elements.
+    expect(nativeBlock).toContain("--liquid-ease:cubic-bezier(0.22, 1, 0.36, 1)");
+    expect(nativeBlock).toContain("scale(0.97)");
   });
 });

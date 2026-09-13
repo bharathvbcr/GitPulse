@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "./virtualWindow";
 
@@ -234,7 +234,13 @@ describe("every fixed-row list windows through this owner", () => {
   const read = (path: string) =>
     readFileSync(new URL(`../components/${path}`, import.meta.url), "utf8");
 
-  it.each([["VirtualList.svelte"], ["BranchList.svelte"], ["CommitTable.svelte"]])(
+  // BranchList is deliberately NOT in these lists any more: a two-line branch
+  // row is taller than the headers around it, so it windows through
+  // sidebar/rowWindow.ts instead. The equivalent registry for that owner —
+  // same "no hand-rolled arithmetic" property — lives in
+  // sidebar/rowWindow.test.ts, and BranchList must appear in exactly one of
+  // the two. `no list escapes both owners` below is what enforces that.
+  it.each([["VirtualList.svelte"], ["CommitTable.svelte"]])(
     "%s derives its window here rather than re-deriving the arithmetic",
     (file) => {
       const source = read(file);
@@ -245,11 +251,35 @@ describe("every fixed-row list windows through this owner", () => {
     },
   );
 
-  it.each([["BranchList.svelte"], ["CommitTable.svelte"]])(
+  it.each([["CommitTable.svelte"]])(
     "%s clamps its anchor so a shrinking list does not paint an empty frame",
     (file) => {
       expect(read(file)).toContain("clampScrollTop(");
       expect(read(file)).toContain("ensureNonEmptyWindow(");
     },
   );
+
+  it("no list escapes both owners", () => {
+    // Derived rather than hand-listed: every component that maintains its own
+    // scrollTop and renders a windowed slice has to name one of the two
+    // windowing modules. A third, hand-rolled implementation would show up
+    // here as a component with the state but neither import.
+    const dir = new URL("../components/", import.meta.url);
+    const windowed = readdirSync(dir)
+      .filter((name) => name.endsWith(".svelte"))
+      .map((name) => ({ name, source: readFileSync(new URL(name, dir), "utf8") }))
+      .filter(({ source }) => /\blet (?:scrollTop|viewportHeight)\b/.test(source))
+      .filter(({ source }) => /\b(?:visibleRows|visibleItems|win\.start)\b/.test(source));
+
+    expect(windowed.length).toBeGreaterThan(0);
+    for (const { name, source } of windowed) {
+      const fixed = source.includes("computeWindow(");
+      const variable = source.includes("windowFromOffsets(");
+      expect(
+        fixed || variable,
+        `${name} windows a slice but imports neither windowing owner`,
+      ).toBe(true);
+      expect(fixed && variable, `${name} mixes both windowing owners`).toBe(false);
+    }
+  });
 });

@@ -164,18 +164,44 @@ describe("BranchList pin persistence via branches/pins", () => {
 });
 
 describe("BranchList virtual window tail guarantee", () => {
-  it("wraps computeWindow with clampScrollTop + ensureNonEmptyWindow using live geometry", () => {
-    expect(source).toContain("ensureNonEmptyWindow(");
-    expect(source).toContain("clampScrollTop(");
-    const ensureIdx = source.indexOf("ensureNonEmptyWindow(");
-    const computeIdx = source.indexOf("computeWindow(clamped");
-    expect(computeIdx).toBeGreaterThan(-1);
-    expect(computeIdx).toBeGreaterThan(ensureIdx - 200);
-    // The guard receives the same geometry as the window itself.
-    const block = source.slice(ensureIdx, ensureIdx + 400);
-    expect(block).toContain("allRows.length");
-    expect(block).toContain("ROW_HEIGHT");
+  it("clamps the anchor before computing the window, using live geometry", () => {
+    // Same property the fixed-height version guarded: a deep anchor over a
+    // list that just shrank must not paint a frame of nothing. The tail
+    // guarantee itself now lives inside windowFromOffsets (see
+    // sidebar/rowWindow.test.ts) because no caller wants the empty band.
+    expect(source).toContain("windowFromOffsets(");
+    expect(source).toContain("clampScrollTopToOffsets(scrollTop, rowOffsets, viewportHeight)");
+    const winIdx = source.indexOf("windowFromOffsets(");
+    const block = source.slice(winIdx, winIdx + 300);
+    expect(block).toContain("rowOffsets");
     expect(block).toContain("viewportHeight");
+    expect(block).toContain("BRANCH_OVERSCAN");
+  });
+
+  it("answers every scroll-position question from the one offsets array", () => {
+    // Rows are no longer all one height, so `index * height` is wrong
+    // everywhere. It does not throw — it silently scrolls to another row —
+    // so the guard is that no such arithmetic survives and that all four
+    // position consumers read rowOffsets.
+    expect(source).toContain("let rowOffsets = $derived(buildRowOffsets(rowHeights));");
+    expect(source).toContain("totalRowHeight(rowOffsets)");
+    expect(source).toContain("rowTop(rowOffsets, win.start)");
+    expect(source).toContain("scrollOffsetToReveal(rowOffsets, index, scrollTop, viewportHeight)");
+    expect(source).toContain("scrollOffsetToCenter(rowOffsets, idx, viewportHeight)");
+    // No surviving uniform-height arithmetic.
+    expect(source).not.toMatch(/idx \* [A-Z_]*HEIGHT/);
+    expect(source).not.toMatch(/index \* [A-Z_]*HEIGHT/);
+    expect(source).not.toMatch(/win\.start \* [A-Z_]*HEIGHT/);
+    expect(source).not.toMatch(/allRows\.length \* [A-Z_]*HEIGHT/);
+  });
+
+  it("sizes each row by its own kind, so the window and the markup agree", () => {
+    // One helper call feeds both the offsets array and the inline heights.
+    // Two independent height decisions is how a variable-height list drifts
+    // into blank bands and overlapping rows.
+    expect(source).toContain(
+      "allRows.map((row) => sidebarRowHeight(row.kind, $densityStore, rowLayout))",
+    );
   });
 
   it("takes overscan from the shared metrics module, not a local constant", () => {
@@ -188,6 +214,81 @@ describe("BranchList virtual window tail guarantee", () => {
     expect(source).toContain("branchRowHeight($densityStore)");
     expect(source).not.toContain("const ROW_HEIGHT = 26");
     expect(source).toContain("$derived");
+  });
+});
+
+describe("BranchList two-line branch rows", () => {
+  // The rendered geometry — row heights matching the window math, neither
+  // line painting under the hover actions, the clipping ladder — is asserted
+  // against real layout in harness/branches.html. These guard the structure
+  // that geometry depends on, which a source read can see and a jsdom render
+  // of an empty branch list cannot.
+
+  it("gives the name a line of its own, with the numbers on the second", () => {
+    const row = source.slice(
+      source.indexOf("{#snippet branchRow("),
+      source.indexOf("{#snippet tagRow("),
+    );
+    const twoLineBranch = row.indexOf("{#if twoLine}");
+    const oneLineBranch = row.indexOf("{:else}", twoLineBranch);
+    const twoLineBody = row.slice(twoLineBranch, oneLineBranch);
+    // Line one renders identity only; the numbers snippet is on line two.
+    const numbersInTwoLine = twoLineBody.indexOf("branchNumbers(");
+    const identityInTwoLine = twoLineBody.indexOf("branchIdentity(");
+    expect(identityInTwoLine).toBeGreaterThan(-1);
+    expect(numbersInTwoLine).toBeGreaterThan(identityInTwoLine);
+  });
+
+  it("renders the same number facts in both layouts from one owner", () => {
+    // Two copies of this markup is how the dense list comes to show a count
+    // the two-line list does not, or the other way round.
+    expect((source.match(/\{@render branchNumbers\(/g) ?? []).length).toBe(2);
+    expect((source.match(/\{@render branchIdentity\(/g) ?? []).length).toBe(2);
+    expect((source.match(/\{@render branchActions\(/g) ?? []).length).toBe(2);
+    expect((source.match(/\{#snippet branchNumbers\(/g) ?? []).length).toBe(1);
+  });
+
+  it("clips line two instead of letting counts escape the row", () => {
+    // Every item on line two is shrink-0, so without this the numbers paint
+    // through the row's edge and under the hover actions on a narrow sidebar.
+    const line2 = source.slice(source.indexOf("{@render branchNumbers(branch, statsMissing)}") - 900);
+    expect(line2).toContain("overflow-hidden");
+    // The fade only consumes pixels when content reaches them, so a clipped
+    // row looks clipped rather than looking like a smaller number.
+    expect(source).toContain("mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent)");
+    expect(source).toContain("-webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent)");
+  });
+
+  it("reserves the hover actions' width so they never overlap the text", () => {
+    // The rail is absolutely positioned; pr-11 is the space it sits in.
+    // Measured: 20px copy + 16px menu + 2px gap + 4px inset = 42px < 44px.
+    expect(source).toContain('"flex-1 min-w-0 flex items-center gap-1.5 text-left pr-11"');
+    expect(source).toContain('class="absolute right-1 top-0 h-full flex items-center gap-0.5"');
+  });
+
+  it("drops the stale chip only where the tinted age replaces it", () => {
+    // Two-line prints the real age and tints it; one-line has no age to
+    // tint, so it keeps the chip. Passing the flag both ways is the point —
+    // a single hardcoded choice would either duplicate or lose the signal.
+    expect(source).toContain("{@render branchIdentity(branch, leaf, false, false)}");
+    expect(source).toContain("{@render branchIdentity(branch, leaf, true, true)}");
+    expect(source).toContain("showStale && isStaleBranch(branch.last_commit_timestamp)");
+    expect(source).toContain("stale ? 'text-amber-500/90' : 'text-textMuted/80'");
+  });
+
+  it("keeps the separator with the author, which is what clipping removes", () => {
+    // A separator owned by the age survives the author's removal and reads
+    // as a dot joining the time to nothing.
+    expect(source).toContain('{age ? "· " : ""}{author}');
+  });
+
+  it("shows only measured file counts, never a zero standing in for unknown", () => {
+    expect(source).toContain("{#if branch.files_changed > 0}");
+  });
+
+  it("offers the dense layout rather than forcing two lines on everyone", () => {
+    expect(source).toContain('$interfaceStore.branchRowLayout');
+    expect(source).toContain('rowLayout === "two-line"');
   });
 });
 
@@ -280,11 +381,30 @@ describe("BranchList density-aware rows", () => {
     expect(source).not.toContain("h-[26px]");
   });
 
-  it("drives every row's height and content-visibility hint inline from ROW_HEIGHT", () => {
-    const occurrences = (source.match(/contain-intrinsic-size: auto \{ROW_HEIGHT\}px/g) ?? []).length;
-    // Branch, tag, folder-header, and section-header rows all carry it.
-    expect(occurrences).toBe(4);
-    expect((source.match(/height: \{ROW_HEIGHT\}px/g) ?? []).length).toBe(4);
+  it("drives every row's height and content-visibility hint from the metrics module", () => {
+    // Branch, tag, folder-header and section-header rows all carry both.
+    // A row kind added without them is a hole in the windowing, so the count
+    // is a deliberate tripwire rather than a derived number.
+    const declared = [...source.matchAll(/height: \{([A-Z_]+)\}px/g)].map((m) => m[1]);
+    expect(declared).toHaveLength(4);
+    // Only the two metrics-derived heights exist, and each row's
+    // contain-intrinsic-size hint names the SAME variable as its height —
+    // a mismatched pair is exactly the drift this module was created to stop.
+    for (const name of declared) {
+      expect(["HEADER_HEIGHT", "BRANCH_HEIGHT"]).toContain(name);
+    }
+    for (const name of new Set(declared)) {
+      const heights = (source.match(new RegExp(`height: \\{${name}\\}px`, "g")) ?? []).length;
+      const hints = (
+        source.match(new RegExp(`contain-intrinsic-size: auto \\{${name}\\}px`, "g")) ?? []
+      ).length;
+      expect(hints).toBe(heights);
+    }
+    // Branch rows are the only kind that grows; the other three stay headers.
+    expect((source.match(/height: \{BRANCH_HEIGHT\}px/g) ?? []).length).toBe(1);
+    expect((source.match(/height: \{HEADER_HEIGHT\}px/g) ?? []).length).toBe(3);
+    expect(source).toContain('sidebarRowHeight("branch", $densityStore, rowLayout)');
+    expect(source).toContain("branchRowHeight($densityStore)");
   });
 
   it("varies chrome spacing by density without dynamic class fragments", () => {
@@ -310,8 +430,15 @@ describe("BranchList chip strip scrollbar", () => {
 describe("BranchList at-a-glance tooltips", () => {
   it("explains the commits-ahead-of-base counter", () => {
     expect(source).toContain(
-      'title="{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || \'base\'}"'
+      "title=\"{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}"
     );
+  });
+
+  it("also reports how far behind the base the branch is, which no chip shows", () => {
+    // commits_behind_base rode on BranchInfo unread. A branch 2 ahead and 90
+    // behind reads identically to one 2 ahead and current without it.
+    expect(source).toContain("branch.commits_behind_base > 0");
+    expect(source).toContain("${branch.commits_behind_base} behind");
   });
 
   it("gives upstream arrows descriptive titles", () => {

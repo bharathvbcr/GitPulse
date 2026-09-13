@@ -35,11 +35,21 @@
   import ScrollCue from "./ScrollCue.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
-  import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "../dom/virtualWindow";
+  import {
+    buildRowOffsets,
+    clampScrollTopToOffsets,
+    rowTop,
+    scrollOffsetToCenter,
+    scrollOffsetToReveal,
+    totalRowHeight,
+    windowFromOffsets,
+  } from "../sidebar/rowWindow";
   import { clampMenuPosition } from "../branches/menuPosition";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
-  import { branchRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
+  import { branchRowHeight, sidebarRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
+  import { formatTimestamp, timestampTitle } from "../ui/timestampStyle";
+  import { plural } from "../format";
   import { densityStore } from "../stores/densityStore";
   import { portal } from "../dom/portal";
   import ChurnBar from "./ChurnBar.svelte";
@@ -51,6 +61,7 @@
     Copy,
     Crosshair,
     Download,
+    FileDiff,
     GitBranch,
     GitCompare,
     GitMerge,
@@ -77,10 +88,17 @@
   let debouncedQuery = $state("");
   const applyFilter = debounce((q: string) => (debouncedQuery = q), FILTER_DEBOUNCE_MS);
 
-  // Row height follows the density store so window math, row styles, and
-  // app.css's content-visibility hint can never drift apart. branchRowHeight
-  // fail-closes unknown values to the spacious height.
-  let ROW_HEIGHT = $derived(branchRowHeight($densityStore));
+  // Row heights follow the density store AND the row-layout preference, so
+  // window math, row styles, and app.css's content-visibility hint can never
+  // drift apart. Both helpers fail-close unknown values to the roomier
+  // height: a row drawn too tall is untidy, a row drawn too short clips its
+  // own content and desynchronises the window.
+  let rowLayout = $derived($interfaceStore.branchRowLayout);
+  /** Section headers, folder headers and tag rows: always one line. */
+  let HEADER_HEIGHT = $derived(branchRowHeight($densityStore));
+  /** Branch rows: two lines unless the reader asked for the dense list. */
+  let BRANCH_HEIGHT = $derived(sidebarRowHeight("branch", $densityStore, rowLayout));
+  let twoLine = $derived(rowLayout === "two-line");
   // Spacious mode breathes: slightly larger gaps between the chrome bands.
   // Compact stays genuinely tight. Class literals are spelled out in full so
   // Tailwind's scanner sees every variant.
@@ -121,23 +139,37 @@
   let filteredSections = $derived(filterBranchSections(groupedSections, debouncedQuery, activeTab));
   let allRows = $derived(flattenRows(filteredSections, isCollapsed));
 
-  // O(1) Virtual Windowing math. clampScrollTop mirrors VirtualList: after a
-  // filter/density change shrinks the list under a deep anchor, the raw
-  // scrollTop would paint one frame of tail-only rows until the browser's
-  // async clamp round-trips; clamping here keeps that frame correct too.
-  // ensureNonEmptyWindow is the last-line guarantee against an empty band.
-  let win = $derived.by(() => {
-    const clamped = clampScrollTop(scrollTop, allRows.length, ROW_HEIGHT, viewportHeight);
-    return ensureNonEmptyWindow(
-      computeWindow(clamped, viewportHeight, allRows.length, ROW_HEIGHT, BRANCH_OVERSCAN),
-      allRows.length,
-      ROW_HEIGHT,
-      viewportHeight
-    );
-  });
+  // Virtual windowing over rows of DIFFERENT heights: a two-line branch row
+  // is taller than the headers around it, so `index * one height` is no
+  // longer where row `index` starts. rowOffsets is the prefix-sum array every
+  // position question is answered from — it rebuilds O(n) on the same
+  // dependencies flattenRows already walks, and each lookup is O(log n).
+  //
+  // Every scroll position in this component reads it: the window, the
+  // spacer, the slice transform, keyboard navigation and "locate branch".
+  // A second source of geometry is exactly how a variable-height list starts
+  // scrolling to the wrong row.
+  let rowHeights = $derived(
+    allRows.map((row) => sidebarRowHeight(row.kind, $densityStore, rowLayout))
+  );
+  let rowOffsets = $derived(buildRowOffsets(rowHeights));
+
+  // clampScrollTopToOffsets mirrors VirtualList: after a filter/density
+  // change shrinks the list under a deep anchor, the raw scrollTop would
+  // paint one frame of tail-only rows until the browser's async clamp
+  // round-trips; clamping here keeps that frame correct too. The empty-band
+  // guarantee lives inside windowFromOffsets.
+  let win = $derived.by(() =>
+    windowFromOffsets(
+      clampScrollTopToOffsets(scrollTop, rowOffsets, viewportHeight),
+      viewportHeight,
+      rowOffsets,
+      BRANCH_OVERSCAN
+    )
+  );
   let visibleRows = $derived(allRows.slice(win.start, win.end));
-  let totalHeight = $derived(allRows.length * ROW_HEIGHT);
-  let offsetY = $derived(win.start * ROW_HEIGHT);
+  let totalHeight = $derived(totalRowHeight(rowOffsets));
+  let offsetY = $derived(rowTop(rowOffsets, win.start));
 
   // Counts for quick filter tabs. The pinned chip mirrors the Pinned SECTION,
   // which only lists names that still resolve to live branches — counting the
@@ -267,8 +299,10 @@
       locateName = null;
       if (!containerEl) return;
       selectedIndex = idx;
-      const targetY = Math.max(0, idx * ROW_HEIGHT - viewportHeight / 3);
-      containerEl.scrollTo({ top: targetY, behavior: "smooth" });
+      containerEl.scrollTo({
+        top: scrollOffsetToCenter(rowOffsets, idx, viewportHeight),
+        behavior: "smooth",
+      });
     });
   });
 
@@ -384,14 +418,12 @@
   }
 
   function ensureVisible(index: number) {
-    if (!containerEl || index < 0) return;
-    const itemTop = index * ROW_HEIGHT;
-    const itemBottom = itemTop + ROW_HEIGHT;
-    if (itemTop < scrollTop) {
-      containerEl.scrollTo({ top: itemTop });
-    } else if (itemBottom > scrollTop + viewportHeight) {
-      containerEl.scrollTo({ top: itemBottom - viewportHeight });
-    }
+    if (!containerEl) return;
+    // Reads the same offsets the window does, so a list of mixed row heights
+    // reveals the row the reader actually selected. null means "already fully
+    // visible" — distinct from "scroll to 0", which is why it is not a number.
+    const top = scrollOffsetToReveal(rowOffsets, index, scrollTop, viewportHeight);
+    if (top !== null) containerEl.scrollTo({ top });
   }
 
   async function submitCreate() {
@@ -745,6 +777,138 @@
   {/if}
 {/snippet}
 
+{#snippet branchGlyph(branch: BranchInfo)}
+  <GitBranch size={13} class={branch.is_current ? "text-accent shrink-0" : "text-textMuted shrink-0"} />
+{/snippet}
+
+{#snippet branchIdentity(branch: BranchInfo, leaf: string, showStale: boolean, withGlyph: boolean)}
+  {#if withGlyph}{@render branchGlyph(branch)}{/if}
+  {@render highlightedLabel(leaf, debouncedQuery)}
+  {#if branch.is_default}
+    <span class="text-[9px] px-1 py-0 rounded-full bg-surface border border-border/80 text-textMuted font-mono shrink-0">default</span>
+  {/if}
+  {#if branch.is_gone}
+    <span class="text-[9px] px-1 py-0 rounded-full bg-rose-500/15 text-rose-400 font-mono shrink-0">gone</span>
+  {/if}
+  <!-- The two-line row prints the actual commit age on line two and tints it
+       when stale, so a separate "stale" chip would say the same thing twice
+       and less precisely — and it would say it in the one place that costs
+       the branch name its width. The one-line row has no age to tint, so it
+       keeps the chip. -->
+  {#if showStale && isStaleBranch(branch.last_commit_timestamp)}
+    <span class="text-[9px] px-1 py-0 rounded-full bg-surface text-textMuted font-mono shrink-0">stale</span>
+  {/if}
+{/snippet}
+
+<!-- Every measured number for one branch, in one owner, so the one-line and
+     two-line rows cannot drift into showing different facts. Each item stays
+     shrink-0: these are the values the reader came for, and a half-rendered
+     "+33" is worse than a name that had to give up a character. -->
+{#snippet branchNumbers(branch: BranchInfo, statsMissing: boolean)}
+  {#if statsPending && statsMissing}
+    <span class="inline-block w-6 h-1 rounded-full bg-border/70 animate-pulse shrink-0" aria-hidden="true"></span>
+  {:else if statsFailed && statsMissing}
+    <!-- Stats fetch failed outright: a dimmed static marker instead of zeros pretending "no churn". -->
+    <span class="inline-block w-6 h-1 rounded-full bg-rose-500/20 opacity-60 shrink-0" title="Churn unavailable (stats failed)" aria-hidden="true"></span>
+  {/if}
+  {#if branch.additions > 0 || branch.deletions > 0}
+    <ChurnBar additions={branch.additions} deletions={branch.deletions} />
+  {/if}
+  {#if branch.is_current && (workAdd > 0 || workDel > 0)}
+    <span class="text-[9px] text-textMuted font-mono shrink-0" title="Uncommitted working tree">wt</span>
+    <ChurnBar additions={workAdd} deletions={workDel} />
+  {/if}
+  <!-- Only ever a measured positive count. A zero here would be
+       indistinguishable from "stats never arrived", which the markers above
+       are the honest answer to. -->
+  {#if branch.files_changed > 0}
+    <span
+      class="shrink-0 inline-flex items-center gap-0.5 text-[10px] font-mono text-textMuted/90"
+      title="{plural(branch.files_changed, 'file')} changed vs {branch.compared_to || 'base'}"
+      >
+      <FileDiff size={9} aria-hidden="true" />{branch.files_changed}
+    </span>
+  {/if}
+  {#if branch.ahead_count > 0}
+    <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
+  {/if}
+  {#if branch.behind_count > 0}
+    <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25 shrink-0" title="{branch.behind_count} behind upstream">↓{branch.behind_count}</span>
+  {/if}
+  {#if branch.commits_ahead_of_base > 0 && !branch.is_current}
+    <span
+      class="text-[10px] font-mono text-textMuted shrink-0"
+      title="{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}{branch.commits_behind_base > 0
+        ? `, ${branch.commits_behind_base} behind`
+        : ''}"
+      >+{branch.commits_ahead_of_base}</span
+    >
+  {/if}
+{/snippet}
+
+<!--
+  Who touched the branch and when — the two facts the sidebar already held on
+  every row and showed on none of them, because the one-line layout had no
+  room left. Deliberately the LAST items on line two and the only shrinkable
+  ones, so a branch with a wide set of counts loses the author's surname
+  rather than a number.
+
+  The age carries staleness itself: `isStaleBranch`'s verdict as a tint on the
+  exact figure it was computed from, instead of a chip beside it.
+-->
+{#snippet branchAge(branch: BranchInfo)}
+  {@const stale = isStaleBranch(branch.last_commit_timestamp)}
+  {@const age = formatTimestamp(branch.last_commit_timestamp, $interfaceStore.timestampStyle)}
+  {@const author = branch.last_author?.trim() ?? ""}
+  <!-- The separator lives INSIDE the author span, at its end. The author is
+       the only shrinkable thing on the line, so on a busy row it clips to
+       nothing — and a separator owned by the age would survive that and read
+       as "· 3d ago", a dot joining the time to nothing. Clipped together,
+       the line degrades "Alex · 3d ago" → "Ale… 3d ago" → "3d ago". -->
+  {#if age}
+    <span
+      class="shrink-0 text-[10px] font-mono {stale ? 'text-amber-500/90' : 'text-textMuted/80'}"
+      title="Last commit {timestampTitle(branch.last_commit_timestamp, $interfaceStore.timestampStyle)}{stale
+        ? ' — stale'
+        : ''}">{age}</span
+    >
+  {/if}
+  {#if author}
+    <span class="truncate text-[10px] text-textMuted/70" title="Last commit by {author}"
+      >{age ? "· " : ""}{author}</span
+    >
+  {/if}
+{/snippet}
+
+<!-- Per-row buttons. Hover/focus revealed in the two-line row, where they sit
+     in a right-edge rail over reserved space, so they never take width from
+     the name and never shift the layout when they appear. -->
+{#snippet branchActions(branch: BranchInfo, reveal: boolean)}
+  <button
+    type="button"
+    class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0 {reveal
+      ? 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity'
+      : ''}"
+    onclick={() => void copyText(branch.name)}
+    title="Copy branch name"
+    aria-label="Copy branch name {branch.name}"
+  ><Copy size={12} /></button>
+  <button
+    type="button"
+    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-background text-textMuted transition-opacity shrink-0"
+    onclick={(e) => {
+      e.stopPropagation();
+      openBranchMenu(e, branch);
+    }}
+    title="Branch actions"
+    aria-label="Branch actions"
+    aria-haspopup="menu"
+    aria-expanded={menu?.branch?.name === branch.name && !menu?.tag}
+  >
+    <MoreHorizontal size={12} />
+  </button>
+{/snippet}
+
 {#snippet branchRow(branch: BranchInfo, depth: number, isRowSelected: boolean)}
   {@const selected = $filterStore.selectedBranch === branch.name}
   {@const isPinned = pinnedNames.has(branch.name)}
@@ -756,14 +920,17 @@
     !branch.is_current &&
     !branch.is_default}
   <div
-    class="gp-cv-row w-full rounded-full flex items-center gap-1.5 pr-1 group transition-colors select-none {branch.is_current
+    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none {twoLine
+      ? 'rounded-2xl'
+      : 'rounded-full pr-1'} {branch.is_current
       ? 'bg-accent/15 text-accent font-semibold ring-1 ring-accent/40'
       : selected
         ? 'bg-accent/10 text-textPrimary ring-1 ring-accent/20'
         : isRowSelected
           ? 'bg-surfaceHover text-textPrimary ring-1 ring-border'
           : 'text-textPrimary hover:bg-surfaceHover'}"
-    style="height: {ROW_HEIGHT}px; contain-intrinsic-size: auto {ROW_HEIGHT}px; padding-left: {8 + depth * 12}px;"
+    style="height: {BRANCH_HEIGHT}px; contain-intrinsic-size: auto {BRANCH_HEIGHT}px; padding-left: {8 +
+      depth * 12}px;"
   >
     <button
       type="button"
@@ -787,70 +954,65 @@
       }}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
       title={branchTooltip(branch, undefined, $interfaceStore.timestampStyle)}
-      class="flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"
+      class={twoLine
+        ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-11"
+        : "flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"}
     >
-      <GitBranch size={13} class={branch.is_current ? "text-accent shrink-0" : "text-textMuted shrink-0"} />
-      {@render highlightedLabel(leaf, debouncedQuery)}
-      {#if branch.is_default}
-        <span class="text-[9px] px-1 py-0 rounded-full bg-surface border border-border/80 text-textMuted font-mono shrink-0">default</span>
-      {/if}
-      {#if branch.is_gone}
-        <span class="text-[9px] px-1 py-0 rounded-full bg-rose-500/15 text-rose-400 font-mono shrink-0">gone</span>
-      {/if}
-      {#if isStaleBranch(branch.last_commit_timestamp)}
-        <span class="text-[9px] px-1 py-0 rounded-full bg-surface text-textMuted font-mono shrink-0">stale</span>
+      {#if twoLine}
+        {@render branchGlyph(branch)}
+        <span class="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
+          <!-- Line one is the name's alone. Nothing after it can outgrow a
+               chip, so the name truncates at the width of the sidebar rather
+               than at whatever a row of buttons and counters left over. -->
+          <span class="w-full flex items-center gap-1.5 min-w-0 leading-none">
+            {@render branchIdentity(branch, leaf, false, false)}
+            <span class="ml-auto flex items-center gap-1 shrink-0">
+              <BranchHealthDot {branch} />
+              {#if branch.is_current}
+                <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs"></span>
+              {/if}
+            </span>
+          </span>
+          <!-- Line two, flush left under the name, in descending order of
+               what a reader would miss: churn, divergence, files, then the
+               attribution. An `ml-auto` here would right-align the tail,
+               which on the common branch — no churn, no divergence — leaves
+               it floating alone across an empty row.
+               `overflow-hidden` is load-bearing, not tidiness: the numbers
+               are all shrink-0, so on a sidebar dragged near its 264px
+               minimum they would otherwise paint straight through the row's
+               edge and under the hover actions. The mask fades the last 14px
+               only if content actually reaches them, so a clipped row looks
+               clipped instead of looking like a smaller number — and the
+               order above means what goes first is the author, not a count. -->
+          <span
+            class="w-full flex items-center gap-1 min-w-0 leading-none overflow-hidden"
+            style="mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent);"
+          >
+            {@render branchNumbers(branch, statsMissing)}
+            <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
+            {@render branchAge(branch)}
+          </span>
+        </span>
+      {:else}
+        {@render branchIdentity(branch, leaf, true, true)}
       {/if}
     </button>
-    <div class="flex items-center gap-1 shrink-0 opacity-90">
-      {#if statsPending && statsMissing}
-        <span class="inline-block w-6 h-1 rounded-full bg-border/70 animate-pulse" aria-hidden="true"></span>
-      {:else if statsFailed && statsMissing}
-        <!-- Stats fetch failed outright: a dimmed static marker instead of zeros pretending "no churn". -->
-        <span class="inline-block w-6 h-1 rounded-full bg-rose-500/20 opacity-60" title="Churn unavailable (stats failed)" aria-hidden="true"></span>
-      {/if}
-      {#if branch.additions > 0 || branch.deletions > 0}
-        <ChurnBar additions={branch.additions} deletions={branch.deletions} />
-      {/if}
-      {#if branch.is_current && (workAdd > 0 || workDel > 0)}
-        <span class="text-[9px] text-textMuted font-mono" title="Uncommitted working tree">wt</span>
-        <ChurnBar additions={workAdd} deletions={workDel} />
-      {/if}
-      <BranchHealthDot {branch} />
-      <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
-      {#if branch.ahead_count > 0}
-        <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
-      {/if}
-      {#if branch.behind_count > 0}
-        <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25" title="{branch.behind_count} behind upstream">↓{branch.behind_count}</span>
-      {/if}
-      {#if branch.commits_ahead_of_base > 0 && !branch.is_current}
-        <span class="text-[10px] font-mono text-textMuted" title="{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}">+{branch.commits_ahead_of_base}</span>
-      {/if}
-      {#if branch.is_current}
-        <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs shrink-0"></span>
-      {/if}
-      <button
-        type="button"
-        class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0"
-        onclick={() => void copyText(branch.name)}
-        title="Copy branch name"
-        aria-label="Copy branch name {branch.name}"
-      ><Copy size={12} /></button>
-      <button
-        type="button"
-        class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-background text-textMuted transition-opacity shrink-0"
-        onclick={(e) => {
-          e.stopPropagation();
-          openBranchMenu(e, branch);
-        }}
-        title="Branch actions"
-        aria-label="Branch actions"
-        aria-haspopup="menu"
-        aria-expanded={menu?.branch?.name === branch.name && !menu?.tag}
-      >
-        <MoreHorizontal size={12} />
-      </button>
-    </div>
+    {#if twoLine}
+      <div class="absolute right-1 top-0 h-full flex items-center gap-0.5">
+        {@render branchActions(branch, true)}
+      </div>
+    {:else}
+      <div class="flex items-center gap-1 shrink-0 opacity-90">
+        {@render branchNumbers(branch, statsMissing)}
+        <BranchHealthDot {branch} />
+        <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
+        {#if branch.is_current}
+          <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs shrink-0"></span>
+        {/if}
+        {@render branchActions(branch, false)}
+      </div>
+    {/if}
   </div>
 {/snippet}
 
@@ -865,7 +1027,7 @@
       : isRowSelected
         ? 'bg-surfaceHover text-textPrimary ring-1 ring-border'
         : 'text-textPrimary hover:bg-surfaceHover'}"
-    style="height: {ROW_HEIGHT}px; contain-intrinsic-size: auto {ROW_HEIGHT}px;"
+    style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px;"
   >
     <Tag size={12} class="text-textMuted shrink-0" />
     {@render highlightedLabel(row.tag.name, debouncedQuery)}
@@ -889,7 +1051,7 @@
     onclick={() => toggle(row.folderId, "local")}
     aria-expanded={!closed}
     class="gp-cv-row w-full flex items-center gap-1.5 text-[11px] font-semibold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
-    style="height: {ROW_HEIGHT}px; contain-intrinsic-size: auto {ROW_HEIGHT}px; padding-left: {8 + row.depth * 12}px"
+    style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px; padding-left: {8 + row.depth * 12}px"
   >
     {#if closed}
       <ChevronRight size={12} class="shrink-0" />
@@ -908,7 +1070,7 @@
     onclick={() => toggle(row.sectionId, row.section.kind)}
     aria-expanded={!closed}
     class="w-full flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
-    style="height: {ROW_HEIGHT}px; contain-intrinsic-size: auto {ROW_HEIGHT}px;"
+    style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px;"
   >
     {#if closed}
       <ChevronRight size={11} class="shrink-0" />

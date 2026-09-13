@@ -60,6 +60,7 @@
   import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
   import SettingToggle from "./SettingToggle.svelte";
   import SettingSegment from "./SettingSegment.svelte";
+  import type { BranchRowLayout } from "../sidebar/metrics";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
 
@@ -352,6 +353,23 @@
     },
   ];
 
+  const BRANCH_ROW_OPTIONS: readonly {
+    value: BranchRowLayout;
+    label: string;
+    title: string;
+  }[] = [
+    {
+      value: "two-line",
+      label: "Two lines",
+      title: "Name on its own line, churn and counts below — long names stay readable",
+    },
+    {
+      value: "one-line",
+      label: "One line",
+      title: "Everything on one line: about 45% more refs on screen, names truncate sooner",
+    },
+  ];
+
   const DIFF_LAYOUT_OPTIONS: readonly { value: DiffLayout; label: string; title: string }[] = [
     {
       value: "unified",
@@ -614,6 +632,24 @@
                       picker, Work and the stack. Hovering a commit time in the list
                       shows the other form, and the graph's node card keeps showing both
                       whichever way this is set.
+                    </p>
+                  </div>
+
+                  <div data-setting="branch-rows" hidden={!shown("branch-rows")}>
+                    <div class="text-textMuted text-[10px] mb-1.5">Sidebar branch rows</div>
+                    <SettingSegment
+                      ariaLabel="Sidebar branch row layout"
+                      options={BRANCH_ROW_OPTIONS}
+                      value={$interfaceStore.branchRowLayout}
+                      onselect={(layout) => interfaceStore.setBranchRowLayout(layout)}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
+                      On one line the branch name is the only thing that can shrink, so a
+                      row of counters and buttons squeezes it down to a few characters.
+                      Two lines give the name the full width and move every number —
+                      lines changed, ahead and behind, files, author and age — underneath
+                      it. Branch spacing under Commit graph still sets how tall each line
+                      is.
                     </p>
                   </div>
 

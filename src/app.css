@@ -1355,9 +1355,10 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
    full paint cost — the list still renders correctly. */
 .gp-cv-row {
   content-visibility: auto;
-  /* Fallback only: BranchList sets `contain-intrinsic-size` inline from the
-     density-aware row height in src/lib/sidebar/metrics.ts, which is the
-     single source of truth — this static value covers non-JS edge paints. */
+  /* Fallback only: BranchList sets `contain-intrinsic-size` inline per row
+     KIND from src/lib/sidebar/metrics.ts, which is the single source of truth
+     — a two-line branch row is taller than the headers around it. This static
+     value is the header height and covers non-JS edge paints. */
   contain-intrinsic-size: auto 30px;
 }
 

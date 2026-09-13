@@ -70,6 +70,13 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "date time relative absolute ago commit age when clock",
   },
   {
+    id: "branch-rows",
+    section: "appearance",
+    label: "Sidebar branch rows",
+    keywords:
+      "branch list sidebar two line rows truncated truncate ellipsis name width churn lines changed author age density compact",
+  },
+  {
     id: "coach-marks",
     section: "appearance",
     label: "First-run coach marks",

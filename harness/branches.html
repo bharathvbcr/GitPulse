@@ -11,12 +11,35 @@ import { repoStore } from "../src/lib/stores/repoStore";
 import { filterStore } from "../src/lib/stores/filterStore";
 import { toastStore } from "../src/lib/stores/toastStore";
 import BranchList from "../src/lib/components/BranchList.svelte";
+import { sidebarRowHeight } from "../src/lib/sidebar/metrics";
 import ToastContainer from "../src/lib/components/ToastContainer.svelte";
 const params = new URLSearchParams(location.search);
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
 const results = [], crashes = [], merges = [], copies = [], unexpected = [];
 let current = "main", failMerge = false, pendingMerge = null, operation = null, probeFailed = false, copyFailed = false;
-const branch = (name, remote = false) => ({name, is_current: name === current && !remote, is_remote: remote, remote_name: remote ? name.split("/")[0] : null, tip_commit_id: "abc123456789", ahead_count: 0, behind_count: 0, is_default: name === "main", is_gone: false, last_commit_timestamp: Date.now()/1000, last_author: "Alex", last_summary: "Refine branch interactions", commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0});
+// Churn and divergence are derived from the name so they are stable across
+// runs but non-zero: every branch used to arrive as all-zeros, so the row's
+// entire measured-number path — churn bar, upstream arrows, files, ahead of
+// base — was never rendered by any harness check. That chrome is what used
+// to squeeze the branch name down to a few characters, so a fixture without
+// it cannot show the layout it broke. `main` stays clean: it is the
+// checked-out default, and some checks read it as the quiet baseline.
+const churn = name => {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.codePointAt(0)) % 9973;
+  return {ahead_count: h % 23, behind_count: h % 4, commits_ahead_of_base: h % 7,
+    commits_behind_base: h % 11, additions: 40 + (h % 3277), deletions: h % 149,
+    files_changed: 1 + (h % 17)};
+};
+const branch = (name, remote = false) => ({name, is_current: name === current && !remote, is_remote: remote, remote_name: remote ? name.split("/")[0] : null, tip_commit_id: "abc123456789", is_default: name === "main", is_gone: false, last_commit_timestamp: Date.now()/1000 - (name.startsWith("release/") ? STALE_AGE : 0), last_author: "Alex", last_summary: "Refine branch interactions",
+  ...(name === "main" && !remote
+    ? {ahead_count: 0, behind_count: 0, commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0}
+    : churn(name))});
+// release/0.0.9 is deliberately old. The two-line row drops the separate
+// "stale" chip and tints the commit age instead — one token carrying the
+// exact figure and the verdict computed from it — so a fixture where every
+// branch is seconds old cannot show that path at all.
+const STALE_AGE = 120 * 86400;
 const names = ["main", "feature/branch-selection", "feature/keyboard-navigation", "release/0.0.9"];
 let branches = [...names.map(n => branch(n)), branch("origin/feature/branch-selection", true), branch("upstream/main", true), branch("origin/HEAD", true)];
 const fixture = {
@@ -52,6 +75,74 @@ mount(ToastContainer,{target:document.getElementById("toasts")});
 await settle();
 if(params.has("check")) {
   try {
+    // --- two-line branch rows -------------------------------------------
+    // Geometry, so it can only be checked where real layout exists. The
+    // sidebar here is 320px: narrow enough that line two overflows on a
+    // branch with churn AND divergence, which is the case that used to
+    // paint numbers straight through the row's edge.
+    const branchRows = () => [...document.querySelectorAll(".gp-cv-row")]
+      .filter(r => r.querySelector('[aria-label^="Copy branch name"]'));
+    const lines = row => [...row.querySelector(".flex-col").children];
+    // Rightmost pixel either line actually PAINTS: a child clipped by its
+    // line cannot paint past that line's own edge.
+    const paintRight = row => Math.max(...lines(row).flatMap(line => {
+      const edge = line.getBoundingClientRect().right;
+      return [...line.children].map(c => Math.min(c.getBoundingClientRect().right, edge));
+    }));
+    check("two-line rows exist to measure",branchRows().length===4);
+    // The window math derives every scroll position from these heights. A
+    // row whose markup outgrows its declared height desynchronises the
+    // virtual window into blank bands, and nothing else here would notice.
+    const declaredHeight = sidebarRowHeight("branch","spacious","two-line");
+    check("each branch row is exactly as tall as the window math believes",
+      branchRows().every(r => Math.round(r.getBoundingClientRect().height)===declaredHeight));
+    check("headers stay one line while branch rows grow",
+      [...document.querySelectorAll(".gp-cv-row")]
+        .filter(r => !r.querySelector('[aria-label^="Copy branch name"]'))
+        .every(r => Math.round(r.getBoundingClientRect().height)===sidebarRowHeight("section-header","spacious","two-line")));
+    check("neither line paints under the hover actions",branchRows().every(row =>
+      paintRight(row) <= row.querySelector('[aria-label^="Copy branch name"]').parentElement.getBoundingClientRect().left + 0.5));
+    check("no row paints past its own edge",branchRows().every(row =>
+      paintRight(row) <= row.getBoundingClientRect().right));
+    // The name gets line one to itself. Measured against the widest thing
+    // the old single line left it on this fixture, which was ~52px.
+    const navRow = branchRows().find(r => r.textContent.includes("keyboard-navigation"));
+    const nameEl = lines(navRow)[0].querySelector(".truncate");
+    const roomForName = line => line.getBoundingClientRect().width
+      - [...line.children].filter(c => c !== nameEl)
+          .reduce((n,c) => n + c.getBoundingClientRect().width, 0)
+      - 6 * (line.children.length - 1);
+    check("the branch name is shown in full, not ellipsised",nameEl.scrollWidth <= nameEl.clientWidth + 1);
+    check("the branch name owns line one",roomForName(lines(navRow)[0]) > 150);
+    check("line one carries no counters to compete with the name",
+      !/[+↑↓]\d/.test(lines(navRow)[0].textContent));
+    check("line two carries the measured numbers",
+      /\+2768/.test(lines(navRow)[1].textContent) && /↑14/.test(lines(navRow)[1].textContent));
+    // Clipping is the last resort and it must cost the attribution first,
+    // never a count — a half-drawn "+27" reads as a smaller number.
+    const busy = lines(navRow)[1];
+    check("line two clips rather than overflowing",busy.scrollWidth > busy.clientWidth);
+    const paintedWidth = (el,line) => {
+      const b = el.getBoundingClientRect(), edge = line.getBoundingClientRect().right;
+      return Math.max(0, Math.min(b.right, edge) - b.left);
+    };
+    const authorEl = [...busy.querySelectorAll("span")].find(el => el.title.startsWith("Last commit by"));
+    check("clipping takes the author first — it paints nothing",paintedWidth(authorEl,busy)===0);
+    check("clipping never touches a count",
+      busy.querySelector('[aria-label*="additions"]').getBoundingClientRect().right
+        <= busy.getBoundingClientRect().right + 0.5);
+    // Stale is the age's own tint now, not a second chip beside it.
+    const staleRow = branchRows().find(r => r.textContent.includes("0.0.9"));
+    const staleAge = [...lines(staleRow)[1].querySelectorAll("span")]
+      .find(el => el.title.startsWith("Last commit"));
+    check("a stale branch shows its real age, not a chip",
+      /mo|y/.test(staleAge.textContent) && !staleRow.textContent.includes("stale"));
+    check("the stale age is tinted, and says so where it is read out",
+      staleAge.className.includes("amber") && staleAge.title.endsWith("stale"));
+    const freshAge = [...lines(navRow)[1].querySelectorAll("span")]
+      .find(el => el.title.startsWith("Last commit"));
+    check("a fresh branch's age is not tinted",!freshAge.className.includes("amber"));
+
     check("visible merge entry point",button("Merge branches"));
     await click("Copy branch name feature/branch-selection");
     check("copy preserves full branch path",copies.at(-1)==="feature/branch-selection");
