@@ -45,7 +45,10 @@
     SETTINGS_SECTIONS,
     type SettingsSectionId,
   } from "../ui/settingsSections";
-  import { matchSettings } from "../ui/settingsCatalog";
+  import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
+  import { hostPlatform } from "../stores/platformStore";
+  import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
+  import { appleIntelligenceStatus, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
   import type { GraphWidthMode } from "../graph/graphLayout";
   import type { RefScope } from "../graph/refScope";
@@ -112,7 +115,27 @@
   let query = $state("");
   let railEl = $state<HTMLElement>();
 
-  const filter = $derived(matchSettings(query));
+  // Settings whose implementing code does not exist on this host. Excluded from
+  // the catalog search too, so typing "dock" on Windows cannot open a section
+  // that then renders nothing.
+  // Live, not cached with the platform snapshot: a model can finish downloading
+  // and Apple Intelligence can be switched off while GitPulse is running.
+  let apple = $state<AppleIntelligenceStatus | null>(null);
+  async function loadApple() {
+    const status = await appleIntelligenceStatus($hostPlatform.os);
+    if (isOpen) apple = status;
+  }
+
+  const unsupported = $derived(
+    unsupportedSettingIds({
+      dockHiding: $hostPlatform.dock_hiding,
+      // "Could this host conceivably have it", not "is it working now" — the
+      // live answer is the row's own content, and a Mac that merely has it
+      // switched off still needs the row in order to be told so.
+      appleIntelligence: $hostPlatform.os === "macos",
+    }),
+  );
+  const filter = $derived(matchSettings(query, unsupported));
   const matchedSettings = $derived(new Set(filter.settings));
   const railSections = $derived(
     SETTINGS_SECTIONS.filter((entry) => filter.sections.includes(entry.id)),
@@ -120,7 +143,12 @@
   const noMatches = $derived(!filter.all && railSections.length === 0);
 
   /** Whether one control survives the filter; `data-setting` ids match the catalog. */
-  const shown = (id: string): boolean => filter.all || matchedSettings.has(id);
+  // One gate for both reasons a control is not on screen: the reader filtered it
+  // out, or this host cannot support it. Unsupported rows stay in the DOM as
+  // `hidden`, exactly as filtered rows do, so the row and its catalog entry
+  // remain paired.
+  const shown = (id: string): boolean =>
+    !unsupported.has(id) && (filter.all || matchedSettings.has(id));
 
   // A filter that leaves the open panel behind would show an empty pane and
   // read as "no results" while results sit one category away.
@@ -198,6 +226,9 @@
   $effect(() => {
     if (!isOpen) return;
     void loadMcpInfo();
+    // Only where the answer could be anything but "wrong OS"; elsewhere the row
+    // is not rendered and the probe would be a call with nowhere to land.
+    if ($hostPlatform.os === "macos") void loadApple();
   });
 
   $effect(() => () => {
@@ -550,7 +581,7 @@
                         type="button"
                         onclick={() => interfaceStore.zoomOut()}
                         class="gp-btn py-0.5! px-2! text-xs"
-                        title="Zoom Out (⌘-)">-</button
+                        title="Zoom Out ({shortcutTextLabel('⌘-', $hostPlatform.os)})">-</button
                       >
                       <input
                         type="range"
@@ -566,13 +597,13 @@
                         type="button"
                         onclick={() => interfaceStore.zoomIn()}
                         class="gp-btn py-0.5! px-2! text-xs"
-                        title="Zoom In (⌘+)">+</button
+                        title="Zoom In ({shortcutTextLabel('⌘+', $hostPlatform.os)})">+</button
                       >
                       <button
                         type="button"
                         onclick={() => interfaceStore.resetZoom()}
                         class="gp-btn py-0.5! px-2! text-[10px]"
-                        title="Reset Zoom (⌘0)">Reset</button
+                        title="Reset Zoom ({shortcutTextLabel('⌘0', $hostPlatform.os)})">Reset</button
                       >
                     </div>
                   </div>
@@ -641,9 +672,9 @@
                 <div class="space-y-4">
                   <div data-setting="status-icon" hidden={!shown("status-icon")}>
                     <SettingToggle
-                      label="Menu bar status icon"
+                      label={statusIconSettingLabel($hostPlatform.os)}
                       description="Show repository status while GitPulse is in the background. Closing the window hides it; use Quit to exit."
-                      ariaLabel="Show menu bar status icon"
+                      ariaLabel={`Show ${statusIconLocationName($hostPlatform.os)} status icon`}
                       checked={$interfaceStore.showStatusIcon}
                       onchange={(next) => interfaceStore.setShowStatusIcon(next)}
                     />
@@ -662,8 +693,8 @@
                     <div data-setting="status-icon-counts" hidden={!shown("status-icon-counts")}>
                       <SettingToggle
                         label="Show counts beside the icon"
-                        description="Optional changed and conflict counts next to the menu bar glyph. Off by default."
-                        ariaLabel="Show counts beside the menu bar status icon"
+                        description={`Optional changed and conflict counts next to the ${statusIconLocationName($hostPlatform.os)} glyph. Off by default.`}
+                        ariaLabel={`Show counts beside the ${statusIconLocationName($hostPlatform.os)} status icon`}
                         checked={$interfaceStore.statusIconCounts}
                         disabled={!$interfaceStore.showStatusIcon}
                         onchange={(next) => interfaceStore.setStatusIconCounts(next)}
@@ -672,7 +703,7 @@
                     <div data-setting="launch-at-login" hidden={!shown("launch-at-login")}>
                       <SettingToggle
                         label="Launch at login"
-                        description="Start GitPulse when you sign in. Uses a per-user LaunchAgent; the operating system is the source of truth."
+                        description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
                         ariaLabel="Launch GitPulse at login"
                         checked={launchAtLogin}
                         onchange={(next) => void setLaunchAtLogin(next)}
@@ -748,7 +779,7 @@
                 <div class="space-y-3" data-setting="view-visibility">
                   <p class="text-textMuted text-[10px] leading-snug">
                     Unchecking a view removes it from the header only. It stays reachable from
-                    the command palette (⌘K) and the View menu, the view you are currently in
+                    the command palette ({shortcutTextLabel("⌘K", $hostPlatform.os)}) and the View menu, the view you are currently in
                     always shows, and Work reappears on its own while conflicts are
                     unresolved — that is where Resolve lives.
                   </p>
@@ -937,6 +968,37 @@
                   </div>
                 </div>
               {:else if entry.id === "agents"}
+                <div data-setting="apple-intelligence" hidden={!shown("apple-intelligence")}>
+                  <div class="text-textMuted text-[10px] mb-1.5">Apple Intelligence</div>
+                  <p class="text-textMuted text-[10px] leading-snug mb-2">
+                    Drafts task titles and descriptions with the on-device model. Nothing leaves
+                    this computer, and no local model server is needed. Choose it per task in
+                    the enhancement panel.
+                  </p>
+                  <div class="flex items-start gap-1.5 text-[10px]"
+                    class:text-amber-600={apple !== null && !apple.available}
+                    class:dark:text-amber-400={apple !== null && !apple.available}
+                    class:text-textMuted={apple === null || apple.available}>
+                    {#if apple !== null && !apple.available}
+                      <AlertTriangle size={12} class="shrink-0 mt-px" />
+                    {/if}
+                    <!-- Already specific to the cause. A build compiled without
+                         the bridge says exactly that, and never blames the Mac:
+                         this row is the only place that answer is ever shown,
+                         because the per-task control hides an option nothing in
+                         the app can enable. -->
+                    <span data-testid="apple-intelligence-status">
+                      {apple?.explanation ?? "Checking whether Apple Intelligence is available…"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onclick={() => void loadApple()}
+                    class="gp-btn py-0.5! px-2.5! text-[11px] mt-2"
+                  >
+                    Recheck
+                  </button>
+                </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">
                     Agents connect through the native Codex plugin package

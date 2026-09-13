@@ -327,6 +327,15 @@ fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     window.set_focus().map_err(|error| error.to_string())
 }
 
+/// Whether this host has a Dock icon whose visibility GitPulse can control.
+///
+/// `apply_dock_policy` below is compiled only for macOS, because
+/// `set_activation_policy` exists only there. This constant is what the
+/// frontend is told, so it must track the same condition: a reader offered
+/// "Hide Dock icon while closed" on a host with no such code gets a switch
+/// that silently does nothing. `host_platform` asserts the two agree.
+pub const DOCK_HIDING: bool = cfg!(target_os = "macos");
+
 /// Dock visibility for menu-bar-only mode. Pure so MockRuntime tests can pin the matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockMode {

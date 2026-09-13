@@ -4,6 +4,35 @@ import {
 } from "./settingsSections";
 
 /**
+ * A host capability a setting cannot work without.
+ *
+ * Named rather than boolean so the reason a control is absent is legible at the
+ * definition, and so the check is made once here instead of as a platform
+ * conditional scattered through the modal's markup.
+ */
+export type SettingRequirement = "dockHiding" | "appleIntelligence";
+
+export interface SettingEntry {
+  readonly id: string;
+  readonly section: SettingsSectionId;
+  /** The control's own label, as the reader sees it. */
+  readonly label: string;
+  /**
+   * Words a reader might search that the label does not contain — synonyms,
+   * the vocabulary of other Git clients, and the thing the setting affects.
+   */
+  readonly keywords: string;
+  /**
+   * Host capability this setting needs. Absent means every host has it.
+   *
+   * A setting whose requirement is unmet is hidden rather than disabled: a
+   * greyed switch invites a reader to hunt for what would enable it, and on a
+   * platform where the implementing code does not exist, nothing will.
+   */
+  readonly requires?: SettingRequirement;
+}
+
+/**
  * Every individual setting on the page, so the filter box can find one.
  *
  * The rail catalog answers "which categories exist"; this answers "which
@@ -17,23 +46,13 @@ import {
  * added without an entry is unfindable by search, and an entry with no control
  * is a filter result that hides everything. Neither can ship.
  */
-export interface SettingEntry {
-  readonly id: string;
-  readonly section: SettingsSectionId;
-  /** The control's own label, as the reader sees it. */
-  readonly label: string;
-  /**
-   * Words a reader might search that the label does not contain — synonyms,
-   * the vocabulary of other Git clients, and the thing the setting affects.
-   */
-  readonly keywords: string;
-}
-
 export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   { id: "status-icon", section: "layout", label: "Menu bar status icon",
     keywords: "tray background close hide window repository conflicts menu bar stash pulse fleet terminal dock launch login autostart counts" },
+  // macOS-only: the activation-policy path behind it is compiled only there,
+  // and Windows and Linux have no Dock to hide.
   { id: "hide-dock", section: "layout", label: "Hide Dock icon while closed",
-    keywords: "dock accessory menu bar hide closed window" },
+    keywords: "dock accessory menu bar hide closed window", requires: "dockHiding" },
   { id: "status-icon-counts", section: "layout", label: "Show counts beside the icon",
     keywords: "tray title counts conflicts changed menu bar" },
   { id: "launch-at-login", section: "layout", label: "Launch at login",
@@ -189,6 +208,15 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     label: "Agent plugin surface",
     keywords: "mcp codex plugin tools read-only agents claude protocol",
   },
+  // macOS-only: on every other host the framework cannot exist, so the row
+  // would be a permanent "unavailable" with nothing the reader could do.
+  {
+    id: "apple-intelligence",
+    section: "agents",
+    label: "Apple Intelligence",
+    keywords: "on-device foundation models local drafting private offline mac apple intelligence task enhance",
+    requires: "appleIntelligence",
+  },
   {
     id: "external-tools",
     section: "agents",
@@ -208,6 +236,22 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "update manual check release version now",
   },
 ];
+
+/**
+ * Ids the host cannot support, given which capabilities it has.
+ *
+ * Passed to `matchSettings` so search agrees with the page: a reader on Windows
+ * typing "dock" must not be shown a section that then renders nothing.
+ */
+export function unsupportedSettingIds(
+  capabilities: Readonly<Record<SettingRequirement, boolean>>,
+): ReadonlySet<string> {
+  return new Set(
+    SETTINGS_CATALOG.filter(
+      (entry) => entry.requires !== undefined && !capabilities[entry.requires],
+    ).map((entry) => entry.id),
+  );
+}
 
 /** Lowercase words, empty for a blank query. */
 function terms(query: string): string[] {
@@ -234,13 +278,17 @@ export interface SettingsMatch {
  * keeps all of its controls: searching "graph" should show the Graph panel
  * intact, not just the two rows with "graph" in their label.
  */
-export function matchSettings(query: string): SettingsMatch {
+export function matchSettings(
+  query: string,
+  unsupported: ReadonlySet<string> = new Set(),
+): SettingsMatch {
+  const supported = SETTINGS_CATALOG.filter((entry) => !unsupported.has(entry.id));
   const words = terms(query);
   if (words.length === 0) {
     return {
       all: true,
       sections: SETTINGS_SECTIONS.map((entry) => entry.id),
-      settings: SETTINGS_CATALOG.map((entry) => entry.id),
+      settings: supported.map((entry) => entry.id),
     };
   }
 
@@ -256,7 +304,7 @@ export function matchSettings(query: string): SettingsMatch {
     ).map((entry) => entry.id),
   );
 
-  const settings = SETTINGS_CATALOG.filter((entry) => {
+  const settings = supported.filter((entry) => {
     if (wholeSections.has(entry.section)) return true;
     const haystack =
       `${entry.label} ${entry.keywords} ${sectionText.get(entry.section) ?? ""}`.toLowerCase();

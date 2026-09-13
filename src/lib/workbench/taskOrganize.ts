@@ -218,6 +218,45 @@ export function canQuickEnhance(
   return { ok: true, fields };
 }
 
+/**
+ * The provider name that routes an enhancement to Apple's on-device model.
+ *
+ * Must equal `WorkbenchState::APPLE_PROVIDER` in src-tauri/src/workbench.rs.
+ * The backend reads the provider off the stored proposal to decide whether to
+ * run the model in-process or forward to the Manvi sidecar, so a mismatch here
+ * would silently send every on-device request to a sidecar that is not
+ * configured. scripts/apple-bridge-contract.test.ts pins the two together.
+ */
+export const APPLE_ENHANCEMENT_PROVIDER = "apple";
+
+/** The model name recorded for on-device drafts, for provenance in history. */
+export const APPLE_ENHANCEMENT_MODEL = "system-language-model";
+
+/**
+ * Whether a task can be drafted by the on-device model.
+ *
+ * The sibling of [`canQuickEnhance`], and separate from it on purpose: on-device
+ * generation needs no local model server and no Manvi provider selection, so
+ * gating it on that configuration would refuse a path that works. What it does
+ * need is a framework that is actually available right now — which only the
+ * backend probe can say.
+ */
+export function canEnhanceOnDevice(
+  task: Pick<Task, "locked_fields">,
+  status: { available: boolean; explanation: string } | null,
+): { ok: true; fields: EnhancementField[] } | { ok: false; reason: string } {
+  if (!status) return { ok: false, reason: "Apple Intelligence availability is still unknown." };
+  // The explanation is already specific to the cause — an ineligible Mac, a
+  // switched-off setting, a model still downloading — so it is passed through
+  // rather than replaced by one generic refusal.
+  if (!status.available) return { ok: false, reason: status.explanation };
+  const fields = enhanceableFields(task);
+  if (fields.length === 0) {
+    return { ok: false, reason: "Title and description are locked against enhancement." };
+  }
+  return { ok: true, fields };
+}
+
 export function priorityName(priority: number): string {
   return PRIORITY_LABELS[priority as 0 | 1 | 2 | 3] ?? "Unknown";
 }

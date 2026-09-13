@@ -1,5 +1,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import { graphStore } from "../stores/graphStore";
   import CommitCadence from "./CommitCadence.svelte";
   import LanguageSegment from "./LanguageSegment.svelte";
@@ -238,7 +240,7 @@
           .terminalDockOpen
           ? 'text-accent'
           : 'text-textMuted hover:text-textPrimary'}"
-        title="Toggle the terminal dock (⌃`)"
+        title="Toggle the terminal dock ({shortcutTextLabel('⌃`', $hostPlatform.os)})"
       >
         <SquareTerminal size={11} class="shrink-0" />
         <span class="hidden md:inline">Terminal</span>
@@ -251,7 +253,7 @@
       class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-[10px]"
       title="Open Command Palette"
     >
-      <span class="gp-keycap">⌘K</span>
+      <span class="gp-keycap">{shortcutTextLabel("⌘K", $hostPlatform.os)}</span>
       <span class="hidden md:inline">Palette</span>
     </button>
 

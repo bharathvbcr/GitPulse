@@ -35,6 +35,7 @@
 //! window and a local reply parser, and every result says which of the two it
 //! was — `AiGeneration::warnings` carries the difference rather than hiding it.
 
+pub mod apple;
 pub mod discovery;
 pub mod http;
 pub mod prompt;

@@ -39,6 +39,13 @@ mockIPC(async (cmd, args) => {
       detail: "Fixture model ready.",
     };
   }
+  // TaskManviAssist probes on-device availability when it mounts, because that
+  // answer changes while the app runs. Reporting a build with no bridge is what
+  // `showsAppleOption` hides, so the board these checks measure stays the Manvi
+  // one; the on-device path is covered by its own unit and settings checks.
+  if (cmd === "cmd_apple_intelligence_status") {
+    return { available: false, state: { state: "not_compiled" }, explanation: "This build has no on-device bridge." };
+  }
   if (cmd !== "cmd_workbench_request") { unknown.push(cmd); throw Error(`Unconfigured command: ${cmd}`); }
   const input = JSON.parse(args.input);
   switch (args.method) {

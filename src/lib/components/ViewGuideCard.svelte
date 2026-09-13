@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { DestinationGuide } from "../views/viewGuide";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import ViewGuideArt from "./ViewGuideArt.svelte";
 
   /**
@@ -19,7 +21,7 @@
     <div class="flex items-center justify-between gap-2">
       <div class="text-xs font-semibold leading-tight text-textPrimary">{guide.title}</div>
       {#if guide.shortcut}
-        <kbd class="gp-keycap shrink-0 text-[10px]">{guide.shortcut}</kbd>
+        <kbd class="gp-keycap shrink-0 text-[10px]">{shortcutTextLabel(guide.shortcut, $hostPlatform.os)}</kbd>
       {/if}
     </div>
     <p class="mt-1 text-[11px] leading-relaxed text-textMuted">{guide.summary}</p>

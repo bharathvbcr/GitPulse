@@ -1,5 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { hostPlatform } from "../stores/platformStore";
+  import { closedAppSchedulingReason } from "../ui/platformCopy";
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
   import type { CleanerConfig, CleanerInventory, CleanerState } from "../storage/hygiene/globalTypes";
   import { humanBytes } from "../storage/format";
@@ -110,7 +112,7 @@
       <label class="flex items-center gap-2"><input type="checkbox" aria-label="Enable scheduled cleanup" bind:checked={draft.enabled} onchange={edited} disabled={!cleaner.supported} /><Clock size={13} />Automatically remove eligible output on schedule</label>
       <label>Repeat every <select aria-label="Cleanup interval" class="mx-1 rounded border border-border bg-surface p-1" bind:value={draft.interval_hours} onchange={() => { if (draft) draft.next_run_at = 0; edited(); }}><option value={24}>day</option><option value={168}>week</option><option value={720}>30 days</option></select></label>
       <label class="flex items-center gap-2"><input type="checkbox" aria-label="Run cleanup when GitPulse is closed" bind:checked={draft.run_when_closed} onchange={edited} disabled={!cleaner.background_supported} />Also run when GitPulse is closed</label>
-      <p class="text-textMuted">{cleaner.background_supported ? "Closed-app mode uses a per-user macOS background job and the same saved limits." : "Closed-app mode is available from an installed macOS application bundle."} Otherwise, schedules run while GitPulse is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
+      <p class="text-textMuted">{closedAppSchedulingReason($hostPlatform.os, cleaner.background_supported)} Otherwise, schedules run while GitPulse is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
       <p class="text-textMuted">Next scheduled run: {cleaner.config.enabled ? new Date(cleaner.config.next_run_at * 1000).toLocaleString() : "Off"}</p>
     </div>
     <p class="text-textMuted">Only ignored output with recognized producer evidence is eligible. Dirty repositories, active tasks, recent files, symlinks, environments, dependencies and persistent state are preserved. Shared package caches and non-Git projects are excluded from scheduled sweeps.</p>

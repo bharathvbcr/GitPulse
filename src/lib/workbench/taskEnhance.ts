@@ -10,7 +10,13 @@ import {
   type ModelSelection,
   type Task,
 } from "./client";
-import { canQuickEnhance, enhanceableFields } from "./taskOrganize";
+import {
+  APPLE_ENHANCEMENT_MODEL,
+  APPLE_ENHANCEMENT_PROVIDER,
+  canEnhanceOnDevice,
+  canQuickEnhance,
+  enhanceableFields,
+} from "./taskOrganize";
 import { bounded } from "./taskActions";
 import { selectionWire } from "./taskModel";
 
@@ -128,6 +134,35 @@ export async function startQuickEnhance(
     id: newID(),
     requestId: newID(),
   });
+  if (!input) throw new Error("Nothing is available to enhance.");
+  const { proposal } = await action.run("enhancements.create", input, task.id);
+  return { task, proposal };
+}
+
+/**
+ * Starts an on-device draft.
+ *
+ * Deliberately stops at `enhancements.create`, exactly as the Manvi path does.
+ * The backend recognises the provider on the stored proposal and runs the model
+ * in-process when generation is requested, so the two paths share the whole
+ * accept / revise / undo / history lifecycle rather than forking it.
+ */
+export async function startOnDeviceEnhance(
+  task: Task,
+  fields: readonly EnhancementField[],
+  status: { available: boolean; explanation: string } | null,
+  action = new EnhancementAction(),
+): Promise<QuickEnhanceStart> {
+  const gate = canEnhanceOnDevice(task, status);
+  if (!gate.ok) throw new Error(gate.reason);
+  const requested = fields.filter((field) => gate.fields.includes(field));
+  const input = createEnhancementInput(
+    task,
+    requested,
+    APPLE_ENHANCEMENT_PROVIDER,
+    APPLE_ENHANCEMENT_MODEL,
+    { id: newID(), requestId: newID() },
+  );
   if (!input) throw new Error("Nothing is available to enhance.");
   const { proposal } = await action.run("enhancements.create", input, task.id);
   return { task, proposal };

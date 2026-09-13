@@ -1,5 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { hostPlatform } from "../../stores/platformStore";
+  import { shortcutTextLabel } from "../../ui/platformCopy";
   import { repoStore } from "../../stores/repoStore";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
@@ -402,7 +404,7 @@
       >
         <Search size={11} />
         <span>Find</span>
-        <span class="gp-keycap text-[9px]!">⌘F</span>
+        <span class="gp-keycap text-[9px]!">{shortcutTextLabel("⌘F", $hostPlatform.os)}</span>
       </button>
 
       <button
@@ -412,7 +414,7 @@
       >
         <Hash size={11} />
         <span>Go to Line</span>
-        <span class="gp-keycap text-[9px]!">⌘G</span>
+        <span class="gp-keycap text-[9px]!">{shortcutTextLabel("⌘G", $hostPlatform.os)}</span>
       </button>
     </div>
 
@@ -485,7 +487,7 @@
           {:else}
             <Save size={12} />
           {/if}
-          <span>Save (⌘S)</span>
+          <span>Save ({shortcutTextLabel("⌘S", $hostPlatform.os)})</span>
         </button>
       {/if}
 

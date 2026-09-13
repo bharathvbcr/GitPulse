@@ -20,10 +20,12 @@
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, startQuickEnhance, EnhancementAction, liveEnhancement } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, startOnDeviceEnhance, startQuickEnhance, EnhancementAction, liveEnhancement } from "../workbench/taskEnhance";
   import { bounded } from "../workbench/taskActions";
   import { canAskManvi, suggestionDiffers } from "../workbench/taskCompose";
-  import { canQuickEnhance } from "../workbench/taskOrganize";
+  import { canEnhanceOnDevice, canQuickEnhance } from "../workbench/taskOrganize";
+  import { appleIntelligenceStatus, showsAppleOption, unknownAppleStatus, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
+  import { hostPlatform } from "../stores/platformStore";
   import {
     describeSelection,
     effectiveSelection,
@@ -124,10 +126,27 @@
   const descriptionSuggestion = $derived(ready && proposal ? proposal.proposed.description ?? "" : "");
   const showTitleSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("title") && suggestionDiffers(title, titleSuggestion)));
   const showDescriptionSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("description") && suggestionDiffers(description, descriptionSuggestion)));
+  /**
+   * Which engine drafts the task.
+   *
+   * On-device generation runs in this process through Apple's Foundation
+   * Models, so it needs no local model server and no Manvi provider selection —
+   * which is why it has its own gate rather than reusing Manvi's.
+   */
+  let engine = $state<"manvi" | "on-device">("manvi");
+  let apple = $state<AppleIntelligenceStatus | null>(null);
+  const appleStatus = $derived(apple ?? unknownAppleStatus($hostPlatform.os));
+  const showsOnDevice = $derived(showsAppleOption($hostPlatform.os, appleStatus));
+  // An engine that stopped being offered must not stay selected.
+  const activeEngine = $derived(engine === "on-device" && showsOnDevice ? "on-device" : "manvi");
+  const onDeviceGate = $derived(canEnhanceOnDevice({ locked_fields: lockedFields }, appleStatus));
   const gate = $derived(canAskManvi({ title, description, repository_ids: repositoryIds }, notes));
   const manviGate = $derived(canQuickEnhance({ locked_fields: lockedFields }, configuration, configurationError));
   const available = $derived(requested.filter((field) => !lockedFields.includes(field)));
-  const askLabel = $derived(busy || preparing ? (quick ? "Enhancing…" : "Asking Manvi…") : notes.trim() ? "Draft with Manvi" : quick ? "Enhance with Manvi" : "Improve with Manvi");
+  const engineName = $derived(activeEngine === "on-device" ? "Apple Intelligence" : "Manvi");
+  const askLabel = $derived(busy || preparing
+    ? (quick ? "Enhancing…" : `Asking ${engineName}…`)
+    : notes.trim() ? `Draft with ${engineName}` : quick ? `Enhance with ${engineName}` : `Improve with ${engineName}`);
   const selectionSummary = $derived(liveSelection ? describeSelection(liveSelection) : "");
   const confirmedModel = $derived(configuration?.model_source === "env" && configuration.model.trim()
     ? (liveSelection ? describeSelection({ base_url: liveSelection.base_url, model: configuration.model }) : `${configuration.provider} / ${configuration.model}`)
@@ -138,16 +157,25 @@
       ? "Title and description are locked"
       : available.length === 0
         ? "Choose title, description, or both"
-        : !liveSelection
-          ? "Pick a local model in Local model servers"
-          : !manviReady
-            ? (configurationError ?? "Manvi has no provider and model selected.")
-            : !manviGate.ok
-              ? manviGate.reason
-              : undefined,
+        : activeEngine === "on-device"
+          // The on-device refusal is already specific to its cause — an
+          // ineligible Mac, a switched-off setting, a model still downloading —
+          // so it is shown as-is rather than replaced by a Manvi reason that
+          // does not apply to this engine.
+          ? (onDeviceGate.ok ? undefined : onDeviceGate.reason)
+          : !liveSelection
+            ? "Pick a local model in Local model servers"
+            : !manviReady
+              ? (configurationError ?? "Manvi has no provider and model selected.")
+              : !manviGate.ok
+                ? manviGate.reason
+                : undefined,
   );
   const askDisabled = $derived(
-    disabled || acting || liveAttempt || configPending || available.length === 0 || Boolean(gate) || !manviReady || !manviGate.ok,
+    disabled || acting || liveAttempt || available.length === 0 || Boolean(gate) ||
+      (activeEngine === "on-device"
+        ? !onDeviceGate.ok
+        : configPending || !manviReady || !manviGate.ok),
   );
   const revisionDirty = $derived(proposal?.fields.some((field) => revisionDraft[field] !== proposal?.proposed[field]) ?? false);
   const failureAdvice = $derived(proposal?.failure ? explainEnhancementFailure(proposal.failure) : null);
@@ -171,6 +199,12 @@
     update();
     document.addEventListener("visibilitychange", update);
     void loadConfig();
+    // Availability genuinely changes while the app runs — a model finishes
+    // downloading, or Apple Intelligence is switched off — so this is probed
+    // rather than read from the session-long platform snapshot.
+    void appleIntelligenceStatus(get(hostPlatform).os).then((status) => {
+      if (!disposed) apple = status;
+    });
     if (task) void history();
     if (autofocus && !quick) queueMicrotask(() => notesEl?.focus());
     const tick = window.setInterval(() => { now = Date.now() / 1000; }, 1000);
@@ -313,12 +347,23 @@
         if (!error) error = gate ?? "Could not save a draft for Manvi.";
         return;
       }
-      if (!configuration) {
-        error = configurationError ?? "Manvi configuration has not been loaded.";
-        return;
-      }
-      if (!liveSelection) {
-        error = "Pick a local model in Local model servers.";
+      // On-device generation needs neither a Manvi configuration nor a local
+      // model server, so these two checks belong to the Manvi engine only.
+      // `manviConfiguration` carries the narrowed value past the branch, so the
+      // start call below needs no non-null assertion to see it.
+      let manviConfiguration: EnhancementConfiguration | null = null;
+      if (activeEngine === "manvi") {
+        if (!configuration) {
+          error = configurationError ?? "Manvi configuration has not been loaded.";
+          return;
+        }
+        if (!liveSelection) {
+          error = "Pick a local model in Local model servers.";
+          return;
+        }
+        manviConfiguration = configuration;
+      } else if (!onDeviceGate.ok) {
+        error = onDeviceGate.reason;
         return;
       }
       const page = await bounded(listEnhancements(saved.id));
@@ -329,7 +374,9 @@
         if (!disposed) { proposal = current; note = "A suggestion is already in progress."; await history(); }
         return;
       }
-      const started = await startQuickEnhance(saved, available, configuration, action);
+      const started = manviConfiguration
+        ? await startQuickEnhance(saved, available, manviConfiguration, action)
+        : await startOnDeviceEnhance(saved, available, appleStatus, action);
       if (disposed) return;
       proposal = started.proposal;
       selected = started.proposal.fields.filter((field) => !lockedFields.includes(field));
@@ -338,8 +385,8 @@
         suggestionDiffers(description, started.proposal.proposed.description ?? "")
       );
       note = started.proposal.state === "ready"
-        ? (changed ? "Suggestions ready under the fields they change." : "Manvi kept your wording.")
-        : "Manvi is drafting title and description.";
+        ? (changed ? "Suggestions ready under the fields they change." : `${engineName} kept your wording.`)
+        : `${engineName} is drafting title and description.`;
       await history();
     } catch (cause) {
       if (!disposed) error = explainError(cause);
@@ -459,17 +506,45 @@
     </label>
   {/if}
 
-  <div class="model-row">
-    {#if confirmedModel}
-      <p class="meta">Using {confirmedModel}</p>
-    {:else}
-      <p class="warn">Pick a local model in Local model servers</p>
+  <!-- The engine choice appears only where on-device drafting can exist at all.
+       On a non-Mac there is no second option, so a disabled control would be
+       nothing but a question the reader cannot answer. -->
+  {#if showsOnDevice}
+    <div class="engine-row" role="radiogroup" aria-label="Drafting engine">
+      <button type="button" class="engine" role="radio" aria-checked={activeEngine === "manvi"}
+        class:picked={activeEngine === "manvi"} disabled={disabled || acting || busy}
+        onclick={() => (engine = "manvi")}>Manvi</button>
+      <button type="button" class="engine" role="radio" aria-checked={activeEngine === "on-device"}
+        class:picked={activeEngine === "on-device"} disabled={disabled || acting || busy}
+        onclick={() => (engine = "on-device")}>On-device</button>
+    </div>
+  {/if}
+
+  {#if activeEngine === "on-device"}
+    <div class="model-row">
+      {#if appleStatus.available}
+        <p class="meta" data-testid="apple-status">Using Apple Intelligence on this computer. Nothing is sent to a server.</p>
+      {:else}
+        <!-- Already specific to the cause: an ineligible Mac, Apple Intelligence
+             switched off, or a model still downloading are different problems. -->
+        <p class="warn" data-testid="apple-status">{appleStatus.explanation}</p>
+      {/if}
+      <button type="button" class="change-link" disabled={busy || acting}
+        onclick={() => void appleIntelligenceStatus($hostPlatform.os).then((status) => { apple = status; })}>Recheck</button>
+    </div>
+  {:else}
+    <div class="model-row">
+      {#if confirmedModel}
+        <p class="meta">Using {confirmedModel}</p>
+      {:else}
+        <p class="warn">Pick a local model in Local model servers</p>
+      {/if}
+      <button type="button" class="change-link" onclick={() => requestManviFocus("model")}>Change</button>
+    </div>
+    {#if configurationError}
+      <p class="warn">{configurationError}</p>
+      <button type="button" class="gp-btn" disabled={configPending || acting || disabled} onclick={() => void loadConfig()}>Retry Manvi configuration</button>
     {/if}
-    <button type="button" class="change-link" onclick={() => requestManviFocus("model")}>Change</button>
-  </div>
-  {#if configurationError}
-    <p class="warn">{configurationError}</p>
-    <button type="button" class="gp-btn" disabled={configPending || acting || disabled} onclick={() => void loadConfig()}>Retry Manvi configuration</button>
   {/if}
 
   <div class="locks">
@@ -623,6 +698,10 @@
   .suggestion-body{margin:4px 0 8px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:7rem;overflow:auto;font:12px/1.45 inherit}
   .suggested{border:1px solid rgb(var(--c-accent) / 0.45);border-radius:7px;padding:8px;background:rgb(var(--c-bg) / 0.45)}
   .review-actions,.actions,.history-heading,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .engine-row{display:flex;gap:6px;margin:8px 0}
+  .engine{font:inherit;font-size:11px;padding:4px 10px;border-radius:999px;border:1px solid rgb(var(--c-border));background:transparent;color:rgb(var(--c-text-muted));cursor:pointer}
+  .engine.picked{background:rgb(var(--c-accent) / 0.14);border-color:rgb(var(--c-accent) / 0.5);color:rgb(var(--c-text))}
+  .engine:disabled{opacity:.5;cursor:default}
   .model-row{justify-content:space-between;margin:4px 0 8px}
   .change-link{background:none;border:0;color:rgb(var(--c-accent));font-size:11px;padding:0;cursor:pointer;text-decoration:underline}
   .locks{margin:4px 0 8px}

@@ -238,12 +238,34 @@ fn test_language_stats_skip_oversized_files_without_reading() {
     let path = repo.path().to_str().unwrap();
 
     std::fs::write(repo.path().join("small.rs"), "fn a() {}\n").unwrap();
-    let huge = File::create(repo.path().join("huge.rs")).unwrap();
-    huge.set_len(3 * 1024 * 1024 * 1024).unwrap(); // sparse: 3 GiB on disk usage ~0
-    drop(huge);
+    // Track `huge.rs` while it is still tiny, then grow it on disk. The file is
+    // tracked either way — `get_repo_language_stats` lists paths with
+    // `git ls-files` and then stats the WORKING TREE copy, which is the code
+    // under test — but staging it at full size makes git hash 3 GiB of zeroes
+    // first. Measured on this machine: a raw `git add` of that file takes 136s
+    // against GitPulse's 90s command cap, so the setup, not the assertion,
+    // decided whether the test could pass. Growing it after the commit keeps
+    // exactly the same thing under test and costs nothing.
+    std::fs::write(repo.path().join("huge.rs"), "fn b() {}\n").unwrap();
     GitWriter::stage_file(path, "small.rs").unwrap();
     GitWriter::stage_file(path, "huge.rs").unwrap();
     GitWriter::commit(path, "feat: sizes", false).unwrap();
+    let huge = File::options()
+        .write(true)
+        .open(repo.path().join("huge.rs"))
+        .unwrap();
+    huge.set_len(3 * 1024 * 1024 * 1024).unwrap(); // sparse: 3 GiB, ~0 on disk
+    drop(huge);
+    // The test is only meaningful if the file really is oversized at stat time.
+    // Without this, a setup that silently failed to grow the file would leave a
+    // fast, green, and entirely vacuous assertion below.
+    assert_eq!(
+        std::fs::metadata(repo.path().join("huge.rs"))
+            .unwrap()
+            .len(),
+        3 * 1024 * 1024 * 1024,
+        "the oversized file was not grown, so the skip is never exercised"
+    );
 
     let started = std::time::Instant::now();
     let stats = GitReader::get_repo_language_stats(path)

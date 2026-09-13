@@ -11,7 +11,8 @@
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { isImeComposition } from "../keyboard/imeGuard";
-  import { isMacOS } from "../platform";
+  import { hostPlatform } from "../stores/platformStore";
+  import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { highlightMatches } from "../branches/groupBranches";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
@@ -263,7 +264,7 @@
               onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
               <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
               <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`palette-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
-              <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{isMacOS() ? cmd.shortcut : cmd.shortcut.replaceAll("⌘", "Ctrl+").replaceAll("⇧", "Shift+")}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
+              <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
             </button>
           {/each}
           {#if filteredCommands.length === 0}
@@ -274,7 +275,7 @@
       {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
       <div id="palette-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
       <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
-        {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{isMacOS() ? "⌘K" : "Ctrl+K"}</kbd>{/if}
+        {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{platformChord("⌘K", "Ctrl+K", $hostPlatform.os)}</kbd>{/if}
       </footer>
     </div>
   </div>

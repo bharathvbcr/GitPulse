@@ -36,6 +36,30 @@ const TRACKED_DOCS = [
  */
 const LOCAL_DRAFTS = ["docs/PROMO.md"] as const;
 
+/**
+ * The checker's own SCOPE docstring, which states the same two counts.
+ *
+ * That docstring is where this rot started: it claimed "40 contracts over 57
+ * structs" while its table held 57 and 142. A reader deciding whether their
+ * payload is covered reads the note beside the table long before they read
+ * README, so guarding only the documents would guard the echo and not the
+ * source.
+ *
+ * Only the SCOPE note is scanned, not the whole file: prose patterns are far
+ * too eager against source, where "Exit codes: 0 contract holds · 1 contract
+ * violation" reads as two claims that the table has 0 and 1 contracts.
+ */
+const SCOPE_SOURCE = "scripts/check-coverage-types.mjs";
+
+function scopeNote(): string {
+  const source = read(SCOPE_SOURCE);
+  const start = source.indexOf(" * SCOPE:");
+  expect(start, `${SCOPE_SOURCE} no longer has a SCOPE note to check`).toBeGreaterThan(-1);
+  // Runs to the end of that comment paragraph.
+  const end = source.indexOf("\n *\n", start);
+  return source.slice(start, end < 0 ? source.indexOf("*/", start) : end);
+}
+
 function docUrl(relative: string): URL {
   return new URL(`../${relative}`, import.meta.url);
 }
@@ -67,6 +91,8 @@ function claimPattern(noun: string): RegExp {
 const HANDLER_CLAIM = claimPattern("handlers?|commands?");
 const VIEW_CLAIM = claimPattern("views?");
 const FIELD_CLAIM = claimPattern("fields?");
+const CONTRACT_CLAIM = claimPattern("contracts?");
+const STRUCT_CLAIM = claimPattern("structs?");
 
 interface Claim {
   doc: string;
@@ -79,7 +105,9 @@ interface Claim {
 function claimsIn(pattern: RegExp, docs: readonly string[]): Claim[] {
   const found: Claim[] = [];
   for (const doc of docs) {
-    for (const match of read(doc).matchAll(pattern)) {
+    // The scope note is a slice of a source file, not a whole document.
+    const text = doc === SCOPE_SOURCE ? scopeNote() : read(doc);
+    for (const match of text.matchAll(pattern)) {
       const value = Number(match[1].replace(/,/g, ""));
       if (!Number.isFinite(value)) continue;
       found.push({ doc, value, floor: match[2] === "+", text: match[0].trim() });
@@ -127,6 +155,23 @@ function fieldCount(): number {
   const reports = JSON.parse(logged.join("\n")) as Array<{ fieldCount?: number }>;
   const actual = reports.reduce((sum, report) => sum + (report.fieldCount ?? 0), 0);
   expect(actual, "the checker should report a field count").toBeGreaterThan(0);
+  return actual;
+}
+
+/** How many contracts the type checker compares, from its own table. */
+function contractCount(): number {
+  const actual = checkCoverageTypes.CONTRACTS.length;
+  expect(actual, "the checker should define contracts").toBeGreaterThan(0);
+  return actual;
+}
+
+/** How many structs those contracts cover, from the same table. */
+function structCount(): number {
+  const actual = checkCoverageTypes.CONTRACTS.reduce(
+    (sum: number, contract: { structs: readonly string[] }) => sum + contract.structs.length,
+    0,
+  );
+  expect(actual, "the checker's contracts should name structs").toBeGreaterThan(0);
   return actual;
 }
 
@@ -186,6 +231,20 @@ describe("documented counts match the code", () => {
 
   it("states the real number of registered views", () => {
     expectClaims(TRACKED_DOCS, VIEW_CLAIM, REGISTERED_VIEWS.length, "view");
+  });
+
+  /**
+   * Added after both of these were found stale in three documents at once, and
+   * in the checker's own docstring: it claimed "40 contracts over 57 structs"
+   * when the table held 57 contracts and 142 structs. Handlers, views and
+   * fields were guarded; these two were not, so they were the two that rotted.
+   */
+  it("states the real number of type contracts", () => {
+    expectClaims([...TRACKED_DOCS, SCOPE_SOURCE], CONTRACT_CLAIM, contractCount(), "contract");
+  });
+
+  it("states the real number of contracted structs", () => {
+    expectClaims([...TRACKED_DOCS, SCOPE_SOURCE], STRUCT_CLAIM, structCount(), "struct");
   });
 
   it("states the real number of type-checked fields", () => {

@@ -7,6 +7,8 @@
   import { LAYERS } from "../ui/layers";
   import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "@lucide/svelte";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutKeyLabels, shortcutTextLabel } from "../ui/platformCopy";
 
   let {
     isOpen = $bindable(false),
@@ -98,10 +100,27 @@
     },
   ];
 
+  // The accelerators themselves are bound as CmdOrCtrl and already resolve to
+  // Control off macOS; only this printed reference was wrong. Mapping happens
+  // before filtering so that searching "ctrl" on Windows finds the rows whose
+  // keys are authored as macOS glyphs.
+  let platformCategories = $derived(
+    SHORTCUT_CATEGORIES.map((cat) => ({
+      ...cat,
+      shortcuts: cat.shortcuts.map((item) => ({
+        ...item,
+        keys: shortcutKeyLabels(item.keys, $hostPlatform.os),
+        // Descriptions carry glyphs too ("Next match (⇧F3 for previous)"), so
+        // mapping only the key chips would leave macOS notation in the prose.
+        description: shortcutTextLabel(item.description, $hostPlatform.os),
+      })),
+    })),
+  );
+
   let filteredCategories = $derived.by(() => {
     const q = filterQuery.trim().toLowerCase();
-    if (!q) return SHORTCUT_CATEGORIES;
-    return SHORTCUT_CATEGORIES.map((cat) => ({
+    if (!q) return platformCategories;
+    return platformCategories.map((cat) => ({
       ...cat,
       shortcuts: cat.shortcuts.filter(
         (s) =>

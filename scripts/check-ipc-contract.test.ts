@@ -113,7 +113,10 @@ describe("check:ipc contract", () => {
     expect(bad.code).toBe(1);
     expect(bad.stdout).toMatch(/manual-review sites\s*:\s*1/);
     expect(bad.stdout).toMatch(/could not be resolved locally/);
-  });
+    // Two full checker runs at ~2.3s each sit right on vitest's 5s default, so
+    // this failed intermittently under load — a flaky gate, which is a gate
+    // people learn to ignore. Same budget the five-run test above already uses.
+  }, STRESS_TIMEOUT_MS);
 
   it("recognizes invoke calls whose generic argument nests one level deep", async () => {
     // Regression: `invoke<Guarded<string>>("cmd_…")` used to be invisible to
@@ -250,7 +253,8 @@ describe("check:ipc contract", () => {
     const bad = await runScript(["--extra-dir", srcDir]);
     expect(bad.code).toBe(1);
     expect(bad.stdout).toMatch(/missing commands\s*:\s*1/);
-  });
+    // Two checker runs, same reason as above.
+  }, STRESS_TIMEOUT_MS);
 });
 
 describe("report alignment (A3)", () => {
@@ -285,7 +289,7 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    expect(found.size).toBe(212);
+    expect(found.size).toBe(214);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

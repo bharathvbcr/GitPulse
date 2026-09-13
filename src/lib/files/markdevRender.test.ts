@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
+import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestOf } from "../__tests__/perfBudget";
 import {
   MAX_RENDER_BYTES,
   calculateDocumentStats,
@@ -124,14 +124,24 @@ describe("markdevRender IPC", () => {
 
 describe("markdevRender — document stats stay linear", () => {
   it("does not slow quadratically on unmatched brackets", () => {
+    // Fastest of three per size. A single sample made this fail under a
+    // concurrent build: `expectWithinBudget` calibrates immediately AFTER the
+    // measured work, so work that ran during a busy stretch and calibration
+    // that ran during an idle one produced a budget nothing could meet. The
+    // minimum is the sample least disturbed by other load, and a genuine
+    // regression still slows it.
     const timings = [20000, 40000, 80000].map((n) => {
-      const started = Date.now();
-      calculateDocumentStats("[".repeat(n));
-      return Date.now() - started;
+      const text = "[".repeat(n);
+      return fastestOf(3, () => void calculateDocumentStats(text));
     });
     expectWithinBudget(timings[2]!, 400, "stats on unmatched brackets");
-    // Soft ratio guard: 4× input should not cost ~16× (true quadratic).
-    expect(timings[2]! / Math.max(1, timings[0]!)).toBeLessThan(13);
+    // 4x the input must not cost ~16x. Measured on this tree the ratio is a
+    // flat 3.9-4.0, so 8 sits midway between linear and quadratic: tight enough
+    // to catch the regression, loose enough never to depend on the weather.
+    // No `Math.max` floor is needed — `fastestOf` reports sub-millisecond time,
+    // where the old `Date.now()` truncated ~13.6ms work toward a whole number
+    // and a genuinely fast case to 0.
+    expect(timings[2]! / timings[0]!).toBeLessThan(8);
   }, STRESS_TIMEOUT_MS);
 });
 
