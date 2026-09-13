@@ -11,6 +11,73 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-12
+
+Security hardening release. Opening a repository is now an explicit decision,
+and ordinary file saves no longer follow links out of the entry they target.
+Both changes narrow what GitPulse does on your behalf; no surface is widened.
+
+### Security
+
+- Opening a checkout requires an explicit **Trust and Open** decision before
+  GitPulse runs Git against it. Path inspection is filesystem-only: a canceled
+  or failed approval starts no watchers, status hydration, dependency scans, or
+  code indexing. Trust permits that checkout's Git hooks, helpers, and project
+  tools — including code in submodules — to run with your account's
+  permissions. It is an execution decision, not an OS sandbox, and not a claim
+  that the project is safe.
+- Remembered grants live in the application configuration directory, outside
+  repository policy and task files, and bind the canonical checkout, private
+  Git directory, common Git directory, and their filesystem identities.
+  Replacing a checkout or redirecting a gitfile requires fresh approval.
+- Linked worktrees are approved separately. Shared Git-directory discovery is
+  filesystem-only, and removing a worktree requires trust for the target as
+  well as the parent, because Git may scan the target internally.
+- Native Git, background analysis, DevMap, PTY startup, and MCP reads all
+  enforce trust, and MCP cannot grant it. A refusal is an explicit error or an
+  unavailable result, never a successful empty scan.
+- Global tool probes run from a neutral filesystem root. Installing a tool from
+  local source requires approval for the checkout used to build it.
+- **Revoke repository trust** on the repository tab closes the tab and blocks
+  subsequent operations. Terminals and agent tasks already running keep the
+  authority they were given; stop those separately.
+- Filesystems that cannot supply a stable creation identity are refused with an
+  explanation rather than trusted silently. Trust decisions are local to this
+  installation and are not portable project metadata.
+- Editor and documentation saves replace file entries atomically under pinned,
+  symlink-free parent directories, so saving one hard link no longer truncates
+  the inode shared by its other names. External symlinks and special files are
+  refused; nested paths, empty files, internal symlinks, and executable
+  permissions still work, under the existing 8 MiB budget.
+- Platform metadata preservation — macOS metadata copying, Linux ownership and
+  extended attributes, Windows replacement — now fails the save rather than
+  silently dropping metadata. Linux saves clear set-id and file-capability
+  privileges as ordinary content writes do, with metadata work bounded to 512
+  attributes and 1 MiB of values.
+- A save that loses a race to a concurrent change fails with an error naming the
+  retained recovery content. This is not an OS sandbox against a process already
+  running with your rights.
+
+### Fixed
+
+- The repository status publish gate compared a hand-written list of eleven
+  fields and silently ignored `warnings`. A repository whose churn had stopped
+  being partial compared equal and never republished, so the explorer kept
+  showing "counts may understate reality" for numbers that had since parsed
+  cleanly. The gate now derives its comparison from every field the wire
+  carries, treats an omitted and an empty list as the same fact, and compares
+  array values element-wise instead of by identity.
+
+### Changed
+
+- RUSTSEC-2024-0429 (`glib 0.18.5`) no longer applies: the September 2026 GTK
+  migration moved the Linux stack to `glib 0.22.9`. On 2026-09-12 the tree
+  passed `cargo audit --deny warnings` across 550 Rust dependencies and
+  `npm audit` across 175 npm dependencies with no reported advisories. These are
+  dated advisory-database checks, not exhaustive source or runtime verification.
+- The IPC surface grows to 212 handlers, and the Rust/TypeScript contract check
+  to 57 contracts across 1,022 fields.
+
 ## [1.0.0] - 2026-09-11
 
 First major GitPulse release. The `v0.1.0` tag was cut the day before, but
@@ -1283,7 +1350,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
 [0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
