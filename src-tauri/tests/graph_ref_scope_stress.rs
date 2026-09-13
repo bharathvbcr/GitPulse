@@ -11,6 +11,8 @@
 //! asks git and compares. Every rule encoded twice — once in a Rust prefix
 //! test, once in a git option — is a rule that can drift.
 
+mod common;
+
 use std::collections::{BTreeSet, HashSet};
 use std::process::Command;
 
@@ -38,6 +40,9 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

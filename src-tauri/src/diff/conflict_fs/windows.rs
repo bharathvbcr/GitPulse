@@ -6,37 +6,19 @@ use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CAP: u64 = 16 * 1024 * 1024;
 const SHARE_READ: u32 = 1;
-const SHARE_WRITE: u32 = 2;
 const SHARE_DELETE: u32 = 4;
 const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const REPARSE_POINT: u32 = 0x400;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-#[repr(C)]
-#[derive(Default)]
-struct FileInformation {
-    attributes: u32,
-    creation_time: [u32; 2],
-    access_time: [u32; 2],
-    write_time: [u32; 2],
-    volume: u32,
-    size_high: u32,
-    size_low: u32,
-    links: u32,
-    index_high: u32,
-    index_low: u32,
-}
-
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn GetFileInformationByHandle(file: *mut c_void, info: *mut FileInformation) -> i32;
     fn ReplaceFileW(
         target: *const u16,
         replacement: *const u16,
@@ -47,15 +29,10 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-type Identity = (u32, u32, u32);
+type Identity = (u64, [u8; 16]);
 
 fn identity(file: &File) -> Result<Identity, String> {
-    let mut info = FileInformation::default();
-    // SAFETY: File owns the live handle; info has the documented C layout.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok((info.volume, info.index_high, info.index_low))
+    crate::fs_entry::windows_file_identity(file).map_err(|e| e.to_string())
 }
 
 fn wide(path: &Path) -> Result<Vec<u16>, String> {
@@ -63,48 +40,19 @@ fn wide(path: &Path) -> Result<Vec<u16>, String> {
 }
 
 fn pin_directory(path: &Path) -> Result<File, String> {
-    let file = OpenOptions::new()
-        // FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. Metadata-only opens do
-        // not participate in Windows share-access checks, so they cannot pin
-        // a directory name. No backup privilege or ACL override is enabled.
-        .access_mode(0x81)
-        .share_mode(SHARE_READ | SHARE_WRITE) // No DELETE: the name stays pinned.
-        .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
-        .open(path)
-        .map_err(|e| format!("Cannot pin conflict parent: {e}"))?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_dir() || meta.file_attributes() & REPARSE_POINT != 0 {
-        return Err("Conflict parent must be an existing real directory".into());
-    }
-    Ok(file)
+    crate::fs_entry::pin_directory(path).map_err(|e| e.to_string())
 }
 
 fn parents(path: &Path) -> Result<Vec<File>, String> {
-    if !path.is_absolute() || path.file_name().is_none() {
-        return Err("Conflict path must be an absolute file path".into());
-    }
-    let parent = path.parent().ok_or("Missing conflict parent")?;
-    let mut current = PathBuf::new();
-    let mut handles = Vec::new();
-    for component in parent.components() {
-        if handles.len() >= 256 {
-            return Err("Conflict path exceeds the directory depth limit".into());
-        }
-        match component {
-            Component::Prefix(_) => current.push(component),
-            Component::RootDir | Component::Normal(_) => {
-                current.push(component);
-                handles.push(pin_directory(&current)?);
-            }
-            _ => return Err("Conflict path must have normalized parents".into()),
-        }
-    }
-    Ok(handles)
+    crate::fs_entry::pin_parents(path, false).map_err(|e| e.to_string())
 }
 
 // Holding the returned file denies writers for the lifetime of this snapshot.
 // DELETE is shared so ReplaceFileW can retain it under the recovery name.
 fn read_entry(path: &Path) -> Result<(Option<File>, Worktree), String> {
+    read_entry_with_limit(path, CAP)
+}
+fn read_entry_with_limit(path: &Path, cap: u64) -> Result<(Option<File>, Worktree), String> {
     let file = match OpenOptions::new()
         .read(true)
         .share_mode(SHARE_READ | SHARE_DELETE)
@@ -136,16 +84,22 @@ fn read_entry(path: &Path) -> Result<(Option<File>, Worktree), String> {
             },
         ));
     }
-    if !meta.is_file() || meta.len() > CAP {
-        return Err("Conflict entry is not a regular file within the 16 MiB limit".into());
+    if !meta.is_file() || meta.len() > cap {
+        return Err(format!(
+            "File entry is not a regular file within the {} MiB limit",
+            cap / (1024 * 1024)
+        ));
     }
     let mut bytes = Vec::new();
     (&file)
-        .take(CAP + 1)
+        .take(cap + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > CAP {
-        return Err("Conflict file grew beyond the 16 MiB limit".into());
+    if bytes.len() as u64 > cap {
+        return Err(format!(
+            "File grew beyond the {} MiB limit",
+            cap / (1024 * 1024)
+        ));
     }
     Ok((
         Some(file),
@@ -161,6 +115,27 @@ pub(in crate::diff) fn read(path: &Path) -> Result<Worktree, String> {
     Ok(read_entry(path)?.1)
 }
 
+pub(super) fn read_for_save(path: &Path, cap: usize) -> Result<Worktree, String> {
+    let _parents = crate::fs_entry::pin_parents(path, true).map_err(|e| e.to_string())?;
+    // Preserve ordinary-save write permission checks without truncation.
+    match OpenOptions::new()
+        .write(true)
+        .share_mode(SHARE_READ | SHARE_DELETE)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => {
+            let meta = file.metadata().map_err(|e| e.to_string())?;
+            if !meta.is_file() || meta.file_attributes() & REPARSE_POINT != 0 {
+                return Err("Only regular files can be saved".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(read_entry_with_limit(path, cap as u64)?.1)
+}
+
 pub(in crate::diff) struct Recovery {
     pub path: PathBuf,
     pub keep: bool,
@@ -170,10 +145,11 @@ pub(in crate::diff) struct Recovery {
     prepared: PathBuf,
     prepared_id: Option<Identity>,
     original_id: Option<Identity>,
+    cap: u64,
 }
 
 impl Recovery {
-    fn create(path: &Path, parents: Vec<File>) -> Result<Self, String> {
+    fn create(path: &Path, parents: Vec<File>, cap: u64) -> Result<Self, String> {
         for _ in 0..32 {
             let directory = path
                 .parent()
@@ -195,6 +171,7 @@ impl Recovery {
                         keep: false,
                         prepared_id: None,
                         original_id: None,
+                        cap,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -205,8 +182,8 @@ impl Recovery {
     }
 }
 
-fn remove_owned(path: &Path, expected: Option<Identity>) -> Result<(), String> {
-    let (file, _) = read_entry(path)?;
+fn remove_owned(path: &Path, expected: Option<Identity>, cap: u64) -> Result<(), String> {
+    let (file, _) = read_entry_with_limit(path, cap)?;
     if let Some(file) = file {
         if Some(identity(&file)?) != expected {
             return Err("Recovery entry changed ownership; it has been retained".into());
@@ -221,8 +198,8 @@ impl Drop for Recovery {
         if self.keep {
             return;
         }
-        let cleaned = remove_owned(&self.prepared, self.prepared_id)
-            .and_then(|()| remove_owned(&self.path, self.original_id));
+        let cleaned = remove_owned(&self.prepared, self.prepared_id, self.cap)
+            .and_then(|()| remove_owned(&self.path, self.original_id, self.cap));
         if let Err(error) = cleaned {
             log::warn!(
                 "Conflict recovery retained at {}: {error}",
@@ -249,6 +226,14 @@ pub(in crate::diff) fn replace(
     source: &Worktree,
     next: &Worktree,
 ) -> Result<Option<Recovery>, String> {
+    replace_with_limit(path, source, next, CAP)
+}
+pub(super) fn replace_with_limit(
+    path: &Path,
+    source: &Worktree,
+    next: &Worktree,
+    cap: u64,
+) -> Result<Option<Recovery>, String> {
     if source == next {
         return Ok(None);
     }
@@ -258,7 +243,7 @@ pub(in crate::diff) fn replace(
             || entry
                 .bytes
                 .as_ref()
-                .is_some_and(|bytes| bytes.len() as u64 > CAP)
+                .is_some_and(|bytes| bytes.len() as u64 > cap)
         {
             return Err(
                 "Windows conflict replacement requires a bounded regular file or deletion".into(),
@@ -266,12 +251,12 @@ pub(in crate::diff) fn replace(
         }
     }
     let parents = parents(path)?;
-    let (source_handle, current) = read_entry(path)?;
+    let (source_handle, current) = read_entry_with_limit(path, cap)?;
     if &current != source {
         return Err("Conflict source changed; reload before saving".into());
     }
     let source_id = source_handle.as_ref().map(identity).transpose()?;
-    let mut recovery = Recovery::create(path, parents)?;
+    let mut recovery = Recovery::create(path, parents, cap)?;
     if let Some(bytes) = &next.bytes {
         let mut prepared = OpenOptions::new()
             .write(true)
@@ -285,7 +270,7 @@ pub(in crate::diff) fn replace(
     }
     // Revalidate after preparation. A rename can displace the locked source;
     // it cannot change its bytes, and any later displaced entry is retained.
-    let (fresh_handle, fresh) = read_entry(path)?;
+    let (fresh_handle, fresh) = read_entry_with_limit(path, cap)?;
     if &fresh != source || fresh_handle.as_ref().map(identity).transpose()? != source_id {
         return Err("Conflict source changed while preparing the resolution".into());
     }
@@ -323,7 +308,7 @@ pub(in crate::diff) fn replace(
         }
     };
     result.map_err(|e| format!("Conflict replacement failed: {e}. Recovery files retained at {}; reload before staging", recovery.directory.display()))?;
-    let (displaced, original) = read_entry(&recovery.path)?;
+    let (displaced, original) = read_entry_with_limit(&recovery.path, cap)?;
     if &original != source || displaced.as_ref().map(identity).transpose()? != source_id {
         return Err(format!("Conflict source changed during replacement; displaced content retained at {}. Reload before staging", recovery.path.display()));
     }

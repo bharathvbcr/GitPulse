@@ -1835,6 +1835,7 @@ mod tests {
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 

@@ -20,6 +20,9 @@ fn run_git(dir: &Path, args: &[&str]) {
         .status()
         .expect("git must be on PATH");
     assert!(status.success(), "git {args:?} failed");
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 struct TestRepo {
@@ -187,3 +190,5 @@ fn a_timeout_is_reported_as_a_timeout_not_a_silent_success() {
         "a timeout must not look like success"
     );
 }
+
+mod common;

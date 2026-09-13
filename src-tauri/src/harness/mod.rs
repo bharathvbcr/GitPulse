@@ -456,6 +456,7 @@ mod scope_tests {
                 worktree.to_str().expect("utf8 worktree path"),
             ],
         );
+        crate::test_support::trust_repo(&worktree);
         let worktree = worktree
             .canonicalize()
             .expect("canonical worktree")

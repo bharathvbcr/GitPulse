@@ -1,5 +1,6 @@
 //! Consumer contracts shared by the database, map and graph adapters.
 
+mod common;
 use gitpulse_lib::{codeintel, devmap};
 use serde_json::json;
 use std::fs;
@@ -17,6 +18,7 @@ fn repository() -> tempfile::TempDir {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    common::trust_repo(root.path());
     root
 }
 

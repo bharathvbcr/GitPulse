@@ -81,7 +81,8 @@ describe("WorktreesPanel removal safety", () => {
 
   it("preserves the concurrent-session currentPath guards after the await", () => {
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
-    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(2);
+    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(3);
+    expect(fn).toMatch(/await repoStore\.trustRepo\(targetPath\)[\s\S]*?currentPath !== repo[\s\S]*?cmd_remove_worktree/);
     expect(fn).toContain("await load()");
   });
 

@@ -15,6 +15,9 @@ fn run_git(dir: &Path, args: &[&str]) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 fn init_repo() -> TempDir {
@@ -410,6 +413,7 @@ fn remote_only_repo_lists_and_computes_against_remote_tip() {
             clone.path().to_str().unwrap(),
         ],
     );
+    common::trust_repo(clone.path());
     // Strip the local head so only refs/remotes/* remain.
     run_git(clone.path(), &["checkout", "-q", "--detach", "origin/main"]);
     run_git(clone.path(), &["branch", "-qD", "main"]);
@@ -438,3 +442,5 @@ fn remote_only_repo_lists_and_computes_against_remote_tip() {
         (0, 0, 0, 0)
     );
 }
+
+mod common;

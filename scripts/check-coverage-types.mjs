@@ -149,6 +149,7 @@ export const CONTRACTS = Object.freeze([
   { label: "fleet-metrics", rustPath: rust("ledger", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetMetrics", "FleetMetricsInput", "FleetLanguageStat"] },
   { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
   { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
+  { label: "repository trust", rustPath: rust("repository_trust.rs"), tsPath: ts("repos", "repositoryTrust.ts"), structs: ["TrustPreview"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
   { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo"] },

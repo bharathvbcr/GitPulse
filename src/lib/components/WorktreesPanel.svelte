@@ -269,6 +269,8 @@
     const force = typeof wt.dirty_files === "number" && wt.dirty_files > 0;
     let removeCompleted = false;
     try {
+      if (!(await repoStore.trustRepo(targetPath))) return;
+      if ($repoStore.currentPath !== repo) return;
       await invoke("cmd_remove_worktree", { repoPath: repo, targetPath, force });
       removeCompleted = true;
       harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: true });

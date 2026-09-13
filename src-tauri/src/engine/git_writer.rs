@@ -1183,6 +1183,31 @@ impl GitWriter {
 
     pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, String> {
         validate_clone_url(url)?;
+        // Global Git runs from a neutral directory. Resolve local relative
+        // sources first so that isolation does not reinterpret the user's URL.
+        // Keep URL schemes and scp-like host:path syntax intact.
+        let source_path = Path::new(url);
+        let local_source = if source_path.is_relative()
+            && (!url.contains(':')
+                || matches!(
+                    source_path.components().next(),
+                    Some(
+                        std::path::Component::CurDir
+                            | std::path::Component::ParentDir
+                            | std::path::Component::Prefix(_)
+                    )
+                )) {
+            Some(
+                super::git_cli::canonicalize_plain(source_path)
+                    .map_err(|error| format!("Cannot resolve local clone source: {error}"))?,
+            )
+        } else {
+            None
+        };
+        let url = match &local_source {
+            Some(source) => source.to_str().ok_or("Local clone source is not UTF-8")?,
+            None => url,
+        };
         let requested = Path::new(target_dir);
         let dest = resolve_clone_destination(requested)?;
         let is_parent_directory = dest.is_dir();
@@ -1938,6 +1963,7 @@ mod tests {
             "commit failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -1953,6 +1979,9 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+        if args.first() == Some(&"init") {
+            crate::test_support::trust_repo(dir);
+        }
     }
 
     fn git_text(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
@@ -1987,6 +2016,7 @@ mod tests {
             "bare init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -2417,6 +2447,7 @@ mod tests {
             false,
         )
         .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
         let canon_main = validate_repo(dir.path().to_str().unwrap()).unwrap();
         let canon_wt = validate_repo(wt.to_str().unwrap()).unwrap();
         assert_ne!(

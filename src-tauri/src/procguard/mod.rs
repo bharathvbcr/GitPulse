@@ -244,6 +244,8 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     if shutting_down() {
         return Err(refused(label));
     }
+    crate::repository_trust::check_command(cmd)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     sys::prepare(cmd);
     let mut child = cmd.spawn()?;
     let slot: Slot = Arc::new(Entry {

@@ -1919,6 +1919,26 @@ pub async fn cmd_resolve_repo(repo_path: String) -> Result<ResolvedRepo, String>
     off_thread(move || resolve_repo(&repo_path)).await
 }
 
+#[tauri::command(async)]
+pub async fn cmd_repository_trust(
+    repo_path: String,
+) -> Result<crate::repository_trust::TrustPreview, String> {
+    off_thread(move || crate::repository_trust::inspect(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_grant_repository_trust(
+    repo_path: String,
+    expected_identity: String,
+) -> Result<(), String> {
+    off_thread(move || crate::repository_trust::grant(&repo_path, &expected_identity, true)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_revoke_repository_trust(repo_path: String) -> Result<(), String> {
+    off_thread(move || crate::repository_trust::revoke(&repo_path)).await
+}
+
 // ---------------------------------------------------------------------------
 // Linked worktrees: how agents parallelize, so they are first-class here.
 // ---------------------------------------------------------------------------
@@ -2508,6 +2528,7 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-m", "seed"]);
         std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -2661,6 +2682,7 @@ mod tests {
         git(&["add", "--", "b.txt"]);
         git(&["commit", "-m", "B"]);
         let c_b = git(&["rev-parse", "HEAD"]);
+        crate::test_support::trust_repo(dir.path());
         (dir, base, c_a, c_b)
     }
 
@@ -4363,7 +4385,9 @@ mod assemble_tests {
             linked.to_str().expect("utf8 worktree"),
         ]);
         let main_path = main.path().canonicalize().expect("main canonical");
+        crate::test_support::trust_repo(&main_path);
         let linked_path = linked.canonicalize().expect("linked canonical");
+        crate::test_support::trust_repo(&linked_path);
         crate::ledger::append(crate::ledger::Draft {
             repo_path: main_path.to_string_lossy().into_owned(),
             worktree_path: Some(linked_path.to_string_lossy().into_owned()),

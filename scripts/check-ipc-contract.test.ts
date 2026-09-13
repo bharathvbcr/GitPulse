@@ -285,7 +285,10 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    expect(found.size).toBe(209);
+    expect(found.size).toBe(212);
+    expect(found.has("cmd_repository_trust")).toBe(true);
+    expect(found.has("cmd_grant_repository_trust")).toBe(true);
+    expect(found.has("cmd_revoke_repository_trust")).toBe(true);
     expect(found.has("cmd_codeintel_search")).toBe(true);
     expect(found.has("cmd_codeintel_impact_at_rung")).toBe(true);
     for (const name of ["cmd_cache_inventory", "cmd_hygiene_prepare", "cmd_hygiene_execute", "cmd_hygiene_cancel"]) {

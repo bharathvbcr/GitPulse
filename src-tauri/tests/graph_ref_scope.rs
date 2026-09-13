@@ -13,6 +13,8 @@
 //! graph width (440px, ~14 lanes) 21 of those rows drew their node off-canvas
 //! and appeared to have no node at all.
 
+mod common;
+
 use std::process::Command;
 
 use gitpulse_lib::analyzer::CommitFilter;
@@ -40,6 +42,9 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

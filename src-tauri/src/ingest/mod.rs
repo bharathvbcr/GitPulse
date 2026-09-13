@@ -646,6 +646,7 @@ mod tests {
                 linked.to_str().expect("utf8 worktree"),
             ],
         );
+        crate::test_support::trust_repo(&linked);
         std::fs::write(linked.join("linked.txt"), "linked").expect("linked change");
         git_in(&linked, &["add", "linked.txt"]);
         git_in(&linked, &["commit", "-m", "linked change"]);

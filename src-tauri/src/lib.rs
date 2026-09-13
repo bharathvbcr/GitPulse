@@ -26,6 +26,7 @@ pub mod ndjson;
 pub mod ops;
 pub mod output;
 pub mod procguard;
+pub mod repository_trust;
 pub mod stack;
 pub mod storage;
 pub mod syntax;
@@ -232,6 +233,9 @@ pub fn run() {
             cmd_watch_repo,
             cmd_unwatch_repo,
             cmd_resolve_repo,
+            cmd_repository_trust,
+            cmd_grant_repository_trust,
+            cmd_revoke_repository_trust,
             cmd_list_worktrees,
             cmd_add_worktree,
             cmd_remove_worktree,

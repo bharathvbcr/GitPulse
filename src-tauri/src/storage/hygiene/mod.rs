@@ -488,7 +488,9 @@ fn prepare_with_activity(
 }
 
 pub fn cancel(repo_path: &str, id: &str) -> Result<(), String> {
-    let repo = validate_repo(repo_path)?.to_string_lossy().into_owned();
+    let repo = crate::engine::git_cli::validate_repo_path(repo_path)?
+        .to_string_lossy()
+        .into_owned();
     let mut store = plans().lock().map_err(|_| "Plan store is unavailable")?;
     if let Some(plan) = store.pending.get(id) {
         if plan.view.repo_path != repo {

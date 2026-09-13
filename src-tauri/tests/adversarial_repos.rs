@@ -41,6 +41,9 @@ fn git_in(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 /// Repo with one seed commit on `main`.
@@ -484,3 +487,5 @@ fn watcher_storm_keeps_session_responsive() {
     );
     drop(watcher); // Drop impl flips the stop flag; must not hang.
 }
+
+mod common;

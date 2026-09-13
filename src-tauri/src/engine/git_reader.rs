@@ -3791,6 +3791,7 @@ mod tests {
             .output()
             .expect("git add");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir);
     }
 
     /// The language scan must report honestly when it stopped early: a
@@ -4037,6 +4038,9 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        if args.first() == Some(&"init") {
+            crate::test_support::trust_repo(dir);
+        }
     }
 
     fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -4898,6 +4902,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir.path());
 
         // Sparse 64 MiB+1 file: get_file_blob must reject on metadata before
         // attempting the (never-materialized) read.
@@ -4925,6 +4930,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir.path());
 
         let err = GitReader::get_file_blob(&dir.path().to_string_lossy(), "__main__.py", None)
             .expect_err("synthetic coverage.py path is not in this repo");
@@ -4951,6 +4957,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir.path());
         std::fs::write(dir.path().join("__main__.py"), "print(1)\n").unwrap();
         let add = std::process::Command::new("git")
             .args(["add", "--", "__main__.py"])
@@ -5288,6 +5295,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir.path());
 
         let outside = tempfile::TempDir::new().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();

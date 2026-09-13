@@ -246,6 +246,7 @@ fn repo_with_change() -> tempfile::TempDir {
         );
     };
     git(&["init", "-b", "main"]);
+    common::trust_repo(dir.path());
     git(&["config", "user.email", "test@example.com"]);
     git(&["config", "user.name", "Test User"]);
     git(&["config", "commit.gpgsign", "false"]);
@@ -725,6 +726,7 @@ fn a_write_escaping_the_repository_is_refused_across_the_bridge() {
         assert!(out.status.success(), "git {args:?}");
     };
     git(&["init", "-b", "main"]);
+    common::trust_repo(&repo);
     git(&["config", "user.email", "test@example.com"]);
     git(&["config", "user.name", "Test User"]);
     let root = repo.to_string_lossy().into_owned();
@@ -961,3 +963,5 @@ fn release_stash_options_and_preview_preserve_the_ipc_envelopes() {
     assert_eq!(preview["truncated"], false);
     assert!(preview["truncation_reason"].is_null());
 }
+
+mod common;

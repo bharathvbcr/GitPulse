@@ -406,6 +406,7 @@ fn release_concurrent_clones_never_remove_another_clones_repository() {
             outcomes.iter().any(Result::is_ok),
             "no clone completed: {outcomes:?}"
         );
+        common::trust_repo(&target);
         assert_eq!(
             GitReader::head_id(target.to_str().unwrap()).unwrap_or_else(|e| panic!(
                 "a failed contender damaged the destination: {e}; {outcomes:?}"
@@ -981,6 +982,7 @@ fn test_clone_into_parent_directory() {
     let cloned =
         GitWriter::clone_repo(&src.path_str(), parent.path().to_str().unwrap()).expect("clone");
     assert!(Path::new(&cloned).join(".git").exists());
+    common::trust_repo(Path::new(&cloned));
     let history = GitReader::read_commit_history(&cloned, 10, None).expect("history");
     assert_eq!(history.len(), 1);
 }
@@ -1939,6 +1941,7 @@ fn linked_worktree_mutations_serialize_without_lock_failures() {
         ],
     );
 
+    common::trust_repo(&work_path);
     let main_path = repo.path_str();
     let wt_path = work_path.to_string_lossy().into_owned();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));

@@ -27,6 +27,9 @@ fn run_git(cwd: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(cwd);
+    }
 }
 
 /// For the commands that are supposed to fail because they hit a conflict.
@@ -436,3 +439,5 @@ fn a_bare_repository_reports_idle_rather_than_failing() {
         Err(e) => panic!("a bare repository must not fail detection: {e}"),
     }
 }
+
+mod common;

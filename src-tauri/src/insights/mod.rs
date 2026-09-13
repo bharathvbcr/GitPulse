@@ -1682,6 +1682,7 @@ mod tests {
             false,
         )
         .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
 
         fs::write(main.path().join("shared.txt"), "main-edit").unwrap();
         fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
@@ -1717,6 +1718,7 @@ mod tests {
             false,
         )
         .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
 
         let snap = snapshot(repo);
         assert!(snap.worktrees.ok, "{snap:?}");
@@ -2120,6 +2122,7 @@ mod tests {
             false,
         )
         .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
 
         let snap = fleet_snapshot_default(&[repo.to_string()]);
         let facet = &snap.repos[0];
@@ -2205,6 +2208,7 @@ mod tests {
                 false,
             )
             .expect("add worktree");
+            crate::test_support::trust_repo(&wt);
         }
         // Two worktrees dirty the same file, so there is a real finding for a
         // partial scan to keep hold of.
@@ -2435,6 +2439,7 @@ mod tests {
             false,
         )
         .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
         fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
 
         let changes = active_changes(repo, Some(wt.to_str().unwrap()), None);

@@ -116,6 +116,17 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        trust_repo(dir);
+    }
+}
+
+/// Explicit approval for an owned fixture through the production grant path.
+#[cfg(test)]
+pub(crate) fn trust_repo(dir: &Path) {
+    let path = dir.to_str().expect("fixture path");
+    let preview = crate::repository_trust::inspect(path).expect("inspect fixture");
+    crate::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
 }
 
 /// A fresh repository on `main`, for suites that only need somewhere to scan.
@@ -131,6 +142,7 @@ pub(crate) fn git_repo() -> TempDir {
         .status()
         .expect("git init");
     assert!(status.success());
+    trust_repo(dir.path());
     dir
 }
 

@@ -297,6 +297,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .expect("initial commit");
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -354,6 +355,7 @@ mod freshness_honesty_tests {
             git(&["add", "-A"]);
             git(&["commit", "-m", &format!("c{i}")]);
         }
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -850,6 +852,7 @@ mod batch_tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let repo = Repo(dir);
             repo.git(&["init", "-b", "main"]);
+            crate::test_support::trust_repo(repo.path());
             repo.git(&["config", "user.name", "T"]);
             repo.git(&["config", "user.email", "t@e.com"]);
             for i in 0..commits {

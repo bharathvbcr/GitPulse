@@ -14,6 +14,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let repo = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
     crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
     fs::write(
         repo.join(".gitignore"),
         "target/\ntarget-audit/\n__pycache__/\n",

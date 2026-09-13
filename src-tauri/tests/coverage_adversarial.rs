@@ -3,6 +3,7 @@
 //! concurrent hammering. Complements the parser-level corpus in
 //! coverage_stress.rs by attacking what sits AROUND the parsers.
 
+mod common;
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use std::fs;
 #[cfg(unix)]
@@ -21,6 +22,7 @@ fn git_repo() -> TempDir {
         .status()
         .expect("git init");
     assert!(status.success());
+    common::trust_repo(dir.path());
     dir
 }
 

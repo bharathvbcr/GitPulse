@@ -376,6 +376,7 @@ mod tests {
             .status()
             .expect("git init");
         assert!(status.success(), "git init failed in {}", dir.display());
+        crate::test_support::trust_repo(dir);
     }
 
     #[test]

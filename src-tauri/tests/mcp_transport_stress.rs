@@ -366,37 +366,49 @@ fn a_request_past_its_budget_is_answered_and_the_server_keeps_serving() {
     );
 }
 
-/// A directory that is absolute on every platform and holds enough for a scan
-/// of it to take meaningfully longer than a trivial `tools/list`.
-///
-/// `/tmp` is not an absolute path on Windows, so `gitpulse_insights` rejected
-/// it before doing any work — `"Repository path must be absolute"` with
-/// `duration_ms: 0` — and the "slow" call answered instantly and beat the fast
-/// one. The test failed for the exact opposite of the condition it exists to
-/// catch. Unix keeps `/tmp` verbatim, because that is the path the timing here
-/// was tuned against.
-fn slow_scan_root() -> String {
-    if cfg!(windows) {
-        std::env::temp_dir().to_string_lossy().into_owned()
-    } else {
-        "/tmp".to_string()
-    }
-}
-
 #[test]
 fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
     // Head-of-line blocking, measured: with a sequential loop a trivial
     // `tools/list` queued behind a stalled tool call waited for the whole of it.
     // With a 400 ms budget on the slow call, the fast answer must arrive well
     // before that budget expires.
-    let (mut server, stdout) = Server::start_undrained(&[("GITPULSE_MCP_CALL_TIMEOUT_MS", "400")]);
+    let fixture = tempfile::tempdir().unwrap();
+    let repo = fixture.path().join("repo");
+    let home = fixture.path().join("home");
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repo)
+        .status()
+        .unwrap();
+    assert!(init.success());
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\'', "'\"'\"'");
+    let monitor = format!("'{executable}' --exact slow_status_fixture --ignored; :");
+    assert!(Command::new("git")
+        .current_dir(&repo)
+        .args(["config", "core.fsmonitor", &monitor])
+        .status()
+        .unwrap()
+        .success());
+    process_trust::approve(&repo, &home);
+    let home_text = home.to_str().unwrap();
+    let config = home.join(".config");
+    let appdata = home.join("AppData");
+    let (mut server, stdout) = Server::start_undrained(&[
+        ("GITPULSE_MCP_CALL_TIMEOUT_MS", "400"),
+        ("HOME", home_text),
+        ("XDG_CONFIG_HOME", config.to_str().unwrap()),
+        ("APPDATA", appdata.to_str().unwrap()),
+    ]);
     let mut reader = BufReader::new(stdout);
 
     server.write(
         request(
             json!("slow"),
             "tools/call",
-            json!({ "name": "gitpulse_insights", "arguments": { "repo_path": slow_scan_root() } }),
+            json!({ "name": "gitpulse_insights", "arguments": { "repo_path": repo } }),
         )
         .as_bytes(),
     );
@@ -724,4 +736,13 @@ fn the_stderr_log_never_leaks_into_stdout() {
     assert_eq!(status, Some(0));
     assert_eq!(responses.len(), 1, "{responses:?}");
     assert_eq!(responses[0]["id"], json!(1));
+}
+
+#[path = "common/process_trust.rs"]
+mod process_trust;
+
+#[test]
+#[ignore = "bounded subprocess fixture used to make Git status observably slow"]
+fn slow_status_fixture() {
+    std::thread::sleep(Duration::from_secs(1));
 }

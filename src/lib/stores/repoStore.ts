@@ -3,6 +3,8 @@ import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
+import { askConfirm } from "./modalStore";
+import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
@@ -137,6 +139,7 @@ export interface ResolvedRepo {
   name: string;
   is_bare: boolean;
 }
+
 
 /** Wire shape of `cmd_branch_stats`; snake_case like every other command. */
 interface BranchStatsUpdate {
@@ -681,7 +684,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (unchanged) return;
     applyToSession(session.id, session.generation, { selectedDiffPending: true });
   };
-
 
   /**
    * How many poll ticks between re-asserting the active repository's watch.
@@ -1408,6 +1410,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       internal = { ...internal, workspaceError: error };
       publish();
     },
+    trustRepo: (path: string) => requestRepositoryTrust(path, "Trust Repository", invokeFn),
     openRepo: async (
       rawPath: string,
       extras: {
@@ -1430,7 +1433,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       try {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
-        if (!extras.allowBroken) {
+        if (formatError(err).includes("REPOSITORY_TRUST_REQUIRED")) {
+          try {
+            const trustedPath = await requestRepositoryTrust(rawPath, "Trust and Open", invokeFn);
+            if (!trustedPath) return false;
+            resolved = await resolvePath(trustedPath);
+          } catch (trustError: unknown) {
+            internal = { ...internal, workspaceError: formatError(trustError) };
+            publish();
+            return false;
+          }
+        } else if (!extras.allowBroken) {
           internal = { ...internal, workspaceError: formatError(err) };
           publish();
           return false;
@@ -1593,6 +1606,23 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       } catch (err: unknown) {
         internal = { ...internal, workspaceError: formatError(err) };
         publish();
+      }
+    },
+    revokeTrust: async (id: string) => {
+      const session = internal.sessions[id];
+      if (!session) return;
+      const approved = await askConfirm({
+        title: "Revoke repository trust?",
+        message: `${session.path}\n\nThis closes the tab and blocks new GitPulse operations. Already-running terminals and agent tasks retain their permissions; stop them separately if needed.`,
+        confirmLabel: "Revoke Trust",
+        destructive: true,
+      });
+      if (!approved) return;
+      try {
+        await invokeFn("cmd_revoke_repository_trust", { repoPath: session.path });
+        await store.closeTab(id);
+      } catch (error: unknown) {
+        store.setError(formatError(error));
       }
     },
     activateTab: async (id: string, extras: { force?: boolean } = {}) => {

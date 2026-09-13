@@ -75,6 +75,9 @@ fn git_in(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,3 +460,5 @@ fn randomized_multibyte_commit_bodies_never_panic() {
     }
     eprintln!("randomized bodies: {rounds} rounds from seed {seed:#x}");
 }
+
+mod common;

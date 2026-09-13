@@ -24,6 +24,9 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 /// A repository whose HEAD commit rewrites `lines` lines of `width` chars.
@@ -156,3 +159,5 @@ fn blame_on_a_large_file_stays_within_its_budget() {
         "the incomplete read must explain its limit: {error}"
     );
 }
+
+mod common;

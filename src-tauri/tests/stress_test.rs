@@ -1,3 +1,4 @@
+mod common;
 use gitpulse_lib::analyzer::LocCounter;
 use gitpulse_lib::diff::{
     compute_word_diff, ConflictResolver, DiffLineType, FilePatch, PatchBuilder, UnifiedDiffHunk,
@@ -28,6 +29,7 @@ fn init_repo_with_base_file() -> tempfile::TempDir {
         .current_dir(dir.path())
         .status()
         .expect("git init");
+    common::trust_repo(dir.path());
     git(&["config", "user.name", "t"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "commit.gpgsign", "false"]);
@@ -672,6 +674,7 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
         .current_dir(dir.path())
         .status()
         .expect("git init");
+    common::trust_repo(dir.path());
     // Windows installs git with core.autocrlf=true in its system config, so a
     // fixture repo inherits it and git rewrites LF to CRLF on checkout --
     // silently breaking every assertion below that compares exact bytes.
@@ -799,6 +802,7 @@ fn worktree_list_add_remove_roundtrip_on_a_temp_repo() {
 
     // Add a linked worktree on a new branch.
     add_worktree(&repo, target_str, Some("feature/wt"), None, false).expect("worktree add");
+    common::trust_repo(&target);
     assert!(
         target.join(".git").is_file(),
         "linked worktree uses a gitfile"

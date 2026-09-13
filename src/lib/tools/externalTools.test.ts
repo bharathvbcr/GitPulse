@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { askConfirm } from "../stores/modalStore";
 import {
   cancelExternalToolInstall,
   classifyMapFailure,
@@ -19,6 +20,8 @@ import {
   verifyTool,
   type ToolStatus,
 } from "./externalTools";
+
+vi.mock("../stores/modalStore", () => ({ askConfirm: vi.fn() }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -42,6 +45,7 @@ function status(partial: Partial<ToolStatus>): ToolStatus {
 
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
+  vi.mocked(askConfirm).mockReset().mockResolvedValue(false);
 });
 
 describe("toolStatusSummary", () => {
@@ -246,5 +250,33 @@ describe("IPC wrappers", () => {
 
     await refreshToolCapability();
     expect(invoke).toHaveBeenCalledWith("cmd_tool_capability_refresh");
+  });
+});
+
+
+describe("source checkout trust", () => {
+  const denied = {
+    tool: "manvi", ok: false, binary: null, lookup: null, version: null,
+    source_used: "/source", command: "go -C /source install ./cmd/manvi", exit_code: null,
+    stdout: "", stderr: "", timed_out: false, cancelled: false,
+    reason: "REPOSITORY_TRUST_REQUIRED: /source", rung: "local_checkout",
+  };
+  const preview = { path: "/source", git_dir: "/source/.git", common_dir: "/source/.git", identity: "native-identity", trusted: false };
+  it("approves the exact native source identity before one bounded retry", async () => {
+    vi.mocked(askConfirm).mockResolvedValue(true);
+    vi.mocked(invoke).mockResolvedValueOnce(denied).mockResolvedValueOnce(preview)
+      .mockResolvedValueOnce(undefined).mockResolvedValueOnce({ ...denied, ok: true, reason: null });
+    expect((await installExternalTool("manvi", "local_checkout")).ok).toBe(true);
+    expect(invoke).toHaveBeenNthCalledWith(3, "cmd_grant_repository_trust", {
+      repoPath: "/source", expectedIdentity: "native-identity",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, "cmd_external_tool_install", { tool: "manvi", rung: "local_checkout" });
+    expect(askConfirm).toHaveBeenCalledTimes(1);
+  });
+  it("cancels without granting or retrying when source trust is declined", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(denied).mockResolvedValueOnce(preview);
+    const result = await installExternalTool("manvi", "local_checkout");
+    expect(result.cancelled).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 });

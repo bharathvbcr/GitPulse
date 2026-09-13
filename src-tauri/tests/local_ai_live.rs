@@ -49,6 +49,9 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 #[test]
@@ -185,3 +188,5 @@ fn analyzes_a_real_coverage_report() {
     assert!(!generation.model.is_empty());
     assert!(generation.context_window > 0);
 }
+
+mod common;

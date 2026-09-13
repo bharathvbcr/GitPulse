@@ -200,6 +200,7 @@ mod tests {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let root = dir.path().join("checkout");
             git_global(&["init", root.to_str().unwrap()]).unwrap();
+            crate::test_support::trust_repo(&root);
             host.register(root.to_str().unwrap(), "repo", "register")
                 .unwrap();
             host.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Verify the managed response path","description":"Reply with MANVI_NATIVE_RUN_OK only. Do not call tools or change files.","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
@@ -261,6 +262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         git_global(&["init", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&root);
         let state = WorkbenchState(Arc::new(super::super::Inner {
             path: Some(dir.path().join("profile.sqlite")),
             ..Default::default()
@@ -314,6 +316,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("repo");
             git_global(&["init", root.to_str().unwrap()]).unwrap();
+            crate::test_support::trust_repo(&root);
             let state = WorkbenchState(Arc::new(super::super::Inner {
                 path: Some(dir.path().join("profile.sqlite")),
                 ..Default::default()

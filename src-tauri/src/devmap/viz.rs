@@ -154,7 +154,8 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("gitpulse-viz-{label}-{stamp}"));
-        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        crate::test_support::git_in(&dir, &["init", "-q"]);
         dir
     }
 

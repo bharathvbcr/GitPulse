@@ -814,6 +814,7 @@ mod tests {
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        crate::test_support::trust_repo(dir);
     }
 
     use crate::test_support::git_in;
@@ -847,6 +848,7 @@ mod tests {
             work_path.join(".git").is_file(),
             "linked worktree must use a gitfile"
         );
+        crate::test_support::trust_repo(&work_path);
         (main, work_parent, work_path)
     }
 

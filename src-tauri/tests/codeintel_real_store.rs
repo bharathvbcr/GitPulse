@@ -7,6 +7,8 @@
 //! Skipped loudly rather than silently when the real store is absent: a test
 //! that passes by finding nothing is the failure mode this project is about.
 
+mod common;
+
 use gitpulse_lib::codeintel;
 
 /// DevCouncil's own repository, which carries a built map.
@@ -37,6 +39,7 @@ fn answers_impact_from_the_real_map_in_process() {
         return;
     }
 
+    common::trust_repo(std::path::Path::new(repo));
     let status = codeintel::status(repo);
     assert!(
         status.available,

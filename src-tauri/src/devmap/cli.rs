@@ -893,6 +893,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 

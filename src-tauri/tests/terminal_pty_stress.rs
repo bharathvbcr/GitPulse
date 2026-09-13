@@ -28,6 +28,7 @@ fn repo() -> tempfile::TempDir {
         .status()
         .unwrap()
         .success());
+    common::trust_repo(dir.path());
     dir
 }
 
@@ -455,3 +456,5 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     kill_session(&state, &session.id).unwrap();
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }
+
+mod common;

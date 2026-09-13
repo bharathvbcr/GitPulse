@@ -6,6 +6,7 @@
  * local checkout).
  */
 import { invoke } from "@tauri-apps/api/core";
+import { requestRepositoryTrust } from "../repos/repositoryTrust";
 
 export type ExternalTool = "devmap" | "manvi";
 
@@ -128,11 +129,21 @@ export function getExternalToolsStatus(): Promise<ToolsStatus> {
   return invoke<ToolsStatus>("cmd_external_tools_status");
 }
 
-export function installExternalTool(
+export async function installExternalTool(
   tool: ExternalTool,
   rung?: InstallRung | null,
 ): Promise<InstallOutcome> {
-  return invoke<InstallOutcome>("cmd_external_tool_install", { tool, rung: rung ?? null });
+  const outcome = await invoke<InstallOutcome>("cmd_external_tool_install", { tool, rung: rung ?? null });
+  if (!outcome.ok && outcome.rung === "local_checkout" && outcome.source_used &&
+      outcome.reason?.includes("REPOSITORY_TRUST_REQUIRED")) {
+    if (!(await requestRepositoryTrust(outcome.source_used, "Trust and Install"))) {
+      return { ...outcome, cancelled: true, reason: "Repository trust was declined" };
+    }
+    // Retry this explicit install once. Changed source identity is rechecked
+    // natively and cannot silently trigger another grant or an endless retry.
+    return invoke<InstallOutcome>("cmd_external_tool_install", { tool, rung: "local_checkout" });
+  }
+  return outcome;
 }
 
 export function cancelExternalToolInstall(): Promise<void> {

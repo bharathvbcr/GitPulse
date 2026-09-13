@@ -11,6 +11,8 @@
 //! phase was built: 886 transcripts, 0 unreadable lines, 193 events attributed
 //! to one repository, and a second pass that added nothing.
 
+mod common;
+
 use gitpulse_lib::{ingest, ledger};
 use std::process::Command;
 
@@ -29,6 +31,7 @@ fn catch_up_attributes_real_history() {
     };
 
     run_git(&["init", "-b", "main"]);
+    common::trust_repo(temp_dir.path());
     run_git(&["config", "user.name", "Test User"]);
     run_git(&["config", "user.email", "test@example.com"]);
     std::fs::write(temp_dir.path().join("a.txt"), "hello\n").expect("write");

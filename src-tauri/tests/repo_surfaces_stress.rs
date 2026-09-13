@@ -27,6 +27,9 @@ fn run_git(cwd: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(cwd);
+    }
 }
 
 fn init_repo() -> TempDir {
@@ -563,3 +566,5 @@ fn sync_rewrites_urls_from_gitmodules_without_cloning() {
     assert_eq!(listed.submodules.len(), 1);
     assert_eq!(listed.submodules[0].url.as_deref(), Some(new_url.as_str()));
 }
+
+mod common;

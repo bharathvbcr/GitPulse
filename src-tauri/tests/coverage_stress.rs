@@ -20,6 +20,7 @@ fn git_repo() -> TempDir {
         .status()
         .expect("git init");
     assert!(status.success());
+    common::trust_repo(dir.path());
     dir
 }
 
@@ -581,3 +582,5 @@ fn oversized_git_stream_errors_for_git_text_but_degrades_for_git_text_partial() 
     assert!(!small_truncated);
     assert!(small.contains("src/lib.rs"));
 }
+
+mod common;

@@ -106,6 +106,9 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .status()
         .expect("git");
     assert!(status.success(), "git {args:?} failed");
+    if args.first() == Some(&"init") {
+        common::trust_repo(cwd);
+    }
 }
 
 /// Runs git ignoring the exit status — for the commands that are *supposed* to
@@ -287,6 +290,7 @@ fn operations_are_scoped_to_the_worktree_that_owns_them() {
     let linked_arg = linked.to_string_lossy().into_owned();
     run_git(repo.path(), &["worktree", "add", &linked_arg, "side"]);
     let linked = linked.canonicalize().unwrap();
+    common::trust_repo(&linked);
 
     // Make `side` conflict with main inside the linked worktree only.
     fs::write(linked.join("f.txt"), "c\n").unwrap();
@@ -714,3 +718,5 @@ fn an_unavailable_action_is_refused_before_the_gate_runs() {
         "the gate must not be consulted for an impossible action"
     );
 }
+
+mod common;

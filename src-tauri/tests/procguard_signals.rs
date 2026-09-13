@@ -53,6 +53,12 @@ impl Fixture {
         run_git(&repo, &["config", "user.name", "Test"]);
         run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
 
+        // Persist the explicit fixture approval in a child with its own HOME.
+        // Neither the developer's grant store nor parent-process environment is changed.
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        process_trust::approve(&repo, &home);
+
         let shim = root.join("bin/git");
         std::fs::write(
             &shim,
@@ -89,7 +95,11 @@ impl Fixture {
             self.dir.path().join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        command.env("PATH", path).env("PIDDIR", self.dir.path());
+        command
+            .env("PATH", path)
+            .env("PIDDIR", self.dir.path())
+            .env("HOME", self.dir.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.dir.path().join("home/.config"));
     }
 
     fn create(&self, name: &str) -> std::fs::File {
@@ -385,3 +395,6 @@ fn the_shim_is_what_path_resolves_git_to() {
         "PATH did not resolve git to the shim"
     );
 }
+
+#[path = "common/process_trust.rs"]
+mod process_trust;

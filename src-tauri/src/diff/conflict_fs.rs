@@ -1,8 +1,9 @@
 //! Worktree entries are accessed relative to a pinned, symlink-free directory.
 //! A concurrent ancestor rename cannot redirect resolution I/O through a link.
 use super::conflict_session::Worktree;
+use std::path::Path;
 #[cfg(not(windows))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[cfg(windows)]
 mod windows;
@@ -18,7 +19,6 @@ mod unix {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::path::Component;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -45,32 +45,18 @@ mod unix {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
     fn parent(path: &Path) -> Result<Arc<File>, String> {
-        let mut directory = File::open("/").map_err(|e| e.to_string())?;
-        for component in path.parent().ok_or("Missing parent")?.components() {
-            if component == Component::RootDir {
-                continue;
-            }
-            let Component::Normal(part) = component else {
-                return Err("Noncanonical conflict parent".into());
-            };
-            let part = CString::new(part.as_bytes()).map_err(|e| e.to_string())?;
-            // SAFETY: live directory descriptor and NUL-terminated component;
-            // O_NOFOLLOW applies separately to every ancestor in this walk.
-            directory = opened(unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    part.as_ptr(),
-                    libc::O_RDONLY
-                        | libc::O_DIRECTORY
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC
-                        | libc::O_NONBLOCK,
-                )
-            })?;
-        }
-        Ok(Arc::new(directory))
+        crate::fs_entry::pin_parent(path, false)
+            .map(Arc::new)
+            .map_err(|e| e.to_string())
     }
     fn read_at(directory: &File, name: &CString) -> Result<Worktree, String> {
+        read_at_with_limit(directory, name, CAP)
+    }
+    fn read_at_with_limit(
+        directory: &File,
+        name: &CString,
+        cap: usize,
+    ) -> Result<Worktree, String> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: initialized descriptor and name; fstatat initializes stat on success.
         if unsafe {
@@ -133,15 +119,21 @@ mod unix {
             )
         })?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_file() || meta.len() > CAP as u64 {
-            return Err("Conflict entry is not a regular file within the 16 MiB limit".into());
+        if !meta.is_file() || meta.len() > cap as u64 {
+            return Err(format!(
+                "File entry is not a regular file within the {} MiB limit",
+                cap / (1024 * 1024)
+            ));
         }
         let mut bytes = Vec::new();
-        file.take(CAP as u64 + 1)
+        file.take(cap as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
-        if bytes.len() > CAP {
-            return Err("Conflict file grew beyond the 16 MiB limit".into());
+        if bytes.len() > cap {
+            return Err(format!(
+                "File grew beyond the {} MiB limit",
+                cap / (1024 * 1024)
+            ));
         }
         Ok(Worktree {
             bytes: Some(bytes),
@@ -156,6 +148,35 @@ mod unix {
     pub(super) fn read(path: &Path) -> Result<Worktree, String> {
         let directory = parent(path)?;
         read_at(&directory, &name(path)?)
+    }
+
+    pub(super) fn read_for_save(path: &Path, cap: usize) -> Result<Worktree, String> {
+        let directory = crate::fs_entry::pin_parent(path, true).map_err(|e| e.to_string())?;
+        let target = name(path)?;
+        // Check the same write authority as an ordinary save, without ever
+        // truncating the inode (which may also have names outside the repo).
+        // SAFETY: the pinned directory and single-component name stay live;
+        // no-follow/nonblocking flags refuse links and prevent FIFO waits.
+        let writable = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                target.as_ptr(),
+                libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if writable < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.to_string());
+            }
+        } else if !opened(writable)?
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .is_file()
+        {
+            return Err("Only regular files can be saved".into());
+        }
+        read_at_with_limit(&directory, &target, cap)
     }
 
     pub struct Recovery {
@@ -262,6 +283,14 @@ mod unix {
         source: &Worktree,
         next: &Worktree,
     ) -> Result<Option<Recovery>, String> {
+        replace_with_limit(path, source, next, CAP)
+    }
+    pub(super) fn replace_with_limit(
+        path: &Path,
+        source: &Worktree,
+        next: &Worktree,
+        cap: usize,
+    ) -> Result<Option<Recovery>, String> {
         if source == next {
             return Ok(None);
         }
@@ -312,7 +341,7 @@ mod unix {
                     .as_ref()
                     .filter(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
                     .map_or(0o600, |stat| u32::from(stat.st_mode) & 0o777);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if original
                     .as_ref()
                     .is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
@@ -327,6 +356,7 @@ mod unix {
                             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                         )
                     })?;
+                    #[cfg(target_os = "macos")]
                     if unsafe {
                         libc::fcopyfile(
                             source_file.as_raw_fd(),
@@ -338,6 +368,9 @@ mod unix {
                     {
                         return Err(format!("Cannot preserve file metadata: {}", error()));
                     }
+                    #[cfg(target_os = "linux")]
+                    crate::fs_entry::preserve_metadata(&source_file, &handle)
+                        .map_err(|e| format!("Cannot preserve file metadata: {e}"))?;
                 }
                 if source.mode != next.mode {
                     mode = if next.mode == "100755" {
@@ -357,7 +390,7 @@ mod unix {
         let still_here = parent(path)?.metadata().map_err(|e| e.to_string())?;
         let anchored = directory.metadata().map_err(|e| e.to_string())?;
         if (still_here.dev(), still_here.ino()) != (anchored.dev(), anchored.ino())
-            || read_at(&directory, &target)? != *source
+            || read_at_with_limit(&directory, &target, cap)? != *source
         {
             return Err("The working file or its directory changed; reload before saving".into());
         }
@@ -393,7 +426,7 @@ mod unix {
             rename(&directory, &recovery.name, &target, true)?;
         }
         recovery.keep = true;
-        if read_at(&directory, &recovery.name)? != *source {
+        if read_at_with_limit(&directory, &recovery.name, cap)? != *source {
             return Err(format!("An external edit raced the save. Review the working file and the displaced content retained at {} before staging", recovery.path.display()));
         }
         directory.sync_all().map_err(|e| {
@@ -466,5 +499,50 @@ pub(super) fn replace(
         Ok(None)
     } else {
         Err("Atomic conflict replacement is unavailable on this platform; resolve externally and use Stage working file".into())
+    }
+}
+
+/// Ordinary saves share the anchored entry transaction used by conflict saves.
+/// They retain the editor's file-size budget and retain displaced content when
+/// an external edit races publication.
+pub(crate) fn write_regular(path: &Path, content: &[u8]) -> Result<(), String> {
+    let cap = crate::engine::budget::MAX_FILE_BYTES as usize;
+    if content.len() > cap {
+        return Err(format!(
+            "File exceeds the {} MiB save limit",
+            cap / (1024 * 1024)
+        ));
+    }
+    #[cfg(unix)]
+    let source = unix::read_for_save(path, cap)?;
+    #[cfg(windows)]
+    let source = windows::read_for_save(path, cap)?;
+    #[cfg(any(unix, windows))]
+    {
+        if !matches!(source.mode.as_str(), "missing" | "100644" | "100755") {
+            return Err("Only regular files can be saved".into());
+        }
+        let next = Worktree {
+            bytes: Some(content.to_vec()),
+            mode: if source.mode == "100755" {
+                "100755"
+            } else {
+                "100644"
+            }
+            .into(),
+        };
+        #[cfg(unix)]
+        let saved = unix::replace_with_limit(path, &source, &next, cap)?;
+        #[cfg(windows)]
+        let saved = windows::replace_with_limit(path, &source, &next, cap as u64)?;
+        if let Some(mut original) = saved {
+            original.keep = false;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err("Atomic file saves are unavailable on this platform".into())
     }
 }

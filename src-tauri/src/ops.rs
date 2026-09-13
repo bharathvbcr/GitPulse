@@ -513,6 +513,9 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+        if args.first() == Some(&"init") {
+            crate::test_support::trust_repo(path);
+        }
     }
 
     fn commit_file(path: &Path, name: &str, content: &str, message: &str) {

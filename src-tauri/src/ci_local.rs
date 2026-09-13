@@ -1209,6 +1209,7 @@ mod tests {
             .current_dir(dir.path())
             .status()
             .expect("git available in test environment");
+        crate::test_support::trust_repo(dir.path());
         let err = run_ci_local(dir.path().to_str().unwrap()).unwrap_err();
         assert!(
             err.contains("No supported CI manifests"),
@@ -1471,6 +1472,7 @@ mod gate_tests {
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
         };
         git(&["init", "-b", "main"]);
+        crate::test_support::trust_repo(dir.path());
 
         // A manifest, so the planner produces at least one step.
         std::fs::write(
@@ -1522,11 +1524,13 @@ mod verification_note_tests {
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
         git(&["init", "-b", "main"]);
+        crate::test_support::trust_repo(dir.path());
         git(&["config", "user.name", "T"]);
         git(&["config", "user.email", "t@e.com"]);
         std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-m", "c0"]);
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 

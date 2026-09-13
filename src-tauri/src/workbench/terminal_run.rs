@@ -298,6 +298,7 @@ mod tests {
 
     fn fixture(root: &Path) -> WorkbenchState {
         git_global(&["init", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(root);
         let state = WorkbenchState(Arc::new(Inner {
             path: Some(root.join("profile.sqlite")),
             ..Inner::default()

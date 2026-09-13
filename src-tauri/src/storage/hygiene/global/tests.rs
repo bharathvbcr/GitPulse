@@ -21,6 +21,7 @@ fn repo(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     let repo = root.join(name);
     fs::create_dir_all(&repo).unwrap();
     crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
     repo
 }
 #[test]

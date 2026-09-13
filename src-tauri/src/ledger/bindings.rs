@@ -286,6 +286,7 @@ mod tests {
                 path.to_str().expect("utf8 worktree path"),
             ],
         );
+        crate::test_support::trust_repo(&path);
         let canonical = path
             .canonicalize()
             .expect("canonical worktree")
@@ -459,6 +460,7 @@ mod tests {
             format!("gitdir: {}\n", repo.path().join(".git").display()),
         )
         .expect("impostor gitfile");
+        crate::test_support::trust_repo(impostor.path());
 
         let error = bind(
             repo.path().to_str().expect("utf8 repository"),

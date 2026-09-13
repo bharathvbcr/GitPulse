@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+mod common;
 use gitpulse_lib::storage::{scan_storage, ReclaimConfidence, ReclaimSafety};
 use std::fs;
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ impl TempRepo {
             _guard: guard,
         };
         repo.git(&["init", "-q", "-b", "main"]);
+        common::trust_repo(&repo.root);
         repo.git(&["config", "user.email", "stress@example.com"]);
         repo.git(&["config", "user.name", "Stress Test"]);
         repo
@@ -258,6 +260,7 @@ mod bare_and_worktrees {
             String::from_utf8_lossy(&out.stderr)
         );
 
+        common::trust_repo(&bare);
         let report = scan_storage(bare.to_str().unwrap()).unwrap();
         assert!(report.is_bare);
         assert_eq!(report.totals.worktree_bytes, 0);

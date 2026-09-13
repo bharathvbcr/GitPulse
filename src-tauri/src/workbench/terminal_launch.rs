@@ -279,6 +279,7 @@ mod tests {
 
     fn init(root: &Path) {
         git_global(&["init", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(root);
     }
 
     fn commit(root: &Path) {
@@ -335,6 +336,8 @@ mod tests {
             clone.to_str().unwrap(),
         ])
         .unwrap();
+        crate::test_support::trust_repo(&linked);
+        crate::test_support::trust_repo(&clone);
         let db = dir.path().join("profile.sqlite");
         let state = host(&db);
         seed(&state, &root);
@@ -453,6 +456,7 @@ mod tests {
         );
         let bare = dir.path().join("bare");
         git_global(&["init", "--bare", bare.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&bare);
         assert_eq!(
             state
                 .request("runs.prepare_terminal", &prepare(&bare).to_string())
@@ -537,6 +541,7 @@ mod tests {
         );
         std::fs::rename(&root, dir.path().join("replacement")).unwrap();
         std::fs::rename(dir.path().join("moved"), &root).unwrap();
+        crate::test_support::trust_repo(&root);
         state.request("items.put", &json!({"id":"task","request_id":"edit","expected_revision":1,"title":"Changed instructions","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
         assert_eq!(
             state.request("runs.claim", claim).unwrap_err().code,

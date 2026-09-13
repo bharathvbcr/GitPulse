@@ -45,5 +45,14 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
             cwd,
             &["config", "--local", "user.email", "test@example.com"],
         );
+        trust_repo(cwd);
     }
+}
+
+/// The test owns this fixture and explicitly admits it through the real trust
+/// boundary. This is a session grant, never a bypass or a user's saved grant.
+pub fn trust_repo(repo: &Path) {
+    let path = repo.to_str().expect("fixture path");
+    let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect fixture");
+    gitpulse_lib::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
 }

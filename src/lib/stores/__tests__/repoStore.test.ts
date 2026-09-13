@@ -6,6 +6,7 @@ import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
 import type { FilterState } from "../filterStore";
 import { interfaceStore } from "../interfaceStore";
 import { diagnostics } from "../../diagnostics/diagnostics";
+import { promptState, completePrompt, cancelPrompt } from "../modalStore";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -188,6 +189,77 @@ function makeStore(invoke: InvokeFn = makeInvoke()) {
   return { store, graph };
 }
 
+describe("explicit repository trust", () => {
+  afterEach(() => cancelPrompt());
+  const preview = { path: "/canonical/repo", git_dir: "/canonical/repo/.git", common_dir: "/canonical/repo/.git", identity: "opaque-native-identity", trusted: false };
+
+  it.each([false, true])("does no repository work before approval, including broken-tab restore (%s)", async allowBroken => {
+    const calls: string[] = [];
+    const invokeFn: InvokeFn = async command => {
+      calls.push(command);
+      if (command === "cmd_resolve_repo") throw new Error("REPOSITORY_TRUST_REQUIRED: explicit approval required");
+      if (command === "cmd_repository_trust") return preview as never;
+      throw new Error(`Unexpected pre-trust work: ${command}`);
+    };
+    const { store, graph } = makeStore(invokeFn);
+    const opening = store.openRepo("/alias", { allowBroken });
+    await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("Trust this repository?"));
+    expect(get(store).currentPath).toBeNull();
+    expect(get(store).openTabs).toEqual([]);
+    expect(graph.loaded).toEqual([]);
+    expect(calls).toEqual(["cmd_resolve_repo", "cmd_repository_trust"]);
+    cancelPrompt();
+    expect(await opening).toBe(false);
+    expect(calls).toEqual(["cmd_resolve_repo", "cmd_repository_trust"]);
+    expect(get(store).currentPath).toBeNull();
+  });
+
+  it("grants only the displayed identity, then resolves again before publishing", async () => {
+    let approved = false;
+    const order: string[] = [];
+    const invokeFn = makeInvoke({
+      cmd_resolve_repo: async () => {
+        order.push("resolve");
+        if (!approved) throw new Error("REPOSITORY_TRUST_REQUIRED");
+        return { path: preview.path, name: "repo", is_bare: false } as never;
+      },
+      cmd_repository_trust: async () => preview as never,
+      cmd_grant_repository_trust: async (_command, args) => {
+        expect(args).toEqual({ repoPath: preview.path, expectedIdentity: preview.identity });
+        approved = true;
+        order.push("grant");
+        return undefined as never;
+      },
+      cmd_watch_repo: async () => { order.push("watch"); return preview.path as never; },
+    });
+    const { store } = makeStore(invokeFn);
+    const opening = store.openRepo("/alias");
+    await vi.waitFor(() => expect(get(promptState)).not.toBeNull());
+    expect(get(store).currentPath).toBeNull();
+    completePrompt(true);
+    expect(await opening).toBe(true);
+    expect(order).toEqual(["resolve", "grant", "resolve", "watch"]);
+    expect(get(store).currentPath).toBe(preview.path);
+    const activeId = get(store).activeTabId;
+    if (!activeId) throw new Error("approved repository did not become active");
+    await store.closeTab(activeId);
+  });
+
+  it("keeps a changed or failed grant closed even during restore", async () => {
+    const { store } = makeStore(makeInvoke({
+      cmd_resolve_repo: async () => { throw new Error("REPOSITORY_TRUST_REQUIRED"); },
+      cmd_repository_trust: async () => preview as never,
+      cmd_grant_repository_trust: async () => { throw new Error("Repository changed while trust was being requested"); },
+    }));
+    const opening = store.openRepo("/alias", { allowBroken: true });
+    await vi.waitFor(() => expect(get(promptState)).not.toBeNull());
+    completePrompt(true);
+    expect(await opening).toBe(false);
+    expect(get(store).currentPath).toBeNull();
+    expect(get(store).error).toContain("Repository changed");
+  });
+});
+
 describe("repository content revisions", () => {
   it("advances on an identical full snapshot without turning unrelated publications into content changes", async () => {
     const { store } = makeStore();
@@ -224,11 +296,15 @@ describe("repository content revisions", () => {
     const { store } = makeStore();
     await store.openRepo("/r/content");
     const initial = get(store.contentRevisions)["/r/content"];
-    await store.closeTab(get(store).activeTabId!);
+    const activeId = get(store).activeTabId;
+    if (!activeId) throw new Error("approved repository did not become active");
+    await store.closeTab(activeId);
     await store.openRepo("/r/content");
     expect(get(store.contentRevisions)["/r/content"]).not.toBe(initial);
     for (let i = 0; i < 20; i++) {
-      await store.closeTab(get(store).activeTabId!);
+      const activeId = get(store).activeTabId;
+    if (!activeId) throw new Error("approved repository did not become active");
+    await store.closeTab(activeId);
       await store.openRepo(`/r/content-${i}`);
       expect(Object.keys(get(store.contentRevisions))).toHaveLength(1);
     }

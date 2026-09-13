@@ -26,6 +26,7 @@ fn init_repo(dir: &std::path::Path) {
         "git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    common::trust_repo(dir);
     for (k, v) in [
         ("user.name", "t"),
         ("user.email", "t@t"),
@@ -551,3 +552,5 @@ fn clone_repo_still_clones_local_file_urls() {
     let checked_out = std::fs::read_to_string(Path::new(&cloned).join("tracked.txt")).unwrap();
     assert_eq!(checked_out.replace("\r\n", "\n"), "base\n");
 }
+
+mod common;

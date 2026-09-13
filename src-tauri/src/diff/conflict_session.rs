@@ -945,7 +945,7 @@ mod tests {
     fn a_replaced_index_lock_is_neither_published_nor_deleted() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = temp.path().canonicalize().unwrap();
-        git(&repo, &["init", "-b", "main"]).unwrap();
+        crate::test_support::git_in(&repo, &["init", "-b", "main"]);
         fs::write(repo.join("file"), b"original\n").unwrap();
         git(&repo, &["add", "file"]).unwrap();
         let original = fs::read(repo.join(".git/index")).unwrap();
@@ -965,7 +965,7 @@ mod tests {
     fn publication_failure_retains_original_content_and_does_not_replace_the_index() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = temp.path().canonicalize().unwrap();
-        git(&repo, &["init", "-b", "main"]).unwrap();
+        crate::test_support::git_in(&repo, &["init", "-b", "main"]);
         fs::write(repo.join("file"), b"original\n").unwrap();
         git(&repo, &["add", "file"]).unwrap();
         git(

@@ -6,6 +6,8 @@
 //! be destructive, so the refusals matter as much as the happy paths — and the
 //! module had no integration test at all, only inline unit tests.
 
+mod common;
+
 use gitpulse_lib::ops::{
     branch_cleanup_plan, prepare_release, review_outgoing_commits, validate_release_tag,
 };
@@ -39,6 +41,7 @@ impl TestRepo {
     fn init() -> Self {
         let dir = TempDir::new().expect("tempdir");
         git_ok(dir.path(), &["init", "-b", "main"]);
+        common::trust_repo(dir.path());
         git_ok(dir.path(), &["config", "user.email", "test@example.com"]);
         git_ok(dir.path(), &["config", "user.name", "Test User"]);
         git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);

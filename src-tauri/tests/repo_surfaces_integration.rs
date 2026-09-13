@@ -33,6 +33,9 @@ fn run_git(cwd: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(cwd);
+    }
 }
 
 fn try_git(cwd: &Path, args: &[&str]) {
@@ -545,6 +548,7 @@ fn tracking_branch_counts_reflect_real_remote_refs() {
         ],
     );
 
+    common::trust_repo(&target);
     let listed = remotes::list(&target.to_string_lossy()).unwrap();
     assert_eq!(listed.remotes.len(), 1);
     assert_eq!(listed.remotes[0].name, "origin");
@@ -622,6 +626,7 @@ fn a_fresh_clone_reports_its_submodule_as_uninitialized() {
         ],
     );
 
+    common::trust_repo(&target);
     let listed = submodules::list(&target.to_string_lossy()).unwrap();
     assert_eq!(listed.submodules.len(), 1);
     assert_eq!(listed.submodules[0].state, SubmoduleState::Uninitialized);
@@ -660,6 +665,7 @@ fn detection_follows_a_submodule_across_initialization() {
         ],
     );
 
+    common::trust_repo(&target);
     let path = target.to_string_lossy().into_owned();
     assert_eq!(
         submodules::list(&path).unwrap().submodules[0].state,
@@ -701,6 +707,7 @@ fn a_refused_submodule_transport_is_reported_rather_than_swallowed() {
         ],
     );
 
+    common::trust_repo(&target);
     let path = target.to_string_lossy().into_owned();
     let err = submodules::apply_with(
         &path,
@@ -937,3 +944,5 @@ fn every_reset_mode_renders_the_flag_it_names() {
         );
     }
 }
+
+mod common;

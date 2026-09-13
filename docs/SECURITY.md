@@ -44,6 +44,48 @@ flowchart TD
   CLI when a repository opens). A failed GitHub check does not toast.
 - The webview does not load external CDN scripts, styles, or telemetry trackers.
 
+### Explicit Repository Trust
+- Opening a checkout first requires an explicit **Trust and Open** decision.
+  Path inspection does not run Git; canceled or failed approval does not start
+  watchers, status hydration, dependency scans, or code indexing.
+- Trust permits this checkout's Git hooks, helpers, and project tools to run
+  with the user's account permissions, including code in submodules. It is an
+  execution decision, not an OS sandbox or a claim that the project is safe.
+- GitPulse stores remembered grants in its application configuration directory,
+  outside repository policy and task files. Grants bind canonical checkout,
+  private Git directory, common Git directory, and filesystem identities.
+  Replacing the checkout or redirecting a gitfile requires fresh approval.
+- Linked worktrees need separate approval. Shared Git-directory discovery is
+  filesystem-only; removing a worktree requires trust for the target as well
+  as the parent because Git may scan the target internally.
+- Native Git, background analysis, DevMap, PTY startup, and MCP reads enforce
+  trust. MCP cannot grant it. A refusal is an explicit error or unavailable
+  result, never a successful empty scan.
+- Global tool probes run from a neutral filesystem root. Local source-tool
+  installation requires approval for the checkout used to build the tool.
+- Use the repository tab's **Revoke repository trust** action to close the tab
+  and block subsequent operations. Already-started terminals and agent tasks
+  retain the authority they were given; stop them separately when needed.
+- Filesystems that cannot supply a stable creation identity are refused with
+  an explanation. Trust decisions are local to this installation and are not
+  portable project metadata.
+
+### File Save Boundaries
+- Ordinary editor and documentation saves replace file entries atomically
+  under pinned, symlink-free parent directories. Saving one hard link does
+  not truncate the inode shared by its other names.
+- Saves enforce the existing 8 MiB file budget. Nested paths, empty files,
+  internal symlinks, and executable permissions remain supported; external
+  symlinks and special files are refused.
+- macOS metadata copying, Linux ownership and extended-attribute copying,
+  and Windows replacement preserve supported file metadata. If preservation
+  fails, the save fails rather than silently dropping that metadata. Linux
+  saves clear set-id and file-capability privileges as ordinary content writes
+  do; metadata work is bounded to 512 attributes and 1 MiB of values.
+- Concurrent changes can make a save fail. If a change races publication,
+  the error identifies retained recovery content for review. This is not an
+  OS sandbox against another process already running with the user's rights.
+
 ### Local `gh` Credential Safety
 - GitPulse never requests, reads, stores, or transmits your GitHub personal access tokens or passwords.
 - All GitHub operations (PR inspection, workflow dispatch, Dependabot and code scanning queries) delegate exclusively to your locally installed and authenticated `gh` CLI.
@@ -102,31 +144,14 @@ If you discover a security vulnerability in GitPulse, please report it via GitHu
 
 We take security issues seriously and will respond promptly to investigate and patch confirmed vulnerabilities.
 
-## 3. Unresolved Dependency Advisory
+## 3. Dependency Advisory Status
 
-As of 2026-09-08, **GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429 remains
-unresolved** in `src-tauri/Cargo.lock` (`glib 0.18.5`). The upstream advisory
-describes undefined behavior in `VariantStrIter` and identifies `0.20.0` as the
-first fixed version. See the [RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2024-0429.html)
-and [upstream fix](https://github.com/gtk-rs/gtk-rs-core/pull/1343).
+The September 2026 GTK migration replaced the old `glib 0.18.5` dependency
+with `glib 0.22.9`; the previous unresolved RUSTSEC-2024-0429 note no longer
+matches the lockfile. The maintained GTK consumer patches and their validation
+are documented in [Dependency Health](DEPENDENCY_HEALTH.md).
 
-**Verified:** Tauri's Linux GTK3/WebKitGTK stack resolves `gtk 0.18.2` and
-`webkit2gtk 2.0.2`, which require `glib 0.18` and `^0.18.0` respectively.
-`0.18.5` is the latest published release on that compatible line. Cargo rejects
-the suggested `0.20.0` update with `failed to select a version for the requirement
-glib = "^0.18"`. Reproduce without changing the lockfile:
-
-```sh
-cargo tree --manifest-path src-tauri/Cargo.toml --locked --target all -i glib@0.18.5
-cargo update --manifest-path src-tauri/Cargo.toml -p glib@0.18.5 --precise 0.20.0 --dry-run
-```
-
-The Apple Silicon macOS dependency graph has no `glib` edge; this does not clear
-the advisory for Linux builds. The [Wry GTK4 port](https://github.com/tauri-apps/wry/pull/1767)
-and [Tauri GTK4 port](https://github.com/tauri-apps/tauri/pull/14684) were still
-unmerged when checked. A resolution requires either a compatible maintained
-backport of the upstream fix or a compatible migration of the parent stack.
-Adding `glib 0.20` directly cannot replace GTK3's incompatible dependency.
-
-**Unverified:** reachability of the affected iterator in a running Linux build.
-The alert remains open; no advisory suppression or version override is applied.
+On 2026-09-12, the pinned revision `ac84b24` passed `cargo audit --deny warnings`
+for 550 Rust dependencies and `npm audit` for 175 npm dependencies, with no
+reported advisories. These are dated advisory-database checks, not exhaustive
+source or runtime security verification. Re-run both checks for a release.

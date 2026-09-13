@@ -606,6 +606,7 @@ fn linked_worktrees_use_their_own_operation_and_index() {
             "main",
         ],
     );
+    common::trust_repo(linked.path());
     let main_index = fs::read(main.path().join(".git/index")).unwrap();
     assert!(git(linked.path(), &["merge", "incoming"]).is_err());
     assert!(

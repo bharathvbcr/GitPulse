@@ -19,6 +19,9 @@ fn run_git(dir: &Path, args: &[&str]) {
         .status()
         .expect("git must be on PATH");
     assert!(status.success(), "git {args:?} failed");
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 fn init_repo(dir: &Path) {
@@ -97,3 +100,5 @@ fn resolves_from_a_file_path_not_only_a_directory() {
     let resolved = cmd_resolve_git_root(file.to_string_lossy().into_owned()).expect("a root");
     assert_same_dir(&resolved, dir.path());
 }
+
+mod common;

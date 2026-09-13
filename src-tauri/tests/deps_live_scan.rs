@@ -5,6 +5,7 @@
 //! the check prints why and returns, so machines without it still pass; when
 //! it is present, the assertions must hold against its genuine output.
 
+mod common;
 use gitpulse_lib::analyzer::deps::{DepsScanner, ScanOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ fn git_repo() -> TempDir {
         .status()
         .expect("git init");
     assert!(status.success());
+    common::trust_repo(dir.path());
     dir
 }
 

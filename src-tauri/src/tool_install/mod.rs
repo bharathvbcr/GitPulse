@@ -1468,7 +1468,6 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                 "--locked",
                 "--force",
             ]);
-            cmd.current_dir(&target);
             cmd
         }
         ExternalTool::Manvi => {
@@ -1504,6 +1503,8 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
         }
     };
 
+    cmd.current_dir(&target);
+
     let label = match tool {
         ExternalTool::Devmap => "cargo install",
         ExternalTool::Manvi => "go install",
@@ -1527,13 +1528,20 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
         },
         InstallRun::Failed(err) => {
             let was_timeout = timed_out(&err);
+            // The source module may itself be a nested checkout. The approval
+            // flow must name the same repository that process admission checks.
+            let source = if err.contains(crate::repository_trust::REQUIRED) {
+                git_cli::find_git_root(&target).unwrap_or_else(|| root.clone())
+            } else {
+                root.clone()
+            };
             InstallOutcome {
                 tool,
                 ok: false,
                 binary: None,
                 lookup: None,
                 version: None,
-                source_used: Some(root.display().to_string()),
+                source_used: Some(source.display().to_string()),
                 command,
                 exit_code: None,
                 stdout: String::new(),
@@ -2198,6 +2206,82 @@ mod tests {
         tool_capability::invalidate(ExternalTool::Manvi);
         assert!(!status.installed);
         assert_eq!(status.lookup, ToolLookup::ExplicitMissing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_installs_require_repository_trust_before_starting_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::harness::sidecar::test_serial();
+        for nested in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let repo = root.path().join("source");
+            std::fs::create_dir(&repo).unwrap();
+            assert!(Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::create_dir_all(repo.join("manvi/cmd/manvi")).unwrap();
+            std::fs::write(repo.join("manvi/go.mod"), "module fixture\n").unwrap();
+            let checkout = if nested {
+                repo.join("manvi")
+            } else {
+                repo.clone()
+            };
+            if nested {
+                assert!(Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(&checkout)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let go = bin.join("go");
+            std::fs::write(&go, "#!/bin/sh\nprintf ran > \"$0.marker\"\nexit 7\n").unwrap();
+            std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let old_path = std::env::var_os("PATH");
+            let old_root = std::env::var_os("GITPULSE_MANVI_ROOT");
+            let path = std::env::join_paths(
+                std::iter::once(bin.clone())
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap();
+            std::env::set_var("PATH", path);
+            std::env::set_var("GITPULSE_MANVI_ROOT", &repo);
+            let denied = install_from_checkout(ExternalTool::Manvi);
+            let started_before_approval = bin.join("go.marker").exists();
+            crate::test_support::trust_repo(&checkout);
+            let admitted = install_from_checkout(ExternalTool::Manvi);
+            for (key, value) in [("PATH", old_path), ("GITPULSE_MANVI_ROOT", old_root)] {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+            assert!(
+                !started_before_approval,
+                "unapproved source installer started"
+            );
+            assert!(denied
+                .reason
+                .unwrap_or_default()
+                .contains(crate::repository_trust::REQUIRED));
+            assert_eq!(
+                denied.source_used,
+                Some(checkout.canonicalize().unwrap().display().to_string()),
+                "approval must name the actual nested execution checkout"
+            );
+            assert!(
+                bin.join("go.marker").exists(),
+                "approved installer did not start"
+            );
+            assert_eq!(admitted.exit_code, Some(7));
+        }
     }
 
     #[test]

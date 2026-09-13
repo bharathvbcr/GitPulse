@@ -743,6 +743,13 @@
       <button role="menuitem" class="gp-menu-item" onclick={() => void copyPath(tab.path)}>
         Copy path
       </button>
+      <button role="menuitem" class="gp-menu-item" onclick={() => {
+        const id = tab.id;
+        closeMenu();
+        void repoStore.revokeTrust(id);
+      }}>
+        Revoke repository trust…
+      </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeTab(tab.id); closeMenu(); }}>
         Close
       </button>

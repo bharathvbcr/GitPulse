@@ -319,6 +319,7 @@ mod tests {
             );
         };
         run(&["init", "-q", "-b", "main"], &[]);
+        crate::test_support::trust_repo(dir.path());
         run(&["config", "user.name", "t"], &[]);
         run(&["config", "user.email", "t@t"], &[]);
         run(&["config", "commit.gpgsign", "false"], &[]);

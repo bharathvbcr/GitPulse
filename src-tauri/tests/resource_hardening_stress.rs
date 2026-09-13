@@ -27,6 +27,9 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 fn repo_with(dir: &Path, name: &str, first: &str, second: &str) -> String {
@@ -256,3 +259,5 @@ fn concurrent_worst_case_diff_reads_stay_within_a_sane_memory_envelope() {
         threads
     );
 }
+
+mod common;

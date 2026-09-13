@@ -660,6 +660,7 @@ mod tests {
             .output()
             .expect("git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(repo.path());
         let bin = repo.path().join("devmap");
         std::fs::write(
             &bin,
@@ -747,6 +748,7 @@ exit 2
             .output()
             .expect("git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(repo.path());
         let bin = repo.path().join("devmap");
         std::fs::write(
             &bin,
@@ -805,6 +807,7 @@ exit 2
             .output()
             .expect("git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(repo.path());
         let bin = repo.path().join("devmap");
         std::fs::write(
             &bin,
@@ -859,6 +862,7 @@ exit 2
             .output()
             .expect("git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(repo.path());
         let bin = repo.path().join("devmap");
         std::fs::write(
             &bin,

@@ -1,3 +1,4 @@
+mod common;
 use gitpulse_lib::engine::{GitReader, GitWriter};
 use std::fs::File;
 use std::io::Write;
@@ -14,6 +15,7 @@ fn create_temp_git_repo() -> TempDir {
         .output()
         .expect("git init failed");
     assert!(init.status.success());
+    common::trust_repo(dir.path());
 
     let config_email = Command::new("git")
         .args(["config", "user.email", "test@gitpulse.dev"])

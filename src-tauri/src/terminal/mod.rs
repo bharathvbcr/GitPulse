@@ -684,10 +684,14 @@ fn spawn_session_inner<R: tauri::Runtime>(
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }
-    let child = match pair.slave.spawn_command(cmd) {
+    let spawn_result = crate::repository_trust::require(&repo).and_then(|_| {
+        pair.slave
+            .spawn_command(cmd)
+            .map_err(|error| format!("Failed to spawn process '{shell}': {error}"))
+    });
+    let child = match spawn_result {
         Ok(child) => child,
-        Err(error) => {
-            let reason = format!("Failed to spawn process '{shell}': {error}");
+        Err(reason) => {
             if let Some(observer) = &observer {
                 observer.spawn_failed(&session_id, &reason);
             }
@@ -2193,6 +2197,59 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn late_trust_revocation_records_a_failed_spawn_without_starting_a_child() {
+        struct RevokeBeforeSpawn {
+            repo: std::path::PathBuf,
+            failed: std::sync::atomic::AtomicBool,
+        }
+        impl SessionObserver for RevokeBeforeSpawn {
+            fn run_id(&self) -> &str {
+                "revoked-launch"
+            }
+            fn before_spawn(&self, _: &str) -> Result<(), String> {
+                crate::repository_trust::revoke(self.repo.to_str().unwrap())
+            }
+            fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+                panic!("revoked launch started")
+            }
+            fn spawn_failed(&self, _: &str, reason: &str) {
+                assert!(reason.contains(crate::repository_trust::REQUIRED));
+                self.failed.store(true, Ordering::SeqCst);
+            }
+            fn finished(&self, _: &TerminalExitPayload) {
+                panic!("revoked launch acquired a child")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let observer = Arc::new(RevokeBeforeSpawn {
+            repo: dir.path().to_path_buf(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let result = spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), "touch revoked-launch-marker".into()]),
+            None,
+            Some(observer.clone()),
+        );
+        assert!(result
+            .unwrap_err()
+            .contains(crate::repository_trust::REQUIRED));
+        assert!(!dir.path().join("revoked-launch-marker").exists());
+        assert!(
+            observer.failed.load(Ordering::SeqCst),
+            "a consumed launch claim must receive its failure receipt"
+        );
+    }
+
     fn init_test_repo(dir: &std::path::Path) {
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
@@ -2200,6 +2257,7 @@ mod tests {
             .output()
             .expect("git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir);
     }
 
     #[test]

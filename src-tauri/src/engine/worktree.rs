@@ -536,6 +536,10 @@ pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Resul
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     validate_target_path(target_path)?;
+    // Git scans the target's status internally. Its config.worktree helpers
+    // can execute even though the parent is the process's current directory.
+    let target = validate_repo(target_path)?;
+    let target_path = target.to_str().ok_or("Worktree path is not UTF-8")?;
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -814,6 +818,7 @@ some-future-field whatever
         )
         .expect("add worktree");
         assert_eq!(created, wt_path.to_str().unwrap());
+        crate::test_support::trust_repo(&wt_path);
 
         let listed = list_worktrees(main.path().to_str().unwrap()).expect("list two");
         assert_eq!(listed.len(), 2);

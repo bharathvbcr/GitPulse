@@ -1,3 +1,4 @@
+mod common;
 use gitpulse_lib::storage::{scan_storage, ReclaimSafety};
 use std::{fs, process::Command};
 
@@ -10,6 +11,7 @@ fn untracked_environments_agent_state_and_scratch_are_not_safe_cleanup() {
         .status()
         .unwrap()
         .success());
+    common::trust_repo(root.path());
     for name in [
         ".venv",
         ".claude",
@@ -48,6 +50,7 @@ fn capped_artifact_inventory_never_looks_complete_to_a_global_cleaner() {
         .status()
         .unwrap()
         .success());
+    common::trust_repo(root.path());
     for i in 0..70 {
         let path = root.path().join(format!("project-{i}/__pycache__"));
         fs::create_dir_all(&path).unwrap();

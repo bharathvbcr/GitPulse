@@ -1042,6 +1042,9 @@ done
                 other.to_str().unwrap(),
             ],
         );
+        for checkout in [&repo, &linked, &other] {
+            crate::test_support::trust_repo(checkout);
+        }
         let path = dir.path().join("profile.sqlite");
         let host = state(&path);
         let first = host

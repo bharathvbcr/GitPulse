@@ -28,6 +28,9 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&status.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 /// A repository with one commit on `main`, a `feature` branch and a `v1.0` tag.
@@ -258,3 +261,5 @@ fn overlapping_gated_actions_are_all_actually_checked() {
         assert_eq!(verdict.rule, "command.force_push");
     }
 }
+
+mod common;

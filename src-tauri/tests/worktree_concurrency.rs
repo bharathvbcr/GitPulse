@@ -27,6 +27,9 @@ fn git_in(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        common::trust_repo(dir);
+    }
 }
 
 fn init_repo() -> TempDir {
@@ -54,6 +57,7 @@ fn concurrent_mutations_from_linked_worktrees_all_land() {
         false,
     )
     .expect("add worktree");
+    common::trust_repo(&wt_path);
 
     let main_path = main.path().to_str().unwrap().to_string();
     let wt_str = wt_path.to_str().unwrap().to_string();
@@ -114,6 +118,7 @@ fn lock_unlock_and_prune_from_engine_api() {
         false,
     )
     .expect("add");
+    common::trust_repo(&wt_path);
 
     worktree::lock_worktree(main.path().to_str().unwrap(), &created, Some("hold")).expect("lock");
     let listed = worktree::list_worktrees(main.path().to_str().unwrap()).expect("list");
@@ -136,3 +141,5 @@ fn lock_unlock_and_prune_from_engine_api() {
     let listed = worktree::list_worktrees(main.path().to_str().unwrap()).expect("list after prune");
     assert_eq!(listed.len(), 1);
 }
+
+mod common;

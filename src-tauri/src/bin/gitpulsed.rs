@@ -550,6 +550,9 @@ mod tests {
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
         git(&["init", "-b", "main"]);
+        let view = gitpulse_lib::repository_trust::inspect(repo.path().to_str().unwrap()).unwrap();
+        gitpulse_lib::repository_trust::grant(repo.path().to_str().unwrap(), &view.identity, false)
+            .unwrap();
         git(&["config", "user.name", "T"]);
         git(&["config", "user.email", "t@e.com"]);
         git(&["commit", "--allow-empty", "-m", "c0"]);
@@ -596,6 +599,9 @@ mod tests {
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
         git(&["init", "-b", "main"]);
+        let view = gitpulse_lib::repository_trust::inspect(repo.path().to_str().unwrap()).unwrap();
+        gitpulse_lib::repository_trust::grant(repo.path().to_str().unwrap(), &view.identity, false)
+            .unwrap();
         git(&["commit", "--allow-empty", "-m", "seed"]);
         let parent = tempfile::tempdir().expect("worktree parent");
         let linked = parent.path().join("linked");
@@ -606,6 +612,9 @@ mod tests {
             linked.to_str().expect("utf8 linked path"),
         ]);
         let linked = linked.canonicalize().expect("canonical linked worktree");
+        let view = gitpulse_lib::repository_trust::inspect(linked.to_str().unwrap()).unwrap();
+        gitpulse_lib::repository_trust::grant(linked.to_str().unwrap(), &view.identity, false)
+            .unwrap();
         gitpulse_lib::ledger::append(gitpulse_lib::ledger::Draft {
             repo_path: linked.to_string_lossy().into_owned(),
             worktree_path: Some(linked.to_string_lossy().into_owned()),

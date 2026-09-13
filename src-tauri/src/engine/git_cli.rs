@@ -37,13 +37,21 @@ pub struct ResolvedRepo {
     pub is_bare: bool,
 }
 
-/// Validates that `repo_path` is an absolute, readable Git work tree or bare repository.
+/// Admits an explicitly trusted Git work tree or bare repository.
+pub fn validate_repo(repo_path: &str) -> Result<PathBuf, String> {
+    let canonical = validate_repo_path(repo_path)?;
+    crate::repository_trust::require(&canonical)?;
+    Ok(canonical)
+}
+
+/// Filesystem-only discovery for trust preview and cleanup. This grants no
+/// execution authority; ordinary readers and writers use [`validate_repo`].
 ///
 /// A work tree is accepted when `.git` exists as a directory or a gitfile (linked worktrees).
-/// A bare repo is accepted when `HEAD` and `objects` exist, or when
-/// `git rev-parse --is-bare-repository` returns true.
+/// A bare repo is accepted when both `HEAD` and `objects` are present.
+/// Discovery never invokes Git.
 /// Always returns the canonical path.
-pub fn validate_repo(repo_path: &str) -> Result<PathBuf, String> {
+pub fn validate_repo_path(repo_path: &str) -> Result<PathBuf, String> {
     if repo_path.is_empty() || repo_path.contains('\0') || repo_path.chars().any(|c| c.is_control())
     {
         return Err("Invalid repository path".into());
@@ -68,7 +76,7 @@ fn is_git_repository(canonical: &Path) -> bool {
     if canonical.join(".git").exists() {
         return true;
     }
-    has_bare_layout(canonical) || rev_parse_is_bare(canonical)
+    has_bare_layout(canonical)
 }
 
 fn has_bare_layout(path: &Path) -> bool {
@@ -82,52 +90,14 @@ fn rev_parse_is_bare(path: &Path) -> bool {
     }
 }
 
-/// Resolves `git rev-parse --git-dir` to an absolute canonical git directory.
+/// Resolves the private Git directory from bounded filesystem metadata.
 pub fn resolve_git_dir(repo: &Path) -> Result<PathBuf, String> {
-    let raw = git_text(repo, &["rev-parse", "--git-dir"])?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("git rev-parse --git-dir returned an empty path".into());
-    }
-    let git_dir = Path::new(trimmed);
-    let absolute = if git_dir.is_absolute() {
-        git_dir.to_path_buf()
-    } else {
-        repo.join(git_dir)
-    };
-    absolute.canonicalize().map_err(|e| {
-        format!(
-            "Cannot resolve git directory '{}': {}",
-            absolute.display(),
-            e
-        )
-    })
+    crate::repository_trust::git_directories(repo).map(|(private, _)| private)
 }
 
-/// Resolves `git rev-parse --git-common-dir` to the shared canonical git directory,
-/// ensuring all linked worktrees in the same repository map to the same root git directory.
+/// Resolves the common Git directory without executing sibling configuration.
 pub fn resolve_git_common_dir(repo: &Path) -> Result<PathBuf, String> {
-    let raw = match git_text(repo, &["rev-parse", "--git-common-dir"]) {
-        Ok(text) => text,
-        Err(_) => git_text(repo, &["rev-parse", "--git-dir"])?,
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("git rev-parse --git-common-dir returned an empty path".into());
-    }
-    let git_dir = Path::new(trimmed);
-    let absolute = if git_dir.is_absolute() {
-        git_dir.to_path_buf()
-    } else {
-        repo.join(git_dir)
-    };
-    absolute.canonicalize().map_err(|e| {
-        format!(
-            "Cannot resolve common git directory '{}': {}",
-            absolute.display(),
-            e
-        )
-    })
+    crate::repository_trust::git_directories(repo).map(|(_, common)| common)
 }
 
 /// Canonicalizes `repo_path` and reports whether it is a bare repository.
@@ -280,29 +250,7 @@ pub fn sandbox_join_entry(repo: &Path, file_path: &str) -> Result<PathBuf, Strin
 pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<(), String> {
     let repo = validate_repo(repo_path)?;
     let dest = sandbox_join_canonical(&repo, file_path)?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent directories: {}", e))?;
-    }
-    std::fs::write(&dest, content).map_err(|e| format!("Failed to write file: {}", e))?;
-    // TOCTOU hardening (post-hoc containment re-check): sandbox_join_canonical
-    // verified every existing component before the write, but a symlink
-    // swapped in between that check and fs::write would redirect the write
-    // outside the repository. Full prevention needs O_NOFOLLOW via libc,
-    // which this crate deliberately does not depend on, so we instead
-    // re-canonicalize the written file — resolving any final-component or
-    // parent-directory swap — and fail loudly if it left the repo. Residual
-    // race, documented honestly: a swap AFTER this check goes undetected, and
-    // the escaped bytes are already on disk; the window is narrowed, not closed.
-    let written = std::fs::canonicalize(&dest)
-        .map_err(|e| format!("Cannot verify written file '{}': {}", dest.display(), e))?;
-    if !written.starts_with(&repo) {
-        return Err(format!(
-            "Written file '{}' escaped the repository (containment re-check failed)",
-            written.display()
-        ));
-    }
-    Ok(())
+    crate::diff::write_regular(&dest, content.as_bytes())
 }
 
 /// True for inherited environment names that can redirect git's config,
@@ -512,6 +460,7 @@ fn git_captured_inner(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> Result<BoundedRun, String> {
+    crate::repository_trust::require(repo)?;
     let label = format!("git {}", args.first().unwrap_or(&""));
     run_bounded(
         git_command(Some(repo), args),
@@ -537,6 +486,7 @@ pub(crate) fn git_with_index(
     args: &[&str],
     stdin_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
+    crate::repository_trust::require(repo)?;
     let mut command = git_command(Some(repo), args);
     // Canonical paths carry the Windows verbatim prefix, which Git rejects
     // in GIT_INDEX_FILE. The transaction may create this file, so do not
@@ -1893,6 +1843,9 @@ fn git_run_capped(
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
 ) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+    if let Some(repo) = repo {
+        crate::repository_trust::require(repo)?;
+    }
     let sub = args.first().unwrap_or(&"");
     let label = format!("git {}", sub);
     let started = Instant::now();
@@ -2244,7 +2197,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_failure_diagnostics_bound_stderr_as_well_as_stdout() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::git_repo();
         let error = git_run_capped(
             Some(dir.path()),
             &[
@@ -2279,7 +2232,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn audit_lock_retries_share_one_total_deadline() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::git_repo();
         let started = Instant::now();
         let error = git_run_capped(Some(dir.path()), &[
             "-c", "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1", "retry"
@@ -2715,6 +2668,7 @@ mod tests {
             work_path.join(".git").is_file(),
             "linked worktree must use a gitfile"
         );
+        crate::test_support::trust_repo(&work_path);
         (main, work_parent, work_path)
     }
 
@@ -2733,6 +2687,7 @@ mod tests {
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -2746,9 +2701,8 @@ mod tests {
 
     #[test]
     fn test_validate_repo_accepts_gitfile() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join(".git"), "gitdir: /tmp/fake.git\n").unwrap();
-        validate_repo(&dir.path().to_string_lossy()).expect("gitfile worktree");
+        let (_main, _parent, linked) = init_linked_worktree();
+        validate_repo(linked.to_str().unwrap()).expect("gitfile worktree");
     }
 
     #[test]
@@ -3497,7 +3451,7 @@ mod tests {
     #[test]
     fn index_transaction_accepts_a_canonical_windows_parent_and_new_index() {
         let dir = tempfile::TempDir::new().unwrap();
-        git(dir.path(), &["init"]).unwrap();
+        crate::test_support::git_in(dir.path(), &["init"]);
         let canonical = dir.path().canonicalize().unwrap();
         let index = canonical.join(".git").join("transaction-index");
         assert!(!index.exists());
@@ -4053,7 +4007,7 @@ mod tests {
     fn git_captured_reports_a_non_zero_exit_as_data_and_a_spawn_failure_as_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
-        assert!(git(repo, &["init", "-b", "main"]).is_ok(), "fixture repo");
+        crate::test_support::git_in(repo, &["init", "-b", "main"]);
 
         // Exit 1, empty stdout: an answer.
         let run = git_captured(repo, &["notes", "--ref=refs/notes/none", "show", "HEAD"])
@@ -4487,6 +4441,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        crate::test_support::trust_repo(dir);
     }
 
     /// THE CLASS: a count too large for its type used to read as zero, which a

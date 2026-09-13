@@ -1077,6 +1077,7 @@ mod tests {
         run(&["commit", "-m", "chore: seed"]);
         std::fs::write(dir.path().join("README.md"), "# hello\n").unwrap();
         run(&["add", "README.md"]);
+        crate::test_support::trust_repo(dir.path());
         dir
     }
 
@@ -1152,6 +1153,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .expect("git init");
+        crate::test_support::trust_repo(dir.path());
         let error = generate_commit_message(
             &dir.path().to_string_lossy(),
             Some(AiSelection {

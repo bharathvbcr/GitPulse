@@ -155,6 +155,35 @@ async function run(){
   check("unstaged preview keeps the working side of mixed files",get(repoStore).selectedIsStaged===false);
   await repoStore.stageAll();
   check("stage all includes remaining edits in a partially staged file",JSON.stringify(indexWrites.at(-1).filePaths)===JSON.stringify(["mixed.txt"]));
+  const {promptState,cancelPrompt}=await import("../src/lib/stores/modalStore.ts");
+  const {default:PromptModal}=await import("../src/lib/components/PromptModal.svelte");
+  const promptTarget=document.createElement("div");document.body.append(promptTarget);
+  const prompt=mount(PromptModal,{target:promptTarget}),revocations=[];
+  fixtures.cmd_revoke_repository_trust=args=>{revocations.push(args.repoPath);};
+  await show("RepoTabBar");
+  const requestRevocation=async(path)=>{
+   const name=path.split("/").pop();
+   const shell=[...surface.querySelectorAll('[data-tab-shell-index]')].find(node=>node.querySelector('[role="tab"]')?.textContent.includes(name));
+   shell.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,clientX:30,clientY:30}));await tick();
+   const action=[...document.querySelectorAll('[data-repo-menu] [role="menuitem"]')].find(node=>node.textContent.trim()==="Revoke repository trust…");
+   action.click();
+   await until(()=>get(promptState)?.options.title==="Revoke repository trust?","repository revocation confirmation");
+   check("revocation retains the selected repository after its menu closes",get(promptState).options.message.includes(path)&&!document.querySelector('[data-repo-menu]'));
+  };
+  try{
+   await requestRevocation(other);
+   cancelPrompt();await tick();
+   check("cancelled revocation keeps the inactive repository and makes no native write",revocations.length===0&&get(repoStore).openTabs.some(tab=>tab.path===other)&&get(repoStore).currentPath===root);
+   await requestRevocation(other);
+   promptTarget.querySelector('button[type="submit"]').click();
+   await until(()=>revocations.length===1&&!get(repoStore).openTabs.some(tab=>tab.path===other),"confirmed repository revocation");
+   check("confirmed revocation targets only the chosen repository",revocations[0]===other&&get(repoStore).currentPath===root);
+   fixtures.cmd_revoke_repository_trust=()=>{throw Error("Fixture revocation denied");};
+   await requestRevocation(root);
+   promptTarget.querySelector('button[type="submit"]').click();
+   await until(()=>get(repoStore).error?.includes("Fixture revocation denied"),"visible revocation failure");
+   check("failed revocation preserves the repository tab",get(repoStore).openTabs.some(tab=>tab.path===root));
+  }finally{cancelPrompt();await unmount(prompt);promptTarget.remove();}
   check("No unexpected commands",unexpected.length===0);
   check("No runtime errors",crashes.length===0);
  }catch(error){results.push({name:String(error),pass:false});}
