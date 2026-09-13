@@ -10,7 +10,10 @@ import { harnessStore } from "../src/lib/stores/harnessStore";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
-const repos = ["GitPulse", "Manvi"].map((name, i) => ({ id: `repo-${i}`, name, revision: 1, updated_at: 1, identity_key: `/fixture/${name}`, remote_url: null }));
+const preparedRuns = [], appleDrafts = [];
+let appleStatus = { compiled: true, state: "available", reason: null, detail: "The on-device model is ready. Nothing leaves this Mac." };
+let appleFailure = "";
+const repos = ["GitPulse", "Manvi"].map((name, i) => ({ id: `repo-${i}`, name, revision: 1, updated_at: 1, identity_key: `local:/fixture/${name}/.git`, remote_url: null }));
 const workspace = { id: "workspace", name: "Developer tools", revision: 1, updated_at: 1, icon: "", color: "", pinned: false, archived: false, position: 1, description: "", repository_ids: ["repo-1"], repository_count: 1 };
 const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [] });
 let tasks = [
@@ -26,7 +29,7 @@ const receipts = new Map(), proposals = new Map(), enhancementWrites = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 const page = (items, start = 0, limit = 200) => ({ ok: true, items: items.slice(start, start + limit), total: items.length, shown: items.slice(start, start + limit).length, has_more: start + limit < items.length, next_cursor: start + limit < items.length ? String(start + limit) : null });
 mockIPC(async (cmd, args) => {
-  if (cmd === "cmd_workbench_register_repository") return JSON.stringify({ repository: repos.find(repo => repo.identity_key === args.repoPath) });
+  if (cmd === "cmd_workbench_register_repository") return JSON.stringify({ repository: repos.find(repo => repo.identity_key === `local:${args.repoPath}/.git`) });
   if (cmd === "cmd_pick_folder") return null;
   if (cmd === "cmd_ai_status") {
     return {
@@ -39,10 +42,27 @@ mockIPC(async (cmd, args) => {
       detail: "Fixture model ready.",
     };
   }
+  if (cmd === "cmd_apple_intelligence_status") return appleStatus;
+  if (cmd === "cmd_apple_intelligence_draft") {
+    appleDrafts.push(structuredClone(args.request));
+    if (appleFailure) throw { code: appleFailure, message: "Apple Intelligence declined." };
+    const fields = args.request.fields;
+    return {
+      title: fields.includes("title") ? "Route notifications to the right task" : null,
+      description: fields.includes("description") ? "Keep the saved evidence and explain recovery." : null,
+      rationale: "Written on this Mac by Apple Intelligence. No text left the device.",
+    };
+  }
   if (cmd !== "cmd_workbench_request") { unknown.push(cmd); throw Error(`Unconfigured command: ${cmd}`); }
   const input = JSON.parse(args.input);
   switch (args.method) {
     case "repositories.list": return JSON.stringify(page(repos));
+    case "repositories.get": return JSON.stringify({ok:true, item: repos.find(repo => repo.id === input.id)});
+    case "runs.list": return JSON.stringify({ok:true, items:[], shown:0, total:0, has_more:false, next_cursor:null});
+    case "runs.prepare_terminal": case "runs.prepare_managed": {
+      preparedRuns.push(structuredClone(input));
+      throw {code:"store_error", message:"The tasks fixture does not start agents."};
+    }
     case "workspaces.list": return JSON.stringify(page([workspace]));
     case "workspaces.get": return JSON.stringify({ok: true, item: workspace});
     case "enhancements.wake": case "enhancements.worker": return JSON.stringify({ok:true, state:"disabled", reason:"", task_id:"", proposal_id:"", next_check_at:0});
@@ -57,7 +77,7 @@ mockIPC(async (cmd, args) => {
     }
     case "enhancements.list": return JSON.stringify(page([...proposals.values()].filter(p=>p.task_id===input.task_id)));
     case "enhancements.get": return JSON.stringify({ok:true,item:proposals.get(input.id)});
-    case "enhancements.create": case "enhancements.generate": case "enhancements.accept": case "enhancements.undo": case "enhancements.dismiss": {
+    case "enhancements.create": case "enhancements.generate": case "enhancements.complete": case "enhancements.accept": case "enhancements.undo": case "enhancements.dismiss": {
       enhancementWrites.push({method:args.method,...structuredClone(input)});
       if(receipts.has(input.request_id)) return receipts.get(input.request_id);
       let proposal = proposals.get(input.id);
@@ -68,6 +88,20 @@ mockIPC(async (cmd, args) => {
         if(!proposal || proposal.revision !== input.expected_revision) throw {code:"revision_conflict",message:"Suggestion changed"};
         proposal = {...proposal,revision:proposal.revision+1};
         if(args.method === "enhancements.generate") { proposal.state="running"; proposal.worker_id="worker"; }
+        if(args.method === "enhancements.complete") {
+          // Mirrors the store: a completion carries a proposal or a reason it
+          // failed, never both, and never a field nobody asked for.
+          if(input.failure !== undefined) { proposal.state="failed"; proposal.failure=input.failure; }
+          else {
+            for(const field of ["title","description"]) {
+              if(input[field] !== undefined && !proposal.fields.includes(field)) throw {code:"invalid_input",message:"a proposal cannot change a field that was not requested"};
+              if(input[field] === undefined && proposal.fields.includes(field)) throw {code:"invalid_input",message:`missing proposed ${field}`};
+            }
+            proposal.state="ready";
+            proposal.proposed={...Object.fromEntries(proposal.fields.map(field=>[field,input[field]]))};
+            proposal.rationale=input.rationale ?? "";
+          }
+        }
         if(args.method === "enhancements.dismiss") { proposal.state="cancelled"; proposal.failure="Cancelled by user"; }
         if(args.method === "enhancements.accept" || args.method === "enhancements.undo") {
           const index = tasks.findIndex(task=>task.id===proposal.task_id), current=tasks[index];
@@ -144,7 +178,11 @@ const button = (text, within = root) => [...within.querySelectorAll("button")].f
   return names.includes(el.textContent.trim()) || names.includes(el.getAttribute("aria-label")) || names.includes(el.querySelector(":scope > span.flex-1")?.textContent.trim());
 });
 const field = (text) => [...root.querySelectorAll(".task-editor label")].find(el => el.firstChild?.textContent.trim() === (text === "Due date" || text === "Due" ? "Due" : text === "Custom type" ? "Type" : text))?.querySelector("input,textarea,select");
-const enhanceButton = () => button("Improve with Manvi") ?? button("Enhance with Manvi") ?? button("Draft with Manvi");
+// The label carries the engine's name, so matching on text alone stopped
+// finding this button the moment a second engine existed. The class is the
+// stable handle; the text lookups stay first so failures still name a label.
+const enhanceButton = () => button("Improve with Manvi") ?? button("Enhance with Manvi") ?? button("Draft with Manvi")
+  ?? root.querySelector(".manvi-assist button.ask");
 const card = id => root.querySelector(`[data-card-id="${id}"]`);
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
@@ -200,10 +238,27 @@ if (params.has("check")) {
     check("type offers all supported task kinds and permits custom names", field("Type") instanceof HTMLSelectElement && field("Type").options.length === 8 && [...field("Type").options].some(option => option.value === "__custom__"));
     check("the primary repository is available without expanding settings", field("Primary repository").getClientRects().length > 0 && !field("Primary repository").closest("details"));
     check("linked repositories remain intact in the draft", field("Primary repository").value === "repo-0" && editor().textContent.includes("Linked repositories"));
-    check("optional Manvi history and advanced details are folded initially", editor().querySelector(".history-drawer")?.open !== true && button("More details").getAttribute("aria-checked") === "false");
+    const paneTab = id => editor().querySelector(`[data-sheet-tab="${id}"]`);
+    const onScreen = el => Boolean(el) && el.getClientRects().length > 0;
+    check("a saved task opens on Task and draws exactly one pane",
+      [...editor().querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,organize,agent,ai"
+      && paneTab("task").getAttribute("aria-selected") === "true"
+      && [...editor().querySelectorAll(".pane")].filter(onScreen).length === 1);
+    // The assist and the run panel used to sit one above the other below every
+    // field, which is why reaching either meant scrolling past the whole task.
+    check("the assist and the agent panel are panes, not a stack below the fields",
+      !onScreen(editor().querySelector('[aria-label="Manvi task assist"]')) && !onScreen(editor().querySelector('[aria-label="Task agent runs"]')));
+    paneTab("task").focus();
+    paneTab("task").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    await settle();
+    check("arrow keys move the sheet's tab strip and the focus with it",
+      paneTab("organize").getAttribute("aria-selected") === "true" && document.activeElement === paneTab("organize") && onScreen(field("Owner")));
+    paneTab("ai").click(); await settle();
+    check("optional Manvi history is folded when its pane opens", onScreen(editor().querySelector(".manvi-assist")) && editor().querySelector(".history-drawer")?.open !== true);
     check("merged Manvi section has no model input", Boolean(editor().querySelector(".manvi-assist .change-link")) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
-    const stacked = (a, b) => a && b && a.getBoundingClientRect().bottom <= b.getBoundingClientRect().top + 2;
-    check("saved-task sheet stacks assist above runs", stacked(editor().querySelector('[aria-label="Manvi task assist"]'), editor().querySelector('[aria-label="Task agent runs"]')));
+    paneTab("agent").click(); await settle();
+    check("the agent pane offers the same handoff form the board sheet uses", onScreen(editor().querySelector('[data-testid="task-handoff-form"]')));
+    paneTab("task").click(); await settle();
     editor().querySelector(".sheet-body").scrollTop = 900; await settle();
     const saveRect = button("Save task").getBoundingClientRect();
     check("save remains visible while the sheet scrolls", saveRect.top >= 0 && saveRect.bottom < innerHeight);
@@ -419,9 +474,11 @@ if (params.has("check")) {
     } else {
       check("inline Manvi acceptance retries once", tasks.find(task=>task.id==="task-2").title==="A focused task brief" && enhancementWrites.filter(w=>w.method==="enhancements.accept").length>=1);
     }
-    if(button("Schedule and labels")?.getAttribute("aria-checked") !== "true") await click("Schedule and labels");
+    editor().querySelector('[data-sheet-tab="organize"]').click(); await settle();
     await change(field("Due"),"2026-09-01T09:30"); await click("Save task"); await settle(100);
     check("due dates round-trip through the task editor", field("Due").value==="2026-09-01T09:30");
+    check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="organize"]').getAttribute("aria-selected")==="true");
+    editor().querySelector('[data-sheet-tab="task"]').click(); await settle();
     await change(field("Description"),"Unsaved context");
     check("unsaved edits stay local until Manvi prepare saves", editor().querySelector("header small").textContent==="Unsaved" && Boolean(enhanceButton()) && !enhanceButton().matches(":disabled"));
     confirmAnswer=true; await click("Close task details");
@@ -434,6 +491,7 @@ if (params.has("check")) {
     await wait(()=>[...proposals.values()].some(p=>p.source.title==="Fix notification routing" && p.state==="running"));
     const quickProposal=[...proposals.values()].find(p=>p.source.title==="Fix notification routing");
     check("inline drafting refuses duplicate generations while a worker is running", enhanceButton().matches(":disabled"));
+    const stacked = (a, b) => a && b && a.getBoundingClientRect().bottom <= b.getBoundingClientRect().top + 2;
     const assistBox = editor().querySelector('[aria-label="Manvi task assist"]');
     const typeLabel = [...editor().querySelectorAll("label")].find(label => label.firstChild?.textContent.trim() === "Type");
     check("Manvi assist sits above task type controls", stacked(assistBox, typeLabel));
@@ -478,6 +536,180 @@ if (params.has("check")) {
     editor().querySelector(".notes-label textarea").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",ctrlKey:true,bubbles:true})); await settle();
     check("empty field selection cannot widen through the keyboard shortcut", button("Draft with Manvi").matches(":disabled") && enhancementWrites.length===emptySelectionWrites);
     blankConfiguration=false; await click("Close task details");
+
+    // ---- One-line entry -------------------------------------------------
+    // Adding a task used to mean opening a sheet with twenty controls. This
+    // is the LiquiTask shape: one line, parsed as you type, Enter commits.
+    const quickAdd = () => root.querySelector('[data-testid="task-quick-add"] input');
+    const quickPreview = () => root.querySelector('[data-testid="task-quick-add-preview"]');
+    const chips = () => [...(quickPreview()?.querySelectorAll(".chip") ?? [])].map(el => el.textContent.trim());
+    const enter = (el, extra = {}) => { el.dispatchEvent(new KeyboardEvent("keydown", {key:"Enter", bubbles:true, cancelable:true, ...extra})); };
+    quickAdd().focus();
+    await change(quickAdd(), "Ship the release notes !high #docs #release @ada ~feature :: with the changelog");
+    check("quick add parses markers into fields while typing",
+      chips().includes("High") && chips().includes("feature") && chips().includes("ada")
+      && chips().includes("docs") && chips().includes("release") && chips().includes("notes")
+      && chips().includes("Ship the release notes"));
+    check("quick add keeps markers out of the title", !chips()[0].includes("!high") && !chips()[0].includes("#docs"));
+    const beforeQuick = tasks.length;
+    enter(quickAdd()); await settle(250);
+    const added = tasks.find(task => task.title === "Ship the release notes");
+    check("quick add creates the task the preview promised",
+      tasks.length === beforeQuick + 1 && Boolean(added) && added.priority === 1 && added.kind === "feature"
+      && added.owner === "ada" && [...added.labels].sort().join(",") === "docs,release"
+      && added.description === "with the changelog" && quickAdd().value === "");
+    await change(quickAdd(), "#orphan @nobody !urgent");
+    check("markers with no title refuse to become a task",
+      quickPreview().textContent.includes("Markers alone do not make a task")
+      && button("Add", root.querySelector('[data-testid="task-quick-add"]')).disabled);
+    enter(quickAdd()); await settle(150);
+    check("a refused quick add writes nothing", tasks.length === beforeQuick + 1);
+    await change(quickAdd(), "Investigate the flake !2 #ci");
+    enter(quickAdd(), {shiftKey:true}); await wait(editor);
+    check("shift-enter hands the parsed line to the editor instead of saving",
+      field("Title").value === "Investigate the flake" && tasks.length === beforeQuick + 1
+      && !editor().querySelector(".sheet-tabs"));
+    check("an expanded quick add shows the fields it already filled in",
+      button("Schedule and labels").getAttribute("aria-checked") === "true");
+    confirmAnswer = true; await click("Close task details"); await settle();
+    root.querySelector('[data-task-column="inbox"]')?.focus();
+    document.dispatchEvent(new KeyboardEvent("keydown", {key:"a", bubbles:true}));
+    await settle();
+    check("the a shortcut puts the cursor in quick add", document.activeElement === quickAdd());
+    await change(quickAdd(), "");
+
+    // ---- Board customization, and what it costs --------------------------
+    const viewToggle = () => root.querySelector("[data-task-view-toggle]");
+    const viewMenu = () => root.querySelector('[data-testid="task-view-menu"]');
+    const columnToggle = status => viewMenu().querySelector(`[data-task-column-toggle="${status}"]`);
+    const hiddenNote = () => root.querySelector('[data-testid="task-hidden-columns"]');
+    const columnEl = status => root.querySelector(`[data-task-column="${status}"]`);
+    viewToggle().click(); await settle();
+    check("the view menu offers every column and card field",
+      [...viewMenu().querySelectorAll("[data-task-column-toggle]")].length === 6
+      && [...viewMenu().querySelectorAll("[data-task-field-toggle]")].length === 5);
+    const backlogCount = root.querySelectorAll('[data-task-column="backlog"] [data-task-card]').length;
+    columnToggle("backlog").click(); await settle();
+    check("hiding a column removes it from the board",
+      !columnEl("backlog") && columnToggle("backlog").getAttribute("aria-checked") === "false");
+    // The count is asserted exactly, not as "contains a digit": the banner
+    // exists to say how much work is out of sight, and a wrong number there is
+    // the failure it was written to prevent. `backlogCount > 0` is asserted
+    // rather than used to skip, so a fixture that stopped seeding Backlog turns
+    // this red instead of quietly passing on the empty branch.
+    const hiddenCount = Number(hiddenNote()?.textContent.match(/\d+/)?.[0]);
+    check("a hidden column reports the work it is hiding, with an exact count",
+      Boolean(hiddenNote()) && hiddenNote().textContent.includes("hidden from this board")
+      && backlogCount > 0 && hiddenCount === backlogCount);
+    for (const status of ["inbox","ready","in_progress","review","done"]) { columnToggle(status).click(); await settle(); }
+    // `>= 1` passed whether the toggle refused or reset every column back on,
+    // which is why the reset survived: exactly one column may still stand, and
+    // the control that would remove it has to be visibly closed, not merely inert.
+    check("the board refuses to hide its last column, and closes that control",
+      [...viewMenu().querySelectorAll('[data-task-column-toggle][aria-checked="true"]')].length === 1
+      && columnToggle("done").disabled === true
+      && columnToggle("done").getAttribute("aria-checked") === "true"
+      && Boolean(columnToggle("done").title)
+      && root.querySelectorAll("[data-task-column]").length >= 1);
+    check("every other column is still free to come back",
+      ["inbox","backlog","ready","in_progress","review"].every(status => columnToggle(status).disabled === false));
+    viewMenu().querySelector('[data-task-field-toggle="repo"]').click(); await settle();
+    check("card fields are a choice the card obeys",
+      viewMenu().querySelector('[data-task-field-toggle="repo"]').getAttribute("aria-checked") === "false");
+    button("Reset board view", viewMenu()).click(); await settle();
+    check("reset restores every column and field",
+      root.querySelectorAll("[data-task-column]").length === 6 && !hiddenNote()
+      && [...viewMenu().querySelectorAll('[data-task-field-toggle][aria-checked="true"]')].length === 5);
+    viewToggle().click(); await settle();
+    check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
+
+    // ---- The fuller right-click menu ------------------------------------
+    await openMenu("task-11");
+    const labels = () => [...menu().querySelectorAll("button")].map(el => el.textContent.trim());
+    const wanted = ["Move to…","Set priority…","Due…","Owner…","Labels…","Send to agent…","Copy…"];
+    const missingRows = wanted.filter(name => !labels().some(text => text.includes(name)));
+    check(`the menu offers schedule, owner, labels and an agent handoff${missingRows.length ? ` (missing ${missingRows.join(", ")} of ${labels().join(" / ")})` : ""}`, missingRows.length === 0);
+    button("Set priority…", menu()).click(); await settle();
+    const currentPriority = [...menu().querySelectorAll('[role="menuitemcheckbox"]')].find(el => el.getAttribute("aria-checked") === "true");
+    check("a value submenu lists every choice and marks the current one",
+      [...menu().querySelectorAll('[role="menuitemcheckbox"]')].length === 4
+      && Boolean(currentPriority) && currentPriority.textContent.includes("Urgent") && currentPriority.disabled);
+    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+    await openMenu("task-11"); button("Due…", menu()).click(); await settle();
+    button("Tomorrow", menu()).click(); await settle(200);
+    check("the menu can schedule a task without opening it", Number.isFinite(tasks.find(task=>task.id==="task-11").due_at));
+    await openMenu("task-11"); button("Labels…", menu()).click(); await settle();
+    const firstLabel = [...menu().querySelectorAll('[role="menuitemcheckbox"]')][0];
+    const labelText = firstLabel?.textContent.trim();
+    firstLabel?.click(); await settle(200);
+    check("the menu toggles a label in place", tasks.find(task=>task.id==="task-11").labels.includes(labelText));
+
+    // ---- Handing a card to an agent --------------------------------------
+    await openMenu("task-11"); button("Send to agent…", menu()).click(); await settle();
+    const target = [...menu().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Codex"));
+    target.click(); await settle(250);
+    const sheet = () => document.querySelector('[data-testid="task-handoff"]');
+    check("the agent handoff opens from a card in two clicks, and launches nothing on its own",
+      Boolean(sheet()) && preparedRuns.length === 0);
+    check("the handoff sheet shows what it would run before it runs it",
+      sheet().textContent.includes("Saved revision") && Boolean(sheet().querySelector('[data-testid="task-handoff-form"]')));
+    check("the handoff names the one thing left to do rather than a dead button",
+      button("Launch in Codex", sheet()).disabled === (sheet().querySelector(".gate").textContent.trim() !== "⌘↩ to launch"));
+    sheet().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+    check("Escape closes the handoff without preparing a run", !sheet() && preparedRuns.length === 0);
+
+
+    // ---- Which model writes the text ------------------------------------
+    const enginePicks = () => root.querySelector('[data-testid="task-assist-engine"]');
+    const appleButton = () => [...(enginePicks()?.querySelectorAll("button") ?? [])].find(el => el.textContent.includes("Apple Intelligence"));
+    await click("New task");
+    await change(editor().querySelector(".notes-label textarea"), "notifications go to the wrong task after a rename");
+    check("a Mac with the on-device model offers it beside Manvi",
+      Boolean(enginePicks()) && Boolean(appleButton()) && !appleButton().disabled
+      && appleButton().textContent.includes("On this Mac"));
+    appleButton().click(); await settle();
+    check("choosing the on-device engine renames the action and says where it runs",
+      /Apple Intelligence/.test(enhanceButton().textContent) && editor().textContent.includes("Nothing leaves this Mac"));
+    const writesBefore = enhancementWrites.length;
+    enhanceButton().click(); await wait(() => button("Use both"));
+    const appleWrites = enhancementWrites.slice(writesBefore);
+    check("the on-device draft is one proposal in the same store, generated here",
+      appleWrites[0].method === "enhancements.create" && appleWrites[0].provider === "apple-intelligence"
+      && appleWrites.some(write => write.method === "enhancements.complete")
+      && !appleWrites.some(write => write.method === "enhancements.generate"));
+    // `prepareTask` saves the draft first, which promotes raw notes into the
+    // title and description — so by now the text is in those fields, not in
+    // `notes`, and the ask is an "improve" rather than a "draft".
+    check("the task text reaches the on-device model, named, and nothing else does",
+      appleDrafts.length === 1
+      && [appleDrafts[0].notes, appleDrafts[0].title, appleDrafts[0].description].join(" ").includes("wrong task after a rename")
+      && appleDrafts[0].context.includes(`Repository: ${repos[0].name}`)
+      && !("model" in appleDrafts[0]) && !("base_url" in appleDrafts[0]));
+    check("an on-device suggestion is reviewed exactly like a Manvi one",
+      Boolean(button("Use this title")) && Boolean(button("Use this description")) && Boolean(button("Not now")));
+    await click("Use both"); await settle(150);
+    const drafted = [...proposals.values()].at(-1);
+    check("accepting an on-device suggestion goes through the same acceptance",
+      drafted.state === "accepted" && field("Title").value === "Route notifications to the right task");
+    confirmAnswer = true; await click("Close task details"); await settle();
+
+    // A Mac that could run it but has it switched off must say so and refuse,
+    // not present a button that fails when pressed.
+    appleStatus = { compiled: true, state: "unavailable", reason: "apple_intelligence_not_enabled", detail: "Turn on Apple Intelligence in System Settings to use it here." };
+    await click("New task"); await settle();
+    check("an engine that is switched off is offered but not selectable",
+      Boolean(appleButton()) && appleButton().disabled && appleButton().textContent.includes("Turned off"));
+    check("a Mac with it switched off still drafts with Manvi",
+      /Manvi/.test(enhanceButton().textContent));
+    confirmAnswer = true; await click("Close task details"); await settle();
+
+    // A build with no bridge hides the choice entirely: a permanently disabled
+    // option is a worse answer than no option.
+    appleStatus = { compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "This build has no Apple Intelligence support." };
+    await click("New task"); await settle();
+    check("a build with no bridge offers no engine picker at all", !enginePicks());
+    confirmAnswer = true; await click("Close task details"); await settle();
+
     check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }
   document.getElementById("verdict").textContent = JSON.stringify({results}, null, 2);

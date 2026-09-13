@@ -1,7 +1,6 @@
-import { PRIORITY_LABELS } from "./boardDrag";
 import type { EnhancementField, Task, TaskCard, TaskStatus } from "./client";
+export type { BoardLayout } from "../ui/taskView";
 
-export type BoardLayout = "board" | "list";
 export type DueFilter = "all" | "overdue" | "soon" | "none";
 export type DueState = "none" | "overdue" | "soon" | "later";
 
@@ -187,17 +186,6 @@ export function parseDueInput(value: unknown): number | null {
   return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : null;
 }
 
-export function canStartEnhanceFromDraft(draft: {
-  title?: unknown;
-  repository_ids?: unknown;
-}): string | null {
-  const title = typeof draft.title === "string" ? draft.title.trim() : "";
-  if (!title) return "Add a title before Quick Enhance.";
-  const repos = Array.isArray(draft.repository_ids) ? draft.repository_ids.filter((id) => typeof id === "string" && id.length > 0) : [];
-  if (!repos.length) return "Link a repository before Quick Enhance.";
-  return null;
-}
-
 export function enhanceableFields(task: Pick<Task, "locked_fields">): EnhancementField[] {
   const locked = new Set(task.locked_fields ?? []);
   return (["title", "description"] as const).filter((field) => !locked.has(field));
@@ -218,10 +206,19 @@ export function canQuickEnhance(
   return { ok: true, fields };
 }
 
-export function priorityName(priority: number): string {
-  return PRIORITY_LABELS[priority as 0 | 1 | 2 | 3] ?? "Unknown";
-}
-
-export function layoutLabel(layout: BoardLayout): string {
-  return layout === "list" ? "List" : "Board";
+/**
+ * Re-space a fully loaded column when its integer positions leave no gap.
+ *
+ * Moved here from the former `taskOrganization` module, which duplicated this
+ * file's filtering and date helpers under a near-identical name. This is the
+ * one function that had a caller.
+ */
+export function reorderPlan(
+  items: readonly TaskCard[],
+  dragged: TaskCard,
+  index: number,
+): { cards: TaskCard[]; positions: Record<string, number> } {
+  const cards = items.filter((card) => card.id !== dragged.id);
+  cards.splice(Math.max(0, Math.min(cards.length, index)), 0, dragged);
+  return { cards, positions: Object.fromEntries(cards.map((card, i) => [card.id, (i + 1) * 1_048_576])) };
 }

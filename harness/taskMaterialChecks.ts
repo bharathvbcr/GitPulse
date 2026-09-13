@@ -76,15 +76,27 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     }
 
     click("[data-task-card]");
-    await wait(() => !!document.querySelector(".task-runs") && !document.querySelector(".task-runs [role=alert]"));
+    await wait(() => !!document.querySelector(".task-editor"));
     material(`${mode} task details`, ".task-editor,.task-editor .gp-field:not(.draft),.task-editor select");
     floating(`${mode} task header`, ".task-editor > header");
-    await wait(() => !!document.querySelector(".manvi-assist .change-link"));
+    // A saved task is four panes, and only the open one is drawn. Every probe
+    // below therefore has to open its pane first: `material` measures client
+    // rects, so a hidden pane would report "no surfaces" rather than a colour.
+    check(`${mode}: a saved task offers its four panes`,
+      [...document.querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,organize,agent,ai");
+    check(`${mode}: only the selected pane is drawn`,
+      [...document.querySelectorAll(".task-editor .pane")].filter(pane => pane.getClientRects().length > 0).length === 1);
+    click('[data-sheet-tab="ai"]');
+    await wait(() => (document.querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
     check(`${mode}: merged Manvi section has Change link and no Model input`,
       Boolean(document.querySelector(".manvi-assist .change-link"))
       && ![...document.querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent?.trim() === "Model"));
     material(`${mode} Manvi assist`, ".manvi-assist .gp-field:not(.draft),.manvi-assist textarea");
+    click('[data-sheet-tab="agent"]');
+    await wait(() => (find(".task-runs").getClientRects().length > 0) && !document.querySelector(".task-runs [role=alert]"));
     material(`${mode} agent run controls`, ".task-runs .gp-field,.task-runs select");
+    click('[data-sheet-tab="task"]');
+    await wait(() => (document.querySelector('input[name="task-title"]')?.getClientRects().length ?? 0) > 0);
     const editor = find(".task-editor");
     check(`${mode}: task revision attribute is present`, editor.hasAttribute("data-task-revision"));
     const body = find(".task-editor .sheet-body");

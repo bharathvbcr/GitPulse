@@ -66,12 +66,40 @@ fn main() {
             std::thread::sleep(Duration::from_millis(300));
             for step in 0..4 {
                 let app = handle.clone();
-                let (sent, received) = mpsc::channel();
+                // Carries "keep going": a skip has to stop the remaining steps
+                // rather than let them run against a popover that never opened.
+                let (sent, received) = mpsc::channel::<bool>();
                 handle
                     .run_on_main_thread(move || {
                         if step == 0 {
-                            println!("native test displays: {:?}", app.available_monitors().unwrap());
+                            let monitors = app.available_monitors().unwrap_or_default();
+                            println!("native test displays: {monitors:?}");
                             println!("native test status rect: {:?}", app.tray_by_id("gitpulse-status").map(|tray| tray.rect()));
+                            // The popover positions itself against the monitor
+                            // holding the status item, so with no display there
+                            // is nothing to open or to measure. A sleeping or
+                            // locked screen empties this list on a developer
+                            // machine at night, and the old code turned that
+                            // into `production popover opens: "Status icon
+                            // display is unavailable"` — an environment
+                            // condition wearing a product failure's words.
+                            //
+                            // In CI a missing display means the job is
+                            // misconfigured, and skipping would hide every
+                            // check below it, so there it stays fatal.
+                            if monitors.is_empty() {
+                                assert!(
+                                    std::env::var_os("CI").is_none(),
+                                    "no display is available in CI: the status-material checks cannot run, and must not be reported as passing"
+                                );
+                                println!(
+                                    "SKIPPED native status material: no display is available to this process \
+                                     (screen asleep or locked); the material, bounds, resize and reopen checks did NOT run"
+                                );
+                                sent.send(false).unwrap();
+                                app.exit(0);
+                                return;
+                            }
                             popover::toggle(&app).expect("production popover opens");
                         } else {
                             let window = app
@@ -96,12 +124,15 @@ fn main() {
                                 app.exit(0);
                             }
                         }
-                        sent.send(()).unwrap();
+                        sent.send(true).unwrap();
                     })
                     .expect("schedule main-thread check");
-                received
+                let keep_going = received
                     .recv_timeout(Duration::from_secs(3))
                     .expect("main-thread check completed");
+                if !keep_going {
+                    return;
+                }
                 // Let AppKit process native size/show events before the next read.
                 std::thread::sleep(Duration::from_millis(150));
             }

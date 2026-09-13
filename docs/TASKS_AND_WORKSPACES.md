@@ -33,13 +33,47 @@ from these profile task records.
 
 ## Create and organize
 
+The fastest way in is the **quick add** line above the board. Type a title and
+tag the rest inline; the preview under the field shows what will be created
+before you press Return:
+
+| Marker | Sets | Example |
+| --- | --- | --- |
+| `!` | Priority | `!urgent`, `!high`, `!1` |
+| `#` | Label (repeatable) | `#ci #flake` |
+| `@` | Owner | `@ada` |
+| `~` | Task type | `~bug` |
+| `^` | Repository | `^gitpulse` |
+| `due:` | Due date | `due:friday`, `due:tomorrow`, `due:2026-10-02`, `due:+3d` |
+| `::` | Description | `Fix the retry loop :: it drops the last attempt` |
+
+Markers alone never create a task — a line with no title is refused and says so.
+Shift+Return opens the full editor with everything already parsed, and `a`
+focuses the field from anywhere on the board.
+
+For anything longer:
+
 1. Choose a scope and select **New task**. Enter a title and description, or use
    notes to seed them. Link the repositories the task concerns.
 2. Set its type, status and details: priority, severity, owner, due date, labels,
-   acceptance criteria and optional home workspace. Repository membership and
-   enhancement locks are available in the editor details.
+   acceptance criteria and optional home workspace. A draft keeps these under one
+   **Schedule and labels** disclosure; a saved task gets its own **Organize** pane.
 3. Save, then use **Board** or **List** to organize the same results. Statuses are
    Inbox, Backlog, Ready, In progress, Review and Done.
+
+A saved task's sheet has four panes. **Task** carries what the work is — status,
+priority, type, title, description, acceptance criteria and repository links —
+and is where Manvi's suggestions appear, under the field each one would replace.
+**Organize** holds severity, owner, due date, labels, home workspace and
+notifications. **Agent** hands the saved revision to a coding agent and lists
+that task's runs. **AI** holds the drafting controls and suggestion history. A
+new task has only the first pane and no tab strip.
+
+**View** above the board chooses the layout, how tightly cards pack, which of the
+six columns are on screen and which chips a card carries. The choices are saved
+per profile and **Reset board view** restores all of them. Hiding a column does
+not hide its work silently: a banner names how many tasks are in the columns
+currently off screen, and the board refuses to hide its last column.
 
 Search uses the store's full-text query. **Filters** narrows loaded cards by
 priority, type, owner, label and due date. **Due soon** means from now through the
@@ -49,14 +83,17 @@ an empty filtered page does not establish that the whole profile has no matches.
 
 Click a card to edit it. Command/Ctrl-click toggles selection; Shift-click selects
 a visible range. Right-click a card, or press Shift+F10 on a focused card, for
-Open, Quick Enhance, Duplicate, Copy, Move to, Set priority and Delete. Single-task
-actions disappear for multiple selections. Duplicate opens a draft for review
-and save. Right-click an empty column to create a task with that status.
+Open, Quick Enhance, **Send to agent**, Duplicate, Copy, Move to, Set priority,
+**Due**, **Owner**, **Labels** and Delete. A value submenu lists every choice with
+the current one ticked and disabled, so the menu says what a task is as well as
+what it could become; typing jumps to a row. Single-task actions disappear for
+multiple selections. Duplicate opens a draft for review and save. Right-click an
+empty column to create a task with that status.
 
 Drag cards to change status or position. Bulk status/priority edits can partially
 succeed; the board reports failures. They are not a transaction across all tasks.
 
-## Draft and review with Manvi
+## Draft and review with Manvi or Apple Intelligence
 
 In the editor, **Draft with Manvi** uses notes; **Improve with Manvi** uses the
 task text. GitPulse saves the task first, then asks the configured Manvi provider
@@ -66,6 +103,16 @@ line supplies a missing title and the notes are appended to an existing
 description. Extracted notes are cleared so a later save cannot reapply them over
 accepted wording. Oversized combined descriptions are refused without discarding
 the notes.
+
+On a Mac running Apple Intelligence, an engine picker appears beside the drafting
+controls and **Apple Intelligence** writes the text on the device instead: nothing
+to install, and no text reaches a socket. It is an engine for the same proposal,
+not a different feature — the suggestion is reviewed, accepted, undone and kept in
+history exactly as a Manvi one is, and the history records which engine wrote each
+revision. A build without Apple's Foundation Models framework shows no picker at
+all; a Mac that has Apple Intelligence switched off, still preparing the model, or
+that cannot run it shows the option with that reason and keeps Manvi selected.
+Very long tasks are refused before the model runs, with the limit named.
 
 **Task model settings** lets you choose a provider and model for suggestions in
 this editor and reload Manvi's configuration. This uses Manvi's task provider
@@ -102,6 +149,16 @@ Saved briefs include the task, ordered repository references and home workspace
 with their revisions. Stale or incomplete snapshots are refused. Save edits
 before copying if they should be part of the agent's brief.
 
+**Send to agent** on a card, and the **Agent** pane of a saved task, are the same
+form: agent, connection, working checkout and permission mode. The checkout is
+offered rather than typed — a repository tab GitPulse already has open, or the
+folder beside that repository's git directory, marked as derived. The form
+re-reads the saved task and refuses a revision that changed elsewhere, locks
+every control while a preparation outcome is unknown so a retry replays that
+exact request, and remembers the agent, connection and permission mode for the
+next launch. `Bypass permissions` is the one setting never remembered: it has to
+be chosen again, with its acknowledgement, for every attempt.
+
 Task run controls prepare a saved revision and the selected checkout before
 launch. A terminal handoff opens a dedicated task-bound session in the existing
 [terminal dock](TERMINAL.md). It runs under that CLI's configured permissions;
@@ -123,6 +180,7 @@ fields and dialogs. Card-specific shortcuts require a focused card.
 | --- | --- |
 | `/` | Focus task search |
 | `n` | New task |
+| `a` | Focus quick add |
 | Command/Ctrl+A | Select visible loaded cards |
 | Command/Ctrl+Shift+C | Copy selected tasks for an agent |
 | `o` | Open the single selected task |
@@ -141,7 +199,9 @@ failed and skipped tasks remain selected. An uncertain editor deletion offers
 **Retry delete** to reconcile the same request before further editing.
 
 This guide describes the current source paths in `src/lib/workbench/`,
-`TaskBoard.svelte`, `TaskEditor.svelte`, `TaskManviAssist.svelte` and
+`src/lib/ai/appleIntelligence.ts`, `src-tauri/src/ai/apple.rs`, `TaskBoard.svelte`,
+`TaskEditor.svelte`, `TaskQuickAdd.svelte`, `TaskViewMenu.svelte`,
+`TaskHandoffForm.svelte`, `TaskAgentPanel.svelte`, `TaskManviAssist.svelte` and
 `QuickEnhanceSheet.svelte`. Unit and source contracts cover helpers and wiring;
 they do not prove native clipboard delivery, physical drag behavior, installed
 provider permissions or OS notification delivery. The implementation contract

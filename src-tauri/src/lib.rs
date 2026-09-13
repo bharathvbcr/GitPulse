@@ -249,6 +249,8 @@ pub fn run() {
             cmd_harness_reconnect,
             cmd_policy_check_command,
             cmd_ai_status,
+            cmd_apple_intelligence_status,
+            cmd_apple_intelligence_draft,
             cmd_ai_generate_commit_message,
             cmd_ai_explain_commit,
             cmd_ai_suggest_branch_name,

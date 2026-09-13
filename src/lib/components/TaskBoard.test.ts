@@ -96,11 +96,60 @@ describe("TaskBoard", () => {
 
   it("renders scannable cards and collapses empty columns while exposing empty drop targets", () => {
     expect(source).toContain("cardFace");
-    expect(source).toContain("visibleStatuses");
+    expect(source).toContain("visibleBoardStatuses");
     expect(source).toContain("insertionPosition");
     expect(source).toContain("shouldCommitMove");
     expect(source).not.toContain("PRIORITY_LABELS[card.priority]");
     expect(source).not.toContain("repoNames(");
+  });
+
+  it("reads layout, density, columns and card chips from the persisted preference", () => {
+    // The board renders the preference; it never keeps a second copy that
+    // could drift from what the View menu and the header just wrote.
+    expect(source).toContain("$interfaceStore.taskLayout");
+    expect(source).toContain("$interfaceStore.taskDensity");
+    expect(source).toContain("$interfaceStore.taskHiddenColumns");
+    expect(source).toContain("$interfaceStore.taskCardFields");
+    expect(source).toContain("interfaceStore.setTaskLayout");
+    expect(source).not.toMatch(/let layout = \$state/);
+    expect(source).not.toMatch(/let showArchived = \$state/);
+    expect(source).toContain("TaskViewMenu");
+    expect(source).toContain("is-compact");
+    for (const field of ["repo", "type", "owner", "due", "labels"]) {
+      expect(source, `card chip ${field} is not switchable`).toContain(`cardFields.has("${field}")`);
+    }
+  });
+
+  it("says what a hidden column is keeping off screen, and offers the undo", () => {
+    // Hiding is cosmetic. Hiding the work in a column without saying so would
+    // make a filtered board indistinguishable from an empty one.
+    expect(source).toContain("hiddenColumnReport");
+    expect(source).toContain('data-testid="task-hidden-columns"');
+    expect(source).toContain("showAllTaskColumns");
+  });
+
+  it("adds a task from one line and can hand that line to the full editor", () => {
+    expect(source).toContain("TaskQuickAdd");
+    expect(source).toContain("createFromQuickAdd");
+    expect(source).toContain("quickAddDraft");
+    expect(source).toContain("expandQuickAdd");
+    // The quick-add path saves through the same write the editor uses.
+    expect(source).toContain("putTask(taskWrite(");
+  });
+
+  it("offers an agent handoff from the card menu and the selection bar", () => {
+    expect(source).toContain("TaskHandoffSheet");
+    expect(source).toContain("handoffFromTarget");
+    expect(source).toContain("canHandoff: repositories.length > 0");
+    expect(source).toContain("Send to agent");
+  });
+
+  it("gives the context menu the vocabulary it needs for owner and label rows", () => {
+    expect(source).toContain("vocabulary: { owners: facetOptions.owners, labels: facetOptions.labels }");
+    expect(source).toContain('case "due"');
+    expect(source).toContain('case "owner"');
+    expect(source).toContain('case "label"');
+    expect(source).toContain('case "agent"');
   });
 
   it("adds already-open repositories from a menu and attaches them to the current workspace", () => {

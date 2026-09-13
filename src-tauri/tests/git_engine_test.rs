@@ -238,23 +238,71 @@ fn test_language_stats_skip_oversized_files_without_reading() {
     let path = repo.path().to_str().unwrap();
 
     std::fs::write(repo.path().join("small.rs"), "fn a() {}\n").unwrap();
-    let huge = File::create(repo.path().join("huge.rs")).unwrap();
-    huge.set_len(3 * 1024 * 1024 * 1024).unwrap(); // sparse: 3 GiB on disk usage ~0
-    drop(huge);
+    // Tracked while it is still ten bytes, and grown afterwards. Staging the
+    // 3 GiB form makes git hash 3 GiB, which is ~9 s of CPU on an idle machine
+    // and stretches past `git_cli::DEFAULT_TIMEOUT` (a hard 90 s, no override)
+    // whenever the box is busy — this setup, not the assertion, is what failed
+    // under a concurrent build. The index entry is irrelevant to what is being
+    // tested: the reader stats the *working-tree* file.
+    std::fs::write(repo.path().join("huge.rs"), "fn b() {}\n").unwrap();
     GitWriter::stage_file(path, "small.rs").unwrap();
     GitWriter::stage_file(path, "huge.rs").unwrap();
     GitWriter::commit(path, "feat: sizes", false).unwrap();
+    let huge = File::options()
+        .write(true)
+        .open(repo.path().join("huge.rs"))
+        .unwrap();
+    huge.set_len(3 * 1024 * 1024 * 1024).unwrap(); // sparse: 3 GiB, ~0 on disk
+    drop(huge);
+    // The scenario is only honest if the file really is oversized on disk and
+    // really is still tracked; neither is implied by the lines above, and
+    // `ls-files` is queried with `--cached --others`, so a file that quietly
+    // stopped being tracked would still reach the scan and this test would
+    // still pass while covering a different path.
+    assert_eq!(
+        std::fs::metadata(repo.path().join("huge.rs"))
+            .unwrap()
+            .len(),
+        3 * 1024 * 1024 * 1024,
+        "the working-tree file must actually be multi-gigabyte"
+    );
+    let tracked = Command::new("git")
+        .args(["ls-files", "--cached", "huge.rs"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&tracked.stdout).trim(),
+        "huge.rs",
+        "the oversized file must still be tracked, not merely present"
+    );
 
     let started = std::time::Instant::now();
-    let stats = GitReader::get_repo_language_stats(path)
-        .expect("language stats failed")
-        .stats;
+    let report = GitReader::get_repo_language_stats(path).expect("language stats failed");
     let elapsed = started.elapsed();
 
-    let names: Vec<_> = stats.iter().map(|s| s.language.as_str()).collect();
+    let names: Vec<_> = report.stats.iter().map(|s| s.language.as_str()).collect();
     assert!(!names.is_empty(), "the small file must still be counted");
-    // A sparse 3 GiB file read into memory would take far longer than a
-    // second even on fast hardware; the budget skip makes this instant.
+    // The direct evidence, rather than a wall clock standing in for it: both
+    // files reach the scan, and exactly one of them is read. Measured with the
+    // size budget deliberately raised so the file *is* read, the run takes
+    // ~190 s — reading 3 GiB into a `Vec` costs far more than streaming the
+    // same holes to /dev/null (~0.2 s), so the elapsed-time assertion below
+    // does catch this too. These three are kept because they are deterministic:
+    // they name the behaviour instead of inferring it from how slow a busy
+    // machine happened to be.
+    assert_eq!(
+        report.candidate_files, 2,
+        "both files must reach the scan, or this proves nothing about skipping"
+    );
+    assert_eq!(
+        report.scanned_files, 1,
+        "the oversized file must be stat-skipped, never read"
+    );
+    assert!(
+        report.truncated,
+        "a scan that skipped a candidate must report that it did not count everything"
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "oversized files must be stat-skipped, took {elapsed:?}"

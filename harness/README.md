@@ -293,12 +293,19 @@ banners, click-after-quit and the optional provider/event bus are separate tests
 The fixture isolates its Vite cache and cleans it after cancelled optimizer
 writes drain; its lifecycle regression checks both SIGTERM and failed startup.
 
-Open `/harness/task-runs.html` on the development server and select **Run handoff
-checks** to exercise the task Runs panel, repository opening and terminal dock.
-Its 21 interaction checks cover lost launch/preparation replies, same-attempt
-reconnection, duplicate tab refusal, per-attempt bypass acknowledgment, suspended
+`task-runs` runs with the other browser regressions
+(`node scripts/browser-regressions.mjs --harness task-runs`), and the same page
+still answers **Run handoff checks** when opened by hand on the development
+server. It exercises `TaskAgentPanel`, the shared `TaskHandoffForm`, repository
+opening and the terminal dock. Its 36 interaction checks cover checkout
+resolution from an open tab (deduplicated against the folder derived from the
+git common directory), lost launch/preparation replies, same-attempt
+reconnection, duplicate tab refusal, the form locking itself while a
+preparation outcome is unknown, per-attempt bypass acknowledgment, suspended
 polling, exact request text, decision retry after a lost reply, separate answers
 and denials, stale request controls, and receipt recovery when reopening review.
+Two checks pin the remembered-settings rule deliberately: an ordinary permission
+mode survives its launch, and `bypass` never does.
 This fixture simulates the native process/database transport;
 it does not launch a coding agent. Real PTY/store tests live in
 `src-tauri/src/workbench/terminal_run.rs`. Installed CLI help checks are explicitly
@@ -318,7 +325,7 @@ for commands, ownership contracts, reproduced failures and platform limits.
 Managed Codex is also covered by `/harness/task-runs.html`: the retained checks
 exercise a lost managed launch reply, one-session retry, output loaded on demand,
 multiple question answers, Stop without task acceptance, and failed initialization
-without a provider thread or automatic replacement (30 checks total).
+without a provider thread or automatic replacement.
 The transport is simulated. For the real native/provider path, explicitly run the
 ignored `installed_managed_codex_crosses_native_host_and_store_without_accepting_task`
 Rust test with `GITPULSE_WORKBENCH_TEST_MANVI`,

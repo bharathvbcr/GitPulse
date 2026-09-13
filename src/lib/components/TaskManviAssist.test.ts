@@ -20,15 +20,57 @@ describe("TaskManviAssist", () => {
     expect(source).not.toContain("Task model settings");
   });
 
-  it("surfaces why Cmd+Enter cannot start Manvi instead of returning silently", () => {
+  it("surfaces why Cmd+Enter cannot start a draft instead of returning silently", () => {
     expect(source).toContain("if (askDisabled && !quick)");
-    expect(source).toContain("error = gate ?? fieldReason");
+    // The reason now depends on the engine: Manvi's is about a model server
+    // that has to be running, Apple's about a Mac setting or a size limit.
+    // Reporting Manvi's reason while Apple is selected would send the reader
+    // to the wrong settings pane.
+    expect(source).toContain('error = gate ?? (engine === "apple" ? appleAsk.reason : fieldReason)');
   });
 
-  it("keeps inline accept, compact history, and field locks in one section", () => {
+  it("offers the on-device engine only where the bridge exists, and never silently", () => {
+    // Three separate facts, deliberately not collapsed: a build without the
+    // bridge hides the picker entirely; a Mac that could run it but is not set
+    // up shows the option disabled with the framework's own reason; and a
+    // selected-but-unavailable engine falls back to the engine every build has,
+    // rather than leaving a dead button.
+    expect(source).toContain("const appleOffered = $derived(Boolean(apple?.compiled))");
+    expect(source).toContain(
+      'const engine = $derived<AssistEngine>(requestedEngine === "apple" && appleReady(apple) ? "apple" : DEFAULT_ASSIST_ENGINE)',
+    );
+    // Names come from the engine table, never spelled here: this section and
+    // the sheet around it both write the running engine's name, and a literal
+    // in either is how they came to disagree.
+    expect(source).toContain("const engineName = $derived(assistEngineName(engine))");
+    expect([...source.matchAll(/"Apple Intelligence"|>Apple Intelligence</g)]).toEqual([]);
+    expect(source).toContain("{#if appleOffered}");
+    expect(source).toContain("disabled={disabled || acting || !appleReady(apple)}");
+    expect(source).toContain("{apple?.detail}");
+    // Both engines create the proposal in the same store, so the "one live
+    // attempt" check must not sit inside either branch.
+    expect(source).toMatch(/const page = await bounded\(listEnhancements\(saved\.id\)\)[\s\S]*?runAppleEnhancement/);
+  });
+
+  it("publishes its suggestion instead of drawing its own copy of the fields", () => {
+    /*
+     * The assist used to carry a second Title and Description input and an
+     * "Use this title" button beside them, so a reader comparing a suggestion
+     * to what they wrote was looking at two pairs of fields in one sheet.
+     * It now owns the lifecycle and hands the *result* to the editor, which
+     * draws each suggestion under the field it would replace. The two exported
+     * functions are that seam: without them the editor's buttons do nothing.
+     */
+    expect(source).toContain("export function acceptFields");
+    expect(source).toContain("export function hideSuggestion");
+    expect(source).toContain("onSuggestion?: (state: AssistSuggestion) => void");
+    expect(source).not.toContain("Use this title");
+    expect(source).not.toContain("Use this description");
+    expect(source).not.toMatch(/<label[^>]*>\s*Title/);
+  });
+
+  it("keeps quick enhance, compact history, and field locks in one section", () => {
     expect(source).toContain("startQuickEnhance");
-    expect(source).toContain("Use this title");
-    expect(source).toContain("Use this description");
     expect(source).toContain("history-drawer");
     expect(source).toContain("Keep title");
     expect(source).toContain("Keep description");

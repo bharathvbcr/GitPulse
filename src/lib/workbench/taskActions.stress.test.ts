@@ -9,7 +9,8 @@ import {
   uniqueDeletable,
 } from "./taskDelete";
 import { contextMenuAnchor, duplicateTitle, flattenVisibleIds, rangeSelect, taskMenuItems, toggleSelection } from "./taskMenu";
-import { canStartEnhanceFromDraft, cardMatchesFacet, collectFacetOptions, dueInputValue, dueState, emptyFacet, hiddenTaskDetails, parseDueInput } from "./taskOrganize";
+import { MAX_TASK_LABELS, nextLabels, TaskBatch } from "./taskActions";
+import { cardMatchesFacet, collectFacetOptions, dueInputValue, dueState, emptyFacet, hiddenTaskDetails, parseDueInput } from "./taskOrganize";
 import type { Task, TaskCard, TaskStatus } from "./client";
 
 function card(i: number): TaskCard {
@@ -83,9 +84,49 @@ describe("adversarial stress", () => {
     const cards = Array.from({ length: 200 }, (_, i) => card(i));
     const items = taskMenuItems({ cards, column: "inbox", busy: false });
     expect(items.length).toBeGreaterThan(3);
-    expect(items.length).toBeLessThan(40);
+    expect(items.length).toBeLessThan(60);
     expect(items.filter((item) => item.action.kind === "delete")).toHaveLength(1);
-    expect(items.filter((item) => item.action.kind === "submenu")).toHaveLength(3);
+    // The menu is built from a fixed vocabulary, so its size is a function of
+    // the *available* actions, never of how many cards are selected.
+    const one = taskMenuItems({ cards: [card(0)], column: "inbox", busy: false });
+    const many = taskMenuItems({ cards, column: "inbox", busy: false });
+    expect(many.length).toBeLessThanOrEqual(one.length);
+    expect(new Set(items.map((item) => item.id)).size).toBe(items.length);
+  });
+
+  it("bounds the menu even when the board has loaded thousands of owners and labels", () => {
+    const vocabulary = {
+      owners: Array.from({ length: 5_000 }, (_, i) => `owner-${i}`),
+      labels: Array.from({ length: 5_000 }, (_, i) => `label-${i}`),
+    };
+    const started = performance.now();
+    const items = taskMenuItems({ cards: [card(0)], column: "inbox", vocabulary });
+    expect(performance.now() - started).toBeLessThan(120);
+    expect(items.length).toBeLessThan(80);
+    expect(new Set(items.map((item) => item.id)).size).toBe(items.length);
+  });
+
+  it("refuses a bulk owner, due date or label the wire would reject", () => {
+    const cards = [card(0)];
+    expect(() => new TaskBatch(cards, { kind: "update", changes: { owner: "\u0000evil" } })).toThrow(/owner/i);
+    expect(() => new TaskBatch(cards, { kind: "update", changes: { owner: "x".repeat(301) } })).toThrow(/owner/i);
+    expect(() => new TaskBatch(cards, { kind: "update", changes: { due_at: -1 } })).toThrow(/due/i);
+    expect(() => new TaskBatch(cards, { kind: "update", changes: { due_at: 1.5 } })).toThrow(/due/i);
+    expect(() => new TaskBatch(cards, { kind: "label", label: "  ", add: true })).toThrow(/label/i);
+    expect(() => new TaskBatch(cards, { kind: "label", label: "a\u0007b", add: true })).toThrow(/label/i);
+    // Null is a real value for both: it clears them.
+    expect(() => new TaskBatch(cards, { kind: "update", changes: { owner: null } })).not.toThrow();
+    expect(() => new TaskBatch(cards, { kind: "update", changes: { due_at: null } })).not.toThrow();
+  });
+
+  it("adds and removes one label without disturbing the rest, and bounds the total", () => {
+    expect(nextLabels(["ui", "ux"], "docs", true)).toEqual(["ui", "ux", "docs"]);
+    expect(nextLabels(["ui", "ux"], "ui", false)).toEqual(["ux"]);
+    expect(nextLabels(["ui"], "ui", true)).toEqual(["ui"]);
+    expect(nextLabels([], "ui", false)).toEqual([]);
+    const full = Array.from({ length: MAX_TASK_LABELS }, (_, i) => `l${i}`);
+    expect(nextLabels(full, "one-more", true)).toEqual(full);
+    expect(nextLabels(full, "l0", false)).toHaveLength(MAX_TASK_LABELS - 1);
   });
 
   it("range select and toggle never throw on garbage", () => {
@@ -112,7 +153,6 @@ describe("adversarial stress", () => {
     expect(parseDueInput(Number.POSITIVE_INFINITY)).toBeNull();
     expect(dueInputValue(Number.NaN)).toBe("");
     expect(duplicateTitle("\u0000".repeat(400)).length).toBeLessThanOrEqual(300);
-    expect(canStartEnhanceFromDraft({ title: "A".repeat(10_000), repository_ids: ["r"] })).toBeNull();
   });
 
   it("hidden details survive empty, huge and binary-looking fields", () => {

@@ -85,7 +85,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(212 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(214 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -176,7 +176,8 @@ Manvi suggestions and agent handoff.
 | Feature | Description |
 | --- | --- |
 | **Work View & Task Control Plane** | Unified dashboard (`F10`). Overview keys on the worktree (or a bound DevCouncil task when a store exists); blocked parked operations sort first; agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. Links PRs, workflow runs, policy verdicts and temporary grants. Stack restack plans the whole subtree before the first rewrite. Agent activity recorded to a durable SQLite WAL ledger. |
-| **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts, Kanban drag with neighbor insertion, search, filters over loaded cards, multi-selection, context actions, due dates, notes-to-draft editing, field locks during Manvi enhance, adding currently open tabs as members, and agent copy of a saved revision or an explicitly labelled unsaved draft. |
+| **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts you can customize per profile — density, which columns show, which chips a card carries — with a banner naming the work any hidden column holds. One-line quick add parses `!priority #label @owner ~type ^repo due:friday :: notes` as you type. Kanban drag with neighbor insertion, search, filters over loaded cards, multi-selection, a right-click menu that also sets schedule, owner, labels and hands a card to an agent, a four-pane task sheet, field locks during enhancement, adding currently open tabs as members, and agent copy of a saved revision or an explicitly labelled unsaved draft. |
+| **On-device task drafting** | On a Mac running Apple Intelligence, titles and descriptions can be written by Apple's Foundation Models framework instead of a local model server — nothing to install, and the text never reaches a socket. It is an engine for the existing proposal lifecycle, not a second one: the same store record, the same review, accept and undo. A build without the framework hides the choice rather than offering a disabled one, and a Mac that has it switched off says so in its own words. |
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. Cherry-pick and revert from the commit row. |
 | **Precision Diff Viewer** | File, commit, and range diffs that name what they show, in a true side-by-side or unified layout sharing one row model. Syntax colouring under the intra-line word diff, find-in-diff with regex, block-to-block stepping, both line-number columns behind a pinned gutter, a filterable and resizable file rail, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging from either layout. |
@@ -334,9 +335,9 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
-| `npm run check:ipc` | Verify 212 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 214 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
-| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 57 contracts (1022 fields) |
+| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 58 contracts (1037 fields) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
 | `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |
 | `npm run mcp:doctor` | Assert the `gitpulse-mcp` on PATH is this tree's build, not a stale copy |

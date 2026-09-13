@@ -26,6 +26,19 @@ import {
   type TabWidth,
 } from "../ui/codeDisplay";
 import { isTimestampStyle, type TimestampStyle } from "../ui/timestampStyle";
+import {
+  DEFAULT_TASK_CARD_FIELDS,
+  isBoardLayout,
+  isTaskDensity,
+  sanitizeCardFields,
+  sanitizeHiddenStatuses,
+  toggleHiddenStatus,
+  type BoardLayout,
+  type TaskCardField,
+  type TaskDensity,
+} from "../ui/taskView";
+import type { TaskStatus } from "../workbench/vocabulary";
+import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks";
 
@@ -120,6 +133,39 @@ export interface InterfacePrefs {
   /** Compact rows fit roughly twice as many repositories on screen. */
   fleetCompact: boolean;
   /**
+   * Layout the Tasks board opens in. The header still switches the one on
+   * screen; this is what a fresh window starts with.
+   */
+  taskLayout: BoardLayout;
+  /** Card density on the Tasks board, matching `fleetCompact`'s intent. */
+  taskDensity: TaskDensity;
+  /**
+   * Status columns the Tasks board leaves out, by status key.
+   *
+   * Hiding is cosmetic and never silent: a hidden column still holds its
+   * tasks, still accepts Move from the context menu, and the board reports
+   * how much work is off screen. `sanitizeHiddenStatuses` refuses a stored
+   * value that would hide every column.
+   */
+  taskHiddenColumns: TaskStatus[];
+  /**
+   * Chips a board card carries. Title and the priority pip are not optional —
+   * a card without them cannot be read or triaged at a glance.
+   */
+  taskCardFields: TaskCardField[];
+  /** Whether the scope navigator lists archived workspaces. */
+  taskShowArchivedWorkspaces: boolean;
+  /**
+   * The agent handoff a task launch starts from: provider, connection and
+   * permission mode.
+   *
+   * The checkout path is deliberately *not* here. It is derived per launch
+   * from the repository's own identity and the tabs currently open, so a
+   * remembered path can never point an agent at a directory that has since
+   * moved. `sanitizeHandoff` also refuses to restore `bypass`: see its note.
+   */
+  taskHandoff: HandoffSettings;
+  /**
    * Whether the terminal dock is showing beneath the active view.
    *
    * The terminal was a view until it became clear the shape was wrong: a PTY
@@ -192,6 +238,12 @@ const DEFAULTS: InterfacePrefs = {
   fleetPulseOpen: true,
   fleetHiddenColumns: [],
   fleetCompact: false,
+  taskLayout: "board",
+  taskDensity: "comfortable",
+  taskHiddenColumns: [],
+  taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
+  taskShowArchivedWorkspaces: true,
+  taskHandoff: defaultHandoff(),
   terminalDockOpen: false,
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
@@ -214,6 +266,9 @@ function freshDefaults(): InterfacePrefs {
     ...DEFAULTS,
     hiddenViews: [...DEFAULTS.hiddenViews],
     fleetHiddenColumns: [...DEFAULTS.fleetHiddenColumns],
+    taskHiddenColumns: [...DEFAULTS.taskHiddenColumns],
+    taskCardFields: [...DEFAULTS.taskCardFields],
+    taskHandoff: { ...DEFAULTS.taskHandoff },
     seenCoachMarks: { ...DEFAULTS.seenCoachMarks },
   };
 }
@@ -312,6 +367,17 @@ function readPrefs(): InterfacePrefs {
       fleetPulseOpen: bool(parsed.fleetPulseOpen, DEFAULTS.fleetPulseOpen),
       fleetHiddenColumns: columnKeys(parsed.fleetHiddenColumns, DEFAULTS.fleetHiddenColumns),
       fleetCompact: bool(parsed.fleetCompact, DEFAULTS.fleetCompact),
+      taskLayout: isBoardLayout(parsed.taskLayout) ? parsed.taskLayout : DEFAULTS.taskLayout,
+      taskDensity: isTaskDensity(parsed.taskDensity) ? parsed.taskDensity : DEFAULTS.taskDensity,
+      // Both sanitizers bound and normalize the stored array; neither can
+      // return a board with no columns or a card shape the board cannot draw.
+      taskHiddenColumns: sanitizeHiddenStatuses(parsed.taskHiddenColumns),
+      taskCardFields: sanitizeCardFields(parsed.taskCardFields),
+      taskShowArchivedWorkspaces: bool(
+        parsed.taskShowArchivedWorkspaces,
+        DEFAULTS.taskShowArchivedWorkspaces,
+      ),
+      taskHandoff: sanitizeHandoff(parsed.taskHandoff),
       terminalDockOpen: bool(parsed.terminalDockOpen, DEFAULTS.terminalDockOpen),
       terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
@@ -452,6 +518,42 @@ function createInterfaceStore() {
       })),
     showAllFleetColumns: () => patch({ fleetHiddenColumns: [] }),
     toggleFleetCompact: () => patch((prefs) => ({ fleetCompact: !prefs.fleetCompact })),
+    setTaskLayout: (taskLayout: BoardLayout) => patch({ taskLayout }),
+    setTaskDensity: (taskDensity: TaskDensity) => patch({ taskDensity }),
+    /** Adds or removes one status column; never hides the last visible one. */
+    toggleTaskColumn: (status: TaskStatus) =>
+      patch((prefs) => ({ taskHiddenColumns: toggleHiddenStatus(prefs.taskHiddenColumns, status) })),
+    showAllTaskColumns: () => patch({ taskHiddenColumns: [] }),
+    setTaskCardFields: (fields: readonly TaskCardField[]) =>
+      patch({ taskCardFields: sanitizeCardFields([...fields]) }),
+    toggleTaskCardField: (field: TaskCardField) =>
+      patch((prefs) => ({
+        taskCardFields: sanitizeCardFields(
+          prefs.taskCardFields.includes(field)
+            ? prefs.taskCardFields.filter((entry) => entry !== field)
+            : [...prefs.taskCardFields, field],
+        ),
+      })),
+    setTaskShowArchivedWorkspaces: (show: boolean) => patch({ taskShowArchivedWorkspaces: show }),
+    /**
+     * Remembers the last handoff a reader chose.
+     *
+     * Sanitized on the way in as well as on the way out, so a caller cannot
+     * persist `bypass` or an impossible provider/connection pair even by
+     * passing one directly.
+     */
+    setTaskHandoff: (settings: HandoffSettings) =>
+      patch({ taskHandoff: sanitizeHandoff(reconcileHandoff(settings)) }),
+    /** Restores every Tasks board view preference without touching the rest. */
+    resetTaskView: () =>
+      patch({
+        taskLayout: DEFAULTS.taskLayout,
+        taskDensity: DEFAULTS.taskDensity,
+        taskHiddenColumns: [],
+        taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
+        taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
+        taskHandoff: defaultHandoff(),
+      }),
     setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockOpen: (open: boolean) => patch({ terminalDockOpen: open }),

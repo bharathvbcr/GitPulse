@@ -120,7 +120,10 @@ describe("buildMatcher", () => {
       expect(matcher, pattern).not.toBeNull();
       const started = performance.now();
       matcher?.test(hostile);
-      expect(performance.now() - started, pattern).toBeLessThan(50);
+      // The class being caught is exponential backtracking, which on 40 `a`s
+      // does not finish at all — so a second separates it from a linear match
+      // exactly as decisively as 50 ms did, and survives a loaded machine.
+      expect(performance.now() - started, pattern).toBeLessThan(1_000);
     }
   });
 
@@ -155,7 +158,10 @@ describe("findMatches", () => {
     for (const pattern of ["a*", "\\b", "(?:)", "^", "$", "x?"]) {
       const started = Date.now();
       const result = findMatches(["hello world", "second line"], pattern, { regex: true });
-      expect(Date.now() - started, pattern).toBeLessThan(200);
+      // Guards a non-advancing `exec` loop, which spins forever; any finite
+      // bound catches that, so this one is sized for a busy box rather than
+      // for how long two lines ought to take.
+      expect(Date.now() - started, pattern).toBeLessThan(2_000);
       expect(result.invalid, pattern).toBe(false);
     }
   });
@@ -175,12 +181,22 @@ describe("findMatches", () => {
   });
 
   it("stops scanning further lines once the cap is reached", () => {
-    const many = Array.from({ length: 10_000 }, () => "match");
-    const started = Date.now();
+    // Counted, not timed. Walking all 10,000 lines instead of stopping at the
+    // cap costs a few milliseconds, so no wall-clock bound could ever separate
+    // the two — the old `< 200 ms` here passed whichever the code did. A lazy
+    // source reports exactly how many lines were asked for.
+    let touched = 0;
+    const many = {
+      length: 10_000,
+      at: (_index: number) => {
+        touched += 1;
+        return "match";
+      },
+    };
     const result = findMatches(many, "match", { maxMatches: 10 });
-    expect(Date.now() - started).toBeLessThan(200);
     expect(result.matches).toHaveLength(10);
     expect(result.truncated).toBe(true);
+    expect(touched, "the scan must stop at the cap, not walk every line").toBeLessThanOrEqual(11);
   });
 
   it("reports an unusable regex rather than an empty result", () => {
@@ -219,12 +235,26 @@ describe("findMatches", () => {
     expect(result.matches).toEqual([{ lineIndex: 0, colStart: 0, length: 5 }]);
   });
 
-  it("scans a hundred thousand lines within a frame budget", () => {
+  it("scans a hundred thousand lines quickly, and completely when given the time", () => {
     const lots = Array.from({ length: 100_000 }, (_, i) => `line ${i} of text`);
     const started = Date.now();
-    const result = findMatches(lots, "of text", { maxMatches: 200_000 });
-    expect(Date.now() - started).toBeLessThan(2_000);
+    // The budget is passed rather than defaulted. Relying on the production
+    // default (400 ms, a frame-budget decision for the UI) made this case a
+    // claim about how fast the host is: under `npm run coverage` the scanner is
+    // instrumented too, and the deadline legitimately cut a real run off at
+    // 61,696 of 100,000 lines — the function behaving exactly as designed,
+    // reported as a failure. The sibling deadline case below is the one that
+    // asserts truncation, with `maxMillis` set for the same reason.
+    const result = findMatches(lots, "of text", { maxMatches: 200_000, maxMillis: 60_000 });
+    // Completeness is now independent of the clock, and `truncated` is asserted
+    // with it: a short list that does not admit it is short is the failure this
+    // case exists to catch.
     expect(result.matches).toHaveLength(100_000);
+    expect(result.truncated).toBe(false);
+    // Throughput is still guarded, at a bound a genuine regression would blow
+    // through: the slowest rate ever observed here is the instrumented one
+    // above, ~154k lines/s, which puts this scan near 0.65 s.
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 
   it("returns no matches for an empty input", () => {

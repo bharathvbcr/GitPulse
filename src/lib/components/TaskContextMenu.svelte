@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ArrowLeft, Clipboard, Copy, Hash, Plus, Sparkles, SquareCheck, SquarePen, Trash2 } from "@lucide/svelte";
+  import { ArrowLeft, Bot, Calendar, Check, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { cycleFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { clampMenuPosition } from "../branches/menuPosition";
-  import { menuPageItems, submenuTitle, type TaskMenuIcon, type TaskMenuItem, type TaskMenuSubmenu } from "../workbench/taskMenu";
+  import { menuPageItems, submenuTitle, typeAheadIndex, type TaskMenuIcon, type TaskMenuItem, type TaskMenuSubmenu } from "../workbench/taskMenu";
 
   let {
     items,
@@ -30,6 +30,13 @@
   let page = $state<"root" | TaskMenuSubmenu>("root");
   const shown = $derived(menuPageItems(items, page));
 
+  /**
+   * Type-ahead buffer, cleared after a pause so "re" then "d" is two searches
+   * rather than one for "red". 700ms matches the platform menu convention.
+   */
+  let typed = "";
+  let typedTimer: ReturnType<typeof setTimeout> | undefined;
+
   function fit() {
     if (!menuEl) return;
     // Layout dimensions remain stable while the opening animation scales the menu.
@@ -47,15 +54,31 @@
       if (shouldDismissOverlay(event.target, "[data-task-menu]")) onClose(false);
     };
     const onViewport = () => onClose(false);
+    /**
+     * A page scroll moves the anchor out from under the menu, so the menu
+     * closes. Its *own* scroll does not.
+     *
+     * This listener is on the capture phase, so it sees the menu's internal
+     * scrolling too — and focusing a row below the fold scrolls the menu,
+     * which closed it. End, ArrowDown past the fold and type-ahead all
+     * dismissed the menu instead of moving through it, and the longer the
+     * page (Labels, Owner) the more often it happened.
+     */
+    const onScroll = (event: Event) => {
+      const target = event.target;
+      if (menuEl && target instanceof Node && menuEl.contains(target)) return;
+      onClose(false);
+    };
     window.addEventListener("pointerdown", onPointer, true);
     window.addEventListener("contextmenu", onContext);
     window.addEventListener("resize", onViewport);
-    window.addEventListener("scroll", onViewport, true);
+    window.addEventListener("scroll", onScroll, true);
     return () => {
       window.removeEventListener("pointerdown", onPointer, true);
       window.removeEventListener("contextmenu", onContext);
       window.removeEventListener("resize", onViewport);
-      window.removeEventListener("scroll", onViewport, true);
+      window.removeEventListener("scroll", onScroll, true);
+      if (typedTimer) clearTimeout(typedTimer);
     };
   });
 
@@ -67,14 +90,53 @@
     queueMicrotask(fit);
   });
 
+  /**
+   * Every focusable row, in DOM order.
+   *
+   * Selected by tag rather than by `role`, because value rows are
+   * `menuitemcheckbox` and a `[role="menuitem"]` selector silently skipped
+   * them — End would land on the last *plain* item with four checkable rows
+   * still below it.
+   */
+  function allRows(): HTMLElement[] {
+    return menuEl ? [...menuEl.querySelectorAll<HTMLElement>("button:not([disabled])")] : [];
+  }
+
   $effect(() => {
     if (!menuEl) return;
     shown.length;
-    const timer = window.setTimeout(() => {
-      menuEl?.querySelector<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])')?.focus();
-    }, 0);
+    const timer = window.setTimeout(() => { allRows()[0]?.focus(); }, 0);
     return () => window.clearTimeout(timer);
   });
+
+  /** Rows on this page, including disabled ones, aligned with `shown`. */
+  function rows(): HTMLElement[] {
+    return menuEl ? [...menuEl.querySelectorAll<HTMLElement>("[data-menu-id]")] : [];
+  }
+
+  /**
+   * Focus the next row whose label starts with what has been typed.
+   *
+   * Only single printable characters feed the buffer — a modifier chord is a
+   * shortcut, not a search, and swallowing it here would break Escape, Tab
+   * and the arrow keys handled above.
+   */
+  function typeAhead(key: string) {
+    if (typedTimer) clearTimeout(typedTimer);
+    typed += key.toLowerCase();
+    typedTimer = setTimeout(() => { typed = ""; }, 700);
+    const elements = rows();
+    const current = elements.indexOf(document.activeElement as HTMLElement);
+    // A repeated single letter cycles matches; a longer buffer restarts the
+    // search from the top so "re" finds Ready even while Review has focus.
+    const from = typed.length > 1 ? -1 : current;
+    const index = typeAheadIndex(
+      shown.map((item) => ({ label: item.label, disabled: item.disabled })),
+      typed,
+      from,
+    );
+    if (index >= 0) elements[index]?.focus();
+  }
 
   function onKey(event: KeyboardEvent) {
     event.stopPropagation();
@@ -99,12 +161,11 @@
     else if (event.key === "ArrowUp") { event.preventDefault(); cycleFocus(menuEl, false); }
     else if (event.key === "Home") {
       event.preventDefault();
-      menuEl.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+      allRows()[0]?.focus();
     }
     else if (event.key === "End") {
       event.preventDefault();
-      const buttons = menuEl.querySelectorAll<HTMLElement>('[role="menuitem"]');
-      buttons[buttons.length - 1]?.focus();
+      allRows().at(-1)?.focus();
     }
     else if (event.key === "ArrowRight") {
       const focused = event.target;
@@ -115,6 +176,10 @@
         event.preventDefault();
         page = item.action.submenu;
       }
+    }
+    else if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey && event.key !== " ") {
+      event.preventDefault();
+      typeAhead(event.key);
     }
   }
 
@@ -132,7 +197,7 @@
   bind:this={menuEl}
   use:portal={"body"}
   data-task-menu
-  class="gp-menu gp-pop fixed min-w-56 max-w-[min(18rem,calc(100vw-1rem))] max-h-[min(24rem,calc(100vh-1rem))] overflow-y-auto text-xs text-textPrimary py-1"
+  class="gp-menu gp-pop fixed min-w-56 max-w-[min(18rem,calc(100vw-1rem))] max-h-[min(32rem,calc(100vh-1rem))] overflow-y-auto text-xs text-textPrimary py-1"
   style="left: {left}px; top: {top}px; z-index: {LAYERS.MENU}"
   role="menu"
   aria-label={label}
@@ -140,7 +205,7 @@
   onkeydown={onKey}
 >
   {#if page !== "root"}
-    <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { page = "root"; }}>
+    <button type="button" role="menuitem" class="gp-menu-item" data-menu-back onclick={() => { page = "root"; }}>
       <ArrowLeft size={13} />
       <span class="flex-1 min-w-0 truncate">{submenuTitle(page)}</span>
     </button>
@@ -152,18 +217,23 @@
     {#if item.separatorBefore && page === "root"}<div class="gp-menu-sep" role="separator"></div>{/if}
     <button
       type="button"
-      role="menuitem"
+      role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"}
       data-menu-id={item.id}
       class="gp-menu-item {item.danger ? 'text-rose-400' : ''}"
       aria-disabled={item.disabled}
+      aria-checked={item.checked === undefined ? undefined : item.checked === "mixed" ? "mixed" : item.checked}
       aria-haspopup={item.action.kind === "submenu" ? "menu" : undefined}
       disabled={item.disabled}
       onclick={() => choose(item)}
     >
-      {#if item.icon}{@render menuIcon(item.icon, item.danger)}{/if}
+      {#if item.checked !== undefined}
+        <span class="mark" aria-hidden="true">
+          {#if item.checked === true}<Check size={12} />{:else if item.checked === "mixed"}<Minus size={12} />{/if}
+        </span>
+      {:else if item.icon}{@render menuIcon(item.icon, item.danger)}{/if}
       <span class="flex-1 min-w-0 truncate">{item.label}</span>
-      {#if item.hint}<span class="text-[10px] text-textMuted">{item.hint}</span>{/if}
-      {#if item.action.kind === "submenu"}<span class="text-textMuted" aria-hidden="true">›</span>{/if}
+      {#if item.hint}<span class="text-[10px] text-textMuted shrink-0">{item.hint}</span>{/if}
+      {#if item.action.kind === "submenu"}<span class="text-textMuted shrink-0" aria-hidden="true">›</span>{/if}
     </button>
   {/each}
 </div>
@@ -175,6 +245,10 @@
   {:else if name === "copy"}<Copy size={13} />
   {:else if name === "id"}<Hash size={13} />
   {:else if name === "brief"}<Clipboard size={13} />
+  {:else if name === "agent"}<Bot size={13} class="text-accent" />
+  {:else if name === "due"}<Calendar size={13} />
+  {:else if name === "owner"}<User size={13} />
+  {:else if name === "label"}<Tag size={13} />
   {:else if name === "move"}<span class="w-[13px] text-center" aria-hidden="true">→</span>
   {:else if name === "priority"}<span class="w-[13px] text-center" aria-hidden="true">!</span>
   {:else if name === "select"}<SquareCheck size={13} />
@@ -182,3 +256,10 @@
   {:else if name === "delete"}<Trash2 size={13} class={danger ? "text-rose-400" : ""} />
   {/if}
 {/snippet}
+
+<style>
+  /* Reserve the checkmark column so labels stay aligned whether or not the
+     row is currently marked — a value list that shifts sideways as the mark
+     moves is unreadable at a glance. */
+  .mark{width:13px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+</style>

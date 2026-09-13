@@ -654,3 +654,216 @@ it("reloads terminal preferences and rejects corrupt stored values", async () =>
     vi.resetModules();
   }
 });
+
+describe("tasks board view preferences", () => {
+  beforeEach(() => {
+    interfaceStore.reset();
+  });
+
+  it("opens on the board with every column and chip until told otherwise", () => {
+    const prefs = get(interfaceStore);
+    expect(prefs.taskLayout).toBe("board");
+    expect(prefs.taskDensity).toBe("comfortable");
+    expect(prefs.taskHiddenColumns).toEqual([]);
+    expect(prefs.taskCardFields).toEqual(["repo", "type", "owner", "due", "labels"]);
+    expect(prefs.taskShowArchivedWorkspaces).toBe(true);
+  });
+
+  it("remembers layout and density independently", () => {
+    interfaceStore.setTaskLayout("list");
+    interfaceStore.setTaskDensity("compact");
+    expect(get(interfaceStore).taskLayout).toBe("list");
+    expect(get(interfaceStore).taskDensity).toBe("compact");
+    interfaceStore.setTaskLayout("board");
+    expect(get(interfaceStore).taskDensity).toBe("compact");
+  });
+
+  it("hides columns one at a time and brings them all back in one action", () => {
+    interfaceStore.toggleTaskColumn("done");
+    interfaceStore.toggleTaskColumn("inbox");
+    expect(get(interfaceStore).taskHiddenColumns).toEqual(["inbox", "done"]);
+    interfaceStore.toggleTaskColumn("inbox");
+    expect(get(interfaceStore).taskHiddenColumns).toEqual(["done"]);
+    interfaceStore.showAllTaskColumns();
+    expect(get(interfaceStore).taskHiddenColumns).toEqual([]);
+  });
+
+  it("refuses the toggle that would leave the board with no columns", () => {
+    for (const status of ["inbox", "backlog", "ready", "in_progress", "review"] as const) {
+      interfaceStore.toggleTaskColumn(status);
+    }
+    const five = ["inbox", "backlog", "ready", "in_progress", "review"];
+    expect(get(interfaceStore).taskHiddenColumns).toEqual(five);
+    // Refused, and nothing else disturbed. This asserted `[]` before, which is
+    // the storage repair leaking into a click: the reader unchecks one column
+    // and the other five reappear.
+    interfaceStore.toggleTaskColumn("done");
+    expect(get(interfaceStore).taskHiddenColumns).toEqual(five);
+    // The escape hatch is the one the menu offers by name.
+    interfaceStore.showAllTaskColumns();
+    expect(get(interfaceStore).taskHiddenColumns).toEqual([]);
+  });
+
+  it("normalizes card field choices and allows an explicitly empty card", () => {
+    interfaceStore.toggleTaskCardField("labels");
+    expect(get(interfaceStore).taskCardFields).toEqual(["repo", "type", "owner", "due"]);
+    interfaceStore.setTaskCardFields(["labels", "repo", "labels"]);
+    expect(get(interfaceStore).taskCardFields).toEqual(["repo", "labels"]);
+    interfaceStore.setTaskCardFields([]);
+    expect(get(interfaceStore).taskCardFields).toEqual([]);
+    interfaceStore.toggleTaskCardField("owner");
+    expect(get(interfaceStore).taskCardFields).toEqual(["owner"]);
+  });
+
+  it("resets only the board view, leaving unrelated preferences alone", () => {
+    interfaceStore.setTerminalDockOpen(true);
+    interfaceStore.setTaskLayout("list");
+    interfaceStore.setTaskDensity("compact");
+    interfaceStore.toggleTaskColumn("done");
+    interfaceStore.toggleTaskCardField("due");
+    interfaceStore.setTaskShowArchivedWorkspaces(false);
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore)).toMatchObject({
+      taskLayout: "board",
+      taskDensity: "comfortable",
+      taskHiddenColumns: [],
+      taskCardFields: ["repo", "type", "owner", "due", "labels"],
+      taskShowArchivedWorkspaces: true,
+      terminalDockOpen: true,
+    });
+  });
+
+  it("refuses stored board preferences that would empty the board or blank a card", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({
+          taskLayout: "timeline",
+          taskDensity: "cozy",
+          taskHiddenColumns: ["inbox", "backlog", "ready", "in_progress", "review", "done"],
+          taskCardFields: ["estimate", 7, null],
+        }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const reloaded = (await import("../interfaceStore")).interfaceStore;
+      expect(get(reloaded)).toMatchObject({
+        taskLayout: "board",
+        taskDensity: "comfortable",
+        taskHiddenColumns: [],
+        taskCardFields: ["repo", "type", "owner", "due", "labels"],
+      });
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
+  it("round-trips a valid stored board preference through a reload", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({});
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const first = (await import("../interfaceStore")).interfaceStore;
+      first.setTaskLayout("list");
+      first.setTaskDensity("compact");
+      first.toggleTaskColumn("done");
+      first.setTaskCardFields(["owner", "due"]);
+      vi.resetModules();
+      expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({
+        taskLayout: "list",
+        taskDensity: "compact",
+        taskHiddenColumns: ["done"],
+        taskCardFields: ["owner", "due"],
+      });
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+});
+
+describe("remembered agent handoff", () => {
+  beforeEach(() => {
+    interfaceStore.reset();
+  });
+
+  it("starts on a terminal Codex handoff that asks for permissions", () => {
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "codex",
+      kind: "external_terminal",
+      permission: "ask",
+    });
+  });
+
+  it("remembers a valid handoff", () => {
+    interfaceStore.setTaskHandoff({ provider: "codex", kind: "managed", permission: "edit" });
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "codex",
+      kind: "managed",
+      permission: "edit",
+    });
+  });
+
+  it("refuses to remember bypass, even when a caller passes it directly", () => {
+    interfaceStore.setTaskHandoff({ provider: "codex", kind: "managed", permission: "bypass" });
+    expect(get(interfaceStore).taskHandoff.permission).toBe("ask");
+  });
+
+  it("refuses to remember a managed connection the provider does not offer", () => {
+    interfaceStore.setTaskHandoff({ provider: "claude", kind: "managed", permission: "edit" });
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "claude",
+      kind: "external_terminal",
+      permission: "edit",
+    });
+  });
+
+  it("never restores bypass from storage written by another build", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({
+          taskHandoff: { provider: "codex", kind: "managed", permission: "bypass" },
+        }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const reloaded = (await import("../interfaceStore")).interfaceStore;
+      expect(get(reloaded).taskHandoff).toEqual({
+        provider: "codex",
+        kind: "managed",
+        permission: "ask",
+      });
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
+  it("resets with the rest of the board view", () => {
+    interfaceStore.setTaskHandoff({ provider: "claude", kind: "external_terminal", permission: "inspect" });
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "codex",
+      kind: "external_terminal",
+      permission: "ask",
+    });
+  });
+});

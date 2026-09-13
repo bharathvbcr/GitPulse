@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 40 contracts over
- * 57 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 58 contracts over
+ * 146 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -113,6 +113,10 @@ export const CONTRACTS = Object.freeze([
   { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
   { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },
+  // Apple Intelligence crosses IPC as four structs, and the error is one of
+  // them on purpose: the frontend branches on `code`, so a rename there would
+  // silently turn "busy" into an unrecognized failure.
+  { label: "apple-intelligence", rustPath: rust("ai", "apple.rs"), tsPath: ts("ai", "appleIntelligence.ts"), structs: ["AppleIntelligenceStatus", "AppleIntelligenceRequest", "AppleIntelligenceDraft", "AppleIntelligenceError"] },
   { label: "harness", rustPath: rust("harness", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["HarnessStatus"] },
   { label: "policy", rustPath: rust("harness", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["PolicyVerdict"] },
   { label: "ledger", rustPath: rust("ledger", "mod.rs"), tsPath: ts("ledger", "types.ts"), structs: ["LedgerEvent", "LedgerStatus", "LedgerAppended"] },
@@ -365,6 +369,13 @@ function normalizeTsType(type) {
     const unions = unionParts.map((part) => normalizeTsType(part));
     return [...new Set(unions)].sort().join("|");
   }
+  // A string-literal type is a `string` on the wire. Treating it as its own
+  // type made a union of literals drift against a Rust `String`, which is
+  // backwards: `"available" | "unavailable"` is strictly more precise than
+  // `string`, and refusing it would push every author toward the weaker one.
+  // Only whole-literal forms collapse; nothing else about the union changes,
+  // so `string | null` still differs from `string`.
+  if (/^"[^"]*"$/.test(compact) || /^'[^']*'$/.test(compact)) return "string";
   const array = /^(.*)\[\]$/.exec(compact);
   if (array) return `${normalizeTsType(array[1])}[]`;
   const genericArray = /^Array<(.*)>$/.exec(compact);

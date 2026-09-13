@@ -4,7 +4,7 @@
   import { onMount, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { Clipboard, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
+  import { Bot, Clipboard, EyeOff, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { isCaseInsensitiveFs } from "../repos/paths";
@@ -13,19 +13,22 @@
   import { copyText } from "../desktop/clipboard";
   import { LAYERS } from "../ui/layers";
   import { shouldDismissOverlay } from "../ui/dismiss";
-  import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove, visibleStatuses } from "../workbench/boardDrag";
+  import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putWorkspace, registerRepository,
-    STATUSES, STATUS_LABELS, taskDraft, workspaceDraft,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, putWorkspace, registerRepository,
+    STATUSES, STATUS_LABELS, taskDraft, taskWrite, workspaceDraft,
     type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskStatus, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, membershipAfterAttach, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, type BoardLayout, type TaskFacet } from "../workbench/taskOrganize";
+  import { handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
+  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, type TaskFacet } from "../workbench/taskOrganize";
+  import { interfaceStore } from "../stores/interfaceStore";
+  import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
+  import { parseQuickAddDue, quickAddDraft, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
-  import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
-  import { reorderPlan } from "../workbench/taskOrganization";
+  import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction, type TaskChanges } from "../workbench/taskActions";
   import {
     MAX_TASK_TABS,
     TASK_EDITOR_PANE_ID,
@@ -51,6 +54,9 @@
   import TaskContextMenu from "./TaskContextMenu.svelte";
   import QuickEnhanceSheet from "./QuickEnhanceSheet.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import TaskViewMenu from "./TaskViewMenu.svelte";
+  import TaskQuickAdd from "./TaskQuickAdd.svelte";
+  import TaskHandoffSheet from "./TaskHandoffSheet.svelte";
   import Skeleton from "./Skeleton.svelte";
 
   let { repositoryPath = null, active = true }: { repositoryPath?: string | null; active?: boolean } = $props();
@@ -91,10 +97,11 @@
   let selectionAnchor = $state<string | null>(null);
   let menu = $state<{ cards: TaskCard[]; column: TaskStatus | null; x: number; y: number } | null>(null);
   let enhanceId = $state<string | null>(null);
-  let layout = $state<BoardLayout>("board");
   let facet = $state<TaskFacet>(emptyFacet());
-  let showArchived = $state(true);
   let showFilters = $state(false);
+  let quickAdding = $state(false);
+  let quickAddEl = $state<{ focus: () => void }>();
+  let handoff = $state<{ card: TaskCard; settings: HandoffSettings } | null>(null);
   let now = $state(Math.floor(Date.now() / 1000));
   let boardEl: HTMLDivElement | undefined = $state();
   let revision = 0; let disposed = false; let refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,7 +121,26 @@
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
   const filtering = $derived(facetActive(facet) || search.trim().length > 0);
+  // Layout, density, hidden columns and card chips are reader preferences the
+  // profile remembers; the header and the View menu write them back.
+  const layout = $derived($interfaceStore.taskLayout);
+  const compact = $derived($interfaceStore.taskDensity === "compact");
+  const cardFields = $derived(new Set($interfaceStore.taskCardFields));
+  const hiddenColumns = $derived($interfaceStore.taskHiddenColumns);
+  const showArchived = $derived($interfaceStore.taskShowArchivedWorkspaces);
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
+  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, displayColumns[status]?.total ?? 0])) as Partial<Record<TaskStatus, number>>);
+  /**
+   * Work a hidden column is keeping off screen.
+   *
+   * Hiding a column is a layout choice; hiding the *tasks* in it is not one
+   * the board gets to make silently. The banner names the columns and the
+   * count, and offers the one action that undoes it.
+   */
+  const hiddenWork = $derived(initialized && !loading ? hiddenColumnReport(hiddenColumns, columnTotals) : null);
+  const quickAddRepositories = $derived(repositories.map((repo) => ({ id: repo.id, name: repo.name })));
+  /** A scope can hold a new task only once it has a repository to link it to. */
+  const canCreate = $derived(Boolean(initialized && repositories.length && (scope.kind !== "workspace" || workspaceMemberIds?.length)));
   const selectedCards = $derived(cardsById(displayColumns, selected));
   const busy = $derived(moving || opening || deleting || actionDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
@@ -125,7 +151,7 @@
   });
   const shown = $derived.by(() => {
     const counts = Object.fromEntries(STATUSES.map((status) => [status, visibleIn(status).length])) as Partial<Record<TaskStatus, number>>;
-    return visibleStatuses(counts, drag !== null);
+    return visibleBoardStatuses(hiddenColumns, counts, drag !== null);
   });
   const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
@@ -561,6 +587,14 @@
       void createTask();
       return;
     }
+    // Only claim the key when there is somewhere to put the cursor. A profile
+    // with no repositories draws no quick-add field, and swallowing `a` there
+    // would make the board eat a keystroke and do nothing with it.
+    if (e.key === "a" && !e.metaKey && !e.ctrlKey && !e.altKey && quickAddEl) {
+      e.preventDefault();
+      quickAddEl.focus();
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "c" && selected.size > 0) {
       e.preventDefault();
       void copyCardsForAgent(selectedCards);
@@ -595,11 +629,78 @@
     if (busy || card.status === status && card.position === position) return;
     await applyUpdate(new TaskBatch([card], {kind:"update", changes:{status,position}}));
   }
-  async function patchCards(cards: TaskCard[], patch: { status?: TaskStatus; priority?: number }) {
+  async function patchCards(cards: TaskCard[], patch: TaskChanges) {
     if (busy || !cards.length) return;
     if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
     await applyUpdate(new TaskBatch(cards, {kind:"update", changes:patch}));
   }
+  /** Defaults a quick-added task inherits from wherever it was typed. */
+  function quickAddDefaults(status: TaskStatus) {
+    const primary = scope.kind === "repository"
+      ? scope.id
+      : scope.kind === "workspace"
+        ? workspaceMemberIds?.[0] ?? ""
+        : repositories[0]?.id ?? "";
+    const repositoryIds = primary ? [primary] : [];
+    return {
+      status,
+      kind: "feature",
+      repositoryIds,
+      primaryRepositoryId: primary,
+      homeWorkspaceId: scope.kind === "workspace" ? scope.id : null,
+      position: Date.now(),
+    };
+  }
+
+  /**
+   * Save a parsed quick-add line straight to the store.
+   *
+   * Returns whether the field may clear, so a refused or failed write leaves
+   * the typed line exactly where the reader can fix it. Nothing is invented:
+   * `quickAddDraft` refuses when no repository is linked, and the caller shows
+   * the same reason the board's New task button already gives.
+   */
+  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox"): Promise<boolean> {
+    if (busy || quickAdding) return false;
+    const draft = quickAddDraft(parsed, quickAddDefaults(status));
+    if (!draft) {
+      error = repositories.length ? "Link a repository to this scope before adding tasks." : "Add a repository to create tasks.";
+      return false;
+    }
+    quickAdding = true; error = "";
+    try {
+      const saved = await bounded(putTask(taskWrite(newID(), 0, draft)));
+      if (disposed) return true;
+      announce = `Added ${saved.title}`;
+      toastStore.success(`Added ${saved.title}`);
+      await loadBoard();
+      return true;
+    } catch (cause) {
+      if (!disposed) error = explainError(cause);
+      return false;
+    } finally { if (!disposed) quickAdding = false; }
+  }
+
+  /** Hand a typed quick-add line to the full editor rather than saving it. */
+  async function expandQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox") {
+    if (busy) return;
+    const draft = quickAddDraft(parsed, quickAddDefaults(status));
+    if (!draft) { await createTask(status); return; }
+    const draftId = `draft-${newID()}`;
+    if (refuseAtCeiling(draftId)) return;
+    if (!(await confirmDiscard("Start a new task and discard the current unsaved edits?"))) return;
+    workspaceEditor = null; enhanceId = null;
+    taskTabs = openTaskTab(taskTabs, { id: draftId, title: draft.title || "New task", status, draft: true });
+    session = { tabId: draftId, pane: draftId, value: null, status, seed: draft };
+  }
+
+  /** Relative due targets the context menu offers, resolved against now. */
+  function dueFromChoice(choice: "today" | "tomorrow" | "next_week" | "clear"): number | null {
+    if (choice === "clear") return null;
+    const word = choice === "next_week" ? "next week" : choice;
+    return parseQuickAddDue(word);
+  }
+
   async function createTask(status: TaskStatus = "inbox") {
     if (busy) return;
     const draftId = `draft-${newID()}`;
@@ -721,6 +822,25 @@
       case "priority":
         void patchCards(cards, { priority: item.action.priority });
         break;
+      case "due": {
+        const due = dueFromChoice(item.action.choice);
+        if (item.action.choice !== "clear" && due === null) { error = "Could not resolve that due date."; break; }
+        void patchCards(cards, { due_at: due });
+        break;
+      }
+      case "owner":
+        void patchCards(cards, { owner: item.action.owner });
+        break;
+      case "label": {
+        const { label, add } = item.action;
+        if (busy || !cards.length) break;
+        if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; break; }
+        void applyUpdate(new TaskBatch(cards, { kind: "label", label, add }));
+        break;
+      }
+      case "agent":
+        if (cards[0]) handoff = { card: cards[0], settings: handoffFromTarget(item.action.target, $interfaceStore.taskHandoff) };
+        break;
       case "selectColumn":
         if (column) {
           selected = new Set(visibleIn(column).map((card) => card.id));
@@ -757,7 +877,7 @@
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
 <svelte:window onkeydown={onBoardKeydown} />
-<div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} data-testid="task-board">
+<div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
       <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></div>
@@ -767,7 +887,7 @@
       {/each}
       {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
       {#if workspaces.some((group) => group.archived)}
-        <label class="archive-toggle"><input type="checkbox" bind:checked={showArchived} />Show archived</label>
+        <label class="archive-toggle"><input type="checkbox" checked={showArchived} onchange={(e) => interfaceStore.setTaskShowArchivedWorkspaces(e.currentTarget.checked)} />Show archived</label>
       {/if}
       <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title="Add repository" aria-label="Add repository" disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
         {#if addMenu}
@@ -799,8 +919,8 @@
       <div class="actions">
         <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
-          <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => { layout = "board"; }}><LayoutGrid size={12} /> Board</button>
-          <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => { layout = "list"; }}><List size={12} /> List</button>
+          <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
+          <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
         </div>
         {#if initialized}<AutomaticEnhancements {active} compact />{/if}
         {#if initialized}
@@ -811,7 +931,8 @@
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
-        <button type="button" class="gp-btn-primary" onclick={() => createTask()} disabled={!initialized || !repositories.length || (scope.kind === "workspace" && !workspaceMemberIds?.length)} aria-label="New task">New task</button>
+        <TaskViewMenu disabled={!initialized} />
+        <button type="button" class="gp-btn-primary" onclick={() => createTask()} disabled={!canCreate} aria-label="New task">New task</button>
         {#if initialized && !repositories.length}
           {#if emptyAddLabel}
             <button type="button" class="hint-action" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
@@ -852,12 +973,38 @@
         {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
       </div>
     {/if}
+    {#if initialized && canCreate}
+      <div class="quick-add-row">
+        <TaskQuickAdd
+          bind:this={quickAddEl}
+          repositories={quickAddRepositories}
+          busy={quickAdding}
+          disabled={busy}
+          compact={compact}
+          placeholder="Add a task — try: Fix retry loop !1 #ci @ada due:friday"
+          onSubmit={(parsed) => createFromQuickAdd(parsed)}
+          onExpand={(parsed) => void expandQuickAdd(parsed)}
+        />
+      </div>
+    {/if}
+    {#if hiddenWork}
+      <!-- Hiding a column is a layout choice. Hiding the work in it is not one
+           this board makes on the reader's behalf, so the cost is named. -->
+      <p class="hidden-note" role="status" data-testid="task-hidden-columns">
+        <EyeOff size={11} />
+        {hiddenWork.summary} hidden from this board.
+        <button type="button" class="link" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
+      </p>
+    {/if}
     {#if selected.size > 0}
       <div class="selection gp-glass" role="status" aria-label="Selected task actions">
         <span>{selected.size} selected</span>
         {#if selected.size === 1}
           <button type="button" class="gp-btn" onclick={() => { const id = [...selected][0]; if (id) void openTask(id); }}><SquarePen size={12} /> Open</button>
           <button type="button" class="gp-btn" onclick={() => { const id = [...selected][0]; if (id) void openQuickEnhance(id); }}><Sparkles size={12} /> Quick Enhance</button>
+          {#if repositories.length}
+            <button type="button" class="gp-btn" disabled={busy} onclick={() => { const card = selectedCards[0]; if (card) handoff = { card, settings: $interfaceStore.taskHandoff }; }}><Bot size={12} /> Send to agent</button>
+          {/if}
         {/if}
         <button type="button" class="gp-btn" onclick={() => void copyCardsForAgent(selectedCards)} disabled={busy}><Clipboard size={12} /> Copy for agent</button>
         <button type="button" class="gp-btn-danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
@@ -902,9 +1049,9 @@
             <span class="status">{STATUS_LABELS[card.status]}</span>
             <span class="row-title">{face.title}</span>
             {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
-            {#if face.repo}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
-            {#if chrome.owner}<span class="muted">{chrome.owner}</span>{/if}
-            {#if dueLabel(chrome.due)}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+            {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
+            {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
+            {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
           </button>
         {/each}
       </div>
@@ -923,7 +1070,7 @@
               <span>{STATUS_LABELS[status]}</span>
               <span class="column-meta">
                 <span>{columns[status]?.total ?? "—"}</span>
-                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} disabled={!initialized || !repositories.length || (scope.kind === "workspace" && !workspaceMemberIds?.length)} onclick={() => void createTask(status)}><Plus size={11} /></button>
+                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} disabled={!canCreate} onclick={() => void createTask(status)}><Plus size={11} /></button>
               </span>
             </div>
             <div class="cards">
@@ -960,13 +1107,15 @@
                     <h3>{face.title}</h3>
                     {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
                   </div>
-                  {#if face.repo}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
-                  <div class="card-extra">
-                    {#if chrome.kind}<span class="muted">{chrome.kind}</span>{/if}
-                    {#if chrome.owner}<span class="muted">{chrome.owner}</span>{/if}
-                    {#if dueLabel(chrome.due)}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
-                  </div>
-                  {#if face.labels.length}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
+                  {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
+                  {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
+                    <div class="card-extra">
+                      {#if chrome.kind && cardFields.has("type")}<span class="muted">{chrome.kind}</span>{/if}
+                      {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
+                      {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+                    </div>
+                  {/if}
+                  {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
                 </button>
               {/each}
               {#if insertAtEnd(status)}<div class="insert" aria-hidden="true"></div>{/if}
@@ -985,7 +1134,13 @@
   {/if}
   {#if menu}
     <TaskContextMenu
-      items={taskMenuItems({ cards: menu.cards, column: menu.column, busy })}
+      items={taskMenuItems({
+        cards: menu.cards,
+        column: menu.column,
+        busy,
+        vocabulary: { owners: facetOptions.owners, labels: facetOptions.labels },
+        canHandoff: repositories.length > 0,
+      })}
       x={menu.x}
       y={menu.y}
       label={menu.cards.length ? "Task actions" : "Column actions"}
@@ -1079,6 +1234,16 @@
 </div>
 
 {#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
+{#if handoff}
+  <TaskHandoffSheet
+    card={handoff.card}
+    settings={handoff.settings}
+    {repositories}
+    openTabs={openTabRefs}
+    onClose={() => { handoff = null; }}
+    onLaunched={() => { handoff = null; void loadBoard(); }}
+  />
+{/if}
 
 <style>
   .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
@@ -1160,4 +1325,16 @@
   .error{color:#d15a64}
   .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;font-size:12px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pad{padding:16px}
+  .quick-add-row{padding:8px 14px 0}
+  .hidden-note{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0;padding:6px 14px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .link{border:0;background:transparent;padding:0;font-size:11px;color:rgb(var(--c-accent))}
+  .link:hover{text-decoration:underline}
+  /* Compact trades the card's breathing room for roughly a third more cards
+     on screen. Only padding and gaps change: nothing is dropped, so the same
+     card reads the same way at either density. */
+  .is-compact .card,.is-compact .row{padding:5px 7px;margin-bottom:4px}
+  .is-compact .card-repos,.is-compact .card-extra{margin-top:2px}
+  .is-compact .labels{margin-top:3px}
+  .is-compact .columns{gap:6px;padding:8px}
+  .is-compact .cards{padding:4px}
 </style>

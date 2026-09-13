@@ -32,6 +32,16 @@ function pathDependencies(manifest: string): string[] {
     .flatMap((line) => [...line.matchAll(/\bpath\s*=\s*"([^"]+)"/g)].map((m) => m[1]));
 }
 
+/**
+ * Every case in the two describes that carry this runs the whole-tree vendor
+ * checker — some of them twice, once for JSON and once for prose. Under
+ * `--coverage` the checker modules are instrumented too, which measured ~2x
+ * (11.5 s -> 19.7 s for this file), so vitest's 5 s default fails cases that
+ * assert nothing about speed. The budget is scoped to those blocks rather than
+ * set globally: a slow test elsewhere should still be loud.
+ */
+const CHECKER_BUDGET = { timeout: 30_000 };
+
 describe("GitPulse builds standalone", () => {
   const manifest = readFileSync(CARGO_TOML, "utf8");
 
@@ -89,7 +99,7 @@ describe("GitPulse builds standalone", () => {
   });
 });
 
-describe("the vendored tree matches what was recorded", () => {
+describe("the vendored tree matches what was recorded", CHECKER_BUDGET, () => {
   it("records every crate on disk, and no others", () => {
     const recorded = new Set(JSON.parse(readFileSync(MANIFEST, "utf8")).crates.map((c: { name: string }) => c.name));
     const onDisk = new Set(
@@ -122,7 +132,7 @@ describe("the vendored tree matches what was recorded", () => {
   });
 });
 
-describe("an upstream it cannot see is not an upstream that agrees", () => {
+describe("an upstream it cannot see is not an upstream that agrees", CHECKER_BUDGET, () => {
   /**
    * The invariant the check mode exists for. Comparing against a repository
    * that is not checked out is impossible, and the tempting shape — treat "no

@@ -19,16 +19,6 @@ export function neighborStatus(status: TaskStatus, delta: -1 | 1): TaskStatus | 
   return STATUSES[index];
 }
 
-/** Cross-column status change. Same-column reorder uses `shouldCommitMove`. */
-export function dropTargetStatus(
-  from: TaskStatus,
-  over: TaskStatus | null,
-  options: { moving: boolean },
-): TaskStatus | null {
-  if (options.moving || over == null || over === from) return null;
-  return over;
-}
-
 /**
  * Integer position for `items.put`. `items.list` is `ORDER BY position,id`.
  * When both neighbors exist the result is strictly between them; it is never
@@ -76,16 +66,6 @@ export function shouldCommitMove(
   if (options.moving || over == null) return false;
   if (over !== from) return true;
   return options.insertIndex !== options.fromIndex;
-}
-
-/** Occupied columns while idle; every status (empty drop targets) while dragging. */
-export function visibleStatuses(
-  counts: Partial<Record<TaskStatus, number>>,
-  dragging: boolean,
-): TaskStatus[] {
-  const occupied = STATUSES.filter((status) => (counts[status] ?? 0) > 0);
-  if (dragging || occupied.length === 0) return [...STATUSES];
-  return occupied;
 }
 
 export interface CardFace {

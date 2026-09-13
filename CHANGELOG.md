@@ -11,6 +11,50 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+The tasks page was rebuilt around the work you do most: adding a task, finding
+one, and handing one to an agent. Nothing on the board is hidden without saying
+so, and the agent handoff is one form rather than two that had drifted apart.
+
+### Added
+
+- Quick add: one line creates a task, with `!priority`, `#label`, `@owner`,
+  `due:`, repository and `::` note markers parsed as you type and shown as
+  chips before anything is written. The line is capped and refuses rather than
+  truncating, and the `a` key focuses it.
+- A View menu that persists: hide columns you do not use, choose which fields
+  each card shows, and reset. A board hiding work says how much and where.
+- On-device drafting with Apple Intelligence on macOS 26 and later, as a second
+  engine beside Manvi. Titles and descriptions are written on the Mac and never
+  reach a socket. Where the framework is unavailable, the reason it gives is
+  shown rather than a generic failure, and a build without the bridge says so
+  instead of blaming the hardware.
+- A handoff sheet on the board: launch an agent in two clicks, with the checkout
+  already resolved, without opening the task.
+
+### Changed
+
+- The task editor is four panes — Task, Organize, Assist and Agent — instead of
+  one long scroll, with the title first.
+- The agent handoff is a single shared form used by both the board sheet and the
+  editor, so the two cannot disagree about what will run. Provider, connection
+  and permission are remembered between launches; `bypass` is not, and has to be
+  chosen with its acknowledgement each time.
+- The right-click menu groups status, priority, due date and owner into
+  submenus, and disables what it cannot currently write.
+
+### Fixed
+
+- Turning off the last visible column reset every column back on, silently
+  discarding the other five choices. The toggle now refuses, and the menu marks
+  that one row closed.
+- A prepared agent run was lost if the launch that followed it failed; the
+  attempt is now published as soon as the store accepts it, and can be retried
+  or recovered from the task's Agent tab.
+- The due-date and owner rows of the context menu were offered as enabled while
+  writing nothing.
+- The editor offered to let Manvi draft a task while Apple Intelligence was the
+  selected engine.
+
 ## [1.0.1] - 2026-09-12
 
 Security hardening release. Opening a repository is now an explicit decision,
