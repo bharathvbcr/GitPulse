@@ -67,7 +67,8 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "hygiene",
     label: "Repo hygiene",
-    summary: "Global project roots, cleanup schedules, limits and run history.",
+    summary:
+      "Defaults every repository inherits, and the scheduled cleaner's own roots, limits and history.",
   },
   {
     id: "updates",

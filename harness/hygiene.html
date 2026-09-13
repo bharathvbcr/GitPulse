@@ -17,6 +17,10 @@
   import { mount, unmount } from "svelte";
   import HygienePanel from "../src/lib/components/HygienePanel.svelte";
   import GlobalCleaner from "../src/lib/components/GlobalCleaner.svelte";
+  import HygieneDefaultsPanel from "../src/lib/components/HygieneDefaultsPanel.svelte";
+  // Hygiene settings persist, so a previous run's override would otherwise
+  // decide what this run observes about defaults and inheritance.
+  for (const key of Object.keys(localStorage)) if (key.startsWith("gitpulse:hygiene:")) localStorage.removeItem(key);
   const root=document.querySelector("#app"), results=[], requests=[], crashes=[];
   let refreshes=0, generation=0;
   window.addEventListener("error",e=>crashes.push(e.message));
@@ -97,6 +101,42 @@
     check("failed remeasurement is explicit",root.textContent.includes("measurement unavailable"));
     selectPreview();await settle();const late=take("cmd_hygiene_prepare");await unmount(component);late.resolve(preview());await settle();
     check("late preview is cancelled after unmount",calls.at(-1).cmd==="cmd_hygiene_cancel");
+
+    // Settings scope across repositories: one host-wide default every
+    // repository inherits, one override that reaches only its own repository,
+    // and a shared-cache review that is the host's rather than each repo's.
+    const choose=(select,label)=>{select.selectedIndex=[...select.options].findIndex(o=>o.textContent.includes(label));select.dispatchEvent(new Event("change",{bubbles:true}));};
+    const retentionOf=async()=>{button("Preview cleanup").click();await settle();const request=take("cmd_hygiene_prepare");request.resolve(preview());await settle();return request.args.minAgeDays;};
+    const other={...report,repo_path:"/fixture/other"};
+
+    component=mount(HygienePanel,{target:root,props:{report,onchanged:async()=>{refreshes++;}}});await settle();
+    check("a repository starts on the inherited default",root.querySelector('[aria-label="Retention for this repository"]').selectedIndex===0);
+    check("inheritance is stated, not implied",root.textContent.includes("Inherited from your hygiene default"));
+    choose(root.querySelector('[aria-label="Retention for this repository"]'),"7 days");await settle();
+    check("an override says it is confined to this repository",root.textContent.includes("Only this repository"));
+    check("an override reaches the backend",await retentionOf()===7);
+    root.querySelector('[aria-label="Review shared caches weekly"]').click();await settle();
+    await unmount(component);
+
+    component=mount(HygienePanel,{target:root,props:{report:other,onchanged:async()=>{refreshes++;}}});await settle();
+    check("another repository keeps the default, not the override",await retentionOf()===30);
+    check("the host-wide review reaches a repository that never enabled it",root.querySelector('[aria-label="Review shared caches weekly"]').checked);
+    await unmount(component);
+
+    // Moving the default in Settings must move every inheriting repository.
+    component=mount(HygieneDefaultsPanel,{target:root});await settle();
+    check("the default is settable in one place",!!root.querySelector('[aria-label="Default retention for every repository"]'));
+    check("settings names which setting reaches which repository",root.textContent.includes("Which setting reaches which repository"));
+    choose(root.querySelector('[aria-label="Default retention for every repository"]'),"90 days");await settle();
+    await unmount(component);
+
+    component=mount(HygienePanel,{target:root,props:{report:other,onchanged:async()=>{refreshes++;}}});await settle();
+    check("a moved default moves every inheriting repository",await retentionOf()===90);
+    await unmount(component);
+    component=mount(HygienePanel,{target:root,props:{report,onchanged:async()=>{refreshes++;}}});await settle();
+    check("a moved default leaves an override alone",await retentionOf()===7);
+    await unmount(component);
+
     window.__TAURI_INTERNALS__.invoke=async(cmd,args)=>{
       calls.push({cmd,args});
       if(cmd==="cmd_pick_folder")return "/fixture/code";

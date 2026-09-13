@@ -89,7 +89,7 @@
 
 <section aria-label="Global build cleaner" class="space-y-4 text-xs max-w-5xl">
   <div class="flex flex-wrap justify-between gap-3">
-    <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain projects beneath your chosen roots, including repositories that are closed in GitPulse.</p></div>
+    <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain projects beneath your chosen roots, including repositories that are closed in GitPulse. This policy is the scheduler's own: it keeps its own retention because a sweep runs without this window, and a repository's override in Storage does not change it.</p></div>
     <button class="gp-btn" onclick={refresh}><RefreshCw size={12} />Refresh status</button>
   </div>
   {#if error}<p role="alert" class="rounded border border-rose-400/30 p-3 text-rose-300">{error}</p>{/if}
@@ -104,7 +104,7 @@
     </div>
     <button class="gp-btn" onclick={addRoot} disabled={busy}><FolderPlus size={12} />Add project root</button>
     <div class="flex flex-wrap gap-4">
-      <label>Keep output modified within <select aria-label="Global retention" class="ml-1 rounded border border-border bg-surface p-1" bind:value={draft.retention_days} onchange={edited}><option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
+      <label>Sweeps keep output modified within <select aria-label="Global retention" class="ml-1 rounded border border-border bg-surface p-1" bind:value={draft.retention_days} onchange={edited}><option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
       <label>Per-run byte budget <select aria-label="Cleanup byte budget" class="ml-1 rounded border border-border bg-surface p-1" bind:value={draft.max_run_bytes} onchange={edited}><option value={1073741824}>1 GiB</option><option value={10737418240}>10 GiB</option><option value={53687091200}>50 GiB</option><option value={107374182400}>100 GiB</option></select></label>
       <label>Maximum directories <input aria-label="Maximum cleanup directories" class="ml-1 w-16 rounded border border-border bg-surface p-1" type="number" min="1" max="100" bind:value={draft.max_targets} oninput={edited} /></label>
     </div>

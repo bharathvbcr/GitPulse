@@ -137,6 +137,28 @@ untrusted checkout described as a broken one.
   decision taken under narrower terms should be re-taken rather than
   reinterpreted — so the first approval after upgrading is the one that covers
   the family, granted through a dialog that now names that scope.
+- Repository hygiene settings resolve in two layers: one host-wide default that
+  every repository inherits, and an explicit per-repository override. Scope now
+  decides where a setting lives. Retention had no default before, so every newly
+  opened repository restarted at 30 days and a house rule had to be retyped per
+  repository; and the shared-cache review — which measures caches owned by the
+  host rather than by any repository — was stored per repository too, so opting
+  in from five repositories scheduled five weekly scans of the same caches while
+  opting in from one applied nowhere else. **Settings › Repo hygiene** gains a
+  **Hygiene defaults** panel for the inherited values, and each control names the
+  scope it governs.
+
+  Settings stored by earlier versions are adopted when their repository is next
+  opened rather than in one sweep, because the browser storage holding them
+  cannot be enumerated for them up front; the old record is removed as it is
+  adopted. A stored retention becomes an override only where it departs from the
+  default, so a repository that had simply been left at 30 days stays an
+  inheriting one.
+
+  This layer governs the previewed cleanup in **Insights › Storage**. The
+  scheduled global cleaner keeps its own retention in the backend policy file,
+  because the headless worker that reads it has no browser storage to read — the
+  two remain separate mechanisms.
 
 ### Fixed
 

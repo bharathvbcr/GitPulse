@@ -4,14 +4,15 @@
   import { RefreshCw, ShieldCheck, FolderTree, Clock, X } from "@lucide/svelte";
   import type { StorageReport } from "../storage/types";
   import type { CacheInventory, HygienePlan, HygieneOutcome } from "../storage/hygiene/types";
-  import { DEFAULT_PREFERENCES, ignoreRule, readPreferences, reviewDue, savePreferences, type HygienePreferences } from "../storage/hygiene/preferences";
+  import { DEFAULT_HYGIENE_DEFAULTS, INHERITED_OVERRIDE, RETENTION_CHOICES, ignoreRule, loadHygieneSettings, resolveRetention, reviewDue, saveDefaults, saveOverride, type HygieneDefaults, type RepoHygieneOverride } from "../storage/hygiene/preferences";
   import { humanBytes } from "../storage/format";
   import { copyText } from "../desktop/clipboard";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
 
   let { report, onchanged }: { report: StorageReport; onchanged: () => Promise<void> } = $props();
-  let preferences = $state<HygienePreferences>({ ...DEFAULT_PREFERENCES });
+  let defaults = $state<HygieneDefaults>({ ...DEFAULT_HYGIENE_DEFAULTS });
+  let override = $state<RepoHygieneOverride>({ ...INHERITED_OVERRIDE });
   let inventory = $state<CacheInventory | null>(null);
   let plan = $state<HygienePlan | null>(null);
   let result = $state<HygieneOutcome | null>(null);
@@ -28,10 +29,17 @@
   let repoPath = $derived(report.repo_path);
   let key = $derived(identityKey(repoPath, { caseInsensitive: isCaseInsensitiveFs() }));
   let expired = $derived(plan !== null && clock >= plan.expires_at * 1000);
+  let retention = $derived(resolveRetention(defaults, override));
 
   function storage() { try { return localStorage; } catch { return null; } }
-  function persist() {
-    if (!savePreferences(storage(), key, preferences)) notice = "Preferences could not be saved; these settings apply only to this visit.";
+  const unsaved = "Settings could not be saved; they apply only to this visit.";
+  /** This repository's departure from the host-wide default. */
+  function persistOverride() {
+    if (!saveOverride(storage(), key, override)) notice = unsaved;
+  }
+  /** The host-wide record every repository reads. */
+  function persistDefaults() {
+    if (!saveDefaults(storage(), defaults)) notice = unsaved;
   }
 
   async function scanCaches() {
@@ -43,8 +51,10 @@
       const next = await invoke<CacheInventory>("cmd_cache_inventory");
       if (!alive || mine !== epoch) return;
       inventory = next;
-      preferences = { ...preferences, lastReview: Date.now() };
-      persist();
+      // The caches just measured are the host's, so the stamp is the host's:
+      // one review per week, not one per week per repository.
+      defaults = { ...defaults, lastSharedReview: Date.now() };
+      persistDefaults();
     } catch (e) { if (alive && mine === epoch) { error = String(e); retryAfter = Date.now() + 60 * 60 * 1000; } }
     finally { if (alive && mine === epoch) scanning = false; }
   }
@@ -66,7 +76,7 @@
     result = null;
     try {
       await cancelPreview();
-      const next = await invoke<HygienePlan>("cmd_hygiene_prepare", { repoPath, target, minAgeDays: preferences.retentionDays });
+      const next = await invoke<HygienePlan>("cmd_hygiene_prepare", { repoPath, target, minAgeDays: retention.days });
       if (!alive || mine !== epoch) {
         await invoke<void>("cmd_hygiene_cancel", { repoPath: next.repo_path, planId: next.id });
         return;
@@ -107,12 +117,12 @@
   }
 
   onMount(() => {
-    preferences = readPreferences(storage(), key);
+    ({ defaults, override } = loadHygieneSettings(storage(), key));
     // Only inventory runs on a timer. Every deletion still needs a fresh
     // preview and the user's explicit click, with backend revalidation.
     const tick = () => {
       clock = Date.now();
-      if (document.visibilityState === "visible" && clock >= retryAfter && reviewDue(preferences, clock) && !busy && !executing && !scanning) void scanCaches();
+      if (document.visibilityState === "visible" && clock >= retryAfter && reviewDue(defaults, clock) && !busy && !executing && !scanning) void scanCaches();
     };
     tick();
     const timer = window.setInterval(tick, 30_000);
@@ -134,13 +144,16 @@
     <button class="gp-btn shrink-0" onclick={scanCaches} disabled={scanning || executing || busy}><RefreshCw size={12} class={scanning ? "animate-spin" : ""} />{scanning ? "Inspecting…" : "Inspect shared caches"}</button>
   </div>
 
-  <div class="flex flex-wrap items-center gap-4 text-xs text-textSecondary">
-    <label class="flex items-center gap-2"><Clock size={12} /> Keep output modified within
-      <select class="rounded border border-border bg-surface px-2 py-1" bind:value={preferences.retentionDays} onchange={persist} disabled={busy || executing}>
-        <option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={90}>90 days</option>
+  <div class="space-y-2 rounded-xl border border-border/60 p-3 text-xs text-textSecondary">
+    <label class="flex flex-wrap items-center gap-2"><Clock size={12} /> Previews in this repository keep output modified within
+      <select aria-label="Retention for this repository" class="rounded border border-border bg-surface px-2 py-1" bind:value={override.retentionDays} onchange={persistOverride} disabled={busy || executing}>
+        <option value={null}>Use the default · {defaults.retentionDays} days</option>
+        {#each RETENTION_CHOICES as days (days)}<option value={days}>{days} days</option>{/each}
       </select>
+      <span class="text-textMuted">{retention.source === "default" ? "Inherited from your hygiene default." : `Only this repository. The default stays ${defaults.retentionDays} days.`}</span>
     </label>
-    <label class="flex items-center gap-2"><input type="checkbox" bind:checked={preferences.weeklyReview} onchange={persist} />Review shared caches weekly while this page is open</label>
+    <label class="flex items-center gap-2"><input type="checkbox" aria-label="Review shared caches weekly" bind:checked={defaults.reviewSharedCaches} onchange={persistDefaults} />Review shared caches weekly while a Storage page is open</label>
+    <p class="text-textMuted">Shared caches belong to the host, not to one repository, so this switch and its weekly timer are shared by every repository — reviewing once covers them all. Change the inherited default, roots and scheduled cleanup in Settings → Repo hygiene.</p>
   </div>
   <p class="text-xs text-textMuted">Cleanup checks ignore rules, tracked files, producer markers, modification times and open files. Stop builds first. Recent output, environments and persistent state are preserved.</p>
 

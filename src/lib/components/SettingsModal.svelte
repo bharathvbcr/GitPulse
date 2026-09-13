@@ -69,6 +69,7 @@
   import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
+  import HygieneDefaultsPanel from "./HygieneDefaultsPanel.svelte";
 
   let {
     isOpen = false,
@@ -1146,7 +1147,12 @@
                   </div>
                 </div>
               {:else if entry.id === "hygiene"}
-                <div data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
+                <div class="space-y-3">
+                  <div data-setting="hygiene-defaults" hidden={!shown("hygiene-defaults")}>
+                    {#if isOpen && activeSection === "hygiene"}<HygieneDefaultsPanel />{/if}
+                  </div>
+                  <div class="border-border/70 border-t pt-3" data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
+                </div>
               {:else if entry.id === "updates"}
                 <div class="space-y-3">
                   <div data-setting="update-check" hidden={!shown("update-check")}>

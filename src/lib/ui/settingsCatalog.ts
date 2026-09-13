@@ -57,6 +57,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tray title counts conflicts changed menu bar" },
   { id: "launch-at-login", section: "layout", label: "Launch at login",
     keywords: "autostart launch agent login item startup background" },
+  { id: "hygiene-defaults", section: "hygiene", label: "Hygiene defaults", keywords: "repository hygiene default retention days inherit override per repository shared cache review weekly all repositories scope storage preview" },
   { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {
     id: "theme",
