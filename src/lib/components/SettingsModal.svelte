@@ -41,6 +41,7 @@
   import { openExternal } from "../desktop/openExternal";
   import { formatError } from "../ui/formatError";
   import { askConfirm } from "../stores/modalStore";
+  import { repoStore } from "../stores/repoStore";
   import {
     SETTINGS_SECTIONS,
     type SettingsSectionId,
@@ -61,6 +62,8 @@
   import SettingToggle from "./SettingToggle.svelte";
   import SettingSegment from "./SettingSegment.svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
+  import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
 
   let {
@@ -1030,6 +1033,19 @@
                     Run setup
                   </button>
                   <ExternalToolsPanel />
+                  <div class="border-border/70 mt-3 border-t pt-3">
+                    <DevcouncilSuitePanel
+                      repoPath={$repoStore.currentPath}
+                      active={isOpen && activeSection === "agents"}
+                    />
+                  </div>
+                  <div class="border-border/70 mt-3 border-t pt-3">
+                    <AgentIntegrationPanel
+                      repoPath={isOpen && activeSection === "agents"
+                        ? $repoStore.currentPath
+                        : null}
+                    />
+                  </div>
                 </div>
               {:else if entry.id === "hygiene"}
                 <div data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>

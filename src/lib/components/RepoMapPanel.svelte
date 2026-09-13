@@ -127,6 +127,44 @@
       ? mapFailureMessage(mapFailureMode, errorMsg ?? load?.reason ?? cliStatus?.reason)
       : null,
   );
+  /**
+   * What the automatic index is doing about this absence right now.
+   *
+   * The static messages tell the user to press Build. That was the only
+   * recourse when the live path could not produce a navigator map at all;
+   * now it can, so an empty pane on a repository that is mid-build must say
+   * so rather than ask for a click the app has already made. `null` means
+   * there is nothing in flight and the static message stands.
+   */
+  const indexActivity = $derived.by((): string | null => {
+    if (!currentRepo) return null;
+    const snapshot = $indexSnapshots[currentRepo];
+    if (!snapshot) return null;
+    switch (snapshot.phase) {
+      case "scheduled":
+        return "Indexing this repository — queued.";
+      case "running":
+        // No claim about whether this is the first build: the facts that would
+        // establish that only come back when the attempt finishes. The stage,
+        // when the kernel has reported one, is the only real progress there is.
+        return snapshot.stage
+          ? `Indexing this repository — stage ${snapshot.stage.current} of ${snapshot.stage.total}.`
+          : "Indexing this repository… a large repository takes a few minutes.";
+      case "failed":
+        // The reason is the build's own stderr; it is the only thing that
+        // explains why pressing Build again would not help either.
+        return snapshot.reason
+          ? `The automatic index failed: ${snapshot.reason}`
+          : "The automatic index failed.";
+      case "skipped":
+        // A skip the user needs to know about is one a rebuild cannot fix.
+        return snapshot.decision === "skip_schema_outdated" && snapshot.reason
+          ? snapshot.reason
+          : null;
+      default:
+        return null;
+    }
+  });
   const cliKnownAbsent = $derived(cliStatus != null && !cliStatus.available);
   const selected = $derived.by((): RepoMapSubsystem | null => {
     if (!map) return null;
@@ -553,8 +591,12 @@
       />
     </div>
   {:else if load && !load.available && mapFailureMode !== "other"}
-    <div class="shrink-0 border-b border-border/50 px-3 py-2">
-      <p class="text-[11px] text-amber-600 dark:text-amber-400">{mapFailureText}</p>
+    <div class="shrink-0 border-b border-border/50 px-3 py-2 space-y-1">
+      {#if indexActivity}
+        <p class="text-[11px] text-textMuted" data-testid="map-index-activity">{indexActivity}</p>
+      {:else}
+        <p class="text-[11px] text-amber-600 dark:text-amber-400">{mapFailureText}</p>
+      {/if}
     </div>
   {/if}
 

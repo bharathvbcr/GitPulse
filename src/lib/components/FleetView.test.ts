@@ -98,6 +98,53 @@ describe("scanTargets", () => {
   });
 });
 
+describe("Index all", () => {
+  it("delegates every worded judgement to the tested owner", () => {
+    // Same rule as the sweeps above it: no count sentence may be assembled in
+    // markup, where it cannot be tested and would drift from `indexSweep.ts`.
+    for (const helper of [
+      "runIndexSweep",
+      "summarizeIndexSweep",
+      "isCleanIndexSweep",
+      "firstIndexFailure",
+    ]) {
+      expect(source).toContain(helper);
+    }
+    expect(source).not.toMatch(/Indexed \{/);
+  });
+
+  it("is abortable and reports progress against the real total", () => {
+    expect(source).toContain("indexToken.aborted = true");
+    expect(source).toContain("indexProgress.done}/{indexProgress.total}");
+  });
+
+  it("does not share the sync flag the network operations use", () => {
+    // Fetch and pull reach the network; indexing is local and writes only the
+    // ignored state directory. One flag would make each block the other.
+    expect(source).toContain("let indexing = $state(false)");
+    expect(source).not.toContain('syncing = "index"');
+  });
+
+  it("actually renders the control, disabled, with nothing open", () => {
+    // A rendered assertion rather than a source match: the source tests above
+    // prove the wiring is delegated, but only rendering proves the markup
+    // compiles into a button that is there and is not clickable against an
+    // empty fleet.
+    const { body } = render(FleetView);
+    expect(body).toContain("Index all");
+    const button = body.slice(body.indexOf('data-testid="fleet-index-all"'));
+    expect(button.slice(0, 400)).toContain("disabled");
+  });
+
+  it("offers nothing to index when no repository is open", () => {
+    // `targets` is open-repositories-only, exactly as the scans are: a recents
+    // path may not resolve, and indexing it would spawn a build against a
+    // repository the user has not opened.
+    const button = source.slice(source.indexOf('data-testid="fleet-index-all"'));
+    expect(button).toContain("disabled={targets.length === 0");
+  });
+});
+
 describe("SEVERITY_STRIPE", () => {
   it("gives every severity its own tone", () => {
     const severities: FleetRow["severity"][] = [

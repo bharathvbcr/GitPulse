@@ -35,8 +35,77 @@
         plugin_mcp_json: "{}",
         tools: [{ name: "gitpulse_insights", title: "Repository insights" }],
       };
+      // The DevCouncil panels, with one component deliberately missing and one
+      // that exposes no version: the two states whose wording is the point.
+      // `null` for an unknown command is what the real seam does for anything
+      // unmocked, and the panels have to survive it rather than tear the modal
+      // down — which is why these payloads go through parsers.
+      const suiteReport = {
+        suite: {
+          complete: false,
+          components: [
+            {
+              id: "devmap", label: "DevMap", need: "required",
+              purpose: "Builds and refreshes the code index.",
+              installed: true, path: "/usr/local/bin/devmap",
+              version: { kind: "reported", version: "devmap 0.2.1" },
+              reason: null, presets: ["devmap", "analysis", "all"],
+            },
+            {
+              id: "dcstore", label: "dcstore", need: "host_resolved",
+              purpose: "Manvi opens the profile workbench through it.",
+              installed: true, path: "/usr/local/bin/dcstore",
+              version: { kind: "not_exposed", detail: "this component exposes no version flag" },
+              reason: null, presets: ["analysis", "all"],
+            },
+            {
+              id: "dcgrep", label: "dcgrep", need: "host_resolved",
+              purpose: "Manvi's repository search.",
+              installed: false, path: null,
+              version: { kind: "unavailable", detail: "not found" },
+              reason: "`dcgrep` is not on PATH", presets: ["analysis", "all"],
+            },
+            {
+              id: "devcouncil", label: "DevCouncil host", need: "optional",
+              purpose: "The Go orchestrator; GitPulse never starts it.",
+              installed: false, path: null,
+              version: { kind: "unavailable", detail: "not found" },
+              reason: "`devcouncil` is not on PATH", presets: ["all"],
+            },
+          ],
+          presets: [
+            { id: "devmap", present: 1, total: 1, missing: [] },
+            { id: "analysis", present: 2, total: 3, missing: ["dcgrep"] },
+            { id: "all", present: 2, total: 4, missing: ["dcgrep", "devcouncil"] },
+          ],
+        },
+        doctor: { available: true, binary: "/usr/local/bin/devmap", reason: null },
+        doctor_reason: null,
+        warnings: ["two `devmap` binaries of different builds are on PATH"],
+      };
+      const plan = (host, repoChanges, outsideChanges, extra = {}) => ({
+        available: true, host, repo: "/repo", applied: false, reason: null,
+        entries: [
+          { kind: "guide", path: "/repo/AGENTS.md", disposition: "created", note: null, changed: repoChanges > 0, outside_repo: false },
+          { kind: "global_mcp", path: "/home/u/.claude.json", disposition: "would be written", note: "registered", changed: outsideChanges > 0, outside_repo: true },
+        ],
+        notes: [], repo_changes: repoChanges, outside_changes: outsideChanges,
+        protected: [], ...extra,
+      });
       window.__TAURI_INTERNALS__ = {
-        invoke: async (cmd) => (cmd === "cmd_mcp_info" ? mcpInfo : null),
+        invoke: async (cmd) => {
+          if (cmd === "cmd_mcp_info") return mcpInfo;
+          if (cmd === "cmd_devcouncil_suite_status") return suiteReport;
+          if (cmd === "cmd_devmap_integration_survey") {
+            return [
+              plan("claude", 1, 1),
+              plan("cursor", 0, 0),
+              plan("codex", 2, 0, { protected: ["/repo/AGENTS.md"] }),
+            ];
+          }
+          if (cmd === "cmd_devmap_integration_preview") return plan("claude", 1, 1);
+          return null;
+        },
       };
 
       const { mount } = await import("svelte");

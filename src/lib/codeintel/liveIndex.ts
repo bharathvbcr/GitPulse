@@ -52,6 +52,13 @@ export interface LiveIndexSnapshot {
   revision: number;
   /** True while a refresh child is expected to be running. */
   refreshing: boolean;
+  /**
+   * Stage the running build has reached, from the kernel's own `[n/5]`
+   * progress. `null` whenever no build is running, and also while one is —
+   * until its first stage line arrives, because claiming stage 1 before the
+   * kernel says so would be a progress bar this app invented.
+   */
+  stage: { current: number; total: number } | null;
 }
 
 const EMPTY: LiveIndexSnapshot = {
@@ -61,6 +68,7 @@ const EMPTY: LiveIndexSnapshot = {
   updatedAt: null,
   revision: 0,
   refreshing: false,
+  stage: null,
 };
 
 export interface LiveIndexController {
@@ -68,6 +76,8 @@ export interface LiveIndexController {
   readonly snapshots: ReturnType<typeof writable<Record<string, LiveIndexSnapshot>>>;
   /** Schedule a maybe-refresh after a watcher event for `repoPath`. */
   onRepoChanged(repoPath: string): void;
+  /** Record a build stage reported by the kernel for `repoPath`. */
+  onBuildProgress(repoPath: string, stage: number, total: number): void;
   /** Snapshot for one repo, or idle defaults. */
   get(repoPath: string): LiveIndexSnapshot;
   /** Drop timers and forget state (tests / teardown). */
@@ -113,7 +123,7 @@ export function createLiveIndex(opts?: {
       patch(repoPath, {
         phase: "failed", decision: null,
         reason: error instanceof Error ? error.message : String(error),
-        refreshing: false, updatedAt: Date.now(),
+        refreshing: false, updatedAt: Date.now(), stage: null,
       });
     },
     onOverflow: () => diagnostics.warn("code-index", "Background index queue is full (64 repositories); additional repositories were not refreshed."),
@@ -127,7 +137,7 @@ export function createLiveIndex(opts?: {
   }
 
   async function run(repoPath: string, isCurrent: () => boolean) {
-    patch(repoPath, { phase: "running", refreshing: true, reason: null });
+    patch(repoPath, { phase: "running", refreshing: true, reason: null, stage: null });
     const repoChanged = dirty.has(repoPath);
     const outcome = await maybeRefresh(repoPath, repoChanged);
     if (!isCurrent()) return;
@@ -146,6 +156,7 @@ export function createLiveIndex(opts?: {
           : "Index writer stayed busy or the refresh queue is full. Refresh the map again.",
         refreshing: false,
         updatedAt: Date.now(),
+        stage: null,
       });
       return;
     }
@@ -161,6 +172,7 @@ export function createLiveIndex(opts?: {
         reason: outcome.reason,
         refreshing: false,
         updatedAt: Date.now(),
+        stage: null,
       });
       return;
     }
@@ -168,10 +180,15 @@ export function createLiveIndex(opts?: {
     dirty.delete(repoPath);
     const failed =
       outcome.decision === "refresh" && outcome.build?.ok !== true;
+    // A build spawned because `repo_map.json` was missing rewrites the
+    // artifacts from the existing generation, so the *store* reports
+    // `unchanged: true` while the map the pane reads is brand new. Rust
+    // re-probes the artifacts after the child exits and says so; treating that
+    // as an echo left the freshly written map unread until a manual reload.
     const published =
       outcome.decision === "refresh" &&
       outcome.build?.ok === true &&
-      !isUnchangedEcho(outcome.build);
+      (!isUnchangedEcho(outcome.build) || outcome.artifacts_restored === true);
     patch(repoPath, {
       phase: queue.isPending(repoPath) ? "scheduled" : failed
         ? "failed"
@@ -180,6 +197,7 @@ export function createLiveIndex(opts?: {
       reason: failed && !outcome.build ? "Refresh returned no build outcome" : outcome.reason,
       refreshing: false,
       updatedAt: Date.now(),
+      stage: null,
       ...(published ? { revision: ++revision } : {}),
     });
   }
@@ -247,6 +265,17 @@ export function createLiveIndex(opts?: {
         const prev = snapshotFor(map, repoPath);
         if (prev.phase === "running" || prev.phase === "scheduled") return map;
         return { ...map, [repoPath]: { ...prev, phase: "scheduled" } };
+      });
+    },
+    onBuildProgress(repoPath, stage, total) {
+      if (!Number.isFinite(stage) || !Number.isFinite(total) || total <= 0) return;
+      snapshots.update((map) => {
+        const prev = map[repoPath];
+        // Only a build this controller believes is running may move the bar.
+        // A stray event for a repository whose tab has closed, or for an
+        // explicit Build the user pressed, must not resurrect a stale row.
+        if (!prev || prev.phase !== "running") return map;
+        return { ...map, [repoPath]: { ...prev, stage: { current: stage, total } } };
       });
     },
     get(repoPath: string) {

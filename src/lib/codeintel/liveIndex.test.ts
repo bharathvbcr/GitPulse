@@ -201,6 +201,77 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
+  it("records build stages only while a build is actually running", async () => {
+    // The kernel prints `[n/5]`; a cold index of a large repository is minutes
+    // of an empty pane without it. But a stray event must not resurrect a row:
+    // only a build this controller believes is running may move the bar.
+    let resolve!: (value: LiveRefreshOutcome) => void;
+    const index = createLiveIndex({
+      debounceMs: 0,
+      maybeRefresh: () =>
+        new Promise<LiveRefreshOutcome>((r) => {
+          resolve = r;
+        }),
+    });
+
+    // Before anything runs, progress is ignored.
+    index.onBuildProgress("/repo", 2, 5);
+    expect(index.get("/repo").stage).toBeNull();
+
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("running");
+    // A running build starts with no stage rather than a fabricated first one.
+    expect(index.get("/repo").stage).toBeNull();
+
+    index.onBuildProgress("/repo", 3, 5);
+    expect(index.get("/repo").stage).toEqual({ current: 3, total: 5 });
+
+    // Nonsense from a future producer is dropped, not rendered.
+    index.onBuildProgress("/repo", Number.NaN, 5);
+    index.onBuildProgress("/repo", 1, 0);
+    expect(index.get("/repo").stage).toEqual({ current: 3, total: 5 });
+
+    // A different repository's event never lands on this row.
+    index.onBuildProgress("/other", 1, 5);
+    expect(index.get("/repo").stage).toEqual({ current: 3, total: 5 });
+
+    resolve(outcome("refresh"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(index.get("/repo").stage).toBeNull();
+    index.reset();
+  });
+
+  it("publishes a revision when an unchanged build restored the map artifacts", async () => {
+    // The cold-start and self-heal path: `devmap build --manifest` rewrites
+    // `repo_map.json` from the existing generation, so the store is genuinely
+    // `unchanged` while the document the Map pane reads is new. Suppressing
+    // the revision here left the pane showing nothing until a manual reload.
+    const index = createLiveIndex({
+      debounceMs: 0,
+      maybeRefresh: async () =>
+        outcome("refresh", {
+          artifacts_restored: true,
+          build: {
+            ok: true,
+            binary: "/bin/devmap",
+            lookup: "path_search",
+            exit_code: 0,
+            stdout: "{}",
+            stderr: "",
+            timed_out: false,
+            report: { unchanged: true },
+          },
+        }),
+    });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(index.get("/repo").revision).toBe(1);
+    index.reset();
+  });
+
   it("still publishes a revision when unchanged is absent from a successful build", async () => {
     const index = createLiveIndex({ debounceMs: 0, maybeRefresh: async () => outcome("refresh") });
     index.onRepoChanged("/repo");

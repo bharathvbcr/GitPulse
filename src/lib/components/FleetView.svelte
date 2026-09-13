@@ -104,6 +104,12 @@
   import { formatAge, humanBytes } from "../storage/format";
   import { formatAuditCounts } from "../health/format";
   import { firstFailure, isCleanSweep, summarizeRun } from "../repos/workspaceOps";
+  import {
+    firstIndexFailure,
+    isCleanIndexSweep,
+    runIndexSweep,
+    summarizeIndexSweep,
+  } from "../fleet/indexSweep";
   import { formatError } from "../ui/formatError";
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -276,6 +282,18 @@
    *  marker the scans use: a queued repository is not a running one. */
   let syncPaths = $state<string[]>([]);
   let syncToken: { aborted: boolean } | null = null;
+  /**
+   * The index sweep keeps its own state rather than joining `syncing`.
+   *
+   * Fetch and pull reach the network and touch the working tree; indexing
+   * writes only the DevMap state directory. Sharing one flag would make each
+   * disable the other for no reason, and would put a CPU-bound local build
+   * behind a name that has meant "network operation" everywhere else.
+   */
+  let indexing = $state(false);
+  let indexProgress = $state<{ done: number; total: number } | null>(null);
+  let indexPaths = $state<string[]>([]);
+  let indexToken: { aborted: boolean } | null = null;
 
   /** Every path the sweep should cover: open tabs first, then recents. */
   const sweepPaths = $derived([
@@ -392,6 +410,50 @@
       syncProgress = null;
       syncPaths = [];
       syncToken = null;
+    }
+  }
+
+  /**
+   * Builds the DevMap index for every open repository.
+   *
+   * The automatic path only indexes what you are looking at, which is the
+   * right default and the wrong one the first time devmap is installed against
+   * a workspace that is already full of tabs. Sequential and abortable; the
+   * decisions live in `fleet/indexSweep.ts` so the wording of a partial sweep
+   * is testable rather than assembled in markup.
+   */
+  async function indexAll() {
+    if (indexing || $fleetStore.scanning !== null) return;
+    const token = { aborted: false };
+    indexToken = token;
+    indexing = true;
+    indexProgress = { done: 0, total: targets.length };
+    indexPaths = [];
+    try {
+      const report = await runIndexSweep(targets, {
+        signal: token,
+        onStart: (target) => {
+          indexPaths = [...indexPaths, target.path];
+        },
+        onProgress: (done, total, latest) => {
+          indexProgress = { done, total };
+          indexPaths = indexPaths.filter((path) => path !== latest.path);
+        },
+      });
+      const line = summarizeIndexSweep(report);
+      if (isCleanIndexSweep(report)) {
+        toastStore.success(line);
+        return;
+      }
+      const failure = firstIndexFailure(report);
+      toastStore.warning(failure ? `${line} — ${failure.label}: ${failure.reason}` : line);
+    } catch (err: unknown) {
+      toastStore.warning(`Could not index the fleet: ${formatError(err)}`);
+    } finally {
+      indexing = false;
+      indexProgress = null;
+      indexPaths = [];
+      indexToken = null;
     }
   }
 
@@ -727,6 +789,36 @@
       >
         <ArrowDownToLine size={11} />
         <span>Pull all</span>
+      </button>
+      <div class="h-3.5 w-1 rounded-full bg-border/50" aria-hidden="true"></div>
+    {/if}
+
+    <!-- Indexing is local and touches nothing git tracks, so it is not gated on
+         the sync state the two operations above share. -->
+    {#if indexing && indexProgress}
+      <span class="text-[11px] text-textMuted tabular-nums" role="status" data-testid="fleet-index-progress">
+        Indexing: {indexProgress.done}/{indexProgress.total}
+      </span>
+      <button
+        type="button"
+        class="gp-btn py-1! px-2! text-[11px]!"
+        onclick={() => {
+          if (indexToken) indexToken.aborted = true;
+        }}
+      >
+        Stop
+      </button>
+    {:else}
+      <button
+        type="button"
+        class="gp-btn py-1! px-2! text-[11px]!"
+        data-testid="fleet-index-all"
+        disabled={targets.length === 0 || $fleetStore.scanning !== null}
+        onclick={() => void indexAll()}
+        title="Build the DevMap code index for every open repository, one at a time. Writes only each repository's own ignored state directory — nothing git tracks. Repositories that are already current are reported as such rather than rebuilt."
+      >
+        <SquareCode size={11} />
+        <span>Index all</span>
       </button>
       <div class="h-3.5 w-1 rounded-full bg-border/50" aria-hidden="true"></div>
     {/if}

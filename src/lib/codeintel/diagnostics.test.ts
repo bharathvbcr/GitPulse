@@ -11,7 +11,7 @@ const context: DevmapDiagnosticContext = {
   cli: { available: false, reason: "devmap binary missing" },
   map: { available: false, reason: "map missing", path: "/repo/.devmap/repo_map.json" },
   graph: null,
-  liveIndex: { phase: "failed", decision: null, reason: "store locked", updatedAt: 0, revision: 0, refreshing: false },
+  liveIndex: { phase: "failed", decision: null, reason: "store locked", updatedAt: 0, revision: 0, refreshing: false, stage: null },
   errors: ["build refused"],
 };
 

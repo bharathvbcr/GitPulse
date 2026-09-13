@@ -101,6 +101,7 @@ pub fn run() {
             crate::ledger::set_app_handle(app.handle().clone());
             workbench::notifications::install(app.handle());
             crate::tool_install::set_app_handle(app.handle().clone());
+            crate::devmap::set_build_progress_handle(app.handle().clone());
             if let Err(error) = storage::hygiene::global::start_scheduler() {
                 log::error!("Cleaner scheduler failed to start: {error}");
             }
@@ -315,6 +316,11 @@ pub fn run() {
             cmd_workspace_unregister,
             cmd_workspace_list,
             cmd_workspace_sync,
+            cmd_devcouncil_init,
+            cmd_devcouncil_suite_status,
+            cmd_devmap_integration_preview,
+            cmd_devmap_integration_survey,
+            cmd_devmap_integration_apply,
             cmd_workspace_search,
             cmd_workspace_link_candidates,
             cmd_insights_snapshot,

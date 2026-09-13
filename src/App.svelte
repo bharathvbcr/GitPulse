@@ -7,6 +7,8 @@
   import { repoStore } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";
   import { liveIndex } from "./lib/codeintel/liveIndex";
+  import { autoInit } from "./lib/codeintel/autoInit";
+  import type { DevmapBuildProgress } from "./lib/codeintel/types";
   import { onDocsRepoChanged, setDocsVaultRefreshScope } from "./lib/docs/liveVault";
   import { installBackgroundScope } from "./lib/async/backgroundScope";
   import { graphStore } from "./lib/stores/graphStore";
@@ -388,6 +390,7 @@
       target: document,
       apply: (scope) => {
         liveIndex.setScope(scope);
+        autoInit.setScope(scope);
         setDocsVaultRefreshScope(scope);
         repoMetrics.setScope(scope);
       },
@@ -634,6 +637,18 @@
       },
       [...$repoStore.recentRepos],
       shellHandlers,
+    );
+
+    // Build progress. A cold index of a large repository is several minutes of
+    // an otherwise empty Map pane, and the kernel already prints the stage it
+    // has reached; this is the only thing that carries it to the UI.
+    void listen<DevmapBuildProgress>("devmap-build-progress", (event) => {
+      const payload = event.payload;
+      if (!payload?.repository) return;
+      liveIndex.onBuildProgress(payload.repository, payload.stage, payload.total_stages);
+    }).then(
+      (unlisten) => track(unlisten),
+      (err) => diagnostics.warn("boot:devmap-build-progress", err),
     );
 
     // The action journal follows the durable ledger rather than accumulating

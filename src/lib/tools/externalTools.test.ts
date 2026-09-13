@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { askConfirm } from "../stores/modalStore";
+import { autoInit } from "../codeintel/autoInit";
 import {
   cancelExternalToolInstall,
   classifyMapFailure,
@@ -278,5 +279,43 @@ describe("source checkout trust", () => {
     const result = await installExternalTool("manvi", "local_checkout");
     expect(result.cancelled).toBe(true);
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("the tools probe as an invalidation signal", () => {
+  // Per-repository initialization skips the workspace registry when devmap is
+  // absent and remembers that skip. This probe is the only place the app ever
+  // learns devmap appeared — from its own installer or from a terminal — so it
+  // is the only thing that can un-stick those repositories.
+  it("tells auto-init when devmap is present", async () => {
+    const notify = vi.spyOn(autoInit, "onToolsChanged").mockImplementation(() => {});
+    vi.mocked(invoke).mockResolvedValue({
+      devmap: status({ tool: "devmap", installed: true, path: "/usr/local/bin/devmap" }),
+      manvi: status({ tool: "manvi" }),
+    });
+    await getExternalToolsStatus();
+    expect(notify).toHaveBeenCalledTimes(1);
+    notify.mockRestore();
+  });
+
+  it("stays silent while devmap is still missing", async () => {
+    // Nothing changed, and re-running initialization on every probe would be
+    // pure cost for a repository that is correctly waiting on an install.
+    const notify = vi.spyOn(autoInit, "onToolsChanged").mockImplementation(() => {});
+    vi.mocked(invoke).mockResolvedValue({
+      devmap: status({ tool: "devmap", installed: false }),
+      manvi: status({ tool: "manvi", installed: true }),
+    });
+    await getExternalToolsStatus();
+    expect(notify).not.toHaveBeenCalled();
+    notify.mockRestore();
+  });
+
+  it("does not throw on a payload with no devmap entry", async () => {
+    const notify = vi.spyOn(autoInit, "onToolsChanged").mockImplementation(() => {});
+    vi.mocked(invoke).mockResolvedValue({});
+    await expect(getExternalToolsStatus()).resolves.toEqual({});
+    expect(notify).not.toHaveBeenCalled();
+    notify.mockRestore();
   });
 });

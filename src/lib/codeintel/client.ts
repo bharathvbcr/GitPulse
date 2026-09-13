@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   parseCodeintelResponse,
   parseCodeintelStatus,
+  parseInitReport,
+  parseIntegrationPlan,
+  parseSuiteReport,
   type CodeintelAffectedTests,
   type CodeintelClones,
   type CodeintelDeadSymbol,
@@ -13,11 +16,15 @@ import {
   type CodeintelRung,
   type CodeintelStatus,
   type CodeintelSymbolHit,
+  type InitReport,
+  type SuiteReport,
   type DevmapBuildOutcome,
   type DevmapCliStatus,
   type DevmapPreviewFileResult,
   type DevmapPreviewOutcome,
   type GraphVizLoad,
+  type IntegrationHost,
+  type IntegrationPlan,
   type LiveRefreshOutcome,
   type RepoMapLoad,
   type WorkspaceLinksResult,
@@ -274,6 +281,78 @@ export async function previewDevmapEdits(
     repoPath,
     files,
   });
+}
+
+/* ── Per-repository initialization ─────────────────────────────────────── */
+
+/**
+ * Prepare one opened repository: keep its DevMap state directory out of
+ * `git status`, then make its workspace registry match the open tabs.
+ *
+ * Writes only inside `.git/info/exclude` and the resolved state directory —
+ * never tracked content. Agent guides, editor rules and MCP files are a
+ * separate, previewed action (`previewDevmapIntegration` / `applyDevmap…`).
+ */
+export async function initializeDevcouncil(
+  repoPath: string,
+  openRepos: string[],
+): Promise<InitReport> {
+  return parseInitReport(
+    await invoke("cmd_devcouncil_init", { repoPath, openRepos }),
+    "cmd_devcouncil_init",
+  );
+}
+
+/* ── DevCouncil components and agent-host integration ──────────────────── */
+
+/**
+ * What of DevCouncil is installed, plus the installation warnings `devmap
+ * doctor` measures. `repoPath` is only where the read-only doctor probe runs;
+ * without one the report says health was not checked rather than reporting
+ * none.
+ */
+export async function getDevcouncilSuite(
+  repoPath?: string | null,
+): Promise<SuiteReport> {
+  return parseSuiteReport(
+    await invoke("cmd_devcouncil_suite_status", { repoPath: repoPath ?? null }),
+    "cmd_devcouncil_suite_status",
+  );
+}
+
+/** What registering DevMap with one agent host would change. Writes nothing. */
+export async function previewDevmapIntegration(
+  repoPath: string,
+  host: IntegrationHost,
+): Promise<IntegrationPlan> {
+  return parseIntegrationPlan(
+    await invoke("cmd_devmap_integration_preview", { repoPath, host }),
+    "cmd_devmap_integration_preview",
+  );
+}
+
+/** The same preview for every host, for the setup strip. Writes nothing. */
+export async function surveyDevmapIntegration(repoPath: string): Promise<IntegrationPlan[]> {
+  const raw = await invoke("cmd_devmap_integration_survey", { repoPath });
+  if (!Array.isArray(raw)) {
+    throw new Error("cmd_devmap_integration_survey returned no plan list");
+  }
+  return raw.map((plan) => parseIntegrationPlan(plan, "cmd_devmap_integration_survey"));
+}
+
+/**
+ * Write the integration assets. Edits tracked files in the repository *and* a
+ * machine-wide MCP registration — only call this from an explicit user action
+ * that has shown `previewDevmapIntegration` first.
+ */
+export async function applyDevmapIntegration(
+  repoPath: string,
+  host: IntegrationHost,
+): Promise<IntegrationPlan> {
+  return parseIntegrationPlan(
+    await invoke("cmd_devmap_integration_apply", { repoPath, host }),
+    "cmd_devmap_integration_apply",
+  );
 }
 
 /* ── Multi-repo workspace registry ─────────────────────────────────────── */
