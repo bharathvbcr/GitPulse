@@ -638,8 +638,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
     let size = bounded_pty_size(rows, cols);
-    let pair = pty_system
-        .openpty(size)
+    // `openpty` sets `FD_CLOEXEC` on the master and slave in two `fcntl` calls
+    // after the descriptors exist, and `spawn_command` below forks. Both halves
+    // of `procguard`'s inheritance race live in this function, and the shell
+    // this starts is the longest-lived thief the app has: a stolen `git` pipe
+    // end is held for the whole session rather than the next millisecond.
+    let pair = crate::procguard::with_inheritance_lock(|| pty_system.openpty(size))
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
     let requested = program.filter(|p| !p.trim().is_empty());
@@ -691,10 +695,16 @@ fn spawn_session_inner<R: tauri::Runtime>(
     // substituted between this check and the launch, and the guard is held
     // across `spawn_command` for the platforms where holding it is what does
     // the work.
+    //
+    // Trust resolution touches the filesystem and stays outside the inheritance
+    // lock; only the fork itself is serialized. The two guards nest rather than
+    // compete: `_anchored` is what keeps the approved directory from being
+    // substituted, and the inheritance lock is what keeps a concurrent spawn
+    // from stealing this child's pipe ends while `FD_CLOEXEC` is still being
+    // set in two non-atomic `fcntl` calls.
     let spawn_result =
         crate::repository_trust::require_unsubstitutable_dir(&repo).and_then(|_anchored| {
-            pair.slave
-                .spawn_command(cmd)
+            crate::procguard::with_inheritance_lock(|| pair.slave.spawn_command(cmd))
                 .map_err(|error| format!("Failed to spawn process '{shell}': {error}"))
         });
     let child = match spawn_result {

@@ -1719,9 +1719,15 @@ fn run_with_gate(
                     return Err(format!("Failed to deliver {label} {error}"));
                 }
             }
-            // Normal exit: EOF is imminent unless the child daemonized a
-            // grandchild that inherited the pipes; then we take whatever was
-            // buffered after the grace window instead of hanging forever.
+            // Normal exit: EOF is imminent unless something else is holding a
+            // write end; then we take whatever was buffered after the grace
+            // window instead of hanging forever. Two things can hold one, and
+            // the rarer-sounding one is what actually fired in the field: a
+            // grandchild the child daemonized, and — until
+            // `procguard::with_inheritance_lock` — any sibling spawned inside
+            // this pipe's pre-`FD_CLOEXEC` window, which on macOS `std` cannot
+            // close atomically. Do not read this reason as the first cause
+            // alone.
             let (mut stdout, mut stderr) = output.finish(
                 Instant::now()
                     + if cancelled {

@@ -48,6 +48,14 @@
 //! `harness::sidecar::spawn`), so none of them has a tty to touch. A future
 //! caller that wants `Stdio::inherit()` on a terminal must not use [`spawn`].
 //!
+//! # Creating a child is serialized against creating a descriptor
+//!
+//! [`spawn`] also takes [`with_inheritance_lock`], because `std` cannot make a
+//! pipe `FD_CLOEXEC` atomically on macOS: a process created inside another
+//! spawn's window inherits that pipe for life, and a stolen *write* end is a
+//! `git` whose output never reaches EOF. Every child this process starts must
+//! be created under that lock — `tests/spawn_seam.rs` pins the set.
+//!
 //! # Windows
 //!
 //! There is no `setpgid`, and the OS delivers no SIGTERM — a console control
@@ -227,6 +235,68 @@ impl Drop for Registration {
     }
 }
 
+/// Serializes process creation against descriptor creation that cannot set
+/// `FD_CLOEXEC` atomically.
+///
+/// macOS and the BSDs have no `pipe2`, so `std`'s pipe constructor is `pipe()`
+/// followed by two separate `fcntl(F_SETFD, FD_CLOEXEC)` calls
+/// (`library/std/src/sys/pipe/unix.rs`). A process created on another thread
+/// in between — `posix_spawn` here, the `fork` inside the terminal's
+/// `spawn_command` — copies a descriptor table in which that pipe is still
+/// inheritable, and keeps the copy for the whole of its life.
+///
+/// A stolen *write* end is the expensive one. The pipe it belongs to cannot
+/// reach EOF while the thief holds it, so the owner drains until its grace
+/// window expires and reports `pipe did not reach EOF after child exit` over a
+/// prefix that reads exactly like a complete short answer. Measured on this
+/// seam with eight threads spawning concurrently: 147 of 25,415 children
+/// (0.58%) inherited a foreign descriptor, and every one of them was a
+/// `p`-typed pipe end belonging to a sibling. Under this lock, 0 of 12,944
+/// did. Most thefts cost nothing because the thief is the next millisecond's
+/// `git`; the ones that reached the app's diagnostics as lost `diff`, `show`,
+/// `rev-list` and `for-each-ref` output are the ones where it was something
+/// long-lived — a terminal shell, the MANVI sidecar, or a `git` that ran for
+/// minutes under load.
+///
+/// Go closes the identical hole with `syscall.ForkLock`. Exclusive rather than
+/// shared because the two halves are inseparable here: `Command::spawn`
+/// creates the pipes *and* the process, so there is no seam at which readers
+/// could be admitted. What is serialized is one spawn syscall — 321µs median,
+/// 614µs worst over 300 `git` spawns on this machine — behind a gate that
+/// admits at most sixteen children, so the added wait is a few milliseconds on
+/// calls that run for tens of milliseconds to minutes.
+///
+/// Deliberately not taken by the Windows tree kill: `force_kill` runs during
+/// teardown, where queueing behind a spawn is the one thing it must not do,
+/// and Windows inherits by explicit handle list rather than by table copy.
+static CHILD_CREATION: Mutex<()> = Mutex::new(());
+
+/// Creates a process, or a descriptor that is about to be made `FD_CLOEXEC`,
+/// with no other such creation in flight — see [`CHILD_CREATION`] for what
+/// overlapping the two costs.
+///
+/// Every production process creation must run inside this: [`spawn`] for
+/// everything routed through `engine::git_cli`, and `terminal`'s `openpty` and
+/// `spawn_command` for the PTY. `tests/spawn_seam.rs` pins the set.
+///
+/// Not reentrant. `body` is a single creation call and must not itself reach
+/// back into this module.
+///
+/// Holding a lock across a `fork` is ordinarily a way to hand a child a mutex
+/// it can never unlock, and both creators here can fork — `std` when it cannot
+/// reach `posix_spawn`, `portable-pty` always, since it needs `pre_exec`. It is
+/// safe because neither forked child ever touches this mutex: each runs only
+/// async-signal-safe libc calls and then `exec`s, which replaces the copied
+/// address space outright.
+pub fn with_inheritance_lock<T>(body: impl FnOnce() -> T) -> T {
+    // A panic under the guard leaves nothing inconsistent behind: what is
+    // guarded is an instant in time, not state.
+    let _guard = CHILD_CREATION
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    body()
+}
+
 /// Spawns `cmd` as a killable process group and registers the result.
 ///
 /// This is the only supported way to start a child that must not outlive us;
@@ -250,7 +320,7 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     let _admitted = crate::repository_trust::check_command(cmd)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     sys::prepare(cmd);
-    let mut child = cmd.spawn()?;
+    let mut child = with_inheritance_lock(|| cmd.spawn())?;
     let slot: Slot = Arc::new(Entry {
         label: label.to_string(),
         pid: Mutex::new(Some(child.id())),
@@ -1256,6 +1326,200 @@ mod tests {
             unarmed.describe().contains("no pipe"),
             "the reason was dropped: {}",
             unarmed.describe()
+        );
+    }
+
+    /// The descriptors one child was handed, as it sees them.
+    ///
+    /// Listed by the shell itself rather than by `ls`, because the probe's
+    /// sensitivity is the share of wall-clock each thread spends inside
+    /// `Command::spawn`: dropping the second `exec` roughly doubled the theft
+    /// rate this test can observe per second. Both output streams are piped,
+    /// matching what `run_bounded_capped` gives every production child — two
+    /// pipes per spawn is two windows per spawn.
+    #[cfg(unix)]
+    fn probe_descriptors() -> std::collections::BTreeSet<u32> {
+        use std::io::Read;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(r#"for f in /dev/fd/*; do echo "${f##*/}"; done"#)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, guard) = spawn(&mut cmd, "descriptor probe").expect("spawn");
+        // Read to end before reaping: a probe that stole a sibling's write end
+        // blocks here until the thief exits, which is exactly the production
+        // symptom and must not be short-circuited into a passing read.
+        let mut listing = String::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_string(&mut listing)
+            .expect("read probe output");
+        let status = guard.reap(|| child.wait()).expect("reap probe");
+        assert!(status.success(), "descriptor probe did not run");
+        listing
+            .split_whitespace()
+            .filter_map(|entry| entry.parse().ok())
+            .collect()
+    }
+
+    /// A child must never be handed a descriptor belonging to a sibling.
+    ///
+    /// `std` builds pipes on macOS and the BSDs as `pipe()` followed by two
+    /// `fcntl(F_SETFD, FD_CLOEXEC)` calls, so a process created on another
+    /// thread in between inherits the new pipe for the rest of its life. When
+    /// the stolen end is a write end the pipe never reaches EOF, and its owner
+    /// hands up a prefix nothing downstream can tell from a complete short
+    /// answer — which is how `git diff`, `show`, `rev-list` and `for-each-ref`
+    /// output went missing in the field. [`with_inheritance_lock`] is what
+    /// closes the window.
+    ///
+    /// Isolated into a libtest child of its own because the rest of the crate's
+    /// tests fork concurrently and outside this seam: their spawns would both
+    /// add thefts this test did not cause and mask the ones it did.
+    ///
+    /// The sample is a fixed count, not a duration, so a loaded machine loses
+    /// time rather than evidence. 12,000 concurrent spawns of this shape saw
+    /// 68 thefts in 4.6s against the unlocked seam, so an empty result there
+    /// has probability e^-68; even at a quarter of that rate it is 4e-8. The
+    /// count is asserted too: a run that spawned nothing must not read like a
+    /// run that spawned everything cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_spawns_never_inherit_a_siblings_descriptors() {
+        const CHILD: &str = "GITPULSE_FD_INHERITANCE_CHILD";
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 750;
+
+        if std::env::var_os(CHILD).is_none() {
+            let (mut command, _harness) = crate::test_support::isolated_libtest_command(
+                "procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors",
+            );
+            command.arg("--test-threads=1");
+            command.env(CHILD, "1");
+            let run = crate::engine::git_cli::run_bounded_capped(
+                command,
+                "descriptor inheritance fixture",
+                Duration::from_secs(20 * 60),
+                None,
+                256 * 1024,
+            )
+            .expect("run fixture");
+            assert!(
+                run.success,
+                "{}\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&run.stdout).contains("1 passed"),
+                "fixture was not collected"
+            );
+            return;
+        }
+
+        // What a child is handed when nothing else is being created: its own
+        // three standard descriptors plus whatever `ls` opens to read the
+        // directory. Calibrated rather than written down, so the baseline is
+        // the platform's and not this file's guess at it.
+        let baseline = Arc::new(
+            (0..3)
+                .flat_map(|_| probe_descriptors())
+                .collect::<std::collections::BTreeSet<u32>>(),
+        );
+        assert!(
+            baseline.contains(&0) && baseline.contains(&1) && baseline.contains(&2),
+            "the probe never reported its own standard descriptors: {baseline:?}"
+        );
+
+        let stolen = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));
+        let probed = Arc::new(AtomicU64::new(0));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (baseline, stolen, probed) = (
+                    Arc::clone(&baseline),
+                    Arc::clone(&stolen),
+                    Arc::clone(&probed),
+                );
+                std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        let extra: Vec<u32> = probe_descriptors()
+                            .into_iter()
+                            .filter(|fd| !baseline.contains(fd))
+                            .collect();
+                        probed.fetch_add(1, Ordering::Relaxed);
+                        if !extra.is_empty() {
+                            lock(&stolen).push(extra);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("probe thread");
+        }
+
+        let probed = probed.load(Ordering::Relaxed);
+        assert_eq!(
+            probed,
+            (THREADS * PER_THREAD) as u64,
+            "the sample never completed, so an empty result proves nothing"
+        );
+        let stolen = lock(&stolen);
+        assert!(
+            stolen.is_empty(),
+            "{} of {probed} children inherited descriptors belonging to a \
+             sibling: {:?}",
+            stolen.len(),
+            &stolen[..stolen.len().min(10)]
+        );
+    }
+
+    /// [`spawn`] takes the inheritance lock, deterministically.
+    ///
+    /// The statistical sibling above proves the outcome but only on a machine
+    /// where the window is wide enough to be hit; this one proves the
+    /// mechanism on every machine, and is the case that fails loudly if the
+    /// lock is ever lifted out of [`spawn`] again. It can only fail in one
+    /// direction — a slow machine makes the observed wait longer, never
+    /// shorter.
+    #[cfg(unix)]
+    #[test]
+    fn spawning_waits_behind_the_inheritance_lock() {
+        const HELD: Duration = Duration::from_millis(300);
+        static TAKEN: AtomicBool = AtomicBool::new(false);
+
+        TAKEN.store(false, Ordering::SeqCst);
+        let holder = std::thread::spawn(|| {
+            with_inheritance_lock(|| {
+                TAKEN.store(true, Ordering::SeqCst);
+                std::thread::sleep(HELD);
+            })
+        });
+        // Measure the wait, not the thread start-up.
+        let armed = Instant::now() + Duration::from_secs(10);
+        while !TAKEN.load(Ordering::SeqCst) {
+            assert!(Instant::now() < armed, "the holder never took the lock");
+            std::thread::yield_now();
+        }
+
+        let mut cmd = Command::new("true");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let (mut child, guard) = spawn(&mut cmd, "gated").expect("spawn");
+        let waited = started.elapsed();
+        let _ = guard.reap(|| child.wait());
+        holder.join().expect("holder");
+
+        assert!(
+            waited >= HELD / 2,
+            "spawning took {waited:?} while another thread held the \
+             inheritance lock for {HELD:?}, so it created a process inside \
+             someone else's pre-FD_CLOEXEC window"
         );
     }
 

@@ -43,7 +43,14 @@ fn resolve_address(repo_path: &str, worktree_path: &str) -> Result<FamilyAddress
             members: family.members,
         })
         .map_err(|message| {
-            let code = if message.contains("does not belong")
+            // Trust first, and not merely for tidiness: resolution runs Git,
+            // so an untrusted checkout fails before anything about the
+            // worktree has been examined. Reading that refusal as one of the
+            // verdicts below would report a repository we never looked at as
+            // one we looked at and rejected.
+            let code = if crate::repository_trust::refused(&message) {
+                "untrusted_worktree"
+            } else if message.contains("does not belong")
                 || message.contains("not registered")
                 || message.contains("different repository")
             {
@@ -303,6 +310,41 @@ mod tests {
         let dir = git_repo();
         let path = dir.path().to_str().unwrap().to_string();
         (dir, path)
+    }
+
+    /// A checkout nobody let us open is not a broken checkout.
+    ///
+    /// Resolution runs Git, so an untrusted repository fails at admission —
+    /// before a single fact about the worktree has been established. The
+    /// classifier used to fall through to `invalid_worktree`, and the app's
+    /// diagnostics duly told the user that six valid worktrees were invalid
+    /// when the only thing wrong was that they had not been trusted yet.
+    #[test]
+    fn an_untrusted_checkout_is_not_reported_as_an_invalid_one() {
+        let (dir, path) = repo();
+        crate::repository_trust::revoke(&path).expect("revoke fixture trust");
+
+        let error = repository_address(&path).expect_err("an untrusted checkout must not resolve");
+        assert_eq!(
+            error.code, "untrusted_worktree",
+            "a refusal to look was reported as a verdict: {error}"
+        );
+        assert!(
+            crate::repository_trust::refused(&error.message),
+            "and it must still carry the refusal the user has to act on: {error}"
+        );
+
+        // The sibling arms still mean what they did: a path that is not a
+        // repository at all is `invalid_worktree` whether or not trust is in
+        // play, so the new arm cannot be swallowing them.
+        let missing = repository_address(
+            dir.path()
+                .join("not-a-repository")
+                .to_str()
+                .expect("utf8 path"),
+        )
+        .expect_err("a non-repository must not resolve");
+        assert_eq!(missing.code, "invalid_worktree", "{missing}");
     }
 
     #[test]
