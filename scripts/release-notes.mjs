@@ -36,7 +36,7 @@ export function normalizeTag(tag) {
  */
 export function extractNotes(markdown, tag) {
   const version = normalizeTag(tag);
-  const lines = markdown.split("\n");
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   /** @type {Array<{ version: string, date: string | null, start: number }>} */
   const sections = [];
   lines.forEach((line, index) => {

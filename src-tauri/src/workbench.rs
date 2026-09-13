@@ -248,7 +248,6 @@ impl WorkbenchState {
         result
     }
 
-
     fn worker_call(
         &self,
         method: &str,

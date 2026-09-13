@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { expectedAssetNames } from "./check-release-assets.mjs";
-import { runReleaseStage, runCommand, type Runner } from "./release-state.mjs";
+import { runReleaseStage, runCommand, main, type Runner } from "./release-state.mjs";
 
 const commit = "a".repeat(40);
 const tag = "v1.2.3";
@@ -290,5 +290,27 @@ describe("remote release lifecycle", () => {
     const {run, calls} = fixture();
     expect(() => runReleaseStage({...options, ...change}, run)).toThrow();
     expect(calls).toHaveLength(0);
+  });
+  it("treats 404 with any non-zero exit code as absent when allowMissing is true", () => {
+    const custom404Run: Runner = (program, args, input) => {
+      if (program === "gh" && String(args[4] ?? "").includes("releases/tags/")) {
+        return {status: 4, failed: false, stdout: "HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"message\":\"Not Found\"}"};
+      }
+      return fixture({release: null}).run(program, args, input);
+    };
+    expect(runReleaseStage(options, custom404Run).release_id).toBe("42");
+  });
+  it("main ready resolves repository, commit, and tag from local git when env vars are unset", () => {
+    const originalEnv = { ...process.env };
+    delete process.env.GH_REPO;
+    delete process.env.RELEASE_COMMIT;
+    delete process.env.RELEASE_TAG;
+    try {
+      // In the local repo, commit has not been pushed to CI yet so ready exits 1 with a CI error, not 'Invalid repository'
+      const exitCode = main(["ready"]);
+      expect(exitCode).toBe(1);
+    } finally {
+      process.env = originalEnv;
+    }
   });
 });

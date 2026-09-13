@@ -101,4 +101,13 @@ describe("release notes extraction", () => {
     if (!result.found) return;
     expect(result.body.trim().length).toBeGreaterThan(0);
   });
+
+  it("normalizes Windows CRLF line endings in changelog without corrupting the body", () => {
+    const crlf = CHANGELOG.replace(/\n/g, "\r\n");
+    const result = extractNotes(crlf, "v1.2.0");
+    expect(result.found).toBe(true);
+    if (!result.found) return;
+    expect(result.body).not.toContain("\r");
+    expect(result.body).toContain("- a thing");
+  });
 });

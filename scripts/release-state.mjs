@@ -55,7 +55,7 @@ export function runReleaseStage(options, run = runCommand) {
     }
     const match = /^HTTP\/[\d.]+ (\d{3})[^\n]*\r?\n[\s\S]*?\r?\n\r?\n([\s\S]*)$/.exec(result.stdout ?? "");
     if (!match) throw new Error(`GitHub ${method} ${endpoint}: incomplete response`);
-    if (status === 404 && allowMissing && result.status === 1) return null;
+    if (status === 404 && allowMissing && result.status !== 0) return null;
     if (result.status !== 0 || status < 200 || status >= 300) throw new Error(`GitHub ${method} ${endpoint}: HTTP ${status}`);
     return JSON.parse(match[2]);
   }
@@ -255,15 +255,38 @@ export function main(argv = process.argv.slice(2)) {
   }
   try {
     if (argv.length !== 1) throw new Error("Usage: release-state.mjs prepare|check|finalize|ready (RELEASE_TAG, RELEASE_COMMIT, GH_REPO, RELEASE_ID)");
-    const tag = process.env.RELEASE_TAG ?? "";
+    let repo = process.env.GH_REPO ?? "";
+    if (!repo) {
+      const origin = runCommand("git", ["config", "--get", "remote.origin.url"]).stdout.trim();
+      const match = /(?:github\.com[:/])([^/]+)\/([^/.]+?)(?:\.git)?$/.exec(origin);
+      if (match) repo = `${match[1]}/${match[2]}`;
+    }
+    let commit = process.env.RELEASE_COMMIT ?? "";
+    if (!commit) {
+      commit = runCommand("git", ["rev-parse", "HEAD"]).stdout.trim();
+    }
+    let tag = process.env.RELEASE_TAG ?? "";
+    if (!tag) {
+      const tagAtHead = runCommand("git", ["tag", "--points-at", "HEAD"]).stdout.trim().split(/\s+/).find(t => /^v\d+\.\d+\.\d+$/.test(t));
+      if (tagAtHead) {
+        tag = tagAtHead;
+      } else {
+        try {
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          if (pkg.version) tag = `v${pkg.version}`;
+        } catch {
+          // ignore
+        }
+      }
+    }
     let notes;
     if (argv[0] === "finalize") {
       const section = extractNotes(readFileSync("CHANGELOG.md", "utf8"), tag);
       if (!section.found) throw new Error("Changelog has no notes for release tag");
       notes = section.body;
     }
-    const result = runReleaseStage({stage: argv[0], repo: process.env.GH_REPO ?? "", tag,
-      commit: process.env.RELEASE_COMMIT ?? "", releaseId: process.env.RELEASE_ID, notes});
+    const result = runReleaseStage({stage: argv[0], repo, tag,
+      commit, releaseId: process.env.RELEASE_ID, notes});
     if (process.env.GITHUB_OUTPUT && result.release_id) appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${result.release_id}\n`);
     console.log(JSON.stringify(result));
     return 0;
