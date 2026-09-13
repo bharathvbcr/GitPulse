@@ -56,6 +56,15 @@ const ALLOWED: &[(&str, &str)] = &[
         "devmap binary invocation for map builds/queries; builds a `Command` \
          then hands it to `git_cli::run_bounded_capped`",
     ),
+    (
+        "src/tool_install/components.rs",
+        "DevCouncil component discovery, the same probe ladder as \
+         `tool_install/mod.rs`: its single `Command` is handed to \
+         `git_cli::run_bounded_capped` with a 5s timeout and a 64 KiB cap, and \
+         it runs in `std::env::temp_dir()` so a version probe can never read a \
+         repository. Not git, and a gate permit held across a probe of every \
+         optional component would starve the git calls behind it",
+    ),
 ];
 
 #[test]

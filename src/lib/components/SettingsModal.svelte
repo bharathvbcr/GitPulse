@@ -49,7 +49,7 @@
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
   import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
-  import { appleIntelligenceStatus, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
+  import { appleIntelligenceStatus, appleReady, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
   import type { GraphWidthMode } from "../graph/graphLayout";
   import type { RefScope } from "../graph/refScope";
@@ -126,7 +126,7 @@
   // and Apple Intelligence can be switched off while GitPulse is running.
   let apple = $state<AppleIntelligenceStatus | null>(null);
   async function loadApple() {
-    const status = await appleIntelligenceStatus($hostPlatform.os);
+    const status = await appleIntelligenceStatus();
     if (isOpen) apple = status;
   }
 
@@ -1015,10 +1015,10 @@
                     the enhancement panel.
                   </p>
                   <div class="flex items-start gap-1.5 text-[10px]"
-                    class:text-amber-600={apple !== null && !apple.available}
-                    class:dark:text-amber-400={apple !== null && !apple.available}
-                    class:text-textMuted={apple === null || apple.available}>
-                    {#if apple !== null && !apple.available}
+                    class:text-amber-600={apple !== null && !appleReady(apple)}
+                    class:dark:text-amber-400={apple !== null && !appleReady(apple)}
+                    class:text-textMuted={apple === null || appleReady(apple)}>
+                    {#if apple !== null && !appleReady(apple)}
                       <AlertTriangle size={12} class="shrink-0 mt-px" />
                     {/if}
                     <!-- Already specific to the cause. A build compiled without
@@ -1027,7 +1027,7 @@
                          because the per-task control hides an option nothing in
                          the app can enable. -->
                     <span data-testid="apple-intelligence-status">
-                      {apple?.explanation ?? "Checking whether Apple Intelligence is available…"}
+                      {apple?.detail ?? "Checking whether Apple Intelligence is available…"}
                     </span>
                   </div>
                   <button

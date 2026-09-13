@@ -17,6 +17,8 @@
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
+  import { shortcutTextLabel } from "../ui/platformCopy";
+  import { hostPlatform } from "../stores/platformStore";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import type { Repository, TaskCard, TaskRun } from "../workbench/client";
   import {
@@ -115,7 +117,7 @@
         <span class="meta gate">Attempt prepared. Resume or cancel it from this task's Agent tab.</span>
         <button type="button" class="gp-btn-primary" onclick={onClose}>Done</button>
       {:else}
-        <span class="meta gate">{gate.ok ? "⌘↩ to launch" : gate.reason}</span>
+        <span class="meta gate">{gate.ok ? `${shortcutTextLabel("⌘↩", $hostPlatform.os)} to launch` : gate.reason}</span>
         <button type="button" class="gp-btn" disabled={busy} onclick={onClose}>Cancel</button>
         <button type="button" class="gp-btn-primary" disabled={!gate.ok} onclick={() => void form?.launch()}>
           {busy ? "Preparing…" : pending ? "Retry preparation" : settings.kind === "managed" ? "Start managed Codex" : `Launch in ${PROVIDER_LABELS[settings.provider]}`}

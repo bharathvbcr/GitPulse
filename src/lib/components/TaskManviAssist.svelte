@@ -597,7 +597,7 @@
   {/if}
 
   {#if engine === "apple"}
-    <p class="meta">{apple?.detail ?? "Runs on this Mac."}</p>
+    <p class="meta">{apple?.detail ?? "Runs on this device; the text never leaves it."}</p>
   {:else}
     <div class="model-row">
       {#if confirmedModel}
