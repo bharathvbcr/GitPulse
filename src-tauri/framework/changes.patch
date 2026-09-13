@@ -1299,3 +1299,121 @@
 +        cf::CFRelease(runloop.0);
 +    }
 +}
+--- a/wry/src/wkwebview/download.rs
++++ b/wry/src/wkwebview/download.rs
+@@ -100,6 +100,11 @@
+   }
+ }
+ 
++// `error` is read only by the `debug_assertions` diagnostic below, so a release
++// build sees an unused binding. Scoping the allow to that configuration keeps a
++// genuinely unused parameter here visible in a debug build, which renaming the
++// parameter to `_error` would not.
++#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+ pub(crate) fn download_did_fail(
+   this: &WryDownloadDelegate,
+   download: &WKDownload,
+--- a/wry/src/wkwebview/mod.rs
++++ b/wry/src/wkwebview/mod.rs
+@@ -2,6 +2,16 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-License-Identifier: MIT
+ 
++// The Apple bindings this tree calls move faster than the pinned wry revision.
++// Newer `objc2-app-kit` marks safe what upstream still wraps in `unsafe`, and
++// deprecates the AppKit constants upstream still names. Neither carries a
++// correctness signal, and neither can be "fixed" here without changing
++// behaviour: `NSFilenamesPboardType` and the `NS*KeyMask` constants are the
++// drag-and-drop and modifier contracts this code implements, not style. This is
++// the macOS twin of the allow the GTK half of the port already carries in
++// `webkitgtk/`. Both retire when a published wry adopts the current bindings.
++#![allow(deprecated, unused_unsafe)]
++
+ mod download;
+ #[cfg(target_os = "macos")]
+ mod drag_drop;
+@@ -34,9 +44,16 @@
+ use objc2::runtime::Bool;
+ use objc2::{
+   rc::Retained,
+-  runtime::{AnyObject, NSObject, ProtocolObject},
++  runtime::{AnyObject, ProtocolObject},
+   AllocAnyThread, DeclaredClass, MainThreadOnly, Message,
+ };
++// Named only by the `mac-proxy` proxy-config array and by the
++// `respondsToSelector:` inspectable probe behind `debug_assertions` /
++// `devtools`. A release build with neither feature compiles both away, so the
++// import is unused there and used everywhere else. Split out from the names
++// above so the allow cannot mask an unused import that is genuinely dead.
++#[allow(unused_imports)]
++use objc2::runtime::NSObject;
+ #[cfg(target_os = "macos")]
+ use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTitlebarSeparatorStyle, NSView};
+ #[cfg(target_os = "macos")]
+--- a/tao/src/platform_impl/macos/mod.rs
++++ b/tao/src/platform_impl/macos/mod.rs
+@@ -2,6 +2,14 @@
+ // Copyright 2021-2023 Tauri Programme within The Commons Conservancy
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// Same Apple-binding churn as wry's `wkwebview` tree: newer `objc2-app-kit`
++// marks safe what this revision wraps in `unsafe`, and deprecates constants it
++// still names. `dead_code` joins them because this module carries upstream's
++// full macOS surface — the badge setters, `util::yes`, and the window state
++// this consumer never reads are tao's API, not leftovers to delete. All three
++// retire when a published tao adopts the current bindings.
++#![allow(deprecated, unused_unsafe, dead_code)]
++
+ mod app;
+ mod app_delegate;
+ mod app_state;
+--- a/tao/src/platform_impl/macos/monitor.rs
++++ b/tao/src/platform_impl/macos/monitor.rs
+@@ -20,7 +20,7 @@
+ };
+ use objc2::{msg_send, rc::Retained};
+ use objc2_app_kit::NSScreen;
+-use objc2_foundation::{ns_string, MainThreadMarker, NSString, NSUInteger};
++use objc2_foundation::{ns_string, MainThreadMarker, NSUInteger};
+ 
+ #[derive(Clone)]
+ pub struct VideoMode {
+--- a/tao/src/platform_impl/macos/util/async.rs
++++ b/tao/src/platform_impl/macos/util/async.rs
+@@ -8,7 +8,7 @@
+ };
+ 
+ use core_graphics::base::CGFloat;
+-use dispatch2::{DispatchQueue, DispatchQueueAttr};
++use dispatch2::DispatchQueue;
+ use objc2::{rc::autoreleasepool, Message};
+ use objc2_app_kit::{NSScreen, NSView, NSWindow, NSWindowStyleMask};
+ use objc2_foundation::{MainThreadMarker, NSPoint, NSSize, NSString};
+--- a/tao/src/platform/macos.rs
++++ b/tao/src/platform/macos.rs
+@@ -3,6 +3,10 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #![cfg(target_os = "macos")]
++// `NSApplication::unhide` is safe in the current `objc2-app-kit`; the
++// `MainThreadMarker::new_unchecked` calls beside it still are not. See the note
++// in `platform_impl/macos/mod.rs`.
++#![allow(unused_unsafe)]
+ 
+ use std::os::raw::c_void;
+ 
+--- a/muda/src/platform_impl/macos/mod.rs
++++ b/muda/src/platform_impl/macos/mod.rs
+@@ -1,6 +1,12 @@
+ // Copyright 2022-2022 Tauri Programme within The Commons Conservancy
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-License-Identifier: MIT
++
++// Newer `objc2-app-kit` marks safe the `NSMenu` / `NSMenuItem` calls this
++// revision wraps in `unsafe`. Removing the blocks would bind the port to one
++// bindings version; allowing the lint works against either. See the note in
++// wry's `wkwebview/mod.rs`.
++#![allow(unused_unsafe)]
+ 
+ mod accelerator;
+ mod icon;

@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![cfg(target_os = "macos")]
+// `NSApplication::unhide` is safe in the current `objc2-app-kit`; the
+// `MainThreadMarker::new_unchecked` calls beside it still are not. See the note
+// in `platform_impl/macos/mod.rs`.
+#![allow(unused_unsafe)]
 
 use std::os::raw::c_void;
 

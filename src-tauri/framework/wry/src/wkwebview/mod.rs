@@ -2,6 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+// The Apple bindings this tree calls move faster than the pinned wry revision.
+// Newer `objc2-app-kit` marks safe what upstream still wraps in `unsafe`, and
+// deprecates the AppKit constants upstream still names. Neither carries a
+// correctness signal, and neither can be "fixed" here without changing
+// behaviour: `NSFilenamesPboardType` and the `NS*KeyMask` constants are the
+// drag-and-drop and modifier contracts this code implements, not style. This is
+// the macOS twin of the allow the GTK half of the port already carries in
+// `webkitgtk/`. Both retire when a published wry adopts the current bindings.
+#![allow(deprecated, unused_unsafe)]
+
 mod download;
 #[cfg(target_os = "macos")]
 mod drag_drop;
@@ -34,9 +44,16 @@ use dpi::{LogicalPosition, LogicalSize};
 use objc2::runtime::Bool;
 use objc2::{
   rc::Retained,
-  runtime::{AnyObject, NSObject, ProtocolObject},
+  runtime::{AnyObject, ProtocolObject},
   AllocAnyThread, DeclaredClass, MainThreadOnly, Message,
 };
+// Named only by the `mac-proxy` proxy-config array and by the
+// `respondsToSelector:` inspectable probe behind `debug_assertions` /
+// `devtools`. A release build with neither feature compiles both away, so the
+// import is unused there and used everywhere else. Split out from the names
+// above so the allow cannot mask an unused import that is genuinely dead.
+#[allow(unused_imports)]
+use objc2::runtime::NSObject;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTitlebarSeparatorStyle, NSView};
 #[cfg(target_os = "macos")]

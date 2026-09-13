@@ -45,6 +45,18 @@ not published upstream releases.
   `native_event_unwind` exercises both real callbacks with injected Objective-C
   exceptions, normal forwarding, and subsequent dispatch. See
   `../../docs/archive/DIAGNOSTICS_HARDENING.md` for the crash evidence and limits.
+- The macOS platform modules of WRY, TAO and Muda carry the same scoped lint
+  allows the GTK consumers already had. Current `objc2-app-kit` marks safe what
+  these revisions wrap in `unsafe`, and deprecates constants they still name;
+  neither is a defect, and neither can be "fixed" without changing behaviour,
+  because `NSFilenamesPboardType` and the `NS*KeyMask` constants are the
+  drag-and-drop and modifier contracts the code implements. TAO's macOS module
+  also allows `dead_code`, which is upstream's own API surface rather than
+  anything this consumer left behind. The allows sit at the Apple-gated module
+  roots, so no Linux or Windows lint is suppressed, and the two imports that no
+  cfg uses at all were deleted rather than allowed. Removing the `unsafe`
+  blocks instead would pin the port to one bindings version; retire the allows
+  when a published WRY, TAO and Muda adopt the current bindings.
 
 The GTK bindings require Rust 1.92 or later. No new native system library is
 required by this migration. Ubuntu 22.04 is the native build baseline under

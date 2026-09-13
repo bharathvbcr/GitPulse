@@ -100,6 +100,11 @@ pub(crate) fn download_did_finish(this: &WryDownloadDelegate, download: &WKDownl
   }
 }
 
+// `error` is read only by the `debug_assertions` diagnostic below, so a release
+// build sees an unused binding. Scoping the allow to that configuration keeps a
+// genuinely unused parameter here visible in a debug build, which renaming the
+// parameter to `_error` would not.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub(crate) fn download_did_fail(
   this: &WryDownloadDelegate,
   download: &WKDownload,

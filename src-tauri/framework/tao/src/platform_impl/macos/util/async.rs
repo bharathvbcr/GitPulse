@@ -8,7 +8,7 @@ use std::{
 };
 
 use core_graphics::base::CGFloat;
-use dispatch2::{DispatchQueue, DispatchQueueAttr};
+use dispatch2::DispatchQueue;
 use objc2::{rc::autoreleasepool, Message};
 use objc2_app_kit::{NSScreen, NSView, NSWindow, NSWindowStyleMask};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSSize, NSString};

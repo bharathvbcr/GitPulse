@@ -2,6 +2,14 @@
 // Copyright 2021-2023 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 
+// Same Apple-binding churn as wry's `wkwebview` tree: newer `objc2-app-kit`
+// marks safe what this revision wraps in `unsafe`, and deprecates constants it
+// still names. `dead_code` joins them because this module carries upstream's
+// full macOS surface — the badge setters, `util::yes`, and the window state
+// this consumer never reads are tao's API, not leftovers to delete. All three
+// retire when a published tao adopts the current bindings.
+#![allow(deprecated, unused_unsafe, dead_code)]
+
 mod app;
 mod app_delegate;
 mod app_state;

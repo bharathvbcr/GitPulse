@@ -20,7 +20,7 @@ use core_graphics::{
 };
 use objc2::{msg_send, rc::Retained};
 use objc2_app_kit::NSScreen;
-use objc2_foundation::{ns_string, MainThreadMarker, NSString, NSUInteger};
+use objc2_foundation::{ns_string, MainThreadMarker, NSUInteger};
 
 #[derive(Clone)]
 pub struct VideoMode {

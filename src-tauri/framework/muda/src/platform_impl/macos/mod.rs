@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+// Newer `objc2-app-kit` marks safe the `NSMenu` / `NSMenuItem` calls this
+// revision wraps in `unsafe`. Removing the blocks would bind the port to one
+// bindings version; allowing the lint works against either. See the note in
+// wry's `wkwebview/mod.rs`.
+#![allow(unused_unsafe)]
+
 mod accelerator;
 mod icon;
 mod util;

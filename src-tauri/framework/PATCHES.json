@@ -386,11 +386,11 @@
         "src/wkwebview/class/wry_web_view_delegate.rs": "97559a443b53682d98858effed722774b309b7d72aac1aacc573f1d989fae093",
         "src/wkwebview/class/wry_web_view_parent.rs": "c405e3ea1d2e062a43847c6d7c91be6da36026f3230bf47f2661bddc6852012a",
         "src/wkwebview/class/wry_web_view_ui_delegate.rs": "931ad3ca6e303963e4d2c4267e2cd9fb94a0eef1ac8af8e6602b30cdcc324cc3",
-        "src/wkwebview/download.rs": "3b67113c3d13a2082992d284a1e995e07c06a9b892b3ed2dae9b7370daa0f6c0",
+        "src/wkwebview/download.rs": "3b9112fe3b3f6a043a155d12ab8df153366570004063b28e04b70944af4faf32",
         "src/wkwebview/drag_drop.rs": "10bf1524a41d586810cae18d318629da3768e69a1b0ab59ad04dfd69840d83c7",
         "src/wkwebview/ios/WKWebView.rs": "4ff8588c4d8773c244c228e5aa1cce3af8d62e4de1fb08cb80dfb31ae9a2dbb0",
         "src/wkwebview/ios/mod.rs": "03823ce7c572f1ed345ae4ef6ec63e8ce4df1f0a7d3ad0efebb36dd6a7c18dd1",
-        "src/wkwebview/mod.rs": "795ccc47abc947dbf474a7b0265ffb76538bc3cd4b875b4629550075d249f473",
+        "src/wkwebview/mod.rs": "05da15ff4954bd7d2cb062129cfcaf6030ee5edeee8681208bef63cb538594e4",
         "src/wkwebview/navigation.rs": "1898665e051edf10124178aa596b02dd121b33e1ccf7bb48b54d859d46e73aae",
         "src/wkwebview/proxy.rs": "f7ee208069b3d4d045540c46b842c71f0fa2bba905b20463e67679471f58ad20",
         "src/wkwebview/synthetic_mouse_events.rs": "729487a4009431c29633c0ada6d78c513a18af148c118aefa9b0279c322c7cb2",
@@ -412,6 +412,14 @@
         "src/webkitgtk/synthetic_mouse_events.rs": {
           "upstream": "e534ed5d79d3b0e79a6341cefa57bb20438ec34db32983522bf6816bdbdab2b0",
           "patched": "bfdb981c01442bcc972e844e61f8420eb174d9836e5287c9dc67bb1419a4da41"
+        },
+        "src/wkwebview/download.rs": {
+          "upstream": "3b67113c3d13a2082992d284a1e995e07c06a9b892b3ed2dae9b7370daa0f6c0",
+          "patched": "3b9112fe3b3f6a043a155d12ab8df153366570004063b28e04b70944af4faf32"
+        },
+        "src/wkwebview/mod.rs": {
+          "upstream": "795ccc47abc947dbf474a7b0265ffb76538bc3cd4b875b4629550075d249f473",
+          "patched": "05da15ff4954bd7d2cb062129cfcaf6030ee5edeee8681208bef63cb538594e4"
         }
       }
     },
@@ -478,7 +486,7 @@
         "src/platform/android.rs": "5aefb7ab80d5a8e66c89aac44990fbb8ced82703146af0b2813e6f512e115454",
         "src/platform/ios.rs": "b71729db5e5414e9b48cb299b6b9e65b7704677b04ca3378468b8aa4b328c065",
         "src/platform/linux.rs": "b9568e3b09217b00e1f5d2a01318e6f0b0da1a41d1c34aac94adba7ef1a61e95",
-        "src/platform/macos.rs": "d1993f47ff4958ff98ba35a8560d7b0230e0ee527e8d01d54f28f3cb3b6c8c42",
+        "src/platform/macos.rs": "bd9048137865927a11605ae2db566d1a6e40d25929ee42f4d427ff07abec759a",
         "src/platform/mod.rs": "95e29649dbd5cd6b78645380452e5521579c68b4bd51214dbfb0d09c754e617f",
         "src/platform/run_return.rs": "295b76e76b34211442248d1d610bdcadecc08b7837df4fd5927afaba97293d91",
         "src/platform/unix.rs": "80e672239baf26b290e15bb50d851aeabe1b3a0d38c8df1a32b629ba4ef93cb5",
@@ -520,11 +528,11 @@
         "src/platform_impl/macos/ffi.rs": "6e85ece908839c2c9d58077ec32e2d7835f1cffad200969f871f05a0aacaae9c",
         "src/platform_impl/macos/icon.rs": "8f5a7f00f96462683b4378702a61d78a30814d538a3111bad24ef4c556f35627",
         "src/platform_impl/macos/keycode.rs": "f4ba5a8948ab839eec2515586c48c41c9acc967f1a65d8ed7680ef231d0c1b63",
-        "src/platform_impl/macos/mod.rs": "a60a9bcf84c7bd51f744450674702e6bb88b3e17fc744751b4c4a202544423f8",
-        "src/platform_impl/macos/monitor.rs": "3ef62d6dc6902798fe31b8d57e07bfdfc0a530cdf9a321460e84e4dc62427963",
+        "src/platform_impl/macos/mod.rs": "129888927595bd2c352c665bde7bbecd4537260bdf3ca7c15dfc6223f81649a6",
+        "src/platform_impl/macos/monitor.rs": "595fcdda6836184ac8ebe5319bae152ddfaedff4daec44e7b1ef4fd3da277f75",
         "src/platform_impl/macos/observer.rs": "4d801f48b3badc805770b9cfe63114d4b03b8803d3b1f35eaf1538564516e52a",
         "src/platform_impl/macos/progress_bar.rs": "baa49c76ca0b0914a5eadfab0b3b352f0f073d3daa6b1c933fa1d02a57470ed1",
-        "src/platform_impl/macos/util/async.rs": "f53f5c3a4ec989fbe4126a38553328d3c03286ab9f29376b7854fb6feafdc5c8",
+        "src/platform_impl/macos/util/async.rs": "9666c427876d51c403dd9d14e6e7b82a19dfdc4c086700da3b062de8d7bf56dd",
         "src/platform_impl/macos/util/cursor.rs": "481fe6a34e1547449d8ee7b1a8a1cd93c304f15c2b62f6a6a71aba6d995b903d",
         "src/platform_impl/macos/util/mod.rs": "e8df577333134debdc0731a5198f5876ffb41a70df75b10f1f732874daa8cc1a",
         "src/platform_impl/macos/view.rs": "42b961529295790e6e9084c5a910c4116d1b6ac5f8f2af96a893b722d9dc59b2",
@@ -594,6 +602,22 @@
         "src/platform_impl/macos/window.rs": {
           "upstream": "d299bf58c503715c6aab15aee48194f566385e652b0003511ae34f7d5d60e0b0",
           "patched": "eb254ae034462b4ab42c463b095ba667efce0a6162ae68b0ddd1f7a979fa4bb5"
+        },
+        "src/platform_impl/macos/mod.rs": {
+          "upstream": "a60a9bcf84c7bd51f744450674702e6bb88b3e17fc744751b4c4a202544423f8",
+          "patched": "129888927595bd2c352c665bde7bbecd4537260bdf3ca7c15dfc6223f81649a6"
+        },
+        "src/platform_impl/macos/monitor.rs": {
+          "upstream": "3ef62d6dc6902798fe31b8d57e07bfdfc0a530cdf9a321460e84e4dc62427963",
+          "patched": "595fcdda6836184ac8ebe5319bae152ddfaedff4daec44e7b1ef4fd3da277f75"
+        },
+        "src/platform_impl/macos/util/async.rs": {
+          "upstream": "f53f5c3a4ec989fbe4126a38553328d3c03286ab9f29376b7854fb6feafdc5c8",
+          "patched": "9666c427876d51c403dd9d14e6e7b82a19dfdc4c086700da3b062de8d7bf56dd"
+        },
+        "src/platform/macos.rs": {
+          "upstream": "d1993f47ff4958ff98ba35a8560d7b0230e0ee527e8d01d54f28f3cb3b6c8c42",
+          "patched": "bd9048137865927a11605ae2db566d1a6e40d25929ee42f4d427ff07abec759a"
         }
       }
     },
@@ -642,7 +666,7 @@
         "src/platform_impl/gtk/mod.rs": "9b870f2366837784cfb0cf81038c6e76e754cb3d18d8d7c664a3ef9cf5254d02",
         "src/platform_impl/macos/accelerator.rs": "7d9123a9cf8027c8446391f508cf8618fdc018f5ddef714b8dc33d00940285aa",
         "src/platform_impl/macos/icon.rs": "c82702a05b3149845e16a2a8f097e03c863e433b410611066c60972a645e145c",
-        "src/platform_impl/macos/mod.rs": "3bec7b9ea8b76d1653158ba320e5fe44da57a3cd7172a54222435afa50f083dd",
+        "src/platform_impl/macos/mod.rs": "08602dda3b4ea67d08ba97c798ba02664125127c83c3fe08d1046e1239ad2341",
         "src/platform_impl/macos/util.rs": "0ac95957495b59039063f27b9172ece51e712c38b292be6685686bbe612c694d",
         "src/platform_impl/mod.rs": "1dfc1e2e99a1f5c2a48ee520e3184725a8a9ed1a62b467e939f1c7a526465653",
         "src/platform_impl/windows/accelerator.rs": "22846819c6740662aaf87533ef632862b219f556978da6cbeb1b5e36e0c50243",
@@ -656,6 +680,10 @@
         "Cargo.toml": {
           "upstream": "05925e996dda3c2fd15c295fc1701ba15ba4d6ac9b876e77dc9706cdcdb9a38b",
           "patched": "1c03c233d5417ca904f1428d80f542a012c174f63b30d6083ab68f25901b4013"
+        },
+        "src/platform_impl/macos/mod.rs": {
+          "upstream": "3bec7b9ea8b76d1653158ba320e5fe44da57a3cd7172a54222435afa50f083dd",
+          "patched": "08602dda3b4ea67d08ba97c798ba02664125127c83c3fe08d1046e1239ad2341"
         }
       }
     },
