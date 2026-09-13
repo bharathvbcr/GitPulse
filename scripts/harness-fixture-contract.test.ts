@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -139,6 +139,51 @@ describe("the stress harness stands in for the real IPC layer", () => {
         (field) => !new RegExp(`\\b${field}\\s*[:,}]`).test(fixtures),
       );
       expect(missing, `harness fixture is missing ${name}: ${missing.join(", ")}`).toEqual([]);
+    });
+  }
+});
+
+/**
+ * The check above proves a field *name* appears; it cannot see that the value
+ * has the wrong type. `source_freshness` is where that distinction bites,
+ * because the same name is a boolean on `CodeintelStatus` and a mandatory
+ * object on `CodeintelResponse` — and `parseSourceFreshness` throws on the
+ * wrong one, turning the whole answer into a failed read.
+ *
+ * That is not hypothetical either. `harness/paletteChecks.js` omitted the
+ * object entirely, so every symbol search resolved as "Search failed" and the
+ * palette harness had been timing out through a release; `harness/stress.html`
+ * carried the retired boolean, and `harness/uncommitted.html` made DiffViewer
+ * report "impact request failed" in place of the reason its fixture supplied.
+ *
+ * Both axes are derived: the commands from the client that parses them, the
+ * files from the harness directory.
+ */
+const parsedResponseCommands = [
+  ...src("../src/lib/codeintel/client.ts").matchAll(/asResponse\("(cmd_\w+)"\)/g),
+].map((match) => match[1]);
+
+const harnessDir = fileURLToPath(new URL("../harness", import.meta.url));
+const harnessFixtureFiles = readdirSync(harnessDir).filter((name) => /\.(html|js|ts|svelte)$/.test(name));
+
+describe("harness fixtures speak the CodeintelResponse wire shape", () => {
+  it("derives both the command list and the files to scan", () => {
+    // A rename on either side would otherwise empty this check silently.
+    expect(parsedResponseCommands.length).toBeGreaterThan(3);
+    expect(harnessFixtureFiles.length).toBeGreaterThan(5);
+  });
+
+  for (const file of harnessFixtureFiles) {
+    // Comments in these files deliberately name the wrong shapes they warn
+    // about, exactly as in stress.html above.
+    const body = readFileSync(`${harnessDir}/${file}`, "utf8").replace(/\/\/[^\n]*/g, "");
+    const mocked = parsedResponseCommands.filter((cmd) => new RegExp(`\\b${cmd}\\b`).test(body));
+    if (!mocked.length) continue;
+    it(`${file} carries a freshness object for ${mocked.join(", ")}`, () => {
+      // `fresh: null` plus a reason is a legitimate answer; a missing object and
+      // a bare boolean are both rejected by parseSourceFreshness.
+      expect(body, `${file} mocks ${mocked.join(", ")} without a source_freshness object`)
+        .toMatch(/source_freshness\s*:\s*\{/);
     });
   }
 });

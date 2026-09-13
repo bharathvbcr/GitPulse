@@ -219,7 +219,10 @@
       // src/lib/codeintel/types.ts. Missing from FIXTURES, invoke returned
       // null, and HealthPanel read `.available` off it.
       const deadSymbols = () => ({
-        source_freshness: true,
+        // An object, not the boolean CodeintelStatus carries below: on a
+        // CodeintelResponse parseSourceFreshness rejects a non-object, so the
+        // boolean made this a FAILED read instead of the answer it describes.
+        source_freshness: { fresh: true, generation_id: 12 },
         available: true,
         reason: null,
         items: [
