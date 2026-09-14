@@ -298,7 +298,7 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
         return HookOutput::notice(format!(
             "GitPulse collision check did NOT run for this edit: {}. \
              Other worktrees may hold uncommitted changes to this file.",
-            or_unknown(&facts.error)
+            clause(&facts.error)
         ));
     }
 
@@ -310,7 +310,7 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
                 "GitPulse collision check was INCOMPLETE for {}: {}. \
                  Nothing was found, but not everything was looked at.",
                 or_unknown(&facts.target),
-                facts.partial
+                clause(&facts.partial)
             ));
         }
         return HookOutput::silent();
@@ -1005,6 +1005,28 @@ fn or_unknown(text: &str) -> String {
     }
 }
 
+/// [`or_unknown`], for a reason being embedded *inside* a longer sentence.
+///
+/// These reasons are other people's finished sentences — a repository-trust
+/// refusal is three of them — so dropping one in front of a `. ` produced
+/// "…covers all of them.. Other worktrees may hold…". The terminator belongs
+/// to the sentence doing the embedding, not to the fragment being embedded.
+///
+/// Every trailing terminator, not just one: stripping a single dot off `...`
+/// leaves `..`, which is the defect again one character shorter. GitPulse
+/// writes truncation as `…`, so an ASCII run of dots here is punctuation, not
+/// meaning. A reason that is *nothing but* terminators leaves no clause at
+/// all, and an empty one would render as `: . Other worktrees` — so that falls
+/// back rather than producing a sentence with a hole in it.
+fn clause(text: &str) -> String {
+    let reason = or_unknown(text);
+    let trimmed = reason.trim_end_matches(['.', '!', '?']).trim_end();
+    if trimmed.is_empty() {
+        return reason;
+    }
+    trimmed.to_string()
+}
+
 /// Cuts `text` to `limit` bytes and says that it did.
 fn truncate_marked(mut text: String, limit: usize) -> String {
     const MARKER: &str = "\n… truncated";
@@ -1424,6 +1446,43 @@ mod tests {
         assert!(facts.partial.contains("1 worktree(s) could not be read"));
         assert!(facts.partial.contains("fatal: not a git repository"));
         assert!(!collision_decision(&facts).is_silent());
+    }
+
+    /// A refusal is a finished sentence — the trust one is three of them — and
+    /// the non-check notice embeds it before a `. `. Pasting the two together
+    /// shipped "…covers all of them.. Other worktrees may hold…" to every
+    /// agent session in an untrusted worktree.
+    #[test]
+    fn an_embedded_reason_does_not_bring_its_own_full_stop() {
+        let facts = CollisionFacts {
+            ok: false,
+            error: "REPOSITORY_TRUST_REQUIRED: Open /a in GitPulse and trust it. \
+                    This is a linked worktree: approving any working tree covers all of them."
+                .into(),
+            target: "a.txt".into(),
+            others: Vec::new(),
+            partial: String::new(),
+        };
+        let message = collision_decision(&facts)
+            .system_message
+            .expect("a non-check always says so");
+        assert!(
+            !message.contains(".."),
+            "a reason ending in a full stop must not double it: {message}"
+        );
+        assert!(
+            message.contains("covers all of them. Other worktrees"),
+            "the embedding sentence still supplies its own terminator: {message}"
+        );
+
+        // A reason that ends mid-clause is left alone; a run of dots goes
+        // entirely, because leaving one behind is the same defect shorter.
+        assert_eq!(clause("the disk went away"), "the disk went away");
+        assert_eq!(clause("it failed..."), "it failed");
+        assert_eq!(clause("really?"), "really");
+        assert_eq!(clause("   "), "reason unknown");
+        // Nothing but terminators would leave a hole in the sentence.
+        assert_eq!(clause("..."), "...");
     }
 
     /// `CollisionRisk::error` holds the first failure only. Rendering it after

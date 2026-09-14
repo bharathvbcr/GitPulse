@@ -52,6 +52,19 @@ before that tag is pushed.
   when they are shortened or the list is capped. `stale_server_warning`
   enumerates one process id per running `devmap mcp` — 84 of them on the
   machine that reported this — into a single line.
+- `npm run mcp:doctor` no longer reports a clean pass over binaries running
+  older code. `gitpulse-mcp` and `gitpulse-hook` report only their package
+  version, which is a *release* identity: it does not move when a fix lands
+  between releases, so the doctor compared 1.1.0 against 1.1.0 and said `ok`
+  for a hook built the day before the repository-trust fix — while that hook
+  went on handing users the pre-fix refusal. `mcp:install` now records a digest
+  of the sources it compiled, and the doctor re-derives it as a third verdict.
+  An install nobody recorded reports *unverifiable* rather than `ok`, because
+  one that was never checked must not read like one that was checked and
+  matched.
+- A refusal embedded in the collision-guard notice no longer brings its own
+  full stop with it, which was rendering "…covers all of them.. Other
+  worktrees may hold…" in every agent session inside an untrusted worktree.
 - The walkthrough no longer waits on a frame that may never arrive. Its
   spotlight was positioned from a measurement taken inside
   `requestAnimationFrame`, so on a host that had stopped painting — an occluded

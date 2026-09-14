@@ -29,16 +29,27 @@
  *   unresponsive it did not provide a usable identity
  *   absent       nothing by that name is on PATH at all
  *
- * Each binary carries its own verdict and both are printed. They are not
+ * Version and schema are the *release* identity, and that is not the whole
+ * question. Neither moves when a fix lands between releases, so a binary built
+ * from older source reports a version that still matches and passes every
+ * check above — which is exactly what happened: a `gitpulse-hook` built the day
+ * before a repository-trust fix was reported `ok` here while it went on
+ * emitting the pre-fix refusal. So a third half asks what source the binaries
+ * were actually built from, recorded by `npm run mcp:install` and re-derived
+ * here; see `install-identity.mjs`. Its verdicts add `unverifiable`, which is
+ * never folded into `ok` — an install nobody recorded must not read the same
+ * as one that was checked and matched.
+ *
+ * Each binary carries its own verdict and all three are printed. They are not
  * merged into one line: a healthy server reporting a clean pass over silently
  * disabled hooks is precisely the substitution this file exists to refuse.
- * The process exit code is the whole package — 0 only when both are ok.
+ * The process exit code is the whole package — 0 only when all are ok.
  *
  * Not part of `ci:local`: CI has no reason to install either binary, and a
  * check that cannot run there must not be made to look like one that passed.
  * Refresh with `npm run mcp:install`.
  *
- * Exit codes: 0 ok · 1 absent/stale/unresponsive · 2 internal error.
+ * Exit codes: 0 ok · 1 absent/stale/unresponsive/unverifiable · 2 internal error.
  *
  * Flags:
  *   --bin <path>       probe this server instead of resolving PATH
@@ -53,6 +64,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 import { readVendoredSchema } from "./check-vendor-schema.mjs";
+import { fileDigest, readInstallRecord, recordPath, sourceDigest } from "./install-identity.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -497,7 +509,86 @@ export function classifyHook({ binPath, version, subcommands, error, expected, d
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] } }} result
+ * Whether the binaries on PATH were built from the source this tree holds.
+ *
+ * The version and schema checks above answer "is this the right release". They
+ * cannot answer "is this the right code": both binaries report only
+ * `CARGO_PKG_VERSION`, so every fix that lands between releases leaves them
+ * reporting a version that still matches. That is not hypothetical — a
+ * `gitpulse-hook` built the day before a repository-trust fix passed both
+ * checks above while still emitting the pre-fix refusal to users.
+ *
+ * So the install writes down what it built from and this re-derives it. Three
+ * distinct ways of not being able to say yes, kept distinct because they need
+ * different actions:
+ *
+ * - **unverifiable** — no usable record, or a binary on PATH that this record
+ *   does not describe. Nothing was compared. It is never `ok`: an install that
+ *   was never recorded looks exactly like one that was, and that equivalence is
+ *   the whole defect this closes.
+ * - **stale** — the record describes these binaries, and this tree's sources
+ *   have moved since. Reinstalling is the fix.
+ * - **ok** — the digests agree.
+ *
+ * @param {{ record: import("./install-identity.mjs").InstallRecord | null, treeDigest: string, treeFileCount: number, binPaths: (string | null)[], root: string }} observed
+ * @returns {{ status: "ok" | "stale" | "unverifiable", violations: string[] }}
+ */
+export function classifyProvenance({ record, treeDigest, treeFileCount, binPaths, root }) {
+  const present = binPaths.filter((p) => /** @type {string | null} */ (p) !== null);
+  if (present.length === 0) {
+    return {
+      status: "unverifiable",
+      violations: ["neither binary is on PATH, so there is nothing to check provenance for"],
+    };
+  }
+  if (record === null) {
+    return {
+      status: "unverifiable",
+      violations: [
+        `no usable install record at ${recordPath()} — the binaries on PATH cannot be traced to any source`,
+        "record one with: npm run mcp:install",
+      ],
+    };
+  }
+  /** @type {string[]} */
+  const unknown = [];
+  /** @type {string[]} */
+  const replaced = [];
+  for (const bin of present) {
+    const recorded = record.binaries[/** @type {string} */ (bin)];
+    if (recorded === undefined) {
+      unknown.push(/** @type {string} */ (bin));
+      continue;
+    }
+    const actual = fileDigest(/** @type {string} */ (bin));
+    if (actual === null || actual !== recorded) replaced.push(/** @type {string} */ (bin));
+  }
+  if (unknown.length > 0 || replaced.length > 0) {
+    return {
+      status: "unverifiable",
+      violations: [
+        ...unknown.map((bin) => `${bin} is on PATH but the install record does not describe it`),
+        ...replaced.map((bin) => `${bin} has changed since it was recorded — something other than npm run mcp:install wrote it`),
+        "re-record with: npm run mcp:install",
+      ],
+    };
+  }
+  if (record.sourceDigest !== treeDigest) {
+    const from = record.sourceRoot === root ? "" : ` (installed from ${record.sourceRoot})`;
+    return {
+      status: "stale",
+      violations: [
+        `the binaries on PATH were built from source that differs from this tree${from} — installed ${record.installedAt}`,
+        `recorded digest ${record.sourceDigest.slice(0, 16)}… over ${record.sourceFileCount} files; this tree is ${treeDigest.slice(0, 16)}… over ${treeFileCount}`,
+        "refresh it with: npm run mcp:install",
+      ],
+    };
+  }
+  return { status: "ok", violations: [] };
+}
+
+/**
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null } }} result
  */
 export function formatReport(result) {
   const lines = ["MCP install doctor", ""];
@@ -522,6 +613,16 @@ export function formatReport(result) {
       for (const violation of hook.violations) lines.push(`    - ${violation}`);
     }
   }
+  const provenance = result.provenance;
+  if (provenance) {
+    lines.push("", "  source provenance", "");
+    lines.push(`  ${"this tree's source digest".padEnd(26)} : ${provenance.treeDigest.slice(0, 16)}… (${provenance.treeFileCount} files)`);
+    lines.push(`  ${"recorded at install".padEnd(26)} : ${provenance.installedAt ?? "<never recorded>"}`);
+    if (provenance.violations.length > 0) {
+      lines.push("", "  violations:");
+      for (const violation of provenance.violations) lines.push(`    - ${violation}`);
+    }
+  }
   // Each half gets its own verdict line. Collapsing them into one would let a
   // healthy server report a clean pass over silently disabled hooks, which is
   // the exact substitution this doctor exists to refuse.
@@ -536,6 +637,13 @@ export function formatReport(result) {
       hook.status === "ok"
         ? `OK: the ${HOOK_BIN} on PATH is version ${result.expected} and serves every hook the plugin declares.`
         : `FAIL (${hook.status}): the hooks the plugin declares would not run against this tree's build.`,
+    );
+  }
+  if (provenance) {
+    lines.push(
+      provenance.status === "ok"
+        ? "OK: both binaries were built from the source this tree holds."
+        : `FAIL (${provenance.status}): the code running inside those binaries is not this tree's — version alone cannot see this.`,
     );
   }
   return lines.join("\n");
@@ -588,7 +696,7 @@ export function usage() {
       { flag: "--json", description: "print the result as JSON" },
       { flag: "--help, -h", description: "print this message and exit 0" },
     ],
-    exits: "0 the installed server matches · 1 absent, stale, or unresponsive · 2 the check could not run",
+    exits: "0 the installed server matches · 1 absent, stale, unresponsive, or unverifiable · 2 the check could not run",
   });
 }
 
@@ -632,6 +740,21 @@ export async function main(argv = process.argv.slice(2)) {
       ok: hookVerdict.status === "ok",
     };
 
+    // Asked of the tree, not of the binaries: they have no channel for it.
+    const { digest: treeDigest, fileCount: treeFileCount } = sourceDigest(REPO_ROOT);
+    const record = readInstallRecord();
+    const provenanceVerdict = classifyProvenance({
+      record, treeDigest, treeFileCount, binPaths: [binPath, hookPath], root: REPO_ROOT,
+    });
+    const provenance = {
+      status: provenanceVerdict.status,
+      violations: provenanceVerdict.violations,
+      treeDigest,
+      treeFileCount,
+      installedAt: record?.installedAt ?? null,
+      ok: provenanceVerdict.status === "ok",
+    };
+
     const result = {
       binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema,
       status, violations,
@@ -639,7 +762,8 @@ export async function main(argv = process.argv.slice(2)) {
       // is not silently told something new; `ok` below is the whole package.
       serverOk: status === "ok",
       hook,
-      ok: status === "ok" && hook.ok,
+      provenance,
+      ok: status === "ok" && hook.ok && provenance.ok,
     };
     if (opts.json) console.log(JSON.stringify(result, null, 2));
     else console.log(formatReport(result));
