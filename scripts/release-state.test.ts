@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { expectedAssetNames } from "./check-release-assets.mjs";
-import { runReleaseStage, runCommand, main, type Runner } from "./release-state.mjs";
+import { runReleaseStage, runCommand, main, resolveReleaseContext, type Runner } from "./release-state.mjs";
 
 const commit = "a".repeat(40);
 const tag = "v1.2.3";
@@ -300,17 +301,68 @@ describe("remote release lifecycle", () => {
     };
     expect(runReleaseStage(options, custom404Run).release_id).toBe("42");
   });
-  it("main ready resolves repository, commit, and tag from local git when env vars are unset", () => {
-    const originalEnv = { ...process.env };
-    delete process.env.GH_REPO;
-    delete process.env.RELEASE_COMMIT;
-    delete process.env.RELEASE_TAG;
-    try {
-      // In the local repo, commit has not been pushed to CI yet so ready exits 1 with a CI error, not 'Invalid repository'
-      const exitCode = main(["ready"]);
-      expect(exitCode).toBe(1);
-    } finally {
-      process.env = originalEnv;
-    }
+  // Driven through an injected runner rather than the real `git`. The point is
+  // which identifier each source wins from, and spawning to learn that measured
+  // the host instead: it reached the network through `gh` and timed out on a
+  // Windows runner, where process creation is dearer, while passing elsewhere.
+  const gitRun = (out: Record<string, string>): Runner => (program, args) => {
+    const key = `${program} ${args.join(" ")}`;
+    return {status: key in out ? 0 : 1, failed: false, stdout: out[key] ?? ""};
+  };
+  const ORIGIN = "git config --get remote.origin.url";
+  const HEAD = "git rev-parse HEAD";
+  const POINTS_AT = "git tag --points-at HEAD";
+
+  it("resolves repository, commit, and tag from local git when env vars are unset", () => {
+    expect(resolveReleaseContext({}, gitRun({
+      [ORIGIN]: "https://github.com/owner/repo.git\n",
+      [HEAD]: `${commit}\n`,
+      [POINTS_AT]: `${tag}\n`,
+    }))).toEqual({repo: "owner/repo", commit, tag});
+  });
+
+  it("resolves an SSH remote and a checkout carrying several tags", () => {
+    expect(resolveReleaseContext({}, gitRun({
+      [ORIGIN]: "git@github.com:owner/repo.git\n",
+      [HEAD]: `${commit}\n`,
+      // Only the vMAJOR.MINOR.PATCH one names a release; the draft leftover
+      // `untagged-<hex>` shape sits beside it in real checkouts.
+      [POINTS_AT]: `untagged-2db6b2cc5c\n${tag}\n`,
+    }))).toEqual({repo: "owner/repo", commit, tag});
+  });
+
+  it("prefers the environment over git, so CI stays authoritative", () => {
+    const env = {GH_REPO: "ci/owner", RELEASE_COMMIT: "b".repeat(40), RELEASE_TAG: "v9.9.9"};
+    expect(resolveReleaseContext(env, gitRun({
+      [ORIGIN]: "https://github.com/owner/repo.git\n",
+      [HEAD]: `${commit}\n`,
+      [POINTS_AT]: `${tag}\n`,
+    }))).toEqual({repo: "ci/owner", commit: "b".repeat(40), tag: "v9.9.9"});
+  });
+
+  it("falls back to the package version when HEAD carries no release tag", () => {
+    const resolved = resolveReleaseContext({}, gitRun({
+      [ORIGIN]: "https://github.com/owner/repo.git\n",
+      [HEAD]: `${commit}\n`,
+      [POINTS_AT]: "\n",
+    }));
+    // Read from this repository's own package.json, so it tracks the release
+    // rather than pinning a number this test would have to be told about.
+    const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+    expect(resolved.tag).toBe(`v${version}`);
+  });
+
+  it("leaves an unresolvable remote empty rather than guessing a repository", () => {
+    expect(resolveReleaseContext({}, gitRun({
+      [ORIGIN]: "https://example.invalid/not-github.git\n",
+      [HEAD]: `${commit}\n`,
+      [POINTS_AT]: `${tag}\n`,
+    })).repo).toBe("");
+  });
+
+  it("main still refuses a stage it cannot resolve a repository for", () => {
+    // The exit-code contract the removed end-to-end case was really asserting,
+    // without a network round trip: a refusal prints and returns 1.
+    expect(main(["prepare", "extra"])).toBe(1);
   });
 });

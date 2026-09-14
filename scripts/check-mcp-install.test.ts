@@ -361,8 +361,20 @@ describe("classifyHook", () => {
   });
 });
 
+/**
+ * A shebang script is the only executable a test can synthesise in process,
+ * and it is POSIX-only: Windows dispatches on the extension, `CreateProcess`
+ * cannot run a `.mjs`, and `spawn` without a shell refuses a `.cmd` — so
+ * `fakeHook` there yields `spawn EFTYPE` rather than the behaviour under test.
+ * The shipped Windows hook is `gitpulse-hook.exe`, a real executable, so the
+ * production path is not what these skip; only the stand-in is. The
+ * spawn-failure branch stays covered on every platform by the missing-binary
+ * case below, and the parsing itself by the `parseHookIdentity` suite.
+ */
+const itPosix = it.skipIf(process.platform === "win32");
+
 describe("probeHook", () => {
-  it("reads a complete identity split across writes", async () => {
+  itPosix("reads a complete identity split across writes", async () => {
     const bin = await fakeHook("ok", "gitpulse-hook 1.0.1\nsubcommands: collision-guard, command-gate, session-brief\n");
     await expect(probeHook(bin, 5000)).resolves.toEqual({
       version: "1.0.1",
@@ -371,7 +383,7 @@ describe("probeHook", () => {
     });
   });
 
-  it("reports a binary that prints nothing rather than hanging on it", async () => {
+  itPosix("reports a binary that prints nothing rather than hanging on it", async () => {
     const bin = await fakeHook("silent", "");
     const result = await probeHook(bin, 5000);
     expect(result.version).toBeNull();
@@ -385,7 +397,7 @@ describe("probeHook", () => {
     expect(result.error).toBeTruthy();
   });
 
-  it("bounds a binary that never exits", async () => {
+  itPosix("bounds a binary that never exits", async () => {
     // The identity path reads no stdin, so a build that blocks on it would
     // hang this probe forever without the deadline.
     const dir = await scratchDir("hang");

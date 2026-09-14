@@ -245,6 +245,51 @@ export function runReleaseStage(options, run = runCommand) {
   return { release_id: String(release.id), commit, tag, stage };
 }
 
+/**
+ * The three identifiers a stage needs. CI supplies all of them; a local
+ * `ready` check supplies none, so each falls back to what this checkout
+ * already knows.
+ *
+ * Both the environment and the command runner are parameters so this can be
+ * exercised without spawning anything. A test that shelled out here measured
+ * the host rather than the resolution: three `git` spawns plus a `gh` call
+ * reaching the network sat under Vitest's 5s limit on Linux and macOS and
+ * exceeded it on a Windows runner, where process creation is dearer — a
+ * failure that said nothing about the code under test.
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @param {Runner} [run]
+ * @returns {{repo: string, commit: string, tag: string}}
+ */
+export function resolveReleaseContext(env = process.env, run = runCommand) {
+  let repo = env.GH_REPO ?? "";
+  if (!repo) {
+    const origin = run("git", ["config", "--get", "remote.origin.url"]).stdout.trim();
+    const match = /(?:github\.com[:/])([^/]+)\/([^/.]+?)(?:\.git)?$/.exec(origin);
+    if (match) repo = `${match[1]}/${match[2]}`;
+  }
+  let commit = env.RELEASE_COMMIT ?? "";
+  if (!commit) {
+    commit = run("git", ["rev-parse", "HEAD"]).stdout.trim();
+  }
+  let tag = env.RELEASE_TAG ?? "";
+  if (!tag) {
+    const tagAtHead = run("git", ["tag", "--points-at", "HEAD"]).stdout.trim().split(/\s+/).find(t => /^v\d+\.\d+\.\d+$/.test(t));
+    if (tagAtHead) {
+      tag = tagAtHead;
+    } else {
+      try {
+        const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+        if (pkg.version) tag = `v${pkg.version}`;
+      } catch {
+        // An unreadable package.json leaves the tag empty rather than guessed;
+        // runReleaseStage then refuses it by name.
+      }
+    }
+  }
+  return {repo, commit, tag};
+}
+
 /** @param {string[]} [argv] */
 export function main(argv = process.argv.slice(2)) {
   if (wantsHelp(argv)) {
@@ -255,30 +300,7 @@ export function main(argv = process.argv.slice(2)) {
   }
   try {
     if (argv.length !== 1) throw new Error("Usage: release-state.mjs prepare|check|finalize|ready (RELEASE_TAG, RELEASE_COMMIT, GH_REPO, RELEASE_ID)");
-    let repo = process.env.GH_REPO ?? "";
-    if (!repo) {
-      const origin = runCommand("git", ["config", "--get", "remote.origin.url"]).stdout.trim();
-      const match = /(?:github\.com[:/])([^/]+)\/([^/.]+?)(?:\.git)?$/.exec(origin);
-      if (match) repo = `${match[1]}/${match[2]}`;
-    }
-    let commit = process.env.RELEASE_COMMIT ?? "";
-    if (!commit) {
-      commit = runCommand("git", ["rev-parse", "HEAD"]).stdout.trim();
-    }
-    let tag = process.env.RELEASE_TAG ?? "";
-    if (!tag) {
-      const tagAtHead = runCommand("git", ["tag", "--points-at", "HEAD"]).stdout.trim().split(/\s+/).find(t => /^v\d+\.\d+\.\d+$/.test(t));
-      if (tagAtHead) {
-        tag = tagAtHead;
-      } else {
-        try {
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          if (pkg.version) tag = `v${pkg.version}`;
-        } catch {
-          // ignore
-        }
-      }
-    }
+    const {repo, commit, tag} = resolveReleaseContext();
     let notes;
     if (argv[0] === "finalize") {
       const section = extractNotes(readFileSync("CHANGELOG.md", "utf8"), tag);

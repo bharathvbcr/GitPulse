@@ -996,6 +996,9 @@ mod tests {
         }
     }
 
+    // Mode bits decide this property, and `PermissionsExt::from_mode` exists
+    // only on unix — the same gate its sibling above already carries.
+    #[cfg(unix)]
     #[test]
     fn only_a_privately_held_path_skips_the_child_side_re_anchor() {
         use std::os::unix::fs::PermissionsExt;

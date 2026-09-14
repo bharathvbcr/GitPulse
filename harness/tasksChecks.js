@@ -4,6 +4,8 @@ import { get } from "svelte/store";
 import { promptState } from "../src/lib/stores/modalStore";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { applyPlatformClass } from "../src/lib/platform";
+import { shortcutTextLabel } from "../src/lib/ui/platformCopy";
+import { hostPlatform } from "../src/lib/stores/platformStore";
 import TasksHost from "./TasksHost.svelte";
 import { themeStore } from "../src/lib/stores/themeStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
@@ -938,8 +940,14 @@ if (params.has("check")) {
       Boolean(sheet()) && preparedRuns.length === 0);
     check("the handoff sheet shows what it would run before it runs it",
       sheet().textContent.includes("Saved revision") && Boolean(sheet().querySelector('[data-testid="task-handoff-form"]')));
+    // The ready hint is written the way the sheet writes it. Hard-coding the
+    // macOS glyphs made this assert the host as well as the gate: off macOS
+    // `shortcutTextLabel` spells ⌘ as "Ctrl+", so the comparison was false for
+    // a ready gate and the check inverted on the Linux runner while passing on
+    // every Mac it was written on.
+    const launchHint = `${shortcutTextLabel("⌘↩", get(hostPlatform).os)} to launch`;
     check("the handoff names the one thing left to do rather than a dead button",
-      button("Launch in Codex", sheet()).disabled === (sheet().querySelector(".gate").textContent.trim() !== "⌘↩ to launch"));
+      button("Launch in Codex", sheet()).disabled === (sheet().querySelector(".gate").textContent.trim() !== launchHint));
     sheet().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
     check("Escape closes the handoff without preparing a run", !sheet() && preparedRuns.length === 0);
 

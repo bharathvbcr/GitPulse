@@ -237,6 +237,13 @@ fn entry_mode(dir: &std::fs::File, name: &std::ffi::CStr) -> Option<libc::mode_t
     (rc == 0).then_some(status.st_mode)
 }
 
+/// The no-follow pin is the unix half of this seam: [`PinnedDir`] and the
+/// descriptor walk behind it are unix-only, and Windows pins a path through
+/// [`pin_dir_chain`] instead. Without this gate the Windows build type-checks a
+/// signature naming items that exist nowhere on that platform, so the failure
+/// lands in the library rather than at the one caller that needs it — and
+/// `pin_and_admit`, the only caller outside tests, is itself `#[cfg(unix)]`.
+#[cfg(unix)]
 pub(crate) fn pin_dir_nofollow(dir: &Path) -> io::Result<PinnedDir> {
     if !dir.is_absolute() {
         return Err(io::Error::new(
