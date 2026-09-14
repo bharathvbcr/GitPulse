@@ -13,21 +13,41 @@ export async function checkStatusPopover() {
     // transitioning is one a probe can read the previous state of, and the
     // runner that fails these is the slow one, never a developer's machine.
     await animationsSettled();
+    // An outro finishing is not the node being gone: Svelte unmounts on the
+    // callback after it, so a probe asserting a panel has closed can still see
+    // it for one frame. Give that frame back before anyone looks.
+    await new Promise(resolve => requestAnimationFrame(resolve));
     await tick();
   };
   /**
    * Wait for the disclosure to stop moving before measuring it.
    *
-   * `settle` spends a fixed 220ms, which is a guess about a transition rather
-   * than a fact about one. Where a probe compares a height against a tight
-   * bound, a few pixels of unfinished animation decide the result, and the
-   * difference between a fast laptop and a loaded CI runner is exactly that
-   * many pixels. Bounded, so a looping animation cannot hang the harness.
+   * `settle`'s fixed delay is a guess about how long this host takes; the
+   * animations are a fact about whether it has finished. That matters here for
+   * a specific reason: `.details` opens with `transition:slide`, and Svelte's
+   * slide holds `overflow: hidden` on the element for the whole transition
+   * (`svelte/src/transition/index.js`). Measured mid-slide, a pane whose
+   * stylesheet says `overflow:auto` computes as `hidden` — so the probe read
+   * the transition rather than the rule, on the slow runner only.
+   *
+   * Two details this must get right, both learned by getting them wrong:
+   * a transition the click just started is `pending`, not `running`, so a
+   * check for `running` alone walks straight past it and measures mid-flight;
+   * and it is not registered at all until the next frame. Await the animations'
+   * own completion rather than re-polling a state word. Bounded throughout, so
+   * an animation that loops forever cannot hang the harness.
    */
   const animationsSettled = async (budget = 2000) => {
     const deadline = performance.now() + budget;
-    while (document.getAnimations().some(animation => animation.playState === "running") && performance.now() < deadline) {
-      await new Promise(resolve => requestAnimationFrame(resolve));
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    while (performance.now() < deadline) {
+      const live = document.getAnimations()
+        .filter(animation => animation.playState === "running" || animation.playState === "pending");
+      if (live.length === 0) return;
+      await Promise.race([
+        Promise.allSettled(live.map(animation => animation.finished)),
+        new Promise(resolve => setTimeout(resolve, Math.max(0, deadline - performance.now()))),
+      ]);
     }
   };
   const element = (selector: string) => {
