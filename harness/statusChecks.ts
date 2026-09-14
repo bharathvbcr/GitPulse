@@ -4,51 +4,118 @@ import { tick } from "svelte";
 export async function checkStatusPopover() {
   const results: { name: string; pass: boolean }[] = [];
   const check = (name: string, pass: boolean) => results.push({ name, pass });
-  const settle = async () => {
-    await tick();
-    await new Promise(resolve => setTimeout(resolve, 220));
-    await tick();
-    // The fixed delay above is a guess about how long this host takes; the
-    // animations are a fact about whether it has finished. A popover still
-    // transitioning is one a probe can read the previous state of, and the
-    // runner that fails these is the slow one, never a developer's machine.
-    await animationsSettled();
-    // An outro finishing is not the node being gone: Svelte unmounts on the
-    // callback after it, so a probe asserting a panel has closed can still see
-    // it for one frame. Give that frame back before anyone looks.
-    await new Promise(resolve => requestAnimationFrame(resolve));
-    await tick();
+  /**
+   * Every animation that can still change what the next probe reads.
+   *
+   * `playState === "running"` is the wrong question in both directions. A
+   * transition Svelte has scheduled but not yet begun has nothing running, and
+   * an animation that has reached its end reports `finished` for the whole gap
+   * between its last frame and the frame that dispatches its finish event —
+   * and that event is where Svelte does the cleanup these probes depend on. It
+   * is there that the slide's inline `overflow:hidden` is reverted and the
+   * outroing node leaves the DOM. Presence spans both, because Svelte cancels
+   * the animation from the same callback, so the animation outlives every
+   * intermediate state a probe must not measure.
+   *
+   * The refresh spinner and the busy pulse never end. Counting those could
+   * only ever exhaust the wait, so an endless animation is not something to
+   * wait for; anything with a finite end is.
+   */
+  const animating = () => document.getAnimations()
+    .filter(animation => Number.isFinite(Number(animation.effect?.getComputedTiming().endTime)));
+  const describeAnimating = () => {
+    // One theme change starts a colour transition on every button, so the full
+    // list is unreadable in a CI log and says nothing the first few do not.
+    // The count still travels, because "3 shown" and "3 running" are different
+    // facts and only one of them is a reason to stop looking.
+    const all = animating().map(animation => {
+      const target = animation.effect instanceof KeyframeEffect ? animation.effect.target : null;
+      const name = animation instanceof CSSAnimation ? animation.animationName
+        : animation instanceof CSSTransition ? animation.transitionProperty : "transition";
+      return `${name}@${target ? `${target.tagName.toLowerCase()}.${[...target.classList].join(".")}` : "?"}:${animation.playState}`;
+    });
+    if (!all.length) return "nothing";
+    return `${all.length} animation(s): ${all.slice(0, 3).join(", ")}${all.length > 3 ? `, and ${all.length - 3} more` : ""}`;
   };
   /**
-   * Wait for the disclosure to stop moving before measuring it.
+   * The longest any one wait took, and what it was waiting for.
    *
-   * `settle`'s fixed delay is a guess about how long this host takes; the
-   * animations are a fact about whether it has finished. That matters here for
-   * a specific reason: `.details` opens with `transition:slide`, and Svelte's
-   * slide holds `overflow: hidden` on the element for the whole transition
-   * (`svelte/src/transition/index.js`). Measured mid-slide, a pane whose
-   * stylesheet says `overflow:auto` computes as `hidden` — so the probe read
-   * the transition rather than the rule, on the slow runner only.
-   *
-   * Two details this must get right, both learned by getting them wrong:
-   * a transition the click just started is `pending`, not `running`, so a
-   * check for `running` alone walks straight past it and measures mid-flight;
-   * and it is not registered at all until the next frame. Await the animations'
-   * own completion rather than re-polling a state word. Bounded throughout, so
-   * an animation that loops forever cannot hang the harness.
+   * A green run on a host nobody can log into says only that the margin was
+   * positive, never how positive — and that is the whole question here, since
+   * the wait this replaces was passing locally with about twenty milliseconds
+   * in hand while failing on the runner. Carrying the worst case out with the
+   * verdict turns each CI run into a measurement of the headroom rather than
+   * one more coin flip whose bias nobody can see.
    */
-  const animationsSettled = async (budget = 2000) => {
-    const deadline = performance.now() + budget;
-    await new Promise(resolve => requestAnimationFrame(resolve));
-    while (performance.now() < deadline) {
-      const live = document.getAnimations()
-        .filter(animation => animation.playState === "running" || animation.playState === "pending");
-      if (live.length === 0) return;
-      await Promise.race([
-        Promise.allSettled(live.map(animation => animation.finished)),
-        new Promise(resolve => setTimeout(resolve, Math.max(0, deadline - performance.now()))),
-      ]);
+  const slowest = { ms: 0, waitingFor: "nothing" };
+  // The two guards below stretch a slide on purpose. Their waits are the one
+  // kind that says nothing about the host, so they are left out of the figure.
+  let contrived = false;
+  /**
+   * Wait until the popover has finished reacting, rather than for a guess at
+   * how long that takes.
+   *
+   * This used to spend a fixed 220ms and only then ask what was still running.
+   * Measured under WKWebView, one `transition:slide` costs about 197ms from
+   * the click to the node coming to rest, so the fixed budget was racing the
+   * transition with roughly twenty milliseconds in hand — and the two hops
+   * that make up that difference, the frame that starts the animation and the
+   * frame that dispatches its finish event, are exactly what stretches on a
+   * loaded runner while a 220ms timer does not. Nothing in the old spelling
+   * could report that it had measured too early. It simply handed the probes a
+   * pane whose inline `overflow:hidden` had not been reverted yet, or a node
+   * the outro had not yet removed, and those are precisely the assertions that
+   * failed on CI and nowhere else.
+   *
+   * Waiting on the animations themselves removes the race in both directions:
+   * it cannot end early, it does not pay 220ms when nothing is moving, and it
+   * is loud when it cannot finish, because a probe that could not run must
+   * never be indistinguishable from one that ran and passed.
+   */
+  const settle = async (budget = 8000) => {
+    await tick();
+    // Svelte creates a transition's animation in a microtask after the effect
+    // flush, so give the task back before looking; a synchronous look lands in
+    // the gap before the transition it is meant to wait for exists.
+    await new Promise(resolve => setTimeout(resolve));
+    const began = performance.now();
+    while (animating().length) {
+      const waited = performance.now() - began;
+      if (waited > budget) throw new Error(`The popover never settled after ${budget}ms: ${describeAnimating()}`);
+      if (!contrived && waited > slowest.ms) { slowest.ms = waited; slowest.waitingFor = describeAnimating(); }
+      // A host that has stopped producing frames still has to reach that
+      // deadline. Waiting on `requestAnimationFrame` alone is how a stalled
+      // runner turns a named failure into the runner's own "did not finish
+      // within 60 seconds", which names nothing at all.
+      await new Promise(resolve => { requestAnimationFrame(() => resolve(null)); setTimeout(resolve, 50); });
     }
+    contrived = false;
+    await tick();
+  };
+  const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+  /**
+   * Stretch the transition now under way until it outlasts any fixed budget a
+   * wait could carry.
+   *
+   * This is the runner, reproduced. What a loaded macOS runner does to this
+   * fixture is stretch the frame-driven parts of a transition — the frame that
+   * starts the animation, and the frame that dispatches its finish event and
+   * with it Svelte's cleanup — while leaving the fixture's own timers running
+   * at full speed. Starving a healthy browser of frames from inside the page
+   * is not possible; blocking the thread only delays the frame and the timer
+   * together, and the browser paints as soon as it is released. Stretching the
+   * same interval from the other side costs nothing in fidelity: what the
+   * probes then face is the state that matters, a pane still mid-slide at the
+   * moment they read it, reached without asking the host for anything.
+   *
+   * It throws unless exactly one transition is under way, so a guard whose
+   * slide never started cannot report that the wait handled a slow one.
+   */
+  const outlastAnyBudget = (rate = 0.06) => {
+    const [transition, ...rest] = animating();
+    if (!transition || rest.length) throw new Error(`Expected exactly one transition to slow down, saw ${describeAnimating()}`);
+    transition.playbackRate = rate;
+    contrived = true;
   };
   const element = (selector: string) => {
     const value = document.querySelector(selector);
@@ -162,7 +229,6 @@ export async function checkStatusPopover() {
     await click(".primary"); check("review opens the existing work view", action("section:work:overview"));
     await click(".details-toggle");
     check("Details reveals the available stashes and utilities", !!details() && !button('[aria-label="2 stashes"]').disabled && !!document.querySelector('[aria-label="Tools"]'));
-    await animationsSettled();
     // Split from one `&&`. A panel that outgrew its window, a pane that lost
     // its height cap, and a pane that stopped scrolling are three different
     // defects, and as a single assertion all three reported the same sentence —
@@ -173,6 +239,23 @@ export async function checkStatusPopover() {
     check("Details stays within its 190px cap", detailsPane.offsetHeight <= 190);
     check("Details scrolls instead of growing the panel", getComputedStyle(detailsPane).overflowY === "auto");
     check("Details is keyboard scrollable", element(".details").tabIndex === 0);
+    // Two guards on the wait itself rather than on the popover, because a wait
+    // that ends early is indistinguishable from a component that broke, and
+    // that ambiguity is what left these failures un-actionable for a release.
+    // Each runs a slide well past any fixed budget, so the probe that follows
+    // meets a pane Svelte has not finished with: an outroing node still in the
+    // DOM, and a disclosure still under the slide's inline `overflow:hidden`.
+    // Both are what a `playState === "running"` test, or a stopwatch, calls
+    // settled — and both are exactly what failed on the runner and passed here.
+    button(".details-toggle").click();
+    await tick(); await frame(); outlastAnyBudget();
+    await settle();
+    check("a collapse slower than the wait is waited out, not read through", !details());
+    button(".details-toggle").click();
+    await tick(); await frame(); outlastAnyBudget();
+    await settle();
+    check("a disclosure slower than the wait is waited out, not read through",
+      !!details() && getComputedStyle(element(".details")).overflowY === "auto");
     await click('[aria-label="2 stashes"]'); check("stashes reuse the work view", action("section:work:overview"));
     await click('[aria-label="Command palette"]'); check("the palette remains available inside Details", action("palette"));
     await click('button[title="History"]'); check("History shortcut retains its destination", action("section:history:graph"));
@@ -265,7 +348,8 @@ export async function checkStatusPopover() {
   } catch (error) {
     check(error instanceof Error ? error.message : String(error), false);
   }
-  document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results })));
+  const diagnostics = `slowest settle ${Math.round(slowest.ms)}ms, waiting for ${slowest.waitingFor}`;
+  document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results, diagnostics })));
   const report = new URLSearchParams(location.search).get("report");
   if (report) await fetch(report, { method: "POST", body: document.documentElement.outerHTML });
 }

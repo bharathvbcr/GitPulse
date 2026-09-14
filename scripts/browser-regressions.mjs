@@ -29,6 +29,10 @@ export function readBrowserVerdict(html) {
   if ("genuineObserverShapes" in result && Array.isArray(result.genuineObserverShapes) && result.genuineObserverShapes.length) {
     console.log("genuineObserverShapes", JSON.stringify(result.genuineObserverShapes[0]));
   }
+  // A harness that measured its own headroom says so on the way past. A green
+  // run on a runner nobody can log into otherwise reports only that the margin
+  // was positive, which is what let a fixture pass here and fail there.
+  if ("diagnostics" in result && typeof result.diagnostics === "string") console.log("diagnostics:", result.diagnostics);
   return `${rows.length}/${rows.length} browser regressions passed`;
 }
 
