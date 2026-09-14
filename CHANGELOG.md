@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-14
+
+A release about checks that were not telling the truth. Every fix here is a
+report that read as an answer without being one: a doctor that compared a
+version against itself and said `ok` for a binary running week-old code, an
+installation check that named a cause it did not have, warnings dropped on the
+way to the panel that promised to show them, and a measurement that silently
+never happened on a window that had stopped painting. A check that could not
+run must not read like one that ran and passed.
+
+Repository trust is the other half. An approval made before 1.1.0 left every
+linked worktree refused with nothing offering a way out — the app reported the
+repository as trusted and never asked again, so worktree comparisons, collision
+checks and the fleet view quietly dropped every sibling. Trust is now reported
+as a scope rather than a yes/no, and the worktrees panel offers to extend an
+approval that predates worktree coverage. Approvals are still never widened by
+being read: extending is a decision you take, through the same dialog.
+
 ### Changed
 
 - `extended_child_path` leaves a `PATH` already at the `execve` argument-size
@@ -1684,7 +1702,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
 [0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0

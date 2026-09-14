@@ -69,6 +69,76 @@ export function versionLiteralMatcher(version: string): RegExp {
   return new RegExp(String.raw`(?<![\w.])v?${escaped}(?![\w.-])`);
 }
 
+/**
+ * The same lines with comment *text* blanked out and code left in place.
+ *
+ * The guard catches a version that reaches behaviour. A version inside a
+ * comment reaches nothing, and prose legitimately names versions: `refScope.ts`
+ * illustrates a short ref label with `v1.2.0`, which was an arbitrary example
+ * when it was written and became this repository's own version two releases
+ * later. The header above reasons that historical fixtures "can never collide"
+ * because versions only go up — true of fixtures, false of prose, which is free
+ * to name a version that has not shipped yet. Flagging it taught nobody
+ * anything and blocked a release.
+ *
+ * String state is tracked so `//` inside a URL is not mistaken for a comment:
+ * stripping there would hide a real literal rather than a prose one, turning a
+ * false alarm into a silent miss. The one known blind spot is a regex literal
+ * containing `//` (`/\/\//`), which ends the line early — a false strip, so at
+ * worst a missed offender on a line that also holds a regex, never a false one.
+ */
+export function stripComments(source: string, style: "c" | "hash"): string[] {
+  const out: string[] = [];
+  let inBlock = false;
+  for (const line of source.split(/\r?\n/)) {
+    let code = "";
+    let quote: string | null = null;
+    let index = 0;
+    while (index < line.length) {
+      const ch = line[index];
+      const next = line[index + 1];
+      if (inBlock) {
+        if (ch === "*" && next === "/") inBlock = false, (index += 2);
+        else index += 1;
+        continue;
+      }
+      if (quote) {
+        code += ch;
+        if (ch === "\\" && next !== undefined) {
+          code += next;
+          index += 2;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        index += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") {
+        quote = ch;
+        code += ch;
+        index += 1;
+        continue;
+      }
+      if (style === "hash" && ch === "#") break;
+      if (style === "c" && ch === "/" && next === "/") break;
+      if (style === "c" && ch === "/" && next === "*") {
+        inBlock = true;
+        index += 2;
+        continue;
+      }
+      code += ch;
+      index += 1;
+    }
+    out.push(code);
+  }
+  return out;
+}
+
+/** `#` marks a comment in YAML; every other scanned extension is C-family. */
+export function commentStyle(relPath: string): "c" | "hash" {
+  return /\.ya?ml$/.test(relPath) ? "hash" : "c";
+}
+
 /** Repo-root config files, without descending into every sibling directory. */
 function rootConfigFiles(): string[] {
   return readdirSync(REPO_ROOT)
@@ -104,12 +174,35 @@ describe("the app version is never retyped in source", () => {
     expect(versionLiteralMatcher(VERSION).test(`"${VERSION}"`)).toBe(true);
   });
 
+  it("blanks comment prose without blanking the code beside it", () => {
+    const code = (source: string, style: "c" | "hash" = "c") => stripComments(source, style).join("\n");
+
+    // Prose naming a version reaches no behaviour, so it is not an offender.
+    expect(code('// bumped to v1.2.0')).not.toMatch(versionLiteralMatcher("1.2.0"));
+    expect(code('/**\n * short refs — `v1.2.0` — pass through\n */')).not.toMatch(versionLiteralMatcher("1.2.0"));
+    expect(code("build: current # bumped to 1.2.0", "hash")).not.toMatch(versionLiteralMatcher("1.2.0"));
+
+    // A literal in code is still caught — including one that shares its line
+    // with a comment, and one inside a URL whose `//` must not end the scan.
+    expect(code('const v = "1.2.0";')).toMatch(versionLiteralMatcher("1.2.0"));
+    expect(code('const v = "1.2.0"; // pinned')).toMatch(versionLiteralMatcher("1.2.0"));
+    expect(code('fetch("https://example.com/1.2.0/x");')).toMatch(versionLiteralMatcher("1.2.0"));
+    expect(code('version: "1.2.0" # pinned', "hash")).toMatch(versionLiteralMatcher("1.2.0"));
+
+    // Code resumes after a block comment closes mid-line.
+    expect(code('/* v9.9.9 */ const v = "1.2.0";')).toMatch(versionLiteralMatcher("1.2.0"));
+    // A `#` inside a string is not a YAML comment.
+    expect(code('run: echo "1.2.0#tag"', "hash")).toMatch(versionLiteralMatcher("1.2.0"));
+  });
+
   it("has no source file carrying the current version as a literal", () => {
     const matcher = versionLiteralMatcher(VERSION);
     const offenders: string[] = [];
     for (const file of FILES) {
       const relPath = rel(file);
-      const lines = readFileSync(file, "utf8").split(/\r?\n/);
+      // Comment text is blanked, not dropped: the array stays aligned with the
+      // file so the reported line number still points at the offending line.
+      const lines = stripComments(readFileSync(file, "utf8"), commentStyle(relPath));
       lines.forEach((line, index) => {
         if (!matcher.test(line)) return;
         // External schema URLs (e.g. Agent Plugins 1.0.0 specification)
