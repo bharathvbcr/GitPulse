@@ -116,4 +116,21 @@ describe("architecture documentation contract", () => {
       );
     }
   });
+
+  it("keeps the issue chooser's links into this repository pointing at files that exist", () => {
+    // The issue chooser is the one surface whose links nothing else reads: it
+    // is not Markdown, so the link walk above never sees it, and a reader only
+    // finds a broken one by clicking it while trying to report something. Its
+    // blob URLs are this repository's own paths wearing a github.com prefix,
+    // so they can be resolved here. (Whether a *Discussions* link works is a
+    // repository setting, not a file, and is deliberately not asserted — that
+    // one can only be checked against the API.)
+    const root = new URL("../", import.meta.url);
+    const config = readFileSync(new URL(".github/ISSUE_TEMPLATE/config.yml", root), "utf8");
+    const blob = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/blob\/[\w.-]+\/(\S+?)(?=[\s)]|$)/g;
+    const targets = [...config.matchAll(blob)].map((match) => match[1]);
+    expect(targets.length, "no in-repository links found to check").toBeGreaterThan(0);
+    const missing = targets.filter((relative) => !existsSync(new URL(relative, root)));
+    expect(missing).toEqual([]);
+  });
 });

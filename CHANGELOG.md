@@ -11,16 +11,9 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Documentation
+Nothing yet.
 
-- Reorganized the README around installation, the four views, and everyday
-  workflows. Added a documentation index, canonical installation guide, and
-  first-repository walkthrough; wiki entry points now link to those owners.
-- Clarified release availability, signing, repository trust, optional tools,
-  network boundaries, and the difference between implementation and qualification.
-
-
-## [1.1.0] - 2026-09-13
+## [1.1.0] - 2026-09-14
 
 A feature release that began as a patch. What was staged as 1.0.1 — the
 repository-trust gate and the hardened file saves — was never published, and
@@ -308,6 +301,56 @@ links out of the entry they target.
 - The reserved harness policy endpoint forwarded the caller's string to the
   sidecar as `root`, so it answered for a path this process had never resolved.
   It resolves first, and returns `unchecked` carrying the resolution failure.
+
+### Documentation
+
+- Installation and first-run each have a single owner under `docs/`. The README
+  had grown to 433 lines answering every question at once, and the wiki answered
+  several of them again in its own words, so "how do I install this" had two
+  implementations that could disagree. There is now a documentation index, a
+  canonical installation guide, and a first-repository walkthrough; the README
+  keeps what only it can do, and the wiki pages link to those owners instead of
+  restating them.
+- Corrected while moving: release availability, signing and quarantine,
+  repository trust, optional tools, network boundaries, and the difference
+  between a feature being implemented and being qualified. A version in a
+  checkout is not a published release, and the docs now say so where readers act
+  on it.
+- The architecture-docs contract resolves every local link in the tracked
+  documentation and fails naming the file and the href, so a moved guide cannot
+  leave a dangling link behind. It carries a vacuity guard: too few links
+  resolved means the walk broke, not that the tree is clean.
+
+### Development
+
+- `npm run ci:local` runs every gate CI runs, and no longer stops at the first
+  failure. It was a single `&&` chain — the one shape `ci.yml` deliberately
+  refuses, where "the first failure hides all of them, so a red build reports
+  one problem per push and each fix reveals the next". The local gate had the
+  defect the remote one was hardened against, so a machine that could have
+  reported four problems at once reported them one push at a time.
+- The WKWebView sweep is part of that run on macOS. CI runs the browser
+  regressions under Chrome on Linux and under WKWebView on macOS, but only the
+  Chrome half was in the local chain — so the engine that produced the only
+  CI-only failure of this release was the one engine nobody could run before
+  pushing. A derived contract test now fails when a workflow gains a gate the
+  local runner does not have, and when the runner claims a gate CI no longer has.
+- A gate that cannot run on this host is reported as skipped and named in the
+  summary rather than counted as a pass, and the Rust step passes the
+  `--no-fail-fast` and `--locked` that CI passes, so one failing test binary no
+  longer ends the run.
+- The pre-push hook refuses a release tag whose commit has not passed CI. The
+  release gate requires a successful push run of `ci.yml` and `coverage.yml` on
+  the exact tagged commit, and neither workflow triggers on tags, so a tag pushed
+  too early spent three platform builds before being refused. The hook now runs
+  the gate's own check, which fails closed when GitHub cannot be reached.
+- The status harness waits for the popover's transitions to finish rather than
+  for a fixed delay. Svelte's `slide` holds an inline `overflow:hidden` and
+  unmounts an outroing node from its finish callback, so a probe measuring
+  mid-transition read the transition instead of the rule — a failure only a host
+  slow enough to still be animating ever saw. It waits on the animations'
+  presence, which is what Svelte's cleanup removes, and reports its own headroom
+  with the verdict.
 
 ## [1.0.0] - 2026-09-11
 

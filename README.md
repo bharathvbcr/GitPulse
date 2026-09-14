@@ -137,9 +137,18 @@ npm run tauri dev
 | `npm run check:ipc` | Match frontend calls to the native command registry |
 | `npm run check:types` | Compare Rust and TypeScript wire contracts |
 | `npm run check:release` | Check version manifest consistency |
+| `npm run check:workflows` | Lint the GitHub Actions workflow definitions |
+| `npm run test:browser:all` | Browser regressions under headless Chrome |
+| `npm run test:webkit:all` | The same regressions under WKWebView (macOS only) |
 | `npm run build` | Build the frontend bundle |
 | `npm run tauri build` | Build native bundles for the host |
-| `npm run ci:local` | Full local checks, browser regressions, coverage, and native gates |
+| `npm run ci:local` | Every gate CI runs, both renderers, coverage, and the native gates |
+
+The browser regressions run twice in CI — under Chrome on Linux and under
+WKWebView on macOS — because the two engines disagree often enough to matter: a
+fixture can pass under one and fail under the other. `ci:local` runs both for
+that reason, so prefer it over the individual commands before opening a pull
+request.
 
 A frontend build alone does not qualify the native application. Follow the
 [release procedure](CONTRIBUTING.md) before publishing a build.
@@ -154,12 +163,28 @@ or [tasks and workspaces](docs/TASKS_AND_WORKSPACES.md).
 Bug reports, documentation, design, tests, and code contributions are welcome.
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [good first issues](docs/GOOD_FIRST_ISSUES.md).
 
+### Getting help
+
+Questions and open-ended proposals go to
+[Discussions](https://github.com/bharathvbcr/GitPulse/discussions) — ask in
+**Q&A**, where an answer can be marked accepted, or start in **Ideas**. Bugs,
+scoped feature requests, and adapter proposals go through
+[issues](https://github.com/bharathvbcr/GitPulse/issues/new/choose), which has a
+template for each. Suspected vulnerabilities are the exception: report those
+through GitHub Security Advisories as described in the
+[security and trust model](docs/SECURITY.md), not as a public issue.
+
+The bug template asks for a diagnostics report: open the command palette and
+run **Open Diagnostics**, then use its copy button, which collects the version,
+platform, and recent log lines. Read it before pasting — it can contain
+repository paths.
+
 ### Contributors
 
-Thanks to everyone who has contributed to GitPulse. This project follows the
+Every kind of contribution is recognised here, not only code — documentation,
+design, bug reports, testing, reviews, and ideas all count under the
 [all-contributors](https://github.com/all-contributors/all-contributors)
-specification: **code is one kind of contribution among many** — documentation,
-design, bug reports, testing, reviews, and ideas are all recognised here.
+specification. The list below is generated from `.all-contributorsrc`.
 
 <!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
 <!-- prettier-ignore-start -->
