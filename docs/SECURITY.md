@@ -82,6 +82,16 @@ flowchart TD
   repository-wide one. Widening a decision taken under narrower terms is a
   decision to re-take, not to reinterpret, so the first approval granted after
   upgrading is the one that covers the family.
+- That re-taking is offered rather than waited for. Trust is reported as a
+  scope — none, this checkout, or the repository — not as a yes/no, because a
+  single bit cannot distinguish a complete approval from a partial one, and a
+  caller reading one reports "already trusted" for a repository whose every
+  worktree is refused. Where a pre-repository approval leaves siblings
+  unreadable, the worktrees panel says so and offers to extend it, and the
+  refusal a linked worktree returns names the older scheme instead of telling
+  someone to grant an approval they already granted. Extending is still the
+  human's decision and still goes through the same dialog; nothing is widened
+  by reading it.
 - Native Git, background analysis, DevMap, PTY startup, and MCP reads enforce
   trust. MCP cannot grant it. A refusal is an explicit error or unavailable
   result, never a successful empty scan.

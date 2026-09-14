@@ -25,9 +25,12 @@ fn approve_subprocess_fixture() {
     let repo = std::env::var("GITPULSE_TEST_GRANT_REPO").expect("fixture repository");
     let view = gitpulse_lib::repository_trust::inspect(&repo).unwrap();
     gitpulse_lib::repository_trust::grant(&repo, &view.identity, true).unwrap();
-    assert!(
+    // The fixture must end up covering the repository, not just the checkout
+    // it named: worktrees added by a test are otherwise refused.
+    assert_eq!(
         gitpulse_lib::repository_trust::inspect(&repo)
             .unwrap()
-            .trusted
+            .scope,
+        gitpulse_lib::repository_trust::TrustScope::Repository
     );
 }

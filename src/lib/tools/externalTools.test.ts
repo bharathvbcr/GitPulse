@@ -262,7 +262,7 @@ describe("source checkout trust", () => {
     stdout: "", stderr: "", timed_out: false, cancelled: false,
     reason: "REPOSITORY_TRUST_REQUIRED: /source", rung: "local_checkout",
   };
-  const preview = { path: "/source", git_dir: "/source/.git", common_dir: "/source/.git", identity: "native-identity", trusted: false };
+  const preview = { path: "/source", git_dir: "/source/.git", common_dir: "/source/.git", identity: "native-identity", scope: "none", worktrees: 1 };
   it("approves the exact native source identity before one bounded retry", async () => {
     vi.mocked(askConfirm).mockResolvedValue(true);
     vi.mocked(invoke).mockResolvedValueOnce(denied).mockResolvedValueOnce(preview)

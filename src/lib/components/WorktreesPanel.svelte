@@ -17,9 +17,22 @@
     AlertTriangle,
   } from "@lucide/svelte";
   import { agentKind, agentSessionSlug, isAgentWorktree } from "../work/agentWorktree";
+  import { needsExtension, type TrustPreview } from "../repos/repositoryTrust";
 
 
   let worktrees = $state<WorktreeInfo[]>([]);
+  /**
+   * Set when this repository was approved before the repository became the
+   * unit of trust, so its siblings are refused and extending would change
+   * that.
+   *
+   * This panel is where that state is felt — the rows are right here and their
+   * contents cannot be read — so it is where the offer belongs. A banner
+   * rather than a modal on open: the approval already admits this checkout, so
+   * nothing is blocked, and a dialog that reappeared on every open would be a
+   * nag for a decision the person is allowed to keep declining.
+   */
+  let trustExtendable = $state(false);
   /**
    * DevCouncil state for this repository, and which worktree is bound to what.
    *
@@ -79,6 +92,7 @@
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
       if (!guard.isLive()) return;
       worktrees = next;
+      await loadTrustScope(repo, guard);
       await loadTaskState(repo, next, guard);
     } catch (err: unknown) {
       if (!guard.isLive()) return;
@@ -86,6 +100,35 @@
     } finally {
       if (guard.isLive()) isLoading = false;
     }
+  }
+
+  /**
+   * Asks how far this repository's approval reaches.
+   *
+   * Non-fatal in the same way task state is, and for a stricter reason: this
+   * decides whether to *offer* something, never whether anything is allowed.
+   * An inspection that could not run leaves the offer hidden — proposing a fix
+   * for a condition we did not establish would be a guess wearing a button.
+   */
+  async function loadTrustScope(repo: string, guard: AsyncGuard) {
+    try {
+      const preview = await invoke<TrustPreview>("cmd_repository_trust", { repoPath: repo });
+      if (!guard.isLive()) return;
+      trustExtendable = needsExtension(preview);
+    } catch {
+      if (guard.isLive()) trustExtendable = false;
+    }
+  }
+
+  /** Offers the extension, then reloads so newly readable worktrees fill in. */
+  async function extendTrust() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    await repoStore.trustRepo(repo);
+    // The panel follows the active repository; a tab switch mid-dialog must
+    // not land this repo's reload on another repo's rows.
+    if ($repoStore.currentPath !== repo) return;
+    await load();
   }
 
   /**
@@ -361,6 +404,23 @@
 
   {#if error}
     <div class="text-[10px] text-rose-400 px-2 py-1" title={error}>{error}</div>
+  {/if}
+
+  {#if trustExtendable}
+    <div class="mx-2 mb-1 flex items-start gap-1.5 rounded-2xl bg-amber-500/10 px-2 py-1.5">
+      <AlertTriangle size={11} class="shrink-0 mt-px text-amber-600 dark:text-amber-400" />
+      <div class="min-w-0 flex-1">
+        <p class="text-[10px] leading-snug text-amber-700 dark:text-amber-300">
+          This repository was approved before GitPulse covered worktrees, so only its main
+          checkout can be read. The others are left out of comparisons and collision checks.
+        </p>
+        <button
+          type="button"
+          onclick={extendTrust}
+          class="mt-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300 hover:bg-amber-500/15"
+        >Extend trust to every worktree</button>
+      </div>
+    </div>
   {/if}
 
   {#if isLoading && worktrees.length === 0}

@@ -191,7 +191,7 @@ function makeStore(invoke: InvokeFn = makeInvoke()) {
 
 describe("explicit repository trust", () => {
   afterEach(() => cancelPrompt());
-  const preview = { path: "/canonical/repo", git_dir: "/canonical/repo/.git", common_dir: "/canonical/repo/.git", identity: "opaque-native-identity", trusted: false };
+  const preview = { path: "/canonical/repo", git_dir: "/canonical/repo/.git", common_dir: "/canonical/repo/.git", identity: "opaque-native-identity", scope: "none", worktrees: 1 };
 
   it.each([false, true])("does no repository work before approval, including broken-tab restore (%s)", async allowBroken => {
     const calls: string[] = [];

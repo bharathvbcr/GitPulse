@@ -400,11 +400,24 @@ pub fn collision_facts(
     // about what we saw, not about the repository.
     let mut partial = Vec::new();
     if risk.failed_worktrees > 0 {
-        partial.push(format!(
-            "{} worktree(s) could not be read ({})",
-            risk.failed_worktrees,
-            or_unknown(&risk.error)
-        ));
+        // `CollisionRisk::error` is the *first* failure, not a summary of all
+        // of them, so above one it has to be labelled as one case and not read
+        // as the shared cause. Four worktrees refused for trust and a fifth
+        // lost to a bad disk is a different situation from five of either, and
+        // the reader cannot tell them apart from a count and one message.
+        partial.push(if risk.failed_worktrees > 1 {
+            format!(
+                "{} worktree(s) could not be read (first of {}: {})",
+                risk.failed_worktrees,
+                risk.failed_worktrees,
+                or_unknown(&risk.error)
+            )
+        } else {
+            format!(
+                "1 worktree(s) could not be read ({})",
+                or_unknown(&risk.error)
+            )
+        });
     }
     if risk.unscanned_worktrees > 0 {
         partial.push(format!(
@@ -1411,6 +1424,52 @@ mod tests {
         assert!(facts.partial.contains("1 worktree(s) could not be read"));
         assert!(facts.partial.contains("fatal: not a git repository"));
         assert!(!collision_decision(&facts).is_silent());
+    }
+
+    /// `CollisionRisk::error` holds the first failure only. Rendering it after
+    /// a count of five reads as the cause of all five, which is a claim the
+    /// scan never made — four refusals and one unreadable disk look identical
+    /// to four refusals and one more.
+    #[test]
+    fn several_failures_do_not_present_one_cause_as_all_of_them() {
+        let risk = CollisionRisk {
+            ok: false,
+            error: "REPOSITORY_TRUST_REQUIRED: Open /a in GitPulse".into(),
+            overlapping_files: 0,
+            worktrees_involved: 0,
+            scanned_worktrees: 1,
+            unscanned_worktrees: 0,
+            failed_worktrees: 5,
+            truncated: true,
+            items: Vec::new(),
+        };
+        let facts = collision_facts(&risk, Path::new("/repo"), "a.txt", &|_| String::new());
+        assert!(facts.ok, "one worktree was read, so the scan ran");
+        assert!(
+            facts.partial.contains("5 worktree(s) could not be read"),
+            "{}",
+            facts.partial
+        );
+        assert!(
+            facts.partial.contains("first of 5:"),
+            "the one reported cause must not stand for five: {}",
+            facts.partial
+        );
+
+        // A single failure has nothing to disambiguate, so it stays plain.
+        let one = CollisionRisk {
+            failed_worktrees: 1,
+            ..risk
+        };
+        let facts = collision_facts(&one, Path::new("/repo"), "a.txt", &|_| String::new());
+        assert!(
+            facts
+                .partial
+                .contains("1 worktree(s) could not be read (REPOSITORY"),
+            "{}",
+            facts.partial
+        );
+        assert!(!facts.partial.contains("first of"), "{}", facts.partial);
     }
 
     #[test]

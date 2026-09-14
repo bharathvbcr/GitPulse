@@ -578,7 +578,7 @@ fn status_read_does_not_execute_an_untrusted_repository_fsmonitor() {
     );
     assert!(result.unwrap_err().contains(repository_trust::REQUIRED));
     let preview = repository_trust::inspect(repo.to_str().unwrap()).unwrap();
-    assert!(!preview.trusted);
+    assert_eq!(preview.scope, repository_trust::TrustScope::None);
     assert!(!repo.join("fsmonitor-executed").exists());
     repository_trust::grant(repo.to_str().unwrap(), &preview.identity, false).unwrap();
     let status = GitReader::get_status(repo.to_str().unwrap()).unwrap();
@@ -591,4 +591,177 @@ fn status_read_does_not_execute_an_untrusted_repository_fsmonitor() {
     std::fs::remove_file(repo.join("fsmonitor-executed")).unwrap();
     assert!(GitReader::get_status(repo.to_str().unwrap()).is_err());
     assert!(!repo.join("fsmonitor-executed").exists());
+}
+
+/* ── The pre-repository approval, end to end ──────────────────────────────── */
+
+/// Where an isolated profile keeps its approvals. Mirrors
+/// `tool_config::default_config_dir`, which is private; the plant below is
+/// asserted to have taken effect, so a drift in that layout fails loudly here
+/// rather than leaving this test passing over a record nothing ever read.
+fn trust_store(home: &Path) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    let base = home
+        .join("Library")
+        .join("Application Support")
+        .join("GitPulse");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let base = home.join(".config").join("gitpulse");
+    base.join("repository-trust-v1")
+}
+
+/// The filename `legacy_record` derives. Private there, replicated here for
+/// the same reason and with the same safeguard.
+fn legacy_record_name(checkout: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    checkout.hash(&mut key);
+    format!("{:016x}.json", key.finish())
+}
+
+/// The whole failure, reproduced through the shipping code paths and then
+/// cleared: a repository approved before worktree coverage, the collision scan
+/// that silently loses every worktree of it, the refusal that has to say why,
+/// and the extension that makes the scan whole.
+///
+/// Driven in a subprocess with an isolated profile: `persistent_root` reads the
+/// real one, and a test that wrote there would either pollute the developer's
+/// approvals or pass because of them.
+#[test]
+fn a_pre_repository_approval_loses_every_worktree_until_it_is_extended() {
+    let repo = fixture();
+    commit(repo.path());
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    // The same path dirty in both working trees: a real collision, which only
+    // a scan that reads both can find.
+    std::fs::write(repo.path().join("shared.txt"), b"main edit\n").unwrap();
+    std::fs::write(linked.join("shared.txt"), b"worktree edit\n").unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_pre_repository_approval_subprocess",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("HOME", home.path())
+        .env("APPDATA", home.path().join("AppData"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("GITPULSE_E2E_MAIN", repo.path())
+        .env("GITPULSE_E2E_WORKTREE", &linked)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated end-to-end run failed");
+}
+
+#[test]
+#[ignore = "driven by a_pre_repository_approval_loses_every_worktree_until_it_is_extended"]
+fn a_pre_repository_approval_subprocess() {
+    let main = std::env::var("GITPULSE_E2E_MAIN").expect("main checkout");
+    let worktree = std::env::var("GITPULSE_E2E_WORKTREE").expect("linked worktree");
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let store = trust_store(&home);
+    std::fs::create_dir_all(&store).unwrap();
+
+    // 1. The human approves the main checkout, under the pre-repository scheme.
+    let before = repository_trust::inspect(&main).unwrap();
+    assert_eq!(before.scope, repository_trust::TrustScope::None);
+    std::fs::write(
+        store.join(legacy_record_name(Path::new(&before.path))),
+        &before.identity,
+    )
+    .unwrap();
+
+    let approved = repository_trust::inspect(&main).unwrap();
+    assert_eq!(
+        approved.scope,
+        repository_trust::TrustScope::Checkout,
+        "the planted record must be the one the gate reads, or this test proves nothing"
+    );
+    assert_eq!(approved.worktrees, 2, "one main checkout and one linked");
+
+    // 2. Its worktree is refused, and the refusal has to explain itself.
+    let refused = repository_trust::inspect(&worktree).unwrap();
+    assert_eq!(refused.scope, repository_trust::TrustScope::None);
+    let refusal = repository_trust::require(Path::new(&worktree)).unwrap_err();
+    assert!(repository_trust::refused(&refusal));
+    assert!(
+        refusal.contains("approved before GitPulse covered worktrees"),
+        "a reader who already approved this repository needs to be told why \
+         that did not reach here: {refusal}"
+    );
+    assert!(refusal.contains("Extend Trust"), "{refusal}");
+
+    // 3. The collision scan therefore reads one of two working trees — and the
+    //    shared dirty file it cannot see is exactly what it exists to report.
+    let dark = gitpulse_lib::insights::collision_risk(&main);
+    assert_eq!(dark.scanned_worktrees, 1, "{dark:?}");
+    assert_eq!(dark.failed_worktrees, 1, "{dark:?}");
+    assert!(!dark.ok, "{dark:?}");
+    assert_eq!(dark.overlapping_files, 0, "the collision is invisible");
+
+    // The hook must not render that as a clean pass. This is the message the
+    // reporter saw.
+    let facts =
+        gitpulse_lib::hooks::collision_facts(&dark, Path::new(&main), "shared.txt", &|_| {
+            String::new()
+        });
+    let notice = gitpulse_lib::hooks::collision_decision(&facts)
+        .render()
+        .expect("a partial scan must never be silent");
+    assert!(notice.contains("INCOMPLETE"), "{notice}");
+    assert!(notice.contains("could not be read"), "{notice}");
+    // The refusal travels into the notice, so the agent-side reader gets the
+    // same explanation the desktop does. This is the message that started the
+    // investigation, and without this sentence it is a dead end.
+    assert!(
+        notice.contains("approved before GitPulse covered worktrees"),
+        "{notice}"
+    );
+
+    // 4. Extending is one approval, and it is the human's to give.
+    let preview = repository_trust::inspect(&worktree).unwrap();
+    repository_trust::grant(&worktree, &preview.identity, true).unwrap();
+
+    assert_eq!(
+        repository_trust::inspect(&main).unwrap().scope,
+        repository_trust::TrustScope::Repository
+    );
+    assert_eq!(
+        repository_trust::inspect(&worktree).unwrap().scope,
+        repository_trust::TrustScope::Repository
+    );
+
+    // 5. And the scan is whole: both working trees read, and the collision
+    //    that was invisible is now reported.
+    let whole = gitpulse_lib::insights::collision_risk(&main);
+    assert_eq!(whole.scanned_worktrees, 2, "{whole:?}");
+    assert_eq!(whole.failed_worktrees, 0, "{whole:?}");
+    assert!(whole.ok, "{whole:?}");
+    assert_eq!(whole.overlapping_files, 1, "{whole:?}");
+
+    let facts =
+        gitpulse_lib::hooks::collision_facts(&whole, Path::new(&main), "shared.txt", &|_| {
+            String::new()
+        });
+    assert!(facts.ok && facts.partial.is_empty(), "{facts:?}");
+    assert_eq!(facts.others.len(), 1, "{facts:?}");
+    let decision = gitpulse_lib::hooks::collision_decision(&facts)
+        .render()
+        .expect("a real collision must escalate");
+    assert!(decision.contains("\"ask\""), "{decision}");
+    assert!(decision.contains("shared.txt"), "{decision}");
 }

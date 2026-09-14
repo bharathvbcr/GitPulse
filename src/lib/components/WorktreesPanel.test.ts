@@ -143,3 +143,47 @@ describe("WorktreesPanel store-emission churn guards", () => {
     expect(effect).toContain("removingPath = null;");
   });
 });
+
+describe("WorktreesPanel legacy-trust extension", () => {
+  it("offers the extension only when inspection said so", () => {
+    // The banner is gated on the backend's own scope answer, never on the row
+    // count or on an error string: an offer to fix a condition nobody
+    // established is a guess wearing a button.
+    expect(source).toContain("needsExtension(preview)");
+    expect(source).toContain("{#if trustExtendable}");
+    const fn = source.slice(
+      source.indexOf("async function loadTrustScope"),
+      source.indexOf("async function extendTrust")
+    );
+    expect(fn).toContain('invoke<TrustPreview>("cmd_repository_trust"');
+    // A failed inspection hides the offer rather than showing it.
+    expect(fn).toMatch(/catch[\s\S]*?trustExtendable = false/);
+  });
+
+  it("drops a stale inspection like every other load in this panel", () => {
+    const fn = source.slice(
+      source.indexOf("async function loadTrustScope"),
+      source.indexOf("async function extendTrust")
+    );
+    expect(fn.match(/guard\.isLive\(\)/g)?.length).toBe(2);
+  });
+
+  it("re-guards the active repository across the extension dialog", () => {
+    // The dialog is awaited, so the tab can change under it; reloading then
+    // would land this repository's rows on another repository's panel.
+    const fn = source.slice(
+      source.indexOf("async function extendTrust"),
+      source.indexOf("async function loadTaskState")
+    );
+    expect(fn).toMatch(
+      /await repoStore\.trustRepo\(repo\)[\s\S]*?\$repoStore\.currentPath !== repo[\s\S]*?await load\(\)/
+    );
+  });
+
+  it("says what is currently unreadable, not just that trust is old", () => {
+    const banner = source.slice(source.indexOf("{#if trustExtendable}"));
+    expect(banner).toMatch(/before GitPulse covered worktrees/i);
+    expect(banner).toMatch(/left out of comparisons and collision checks/i);
+    expect(banner).toContain("Extend trust to every worktree");
+  });
+});

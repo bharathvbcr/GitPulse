@@ -65,6 +65,41 @@ struct Grant {
 
 const GRANT_VERSION: u32 = 2;
 
+/// How far the stored approval that covers a checkout actually reaches.
+///
+/// A boolean cannot carry this, and the difference is the whole of what went
+/// wrong once already: `Checkout` and `Repository` both mean "this path may
+/// run Git", so a caller reading one bit cannot tell a complete approval from
+/// a partial one. It then reports "already trusted" for a repository whose
+/// every worktree is refused, and the human is never asked the question that
+/// would fix it. This is the module's own invariant turned on scope — a check
+/// that covers part of something must not report what full coverage reports.
+///
+/// Ordered by reach, so `>=` is a meaningful test rather than a match arm per
+/// caller.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustScope {
+    /// Nothing stored reaches this checkout.
+    None,
+    /// An approval recorded before the repository became the unit of trust.
+    /// It authorizes exactly the checkout it named — never its siblings — and
+    /// is deliberately not widened by reading it. Extending it is a decision
+    /// the human still has to take.
+    Checkout,
+    /// The repository, and every working tree it vouches for.
+    Repository,
+}
+
+impl TrustScope {
+    /// Whether anything at all authorizes this checkout. The gate's question,
+    /// unchanged by the distinction above: a legacy record still admits the
+    /// one checkout it named.
+    pub fn admits(self) -> bool {
+        self != TrustScope::None
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrustPreview {
     pub path: String,
@@ -72,7 +107,14 @@ pub struct TrustPreview {
     pub common_dir: String,
     /// Opaque snapshot returned to the grant command unchanged.
     pub identity: String,
-    pub trusted: bool,
+    /// What the stored approval reaches. Replaces a `trusted` boolean: the UI
+    /// has to be able to offer an upgrade, which means it has to be able to
+    /// see that one is missing.
+    pub scope: TrustScope,
+    /// Whether this checkout has any linked worktrees beyond itself, so an
+    /// offer to extend is made only where extending changes something.
+    /// Metadata only — the registry is counted, never executed.
+    pub worktrees: u32,
 }
 
 /// Session grants, keyed by canonical repository (common Git directory) path.
@@ -313,28 +355,66 @@ fn covers(grant: &Grant, current: &Identity) -> bool {
         && (grant.approved == current.checkout || member_of_repository(current))
 }
 
-fn read_grant(root: &Path, current: &Identity) -> Result<bool, String> {
+/// What the persisted records reach for `current`.
+///
+/// The repository namespace is consulted first and wins outright: once a grant
+/// under the current scheme covers this checkout, an older record for it is
+/// spent history, not a downgrade.
+fn read_grant(root: &Path, current: &Identity) -> Result<TrustScope, String> {
     if let Some(grant) = stored::<Grant>(&repository_record(root, &current.common_dir.path))? {
         if covers(&grant, current) {
-            return Ok(true);
+            return Ok(TrustScope::Repository);
         }
     }
     let Some(saved) = stored::<Identity>(&legacy_record(root, &current.checkout.path))? else {
-        return Ok(false);
+        return Ok(TrustScope::None);
     };
-    Ok(saved.version == 1 && saved == *current)
+    // Unchanged: exactly the checkout this record named, proved by whole
+    // identity equality. Reporting it as `Checkout` rather than `true` widens
+    // nothing — it only stops the caller from mistaking it for family-wide.
+    Ok(if saved.version == 1 && saved == *current {
+        TrustScope::Checkout
+    } else {
+        TrustScope::None
+    })
 }
 
-fn trusted(current: &Identity) -> Result<bool, String> {
+fn scope(current: &Identity) -> Result<TrustScope, String> {
     let session = sessions()
         .lock()
         .map_err(|_| "Repository trust state is unavailable")?
         .get(&current.common_dir.path)
         .cloned();
     if session.is_some_and(|grant| covers(&grant, current)) {
-        return Ok(true);
+        return Ok(TrustScope::Repository);
     }
     read_grant(&persistent_root()?, current)
+}
+
+fn trusted(current: &Identity) -> Result<bool, String> {
+    scope(current).map(TrustScope::admits)
+}
+
+/// How many working trees this repository has, counted from its own registry.
+///
+/// Metadata only, and deliberately not `git worktree list`: this is read while
+/// deciding whether the repository may run Git at all, so it must not be the
+/// thing that runs it. A registry that cannot be listed counts as the one
+/// working tree we are looking at, which makes an offer to extend disappear
+/// rather than appear on a guess.
+fn worktree_count(current: &Identity) -> u32 {
+    let registry = current.common_dir.path.join("worktrees");
+    let linked = match fs::read_dir(&registry) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("gitdir").is_file())
+            .count(),
+        Err(_) => 0,
+    };
+    // The main working tree is not in the registry; a bare repository has none
+    // to add.
+    let main = u32::from(current.checkout != current.common_dir);
+    linked.try_into().unwrap_or(u32::MAX).saturating_add(main)
 }
 
 pub fn inspect(repo_path: &str) -> Result<TrustPreview, String> {
@@ -344,7 +424,8 @@ pub fn inspect(repo_path: &str) -> Result<TrustPreview, String> {
         git_dir: current.git_dir.path.to_string_lossy().into_owned(),
         common_dir: current.common_dir.path.to_string_lossy().into_owned(),
         identity: serde_json::to_string(&current).map_err(|e| e.to_string())?,
-        trusted: trusted(&current)?,
+        scope: scope(&current)?,
+        worktrees: worktree_count(&current),
     })
 }
 
@@ -387,8 +468,61 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
             " This is a linked worktree: approving any working tree of the repository at {} covers all of them.",
             current.common_dir.path.display()
         ));
+        // The one case where a reader can have done everything right and still
+        // be here. Telling someone who already approved this repository to go
+        // approve it is advice they have followed and watched fail; naming the
+        // older scheme is the difference between a dead end and one click.
+        if predates_worktree_coverage(&current) {
+            refusal.push_str(
+                " That repository was approved before GitPulse covered worktrees, \
+                 so the earlier approval reaches only the checkout it named. \
+                 Open that repository in GitPulse; its Worktrees panel offers \
+                 Extend Trust, which covers this worktree and every other.",
+            );
+        }
     }
     Err(refusal)
+}
+
+/// Whether this repository's own main checkout carries a pre-repository
+/// approval — the state in which a human has approved this repository and is
+/// being refused anyway.
+///
+/// Best effort by construction: it answers a question about wording, never
+/// about authority, so every way of not knowing is `false` and the caller
+/// falls back to the generic message. The main working tree is the one that
+/// holds the common directory, so it is `commondir`'s parent; that candidate
+/// is then put through the same identity and membership proofs as any other
+/// checkout rather than trusted for its shape.
+fn predates_worktree_coverage(current: &Identity) -> bool {
+    persistent_root().is_ok_and(|root| approval_predates_worktree_coverage(&root, current))
+}
+
+/// [`predates_worktree_coverage`] over a given store.
+///
+/// Split so the layout guard below can be exercised against a record that
+/// actually exists. Tested through the real store it is unreachable: every
+/// fixture repository is absent from it, so the final lookup answers `None`
+/// whatever the guard did, and a test of the guard passes by accident. That
+/// tautology survived a mutation that deleted the guard outright.
+fn approval_predates_worktree_coverage(root: &Path, current: &Identity) -> bool {
+    let Some(main) = current.common_dir.path.parent() else {
+        return false;
+    };
+    let Some(main) = main.to_str() else {
+        return false;
+    };
+    let Ok(main) = identity(main) else {
+        return false;
+    };
+    // The candidate has to be *this* repository's main working tree: same
+    // common directory, and holding it directly rather than pointing at it.
+    // Without both, a neighbouring repository's approval would be offered as
+    // the explanation for this refusal.
+    if main.common_dir != current.common_dir || main.git_dir != main.common_dir {
+        return false;
+    }
+    read_grant(root, &main) == Ok(TrustScope::Checkout)
 }
 
 /// Whether `message` is — or carries, once a caller has wrapped it — the
@@ -804,9 +938,15 @@ mod tests {
         let other = fixture();
         let storage = tempfile::tempdir().unwrap();
         let current = identity(repo.path().to_str().unwrap()).unwrap();
-        assert!(!read_grant(storage.path(), &current).unwrap());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None
+        );
         save_grant(storage.path(), &approval_for(&current)).unwrap();
-        assert!(read_grant(storage.path(), &current).unwrap());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Repository
+        );
         let record = repository_record(storage.path(), &current.common_dir.path);
         for content in [
             "{".to_owned(),
@@ -819,14 +959,20 @@ mod tests {
         let mut changed = approval_for(&current);
         changed.version = GRANT_VERSION + 1;
         fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
-        assert!(!read_grant(storage.path(), &current).unwrap());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None
+        );
         let foreign = identity(other.path().to_str().unwrap()).unwrap();
         fs::write(
             &record,
             serde_json::to_vec(&approval_for(&foreign)).unwrap(),
         )
         .unwrap();
-        assert!(!read_grant(storage.path(), &current).unwrap());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None
+        );
 
         // `approved` is an audit trail, not a second lock. A record for *this*
         // repository covers a member of it whichever checkout the human was
@@ -836,7 +982,10 @@ mod tests {
         let mut elsewhere = approval_for(&current);
         elsewhere.approved = foreign.checkout.clone();
         fs::write(&record, serde_json::to_vec(&elsewhere).unwrap()).unwrap();
-        assert!(read_grant(storage.path(), &current).unwrap());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Repository
+        );
     }
 
     /// Upgrading must not re-prompt for every repository already approved, and
@@ -851,7 +1000,14 @@ mod tests {
         let current = identity(repo.path().to_str().unwrap()).unwrap();
         let legacy = legacy_record(storage.path(), &current.checkout.path);
         fs::write(&legacy, serde_json::to_vec(&current).unwrap()).unwrap();
-        assert!(read_grant(storage.path(), &current).unwrap());
+        // Admitted, and reported as reaching only this checkout. Both halves
+        // matter: the first is the no-re-prompt promise, the second is what
+        // lets the UI offer the extension instead of claiming full coverage.
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Checkout
+        );
+        assert!(read_grant(storage.path(), &current).unwrap().admits());
 
         // Deliberately the *current* grant version: a record in the legacy
         // namespace claiming to be a newer one is still refused there, so the
@@ -859,7 +1015,10 @@ mod tests {
         let mut stale = current.clone();
         stale.version = GRANT_VERSION;
         fs::write(&legacy, serde_json::to_vec(&stale).unwrap()).unwrap();
-        assert!(!read_grant(storage.path(), &current).unwrap());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None
+        );
 
         // The same bytes at the repository key authorize nothing: the two
         // namespaces are disjoint, so an old record cannot be replayed as a
@@ -871,6 +1030,481 @@ mod tests {
         )
         .unwrap();
         assert!(read_grant(storage.path(), &current).is_err());
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=GitPulse",
+                "-c",
+                "user.email=gitpulse@test.local",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// One repository with a linked worktree, approved under the pre-repository
+    /// scheme — the state every install that trusted anything before
+    /// `GRANT_VERSION` 2 is in.
+    fn legacy_approved_repository() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let repo = fixture();
+        git_in(repo.path(), &["commit", "--allow-empty", "-m", "init"]);
+        let parent = tempfile::tempdir().unwrap();
+        let linked = parent.path().join("linked");
+        git_in(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "gitpulse-link",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        fs::write(
+            legacy_record(storage.path(), &main.checkout.path),
+            serde_json::to_vec(&main).unwrap(),
+        )
+        .unwrap();
+        (repo, parent, storage, linked)
+    }
+
+    /// The gap this scope exists to close, kept as a regression.
+    ///
+    /// A pre-repository approval admits the checkout it named and refuses
+    /// every worktree of the very repository it approved. That refusal is
+    /// correct — widening it silently is the one thing this module must not do
+    /// — but it is only survivable if the difference is *visible*, because a
+    /// caller that cannot see it reports "already trusted" and never offers
+    /// the upgrade. Under the boolean this replaced, both rows below read
+    /// `true`/`false` with nothing to distinguish them from a repository that
+    /// was never approved at all.
+    #[test]
+    fn a_legacy_approval_is_reported_as_reaching_only_its_own_checkout() {
+        let (repo, _parent, storage, linked) = legacy_approved_repository();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        let worktree = identity(linked.to_str().unwrap()).unwrap();
+
+        // Unchanged authority: the approved checkout runs, its worktree does not.
+        assert!(read_grant(storage.path(), &main).unwrap().admits());
+        assert!(!read_grant(storage.path(), &worktree).unwrap().admits());
+
+        // Newly visible: *why* — a partial approval, not a missing one.
+        assert_eq!(
+            read_grant(storage.path(), &main).unwrap(),
+            TrustScope::Checkout
+        );
+        assert_eq!(
+            read_grant(storage.path(), &worktree).unwrap(),
+            TrustScope::None
+        );
+
+        // The repository does vouch for the worktree, so the only thing
+        // standing between the human and coverage is being asked.
+        assert_eq!(worktree.common_dir, main.common_dir);
+        assert!(member_of_repository(&worktree));
+        assert!(!repository_record(storage.path(), &main.common_dir.path).exists());
+    }
+
+    /// Extending is one approval, and it reaches the family from either side.
+    ///
+    /// Run from both checkouts because they take different paths through
+    /// `covers`: the checkout the human approved matches `approved` outright,
+    /// while its sibling has to be proved a member.
+    #[test]
+    fn extending_a_legacy_approval_covers_the_whole_repository() {
+        for approve_worktree in [false, true] {
+            let (repo, _parent, storage, linked) = legacy_approved_repository();
+            let main = identity(repo.path().to_str().unwrap()).unwrap();
+            let worktree = identity(linked.to_str().unwrap()).unwrap();
+            let approved = if approve_worktree {
+                worktree.clone()
+            } else {
+                main.clone()
+            };
+
+            save_grant(storage.path(), &approval_for(&approved)).unwrap();
+
+            assert_eq!(
+                read_grant(storage.path(), &main).unwrap(),
+                TrustScope::Repository,
+                "main checkout, approved via worktree={approve_worktree}"
+            );
+            assert_eq!(
+                read_grant(storage.path(), &worktree).unwrap(),
+                TrustScope::Repository,
+                "linked worktree, approved via worktree={approve_worktree}"
+            );
+
+            // The legacy record is still on disk and must not be what answers
+            // now: a repository grant is strictly more reach, so reading it
+            // second would report a downgrade for the checkout it named.
+            assert!(legacy_record(storage.path(), &main.checkout.path).exists());
+            assert_eq!(
+                read_grant(storage.path(), &main).unwrap(),
+                TrustScope::Repository
+            );
+        }
+    }
+
+    /// An offer to extend is worth making only where it changes something, so
+    /// the count that gates it has to be right for each shape — and must never
+    /// run Git to find out.
+    #[test]
+    fn worktrees_are_counted_from_the_registry_without_running_git() {
+        let (repo, _parent, _storage, linked) = legacy_approved_repository();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        let worktree = identity(linked.to_str().unwrap()).unwrap();
+        assert_eq!(worktree_count(&main), 2, "main checkout plus one linked");
+        assert_eq!(worktree_count(&worktree), 2, "same repository, same answer");
+
+        let lone = fixture();
+        let lone = identity(lone.path().to_str().unwrap()).unwrap();
+        assert_eq!(worktree_count(&lone), 1, "no registry at all");
+
+        // A registry entry that is not a worktree is not counted: an offer
+        // pinned on a stray directory would appear where extending does
+        // nothing.
+        fs::create_dir_all(main.common_dir.path.join("worktrees").join("debris")).unwrap();
+        assert_eq!(worktree_count(&main), 2, "entry without a gitdir pointer");
+    }
+
+    /// The refusal a linked worktree gets has to name the older scheme when
+    /// that is what is holding it — and must not invent one when it is not.
+    /// Someone told to approve a repository they already approved has been
+    /// handed a dead end.
+    #[test]
+    fn a_refusal_names_the_older_scheme_only_when_it_is_the_cause() {
+        let (repo, _parent, _storage, linked) = legacy_approved_repository();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        let worktree = identity(linked.to_str().unwrap()).unwrap();
+
+        // Nothing approved: the generic refusal, with no claim about history.
+        // (`predates_worktree_coverage` reads the real persistent root, which
+        // holds no record for this temporary repository either way.)
+        assert!(!predates_worktree_coverage(&worktree));
+        let refusal = require(&worktree.checkout.path).unwrap_err();
+        assert!(refusal.contains(REQUIRED));
+        assert!(refusal.contains("linked worktree"));
+        assert!(
+            !refusal.contains("Extend Trust"),
+            "must not claim an earlier approval that does not exist: {refusal}"
+        );
+
+        // The main checkout is not a linked worktree, so it never gets the
+        // worktree half of the message at all.
+        let refusal = require(&main.checkout.path).unwrap_err();
+        assert!(!refusal.contains("linked worktree"), "{refusal}");
+    }
+    /// The wire spelling the desktop switches on. A rename here silently turns
+    /// every `scope` comparison in `repositoryTrust.ts` into a false, which
+    /// reads as "never trusted" and re-prompts for everything.
+    #[test]
+    fn scope_serializes_to_the_spellings_the_desktop_matches_on() {
+        for (scope, wire) in [
+            (TrustScope::None, "\"none\""),
+            (TrustScope::Checkout, "\"checkout\""),
+            (TrustScope::Repository, "\"repository\""),
+        ] {
+            assert_eq!(serde_json::to_string(&scope).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<TrustScope>(wire).unwrap(),
+                scope,
+                "round trip"
+            );
+        }
+        // `admits` is the gate's question and must stay true for both approved
+        // states — the split is about reach, never about authority.
+        assert!(!TrustScope::None.admits());
+        assert!(TrustScope::Checkout.admits());
+        assert!(TrustScope::Repository.admits());
+        assert!(TrustScope::Repository > TrustScope::Checkout);
+    }
+
+    /// Counting must survive a registry that is not a readable directory of
+    /// worktrees, because the count decides whether a banner appears and a
+    /// panic or a wild number there is a worse outcome than no offer.
+    #[test]
+    fn a_hostile_worktree_registry_cannot_fabricate_an_offer() {
+        let repo = fixture();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let registry = current.common_dir.path.join("worktrees");
+
+        // No registry: just this checkout.
+        assert_eq!(worktree_count(&current), 1);
+
+        // A *file* where the registry should be reads as unlistable, which is
+        // the same answer as empty rather than an error or a panic.
+        fs::write(&registry, b"not a directory").unwrap();
+        assert_eq!(worktree_count(&current), 1);
+        fs::remove_file(&registry).unwrap();
+
+        // Entries that are files, empty directories, or directories whose
+        // `gitdir` is itself a directory are all not worktrees.
+        fs::create_dir_all(&registry).unwrap();
+        fs::write(registry.join("a-file"), b"x").unwrap();
+        fs::create_dir(registry.join("empty")).unwrap();
+        fs::create_dir_all(registry.join("gitdir-is-a-dir").join("gitdir")).unwrap();
+        assert_eq!(worktree_count(&current), 1, "nothing here is a worktree");
+
+        // Only a real `gitdir` pointer counts.
+        fs::create_dir(registry.join("real")).unwrap();
+        fs::write(registry.join("real").join("gitdir"), b"/somewhere/.git").unwrap();
+        assert_eq!(worktree_count(&current), 2);
+    }
+
+    /// Deriving the main checkout from `commondir`'s parent is a guess about
+    /// layout, so it has to be *checked* rather than trusted. Every shape that
+    /// makes the guess wrong must answer "no", because the message it gates
+    /// tells someone they already approved this repository.
+    ///
+    /// Run against a store that really holds the record, so the layout guard
+    /// is what decides. Pointed at the real store every case answers "no"
+    /// because no fixture is in it, and the test passes without testing.
+    #[test]
+    fn the_older_scheme_is_only_claimed_where_the_layout_proves_it() {
+        // The positive control: a genuine legacy approval of this very
+        // repository's main checkout, seen from its worktree.
+        let (repo, _parent, storage, linked) = legacy_approved_repository();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        let worktree = identity(linked.to_str().unwrap()).unwrap();
+        assert!(
+            approval_predates_worktree_coverage(storage.path(), &worktree),
+            "this is exactly the state the message describes"
+        );
+
+        // Extending it is no longer the older scheme, so the message stops.
+        save_grant(storage.path(), &approval_for(&main)).unwrap();
+        assert!(!approval_predates_worktree_coverage(
+            storage.path(),
+            &worktree
+        ));
+
+        // A bare repository: `commondir`'s parent is the directory that holds
+        // it, which is not a checkout of it.
+        let holder = tempfile::tempdir().unwrap();
+        let bare_path = holder.path().join("bare.git");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bare = identity(bare_path.to_str().unwrap()).unwrap();
+        assert!(!approval_predates_worktree_coverage(storage.path(), &bare));
+
+        // The case the common-directory guard exists for, and the only shape
+        // that reaches it: a repository whose Git directory was placed inside
+        // *another* repository's checkout, with `--separate-git-dir`. Deriving
+        // the main checkout from `commondir`'s parent then lands on the
+        // neighbour — which is a real checkout, is legacy-approved, and has
+        // nothing to do with this refusal. A plainly nested `git init` does
+        // not test this: its own `commondir` parent is its own checkout, so
+        // the guard never fires either way.
+        let outer = fixture();
+        git_in(outer.path(), &["commit", "--allow-empty", "-m", "outer"]);
+        let outer_id = identity(outer.path().to_str().unwrap()).unwrap();
+        fs::write(
+            legacy_record(storage.path(), &outer_id.checkout.path),
+            serde_json::to_vec(&outer_id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &outer_id).unwrap(),
+            TrustScope::Checkout,
+            "the neighbour really is legacy-approved"
+        );
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let separate = elsewhere.path().join("checkout");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(format!(
+                "--separate-git-dir={}",
+                outer.path().join("borrowed-gitdir").display()
+            ))
+            .arg(&separate)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let separate = identity(separate.to_str().unwrap()).unwrap();
+        assert_eq!(
+            separate.common_dir.path.parent(),
+            Some(outer_id.checkout.path.as_path()),
+            "the derived candidate really is the approved neighbour"
+        );
+        assert!(
+            !approval_predates_worktree_coverage(storage.path(), &separate),
+            "a different repository's record must never explain this refusal"
+        );
+    }
+
+    /// A repository grant and a legacy record for the same checkout can both
+    /// exist — the extension writes one and never deletes the other. The newer
+    /// scheme has strictly more reach, so it has to win, or extending would
+    /// report a downgrade for the very checkout the human started from.
+    #[test]
+    fn a_repository_grant_outranks_a_legacy_record_for_the_same_checkout() {
+        let (repo, _parent, storage, linked) = legacy_approved_repository();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        let worktree = identity(linked.to_str().unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &main).unwrap(),
+            TrustScope::Checkout
+        );
+
+        save_grant(storage.path(), &approval_for(&main)).unwrap();
+        assert!(legacy_record(storage.path(), &main.checkout.path).exists());
+        assert_eq!(
+            read_grant(storage.path(), &main).unwrap(),
+            TrustScope::Repository
+        );
+
+        // And a *corrupt* repository record does not silently fall back to the
+        // legacy one: an unreadable approval is an error, not a lesser scope.
+        fs::write(
+            repository_record(storage.path(), &main.common_dir.path),
+            b"{",
+        )
+        .unwrap();
+        assert!(read_grant(storage.path(), &main).is_err());
+        assert!(read_grant(storage.path(), &worktree).is_err());
+    }
+
+    /// Revocation has to reach both namespaces after an extension, or
+    /// "revoked" means "revoked except the half you cannot see".
+    /// Both new reads sit on paths that run per refusal and per panel load, so
+    /// their cost has to be bounded by the registry rather than by the work
+    /// tree, and has to stay far under the hook's 5s budget even when a
+    /// repository has an unreasonable number of worktrees.
+    ///
+    /// The ceiling is deliberately loose. This measures a directory listing
+    /// and a few stats; a tight wall-clock bound here would fail on a loaded
+    /// machine and say nothing about the code. The number that matters is
+    /// printed, and the assertion only catches a change of complexity class.
+    #[test]
+    fn counting_and_explaining_stay_cheap_on_an_unreasonable_registry() {
+        let repo = fixture();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let registry = current.common_dir.path.join("worktrees");
+        fs::create_dir_all(&registry).unwrap();
+        const ENTRIES: usize = 2000;
+        for n in 0..ENTRIES {
+            let entry = registry.join(format!("wt-{n}"));
+            fs::create_dir(&entry).unwrap();
+            fs::write(entry.join("gitdir"), b"/nowhere/.git").unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let counted = worktree_count(&current);
+        let counting = started.elapsed();
+        assert_eq!(counted as usize, ENTRIES + 1);
+
+        // The whole preview, which is what `cmd_repository_trust` costs.
+        let started = std::time::Instant::now();
+        let preview = inspect(repo.path().to_str().unwrap()).unwrap();
+        let previewing = started.elapsed();
+        assert_eq!(preview.worktrees as usize, ENTRIES + 1);
+
+        // And the refusal path, which runs this once per worktree that could
+        // not be read.
+        let storage = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let explained = approval_predates_worktree_coverage(storage.path(), &current);
+        let explaining = started.elapsed();
+        assert!(!explained, "nothing is approved in this store");
+
+        println!(
+            "registry={ENTRIES} count={counting:?} inspect={previewing:?} explain={explaining:?}"
+        );
+        for (label, taken) in [
+            ("count", counting),
+            ("inspect", previewing),
+            ("explain", explaining),
+        ] {
+            assert!(
+                taken < crate::hooks::BUDGET / 5,
+                "{label} took {taken:?} on {ENTRIES} entries, which threatens the {:?} hook budget",
+                crate::hooks::BUDGET
+            );
+        }
+    }
+
+    /// A registry entry whose name or pointer is hostile must not turn a count
+    /// into a traversal, a hang, or a panic. Counting reads the directory and
+    /// stats one file per entry; it must never follow what an entry points at.
+    #[test]
+    fn counting_never_follows_what_a_registry_entry_points_at() {
+        let repo = fixture();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let registry = current.common_dir.path.join("worktrees");
+        fs::create_dir_all(&registry).unwrap();
+
+        // A pointer naming a directory that does not exist, one naming the
+        // registry itself (a cycle if it were followed), and one that is a
+        // symlink loop. All three are counted as entries and none is walked.
+        for (name, target) in [
+            ("missing", "/nonexistent/place/.git"),
+            ("cyclic", registry.to_str().unwrap()),
+        ] {
+            let entry = registry.join(name);
+            fs::create_dir(&entry).unwrap();
+            fs::write(entry.join("gitdir"), target.as_bytes()).unwrap();
+        }
+        let looped = registry.join("looped");
+        fs::create_dir(&looped).unwrap();
+        std::os::unix::fs::symlink(&looped, looped.join("gitdir")).unwrap();
+
+        let started = std::time::Instant::now();
+        let counted = worktree_count(&current);
+        assert!(
+            started.elapsed() < crate::hooks::BUDGET,
+            "counting must not hang"
+        );
+        // `looped`'s gitdir is a symlink to a directory, so it is not a file
+        // and does not count; the other two do.
+        assert_eq!(counted, 3, "main checkout plus the two real pointers");
+    }
+
+    #[test]
+    fn revoking_an_extended_repository_removes_both_records() {
+        let (repo, _parent, storage, linked) = legacy_approved_repository();
+        let main = identity(repo.path().to_str().unwrap()).unwrap();
+        let worktree = identity(linked.to_str().unwrap()).unwrap();
+        save_grant(storage.path(), &approval_for(&main)).unwrap();
+
+        forget_records(
+            storage.path(),
+            Some(&main.common_dir.path),
+            &main.checkout.path,
+        )
+        .unwrap();
+
+        assert_eq!(read_grant(storage.path(), &main).unwrap(), TrustScope::None);
+        assert_eq!(
+            read_grant(storage.path(), &worktree).unwrap(),
+            TrustScope::None
+        );
+        assert!(!legacy_record(storage.path(), &main.checkout.path).exists());
+        assert!(!repository_record(storage.path(), &main.common_dir.path).exists());
     }
 
     #[test]

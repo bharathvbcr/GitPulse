@@ -40,6 +40,10 @@ const fixtures={
  cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
  cmd_devmap_preview_many:()=>[],
  cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>worktrees,
+ // Repository scope, to match cmd_collision_risk below: a fixture that reads
+ // both worktrees is one whose approval reaches both. "checkout" here would
+ // raise the extend-trust banner over every panel in this harness.
+ cmd_repository_trust:()=>({path:"/workspace/alpha",git_dir:"/workspace/alpha/.git",common_dir:"/workspace/alpha/.git",identity:"fixture-identity",scope:"repository",worktrees:2}),
  cmd_worktree_task:()=>null,cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
  cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],issues:[],releases:[],warnings:[],error:null}),
  cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:2,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[]}),

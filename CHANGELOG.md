@@ -11,7 +11,20 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- A repository approved before 1.1.0 made the repository the unit of trust kept
+  every one of its worktrees refused, with nothing anywhere offering to fix it.
+  The approval still admitted the checkout it named, so the app reported the
+  repository as trusted and never asked again; the only way to extend it was to
+  open a linked worktree as a repository, which nothing suggested. Worktree
+  comparisons, collision checks, and the fleet view quietly dropped every
+  sibling — honestly, saying each time that they had not been read, but with no
+  way out. Trust is now reported as a scope rather than a yes/no, the worktrees
+  panel offers to extend an approval that predates worktree coverage, and the
+  refusal a linked worktree returns says so instead of telling you to approve a
+  repository you already approved. Approvals are still never widened by being
+  read: extending is a decision you take, through the same dialog.
 
 ## [1.1.0] - 2026-09-14
 
