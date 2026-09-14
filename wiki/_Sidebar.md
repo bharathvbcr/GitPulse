@@ -1,4 +1,5 @@
 **Using GitPulse**
+* [Documentation index](https://github.com/bharathvbcr/GitPulse/blob/main/docs/README.md)
 * [[Home]]
 * [[Installation]]
 * [[Getting Started]]

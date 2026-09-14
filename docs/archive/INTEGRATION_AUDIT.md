@@ -4,7 +4,7 @@ This audit covers the local GitPulse, DevCouncil, Manvi and MarkDev checkouts.
 It includes the pending GitPulse graph, terminal, conflict, diagnostics and
 work-overview changes, and the canonical library changes those features consume.
 It is local verification, not a release or proof that every possible defect has
-been eliminated. The integration contract is in [MODULE_INTEGRATION.md](MODULE_INTEGRATION.md).
+been eliminated. The integration contract is in [MODULE_INTEGRATION.md](../MODULE_INTEGRATION.md).
 
 The coordinated GitPulse snapshot includes 166 non-Markdown files with 14,787
 lines added and 2,257 removed, including work pending before this audit.

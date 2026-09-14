@@ -1,5 +1,9 @@
 # Contributing to GitPulse
 
+For user workflows, start with the [documentation index](docs/README.md). The public
+website is maintained in the separate Portfolio repository; documentation changes
+here do not deploy it.
+
 Thank you for contributing to GitPulse! We welcome pull requests, bug reports, and feature proposals.
 
 ---
@@ -249,7 +253,7 @@ several were added after the drift had already happened.
 | `apple-bridge-contract` | The Apple Intelligence bridge linking in a way that changes the rest of the process, or the whole app. Two rules, neither visible from the Rust or Swift source. Building the Swift shim for the crate's floor instead of macOS 26 force-links Swift's back-deployment shims, and `swiftCompatibilityConcurrency` installs global executor hooks process-wide: `terminal_pty_stress`'s blocked-reader case stopped receiving its 252 KiB flood within five seconds, reproducibly, in a tree whose Rust diff touched no terminal code. And `-framework FoundationModels` is an `LC_LOAD_DYLIB` for a framework that first exists on macOS 26, so every user below it would fail to launch GitPulse at all — for a feature they cannot reach. Weak-linked instead, with every entry point behind `#available`. |
 | `each-key-contract` | Duplicate external rows crashing a keyed Svelte list. Evaluates the actual template expressions with repeated documentation links, backlinks, operation warnings, CI steps, and storage recommendations. Runtime races and reconciliation are covered by the diagnostics browser harness. |
 | `conventional-grammar-contract` | The frontend and `analyzer/conventional.rs` disagreeing about what counts as a Conventional Commit. Pulse's hygiene metric carried its own regex with a fixed 11-type vocabulary, so `wip:` and `fix(build system): x` counted for the commit badges and the `type:` filter but not for the metric. The pattern is re-derived from the Rust source rather than restated. |
-| `architecture-docs-contract` | The architecture docs describing a dependency the manifest does not have. |
+| `architecture-docs-contract` | Architecture dependency and module claims, plus local documentation links after guide moves. |
 | `archive-separation-contract` | `docs/ARCHIVE_SEPARATION.md` outliving its own premise. The plan says a task cannot carry an `archived` flag because the vendored `dc-store` has no column to store it, no `items.put` field to write it and no `items.list` filter to read it — three claims about files in this repository, each of which stops being true the day upstream lands the field. A stale "this is blocked" is a standing instruction to avoid work that is now possible, so a failure here is the signal to execute the plan and delete it. It also pins the seam from the other side: the plan promises the switch costs four functions in one module, which only holds while no other surface decides for itself what archived means. The status-literal rule is scoped to a `status` token, because `"done"` is also an `ActionState` and a rule keyed on the word alone fails the board for `row.state === "done"`. |
 | `health-failure-codes-contract` | The Health view saying "Local audit incomplete" and naming no cause. `audit_is_complete` in `analyzer/deps.rs` disqualifies a scan on a fixed list of failure issue codes, and the frontend maps the same codes to scanner names so it can say WHICH audit failed — two hand-kept copies of one list, where drift is silent: a newly added scanner would clear `audit_complete` while the UI stayed mute about it. The Rust array is parsed from source rather than restated. |
 | `cli-help-contract`, `cli-json-contract` | A script entry point losing `--help` or `--json`, or their exit codes diverging. |

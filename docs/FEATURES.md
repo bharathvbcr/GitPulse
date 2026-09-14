@@ -1,5 +1,19 @@
 # GitPulse Features & View Catalog
 
+[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Installation](INSTALLATION.md)
+
+This is the detailed feature reference. Start with the guides above for a first
+session; use the sections below for controls, prerequisites, and limits.
+[Open qualification](QUALIFICATION.md) tracks verification that remains outstanding.
+
+## Find a workflow
+
+- [Work: Overview, Resolve, Remote, Stack, Policy, and Tasks](#1-work-work)
+- [Tasks and saved workspaces](TASKS_AND_WORKSPACES.md)
+- [Code](#2-code-code), [History](#3-history-history), and [Insights](#4-insights-insights)
+- [Command palette](COMMAND_PALETTE.md), [terminal](TERMINAL.md), and [native menus](MACOS_MENUS.md)
+- [Trust and permissions](SECURITY.md)
+
 GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil's `devmap` module for the Code → Map code graph. See [Module integration](MODULE_INTEGRATION.md).

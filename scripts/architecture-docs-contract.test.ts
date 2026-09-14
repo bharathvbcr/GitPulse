@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -27,6 +28,38 @@ function directDependencies(manifest: string): string[] {
 
 describe("architecture documentation contract", () => {
   const deps = directDependencies(cargo);
+
+  it("keeps local documentation links valid after moving guides into the archive", () => {
+    const root = new URL("../", import.meta.url);
+    // Ignore local drafts and generated trees; they do not ship in a clone.
+    const tracked = execFileSync("git", ["ls-files", "-z", "--", "*.md"], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 5_000,
+    }).split("\0").filter((name) => /^(docs\/|wiki\/|README\.md$|CONTRIBUTING\.md$|CHANGELOG\.md$)/.test(name));
+    const docs = new Set([
+      ...tracked,
+      "docs/README.md",
+      "docs/INSTALLATION.md",
+      "docs/GETTING_STARTED.md",
+    ]);
+    const broken: string[] = [];
+    let checked = 0;
+    for (const doc of docs) {
+      const url = new URL(doc, root);
+      const source = readFileSync(url, "utf8").replace(/```[\s\S]*?```/g, "");
+      for (const match of source.matchAll(/\[[^\]\n]*\]\(([^)\n]+)\)|(?:href|src)="([^"]+)"/g)) {
+        const href = (match[1] ?? match[2]).trim().replace(/^<|>$/g, "");
+        if (/^[\w+.-]+:|^\/\//.test(href) || href.startsWith("#")) continue;
+        checked++;
+        const target = new URL(href, url);
+        target.hash = "";
+        if (!existsSync(target)) broken.push(`${doc}: ${href}`);
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
+    expect(broken).toEqual([]);
+  });
 
   it("reads the dependency table it is asserting about", () => {
     expect(deps).toContain("tauri");

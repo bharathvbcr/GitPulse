@@ -1,6 +1,8 @@
 # GitPulse Architecture
 
-GitPulse is built as a high-performance, local-first native desktop client combining a **Rust backend (Tauri 2)** with a **Svelte 5 + TypeScript frontend**.
+[Documentation index](README.md) · [Contributing](../CONTRIBUTING.md) · [Module integration](MODULE_INTEGRATION.md)
+
+GitPulse is built as a local-first native desktop client combining a **Rust backend (Tauri 2)** with a **Svelte 5 + TypeScript frontend**.
 
 **Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is
 **components and modules**. [Manvi](https://github.com/bharathvbcr/Manvi) wraps
@@ -17,7 +19,7 @@ flowchart TB
         UI["Views & Components<br/><code>src/lib/components/</code>"]
         Stores["State & Mutation Stores<br/><code>src/lib/stores/</code>"]
         Registry["View Registry & Routerless Nav<br/><code>src/lib/views/</code>"]
-        Canvas["GPU-Accelerated Canvas<br/><code>src/lib/canvas/</code>"]
+        Canvas["Canvas 2D rendering<br/><code>src/lib/canvas/</code>"]
         Async["Async Guards & Debounce<br/><code>src/lib/async/</code>"]
         
         UI --> Stores

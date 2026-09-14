@@ -4,8 +4,8 @@
 > about missing subsystems below describe the original planning baseline. They
 > are not the current implementation status. GitPulse now has a durable ledger,
 > schema-20 DevMap readers, a palette catalog and profile task/workspace CRUD.
-> Use [Architecture](ARCHITECTURE.md), [Module integration](MODULE_INTEGRATION.md)
-> and [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for current behavior.
+> Use [Architecture](../ARCHITECTURE.md), [Module integration](../MODULE_INTEGRATION.md)
+> and [Tasks and workspaces](../TASKS_AND_WORKSPACES.md) for current behavior.
 > Repository execution tasks/leases remain read-only; profile tasks use Manvi
 > storage through a separate API. Resolve current graph/map locations with
 > `devmap paths --json` rather than assuming this plan's legacy paths.

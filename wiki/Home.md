@@ -1,6 +1,6 @@
 # GitPulse Wiki
 
-**GitPulse** is a high-performance, local-first Git desktop client. A native Rust backend (Tauri 2) owns every privileged operation; a Svelte 5 frontend renders the graph, diffs, and audits. Nothing is sent to a GitPulse server — there isn't one.
+**GitPulse** is a local-first desktop workspace for Git, code, tasks, and repository insights. A native Rust backend (Tauri 2) owns every privileged operation; a Svelte 5 frontend renders the graph, diffs, and audits. Nothing is sent to a GitPulse server — there isn't one.
 
 **Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is components and modules. [Manvi](https://github.com/bharathvbcr/Manvi) wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil modules for code intelligence. Update them independently; this app does not require the whole suite.
 
@@ -9,6 +9,8 @@ GitPulse is also the successor to the deprecated [LiquiTask](https://github.com/
 [Website](https://gitpulse.vbcr.dev/) · [Releases](https://github.com/bharathvbcr/GitPulse/releases) · [Repository](https://github.com/bharathvbcr/GitPulse)
 
 ![GitPulse graph view: canvas commit graph with lanes, ref decorations, and the commit diff pane](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-graph.png)
+
+[Complete documentation index](https://github.com/bharathvbcr/GitPulse/blob/main/docs/README.md)
 
 ## Start here
 

@@ -11,7 +11,14 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Documentation
+
+- Reorganized the README around installation, the four views, and everyday
+  workflows. Added a documentation index, canonical installation guide, and
+  first-repository walkthrough; wiki entry points now link to those owners.
+- Clarified release availability, signing, repository trust, optional tools,
+  network boundaries, and the difference between implementation and qualification.
+
 
 ## [1.1.0] - 2026-09-13
 

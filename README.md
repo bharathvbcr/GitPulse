@@ -10,395 +10,149 @@
   <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
 </p>
 
-<p align="center">
-  <strong>High-performance, local-first native Git desktop client.</strong><br>
-  Engineered with a native Rust backend and a reactive Svelte 5 frontend for instant graph rendering, universal code coverage, deep repository auditing, and safe on-device AI.<br>
-  <a href="https://gitpulse.vbcr.dev/"><strong>Explore the Live Showcase &amp; Interactive Topology (gitpulse.vbcr.dev) &rarr;</strong></a>
-</p>
+**Git, code, and tasks in one local-first desktop workspace.**
 
-> **Successor to LiquiTask.** GitPulse is the unified replacement for the
-> deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask) agentic
-> workbench. LiquiTask's split React / IndexedDB / Go+Python sidecar stack is
-> frozen for performance reasons; task boards, agent handoff, and selected
-> [Manvi](https://github.com/bharathvbcr/Manvi) and
-> [DevCouncil](https://github.com/bharathvbcr/DevCouncil) modules live here as one
-> native control plane. DevCouncil is the component layer; Manvi wraps it;
-> GitPulse uses each for its respective job and can update them independently.
-> See LiquiTask's
-> [deprecation notice](https://github.com/bharathvbcr/LiquiTask/blob/main/docs/DEPRECATION.md)
-> and [Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md) in this repo.
+Review changes, follow branch history, organize tasks, and inspect repository
+health from a native Rust / Tauri 2 app with a Svelte 5 frontend.
 
-**1.0** adds a desktop shell around that control plane: native application menus
-with Go to every section, a rebuilt command palette (`⌘K` / `Ctrl+K`), an
-optional macOS menu-bar status popover, modular DevCouncil setup (DevMap by
-default), Insights → Pulse, and GitHub Dependabot / code-scanning alerts when a
-repository opens. Release notes are in the [Changelog](CHANGELOG.md); the full
-catalog is in [Features](docs/FEATURES.md).
+[Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
+[Getting started](docs/GETTING_STARTED.md) ·
+[Documentation](docs/README.md) ·
+[Website](https://gitpulse.vbcr.dev/) ·
+[Release notes](CHANGELOG.md)
 
-<p align="center">
-  <img src="docs/assets/screenshot-graph.png" alt="GitPulse graph view: canvas commit graph with lanes, ref decorations, and the commit diff pane" width="100%">
-</p>
+![GitPulse on macOS: commit graph and selected commit diff](docs/assets/screenshot-graph.png)
 
----
+## Get started
 
-## Getting started
+1. [Install GitPulse](docs/INSTALLATION.md) and Git for your platform.
+2. Open a repository and review **Trust and Open**. Trust allows its hooks,
+   helpers, and project tools to run with your account permissions.
+3. Use **Work** for changes in flight, **History** to review a commit, and
+   **Code** to explore files. Open the command palette with `⌘K` / `Ctrl+K`.
+4. Use **Walkthrough** in the title bar whenever you want a guided tour.
 
-The interactive first-run walkthrough highlights app controls as you open a
-repository, try views, and explore Tasks and Settings. Resume or replay it from
-**Walkthrough** in the title bar. Tool installation
-and launch at login are optional. See [Onboarding and permissions](docs/ONBOARDING.md).
+GitHub CLI, DevMap, Manvi, and local model servers are optional; install the
+ones needed for the features you use. The [first repository guide](docs/GETTING_STARTED.md)
+walks through a review, task creation, and optional setup.
 
-## Screenshots
+## Four views, one workspace
 
-Captured from GitPulse running on macOS against its own repository.
+GitPulse has 4 application views. Each view keeps related sections together.
 
-| Files — IDE explorer & live pulse | Diff — unified commit diff |
+| View | What you do here | Sections |
+| --- | --- | --- |
+| **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Stack · Policy · Tasks |
+| **Code** | Browse files, inspect authorship, explore structure | Explorer · Blame · Map |
+| **History** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog |
+| **Insights** | Inspect activity, coverage, dependencies, and disk usage | Pulse · Coverage · Health · Storage |
+
+Graph and Diff share the selected commit; Explorer and Blame share the selected
+file. **Fleet** compares repositories across the workspace, **Tasks** opens global
+and saved-workspace boards, and the **terminal dock** stays available across views.
+
+## From a change to the next step
+
+- **Review and commit.** Canvas commit graph, unified and side-by-side diffs,
+  word highlighting, image comparisons, selective staging, stash previews,
+  and a three-way conflict resolver.
+- **Organize the work.** Quick add parses priority, labels, owner, repository,
+  due date, and notes. Customize board/list layouts, use the Archive dock,
+  review drafting suggestions, and hand a task to an agent from its board.
+- **Explore the code.** File navigation and blame are built in. Add DevMap for
+  structural navigation, symbol search, dependencies, impact, and candidate tests.
+- **Inspect the repository.** Coverage reports, dependency audits, storage cleanup
+  previews, and Pulse activity summaries distinguish results from scans that did
+  not run. Capped results identify their limits.
+- **Work from the desktop.** Native menus, a command palette, a docked PTY terminal,
+  and an optional macOS menu-bar status popover keep frequent actions close.
+
+The [feature reference](docs/FEATURES.md) describes each surface and its limits.
+The [changelog](CHANGELOG.md) records release changes; [open qualification](docs/QUALIFICATION.md)
+tracks remaining platform, provider, and performance checks.
+
+| File explorer | Diff review |
 | --- | --- |
-| [<img src="docs/assets/screenshot-files.png" alt="Files view: file explorer, syntax-highlighted code viewer, file inspector, and uncommitted status dashboard">](docs/assets/screenshot-files.png) | [<img src="docs/assets/screenshot-diff.png" alt="Diff view: unified commit diff with added and removed line highlighting">](docs/assets/screenshot-diff.png) |
-| **Coverage — universal scanner** | **Health — dependency & vulnerability audit** |
-| [<img src="docs/assets/screenshot-coverage.png" alt="Coverage view: per-file coverage percentages by language with line-level gutters">](docs/assets/screenshot-coverage.png) | [<img src="docs/assets/screenshot-health.png" alt="Health view: dependency audit findings with advisory identifiers and Dependabot count">](docs/assets/screenshot-health.png) |
-| **Storage — disk usage & hygiene audit** | **Pulse — exportable summary card** |
-| [<img src="docs/assets/screenshot-storage.png" alt="Storage view: total and git-internal disk usage, hygiene gaps, and build cache directory breakdown">](docs/assets/screenshot-storage.png) | [<img src="docs/assets/screenshot-pulse-card.png" alt="Pulse summary card exported for this repository: commit count and active days, conventional and signed commit share, lines of code, code half-life, and bus factor, with partially scanned metrics marked">](docs/assets/screenshot-pulse-card.png) |
+| ![File explorer with working tree status](docs/assets/screenshot-files.png) | ![Commit diff with highlighted changes](docs/assets/screenshot-diff.png) |
+| Coverage | Dependency health |
+| ![Per-file and line coverage](docs/assets/screenshot-coverage.png) | ![Dependency audit findings](docs/assets/screenshot-health.png) |
 
----
+Screenshots are captures from the macOS app; appearance varies by release and platform.
 
-## Architecture at a Glance
+## Local state and explicit permissions
 
-GitPulse stores repository and task state locally, with a native IPC boundary and
-no remote telemetry. Git remotes, GitHub operations, optional tool downloads and
-explicitly configured agent providers can use the network.
+Repository and task state are stored locally. The desktop app has no remote
+telemetry. Git remotes, GitHub operations, optional tool downloads, release checks,
+and configured agent providers can use the network.
 
-**Product stack.** [DevCouncil](https://github.com/bharathvbcr/DevCouncil) is
-**components and modules**. [Manvi](https://github.com/bharathvbcr/Manvi) wraps
-them into a coding-agent harness. GitPulse uses **Manvi** for policy, workbench,
-and agent hosting, and **DevCouncil components** (`devmap` CLI and crates,
-verification reads) for code intelligence. Modules stay independently updatable;
-this app takes only the subset it needs. See
-[Module integration](docs/MODULE_INTEGRATION.md).
+Built-in local AI connects to loopback model servers. Task enhancement and agent
+runs use their configured provider; supported Mac builds can also use Apple
+Intelligence for task titles and descriptions. These are distinct execution paths.
+
+Repository trust is an execution decision. A worktree is not an OS sandbox.
+Policy verdicts preserve **unchecked** separately from **allowed**, and the
+read-only MCP server cannot grant repository trust. Read the
+[security and trust model](docs/SECURITY.md) before configuring agents.
+
+## Architecture
+
+DevCouncil is **components and modules**. Manvi wraps them. GitPulse uses Manvi
+for policy, workbench, and agent hosting, and selected DevCouncil components
+for code intelligence. Modules can be updated independently.
 
 ```mermaid
 flowchart TB
-    subgraph Frontend["Svelte 5 + TypeScript Frontend"]
-        direction TB
-        Views["4 Specialized Views<br/>(Work, Code, History, Insights)"]
-        Stores["Reactive Svelte 5 Stores & Runes"]
-        CanvasEngine["GPU-Accelerated HTML5 Canvas"]
-        AsyncGuards["Async Cancellation Guards"]
-        
-        Views --> Stores
-        Views --> CanvasEngine
-        Stores --> AsyncGuards
+    UI["Svelte frontend: views, stores, and canvas"] --> IPC["Tauri IPC contracts"]
+    subgraph Backend["Rust backend (Tauri 2 / Rayon)"]
+        Commands["Native command registry"] --> Git["Git operations and repository analysis"]
+        Commands --> Tasks["Tasks, terminal, and local state"]
     end
-
-    subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
-        direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(220 Handlers verified by <code>npm run check:ipc</code>)</i>"]
-    end
-
-    subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
-        direction TB
-        GitSandbox["Git Execution Sandbox & Blame"]
-        GraphSolver["Topological Lane Solver & Nogap Bounds"]
-        Analyzers["Analyzers: 60+ Languages, Universal Coverage, Health"]
-        StorageEngine["Storage Auditor & History Snapshots"]
-        TerminalPTY["Native PTY Terminal (portable-pty)"]
-        MCPServer["MCP Read Surface<br/>`gitpulse-mcp`"]
-        Ledger["Event Ledger & Attribution"]
-    end
-
-    subgraph LocalTools["Local Toolchain & Sidecars"]
-        direction TB
-        GitCLI["<code>git</code> CLI"]
-        GhCLI["<code>gh</code> CLI (GitHub Auth)"]
-        LocalAI["Local LLMs (Ollama / LM Studio)"]
-        ManviSidecar["Manvi wrap (<code>manvi serve</code>)"]
-        DevCouncilMods["DevCouncil modules<br/>(<code>devmap</code>, selected crates)"]
-    end
-
-    AsyncGuards --> IPCBridge
-    IPCBridge --> Backend
-    GitSandbox --> GitCLI
-    Analyzers --> GhCLI
-    Analyzers --> LocalAI
-    Backend --> ManviSidecar
-    Backend --> DevCouncilMods
+    IPC --> Commands
+    Commands --> Manvi["Manvi: policy and agent hosting"]
+    Commands --> DevMap["DevCouncil modules: code intelligence"]
 ```
 
----
+See [architecture](docs/ARCHITECTURE.md) for ownership and contracts, and
+[module integration](docs/MODULE_INTEGRATION.md) for the boundaries between projects.
+GitPulse succeeds the deprecated [LiquiTask](https://github.com/bharathvbcr/LiquiTask)
+workbench; this does not imply complete feature parity.
 
-## View Catalog & Workflows
+## Build and contribute
 
-GitPulse organizes 4 purpose-built views, each holding the lenses on one
-subject as **sections** rather than as separate destinations:
-
-```mermaid
-flowchart LR
-    subgraph Views["🔨 The four views"]
-        WorkTab["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy · Tasks"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map"]
-        History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog"]
-        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage"]
-    end
-
-    subgraph Docked["⚙️ Docked & Workspace Surfaces"]
-        Terminal["<b>Terminal</b> (<code>⌃`</code>)<br/>Native PTY, docked under the current view"]
-        Fleet["<b>Fleet</b> (<code>Cmd/Ctrl+Shift+F</code>)<br/>Every open repository at once — not a view"]
-        Tasks["<b>Tasks</b><br/>Global, saved-workspace and repository boards"]
-        Palette["<b>Command Palette</b> (<code>⌘K</code> / <code>Ctrl+K</code>)<br/>Eight search modes — not a view"]
-        Menus["<b>Native Menus</b><br/>Go opens all 16 sections; optional macOS status icon"]
-        MCP["<b>MCP</b><br/>Read-only Agent Plugins tools"]
-    end
-```
-
-A section switches the lens without changing the subject: picking a commit in
-**History → Graph** and moving to **Diff** keeps that commit, opening a file in
-**Code → Explorer** and moving to **Blame** keeps that file, and a blocked
-worktree row in **Work → Overview** opens **Resolve** on the worktree that is
-actually stuck. Every section a former top-level view became keeps its own
-command-palette entry, so no door was closed by the consolidation.
-
-> **Fleet is deliberately not one of the 4 views.** Each view answers a
-> question about the active repository and is persisted on that repository's
-> session; Fleet answers one about the whole workspace, so it lives above the
-> repository tab strip and survives switching between repositories.
-
-**Tasks**, beside Fleet, opens global and saved-workspace boards. **Work → Tasks**
-opens the same task store filtered to the active repository. A task linked to
-several repositories appears in each relevant board; edits update the shared task.
-See [Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md) for setup, keyboard controls,
-Manvi suggestions and agent handoff.
-
----
-
-## Key Features
-
-### 🖥️ Desktop Shell
-| Feature | Description |
-| --- | --- |
-| **Native Application Menu** | GitPulse · File · Edit · View · Go · Repository · Window · Help. **Go** opens all 16 sections directly; live checkmarks follow selection and appearance; repository switcher, staging, branch and parked-operation actions reflect availability. Help covers documentation, shortcuts, diagnostics, optional-tool setup, release notes and issue reporting. See [Native menus and status icon](docs/MACOS_MENUS.md). |
-| **macOS Menu Bar Status** | Opt-in pulse icon (`Settings → Layout`) opens a compact popover: Changed / Staged / Conflicts cards, last-fetch age, one primary action, and expandable details. Launch at login and hide-Dock-while-closed keep the app in the menu bar. The popover cannot mutate Git. |
-| **Command Palette** | `⌘K` / `Ctrl+K` with eight discoverable modes (`>`, `/`, `%`, `#`, `@`, `:`, `::`, `?`): commands, files, repositories, commits, branches, single- and cross-repo symbols, and help. Contextual availability, result paging and keyboard focus. See [Command palette](docs/COMMAND_PALETTE.md). |
-
-### 🚀 Core Git & Visualization
-| Feature | Description |
-| --- | --- |
-| **Work View & Task Control Plane** | Unified dashboard (`F10`). Overview keys on the worktree (or a bound DevCouncil task when a store exists); blocked parked operations sort first; agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. Links PRs, workflow runs, policy verdicts and temporary grants. Stack restack plans the whole subtree before the first rewrite. Agent activity recorded to a durable SQLite WAL ledger. |
-| **Tasks & Saved Workspaces** | Global, workspace and repository boards over one persistent task store. Board/list layouts you can customize per profile — density, which columns show, which chips a card carries — with a banner naming the work any hidden column holds. One-line quick add parses `!priority #label @owner ~type ^repo due:friday :: notes` as you type. Kanban drag with neighbor insertion, search, filters over loaded cards, multi-selection, a right-click menu that also sets schedule, owner, labels and hands a card to an agent, a four-pane task sheet, field locks during enhancement, adding currently open tabs as members, and agent copy of a saved revision or an explicitly labelled unsaved draft. |
-| **On-device task drafting** | On a Mac running Apple Intelligence, titles and descriptions can be written by Apple's Foundation Models framework instead of a local model server — nothing to install, and the text never reaches a socket. It is an engine for the existing proposal lifecycle, not a second one: the same store record, the same review, accept and undo. A build without the framework hides the choice rather than offering a disabled one, and a Mac that has it switched off says so in its own words. |
-| **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
-| **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with a straight, pinned main branch, stable branch columns, avatar rendering, nogap lookback bounds, filters that keep the graph connected, and ref decorations solved natively in Rust. Cherry-pick and revert from the commit row. |
-| **Precision Diff Viewer** | File, commit, and range diffs that name what they show, in a true side-by-side or unified layout sharing one row model. Syntax colouring under the intra-line word diff, find-in-diff with regex, block-to-block stepping, both line-number columns behind a pinned gutter, a filterable and resizable file rail, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging from either layout. |
-| **Batch Index Updates** | Stage or unstage the current selection in one native request, with bounded Git commands, shared mutation locking, and explicit partial-failure recovery. Unstaging a rename includes both paths; new repositories work before their first commit. |
-| **Stash Review** | Save named stashes, include untracked files or keep staged changes, and preview a stash inline before restoring or removing it. Limited lists and previews are labelled. |
-| **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
-| **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
-| **Fleet Dashboard** | Workspace-wide grid (`Cmd/Ctrl+Shift+F`) covering every open repository and every recent one: changes, sync, conflicts, stash, worktrees, agent sessions and last activity live; lines of code, disk usage, dependency audits and coverage on demand, cached with their age. Every cell is a value, *not scanned*, or *could not read* — never a reassuring zero — and every total states what it could not count. |
-| **Language Vector Logos & Path Scannability** | Zero-dependency vector logos for 34+ programming languages, configs, and markups across the file tree, editor tabs, diff toolbar, and dashboard, with dimmed path hierarchy for scannable file lists. |
-
-### 🛡️ Code Intelligence & Auditing
-| Feature | Description |
-| --- | --- |
-| **DevMap + MarkDev integration** | Schema-20 code map from the DevCouncil `devmap` module, in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. **Code → Map** is the structural navigator — resolved `repo_map.json`, code/doc graphs, tracked-markdown search — not a third reading of the open file. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
-| **Git-Native Provenance** | `CI:local` runs recorded as verification notes under `refs/notes/gitpulse/`, with branch and PR decay freshness badges based on distance from the default branch. |
-| **Repository Pulse** | Insights → Pulse: 53-week contribution heatmap, rhythm and punch card, commit hygiene, bus factor, local DORA approximations, and an exportable SVG summary card. Unscanned tiles render as an em dash with a reason — never a fake zero. |
-| **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
-| **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. The status-bar mix is ordered by share of code lines; the label is the true majority among the languages drawn. |
-| **Storage & Hygiene Audit** | Disk usage and build/cache maintenance across [three explicit scopes](docs/REPOSITORY_HYGIENE.md): a host-wide default every repository inherits, a per-repository override, and a global cleaner in Fleet and Settings with its own roots, exclusions, retention, scheduled cleanup and run history. |
-| **Multi-Ecosystem Health** | Local audits via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit` and `bundler-audit`. GitHub Dependabot and code scanning alerts (via local `gh`) fetch when a repository opens; critical and high findings warn. Turn off under Settings → Analysis. **Scan local** still does not call GitHub. |
-| **Optional Tools Setup** | Help → Set Up Optional Tools (or the command palette) installs **DevMap only** by default, or the analysis suite / full DevCouncil host. Copy the command or run it in Terminal → Console. Settings can disable or uninstall a GitPulse-owned binary. Native Go/Rust binaries only — no uv / Python install path. |
-| **Durable Crash Logging** | Synchronous append-only per-binary crash logging with bounded backtraces surviving process restarts across GUI and CLI binaries (`gitpulsed`, `gitpulse-mcp`). |
-| **MCP 2.0 + agent plugins** | `gitpulse-mcp` speaks MCP `2026-07-28` (`server/discover`, per-request `_meta`, cacheable `tools/list`) and still answers the legacy `initialize` handshake. The canonical package is `plugins/gitpulse/`, with native Codex, Claude Code, and [Agent Plugins 1.0](https://agent-plugins.org/specification) manifests plus shared skills. Tools are read-only insights: worktrees, collisions, change context, ledger, code graph. |
-
-### 🤖 Local AI & Policy Safety Gate
-| Feature | Description |
-| --- | --- |
-| **MANVI Policy Gate** | Mutating Git actions are evaluated against Manvi's wrap of DevCouncil policy: a 5-verdict safety ladder (*Allowed*, *Demoted*, *Warned*, *Blocked*, *Unchecked*). Asymmetric degradation ensures wedged sidecars fail closed safely. |
-| **On-Device AI Assistance** | Context-calibrated AI assistance for commit messages, commit explanations, and branch naming against local LLMs (Ollama, LM Studio, llama.cpp, vLLM). |
-| **Scoped Action Allowlist** | AI-suggested coverage generation and dependency fixes execute via a purpose-limited command allowlist (`cmd_manvi_run_action`) across all major ecosystems (npm, cargo, pytest, go, swift, dart, etc.) requiring explicit user confirmation. |
-
-```mermaid
-flowchart TD
-    subgraph PolicyGate["🛡️ MANVI 5-Verdict Policy Gate"]
-        ActionReq["User Triggers Mutating Action"] --> Eval["Evaluate Command & Bounds"]
-        Eval -->|Safe| Allowed["Allowed → Execute"]
-        Eval -->|Modified| Demoted["Demoted → Execute Safe Variant"]
-        Eval -->|Caution| Warned["Warned → Execute with Warning"]
-        Eval -->|Hostile / Risky| Blocked["Blocked → Refuse Loudly"]
-        Eval -->|No Harness| Unchecked["Unchecked → Explicit Status"]
-    end
-
-    subgraph Remediation["🤖 Local AI & Scoped Execution"]
-        AIReq["Health / Coverage Gap Identified"] --> LocalModel["Local Model Formulates Remediation"]
-        LocalModel --> AllowlistCheck["Strict Allowlist Validation<br/>(No shell, direct argv, ecosystem tools only)"]
-        AllowlistCheck --> UserConfirm["Explicit User Confirmation"]
-        UserConfirm --> BoundedRun["Bounded Execution (Hard timeout & capped output)"]
-    end
-```
-
----
-
-## Local CI & Release Pipeline
-
-GitPulse includes **`CI:local`** (`cmd_ci_local`), which plans checks from the active
-repository's manifests and reports passed, failed and skipped steps. Affected-test
-mode uses DevMap only when its evidence supports selection; otherwise it falls
-back to the full suite with a reason. GitPulse's own contributor gate is
-**`npm run ci:local`**, the explicit pipeline in `package.json`.
-
-```mermaid
-flowchart LR
-    subgraph LocalCI["CI:Local (Single Click)"]
-        Detect["Scan Manifests<br/>(package.json, Cargo.toml)"] --> Plan["Plan Step Matrix"]
-        Plan --> Run["Sequential Run<br/>(Svelte Check → Vitest → Cargo Clippy → Cargo Test)"]
-        Run --> Outcome["Honest Accounting<br/>(Passed / Failed / Skipped)"]
-    end
-
-    subgraph ReleasePipeline["GitHub Actions Release Pipeline"]
-        TagPush["Push Tag <code>vX.Y.Z</code>"] --> VerGate["Version Gate Validation<br/>(package, lockfiles, native and plugin manifests)"]
-        VerGate --> Matrix["Cross-Platform Matrix<br/>(macOS, Linux, Windows)"]
-        Matrix --> Verify["Draft Release Asset Verification"]
-        Verify --> Publish["Draft Ready for Publishing"]
-    end
-
-    Outcome --> TagPush
-```
-
----
-
-## Installation
-
-Download pre-built installers from the [latest release](https://github.com/bharathvbcr/GitPulse/releases/latest):
-
-| Platform | Format | Architecture | Notes |
-| --- | --- | --- | --- |
-| **macOS** | `.dmg` | Universal (Apple Silicon & Intel) | Unsigned binary. Run quarantine command below. |
-| **Linux** | `.AppImage`, `.deb` | x86_64 | Built on Ubuntu 22.04 (glibc 2.35+) |
-| **Windows** | `.msi`, `.exe` | x64 | Windows 10/11 installer |
-
-### Optional Tools (`devmap` / `manvi`)
-
-Code → Map needs the `devmap` CLI; the policy gate needs `manvi`. In-app **Help →
-Set Up Optional Tools** (also in the command palette) installs **DevMap only** by
-default, or the analysis suite / full DevCouncil host. Copy the documented
-command, or with a repository open run it in Terminal → Console. Settings can
-disable a tool or uninstall a binary GitPulse itself placed in its app bin
-directory. These are native Go/Rust binaries — there is no uv / Python install
-path.
-
-### macOS Unsigned Gatekeeper Note
-macOS quarantines unsigned downloads. After dragging GitPulse to `/Applications`, run:
+Use Node.js 22.x (22.12 or newer), stable Rust, Git, and your platform's native
+build tools. The [contributor guide](CONTRIBUTING.md) covers setup and platform prerequisites.
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/GitPulse.app
-```
-
-### Staying Up To Date
-
-GitPulse does **not** auto-update, and it does not check for updates unless you ask
-it to. Updating is a manual download from the releases page.
-
-There is an opt-in convenience in **Settings → Updates**:
-
-- **Off by default.** With the toggle off, GitPulse makes no network request about
-  itself, ever — consistent with the zero-telemetry model.
-- **When enabled**, it compares release tags against this repository at most once a
-  day and shows a notification if a newer version exists. It reads the public tag
-  list with `git ls-remote` — no account, no token, and nothing is sent about you or
-  your repositories.
-- **Check now** runs a single check on demand regardless of the toggle.
-- It never downloads or installs anything. The notification links to the release
-  page; the download is yours to make.
-
-A check that cannot complete says so. "Could not check" is never reported as "up to
-date".
-
----
-
-## Quickstart & Development
-
-### Prerequisites
-- **Node.js**: `22.x` (22.12 or newer; matches the CI major)
-- **Rust**: `stable` (edition 2021)
-- **Git**: Recent version
-- **cargo-llvm-cov**: required by `npm run ci:local` for the Rust coverage floor —
-  `rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --locked`
-- **actionlint**: required by `npm run ci:local` to lint the GitHub Actions
-  workflows — `brew install actionlint` (see [install docs](https://github.com/rhysd/actionlint/blob/main/docs/install.md))
-
-### Getting Started
-
-```sh
-# 1. Install dependencies
+git clone https://github.com/bharathvbcr/GitPulse.git
+cd GitPulse
 npm ci
-
-# 2. Launch full desktop application with hot-reload
+git config core.hooksPath .githooks
 npm run tauri dev
 ```
 
-### Essential Developer Commands
-
-| Command | Description |
+| Command | Purpose |
 | --- | --- |
-| `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
-| `npm run dev` | Run Vite development server only (browser UI mode) |
-| `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
-| `npm run check:ipc` | Verify 220 Rust commands match frontend `invoke()` calls with zero drift |
-| `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
-| `npm run check:types` | Compare Rust serde structs and TypeScript interfaces across 65 contracts (157 structs, 1104 fields) |
-| `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
-| `npm run mcp:install` | Install/refresh `gitpulse-mcp` **and** `gitpulse-hook` on PATH, which is what agent clients spawn |
-| `npm run mcp:doctor` | Assert the `gitpulse-mcp` and `gitpulse-hook` on PATH are this tree's build, not stale or absent copies |
-| `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
-| `npm test` | Run Vitest unit and integration test suite (2,000+ tests) |
-| `npm run coverage` | Generate Vitest v8 code coverage report |
-| `npm run check:coverage` | Validate both LCOV reports and enforce coverage floors (frontend 90% lines / 85% branches, Rust 80% lines) |
-| `npm run check:workflows` | Lint `.github/workflows/*` with actionlint — the only gate that reads `release.yml`, which CI otherwise sees only on a tag |
-| `npm run build` | Build frontend production bundle |
-| `npm run tauri build` | Bundle native installers for the host platform |
+| `npm run check` | Svelte and TypeScript checks |
+| `npm test` | Frontend and contract tests |
+| `npm run check:ipc` | Match frontend calls to the native command registry |
+| `npm run check:types` | Compare Rust and TypeScript wire contracts |
+| `npm run check:release` | Check version manifest consistency |
+| `npm run build` | Build the frontend bundle |
+| `npm run tauri build` | Build native bundles for the host |
+| `npm run ci:local` | Full local checks, browser regressions, coverage, and native gates |
 
-See [Dependency health](docs/DEPENDENCY_HEALTH.md) for the TypeScript 6/7
-compatibility setup, uncapped audit results, and unresolved GTK3 advisories.
+A frontend build alone does not qualify the native application. Follow the
+[release procedure](CONTRIBUTING.md) before publishing a build.
 
-For a release, commit the candidate and run `npm run ci:local`, then push the
-commit and wait for both **CI** and **Code Coverage** to pass for that exact SHA.
-Push the matching version tag only after those gates pass. The release workflow
-pins every platform to that commit and prepares one draft by ID. It verifies all
-seven uploaded assets and the changelog notes before reporting success. A failed
-run can resume the matching draft; published releases and moved tags are refused.
-Publish the draft only after **Verify Release Completeness** succeeds.
+## Documentation
 
----
+The [documentation index](docs/README.md) organizes user guides, integration
+references, contributor contracts, and historical evidence. Start with
+[installation](docs/INSTALLATION.md), [your first repository](docs/GETTING_STARTED.md),
+or [tasks and workspaces](docs/TASKS_AND_WORKSPACES.md).
 
-macOS bundles use an ad-hoc signature by default so their resources are sealed.
-For trusted distribution, configure `APPLE_SIGNING_IDENTITY` and notarization
-through Tauri's release setup. An ad-hoc build is not a notarized release.
-
-## In-Depth Documentation
-
-For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
-
-- **[Open qualification](docs/QUALIFICATION.md)** — Remaining workbench and notification gates. Dated audits are under [docs/archive/](docs/archive/README.md).
-- 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
-- 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil and Manvi modules independently; take only the subset this app needs.
-- **[Tasks and workspaces](docs/TASKS_AND_WORKSPACES.md)** — Shared boards, task editing, Manvi suggestions, agent briefs and run boundaries. GitPulse is the successor to LiquiTask for this surface.
-- **[Command palette](docs/COMMAND_PALETTE.md)** — Eight search modes, availability, paging and keyboard navigation.
-- **[Repository hygiene](docs/REPOSITORY_HYGIENE.md)** — Storage cleanup previews, Fleet/Settings cleanup and scheduling.
-- **[Native menus and status icon](docs/MACOS_MENUS.md)** — Menu actions, repository context and the macOS status popover.
-- **[Terminal Guide](docs/TERMINAL.md)** — Tabs, split panes, Find, shortcuts, output export, and recovery. Native PTY stress evidence is in the [archived terminal audit](docs/archive/TERMINAL_AUDIT.md).
-- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 4 application views, their sections and keyboard shortcuts.
-- 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
-- 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
-- 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.
-
----
-
-## Contributing
-
-Pull requests, bug reports, and feature proposals are welcome. Start with the
-**[Contributing Guide](CONTRIBUTING.md)** for development setup, how to run the
-tests, and an architecture orientation — then pick something from the
-**[curated backlog](docs/GOOD_FIRST_ISSUES.md)**.
+Bug reports, documentation, design, tests, and code contributions are welcome.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [good first issues](docs/GOOD_FIRST_ISSUES.md).
 
 ### Contributors
 
