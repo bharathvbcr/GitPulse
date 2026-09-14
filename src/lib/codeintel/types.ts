@@ -648,6 +648,15 @@ export interface DoctorReport {
   stale_server_warning: string | null;
   plugin_warning: string | null;
   missing_binary_warning: string | null;
+  stray_state_warning: string | null;
+  /**
+   * Every other `*_warning` devmap emitted, as `key: text`.
+   *
+   * The named fields are the ones GitPulse can order by consequence; this is
+   * what stops the next one devmap adds from being silently dropped, the way
+   * `stray_state_warning` was for as long as the field list was hand-written.
+   */
+  extra_warnings: string[];
   expected_schema_version: number | null;
   code_graph_schema_version: number | null;
   linked_grammar_count: number | null;

@@ -36,6 +36,8 @@ function report(overrides: Partial<SuiteReport> = {}): SuiteReport {
       stale_server_warning: null,
       plugin_warning: null,
       missing_binary_warning: null,
+      stray_state_warning: null,
+      extra_warnings: [],
       expected_schema_version: 20,
       code_graph_schema_version: 2,
       linked_grammar_count: 33,
