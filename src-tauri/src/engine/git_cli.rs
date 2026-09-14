@@ -730,6 +730,19 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Longest inherited `PATH` [`extended_child_path`] will still append to.
+///
+/// `argv` and `envp` share one buffer and `execve` fails the whole spawn with
+/// `E2BIG` once it is full — 1 MiB on this project's macOS hosts, measured by
+/// the test that pins this rather than taken from a manual. A PATH anywhere
+/// near that is pathological, but appending to it is how a helpful change
+/// becomes the reason a spawn that used to work stops working, and the failure
+/// arrives as "Failed to spawn git: Argument list too long" with nothing
+/// pointing back here. Below this ceiling the handful of short fallback dirs
+/// cannot move the total meaningfully; at or above it the child keeps exactly
+/// the environment it would have inherited without us.
+const MAX_INHERITED_PATH_BYTES: usize = 64 * 1024;
+
 /// Child-side `PATH` value: inherited entries first (precedence preserved),
 /// then the [`gui_launch_fallback_dirs`] that are not already present.
 ///
@@ -742,12 +755,17 @@ fn is_executable_file(path: &Path) -> bool {
 /// as "npm is not installed".
 ///
 /// Returns `None` when the joined value cannot be built (an entry with a
-/// disallowed character); the caller then leaves the inherited PATH untouched
-/// rather than degrading the child to an empty one.
+/// disallowed character) or when the inherited value already sits at
+/// [`MAX_INHERITED_PATH_BYTES`]; the caller then leaves the inherited PATH
+/// untouched rather than degrading the child to an empty one — or to one the
+/// kernel refuses to exec.
 pub(crate) fn extended_child_path(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<std::ffi::OsString> {
+    if path_var.is_some_and(|value| value.len() >= MAX_INHERITED_PATH_BYTES) {
+        return None;
+    }
     // Empty entries are dropped: POSIX reads one as "the current directory",
     // which would let whatever repo the user has open inject executables into
     // every spawned tool's lookup path.
@@ -770,6 +788,79 @@ pub(crate) fn extended_child_path(
         }
     }
     std::env::join_paths(entries).ok()
+}
+
+/// Give a hand-built child the same `PATH` [`build_capture_command`] gives its
+/// own, unless the caller already chose one.
+///
+/// Resolving a tool and *running* it are two different PATH questions, and
+/// until this existed only the first was answered. [`find_external_tool`]
+/// searches the [`gui_launch_fallback_dirs`] on top of `PATH`, so a
+/// GUI-launched GitPulse finds `~/.local/bin/devmap` and then spawns it with
+/// launchd's `/usr/bin:/bin:/usr/sbin:/sbin` — a PATH that cannot see the
+/// binary we just resolved out of it.
+///
+/// That is not a cosmetic difference for a tool whose job is to inspect the
+/// machine. `devmap doctor` resolves the bare `devmap` command named by host
+/// MCP configs against its own `PATH`; handed the minimal one it finds
+/// nothing, records `exists: false`, and reports "host MCP config names a
+/// devmap path that is not a file: devmap — this is not version skew".
+/// GitPulse then renders that as an installation fault. It is not one: it is
+/// the PATH we chose, described back to us as the user's broken install — a
+/// check that could not run, naming a cause it did not have.
+///
+/// Two conditions keep this from changing anything else:
+///
+/// - **The caller wins.** A `PATH` already set on the command (the terminal's
+///   own environment, [`build_capture_command`], the harness sidecar) is left
+///   exactly as it is; this only fills an absent one.
+/// - **The program must already be a path.** Rust falls back from
+///   `posix_spawn` to `fork` when `PATH` is overridden for a *bare* program
+///   name (`env_saw_path() && !program_is_path()` in `std`), and forking a
+///   large GUI process is both slow and the shape behind the concurrent-spawn
+///   descriptor races this module already guards. Every production spawn that
+///   reaches here carries a resolved path; bare names arrive through
+///   [`build_capture_command`] or [`git_command_with_env`], which resolve the
+///   program *and* set `PATH` themselves, so the first condition already
+///   excludes them.
+///
+/// Non-Windows only, for the reason [`build_capture_command`] gives: the
+/// Windows environment block is case-insensitive, so setting `"PATH"` through
+/// `.env()` can collide with an inherited `"Path"` and leave the child holding
+/// two different search paths.
+fn default_child_path(cmd: &mut Command) {
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    default_child_path_with_env(cmd, path_var.as_deref(), home.as_deref());
+}
+
+/// [`default_child_path`] with the environment passed in, mirroring the
+/// [`git_command`] / [`git_command_with_env`] split so the three guards can be
+/// tested without writing to the process environment out from under every
+/// other test in the binary.
+fn default_child_path_with_env(
+    cmd: &mut Command,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) {
+    if cfg!(windows) {
+        return;
+    }
+    // `components()` rather than a `/` scan: it is the same question `std`
+    // asks (`program_is_path`), and it answers it identically for "./devmap"
+    // and for a `Path`-typed program built without a literal separator.
+    if Path::new(cmd.get_program()).components().count() <= 1 {
+        return;
+    }
+    if cmd
+        .get_envs()
+        .any(|(key, _)| key == std::ffi::OsStr::new("PATH"))
+    {
+        return;
+    }
+    if let Some(child_path) = extended_child_path(path_var, home) {
+        cmd.env("PATH", child_path);
+    }
 }
 
 /// Resolves the `program` argument of [`capture_command`] to a spawner-ready
@@ -1581,6 +1672,12 @@ fn run_with_gate(
         cmd.stdin(Stdio::null());
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Sited here rather than at each construction site because this is the one
+    // funnel every spawn in the process already passes through: `git_timeout`,
+    // `capture_command`, `run_bounded`, `run_bounded_capped` and `run_observed`
+    // all end up in this function. A per-site fix would have to be remembered
+    // by the next spawn someone adds; this one cannot be forgotten.
+    default_child_path(cmd);
 
     // Held until this function returns, covering the child's descriptors, its
     // output buffers and fallback reader threads -- see [`SpawnGate`] for why an
@@ -3298,6 +3395,236 @@ mod tests {
     /// The extended child PATH appends only the fallback dirs that are not
     /// already present, preserving inherited order and precedence.
     #[cfg(unix)]
+    /// `argv` and `envp` share one buffer and `execve` refuses the whole spawn
+    /// once it is full. Appending six directories to a PATH already at that
+    /// ceiling is how a helpful change becomes the reason a working spawn
+    /// stops working — surfacing as "Failed to spawn git: Argument list too
+    /// long", with nothing pointing back here.
+    ///
+    /// The ceiling is measured on the host rather than taken from a manual,
+    /// and the guard is asserted to sit below it with room to spare: a guard
+    /// at or above the real limit protects nothing while looking like it does.
+    #[test]
+    #[cfg(unix)]
+    fn a_path_at_the_exec_ceiling_is_never_grown() {
+        let home = tempfile::TempDir::new().unwrap();
+        let entry = "/".repeat(1000);
+
+        let under = std::iter::repeat_n(entry.as_str(), (MAX_INHERITED_PATH_BYTES / 1001) - 1)
+            .collect::<Vec<_>>()
+            .join(":");
+        assert!(
+            under.len() < MAX_INHERITED_PATH_BYTES,
+            "fixture must sit under the guard"
+        );
+        let extended = extended_child_path(
+            Some(std::ffi::OsStr::new(&under)),
+            Some(home.path().as_os_str()),
+        )
+        .expect("a PATH under the guard must still be extended");
+        assert!(
+            extended.len() > under.len(),
+            "the fallback dirs were not appended below the guard"
+        );
+
+        for size in [
+            MAX_INHERITED_PATH_BYTES,
+            MAX_INHERITED_PATH_BYTES * 2,
+            MAX_INHERITED_PATH_BYTES * 16,
+        ] {
+            assert!(
+                extended_child_path(
+                    Some(std::ffi::OsStr::new(&"x".repeat(size))),
+                    Some(home.path().as_os_str())
+                )
+                .is_none(),
+                "a {size}-byte PATH was grown toward E2BIG"
+            );
+        }
+
+        let mut refused_at = None;
+        for bytes in [64 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 4096 * 1024] {
+            let refused = Command::new("/usr/bin/true")
+                .env_clear()
+                .env("PATH", "x".repeat(bytes))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_err();
+            if refused {
+                refused_at = Some(bytes);
+                break;
+            }
+        }
+        match refused_at {
+            Some(ceiling) => assert!(
+                MAX_INHERITED_PATH_BYTES < ceiling,
+                "the guard ({MAX_INHERITED_PATH_BYTES}) is at or above this host's measured exec \
+                 ceiling ({ceiling}), so it protects nothing"
+            ),
+            // A host with no reachable ceiling cannot falsify the guard.
+            // Saying so is the honest outcome; passing quietly would make an
+            // unmeasured host read like a measured one.
+            None => eprintln!("exec accepted a 4 MiB PATH: no ceiling in range, guard unverified"),
+        }
+    }
+
+    /// Extending must never hand a child a *smaller* search path.
+    ///
+    /// A dropped entry silently relocates which `git`, `gh` or `devmap` the
+    /// child resolves — the same wrong-binary class the installation-health
+    /// report exists to catch, introduced by the code that reports it.
+    #[test]
+    fn extending_never_removes_an_inherited_entry() {
+        let home = tempfile::TempDir::new().unwrap();
+        for case in [
+            "/usr/bin:/bin",
+            // Empty entries mean "the current directory" to POSIX and are
+            // dropped deliberately; everything else must survive.
+            "/usr/bin::/bin:",
+            "/opt/homebrew/bin:/usr/bin",
+            "/a b/bin:/c\td/bin",
+            "/usr/bin:/usr/bin:/usr/bin",
+            "/ünïcode/bin:/usr/bin",
+        ] {
+            let extended = extended_child_path(
+                Some(std::ffi::OsStr::new(case)),
+                Some(home.path().as_os_str()),
+            )
+            .unwrap_or_else(|| panic!("join failed for {case}"));
+            let before: Vec<PathBuf> = std::env::split_paths(std::ffi::OsStr::new(case))
+                .filter(|entry| !entry.as_os_str().is_empty())
+                .collect();
+            let after: Vec<PathBuf> = std::env::split_paths(&extended).collect();
+            for entry in &before {
+                assert!(
+                    after.contains(entry),
+                    "{} vanished from the child PATH for {case}",
+                    entry.display()
+                );
+            }
+            assert_eq!(
+                after[..before.len()],
+                before[..],
+                "inherited precedence changed for {case}"
+            );
+        }
+    }
+
+    /// Resolving a tool and running it are two different PATH questions.
+    ///
+    /// GitPulse finds `devmap` in `~/.local/bin` through the GUI fallback dirs
+    /// and then, before this existed, spawned it with launchd's minimal
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`. `devmap doctor` resolves the bare
+    /// `devmap` command named by host MCP configs against *its* PATH, found
+    /// nothing, and reported "host MCP config names a devmap path that is not
+    /// a file: devmap — this is not version skew". GitPulse rendered that as
+    /// the user's broken install. It was our PATH.
+    ///
+    /// Asserted as set containment against [`gui_launch_fallback_dirs`] rather
+    /// than a spelled-out list: a directory added there and not handed to the
+    /// child is the same bug again, and a hand-written expectation here would
+    /// keep passing through it.
+    #[test]
+    #[cfg(unix)]
+    fn a_spawned_tool_can_see_the_directory_it_was_resolved_from() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut cmd = Command::new("/usr/bin/true");
+        default_child_path_with_env(
+            &mut cmd,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            Some(home.path().as_os_str()),
+        );
+        let child_path = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("an absent PATH must be filled in")
+            .to_owned();
+        let entries: Vec<PathBuf> = std::env::split_paths(&child_path).collect();
+        for fallback in gui_launch_fallback_dirs(Some(home.path().as_os_str())) {
+            assert!(
+                entries.contains(&fallback),
+                "child cannot see {}: {entries:?}",
+                fallback.display()
+            );
+        }
+        // Inherited entries keep their precedence: a fallback dir must never
+        // shadow a tool the user deliberately put earlier on PATH.
+        assert_eq!(entries[0], PathBuf::from("/usr/bin"));
+    }
+
+    /// The caller's own PATH is a decision, not an omission.
+    ///
+    /// `build_capture_command`, the PTY and the harness sidecar each set one;
+    /// re-deriving it from this process would quietly discard the environment
+    /// the user is actually running in.
+    #[test]
+    #[cfg(unix)]
+    fn a_path_the_caller_chose_is_never_replaced() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut cmd = Command::new("/usr/bin/true");
+        cmd.env("PATH", "/caller/chosen");
+        default_child_path_with_env(
+            &mut cmd,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(home.path().as_os_str()),
+        );
+        let values: Vec<_> = cmd
+            .get_envs()
+            .filter(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some(std::ffi::OsString::from("/caller/chosen"))],
+            "caller PATH replaced or duplicated"
+        );
+    }
+
+    /// Setting PATH for a bare program name drops `std` off `posix_spawn` onto
+    /// `fork` (`env_saw_path() && !program_is_path()`), and forking a GUI
+    /// process this size is both slow and the shape behind the concurrent
+    /// descriptor races [`SpawnGate`] exists to bound.
+    ///
+    /// Bare names are not left unhelped by this: they arrive through
+    /// `build_capture_command` or `git_command_with_env`, which resolve the
+    /// program to a path *and* set PATH themselves.
+    #[test]
+    #[cfg(unix)]
+    fn a_bare_program_name_keeps_posix_spawn() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut cmd = Command::new("true");
+        default_child_path_with_env(
+            &mut cmd,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(home.path().as_os_str()),
+        );
+        assert_eq!(
+            cmd.get_envs()
+                .filter(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+                .count(),
+            0,
+            "a bare program name must not gain a PATH override"
+        );
+        // A relative path is still a path, and `std` treats it as one.
+        let mut relative = Command::new("./devmap");
+        default_child_path_with_env(
+            &mut relative,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(home.path().as_os_str()),
+        );
+        assert_eq!(
+            relative
+                .get_envs()
+                .filter(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+                .count(),
+            1,
+            "a relative path is a path and must be given the child PATH"
+        );
+    }
+
     #[test]
     fn extended_child_path_appends_missing_fallback_dirs_only() {
         let home = tempfile::TempDir::new().unwrap();

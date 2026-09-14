@@ -200,10 +200,24 @@ profile workbench and managed runs fail without it.
 Three of those components reject `--version`, so presence and version are
 reported as separate facts and a component that ran but cannot name itself is
 not shown the same as one that is absent. `devmap doctor`'s installation
-warnings — binary skew, duplicate MCP registrations, `devmap mcp` processes
-older than the installed binary, a stale plugin bundle — are surfaced beside
-the inventory. Doctor needs a trusted repository to run in; without one the
-panel says health was not checked rather than showing an empty list.
+warnings are surfaced beside the inventory: every `*_warning` field the payload
+carries, ordered by consequence — the ones that change *which binary answers*
+first — with any field GitPulse does not recognise kept at the end rather than
+dropped. That sweep is the contract, not a list of field names: a hand-written
+list is how `stray_state_warning` fired on a user's machine into a panel that
+said `devmap doctor` found nothing to report. Each warning is bounded for
+display and says so with both numbers when it is shortened, because
+`stale_server_warning` enumerates one process id per running `devmap mcp` and
+is unbounded at the source. Doctor needs a trusted repository to run in;
+without one the panel says health was not checked rather than showing an empty
+list.
+
+Doctor is spawned with the child `PATH` the rest of the app uses — the
+inherited value plus the GUI-launch fallback dirs. It has to be: doctor
+resolves the bare `devmap` command that host MCP configs name against *its own*
+`PATH`, so a Dock-launched GitPulse handing it launchd's minimal
+`/usr/bin:/bin:/usr/sbin:/sbin` made it report the binary GitPulse had just
+resolved as missing, under a heading that reads as the user's broken install.
 
 ## Compatibility and evidence
 

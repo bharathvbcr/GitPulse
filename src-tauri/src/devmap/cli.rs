@@ -578,6 +578,14 @@ pub fn refresh(repo_path: &str) -> Result<BuildOutcome, String> {
 /// host plugin bundle whose version or hook shape no longer matches. Every one
 /// of them makes a correct-looking answer come from the wrong binary, which is
 /// precisely the failure a silent field cannot be debugged from.
+///
+/// The named fields are the ones GitPulse can order by consequence; they are
+/// not the definition of what gets shown. Every `*_warning` key in the payload
+/// is read, and one with no named field here lands in `extra_warnings` rather
+/// than being dropped — see [`NAMED_WARNING_FIELDS`]. That distinction is the
+/// whole reason this is not a list of five: devmap grew a sixth warning, the
+/// hand-written list did not, and `stray_state_warning` fired on a user's
+/// machine into a panel that reported nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub available: bool,
@@ -593,11 +601,75 @@ pub struct DoctorReport {
     pub plugin_warning: Option<String>,
     /// A registration naming a `devmap` that is not there.
     pub missing_binary_warning: Option<String>,
+    /// A DevMap state directory with no store beside it.
+    pub stray_state_warning: Option<String>,
+    /// Every other `*_warning` this binary emitted, as `key: text`.
+    ///
+    /// The named fields above are the ones GitPulse can order by consequence.
+    /// This is what catches the next one. `stray_state_warning` shipped in
+    /// devmap and went unrendered here for exactly as long as the field list
+    /// was written by hand — a warning that fired on the user's machine and
+    /// reached a panel that then said "found nothing to report".
+    #[serde(default)]
+    pub extra_warnings: Vec<String>,
     /// Schema this binary speaks, for the compatibility strip.
     pub expected_schema_version: Option<i64>,
     pub code_graph_schema_version: Option<i64>,
     pub linked_grammar_count: Option<i64>,
     pub version: Option<String>,
+}
+
+/// Payload keys [`DoctorReport`] has a named field for.
+///
+/// Anything else ending in `_warning` lands in `extra_warnings`. Kept beside
+/// the struct so the two are edited together, and asserted field-for-field by
+/// `every_named_warning_field_is_claimed` rather than trusted.
+const NAMED_WARNING_FIELDS: &[&str] = &[
+    "binary_skew_warning",
+    "duplicate_mcp_registration_warning",
+    "stale_server_warning",
+    "plugin_warning",
+    "missing_binary_warning",
+    "stray_state_warning",
+];
+
+/// Longest one warning may be before GitPulse shortens it for display.
+///
+/// These strings are another program's output, rendered verbatim into a single
+/// DOM node. `stale_server_warning` enumerates one process id per running
+/// `devmap mcp`, and on the machine that reported this it listed 84 — every
+/// Claude Code session on the host spawns two, because the server is
+/// registered twice. That is already past reading; it is not a bound. The
+/// bound is here, and it is generous enough that no warning devmap emits today
+/// reaches it.
+const MAX_WARNING_BYTES: usize = 2048;
+
+/// Most warnings GitPulse will render at once.
+///
+/// devmap has six warning fields, so this can only be reached by a payload
+/// inventing `*_warning` keys. Bounded anyway: `warnings` crosses IPC and
+/// becomes DOM, and "the tool said so" is not a size limit.
+const MAX_WARNINGS: usize = 32;
+
+/// One warning, shortened if it has to be — and saying so with both numbers.
+///
+/// A shortened warning that does not admit it is the same failure this module
+/// is full of guards against: the reader cannot tell a complete list of stale
+/// processes from the first 2 KiB of one. Cut on a character boundary, because
+/// these strings carry `—` and `…` and a raw byte slice panics inside one.
+fn bound_warning(warning: &str) -> String {
+    if warning.len() <= MAX_WARNING_BYTES {
+        return warning.to_string();
+    }
+    let mut cut = MAX_WARNING_BYTES;
+    while cut > 0 && !warning.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}… [GitPulse shortened this warning: {cut} of {} bytes shown]",
+        &warning[..cut],
+        warning.len()
+    )
 }
 
 /// Read `devmap doctor --json`.
@@ -641,45 +713,95 @@ pub fn doctor(repo_path: &str) -> DoctorReport {
             Some(binary.path),
         );
     };
-    let text = |key: &str| {
-        payload
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|value| !value.trim().is_empty())
-    };
-    let number = |key: &str| payload.get(key).and_then(Value::as_i64);
-    DoctorReport {
-        available: true,
-        binary: Some(binary.path),
-        reason: None,
-        binary_skew_warning: text("binary_skew_warning"),
-        duplicate_mcp_registration_warning: text("duplicate_mcp_registration_warning"),
-        stale_server_warning: text("stale_server_warning"),
-        plugin_warning: text("plugin_warning"),
-        missing_binary_warning: text("missing_binary_warning"),
-        expected_schema_version: number("expected_schema_version"),
-        code_graph_schema_version: number("code_graph_schema_version"),
-        linked_grammar_count: number("linked_grammar_count"),
-        version: text("version"),
-    }
+    DoctorReport::from_payload(&payload, binary.path)
 }
 
 impl DoctorReport {
+    /// Read one `devmap doctor --json` object.
+    ///
+    /// Split out of [`doctor`] so the parse can be exercised against payloads
+    /// a spawned binary cannot be made to produce on demand — an unrecognised
+    /// warning key, a warning that is not a string, a payload inventing
+    /// hundreds of them.
+    fn from_payload(payload: &Value, binary: String) -> Self {
+        let text = |key: &str| {
+            payload
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty())
+        };
+        let number = |key: &str| payload.get(key).and_then(Value::as_i64);
+        // Swept, not enumerated: any `*_warning` this binary emits that
+        // GitPulse has no named field for is carried through rather than
+        // dropped. Sorted so the tail is stable across runs — serde_json
+        // preserves object order, but the order two devmap builds emit keys in
+        // is not GitPulse's to depend on.
+        let mut extra_warnings: Vec<String> = payload
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| {
+                key.ends_with("_warning") && !NAMED_WARNING_FIELDS.contains(&key.as_str())
+            })
+            .filter_map(|(key, value)| {
+                let text = value.as_str()?.trim();
+                (!text.is_empty()).then(|| format!("{key}: {text}"))
+            })
+            .collect();
+        extra_warnings.sort();
+        Self {
+            available: true,
+            binary: Some(binary),
+            reason: None,
+            binary_skew_warning: text("binary_skew_warning"),
+            duplicate_mcp_registration_warning: text("duplicate_mcp_registration_warning"),
+            stale_server_warning: text("stale_server_warning"),
+            plugin_warning: text("plugin_warning"),
+            missing_binary_warning: text("missing_binary_warning"),
+            stray_state_warning: text("stray_state_warning"),
+            extra_warnings,
+            expected_schema_version: number("expected_schema_version"),
+            code_graph_schema_version: number("code_graph_schema_version"),
+            linked_grammar_count: number("linked_grammar_count"),
+            version: text("version"),
+        }
+    }
+
     /// Every warning this report carries, in the order a reader should see
     /// them: the ones that change which binary answers come first.
     pub fn warnings(&self) -> Vec<String> {
-        [
+        let mut all: Vec<String> = [
             self.missing_binary_warning.as_ref(),
             self.binary_skew_warning.as_ref(),
             self.stale_server_warning.as_ref(),
             self.duplicate_mcp_registration_warning.as_ref(),
             self.plugin_warning.as_ref(),
+            self.stray_state_warning.as_ref(),
         ]
         .into_iter()
         .flatten()
         .cloned()
-        .collect()
+        // Unknown severity, so last — but never absent. A warning GitPulse
+        // does not recognise is still a warning that fired.
+        .chain(self.extra_warnings.iter().cloned())
+        .map(|warning| bound_warning(&warning))
+        .collect();
+        if all.len() <= MAX_WARNINGS {
+            return all;
+        }
+        // A capped list rendered as the whole list is the same lie as a
+        // shortened warning that does not admit it — "6 warnings" and "the
+        // first 31 of 400" must not look alike. The cap keeps its own slot so
+        // the count it reports is the count that was dropped.
+        let dropped = all.len() - (MAX_WARNINGS - 1);
+        all.truncate(MAX_WARNINGS - 1);
+        all.push(format!(
+            "[GitPulse is showing {} of {} warnings; {dropped} more were not rendered]",
+            MAX_WARNINGS - 1,
+            dropped + MAX_WARNINGS - 1
+        ));
+        all
     }
 }
 
@@ -977,6 +1099,233 @@ fn omitted_preview_file(path: &str) -> PreviewFileResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A warning devmap emits and GitPulse has never heard of must still be
+    /// shown.
+    ///
+    /// This is the shape of the `stray_state_warning` miss: devmap grew a
+    /// sixth warning field, the parse here named five, and the sixth fired on
+    /// the user's machine into a panel that then rendered "devmap doctor found
+    /// nothing to report". The list is swept now, so the next field devmap
+    /// adds arrives on the day it ships rather than the day someone
+    /// remembers.
+    #[test]
+    fn an_unrecognised_warning_field_is_carried_not_dropped() {
+        let payload = serde_json::json!({
+            "stray_state_warning": "state directory exists without a store: ~/.devmap",
+            "quarantined_grammar_warning": "3 grammars failed to link",
+            "version": "0.2.2",
+        });
+        let report = DoctorReport::from_payload(&payload, "/usr/local/bin/devmap".into());
+        let warnings = report.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("~/.devmap")),
+            "the field that was actually dropped is still dropped: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("quarantined_grammar_warning")
+                    && w.contains("3 grammars failed to link")),
+            "an unknown warning field was dropped, and its key was not named: {warnings:?}"
+        );
+        // Unknown severity ranks last, but never absent.
+        assert_eq!(
+            warnings.last().map(String::as_str),
+            Some("quarantined_grammar_warning: 3 grammars failed to link")
+        );
+    }
+
+    /// Nothing that is not a warning may be swept up as one.
+    #[test]
+    fn the_sweep_takes_warnings_and_only_warnings() {
+        let payload = serde_json::json!({
+            "store_path": "/repo/.devcouncil/codeintel/devmap.sqlite",
+            "binaries": [{"path": "/usr/local/bin/devmap"}],
+            "warning": "not a *_warning key",
+            "_warning": "",
+            "blank_warning": "   ",
+            "numeric_warning": 7,
+            "null_warning": serde_json::Value::Null,
+            "nested_warning": {"text": "objects are not messages"},
+        });
+        let report = DoctorReport::from_payload(&payload, "/usr/local/bin/devmap".into());
+        assert!(
+            report.warnings().is_empty(),
+            "non-warning or empty fields were rendered as warnings: {:?}",
+            report.warnings()
+        );
+    }
+
+    /// The named list and the struct are one decision; drift between them
+    /// silently re-opens the `extra_warnings` escape hatch on a field that is
+    /// supposed to be ordered by consequence, or hides a real field twice.
+    ///
+    /// Derived from this file's own source rather than restated, because a
+    /// second hand-written list is the defect, not the fix.
+    #[test]
+    fn every_named_warning_field_is_claimed() {
+        let source = include_str!("cli.rs");
+        let body = source
+            .split_once("pub struct DoctorReport {")
+            .expect("struct present")
+            .1
+            .split_once("\n}")
+            .expect("struct closes")
+            .0;
+        let declared: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub "))
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name)
+            .filter(|name| name.ends_with("_warning"))
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "parsed no fields — the test is broken"
+        );
+        let mut sorted_declared = declared.clone();
+        sorted_declared.sort_unstable();
+        let mut sorted_named = NAMED_WARNING_FIELDS.to_vec();
+        sorted_named.sort_unstable();
+        assert_eq!(
+            sorted_declared, sorted_named,
+            "NAMED_WARNING_FIELDS drifted from the struct fields"
+        );
+    }
+
+    /// A shortened warning that does not admit it is a capped sample rendered
+    /// as complete coverage — the reader cannot tell a full list of stale
+    /// processes from the first 2 KiB of one.
+    ///
+    /// Swept across every length near the budget rather than spot-checked:
+    /// these strings carry `—` and `…`, and a raw byte slice panics whenever
+    /// the cut lands inside one.
+    #[test]
+    fn a_shortened_warning_says_so_with_both_numbers() {
+        let short = "pid 7564, 7570; restart hosts";
+        assert_eq!(
+            bound_warning(short),
+            short,
+            "a warning that fits was altered"
+        );
+
+        for pad in 0..64 {
+            // `…` is three bytes, so this walks the cut through every phase of
+            // a multi-byte character straddling the budget.
+            let long = format!("{}{}", "…".repeat(MAX_WARNING_BYTES), "x".repeat(pad));
+            let bounded = bound_warning(&long);
+            assert!(
+                bounded.contains("GitPulse shortened this warning"),
+                "shortened silently at pad {pad}"
+            );
+            assert!(
+                bounded.contains(&long.len().to_string()),
+                "the original size is missing at pad {pad}: {bounded}"
+            );
+            // Char-boundary safety is proven by this not having panicked, and
+            // by the result still being valid UTF-8 text we can measure.
+            assert!(bounded.chars().count() > 0);
+        }
+    }
+
+    /// The warning list itself is bounded: it crosses IPC and becomes DOM, and
+    /// "the tool said so" is not a size limit.
+    #[test]
+    fn the_warning_list_is_bounded() {
+        let mut payload = serde_json::Map::new();
+        for i in 0..(MAX_WARNINGS * 4) {
+            payload.insert(format!("k{i:03}_warning"), serde_json::json!("noise"));
+        }
+        let report = DoctorReport::from_payload(
+            &serde_json::Value::Object(payload),
+            "/usr/local/bin/devmap".into(),
+        );
+        let warnings = report.warnings();
+        assert_eq!(warnings.len(), MAX_WARNINGS);
+        // And the cap says so, with both numbers: a capped list that reads
+        // like a complete one is the defect, not the cap.
+        let last = warnings.last().expect("capped list is not empty");
+        assert!(
+            last.contains(&(MAX_WARNINGS - 1).to_string())
+                && last.contains(&(MAX_WARNINGS * 4).to_string()),
+            "the cap did not report what it dropped: {last}"
+        );
+    }
+
+    /// The reported fault this whole change exists for, end to end.
+    ///
+    /// GitPulse resolves `devmap` through `PATH` *plus* the GUI-launch
+    /// fallback dirs, so a Dock-launched app finds `~/.local/bin/devmap`. It
+    /// then used to spawn it with launchd's own `/usr/bin:/bin:/usr/sbin:/sbin`
+    /// — a PATH with no `~/.local/bin` in it. `devmap doctor` resolves the bare
+    /// `devmap` command that host MCP configs name against that PATH, found
+    /// nothing, and reported:
+    ///
+    /// > host MCP config names a devmap path that is not a file: devmap;
+    /// > install the binary or re-run integrate … this is not version skew
+    ///
+    /// which GitPulse rendered under "Installation health" as a fault on the
+    /// user's machine. Nothing was wrong with the install. The check could not
+    /// run, and named a cause it did not have.
+    ///
+    /// PATH is pinned to the launchd-minimal value for the spawn so the
+    /// assertion holds on any host: a developer shell that already carries
+    /// every fallback dir would otherwise let the pre-fix behaviour pass here
+    /// and fail in CI, or on the machine that reported this.
+    #[test]
+    #[cfg(unix)]
+    fn devmap_is_spawned_with_a_path_that_can_see_devmap() {
+        const LAUNCHD_MINIMAL: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+        let _serial = crate::harness::sidecar::test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        let recorded = dir.path().join("child-path");
+        let path = write_fake_devmap(dir.path());
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$PATH\" > '{}'\nprintf '{{}}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        let binary = ResolvedDevmap {
+            path: path.to_string_lossy().into_owned(),
+            lookup: DevmapLookup::PathSearch,
+        };
+
+        let restore = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", LAUNCHD_MINIMAL) };
+        let run = run_devmap(
+            &binary,
+            dir.path(),
+            &["status", "--json"],
+            None,
+            Duration::from_secs(5),
+        );
+        match restore {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        run.expect("stub devmap must run");
+
+        let child_path = fs::read_to_string(&recorded).expect("child did not record its PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&child_path).collect();
+        assert_ne!(
+            child_path, LAUNCHD_MINIMAL,
+            "the child inherited the launch PATH unchanged"
+        );
+        for fallback in crate::engine::git_cli::external_tool_fallback_dirs() {
+            assert!(
+                entries.contains(&fallback),
+                "devmap cannot see {} — the directory it may have been resolved from: {entries:?}",
+                fallback.display()
+            );
+        }
+        // The launch PATH still comes first: a fallback dir must never shadow
+        // a tool the user deliberately put earlier on their PATH.
+        assert_eq!(entries[0], PathBuf::from("/usr/bin"));
+    }
 
     #[test]
     #[cfg(unix)]

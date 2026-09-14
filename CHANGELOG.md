@@ -11,7 +11,35 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- Installation health no longer invents a fault. GitPulse resolves `devmap`
+  through `PATH` *plus* the GUI-launch fallback dirs, but spawned it with the
+  `PATH` it inherited — under a Dock or Finder launch, launchd's
+  `/usr/bin:/bin:/usr/sbin:/sbin`. `devmap doctor` resolves the bare `devmap`
+  command that host MCP configs name against its own `PATH`, could not find the
+  binary GitPulse had just resolved out of `~/.local/bin`, and reported "host
+  MCP config names a devmap path that is not a file: devmap — this is not
+  version skew". Nothing was wrong with the install; the check could not run
+  and named a cause it did not have. Every child that reaches the bounded
+  runner now gets the extended `PATH`, so this is fixed for `devmap`, the
+  tool-install probes and the `curl`/`tar`/`cargo`/`go` ladder at once — a
+  caller that chose its own `PATH` still keeps it.
+- A warning `devmap doctor` raised could reach a panel that then said it "found
+  nothing to report". The warning fields were written out by hand and devmap
+  had six, so `stray_state_warning` was dropped. They are swept out of the
+  payload now: unrecognised fields are shown last rather than discarded.
+- Warnings are bounded before they are rendered, and say so with both numbers
+  when they are shortened or the list is capped. `stale_server_warning`
+  enumerates one process id per running `devmap mcp` — 84 of them on the
+  machine that reported this — into a single line.
+
+### Changed
+
+- `extended_child_path` leaves a `PATH` already at the `execve` argument-size
+  ceiling alone instead of appending to it. Growing a near-limit environment
+  turns a working spawn into `E2BIG`, surfacing as "Failed to spawn git:
+  Argument list too long" with nothing naming the cause.
 
 ## [1.1.0] - 2026-09-14
 
