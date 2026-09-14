@@ -38,6 +38,7 @@ const hasBash = (() => {
 })();
 const hook = readFileSync(new URL("../.githooks/pre-push", import.meta.url), "utf8");
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+const state = readFileSync(new URL("./release-state.mjs", import.meta.url), "utf8");
 
 describe("pre-push release hook", () => {
   it("is tracked with the executable bit git will hand to every clone", () => {
@@ -62,8 +63,40 @@ describe("pre-push release hook", () => {
 
   it("reuses the gates rather than reimplementing them", () => {
     // Named explicitly so renaming a script breaks the test, not the release.
-    for (const gate of ["scripts/check-release-version.mjs", "scripts/release-notes.mjs"]) {
+    for (const gate of [
+      "scripts/check-release-version.mjs",
+      "scripts/release-notes.mjs",
+      "scripts/release-state.mjs",
+    ]) {
       expect(hook, `the hook no longer runs ${gate}`).toContain(gate);
+    }
+  });
+
+  it("refuses a tag whose commit has not passed the CI the release gate requires", () => {
+    // A tag can be well-formed, on HEAD, and agree with every manifest and
+    // still be unreleasable: release-state refuses to prepare a draft without
+    // a successful push run of both workflows on that exact commit. Running
+    // the gate's own `ready` stage is what makes the hook's answer the same
+    // answer the runner would give, half an hour earlier.
+    expect(hook).toContain("release-state.mjs ready");
+    expect(hook).toContain("RELEASE_COMMIT=");
+    expect(state).toContain('if (stage === "ready")');
+    for (const required of ["ci.yml", "coverage.yml"]) {
+      expect(state, `the gate no longer requires ${required}`).toContain(required);
+    }
+  });
+
+  it("checks CI locally because neither required workflow runs on the tag", () => {
+    // The hook's whole premise. If ci.yml or coverage.yml ever gained a tag
+    // trigger, pushing the tag would produce the runs the gate wants and this
+    // check would become redundant — so the premise is asserted, not assumed.
+    for (const name of ["ci.yml", "coverage.yml"]) {
+      const text = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8");
+      const triggers = text.slice(text.indexOf("on:"), text.indexOf("concurrency:"));
+      expect(triggers, `${name} has no push trigger`).toContain("branches:");
+      expect(triggers, `${name} now runs on tags; the hook's CI check is stale`).not.toContain(
+        "tags:",
+      );
     }
   });
 

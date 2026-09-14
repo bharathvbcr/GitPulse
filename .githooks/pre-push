@@ -14,6 +14,12 @@
 # cannot parse. `v*` catches `v0.03` as readily as `v0.0.6`, and a malformed
 # tag spends a runner only to fail at the first gate.
 #
+# And it refuses a tag whose commit has not yet passed CI. The release gate
+# requires a successful push run of ci.yml and coverage.yml on the tagged
+# commit, and neither workflow triggers on tags — so the ordering is push the
+# branch, wait for green, then push the tag. Getting that wrong costs three
+# platform builds before the gate says no.
+#
 # Installed with:  git config core.hooksPath .githooks
 # Bypassed with:   git push --no-verify   (re-releasing an older commit)
 
@@ -72,7 +78,31 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
     continue
   fi
 
-  echo "pre-push: $tag → $(git rev-parse --short "$tag_commit") (HEAD), manifests and changelog agree."
+  # A well-formed tag on the right tree is still not a releasable one. The
+  # workflow's own gate demands provenance the manifests cannot show: a
+  # *successful push run* of both ci.yml and coverage.yml on this exact commit,
+  # checked in `release-state.mjs` before it will prepare a draft. Neither
+  # workflow triggers on tags, so pushing the tag before those finish starts a
+  # release that spends three platform builds and is then refused — which is
+  # how v1.1.0 was lost the first time.
+  #
+  # `ready` is the same check the gate runs, and it fails closed: non-zero when
+  # CI is not green *and* when it could not find out, so an unreachable GitHub
+  # refuses the tag instead of waving it through. Its calls are bounded, so an
+  # unresponsive API costs a minute rather than the hook.
+  if ! (cd "$repo_root" && RELEASE_TAG="$tag" RELEASE_COMMIT="$tag_commit" \
+      node scripts/release-state.mjs ready >/dev/null 2>&1); then
+    fail "tag '$tag' is at $(git rev-parse --short "$tag_commit"), which does not have the
+        green CI the release gate requires. release.yml refuses to prepare a draft unless
+        ci.yml AND coverage.yml each have a successful push run for that exact commit, and
+        neither runs on tags. Push the branch first, let both finish, then push the tag.
+        See what the gate sees with:  npm run release:ready
+        This also fails when GitHub could not be reached, because an unverified release is
+        not a verified one. Override deliberately with:  git push --no-verify"
+    continue
+  fi
+
+  echo "pre-push: $tag → $(git rev-parse --short "$tag_commit") (HEAD), manifests and changelog agree, CI green."
 done
 
 exit $status

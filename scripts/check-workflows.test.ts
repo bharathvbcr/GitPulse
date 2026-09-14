@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { GATES } from "./ci-local.mjs";
 import {
   INSTALL_HINT,
   hasWorkflowLevelPermissions,
@@ -81,10 +82,19 @@ describe("check:workflows", () => {
     expect(lcov, coverage).toBeDefined();
     expect(lcov).toContain("--test-threads=1");
     expect(lcov).not.toContain("--no-run");
+    // `ci:local` used to spell its whole chain in package.json, so the cap was
+    // asserted as a substring of that field. It now delegates to a runner and
+    // the flag travels with the gate that needs it. The invariant is that the
+    // local llvm-cov run caps threads, not that package.json is where that is
+    // written — so follow it to its owner and check the command itself, which
+    // is a stronger assertion than the string this replaces.
     const pkg = JSON.parse(
       readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
     );
-    expect(pkg.scripts["ci:local"]).toContain("--test-threads=1");
+    expect(pkg.scripts["ci:local"]).toContain("scripts/ci-local.mjs");
+    const local = GATES.find((gate) => gate.args.includes("llvm-cov"));
+    expect(local, "ci:local no longer runs llvm-cov").toBeDefined();
+    expect([local!.program, ...local!.args].join(" ")).toContain("--test-threads=1");
   });
 
   it("caps uninstrumented cargo test threads so sidecar hello fixtures are not starved", () => {
