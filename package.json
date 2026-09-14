@@ -38,7 +38,7 @@
     "test:webkit:all": "node scripts/browser-regressions.mjs --webkit --all"
   },
   "dependencies": {
-    "@lucide/svelte": "^1.44.0",
+    "@lucide/svelte": "^1.45.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2.5.5",

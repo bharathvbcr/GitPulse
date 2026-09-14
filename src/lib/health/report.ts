@@ -29,9 +29,16 @@ function formatDeadCodeConfidence(value: unknown): string {
   return `${(value * 100).toFixed(0)}%`;
 }
 
-function formatDeadCodeStatus(item: DeadCodeFinding): string {
-  if (!item.is_exempt) return "Unreferenced";
+export function formatDeadCodeStatus(item: DeadCodeFinding): string {
+  if (!item.is_exempt) return "Candidate; verify callers before deletion";
   return item.exemption_reason ? `Exempt: ${item.exemption_reason}` : "Exempt";
+}
+
+/** Fail closed for legacy or unspecified cap provenance. */
+export function inventoryOnlyTruncation(report: DepsHealthReport): boolean {
+  const notices = report.limit_notices ?? [];
+  return report.truncated && notices.length > 0
+    && notices.every((notice) => notice.inventory_only === true);
 }
 
 /**
@@ -114,7 +121,7 @@ export const AUDIT_FAILURE_LABELS: Readonly<Record<string, string>> = Object.fre
  *
  * Derived from the issues actually returned, so a capped scan may name fewer
  * failures than occurred. That is not a silent undercount: capping sets
- * `truncated`, which forces `audit_complete` false and puts the cap notice on
+ * `truncated` with a coverage-affecting notice, which forces `audit_complete` false and puts the cap notice on
  * screen ahead of this.
  */
 export function failedAudits(report: DepsHealthReport): string[] {
@@ -228,6 +235,7 @@ export function formatHealthReport(
   }
   const deadItems = deadCode ? deadCodeItems(deadCode) : [];
   const deadTotal = deadCode ? deadCodeObservedTotal(deadCode, deadItems.length) : 0;
+  const incompleteWalk = deadCode?.available ? deadCode.walk_incomplete?.trim() : null;
   if (deadCode && !deadCode.available) {
     out.push(
       `Dead-code check could not run${deadCode.reason ? `: ${deadCode.reason}` : ""}. That is not the same as finding no unreferenced symbols.`,
@@ -236,14 +244,20 @@ export function formatHealthReport(
     out.push(
       "The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear.",
     );
-  } else if (deadCode?.available && deadItems.length === 0) {
-    out.push("Dead code: 0 unreferenced symbol(s).");
+  } else if (deadCode?.available && deadItems.length === 0 && !incompleteWalk) {
+    out.push("Dead-code candidates: 0 symbol(s).");
   } else if (deadCode?.available) {
     out.push(
-      `Dead code: ${deadCode.truncated ? "at least " : ""}${deadTotal} unreferenced symbol(s).`,
+      `Dead-code candidates: ${deadCode.truncated ? "at least " : ""}${deadTotal} symbol(s).`,
     );
   }
-  if (report.truncated || dependabot?.truncated || codeScanning?.truncated) {
+  if (incompleteWalk) {
+    out.push(`NOTE: dead-code analysis is incomplete: ${incompleteWalk}. Missing callers can produce false positives; this is not an all-clear.`);
+  }
+  if (inventoryOnlyTruncation(report)) {
+    out.push("NOTE: Inventory display was capped; audit target coverage is reported separately above.");
+  }
+  if ((report.truncated && !inventoryOnlyTruncation(report)) || dependabot?.truncated || codeScanning?.truncated) {
     out.push("NOTE: the scan was capped; findings below are not complete coverage.");
   }
   for (const notice of report.limit_notices ?? []) {
@@ -328,8 +342,8 @@ export function formatHealthReport(
     }
   }
 
-  if (deadCode?.available && deadItems.length === 0 && !deadCode.truncated) {
-    out.push("", "No unreferenced symbols in the indexed graph.");
+  if (deadCode?.available && deadItems.length === 0 && !deadCode.truncated && !incompleteWalk) {
+    out.push("", "No dead-code candidates in the indexed graph.");
   } else if (deadCode?.available && deadItems.length > 0) {
     if (deadCode.truncated) {
       out.push(
@@ -339,7 +353,7 @@ export function formatHealthReport(
     }
     out.push(
       "",
-      `## Dead code & unreferenced symbols (${deadTotal}${cappedSuffix(deadTotal, deadItems.length)})`,
+      `## Dead-code candidates (${deadTotal}${cappedSuffix(deadTotal, deadItems.length)})`,
     );
     for (const item of deadItems) {
       if (!item || typeof item !== "object") continue;

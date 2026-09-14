@@ -58,7 +58,7 @@
     type AiGeneration,
   } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
-  import { coverageGap, formatHealthReport, observedTotal } from "../health/report";
+  import { coverageGap, formatHealthReport, formatDeadCodeStatus, inventoryOnlyTruncation, observedTotal } from "../health/report";
   import {
     githubAlertsCache,
     loadGithubAlerts,
@@ -110,6 +110,7 @@
    */
   let deadSymbolsTotal = $state(0);
   let deadSymbolsTruncated = $state(false);
+  let deadSymbolsIncomplete = $state<string | null>(null);
   /**
    * Whether this repository has a devmap code graph at all.
    *
@@ -309,6 +310,7 @@
           ? Math.max(dead.value.total ?? 0, dead.value.items.length)
           : 0;
         deadSymbolsTruncated = dead.value.available && dead.value.truncated === true;
+        deadSymbolsIncomplete = dead.value.available ? dead.value.walk_incomplete?.trim() || null : null;
         deadSymbolsReason = dead.value.available
           ? null
           : (dead.value.reason ?? "dead-symbol query unavailable");
@@ -317,6 +319,7 @@
         deadSymbolsAvailable = false;
         deadSymbolsTotal = 0;
         deadSymbolsTruncated = false;
+        deadSymbolsIncomplete = null;
         deadSymbolsReason = formatError(dead.reason);
       }
       // An IPC-level failure is folded into the same unavailable shape the
@@ -349,6 +352,7 @@
       deadSymbolsAvailable = false;
       deadSymbolsTotal = 0;
       deadSymbolsTruncated = false;
+      deadSymbolsIncomplete = null;
       deadSymbolsReason = formatError(err);
       codegraph = { available: false, db_path: "", reason: formatError(err) };
     } finally {
@@ -428,6 +432,7 @@
             items: deadSymbols,
             total: Math.max(deadSymbolsTotal, deadSymbols.length),
             truncated: deadSymbolsTruncated,
+            walk_incomplete: deadSymbolsIncomplete,
           }
         : null;
     const text = formatHealthReport(current, repoPath, dependabot, codeScanning, deadCode);
@@ -638,6 +643,9 @@
         deadSymbols = [];
         deadSymbolsAvailable = false;
         deadSymbolsReason = null;
+        deadSymbolsTotal = 0;
+        deadSymbolsTruncated = false;
+        deadSymbolsIncomplete = null;
         codegraph = null;
       }
       if (github) {
@@ -1129,7 +1137,9 @@
 
       {#if report.truncated}
         <div class="text-amber-300 space-y-0.5">
-          <div>Scan was capped; some findings may be omitted.</div>
+          <div>{inventoryOnlyTruncation(report)
+            ? "Inventory display was capped; audit target coverage is reported separately above."
+            : "Scan was capped; some findings may be omitted."}</div>
           {#each report.limit_notices ?? [] as notice}
             <div class="font-mono text-[10px]">
               {notice.resource}: retained {notice.kept} of {notice.total}
@@ -1390,21 +1400,27 @@
         </section>
       {/if}
 
+      {#if deadSymbolsAvailable && deadSymbolsIncomplete}
+        <p class="text-[11px] text-amber-300 pb-4">
+          Dead-code analysis is incomplete: {deadSymbolsIncomplete}.
+          Missing callers can produce false positives; this is not an all-clear.
+        </p>
+      {/if}
       {#if codegraph?.available && !deadSymbolsAvailable}
         <p class="text-[11px] text-amber-300 pb-4">
           Dead-code check could not run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
           That is not the same as finding no unreferenced symbols.
         </p>
-      {:else if deadSymbolsAvailable && deadSymbols.length === 0}
+      {:else if deadSymbolsAvailable && deadSymbols.length === 0 && !deadSymbolsIncomplete}
         <p class="text-[11px] {deadSymbolsTruncated ? 'text-amber-300' : 'text-textMuted'} pb-4">
           {deadSymbolsTruncated
             ? "The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear."
-            : "No unreferenced symbols in the indexed graph."}
+            : "No dead-code candidates in the indexed graph."}
         </p>
       {:else if deadSymbolsAvailable && deadSymbols.length > 0}
         <section class="space-y-2 pb-4">
           <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
-            Dead code & unreferenced symbols ({deadSymbolsTotal}{deadSymbolsTotal >
+            Dead-code candidates ({deadSymbolsTotal}{deadSymbolsTotal >
             deadSymbols.length
               ? `; showing ${deadSymbols.length}`
               : ""})
@@ -1437,8 +1453,8 @@
                           Exempt{sym.exemption_reason ? `: ${sym.exemption_reason}` : ""}
                         </span>
                       {:else}
-                        <span class="px-1.5 py-0.5 rounded text-[10px] bg-rose-500/15 text-rose-300 font-medium">
-                          Unreferenced
+                        <span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 font-medium">
+                          {formatDeadCodeStatus(sym)}
                         </span>
                       {/if}
                     </td>

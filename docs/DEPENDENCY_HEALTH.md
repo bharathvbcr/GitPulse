@@ -1,5 +1,8 @@
 # Dependency health — 2026-09-10
 
+Current follow-up: [2026-09-13 remediation and all 57 candidate references](DEPENDENCY_HEALTH_2026-09-13.md).
+Lucide is now 1.45.0; the dated results below describe the earlier migration.
+
 The Health panel report of 2026-09-10 (44 CodeQL alerts, three outdated npm
 packages, cargo discovery capped at 24 of 754) is resolved in this worktree
 as follows. The Rust GTK migration from 2026-09-08 remains in place. Neither

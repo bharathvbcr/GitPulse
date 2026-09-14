@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { coverageGap, failedAudits, formatHealthReport, skippedAudits } from "./report";
+import { coverageGap, failedAudits, formatHealthReport, inventoryOnlyTruncation, skippedAudits } from "./report";
 import type {
   CodeScanningAlertInfo,
   CodeScanningReport,
@@ -509,10 +509,48 @@ describe("formatHealthReport", () => {
 
   it("carries dead-code findings with file, confidence and status", () => {
     const text = formatHealthReport(emptyReport(), "/repo", null, null, deadCodeReport());
-    expect(text).toContain("Dead code: 1 unreferenced symbol(s).");
-    expect(text).toContain("## Dead code & unreferenced symbols (1)");
-    expect(text).toContain("- unusedHelper (src/lib/unused.ts) — 85% — Unreferenced");
+    expect(text).toContain("Dead-code candidates: 1 symbol(s).");
+    expect(text).toContain("## Dead-code candidates (1)");
+    expect(text).toContain("- unusedHelper (src/lib/unused.ts) — 85% — Candidate; verify callers before deletion");
     expect(text).not.toContain("were reported.");
+  });
+
+  it("preserves incomplete call-resolution evidence even when every row fits", () => {
+    const dead = { ...deadCodeReport(), walk_incomplete: "235210 unresolved attribution sites" };
+    const text = formatHealthReport(emptyReport(), "/repo", null, null, dead);
+    expect(text).toContain("235210 unresolved attribution sites");
+    expect(text).toContain("Candidate; verify callers before deletion");
+    expect(text).not.toContain("— Unreferenced");
+  });
+
+  it("never gives an all-clear for an empty incomplete walk", () => {
+    const dead = { ...deadCodeReport({ items: [], total: 0 }), walk_incomplete: "file failed to parse" };
+    const text = formatHealthReport(emptyReport(), "/repo", null, null, dead);
+    expect(text).toContain("file failed to parse");
+    expect(text).toContain("this is not an all-clear");
+    expect(text).not.toContain("No dead-code candidates in the indexed graph");
+    expect(text).not.toContain("Dead code: 0 unreferenced");
+  });
+
+  it("separates an inventory display cap from audit coverage", () => {
+    const report = { ...emptyReport(), truncated: true, limit_notices: [
+      { resource: "cargo ecosystem artifacts", kept: 24, total: 783, inventory_only: true },
+    ] };
+    const text = formatHealthReport(report, "/repo");
+    expect(text).toContain("Inventory display was capped");
+    expect(text).toContain("cargo ecosystem artifacts: retained 24 of 783");
+    expect(text).toContain("No known vulnerabilities");
+    expect(text).not.toContain("findings below are not complete coverage");
+  });
+
+  it("keeps coverage warnings for mixed, legacy, and unspecified caps", () => {
+    const inventory = { resource: "cargo ecosystem artifacts", kept: 24, total: 783, inventory_only: true };
+    for (const notices of [[], [{ ...inventory, inventory_only: undefined }],
+      [inventory, { resource: "cargo lockfiles", kept: 6, total: 7, inventory_only: false }]]) {
+      const report = { ...emptyReport(), truncated: true, audit_complete: false, limit_notices: notices };
+      expect(inventoryOnlyTruncation(report)).toBe(false);
+      expect(formatHealthReport(report, "/repo")).toContain("findings below are not complete coverage");
+    }
   });
 
   it("reports a failed dead-code query instead of laundering it into all-clear silence", () => {
@@ -536,8 +574,8 @@ describe("formatHealthReport", () => {
       null,
       deadCodeReport({ total: 12, truncated: true }, [deadFinding()]),
     );
-    expect(text).toContain("Dead code: at least 12 unreferenced symbol(s).");
-    expect(text).toContain("## Dead code & unreferenced symbols (12; showing 1)");
+    expect(text).toContain("Dead-code candidates: at least 12 symbol(s).");
+    expect(text).toContain("## Dead-code candidates (12; showing 1)");
     expect(text).toContain("token budget");
     expect(text).toContain("floor, not the complete set");
   });
@@ -551,7 +589,7 @@ describe("formatHealthReport", () => {
       deadCodeReport({ items: [], total: 0, truncated: true }),
     );
     expect(text).toContain("this is not an all-clear");
-    expect(text).not.toContain("No unreferenced symbols in the indexed graph");
+    expect(text).not.toContain("No dead-code candidates in the indexed graph");
   });
 
   it("keeps the explicit all-clear when dead-code ran clean alongside an empty local scan", () => {
@@ -562,8 +600,8 @@ describe("formatHealthReport", () => {
       null,
       deadCodeReport({ items: [], total: 0 }),
     );
-    expect(text).toContain("Dead code: 0 unreferenced symbol(s).");
-    expect(text).toContain("No unreferenced symbols in the indexed graph");
+    expect(text).toContain("Dead-code candidates: 0 symbol(s).");
+    expect(text).toContain("No dead-code candidates in the indexed graph");
     expect(text).toContain("No issues, vulnerabilities or outdated packages were reported.");
   });
 
@@ -595,7 +633,7 @@ describe("formatHealthReport", () => {
       null,
       deadCodeReport({}, [deadFinding({ confidence: Number.NaN })]),
     );
-    expect(text).toContain("— unknown — Unreferenced");
+    expect(text).toContain("— unknown — Candidate; verify callers before deletion");
     expect(text).not.toContain("NaN");
   });
 });

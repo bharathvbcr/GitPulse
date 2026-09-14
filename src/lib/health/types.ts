@@ -69,6 +69,8 @@ export interface ScanLimitNotice {
   resource: string;
   kept: number;
   total: number;
+  /** Only displayed inventory paths were capped; absent means coverage-affecting. */
+  inventory_only?: boolean;
 }
 
 export interface DepsHealthReport {
@@ -391,8 +393,9 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
  * `CodeintelDeadSymbol` / `CodeintelResponse` so the panel can pass its
  * bindings through without a second mapping layer.
  *
- * `available: false` is "could not check" — distinct from an empty `items`
- * list, which only ever means the indexed graph had no unreferenced symbols.
+ * `available: false` is "could not check". An empty `items` list is meaningful
+ * only alongside the budget and incomplete-walk evidence; candidates do not
+ * prove that the source has no callers.
  */
 export interface DeadCodeFinding {
   symbol_name: string;
@@ -409,4 +412,6 @@ export interface DeadCodeReport {
   /** Observed total, never below `items.length`. */
   total: number;
   truncated: boolean;
+  /** Missing call edges or incomplete traversal; independent of the row budget. */
+  walk_incomplete?: string | null;
 }

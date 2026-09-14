@@ -330,7 +330,7 @@ describe("HealthPanel error-state separation (regression)", () => {
 
   it("does not treat a failed dead-code check as an empty clean graph", () => {
     expect(source).toContain("Dead-code check could not run");
-    expect(source).toContain("No unreferenced symbols in the indexed graph");
+    expect(source).toContain("No dead-code candidates in the indexed graph");
     expect(source).toContain("not stored — not that it is zero");
   });
 
@@ -384,10 +384,18 @@ describe("HealthPanel error-state separation (regression)", () => {
   it("keeps the dead-symbol total and truncation flag rather than counting rows", () => {
     expect(source).toContain("deadSymbolsTotal");
     expect(source).toContain("deadSymbolsTruncated");
-    const heading = source.slice(source.indexOf("Dead code & unreferenced symbols ("));
+    const heading = source.slice(source.indexOf("Dead-code candidates ("));
     expect(heading.slice(0, 260)).toContain("deadSymbolsTotal");
     // An empty result from a truncated query is not an all-clear.
     expect(source).toContain("this is not an all-clear");
+  });
+
+  it("carries incomplete call evidence through both the panel and copied report", () => {
+    expect(source).toContain("dead.value.walk_incomplete");
+    expect(source).toContain("walk_incomplete: deadSymbolsIncomplete");
+    expect(source).toContain("Dead-code analysis is incomplete: {deadSymbolsIncomplete}");
+    expect(source).toContain("deadSymbols.length === 0 && !deadSymbolsIncomplete");
+    expect(source).toContain("{formatDeadCodeStatus(sym)}");
   });
 
   /**

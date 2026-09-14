@@ -185,6 +185,10 @@ pub struct ScanLimitNotice {
     pub resource: String,
     pub kept: usize,
     pub total: usize,
+    /// Only inventory paths were withheld; audit targets were collected separately.
+    /// Older notices default to coverage-affecting, never an assumed full audit.
+    #[serde(default)]
+    pub inventory_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -385,6 +389,7 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             resource: "npm manifests".into(),
             kept: MAX_MANIFESTS,
             total: npm_manifest_candidates,
+            inventory_only: false,
         });
     }
     cap_scan_targets(&mut targets, &mut limit_notices);
@@ -439,6 +444,7 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
                 resource: format!("{family} ecosystem artifacts"),
                 kept: MAX_ECOSYSTEM_MANIFESTS,
                 total: files.len(),
+                inventory_only: true,
             });
             files.truncate(MAX_ECOSYSTEM_MANIFESTS);
         }
@@ -551,6 +557,7 @@ fn cap_target_list(
             resource: resource.into(),
             kept: max,
             total: items.len(),
+            inventory_only: false,
         });
         items.truncate(max);
     }
@@ -1579,6 +1586,7 @@ fn list_repo_files(repo: &Path) -> Result<(Vec<String>, Option<ScanLimitNotice>)
             resource: "repository files".into(),
             kept: MAX_SOURCE_FILES,
             total,
+            inventory_only: false,
         })
     } else {
         None
@@ -1763,6 +1771,7 @@ fn record_limit(report: &mut DepsHealthReport, resource: &str, kept: usize, tota
         resource: resource.into(),
         kept,
         total,
+        inventory_only: false,
     });
 }
 
@@ -1796,7 +1805,12 @@ fn cap_report(report: &mut DepsHealthReport) {
 }
 
 fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: bool) -> bool {
-    if !run_cli || report.truncated {
+    let coverage_limited = report
+        .limit_notices
+        .iter()
+        .any(|notice| !notice.inventory_only)
+        || (report.truncated && report.limit_notices.is_empty());
+    if !run_cli || coverage_limited {
         return false;
     }
     let ran = |name: &str| report.scanners_ran.iter().any(|scanner| scanner == name);
@@ -3941,6 +3955,61 @@ not-json-at-all
                 && notice.kept == MAX_ISSUES
                 && notice.total == MAX_ISSUES + 7
         }));
+    }
+
+    #[test]
+    fn inventory_display_cap_does_not_skip_audit_targets() {
+        let repo = git_repo();
+        for index in 0..MAX_ECOSYSTEM_MANIFESTS + 1 {
+            let dir = repo.path().join(format!("crate-{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]\nname = 'fixture'\n").unwrap();
+        }
+        std::fs::write(repo.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let env = ScanEnv::from_options(&ScanOptions {
+            run_cli: false,
+            path_var: None,
+            home: None,
+        });
+        let (mut report, targets) = local_scan(repo.path(), &env).unwrap();
+        assert_eq!(targets.cargo_locks, vec!["Cargo.lock"]);
+        assert!(report.truncated);
+        assert_eq!(
+            report.ecosystems[0].manifests.len(),
+            MAX_ECOSYSTEM_MANIFESTS
+        );
+        report.cargo_audit_present = true;
+        report.scanners_ran = vec!["cargo".into()];
+        assert!(
+            audit_is_complete(&report, &targets, true),
+            "inventory display did not omit an audit target"
+        );
+        assert!(!audit_is_complete(&report, &targets, false));
+        report.scanners_ran.clear();
+        assert!(!audit_is_complete(&report, &targets, true));
+        report.scanners_ran.push("cargo".into());
+        let complete = report.clone();
+        for code in ["cargo_audit_failed", "audit_cwd"] {
+            let mut failed = complete.clone();
+            push_issue(
+                &mut failed.issues,
+                "error",
+                code,
+                "fixture failure".into(),
+                None,
+            );
+            assert!(!audit_is_complete(&failed, &targets, true));
+        }
+        let mut legacy = complete.clone();
+        legacy.limit_notices = vec![serde_json::from_str(
+            r#"{"resource":"cargo ecosystem artifacts","kept":24,"total":783}"#,
+        )
+        .unwrap()];
+        assert!(!audit_is_complete(&legacy, &targets, true));
+        legacy.limit_notices.clear();
+        assert!(!audit_is_complete(&legacy, &targets, true));
+        record_limit(&mut report, "cargo lockfiles", 6, 7);
+        assert!(!audit_is_complete(&report, &targets, true));
     }
 
     // -- bundler-audit ----------------------------------------------------------
