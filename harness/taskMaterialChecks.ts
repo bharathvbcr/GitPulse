@@ -163,8 +163,22 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     click(".inbox > details > summary");
     await wait(() => !!document.querySelector(".inbox .native-settings"));
     click(".inbox .native-settings > summary");
-    await wait(() => !!document.querySelector(".inbox .native-settings fieldset"));
-    material(`${mode} notification buttons`, ".inbox .native-settings button");
+    // Desktop notification controls exist only where the host could deliver a
+    // banner: `desktopNotificationsSupported` refuses windows and linux before
+    // any probe runs, and that panel renders its unavailable notice instead.
+    // Waiting for the fieldset alone could only ever spend the deadline there.
+    // Waiting for whichever one arrives, then measuring the one that did, keeps
+    // this an assertion about the panel rather than a second copy of the rule
+    // deciding which half is shown — a copy that would drift out of step the
+    // moment the rule changed.
+    const notifyPanel = ".inbox .native-settings";
+    await wait(() => !!document.querySelector(`${notifyPanel} fieldset, ${notifyPanel} [data-testid="notify-unavailable"]`));
+    if (document.querySelector(`${notifyPanel} fieldset`)) {
+      material(`${mode} notification buttons`, `${notifyPanel} button`);
+    } else {
+      check(`${mode}: a host that cannot deliver banners says so instead of offering dead controls`,
+        (find(`${notifyPanel} [data-testid="notify-unavailable"]`).textContent ?? "").trim().length > 0);
+    }
     check(`${mode}: no surfaced transport errors`, !document.querySelector("#board [role=alert]"));
     click('button[aria-label="Inbox"]');
     await closed(".inbox");

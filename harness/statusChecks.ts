@@ -5,6 +5,21 @@ export async function checkStatusPopover() {
   const results: { name: string; pass: boolean }[] = [];
   const check = (name: string, pass: boolean) => results.push({ name, pass });
   const settle = async () => { await tick(); await new Promise(resolve => setTimeout(resolve, 220)); await tick(); };
+  /**
+   * Wait for the disclosure to stop moving before measuring it.
+   *
+   * `settle` spends a fixed 220ms, which is a guess about a transition rather
+   * than a fact about one. Where a probe compares a height against a tight
+   * bound, a few pixels of unfinished animation decide the result, and the
+   * difference between a fast laptop and a loaded CI runner is exactly that
+   * many pixels. Bounded, so a looping animation cannot hang the harness.
+   */
+  const animationsSettled = async (budget = 2000) => {
+    const deadline = performance.now() + budget;
+    while (document.getAnimations().some(animation => animation.playState === "running") && performance.now() < deadline) {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
+  };
   const element = (selector: string) => {
     const value = document.querySelector(selector);
     if (!(value instanceof HTMLElement)) throw new Error(`Missing fixture element: ${selector}`);
@@ -117,7 +132,16 @@ export async function checkStatusPopover() {
     await click(".primary"); check("review opens the existing work view", action("section:work:overview"));
     await click(".details-toggle");
     check("Details reveals the available stashes and utilities", !!details() && !button('[aria-label="2 stashes"]').disabled && !!document.querySelector('[aria-label="Tools"]'));
-    check("Details remains bounded with the footer reachable", fits() && element(".details").offsetHeight <= 190 && getComputedStyle(element(".details")).overflowY === "auto");
+    await animationsSettled();
+    // Split from one `&&`. A panel that outgrew its window, a pane that lost
+    // its height cap, and a pane that stopped scrolling are three different
+    // defects, and as a single assertion all three reported the same sentence —
+    // which is what made this one unactionable when it failed on a runner and
+    // passed everywhere else.
+    const detailsPane = element(".details");
+    check("Details keeps the panel inside the native window", fits());
+    check("Details stays within its 190px cap", detailsPane.offsetHeight <= 190);
+    check("Details scrolls instead of growing the panel", getComputedStyle(detailsPane).overflowY === "auto");
     check("Details is keyboard scrollable", element(".details").tabIndex === 0);
     await click('[aria-label="2 stashes"]'); check("stashes reuse the work view", action("section:work:overview"));
     await click('[aria-label="Command palette"]'); check("the palette remains available inside Details", action("palette"));
