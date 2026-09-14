@@ -51,15 +51,23 @@ use std::time::Duration;
 const PROTOCOL_VERSION: u32 = 1;
 
 /// The smallest request that proves a daemon is answering.
+///
+/// This and the two budgets below are read only by the `#[cfg(unix)]`
+/// `probe_socket`; the `not(unix)` arm reports that the daemon speaks a named
+/// pipe here and connects to nothing. Ungated, each one is dead code on
+/// Windows, which `-D warnings` promotes to an error.
+#[cfg(unix)]
 const STATUS_FRAME: &str = "{\"version\":1,\"cmd\":\"status\"}\n";
 
 /// How long to wait for that answer. The daemon's own per-read budget is 5s;
 /// a kernel that cannot answer `status` inside this is not usefully serving
 /// this repository right now, and is reported as unconfirmed rather than dead.
+#[cfg(unix)]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A status envelope is a few hundred bytes. This is a ceiling on a reply from
 /// a process we do not control, not a size we expect to approach.
+#[cfg(unix)]
 const MAX_REPLY_BYTES: usize = 256 * 1024;
 
 /// Resolving the socket path opens nothing and creates nothing, so it gets a
@@ -125,8 +133,9 @@ pub fn socket_path(repo: &Path) -> Result<String, String> {
 }
 
 /// Forget every cached endpoint. Only the tests need this — a running app
-/// cannot change either input.
-#[cfg(test)]
+/// cannot change either input. Its one caller resolves a unix socket path and
+/// is `#[cfg(unix)]`, so off unix this is dead and `-D warnings` says so.
+#[cfg(all(test, unix))]
 pub(crate) fn clear_socket_cache() {
     if let Ok(mut cache) = SOCKETS.lock() {
         cache.clear();

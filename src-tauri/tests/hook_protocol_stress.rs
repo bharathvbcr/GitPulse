@@ -212,17 +212,44 @@ fn a_payload_that_could_not_be_read_is_never_answered_with_a_decision() {
     }
 }
 
+/// A `PreToolUse` payload naming the command the gate exists to refuse.
+///
+/// Serialized rather than interpolated into a string literal. `repo_root()` is
+/// `D:\a\GitPulse\GitPulse` on a Windows runner, and a raw backslash makes
+/// `\a` an invalid JSON escape, so the document never parsed. The hook then did
+/// precisely the right thing with an unreadable payload — stayed silent — and
+/// the test that forbids silence failed for the exact opposite of its premise.
+/// One owner, so neither caller can reintroduce the quoting bug.
+fn force_push_payload() -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "cwd": repo_root().to_string_lossy(),
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push --force origin main"},
+    })
+    .to_string()
+}
+
+/// The payload is one JSON document whose `cwd` survives the trip.
+///
+/// Cheap, and it fails where the bug actually lived: interpolating the path
+/// into a literal satisfied this on unix and produced an unparseable document
+/// on Windows, where the separator is an invalid escape. Asserting the round
+/// trip rather than the spelling keeps the guard platform-agnostic.
+#[test]
+fn the_force_push_payload_is_one_document_whose_cwd_round_trips() {
+    let value: serde_json::Value =
+        serde_json::from_str(&force_push_payload()).expect("payload is one JSON document");
+    assert_eq!(value["cwd"], repo_root().to_string_lossy().as_ref());
+}
+
 #[test]
 fn concurrent_hooks_each_answer_completely_and_none_interleave() {
     // A host fires these in parallel on parallel tool calls. Each is its own
     // process writing its own pipe, so a torn document here would mean the
     // bounded writer, not a shared buffer — which is exactly why it is worth
     // checking at the process boundary rather than reasoning about.
-    let repo = repo_root();
-    let repo = repo.to_string_lossy().into_owned();
-    let payload = format!(
-        r#"{{"hook_event_name":"PreToolUse","cwd":"{repo}","tool_name":"Bash","tool_input":{{"command":"git push --force origin main"}}}}"#
-    );
+    let payload = force_push_payload();
 
     let workers: Vec<_> = (0..24)
         .map(|i| {
@@ -268,11 +295,7 @@ fn a_harness_that_cannot_answer_is_never_rendered_as_an_allow() {
     // the gate exists to refuse, there is no environment in which this binary
     // stays silent. Silence is reserved for "checked, and permitted".
     let scratch = tempfile::tempdir().expect("tempdir");
-    let repo = repo_root();
-    let repo = repo.to_string_lossy().into_owned();
-    let payload = format!(
-        r#"{{"hook_event_name":"PreToolUse","cwd":"{repo}","tool_name":"Bash","tool_input":{{"command":"git push --force origin main"}}}}"#
-    );
+    let payload = force_push_payload();
 
     // `HOME` is redirected so the real harness cannot be found through
     // `~/.local/bin`.

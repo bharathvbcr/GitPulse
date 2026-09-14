@@ -1,3 +1,5 @@
+import { isMacOS } from "../src/lib/platform";
+
 export async function checkTaskMaterials(errors: string[]): Promise<{ name: string; pass: true }[]> {
   const results: { name: string; pass: true }[] = [];
   const check = (name: string, pass: boolean) => {
@@ -7,7 +9,19 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
   const wait = async (condition: () => boolean) => {
     const deadline = performance.now() + 8000;
     while (!condition()) {
-      if (performance.now() > deadline) throw new Error("Tasks fixture did not reach the expected state");
+      // Naming the predicate that never came true is the difference between
+      // "the fixture is broken" and "this one element is not rendered on this
+      // platform" — the whole 8s deadline used to report the former for both.
+      if (performance.now() > deadline) {
+        const running = document.getAnimations()
+          .filter(animation => animation.playState === "running")
+          .map(animation => {
+            const effect = animation.effect;
+            const target = effect && "target" in effect ? (effect as KeyframeEffect).target : null;
+            return `${(animation as CSSAnimation).animationName ?? animation.constructor.name}@${target ? `${target.tagName.toLowerCase()}.${[...target.classList].join(".")}` : "?"}`;
+          });
+        throw new Error(`Tasks fixture did not reach the expected state: ${condition} | running: ${running.join(", ") || "none"}`);
+      }
       await new Promise(resolve => setTimeout(resolve, 30));
     }
   };
@@ -27,7 +41,16 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     return style.getPropertyValue("backdrop-filter") || style.getPropertyValue("-webkit-backdrop-filter");
   };
   const fallback = matchMedia("(prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active)").matches;
+  // Two different questions, and conflating them is what broke this harness on
+  // Linux. The `macos` class on <html> is a FIXTURE knob — this page hard-codes
+  // it and the Platform control toggles it — and it drives the CSS, so glass
+  // checks read it. Whether a macOS-only ELEMENT exists is decided by the
+  // component, which calls `isMacOS()` against the webview. On a Mac both agree
+  // and the difference is invisible; on the Linux runner the class is still set
+  // while `isMacOS()` is false, so anything keyed to the class waited for
+  // markup that was never going to render.
   const glasses = () => document.documentElement.classList.contains("macos") && !fallback;
+  const macosUi = isMacOS();
   const material = (name: string, selector: string) => {
     const nodes = [...document.querySelectorAll<HTMLElement>(selector)].filter(node => node.getClientRects().length > 0);
     check(`${name}: surfaces present`, nodes.length > 0);
@@ -55,10 +78,19 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
         scope.click();
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
-      await wait(() => document.querySelectorAll(".navigator .gp-liquid-selection").length === 1 && document.getAnimations().every(animation => animation.playState !== "running"));
+      // The scope pill is macOS-only by construction: TaskBoard renders
+      // `.gp-liquid-selection` under `{#if macos && selected}`, and
+      // macAppearance asserts its absence everywhere else. Waiting for one
+      // unconditionally could only ever spend the full deadline off macOS, and
+      // reported it as the fixture never loading rather than as a pill that is
+      // not coming. Settling is the part that is true on every platform.
+      const pills = () => document.querySelectorAll(".navigator .gp-liquid-selection").length;
+      await wait(() => pills() === (macosUi ? 1 : 0) && document.getAnimations().every(animation => animation.playState !== "running"));
       check(`${mode}: rapid scope changes settle to one selected control`, document.querySelectorAll('.navigator [aria-pressed="true"]').length === 1);
-      check(`${mode}: scope pill stays decorative`, find(".navigator .gp-liquid-selection").getAttribute("aria-hidden") === "true" && getComputedStyle(find(".navigator .gp-liquid-selection")).pointerEvents === "none");
-      check(`${mode}: scope pill belongs to the selected control`, !!document.querySelector('.navigator [aria-pressed="true"] > .gp-liquid-selection'));
+      if (macosUi) {
+        check(`${mode}: scope pill stays decorative`, find(".navigator .gp-liquid-selection").getAttribute("aria-hidden") === "true" && getComputedStyle(find(".navigator .gp-liquid-selection")).pointerEvents === "none");
+        check(`${mode}: scope pill belongs to the selected control`, !!document.querySelector('.navigator [aria-pressed="true"] > .gp-liquid-selection'));
+      }
       click('[aria-label="New workspace"]');
       await wait(() => !!document.querySelector(".workspace-editor"));
       material(`${mode} workspace`, ".workspace-editor,.workspace-editor input:not([type=checkbox]),.workspace-editor textarea");
