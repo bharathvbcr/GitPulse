@@ -4,7 +4,17 @@ import { tick } from "svelte";
 export async function checkStatusPopover() {
   const results: { name: string; pass: boolean }[] = [];
   const check = (name: string, pass: boolean) => results.push({ name, pass });
-  const settle = async () => { await tick(); await new Promise(resolve => setTimeout(resolve, 220)); await tick(); };
+  const settle = async () => {
+    await tick();
+    await new Promise(resolve => setTimeout(resolve, 220));
+    await tick();
+    // The fixed delay above is a guess about how long this host takes; the
+    // animations are a fact about whether it has finished. A popover still
+    // transitioning is one a probe can read the previous state of, and the
+    // runner that fails these is the slow one, never a developer's machine.
+    await animationsSettled();
+    await tick();
+  };
   /**
    * Wait for the disclosure to stop moving before measuring it.
    *
@@ -154,9 +164,30 @@ export async function checkStatusPopover() {
     await click('[aria-label="Choose repository"]');
     check("chooser exposes both repository paths", document.querySelectorAll(".repositories button").length === 2 && element(".repositories").textContent?.includes("/Projects/ScholarLM") === true);
     await click('.repositories button[title="/Projects/ScholarLM"]');
-    check("switching updates the header and closes the chooser", action("activate-repo:/Projects/ScholarLM") && element(".repository").textContent?.includes("ScholarLM") === true && !document.querySelector(".repositories"));
+    // Three facts in one assertion, and on a runner it reported only that one
+    // of them was false. `button()` throws when a selector misses, so a *failed*
+    // check here means the click landed and the panel did something else —
+    // which of the three, and what it actually showed, is the whole question.
+    // Naming the observed values follows what the tasks harness already does
+    // for its menu rows.
+    const switched = () => ({
+      action: action("activate-repo:/Projects/ScholarLM"),
+      header: element(".repository").textContent?.includes("ScholarLM") === true,
+      closed: !document.querySelector(".repositories"),
+    });
+    const observed = (state: { action: boolean; header: boolean; closed: boolean }) =>
+      state.action && state.header && state.closed
+        ? ""
+        : ` (last action ${JSON.stringify(document.querySelector(".action")?.textContent ?? null)},`
+          + ` header ${JSON.stringify(document.querySelector(".repository")?.textContent ?? null)},`
+          + ` chooser ${state.closed ? "closed" : "still open"})`;
+    const afterSwitch = switched();
+    check(`switching updates the header and closes the chooser${observed(afterSwitch)}`,
+      afterSwitch.action && afterSwitch.header && afterSwitch.closed);
     await click('[aria-label="Choose repository"]'); await key("Escape");
-    check("Escape collapses the chooser before dismissing", !document.querySelector(".repositories") && action("activate-repo:/Projects/ScholarLM"));
+    const afterEscape = switched();
+    check(`Escape collapses the chooser before dismissing${afterEscape.closed && afterEscape.action ? "" : observed(afterEscape)}`,
+      afterEscape.closed && afterEscape.action);
     await select(1, "conflicts");
     check("conflicts receive a specific headline and card", element("h1").textContent === "Conflicts need your attention" && button('[aria-label="2 conflicts"]').classList.contains("attention"));
     await click(".primary"); check("the conflict action opens Resolve", action("section:work:resolve"));

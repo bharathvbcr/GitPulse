@@ -418,6 +418,8 @@ mod tests {
         );
     }
 
+    // The frame exists only where the unix probe that sends it does.
+    #[cfg(unix)]
     #[test]
     fn the_status_frame_is_one_line_and_carries_the_version() {
         // The daemon reads until the first newline and rejects a frame with no

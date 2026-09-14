@@ -16,6 +16,13 @@
 //! Skipped loudly, never silently: without an installed `devmap` this prints
 //! why and returns rather than passing on an absence.
 
+// The whole file measures a unix-socket daemon: its single test was already
+// `#[cfg(unix)]`, but the fixtures and imports feeding it were not, so on
+// Windows they compiled with no caller and `-D warnings` read them — correctly
+// — as dead code. Gating the module is the same shape the other unix-only
+// integration tests here use, and keeps the two from drifting apart again.
+#![cfg(unix)]
+
 mod common;
 
 use gitpulse_lib::devmap;
@@ -61,7 +68,6 @@ impl Drop for Daemon {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_live_daemon_answers_and_a_dead_one_is_reported_rather_than_assumed() {
     let Ok(binary) = devmap::resolve_binary() else {
         eprintln!("SKIPPED: no `devmap` binary resolved; nothing to measure against");
