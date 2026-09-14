@@ -74,7 +74,7 @@
       <label>Icon<input class="gp-field" bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>
       <label>Color<input class="gp-field" bind:value={draft.color} maxlength="64" placeholder="Optional color name" /></label>
       <SettingToggle label="Pinned" description="Keep this workspace at the top of the navigator." checked={draft.pinned} onchange={(next) => { draft.pinned = next; }} />
-      <SettingToggle label="Archived" description="Hide this workspace unless Show archived is on." checked={draft.archived} onchange={(next) => { draft.archived = next; }} />
+      <SettingToggle label="Archived" description="Hide this workspace unless Show archived workspaces is on. Unrelated to the task Archive, which holds completed tasks." checked={draft.archived} onchange={(next) => { draft.archived = next; }} />
       <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><input class="gp-field" type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => { draft.repository_ids = e.currentTarget.checked ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
       {#if addable.length}
         <p>Open in GitPulse</p>

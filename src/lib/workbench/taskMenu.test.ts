@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { TaskCard } from "./client";
+import { STATUS_LABELS, type TaskCard } from "./client";
+import { ARCHIVE_STATUS } from "./taskArchive";
 import {
   cardsById,
   contextMenuAnchor,
@@ -107,6 +108,60 @@ describe("taskMenuItems", () => {
     expect(items.find((item) => item.id === "copy-agent")?.label).toContain("2");
     expect(menuPageItems(items, "copy").map((item) => item.id)).toContain("copy-agent");
     expect(items.find((item) => item.id === "delete")?.label).toContain("2");
+  });
+
+  // The reason this whole row exists: the board had `Move to… › Done` and no
+  // Archive anywhere, so "archive this task" had no answer in the product and
+  // the panel called Archive offered only Restore.
+  describe("the Archive row", () => {
+    it("sits beside Delete on every card, and says where an archived task goes", () => {
+      const items = taskMenuItems({ cards: [card({ status: "ready" })], column: "ready" });
+      const ids = items.map((item) => item.id);
+      expect(ids).toContain("archive");
+      // Last two rows, in that order: the two ways work leaves the board.
+      expect(ids.slice(-2)).toEqual(["archive", "delete"]);
+      const archive = items.find((item) => item.id === "archive");
+      expect(archive).toMatchObject({ label: "Archive", icon: "archive", disabled: false });
+      expect(archive?.separatorBefore).toBe(true);
+      // Named from the vocabulary, never spelled: this hint is the only place
+      // the board tells a reader which column archiving files a task into.
+      expect(archive?.hint).toBe(STATUS_LABELS[ARCHIVE_STATUS]);
+      // Not styled as destructive. Archiving is the ordinary end of a task.
+      expect(archive?.danger).toBeUndefined();
+    });
+
+    it("refuses the write that would store the status already there", () => {
+      const archived = taskMenuItems({ cards: [card({ status: ARCHIVE_STATUS })] })
+        .find((item) => item.id === "archive");
+      expect(archived?.disabled).toBe(true);
+      expect(archived?.hint).toBe(`Already in ${STATUS_LABELS[ARCHIVE_STATUS]}`);
+      // Disabled, not hidden — the same rule the Move and Priority rows
+      // follow, so the menu keeps its shape whichever card it opened on.
+      expect(archived?.label).toBe("Archive");
+    });
+
+    it("still offers a mixed selection, and counts what it would archive", () => {
+      const items = taskMenuItems({
+        cards: [card({ id: "a", status: "ready" }), card({ id: "b", status: ARCHIVE_STATUS })],
+      });
+      const archive = items.find((item) => item.id === "archive");
+      expect(archive?.disabled).toBe(false);
+      expect(archive?.label).toBe("Archive 2 tasks");
+      expect(archive?.hint).toBe(STATUS_LABELS[ARCHIVE_STATUS]);
+    });
+
+    it("goes away while a write is in flight, like every other action", () => {
+      const busy = taskMenuItems({ cards: [card({ status: "ready" })], busy: true })
+        .find((item) => item.id === "archive");
+      expect(busy?.disabled).toBe(true);
+    });
+
+    // An empty right-click on a column offers only "new task here". Archiving
+    // nothing is not an action, and a disabled row there would be noise.
+    it("is absent when the menu opened on no cards at all", () => {
+      const items = taskMenuItems({ cards: [], column: "ready" });
+      expect(items.map((item) => item.id)).not.toContain("archive");
+    });
   });
 
   it("caps duplicate titles and refuses to invent an untitled original", () => {

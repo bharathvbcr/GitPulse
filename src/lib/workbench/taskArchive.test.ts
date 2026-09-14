@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  ARCHIVE_RULE,
   ARCHIVE_STATUS,
   RESTORE_STATUSES,
+  archivable,
+  archiveAction,
+  archiveState,
   archiveSummary,
   boardPresence,
+  isArchived,
   offersArchive,
   restoreAction,
 } from "./taskArchive";
-import { STATUSES, type TaskStatus } from "./vocabulary";
+import { STATUSES, STATUS_LABELS, type TaskStatus } from "./vocabulary";
+
+const at = (status: TaskStatus, id: string = status) => ({ id, status });
 
 describe("what the archive holds", () => {
   it("treats exactly one status as completed", () => {
@@ -113,5 +120,99 @@ describe("what the dock says about the board", () => {
     expect(offersArchive(["review", "done"])).toBe(true);
     expect(offersArchive(["review"])).toBe(false);
     expect(offersArchive([])).toBe(false);
+  });
+
+  // Both sentences are fixed chrome above the one scrolling list, and the
+  // hidden-direction one had no assertion on it at all — it could have said
+  // anything. They are pinned short, and named for the column rather than
+  // for a spelling of it.
+  it("keeps both sentences to one short line that names the column", () => {
+    for (const hidden of [[], [ARCHIVE_STATUS]] as const) {
+      const { sentence } = boardPresence(hidden);
+      expect(sentence.length, `too long to sit beside the rule: ${sentence}`).toBeLessThanOrEqual(48);
+      expect(sentence).toContain(STATUS_LABELS[ARCHIVE_STATUS]);
+      expect(sentence.endsWith(".")).toBe(true);
+    }
+    expect(boardPresence([ARCHIVE_STATUS]).sentence).toContain("hidden");
+    expect(boardPresence([]).sentence).not.toContain("hidden");
+  });
+});
+
+describe("the rule the dock teaches", () => {
+  // The sentence used to live only in the empty state — the one moment a
+  // reader has no archived work to wonder about. Everyone with completed
+  // tasks saw a panel called Archive, a Restore button, and nothing that
+  // said how a task gets in. It is now header chrome, so it is asserted to
+  // actually name the mechanism rather than to merely exist.
+  it("names the column a task reaches, without spelling it a second time", () => {
+    expect(ARCHIVE_RULE).toContain(STATUS_LABELS[ARCHIVE_STATUS]);
+    expect(ARCHIVE_RULE).toMatch(/^A task is archived when it reaches .+\.$/);
+    // Built from the label, so renaming the status upstream renames this.
+    expect(ARCHIVE_RULE).toBe(`A task is archived when it reaches ${STATUS_LABELS[ARCHIVE_STATUS]}.`);
+  });
+});
+
+describe("archiving", () => {
+  it("is the same status update restoring is, in the other direction", () => {
+    expect(archiveAction()).toEqual({ kind: "update", changes: { status: ARCHIVE_STATUS } });
+    // The pair is symmetric: whatever archiving writes, no restore target
+    // may write, or a restore would be a no-op dressed up as a move.
+    for (const status of RESTORE_STATUSES) {
+      expect(restoreAction(status)).not.toEqual(archiveAction());
+    }
+  });
+
+  it("reads archived off the one field that decides it", () => {
+    expect(isArchived(at(ARCHIVE_STATUS))).toBe(true);
+    for (const status of RESTORE_STATUSES) expect(isArchived(at(status))).toBe(false);
+  });
+
+  it("separates none, some and all so a mixed selection is still offered", () => {
+    expect(archiveState([])).toBe("none");
+    expect(archiveState([at("ready"), at("inbox")])).toBe("none");
+    expect(archiveState([at("ready"), at(ARCHIVE_STATUS)])).toBe("some");
+    expect(archiveState([at(ARCHIVE_STATUS, "a"), at(ARCHIVE_STATUS, "b")])).toBe("all");
+    // Every status the board has, one at a time: exactly one of them is the
+    // archive, so exactly one single-card selection reads "all".
+    const all = STATUSES.filter((status) => archiveState([at(status)]) === "all");
+    expect(all).toEqual([ARCHIVE_STATUS]);
+  });
+
+  // The defect this function was added for: archiving a mixed selection
+  // re-wrote the already-archived cards, spending a revision each to store
+  // the status they already had and handing the batch more writes to fail on.
+  it("writes only the tasks archiving would change, in the order selected", () => {
+    const selection = [at("ready", "a"), at(ARCHIVE_STATUS, "b"), at("review", "c")];
+    expect(archivable(selection).map((task) => task.id)).toEqual(["a", "c"]);
+    expect(archivable([at(ARCHIVE_STATUS, "b")])).toEqual([]);
+    expect(archivable([])).toEqual([]);
+    // Never a superset, and never the caller's own array — including on the
+    // path where nothing is filtered out, which is the one an "avoid the
+    // copy when there is nothing to drop" shortcut would take. A caller that
+    // sorted the result would otherwise reorder its own selection.
+    const untouched = [at("ready", "a"), at("review", "c")];
+    for (const input of [selection, untouched, []]) {
+      expect(archivable(input)).not.toBe(input);
+      expect(archivable(input).every((task) => input.includes(task))).toBe(true);
+    }
+    expect(archivable(untouched)).toEqual(untouched);
+  });
+
+  // `archiveState` and `archivable` are two readings of the same question and
+  // are used together — the menu disables on one, the board filters on the
+  // other. They may not disagree about whether there is anything to do.
+  it("agrees with archiveState about whether there is anything to write", () => {
+    const cases: (readonly { id: string; status: TaskStatus }[])[] = [
+      [],
+      [at("ready", "a")],
+      [at(ARCHIVE_STATUS, "a")],
+      [at("ready", "a"), at(ARCHIVE_STATUS, "b")],
+      STATUSES.map((status) => at(status)),
+    ];
+    for (const selection of cases) {
+      const empty = archivable(selection).length === 0;
+      const nothingToDo = selection.length === 0 || archiveState(selection) === "all";
+      expect(empty, `disagreed on ${JSON.stringify(selection)}`).toBe(nothingToDo);
+    }
   });
 });

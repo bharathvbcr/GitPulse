@@ -88,10 +88,37 @@ describe("TaskBoard", () => {
     expect(source).toContain("gp-btn");
     expect(source).toContain("gp-btn-primary");
     expect(source).toContain("compact");
-    expect(source).toContain("Add a repository to create tasks");
+    expect(source).toContain('data-testid="task-create-hint"');
     expect(source).toContain("unread");
     expect(source).toContain("listAttention");
     expect(source).not.toContain('class="primary"');
+  });
+
+  it("answers New task from one decision, so no two surfaces can disagree about it", () => {
+    // The header button, the empty state, the column +, quick add and the
+    // sheet's seed each used to decide separately. The empty state offered
+    // New task where the header refused it, opening a sheet that could never
+    // be saved; an empty workspace refused it everywhere with nothing on
+    // screen saying why.
+    expect(source).toContain("return taskCreation(target, {");
+    expect(source).not.toContain("canCreate");
+    expect(source).toContain("disabled={!creation.allowed}");
+    expect(source).toContain("action={creation.allowed ?");
+    expect(source).toContain("primary={creation.seed.primaryRepositoryId}");
+    expect(source).toContain("home={creation.seed.homeWorkspaceId}");
+    expect(source).toContain("...creation.seed");
+    expect(source).toContain("quickAddRefusal(creation)");
+    // A refusal that only disables is a dead end; every gate names its reason.
+    expect(source).toContain("creation.blocked ?? creation.caveat");
+    expect(source).toContain('if (!creation.allowed) { error = creation.blocked ??');
+  });
+
+  it("retries the workspace membership read that Retry used to skip", () => {
+    // The effect is keyed on `scope`; refresh() does not change it, so a
+    // failed membership read could never be repeated from the error banner.
+    expect(source).toContain("let membershipToken = $state(0)");
+    expect(source).toMatch(/\$effect\(\(\) => \{\s*membershipToken;/);
+    expect(source).toMatch(/async function refresh\(\)[\s\S]*?membershipToken\+\+/);
   });
 
   it("renders scannable cards and collapses empty columns while exposing empty drop targets", () => {
@@ -157,8 +184,11 @@ describe("TaskBoard", () => {
     expect(source).toContain("menuTabs");
     expect(source).toContain("Add all open");
     expect(source).toContain("Choose folder…");
-    expect(source).toContain("attachRegistered");
-    expect(source).toContain("putWorkspace");
+    expect(source).toContain("attachToScope");
+    // The read-modify-write lives in openMembership, shared with the task
+    // sheet, rather than as a second copy that could drop a concurrent change.
+    expect(source).toContain("attachRepositories(scope.id, ids)");
+    expect(source).not.toContain("putWorkspace");
     expect(source).toContain("openTabs={openTabRefs}");
     expect(source).toContain('aria-haspopup="menu"');
     expect(source).toContain("data-add-repo");
@@ -168,6 +198,25 @@ describe("TaskBoard", () => {
     expect(source).toContain('aria-controls="task-add-repo-menu"');
     expect(source).toContain("onAddMenuKey");
     expect(source).toContain("class=\"add-path\"");
+  });
+
+  it("reaches registered repositories a workspace has not joined, and names the side effect", () => {
+    // The menu used to list only open tabs and a folder picker, so a
+    // registered repository that happened to be closed could not join a
+    // workspace from this board at all.
+    expect(source).toContain("const attachable = $derived.by(");
+    expect(source).toContain("addRegistered(attachable.map((repo) => repo.id))");
+    expect(source).toContain("Add all registered");
+    expect(source).toContain("menuTabs.length === 0 && attachable.length === 0");
+    // Adding here also writes workspace membership; the control says so.
+    expect(source).toContain('`Add repository to ${title}`');
+    expect(source).toContain("title={addRepoLabel}");
+    expect(source).toContain("`Added ${what} to ${title}`");
+  });
+
+  it("says which workspaces are empty before the reader picks one", () => {
+    expect(source).toContain("workspaceMembershipLabel(group.repository_count)");
+    expect(source).toContain('group.repository_count === 0 ? " · Empty" : ""');
   });
 
   it("uses in-app confirms, a task context menu, liquid glass, and Quick Enhance", () => {
@@ -235,5 +284,80 @@ describe("TaskBoard", () => {
     expect(strip).toContain('data-testid="task-tab-close"');
     expect(strip.indexOf("</div>")).toBeLessThan(strip.indexOf('data-testid="task-tab-close"'));
     expect(source).toContain("var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)))");
+  });
+});
+
+/**
+ * The board had a panel called Archive, a Restore inside it, and no Archive
+ * verb anywhere — not on a card, not in the context menu, not on the
+ * selection bar. "Archive this task" had no answer in the product; the only
+ * route was `Move to… › Done`, and nothing said the two were the same thing.
+ */
+describe("the board can archive a task", () => {
+  it("offers the verb from the card menu and from the selection bar", () => {
+    expect(source, "the card menu's archive row must reach the board").toContain('case "archive":');
+    expect(source).toContain("void archiveCards(cards)");
+    expect(source).toContain('data-testid="task-archive-selected"');
+    expect(source).toContain("void archiveCards(selectedCards)");
+  });
+
+  it("takes what archiving is from the seam rather than deciding here", () => {
+    expect(source).toContain("archiveAction()");
+    expect(source).toContain("archivable(cards)");
+    expect(source).toContain("archiveState(selectedCards)");
+    // The one owner. A status literal here is a second decision about what
+    // archived means, in a place the upstream switch would not reach.
+    expect(source).not.toMatch(/\bstatus\b\s*[!=]==?\s*ARCHIVE_STATUS/);
+  });
+
+  it("runs it through the board's one inline write path, like Move to", () => {
+    // Not a private `putTask`: archiving gets the same revision checks,
+    // uncertainty handling and receipt identity every other bulk edit has.
+    const archive = source.slice(source.indexOf("async function archiveCards"), source.indexOf("/** Defaults a quick-added task"));
+    expect(archive).toContain("applyTaskAction(wanted, archiveAction())");
+    expect(archive).not.toContain("putTask");
+    expect(archive).not.toContain("new TaskBatch");
+    // `patchCards` and Archive are two callers of one function, not two paths.
+    expect(source).toContain("await applyTaskAction(cards, {kind:\"update\", changes:patch});");
+  });
+
+  it("writes only the tasks archiving would change, and says what it skipped", () => {
+    const archive = source.slice(source.indexOf("async function archiveCards"), source.indexOf("/** Defaults a quick-added task"));
+    expect(archive).toContain("const wanted = archivable(cards);");
+    expect(archive, "the batch must get the filtered selection").toContain("applyTaskAction(wanted,");
+    expect(archive, "the batch must not get the raw selection").not.toContain("applyTaskAction(cards,");
+    // A skipped task is not a failed one, and must not be folded into the
+    // count `applyUpdate` announces — that count has to match the receipt.
+    expect(archive).toContain("already archived");
+    expect(archive).toContain("const already = cards.length - wanted.length;");
+  });
+
+  it("refuses the write that would store the status already there", () => {
+    const bar = source.slice(source.indexOf('data-testid="task-archive-selected"'), source.indexOf("Trash2 size={12} /> Delete"));
+    expect(bar).toContain('selectionArchived === "all"');
+    expect(bar).toContain("disabled={busy ||");
+    // The disabled control still says why, rather than sitting there dead.
+    expect(bar).toContain("Already in ${STATUS_LABELS[ARCHIVE_STATUS]}");
+  });
+
+  /**
+   * Two unqualified uses of "archived" on one screen. The navigator's
+   * checkbox hides *workspaces*; the header's Archive holds completed
+   * *tasks*. A reader looking for a way to archive a task finds a checkbox
+   * called "Show archived" that does nothing they wanted, which is one of
+   * the reasons the page read as one feature with a broken control.
+   */
+  it("does not call two different things archived on the same screen", () => {
+    expect(source).toContain("Show archived workspaces");
+    expect(source, "a bare 'Show archived' is the ambiguous label")
+      .not.toMatch(/>Show archived<\/label>/);
+  });
+
+  it("names the column the header's Archive toggle actually holds", () => {
+    // "Archive — completed tasks in this scope" named a category; a reader
+    // hunting for the verb needed the mechanism instead.
+    expect(source).toContain("aria-controls=\"task-archive-dock\"");
+    expect(source).toContain("Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}");
+    expect(source).not.toContain("Archive — completed tasks in this scope");
   });
 });

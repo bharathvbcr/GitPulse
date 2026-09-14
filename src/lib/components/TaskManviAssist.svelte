@@ -57,7 +57,6 @@
     disabled = false,
     dirty = false,
     active = true,
-    autofocus = false,
     quick = false,
     startRequest = 0,
     onSuggestion = (_state: AssistSuggestion) => {},
@@ -85,7 +84,6 @@
     disabled?: boolean;
     dirty?: boolean;
     active?: boolean;
-    autofocus?: boolean;
     quick?: boolean;
     startRequest?: number;
     /**
@@ -170,7 +168,6 @@
   let configPending = $state(false);
   let flash = $state<EnhancementField[]>([]);
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
-  let notesEl: HTMLTextAreaElement | undefined = $state();
   let visible = $state(true);
   /**
    * Which engine writes the text.
@@ -268,7 +265,6 @@
     void loadConfig();
     void appleIntelligenceStatus().then((status) => { if (!disposed) apple = status; });
     if (task) void history();
-    if (autofocus && !quick) queueMicrotask(() => notesEl?.focus());
     const tick = window.setInterval(() => { now = Date.now() / 1000; }, 1000);
     return () => {
       disposed = true;
@@ -563,7 +559,6 @@
     <label class="notes-label">
       <span class="sr-only">What do you need?</span>
       <textarea
-        bind:this={notesEl}
         class="gp-field"
         value={notes}
         maxlength="65536"

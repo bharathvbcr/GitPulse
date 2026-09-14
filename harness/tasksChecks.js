@@ -15,6 +15,12 @@ let appleStatus = { compiled: true, state: "available", reason: null, detail: "T
 let appleFailure = "";
 const repos = ["GitPulse", "Manvi"].map((name, i) => ({ id: `repo-${i}`, name, revision: 1, updated_at: 1, identity_key: `local:/fixture/${name}/.git`, remote_url: null }));
 const workspace = { id: "workspace", name: "Developer tools", revision: 1, updated_at: 1, icon: "", color: "", pinned: false, archived: false, position: 1, description: "", repository_ids: ["repo-1"], repository_count: 1 };
+// A workspace with no member repositories. The board used to refuse New task
+// here with nothing on screen saying why, and the empty state offered a New
+// task that opened a sheet which could never be saved.
+const emptyWorkspace = { id: "workspace-empty", name: "Fresh space", revision: 1, updated_at: 1, icon: "", color: "", pinned: false, archived: false, position: 2, description: "", repository_ids: [], repository_count: 0 };
+const workspaces = [workspace, emptyWorkspace];
+const workspaceWrites = [];
 const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [] });
 let tasks = [
   makeTask("task-1", "Keep repository tasks in sync", "repo-0", "in_progress"),
@@ -67,8 +73,17 @@ mockIPC(async (cmd, args) => {
       preparedRuns.push(structuredClone(input));
       throw {code:"store_error", message:"The tasks fixture does not start agents."};
     }
-    case "workspaces.list": return JSON.stringify(page([workspace]));
-    case "workspaces.get": return JSON.stringify({ok: true, item: workspace});
+    case "workspaces.list": return JSON.stringify(page(workspaces));
+    case "workspaces.get": return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
+    case "workspaces.put": {
+      workspaceWrites.push(structuredClone(input));
+      const index = workspaces.findIndex(space => space.id === input.id);
+      if (index < 0) throw {code:"not_found", message:"Fixture has no such workspace"};
+      if (workspaces[index].revision !== input.expected_revision) throw {code:"conflict", message:"Fixture workspace changed elsewhere"};
+      const saved = { ...workspaces[index], ...input, revision: workspaces[index].revision + 1, repository_count: (input.repository_ids ?? workspaces[index].repository_ids).length };
+      workspaces[index] = saved;
+      return JSON.stringify({ok: true, item: saved});
+    }
     case "enhancements.wake": case "enhancements.worker": return JSON.stringify({ok:true, state:"disabled", reason:"", task_id:"", proposal_id:"", next_check_at:0});
     case "attention.list": {
       const result = JSON.stringify(page([]));
@@ -193,7 +208,12 @@ const field = (text) => [...root.querySelectorAll(".task-editor label")].find(el
 // stable handle; the text lookups stay first so failures still name a label.
 const enhanceButton = () => button("Improve with Manvi") ?? button("Enhance with Manvi") ?? button("Draft with Manvi")
   ?? root.querySelector(".manvi-assist button.ask");
-const card = id => root.querySelector(`[data-card-id="${id}"]`);
+// Scoped to board cards. The archive dock's rows carry `data-card-id` too, so
+// an unscoped lookup returned an archive row whenever the dock was open — and
+// an archive row has no context menu, no column and no drag, so every check
+// built on it would have failed for a reason that had nothing to do with what
+// it was testing.
+const card = id => root.querySelector(`[data-task-card][data-card-id="${id}"]`);
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
 const change = async (el, value, event = "input") => { if(!el) throw Error("Missing form field"); el.value = value; el.dispatchEvent(new Event(event, {bubbles:true})); await settle(); };
@@ -246,8 +266,19 @@ if (params.has("check")) {
     card("task-2").focus(); card("task-2").click(); await wait(editor);
     check("opening the sheet focuses its title", document.activeElement === field("Title"));
     check("type offers all supported task kinds and permits custom names", field("Type") instanceof HTMLSelectElement && field("Type").options.length === 8 && [...field("Type").options].some(option => option.value === "__custom__"));
-    check("the primary repository is available without expanding settings", field("Primary repository").getClientRects().length > 0 && !field("Primary repository").closest("details"));
-    check("linked repositories remain intact in the draft", field("Primary repository").value === "repo-0" && editor().textContent.includes("Linked repositories"));
+    // Repositories lead the sheet. A task cannot be saved without one, and
+    // this used to be the last control on the pane, below the criteria box.
+    const picker = () => editor().querySelector("fieldset.repositories");
+    const primaryRadio = () => [...picker().querySelectorAll('input[type="radio"]')].find(el => el.checked);
+    check("the repository picker is available without expanding settings",
+      picker().getClientRects().length > 0 && !picker().closest("details"));
+    check("the repository picker comes before the title on the pane",
+      picker().compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING);
+    check("linking and the primary choice are one control, not two that can disagree",
+      Boolean(primaryRadio())
+      && primaryRadio().closest(".repo-row").querySelector('input[type="checkbox"]').checked
+      && picker().textContent.includes("primary GitPulse")
+      && !editor().textContent.includes("Linked repositories"));
     const paneTab = id => editor().querySelector(`[data-sheet-tab="${id}"]`);
     const onScreen = el => Boolean(el) && el.getClientRects().length > 0;
     check("a saved task opens on Task and draws exactly one pane",
@@ -361,11 +392,70 @@ if (params.has("check")) {
 
     await click("Developer tools"); await wait(() => Boolean(card("task-3")) && !card("task-1"));
     await click("New task");
-    check("workspace tasks default to a repository in that workspace", field("Primary repository").value === "repo-1");
+    // The picker owns both halves now, so "which repository is primary" is
+    // read off the checked radio rather than a separate select.
+    const primaryName = () => editor().querySelector('.repo-row input[type="radio"]:checked')?.closest(".repo-row")?.querySelector(".repo-name")?.textContent.trim();
+    check("workspace tasks default to a repository in that workspace", primaryName() === "Manvi");
+    check("the picker marks which repositories the home workspace already holds",
+      editor().querySelector(".repo-row.linked .repo-mark")?.textContent.trim() === "In workspace");
     await change(field("Title"), "Workspace draft");
     await click("GitPulse fixture"); await settle(400);
-    check("repository tab switches preserve the open draft's repository", field("Title").value === "Workspace draft" && field("Primary repository").value === "repo-1");
+    check("repository tab switches preserve the open draft's repository", field("Title").value === "Workspace draft" && primaryName() === "Manvi");
     confirmAnswer = true; await click("Close task details");
+
+    // A workspace with no member repositories. Every one of these used to
+    // fail: New task was disabled with nothing on screen saying why, the
+    // empty state offered a New task anyway that opened an unsaveable sheet,
+    // and nothing in the board could give the workspace a repository.
+    // The navigator only exists in the global fixture, so restore it first.
+    // Matched on a prefix, not the whole label, so the rest of this block
+    // still runs against a build whose navigator says nothing about members.
+    await click("Global fixture"); await settle(400);
+    const workspaceTab = name => [...root.querySelectorAll('nav[aria-label="Task scopes"] button')].find(el => el.textContent.trim().startsWith(name));
+    check("the navigator says which workspaces are empty before one is opened",
+      workspaceTab("Fresh space").textContent.trim() === "Fresh space · Empty");
+    workspaceTab("Fresh space").click(); await settle(400);
+    check("an empty workspace still offers New task, and says what the sheet will ask for",
+      button("New task").disabled === false
+      && root.querySelector('[data-testid="task-create-hint"]')?.textContent.includes("Fresh space has no repositories yet"));
+    check("the empty board's own New task agrees with the header instead of contradicting it",
+      Boolean(button("New task", root.querySelector(".board-main"))) && root.textContent.includes("Fresh space has no repositories yet"));
+    // Every step below is guarded rather than allowed to throw. A build that
+    // withdraws the control records a failed check and lets the rest of the
+    // block report; an exception here would hide them behind one stack trace.
+    const quickAddField = () => root.querySelector(".quick-add-row input");
+    if (quickAddField()) {
+      await change(quickAddField(), "A line with no repository");
+      quickAddField().dispatchEvent(new KeyboardEvent("keydown", {key:"Enter", bubbles:true, cancelable:true})); await settle(200);
+      check("quick add refuses here by naming the marker and the editor, not just failing",
+        root.textContent.includes("^name") && root.textContent.includes("Shift+Return"));
+      await change(quickAddField(), "");
+    } else {
+      check("quick add refuses here by naming the marker and the editor, not just failing", false);
+    }
+    button("New task")?.click(); await settle(400);
+    const repoRow = name => [...(editor()?.querySelectorAll(".repo-row") ?? [])].find(row => row.querySelector(".repo-name").textContent.trim() === name);
+    const summaryText = () => editor()?.querySelector('[data-testid="task-repo-summary"]')?.textContent ?? "";
+    check("New task in an empty workspace opens a sheet at all", Boolean(editor()));
+    if (editor()) await change(field("Title"), "First task in a fresh workspace");
+    check("the sheet opens with nothing linked and refuses to save until one is",
+      summaryText().includes("No repository linked") && button("Save task")?.disabled === true);
+    repoRow("GitPulse")?.querySelector('input[type="checkbox"]')?.click(); await settle(150);
+    check("linking a repository from the picker is what makes the task saveable",
+      button("Save task")?.disabled === false && summaryText().includes("primary GitPulse"));
+    check("the sheet says the link is outside the home workspace and offers the join",
+      Boolean(editor()?.textContent.includes("not in Fresh space")) && Boolean(editor() && button("Add to workspace", editor())));
+    if (editor() && button("Add to workspace", editor())) { await click("Add to workspace"); await settle(250); }
+    check("Add to workspace writes the membership and the row stops being an outsider",
+      workspaceWrites.some(write => write.id === "workspace-empty" && write.repository_ids.includes("repo-0"))
+      && !editor()?.textContent.includes("not in Fresh space")
+      && repoRow("GitPulse")?.querySelector(".repo-mark")?.textContent.trim() === "In workspace");
+    if (button("Save task")) { await click("Save task"); await settle(300); }
+    check("a task created from an empty workspace saves with that workspace as its home",
+      tasks.some(task => task.title === "First task in a fresh workspace" && task.home_workspace_id === "workspace-empty" && task.primary_repository_id === "repo-0"));
+    confirmAnswer = true; if (editor()) await click("Close task details");
+    await click("All"); await wait(() => card("task-1"));
+
     await click("Global fixture"); await settle(400);
     holdGet = true; card("task-1").click(); await wait(() => releaseGet);
     // Repeated clicks while loading cannot create competing editor requests.
@@ -649,6 +739,13 @@ if (params.has("check")) {
     await wait(() => archiveRows().length > 0);
     check("the archive opens on the completed tasks for this scope",
       Boolean(archive()) && archiveRows().length === 30);
+    // The panel is named Archive and offers Restore. Until this line it never
+    // said anywhere what puts a task in it, and the one place that came close
+    // was the empty state — the single case a reader has no archived work to
+    // ask about.
+    check("the archive says how a task gets into it, with rows on screen",
+      archive().querySelector('[data-testid="task-archive-rule"]')?.textContent.trim()
+        === "A task is archived when it reaches Done.");
     // The one number this panel must not get wrong. 30 rows on screen out of
     // 35 completed tasks has to read as both numbers, or a reader clears an
     // archive they have only partly seen.
@@ -661,6 +758,41 @@ if (params.has("check")) {
     // board's confirm dialog rather than writing straight through.
     archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();
     archiveRows()[1].querySelector('input[type="checkbox"]').click(); await settle();
+    // The defect this panel was reported for, measured rather than asserted
+    // about the stylesheet. With the rows loaded, the Restore/Delete bar used
+    // to render ~107px below the panel's own fold at scroll top: ticking a
+    // checkbox changed nothing a reader could see, and there was no cue to
+    // scroll. Both ends of the bar must be inside the panel's visible box,
+    // and must stay there with the list scrolled to its end.
+    const visibleIn = (el, within) => {
+      const a = el.getBoundingClientRect(), b = within.getBoundingClientRect();
+      return a.top >= b.top - 1 && a.bottom <= b.bottom + 1 && a.height > 0;
+    };
+    const actionBar = () => archive().querySelector(".actions");
+    const entries = () => archive().querySelector(".entries");
+    check("selecting a row shows the actions it enables, without scrolling first",
+      Boolean(actionBar()) && visibleIn(actionBar(), archive())
+      && actionBar().textContent.includes("Restore") && actionBar().textContent.includes("Delete"));
+    entries().scrollTop = entries().scrollHeight; await settle(80);
+    // Both are siblings of the scroller, never inside it: on macOS
+    // `bg-surface` is a 50%-alpha material, and a row sliding under a
+    // half-transparent bar puts a task title and that bar's own label in the
+    // same pixels. Out here `.entries` clips its rows, so nothing can reach
+    // them — which is a containment fact, not a geometric one. A scrolled-off
+    // row keeps a rect that still intersects the bar's band while being
+    // painted nowhere, so overlap is the wrong thing to measure.
+    const listHead = () => archive().querySelector(".list-head");
+    check("the actions and the select-all head stay put while the rows scroll",
+      visibleIn(actionBar(), archive()) && visibleIn(listHead(), archive())
+      && !entries().contains(listHead()) && !entries().contains(actionBar())
+      && archiveRows().every(row => entries().contains(row)));
+    // One scroller. Two nested ones with independent caps is what pushed the
+    // action bar out: the row list won the panel's height and the actions
+    // went below a fold the panel itself reported as absent.
+    check("the panel scrolls its rows and nothing else",
+      entries().scrollHeight > entries().clientHeight
+      && archive().scrollHeight <= archive().clientHeight + 1);
+    entries().scrollTop = 0; await settle(60);
     const restored = archiveRows().slice(0, 2).map(row => row.getAttribute("data-card-id"));
     await change(archive().querySelector('[aria-label="Restore to"]'), "ready", "change");
     button("Restore", archive()).click(); await settle(150);
@@ -691,7 +823,7 @@ if (params.has("check")) {
     // The dock is a second way to read completed work, not a move, and it
     // says which of the two is true right now.
     check("the archive admits that Done is still on the board",
-      archive().textContent.includes("also in the Done column") && Boolean(columnEl("done")));
+      archive().textContent.includes("in the Done column on the board") && Boolean(columnEl("done")));
     button("Hide Done on the board", archive()).click(); await settle(200);
     check("hiding Done from the archive uses the board's own column preference",
       !columnEl("done") && archive().textContent.includes("Done column is hidden"));
@@ -724,6 +856,57 @@ if (params.has("check")) {
     archiveToggle().click(); await settle();
     check("the archive closes and leaves the board as it was",
       !archive() && root.querySelectorAll("[data-task-column]").length === 6);
+
+    // ---- Archiving a task -------------------------------------------------
+    // The report this block exists for: a panel called Archive, a Restore
+    // inside it, and no Archive verb anywhere in the product. The only route
+    // was `Move to… › Done`, and nothing named the two as the same thing.
+    const archiveRow = () => [...menu().querySelectorAll("button")].find(el => el.dataset.menuId === "archive");
+    const statusOf = id => tasks.find(task => task.id === id)?.status;
+    const revisionOf = id => tasks.find(task => task.id === id)?.revision;
+    // Taken from the board as it stands, not written as literals: earlier
+    // blocks in this script delete tasks and move others between columns, so
+    // a hard-coded id would be measuring this block's position in the script.
+    const onBoardIn = status => [...root.querySelectorAll(`[data-task-column="${status}"] [data-task-card]`)]
+      .map(el => el.getAttribute("data-card-id"));
+    const [first, second] = onBoardIn("ready");
+    if (!first || !second) throw Error("Archive checks need two Ready cards on the board");
+    await openMenu(first);
+    check("a card's own menu offers Archive, and names the column it files into",
+      Boolean(archiveRow()) && !archiveRow().disabled
+      && archiveRow().textContent.includes("Archive") && archiveRow().textContent.includes("Done"));
+    const beforeArchive = completed();
+    archiveRow().click(); await settle(350);
+    check("Archive moves the task without opening a dialog or asking for a status",
+      statusOf(first) === "done" && !document.querySelector('[role="dialog"]')
+      && Number(archiveToggle().textContent.trim()) === beforeArchive + 1
+      && Boolean(card(first)?.closest('[data-task-column="done"]')));
+    // Disabled rather than hidden, the way a Move row showing the current
+    // status is: the menu keeps its shape, and says what the task already is.
+    await openMenu(first);
+    check("an already-archived task is told so instead of being written again",
+      Boolean(archiveRow()) && archiveRow().disabled && archiveRow().textContent.includes("Already in Done"));
+    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+
+    // The bulk half, over a deliberately mixed selection: one task already in
+    // Done and one that is not. Archiving both would spend a revision on the
+    // archived one to store the status it already had, and hand the batch one
+    // more write to fail on.
+    if (root.querySelector(".selection")) await click("Clear task selection");
+    await selectCard(first); await selectCard(second);
+    const bulkButton = () => root.querySelector('[data-testid="task-archive-selected"]');
+    const before = { archived: revisionOf(first), open: revisionOf(second) };
+    check("the selection bar offers Archive beside Delete for a mixed selection",
+      Boolean(bulkButton()) && !bulkButton().disabled
+      && root.querySelector('[aria-label="Selected task actions"]').textContent.includes("2 selected"));
+    bulkButton().click(); await settle(450);
+    check("bulk Archive files the rest and leaves the already-archived task untouched",
+      statusOf(first) === "done" && statusOf(second) === "done"
+      && revisionOf(first) === before.archived
+      && revisionOf(second) === before.open + 1);
+    check("and it refuses once there is nothing left to archive",
+      Boolean(bulkButton()) && bulkButton().disabled && bulkButton().title.includes("Already in Done"));
+    await click("Clear task selection");
 
     // ---- The fuller right-click menu ------------------------------------
     await openMenu("task-11");

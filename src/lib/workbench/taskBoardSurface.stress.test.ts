@@ -25,6 +25,7 @@ import {
   TASK_CARD_FIELDS,
 } from "../ui/taskView";
 import { STATUSES, type TaskStatus } from "./vocabulary";
+import { ARCHIVE_STATUS, archivable, archiveState, isArchived } from "./taskArchive";
 import { taskMenuItems, typeAheadIndex } from "./taskMenu";
 import {
   checkoutCandidates,
@@ -290,5 +291,98 @@ describe("the handoff gate under hostile settings", () => {
       }
     }
     expect(checkoutCandidates("missing", repositories, tabs, { caseInsensitive: true })).toEqual([]);
+  });
+});
+
+/**
+ * The archive seam under selections nobody would build on purpose.
+ *
+ * `archiveState` decides whether a control is offered and `archivable` decides
+ * what a batch writes. They answer the same question from opposite ends, and a
+ * disagreement between them is a click that either does nothing or writes more
+ * than the reader asked for. The status field they read is a wire value: it
+ * arrives from the store as JSON, and a card whose status this build does not
+ * have must not silently count as archived.
+ */
+describe("the archive seam under hostile selections", () => {
+  const task = (status: unknown, id = "t") => ({ id, status }) as { id: string; status: TaskStatus };
+  const NOT_A_STATUS: unknown[] = [
+    undefined, null, "", " done ", "DONE", "Done", 0, 1, true, {}, [], "archived", "completed",
+    ...POLLUTION, ...INVISIBLE.map((mark) => `done${mark}`),
+  ];
+
+  it("treats exactly one spelling as archived, whatever the wire sent", () => {
+    for (const value of NOT_A_STATUS) {
+      expect(isArchived(task(value)), JSON.stringify(value)).toBe(false);
+      expect(archiveState([task(value)]), JSON.stringify(value)).toBe("none");
+      expect(archivable([task(value)]).length, JSON.stringify(value)).toBe(1);
+    }
+    expect(isArchived(task(ARCHIVE_STATUS))).toBe(true);
+  });
+
+  it("never lets the two readings disagree about whether there is work to do", () => {
+    const pool: TaskStatus[] = [...STATUSES, ...(NOT_A_STATUS as TaskStatus[])];
+    // Deterministic pseudo-random selections: a fixed seed keeps a failure
+    // reproducible, which a Math.random sweep would not.
+    let seed = 0x2f6e2b1;
+    const next = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let trial = 0; trial < 2000; trial += 1) {
+      const size = Math.floor(next() * 6);
+      const cards = Array.from({ length: size }, (_, i) => task(pool[Math.floor(next() * pool.length)], `t${i}`));
+      const state = archiveState(cards);
+      const wanted = archivable(cards);
+      const nothingToDo = cards.length === 0 || state === "all";
+      expect(wanted.length === 0, JSON.stringify(cards)).toBe(nothingToDo);
+      // What survives the filter is exactly what is not archived, in order,
+      // and never anything the caller did not hand in.
+      expect(wanted).toEqual(cards.filter((card) => !isArchived(card)));
+      expect(wanted.length <= cards.length).toBe(true);
+      if (state === "some") expect(wanted.length).toBeGreaterThan(0);
+      if (state === "none") expect(wanted.length).toBe(cards.length);
+    }
+  });
+
+  it("stays linear on a selection far past anything the board can build", () => {
+    // MAX_TASK_SELECTION is 100. This is three orders of magnitude past it,
+    // so a quadratic scan would be visible even on a loaded machine.
+    const huge = Array.from({ length: 100_000 }, (_, i) =>
+      task(STATUSES[i % STATUSES.length], `t${i}`));
+    // Counted, not divided: 100_000 does not divide evenly by six statuses,
+    // and an expectation that rounds is an expectation that stops asserting.
+    const archived = huge.filter((entry) => entry.status === ARCHIVE_STATUS).length;
+    expect(archived).toBeGreaterThan(0);
+    const started = performance.now();
+    expect(archiveState(huge)).toBe("some");
+    expect(archivable(huge).length).toBe(huge.length - archived);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  it("offers the menu's Archive row exactly when the batch would write something", () => {
+    const menuCard = (status: TaskStatus, id: string) => ({
+      id, revision: 1, title: "Card", status, priority: 2, kind: "bug",
+      owner: null, due_at: null, labels: [] as string[],
+      repository_ids: ["r"], primary_repository_id: "r",
+    }) as never;
+    const selections: TaskStatus[][] = [
+      ["ready"],
+      [ARCHIVE_STATUS],
+      ["ready", ARCHIVE_STATUS],
+      [ARCHIVE_STATUS, ARCHIVE_STATUS],
+      [...STATUSES],
+      Array.from({ length: 120 }, () => ARCHIVE_STATUS),
+      Array.from({ length: 120 }, (_, i) => (i === 119 ? "ready" : ARCHIVE_STATUS)) as TaskStatus[],
+    ];
+    for (const statuses of selections) {
+      const cards = statuses.map((status, i) => menuCard(status, `c${i}`));
+      const row = taskMenuItems({ cards, column: null, busy: false }).find((item) => item.id === "archive");
+      expect(row, JSON.stringify(statuses)).toBeDefined();
+      // The row and the write agree: enabled exactly when something changes.
+      const writes = archivable(statuses.map((status, i) => ({ id: `c${i}`, status }))).length;
+      expect(row?.disabled, JSON.stringify(statuses)).toBe(writes === 0);
+      expect(row?.hint?.trim().length).toBeGreaterThan(0);
+    }
+    // Busy closes it regardless of what the write would have done.
+    const cards = [menuCard("ready", "c0")];
+    expect(taskMenuItems({ cards, column: null, busy: true }).find((item) => item.id === "archive")?.disabled).toBe(true);
   });
 });

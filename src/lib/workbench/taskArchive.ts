@@ -1,14 +1,24 @@
 /**
- * The archive: where completed tasks go, and how the board says so.
+ * The archive: what puts a task in it, what takes one out, and how the board
+ * says so.
  *
  * There is no `archived` flag to read. `dc-store` is vendored from upstream
  * DevCouncil (`src-tauri/vendored/VENDOR.json` — change it there and
  * re-vendor, never here), its `items.list` accepts exactly `limit`, `cursor`,
- * `workspace_id`, `repository_id`, `status` and `query`, and it rejects any
- * other field. So "completed" is the `done` status and nothing else, and this
- * module is the one place that says so: the dock, the board's note and the
- * restore menu all derive from `ARCHIVE_STATUS` rather than spelling "done"
- * again.
+ * `workspace_id`, `repository_id`, `status` and `query`, its `items.put`
+ * accepts exactly eighteen named fields, and both reject any other field. So
+ * "archived" is the `done` status and nothing else, and this module is the
+ * one place that says so: the dock, the board's note, the card menu's Archive
+ * row and the restore menu all derive from `ARCHIVE_STATUS` rather than
+ * spelling "done" again.
+ *
+ * **This module is the seam.** Making archived a dimension of its own — a
+ * task that is Done but not archived, or archived out of Ready — needs a
+ * stored field the vendored store does not have. When that lands upstream,
+ * `isArchived`, `archiveAction`, `restoreAction` and the dock's single
+ * `listTasks` call are the whole change; nothing else asks what "archived"
+ * means. [docs/ARCHIVE_SEPARATION.md](../../../docs/ARCHIVE_SEPARATION.md)
+ * carries the upstream diff and the migration.
  *
  * Two honesty rules run through the file, both of them the same rule the
  * board already follows for a hidden column:
@@ -33,8 +43,82 @@ import { plural } from "../format";
 import type { TaskAction } from "./taskActions";
 import { STATUSES, STATUS_LABELS, type TaskStatus } from "./vocabulary";
 
-/** The status the archive holds. Completed means exactly this. */
+/** The status the archive holds. Archived means exactly this. */
 export const ARCHIVE_STATUS: TaskStatus = "done";
+
+/**
+ * What puts a task in the archive, in one sentence.
+ *
+ * The dock says this whether or not it is empty. The rule used to appear only
+ * in the empty state, which is the one moment a reader has no archived tasks
+ * to wonder about: everybody with completed work saw a panel called Archive,
+ * a Restore button, and nothing anywhere that said how a task gets in.
+ *
+ * Built from `STATUS_LABELS[ARCHIVE_STATUS]` rather than written out, so the
+ * sentence cannot keep naming a column the board has renamed.
+ */
+export const ARCHIVE_RULE = `A task is archived when it reaches ${STATUS_LABELS[ARCHIVE_STATUS]}.`;
+
+/**
+ * Whether a task is in the archive.
+ *
+ * Takes the one field it reads rather than a whole `TaskCard`, so the board,
+ * the menu and the dock can all ask without agreeing on a card shape first —
+ * and so this stays the only place that knows which field decides it.
+ */
+export function isArchived(task: { status: TaskStatus }): boolean {
+  return task.status === ARCHIVE_STATUS;
+}
+
+/** How much of a selection is already archived. */
+export type ArchiveState = "none" | "some" | "all";
+
+/**
+ * Whether archiving a selection would do anything.
+ *
+ * `"all"` is the case a menu must not offer: every one of those writes would
+ * spend a revision to store the value already there, and the board's own
+ * convention is that a row showing the current value is disabled rather than
+ * hidden. `"some"` is offered — archiving the rest is a real change.
+ */
+export function archiveState(tasks: readonly { status: TaskStatus }[]): ArchiveState {
+  if (!tasks.length) return "none";
+  const archived = tasks.filter(isArchived).length;
+  if (archived === 0) return "none";
+  return archived === tasks.length ? "all" : "some";
+}
+
+/**
+ * The part of a selection that archiving would actually change.
+ *
+ * A mixed selection is offered, so the board has to be able to act on it
+ * without touching the tasks that are already there. Writing all of them
+ * spends a revision per already-archived task to store the value it already
+ * has, and hands every one of those writes its own chance to fail — the same
+ * waste a Move row showing the current status is disabled to avoid.
+ *
+ * Order is preserved, so a receipt reads in the order the reader selected.
+ */
+export function archivable<T extends { status: TaskStatus }>(tasks: readonly T[]): T[] {
+  return tasks.filter((task) => !isArchived(task));
+}
+
+/**
+ * Archiving, as an action.
+ *
+ * The mirror of `restoreAction`, and the same kind of thing: the ordinary
+ * `TaskBatch` status update the board's Move menu builds, run through the
+ * board's existing confirm-and-retry path. A private write here would be a
+ * second owner of "move a task" that no longer shares the board's revision
+ * checks, uncertainty handling or receipt identity.
+ *
+ * Takes no argument because there is exactly one archive. When `archived`
+ * becomes its own stored field this returns `{ archived: true }` instead and
+ * every caller is unchanged.
+ */
+export function archiveAction(): TaskAction {
+  return { kind: "update", changes: { status: ARCHIVE_STATUS } };
+}
 
 /**
  * Where a completed task can be restored to, in board order.
@@ -122,15 +206,19 @@ export interface BoardPresence {
  */
 export function boardPresence(hidden: readonly TaskStatus[]): BoardPresence {
   const onBoard = !hidden.includes(ARCHIVE_STATUS);
+  // Short on purpose. `ARCHIVE_RULE` now states what the archive holds, so
+  // these say only the thing the rule does not: whether the same tasks are
+  // also drawn on the board right now. Every character here is fixed chrome
+  // above the scrolling list, and a wrapped second line costs the list a row.
   return onBoard
     ? {
         onBoard,
-        sentence: "These tasks are also in the Done column on the board.",
+        sentence: "Also in the Done column on the board.",
         actionLabel: "Hide Done on the board",
       }
     : {
         onBoard,
-        sentence: "The Done column is hidden, so this is where completed work is read.",
+        sentence: "The Done column is hidden.",
         actionLabel: "Show Done on the board",
       };
 }

@@ -21,7 +21,7 @@ import { describe, expect, it } from "vitest";
  * it, so the next one is caught without anyone remembering this test exists.
  */
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const ROOTS = ["scripts", "src", "contracts", "src-tauri/src", "docs"];
+const ROOTS = ["scripts", "src", "contracts", "src-tauri/src", "src-tauri/tests", "src-tauri/benches", "docs"];
 const SKIP = new Set(["node_modules", "dist", ".git", "coverage", "target"]);
 const SOURCE = /\.(ts|mts|cts|mjs|cjs|js|svelte|rs|css|md|json|toml|yml|yaml)$/;
 

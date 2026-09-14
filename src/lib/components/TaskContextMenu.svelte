@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ArrowLeft, Bot, Calendar, Check, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
+  import { Archive, ArrowLeft, Bot, Calendar, Check, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { cycleFocus } from "../ui/focusTrap";
@@ -253,6 +253,9 @@
   {:else if name === "priority"}<span class="w-[13px] text-center" aria-hidden="true">!</span>
   {:else if name === "select"}<SquareCheck size={13} />
   {:else if name === "add"}<Plus size={13} />
+  <!-- The same glyph the board header's Archive toggle carries, so the row
+       and the panel it files into read as one thing. -->
+  {:else if name === "archive"}<Archive size={13} />
   {:else if name === "delete"}<Trash2 size={13} class={danger ? "text-rose-400" : ""} />
   {/if}
 {/snippet}

@@ -4,6 +4,7 @@ import {
   sameRepo,
   type PathIdentityOptions,
 } from "../repos/paths";
+import { getWorkspace, newID, putWorkspace, workspaceDraft, type Workspace } from "./client";
 
 const LOCAL_PREFIX = "local:";
 
@@ -57,6 +58,30 @@ export function membershipAfterAttach(current: readonly string[], incoming: read
   let ids = [...current];
   for (const id of incoming) ids = withRepositoryId(ids, id);
   return ids;
+}
+
+/**
+ * Add repositories to a workspace, reading its current revision first.
+ *
+ * The board and the task sheet both offer this, and a second copy of the
+ * read-modify-write would be a second chance to drop a concurrent membership
+ * change. A membership that already holds every id writes nothing, so the
+ * caller cannot bump a revision for no reason.
+ */
+export async function attachRepositories(
+  workspaceId: string,
+  repositoryIds: readonly string[],
+): Promise<Workspace> {
+  const full = await getWorkspace(workspaceId);
+  const next = membershipAfterAttach(full.repository_ids, repositoryIds);
+  if (next.length === full.repository_ids.length) return full;
+  return putWorkspace({
+    ...workspaceDraft(full),
+    id: full.id,
+    expected_revision: full.revision,
+    request_id: newID(),
+    repository_ids: next,
+  });
 }
 
 export function addableOpenTabs(

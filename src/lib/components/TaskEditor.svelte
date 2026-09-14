@@ -10,9 +10,10 @@
   import LabelInput from "./LabelInput.svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { askConfirm } from "../stores/modalStore";
-  import { deleteTask, explainError, getTask, getTaskBrief, newID, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, WorkbenchError, type EnhancementField, type Repository, type Task, type TaskDraft, type TaskStatus, type WorkspaceCard } from "../workbench/client";
+  import { deleteTask, explainError, getTask, getTaskBrief, getWorkspace, newID, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, WorkbenchError, type EnhancementField, type Repository, type Task, type TaskDraft, type TaskStatus, type WorkspaceCard } from "../workbench/client";
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
-  import { addableOpenTabs, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
+  import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
+  import { linkSummary, outsiderLine, repositoryRows, shouldOfferFilter, summaryLine } from "../workbench/taskRepositories";
   import { dueInputValue, parseDueInput } from "../workbench/taskOrganize";
   import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
@@ -64,6 +65,19 @@
   let copying = $state(false);
   let extras = $state<Repository[]>([]);
   let adding = $state(false);
+  let repoFilter = $state("");
+  let attaching = $state(false);
+  /**
+   * Member repositories of the task's home workspace.
+   *
+   * `null` means no home workspace, or a membership this sheet could not
+   * read — never "a member of nothing". The picker marks members only when
+   * this is a list, so an unread membership is never drawn as an empty
+   * workspace, and `homeError` says which of the two happened.
+   */
+  let homeMembers = $state<string[] | null>(null);
+  let homeError = $state("");
+  let homeToken = 0;
   let showOrganize = $state(untrack(() => Boolean(initial.seed)));
   let notes = $state("");
   let copied = $state(false);
@@ -99,7 +113,10 @@
 
   onMount(() => {
     const opener = document.activeElement;
-    if (initial.value) sheet.querySelector<HTMLInputElement>('input[name="task-title"]')?.focus();
+    // A draft lands on its title too. The notes box used to take the cursor,
+    // which scrolled the repository picker — the one control a save requires —
+    // off the top of the sheet before the reader had seen it.
+    sheet.querySelector<HTMLInputElement>('input[name="task-title"]')?.focus();
     return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus(); };
   });
   onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
@@ -113,6 +130,44 @@
     return [...map.values()];
   });
   const addable = $derived(addableOpenTabs(openMembershipCandidates(openTabs, known, draft.repository_ids, pathOpts)));
+  const homeWorkspaceName = $derived(
+    draft.home_workspace_id
+      ? workspaces.find((space) => space.id === draft.home_workspace_id)?.name ?? "this workspace"
+      : "",
+  );
+  const rows = $derived(repositoryRows(known, draft.repository_ids, draft.primary_repository_id, homeMembers, repoFilter));
+  const summary = $derived(linkSummary(known, draft.repository_ids, draft.primary_repository_id, homeMembers));
+  const offerFilter = $derived(shouldOfferFilter(known.length));
+  // Membership follows the draft's home workspace, not the board's scope: the
+  // Organize pane can move a task to another workspace while the sheet is open.
+  $effect(() => {
+    const workspaceId = draft.home_workspace_id;
+    const ticket = ++homeToken;
+    homeMembers = null;
+    homeError = "";
+    if (!workspaceId) return;
+    void getWorkspace(workspaceId)
+      .then((full) => { if (!disposed && ticket === homeToken) homeMembers = full.repository_ids; })
+      .catch((cause) => { if (!disposed && ticket === homeToken) homeError = explainError(cause); });
+  });
+  async function attachOutsiders() {
+    const workspaceId = draft.home_workspace_id;
+    if (!workspaceId || attaching || adding || saving || !summary.outsiders.length) return;
+    attaching = true; error = "";
+    try {
+      const saved = await attachRepositories(workspaceId, summary.outsiders);
+      if (disposed) return;
+      homeMembers = saved.repository_ids;
+      homeError = "";
+      note = `Added to ${homeWorkspaceName}`;
+    } catch (cause) { if (!disposed) error = explainError(cause); }
+    finally { if (!disposed) attaching = false; }
+  }
+  function setPrimary(repositoryId: string) {
+    if (!draft.repository_ids.includes(repositoryId)) return;
+    draft.primary_repository_id = repositoryId;
+    dirty = true;
+  }
   async function addOpenPaths(paths: string[]) {
     if (adding || pending !== null || paths.length === 0) return;
     adding = true; error = "";
@@ -372,50 +427,76 @@
     onchange={() => { dirty = true; }}
   >
     <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
-      <!-- The assist owns the enhancement lifecycle (polling, history,
-           accept/undo) and must stay mounted whichever pane is on screen.
-           Only its own controls move to the AI pane; the suggestions it
-           produces are drawn beside the fields they would change. -->
-      <div class="pane" hidden={Boolean(current) && tab !== "ai"} id={panelId(group, "ai")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "ai") : undefined}>
-        <TaskManviAssist
-          bind:this={assist}
-          task={current}
-          {notes}
-          {dirty}
-          {active}
-          onNotes={(value) => { notes = value; dirty = true; }}
-          bind:title={draft.title}
-          bind:description={draft.description}
-          bind:lockedFields={draft.locked_fields!}
-          repositoryIds={draft.repository_ids}
-          repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
-          prepareTask={prepareForManvi}
-          onApplied={applied}
-          onBusy={(busy) => { enhancementBusy = busy; }}
-          onSuggestion={(state) => { suggestion = state; }}
-          onCount={(count) => { suggestionCount = count; }}
-          onEngine={(name) => { assistName = name; }}
-          disabled={saving || reloading || pending !== null || pendingDelete !== null}
-          autofocus={!current}
-        />
-      </div>
       <fieldset disabled={enhancementBusy}>
       <div class="pane" hidden={Boolean(current) && tab !== "task"} id={panelId(group, "task")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "task") : undefined}>
-        <div class="pair">
-          <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
-          <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
-          <label>Type
-            {#if customKind || kindIsCustom}
-              <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
-              <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
-            {:else}
-              <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
-                {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
-                <option value="__custom__">Custom…</option>
-              </select>
+        <!-- Repositories lead the sheet. A task cannot be saved without one,
+             and this used to be the last control on the pane: the only
+             mandatory field was the one you had to scroll to find. -->
+        <fieldset class="repositories">
+          <legend>Repositories</legend>
+          <p class="repo-summary" class:needs={summary.linked === 0} data-testid="task-repo-summary">{summaryLine(summary)}</p>
+          {#if offerFilter}
+            <input
+              class="gp-field repo-filter"
+              type="search"
+              bind:value={repoFilter}
+              aria-label="Filter repositories"
+              placeholder="Filter repositories"
+              maxlength="200"
+              oninput={(e) => e.stopPropagation()}
+            />
+          {/if}
+          <div class="repo-list">
+            {#each rows as row (row.id)}
+              <div class="repo-row" class:linked={row.linked}>
+                <label class="check">
+                  <input type="checkbox" checked={row.linked} onchange={(e) => membership(row.id, e.currentTarget.checked)} />
+                  <span class="repo-name">{row.name}</span>
+                  {#if row.member}<span class="repo-mark">In workspace</span>{/if}
+                  {#if row.keptByLink}<span class="repo-mark">Linked</span>{/if}
+                </label>
+                {#if row.linked}
+                  <label class="primary-pick">
+                    <input
+                      type="radio"
+                      name="task-primary-{id}"
+                      checked={row.primary}
+                      onchange={() => setPrimary(row.id)}
+                      aria-label="Make {row.name} the primary repository"
+                    />
+                    Primary
+                  </label>
+                {/if}
+              </div>
+            {/each}
+            {#if known.length === 0}
+              <p class="repo-empty">No repositories are registered yet. Open one in GitPulse, then link it here.</p>
+            {:else if rows.length === 0}
+              <p class="repo-empty">No repository matches this filter.</p>
             {/if}
-          </label>
-        </div>
+          </div>
+          {#if addable.length}
+            <small>Open in GitPulse</small>
+            {#each addable as openTab (openTab.path)}
+              <label class="check" title={openTab.path}>
+                <input type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([openTab.path]); }} />
+                {openTab.label}<span class="open-mark">Open</span>
+              </label>
+            {/each}
+            {#if addable.length > 1}<button type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((item) => item.path))}>Add all open</button>{/if}
+          {/if}
+          {#each summary.unknown as missing (missing)}<small>Linked repository {missing} (load more repositories to edit)</small>{/each}
+          {#if draft.home_workspace_id}
+            {#if homeError}
+              <p class="repo-note" role="status">Could not read {homeWorkspaceName}'s repositories: {homeError}</p>
+            {:else if summary.outsiders.length}
+              <p class="repo-note">
+                {outsiderLine(summary.outsiders, homeWorkspaceName)}
+                <button type="button" class="gp-btn" disabled={attaching || adding || saving} onclick={() => void attachOutsiders()}>{attaching ? "Adding…" : "Add to workspace"}</button>
+              </p>
+            {/if}
+          {/if}
+        </fieldset>
         <label class:flash={suggestion.flash.includes("title")}>Title
           <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
         </label>
@@ -445,20 +526,22 @@
             {#if suggestion.blocked}<p class="warn">{suggestion.blocked}</p>{/if}
           </div>
         {/if}
+        <div class="pair">
+          <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
+          <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
+          <label>Type
+            {#if customKind || kindIsCustom}
+              <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
+              <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
+            {:else}
+              <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
+                {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
+                <option value="__custom__">Custom…</option>
+              </select>
+            {/if}
+          </label>
+        </div>
         <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
-        <fieldset class="repositories"><legend>Linked repositories</legend>{#each known as repo (repo.id)}<label class="check"><input type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => membership(repo.id, e.currentTarget.checked)} />{repo.name}</label>{/each}
-        {#if addable.length}
-          <small>Open in GitPulse</small>
-          {#each addable as openTab (openTab.path)}
-            <label class="check" title={openTab.path}>
-              <input type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([openTab.path]); }} />
-              {openTab.label}<span class="open-mark">Open</span>
-            </label>
-          {/each}
-          {#if addable.length > 1}<button type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((item) => item.path))}>Add all open</button>{/if}
-        {/if}
-        {#each draft.repository_ids.filter((id) => !known.some((r) => r.id === id)) as missing (missing)}<small>Linked repository {missing} (load more repositories to edit)</small>{/each}</fieldset>
-        <label>Primary repository<select class="gp-select" bind:value={draft.primary_repository_id} required><option value="" disabled>Select a linked repository</option>{#each draft.repository_ids as repo (repo)}<option value={repo}>{known.find((r) => r.id === repo)?.name ?? repo}</option>{/each}</select></label>
       </div>
 
       {#if current}
@@ -499,6 +582,34 @@
         {/if}
       {/if}
       </fieldset>
+      <!-- The assist owns the enhancement lifecycle (polling, history,
+           accept/undo) and must stay mounted whichever pane is on screen.
+           Only its own controls move to the AI pane; the suggestions it
+           produces are drawn beside the fields they would change. It sits
+           after the task fields, and outside the enhancement-busy fieldset,
+           so a running suggestion cannot disable its own cancel. -->
+      <div class="pane" hidden={Boolean(current) && tab !== "ai"} id={panelId(group, "ai")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "ai") : undefined}>
+        <TaskManviAssist
+          bind:this={assist}
+          task={current}
+          {notes}
+          {dirty}
+          {active}
+          onNotes={(value) => { notes = value; dirty = true; }}
+          bind:title={draft.title}
+          bind:description={draft.description}
+          bind:lockedFields={draft.locked_fields!}
+          repositoryIds={draft.repository_ids}
+          repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
+          prepareTask={prepareForManvi}
+          onApplied={applied}
+          onBusy={(busy) => { enhancementBusy = busy; }}
+          onSuggestion={(state) => { suggestion = state; }}
+          onCount={(count) => { suggestionCount = count; }}
+          onEngine={(name) => { assistName = name; }}
+          disabled={saving || reloading || pending !== null || pendingDelete !== null}
+        />
+      </div>
     </fieldset>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
     {#if shortcutBlocked}<p role="status" class="meta">{shortcutBlocked}</p>{/if}
@@ -549,5 +660,20 @@
   @media (prefers-reduced-motion: reduce){.flash :is(input,textarea){animation:none}}
   .task-editor{width:min(430px,48vw);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
   .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{max-height:160px;overflow:auto;margin:12px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}.error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{margin:0 0 13px}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
+  /* Only the rows scroll. The summary and the filter above them are how the
+     picker stays readable at any catalog size, so they must not scroll away. */
+  .repo-list{max-height:168px;overflow:auto;margin:2px 0 4px}
+  .repo-summary{margin:4px 0 6px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .repo-summary.needs{color:rgb(var(--c-text))}
+  .repo-filter{margin-bottom:4px}
+  .repo-row{display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .repo-row .check{flex:1;min-width:0;gap:7px}
+  .repo-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .repo-mark{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:10px}
+  .primary-pick{flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:10px;color:rgb(var(--c-text-muted))}
+  .primary-pick input{width:auto}
+  .repo-row.linked .primary-pick{color:rgb(var(--c-text))}
+  .repo-empty{margin:6px 0;color:rgb(var(--c-text-muted))}
+  .repo-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0;color:rgb(var(--c-text-muted))}.error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
 </style>

@@ -19,6 +19,139 @@ describe("TaskArchive", () => {
   });
 });
 
+/**
+ * The defect the panel was reported for. With thirty rows loaded on a 1024x768
+ * window the panel's visible box ended at y=533 and the Restore/Delete bar
+ * rendered at y=640 — inside the panel's own scroll container, 107px below its
+ * fold, at scrollTop 0. Ticking a checkbox changed nothing a reader could see.
+ *
+ * The cause was two nested scrollers with independent caps: the panel capped
+ * at 46vh, the row list capped at 280px inside it. The list won and the
+ * actions were pushed out. These are source contracts rather than a rendered
+ * measurement because jsdom computes no layout; the measured proof is the
+ * tasks harness, which drives the real board in a real browser.
+ */
+describe("a selection's actions are never off screen", () => {
+  const styles = source.slice(source.lastIndexOf("<style>"));
+  // Escapes the whole selector, not just its leading dot: `.archive > *`
+  // carries three regex metacharacters, and a helper that silently matched
+  // nothing would report every rule below as absent — or, worse, as present.
+  const rule = (selector: string) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = styles.match(new RegExp(`(?:^|[;}\\s])${escaped}\\{([^}]*)\\}`, "m"));
+    expect(match, `no CSS rule for \`${selector}\``).not.toBeNull();
+    return match?.[1] ?? "";
+  };
+
+  /**
+   * The markup of one element, from `open` to its own closing `</div>`.
+   *
+   * Counts nesting rather than slicing to the next landmark, because the
+   * question here is whether a control sits *inside* the scroller, and a
+   * slice that overshot the closing tag answers "yes" either way.
+   */
+  const balanced = (open: string) => {
+    const start = source.indexOf(open);
+    expect(start, `no element matching \`${open}\``).toBeGreaterThan(-1);
+    let depth = 0;
+    for (let at = start; at < source.length; at += 1) {
+      if (source.startsWith("<div", at)) depth += 1;
+      else if (source.startsWith("</div>", at)) {
+        depth -= 1;
+        if (depth === 0) return source.slice(start, at + 6);
+      }
+    }
+    throw new Error(`\`${open}\` is never closed`);
+  };
+
+  it("keeps exactly one scroller between the panel and its rows", () => {
+    // `.entries` is it. The panel keeps `overflow:auto` only as the fallback
+    // for a window too short for its own chrome, where the sticky action bar
+    // below is what holds the promise.
+    expect(rule(".entries")).toContain("overflow:auto");
+    expect(rule(".entries")).toContain("min-height:0");
+    // No second cap racing the panel's.
+    expect(rule(".entries")).not.toMatch(/max-height/);
+    expect(rule(".archive")).toContain("max-height:");
+  });
+
+  it("makes the row list the only part of the panel that shrinks", () => {
+    expect(rule(".archive")).toContain("display:flex");
+    expect(rule(".archive")).toContain("flex-direction:column");
+    expect(rule(".archive > *")).toContain("flex:0 0 auto");
+    // Shrink, but never grow: three archived tasks draw a short panel.
+    expect(rule(".entries")).toContain("flex:0 1 auto");
+  });
+
+  it("pins the action bar for the case the list cannot shrink any further", () => {
+    expect(rule(".actions")).toContain("position:sticky");
+    expect(rule(".actions")).toContain("bottom:0");
+  });
+
+  // Sticky over scrolling rows needs a ground, and the ground has to be the
+  // one `html.macos` can remap. A local `rgb(var(--c-surface))` is invisible
+  // to that remap and paints an opaque bar across a glass panel — the same
+  // shape `scripts/mac-material-contract.test.ts` guards the whole components
+  // tree against, asserted here beside the rules that need it.
+  it("takes the pinned bar's ground from the shared material", () => {
+    expect(rule(".actions"), ".actions must not paint its own token fill")
+      .not.toMatch(/(?:^|;)background(?:-color)?:/);
+    expect(source).toContain('class="actions bg-surface"');
+  });
+
+  it("spends no fixed row on a control that belongs in the list", () => {
+    // "Load more" was a fixed row competing with the list for the panel's
+    // height, and it extends the rows — it belongs after the last one.
+    //
+    // The region is the *balanced* `.entries` element, not everything up to
+    // the next landmark: a slice that ran past the closing tag would contain
+    // "Load more" whether or not it was still inside the scroller, which is
+    // exactly the move this asserts against.
+    const entries = balanced('<div class="entries">');
+    expect(entries, "Load more must extend the rows from inside the scroller").toContain("Load more");
+  });
+
+  /**
+   * The select-all head is the deliberate exception, and the comment in the
+   * component is the reason. Sticky inside the scroller saves the list 31px
+   * and costs legibility: `bg-surface` is a 50%-alpha material on macOS, and
+   * rows sliding under a half-transparent bar put a task title and the
+   * select-all label in the same pixels — observed, not predicted. Outside,
+   * `.entries` clips its own overflow and no row can reach it.
+   */
+  it("keeps the select-all head out of the scroller rather than floating it", () => {
+    const entries = balanced('<div class="entries">');
+    expect(entries, "a row can slide under a sticky head; it cannot reach a sibling")
+      .not.toMatch(/<div class="list-head[ "]/);
+    expect(rule(".list-head")).not.toContain("position:sticky");
+    // And it must not have acquired its own ground, which would only be
+    // needed by something rows can pass beneath.
+    expect(rule(".list-head")).not.toMatch(/(?:^|;)background(?:-color)?:/);
+    expect(source).not.toContain('class="list-head bg-surface"');
+  });
+});
+
+describe("the dock says how a task gets into it", () => {
+  // It used to say so only in the empty state — the one moment a reader has
+  // no archived work to ask about. A panel called Archive that offers Restore
+  // and never names the thing that archives a task is the report this fixed.
+  it("carries the rule as header chrome, not as an empty state", () => {
+    expect(source).toContain('data-testid="task-archive-rule"');
+    const rule = source.indexOf('data-testid="task-archive-rule"');
+    const empty = source.indexOf("{#if summary.pending}");
+    expect(rule).toBeGreaterThan(-1);
+    expect(rule, "the rule must be above the list, not inside a branch").toBeLessThan(empty);
+  });
+
+  it("teaches the same rule whether or not it is empty, from one constant", () => {
+    expect(source).toContain("ARCHIVE_RULE");
+    // Two renderings, one owner: the header line and the empty state.
+    expect(source.match(/ARCHIVE_RULE/g)?.length).toBeGreaterThanOrEqual(3);
+    // Still no second spelling of the status here.
+    expect(source).not.toMatch(/["']done["']/);
+  });
+});
+
 describe("the dock owns no write path", () => {
   // Restore and delete are the board's existing batch, run through the
   // board's existing confirm dialog. A private `putTask` here would be a

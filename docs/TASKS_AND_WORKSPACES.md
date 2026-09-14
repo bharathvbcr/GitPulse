@@ -31,6 +31,13 @@ An optional home workspace groups it without replacing those repository links.
 Repository execution tasks and leases shown in **Work → Overview** are separate
 from these profile task records.
 
+A workspace with no member repositories still creates tasks. The board says so
+rather than withdrawing the action — the navigator marks the workspace
+**· Empty**, the header repeats what the sheet will ask for, and the sheet's
+first control is where a repository is linked. **New task**, the empty board's
+own button, the column **+**, quick add and the sheet all read one answer, so
+none of them can offer what another refuses.
+
 ## Create and organize
 
 The fastest way in is the **quick add** line above the board. Type a title and
@@ -49,21 +56,46 @@ before you press Return:
 
 Markers alone never create a task — a line with no title is refused and says so.
 Shift+Return opens the full editor with everything already parsed, and `a`
-focuses the field from anywhere on the board.
+focuses the field from anywhere on the board. Where the scope supplies no
+repository — an empty workspace — the line needs `^name`, and the refusal names
+both that marker and Shift+Return rather than only failing.
 
 For anything longer:
 
-1. Choose a scope and select **New task**. Enter a title and description, or use
-   notes to seed them. Link the repositories the task concerns.
+1. Choose a scope and select **New task**. **Repositories** leads the sheet,
+   because a task cannot be saved without one. Then enter a title and
+   description, or use notes to seed them.
 2. Set its type, status and details: priority, severity, owner, due date, labels,
    acceptance criteria and optional home workspace. A draft keeps these under one
    **Schedule and labels** disclosure; a saved task gets its own **Organize** pane.
 3. Save, then use **Board** or **List** to organize the same results. Statuses are
    Inbox, Backlog, Ready, In progress, Review and Done.
 
-A saved task's sheet has four panes. **Task** carries what the work is — status,
-priority, type, title, description, acceptance criteria and repository links —
-and is where Manvi's suggestions appear, under the field each one would replace.
+### Choosing repositories
+
+One control links repositories and picks the primary among them: check a
+repository to link it, then choose **Primary** on any linked row. A line above
+the list reports how many are linked and which is primary, so the answer stays
+on screen while the rows scroll. Past six repositories the picker offers a
+filter; a linked repository is never hidden by it, and is marked **Linked** when
+it is only on screen because you linked it. Repositories keep catalog order, so
+a row cannot move out from under the pointer that just checked it.
+
+When the task has a home workspace, its member repositories are marked **In
+workspace**. Linking one that is not a member is allowed and the sheet says so,
+with **Add to workspace** to close the gap. Nothing is joined silently. A
+membership the sheet could not read is reported as unread rather than drawn as
+an empty workspace.
+
+The navigator's **Repositories +** adds to the profile, and in a workspace scope
+it also joins what it adds to that workspace — its label names the workspace, as
+does the confirmation. It offers the repositories already open in GitPulse, the
+registered ones that workspace has not joined yet, and a folder picker.
+
+A saved task's sheet has four panes. **Task** carries what the work is —
+repository links, title, description, status, priority, type and acceptance
+criteria — and is where Manvi's suggestions appear, under the field each one
+would replace.
 **Organize** holds severity, owner, due date, labels, home workspace and
 notifications. **Agent** hands the saved revision to a coding agent and lists
 that task's runs. **AI** holds the drafting controls and suggestion history. A
@@ -75,8 +107,18 @@ per profile and **Reset board view** restores all of them. Hiding a column does
 not hide its work silently: a banner names how many tasks are in the columns
 currently off screen, and the board refuses to hide its last column.
 
-**Archive**, beside the Inbox, holds the scope's completed tasks. It has its own
-search and **Load more**, and its header badge is the store's total for the
+**Archive** files a task away. It is on a card's right-click menu beside Delete
+and on the selection bar for a batch, and it does exactly one thing: moves the
+task to Done, which is what "archived" means here. The row names that column,
+and is disabled for a task already archived rather than spending a revision to
+store the status it already has — a mixed selection archives only the part that
+is not. There is no separate archived flag to set: the vendored store has no
+field for one, and [ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md) is the plan
+for making the two independent, with the upstream change that needs.
+
+**Archive**, the panel beside the Inbox, holds the scope's archived tasks. It
+states that rule above the list whether or not the list is empty. It has its
+own search and **Load more**, and its header badge is the store's total for the
 scope rather than the page on screen. Select rows to restore them to any other
 status or delete them; both go through the same confirm-and-retry dialog as a
 bulk change from the board, so a lost reply is reconciled the same way. A write
@@ -89,6 +131,10 @@ in the board's own order and stamped with their last update, because the store
 keeps no completion time to sort by. While the window is in the background the
 query is deferred, and the panel says that rather than showing an empty archive.
 
+The rows are the only part of that panel that scrolls, and the actions a
+selection enables are pinned below them: ticking a row shows Restore and Delete
+without scrolling for them.
+
 Search uses the store's full-text query. **Filters** narrows loaded cards by
 priority, type, owner, label and due date. **Due soon** means from now through the
 next seven days; overdue tasks have their own filter. Facet choices and **Select
@@ -98,7 +144,7 @@ an empty filtered page does not establish that the whole profile has no matches.
 Click a card to edit it. Command/Ctrl-click toggles selection; Shift-click selects
 a visible range. Right-click a card, or press Shift+F10 on a focused card, for
 Open, Quick Enhance, **Send to agent**, Duplicate, Copy, Move to, Set priority,
-**Due**, **Owner**, **Labels** and Delete. A value submenu lists every choice with
+**Due**, **Owner**, **Labels**, **Archive** and Delete. A value submenu lists every choice with
 the current one ticked and disabled, so the menu says what a task is as well as
 what it could become; typing jumps to a row. Single-task actions disappear for
 multiple selections. Duplicate opens a draft for review and save. Right-click an
@@ -216,7 +262,12 @@ This guide describes the current source paths in `src/lib/workbench/`,
 `src/lib/ai/appleIntelligence.ts`, `src-tauri/src/ai/apple.rs`, `TaskBoard.svelte`,
 `TaskEditor.svelte`, `TaskQuickAdd.svelte`, `TaskViewMenu.svelte`,
 `TaskHandoffForm.svelte`, `TaskAgentPanel.svelte`, `TaskManviAssist.svelte` and
-`QuickEnhanceSheet.svelte`. Unit and source contracts cover helpers and wiring;
-they do not prove native clipboard delivery, physical drag behavior, installed
+`QuickEnhanceSheet.svelte`. Whether a scope can hold a new task lives in
+`taskCreation.ts`, the sheet's repository picker in `taskRepositories.ts`, and
+the workspace membership write both the board and the sheet perform in
+`openMembership.ts`. Unit and source contracts cover helpers and wiring;
+the repository picker, the empty-workspace path and the workspace join are
+driven through the real components by the `tasks` browser harness. None of them
+prove native clipboard delivery, physical drag behavior, installed
 provider permissions or OS notification delivery. The implementation contract
 retains the broader planned features and their outstanding verification gates.

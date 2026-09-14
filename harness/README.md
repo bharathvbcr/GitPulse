@@ -331,3 +331,11 @@ ignored `installed_managed_codex_crosses_native_host_and_store_without_accepting
 Rust test with `GITPULSE_WORKBENCH_TEST_MANVI`,
 `GITPULSE_WORKBENCH_TEST_DCSTORE` and `GITPULSE_WORKBENCH_TEST_CODEX` set to absolute
 binary paths. That test sends one read-only marker turn to the installed provider.
+
+Health evidence fixtures: open
+`stress.html?c=HealthPanel&scenario=mount&tabs=1&health-evidence=rows&css=1`
+(or `health-evidence=empty`). Both return a completed local audit with a capped
+inventory and an incomplete DevMap walk. Verify the warning in the rendered
+panel and copied report; the empty variant must not display a dead-code
+all-clear. The fixture exposes copied text on the `data-gp-copied` HTML attribute
+without writing the system clipboard.

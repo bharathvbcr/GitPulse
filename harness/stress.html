@@ -20,6 +20,12 @@
       const TABS = Number(q.get("tabs") ?? 4);
       const CYCLES = Number(q.get("cycles") ?? 25);
 
+      if (q.has("health-evidence")) {
+        Object.defineProperty(navigator, "clipboard", { value: {
+          async writeText(text) { document.documentElement.setAttribute("data-gp-copied", text); },
+        } });
+      }
+
       // `?css=1` loads the real stylesheet, for looking at a component rather
       // than only stressing it. Off by default: the rig's job is behaviour, and
       // a run should not depend on Tailwind having compiled.
@@ -185,8 +191,8 @@
         }],
         truncated: true,
         limit_notices: [
-          { resource: "outdated npm packages", kept: 1, total: 4 },
-          { resource: "node ecosystem artifacts", kept: 4, total: 5 },
+          { resource: "outdated npm packages", kept: 1, total: 4, inventory_only: false },
+          { resource: "node ecosystem artifacts", kept: 4, total: 5, inventory_only: true },
         ],
       });
       const dependabotReport = () => ({
@@ -329,10 +335,18 @@
         cmd_get_pulse_snapshots: () => [],
         cmd_get_knowledge_report: () => ({ authors: [], files: [] }),
         cmd_get_dora_report: () => null,
-        cmd_scan_deps_health: healthReport,
+        cmd_scan_deps_health: () => q.has("health-evidence") ? {
+          ...healthReport(), audit_complete: true, issues: [], vulnerabilities: [], outdated: [],
+          audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, unknown: 0, total: 0 },
+          limit_notices: [{ resource: "cargo ecosystem artifacts", kept: 24, total: 783, inventory_only: true }],
+        } : healthReport(),
         cmd_github_dependabot_alerts: dependabotReport,
         cmd_github_code_scanning_alerts: codeScanningReport,
-        cmd_codeintel_dead_symbols: deadSymbols,
+        cmd_codeintel_dead_symbols: () => q.has("health-evidence") ? {
+          ...deadSymbols(), items: q.get("health-evidence") === "empty" ? [] : deadSymbols().items,
+          total: q.get("health-evidence") === "empty" ? 0 : 2, truncated: false,
+          walk_incomplete: "fixture: unresolved callers and one unparsed file",
+        } : deadSymbols(),
         cmd_codeintel_status: codeintelStatus,
         cmd_manvi_run_action: terminalRun,
         cmd_terminal_run: terminalRun,

@@ -71,16 +71,66 @@ describe("TaskEditor", () => {
     expect(source).toContain(".pane[hidden]{display:none}");
   });
 
-  it("keeps the title, primary repository and linked repositories on the first pane", () => {
+  it("keeps the title, repositories and criteria on the first pane", () => {
     // Everything a task needs to exist stays in one place. The panes split
     // what is optional, never what a save requires.
     const taskPane = source.slice(source.indexOf('panelId(group, "task")'), source.indexOf('panelId(group, "organize")'));
     expect(taskPane).toContain('name="task-title"');
-    expect(taskPane).toContain("Primary repository");
-    expect(taskPane).toContain("Linked repositories");
+    expect(taskPane).toContain("<legend>Repositories</legend>");
     expect(taskPane).toContain("Acceptance criteria");
     expect(source).not.toContain("More details");
     expect(source).not.toContain("showDetails");
+  });
+
+  it("leads the sheet with the repository picker, ahead of the title and the assist", () => {
+    // A task cannot be saved without a linked repository — the footer's Save
+    // is disabled on `!draft.repository_ids.length`. This used to be the last
+    // control on the pane, so the only mandatory field was the one you had to
+    // scroll to, and on a draft the assist's notes box came before it.
+    expect(source).toContain("!draft.repository_ids.length");
+    const taskPane = source.slice(source.indexOf('panelId(group, "task")'), source.indexOf('panelId(group, "organize")'));
+    const picker = taskPane.indexOf("<legend>Repositories</legend>");
+    expect(picker).toBeGreaterThanOrEqual(0);
+    expect(picker).toBeLessThan(taskPane.indexOf('name="task-title"'));
+    expect(picker).toBeLessThan(taskPane.indexOf("Acceptance criteria"));
+    expect(source.indexOf('panelId(group, "task")')).toBeLessThan(source.indexOf('panelId(group, "ai")'));
+    // The notes box no longer takes the cursor on open; a draft lands on its
+    // title, which keeps the picker directly above it on screen.
+    expect(source).not.toContain("autofocus={!current}");
+  });
+
+  it("links and picks the primary in one control instead of a second select that can disagree", () => {
+    expect(source).toContain("repositoryRows(known, draft.repository_ids, draft.primary_repository_id, homeMembers, repoFilter)");
+    expect(source).toContain('name="task-primary-{id}"');
+    expect(source).toContain("setPrimary(row.id)");
+    expect(source).toContain('aria-label="Make {row.name} the primary repository"');
+    // Replaced, not accumulated: the standalone Primary repository select is gone.
+    expect(source).not.toContain("bind:value={draft.primary_repository_id}");
+    // The scrolling row list must not carry the line that reports the answer.
+    expect(source).toContain("summaryLine(summary)");
+    expect(source).toMatch(/\.repo-list\{[^}]*max-height/);
+    expect(source).not.toMatch(/\.repositories\{[^}]*overflow:auto/);
+  });
+
+  it("filters repositories without hiding a linked one, and without dirtying the draft", () => {
+    expect(source).toContain("shouldOfferFilter(known.length)");
+    expect(source).toContain('aria-label="Filter repositories"');
+    // The form marks the sheet dirty on any bubbling input; a filter keystroke
+    // is not an edit, and must not raise "Discard task edits?" on close.
+    expect(source).toMatch(/aria-label="Filter repositories"[\s\S]*?oninput=\{\(e\) => e\.stopPropagation\(\)\}/);
+    expect(source).toContain("row.keptByLink");
+  });
+
+  it("reads the home workspace's own membership and offers to close the gap", () => {
+    // Membership follows the draft, not the board's scope: the Organize pane
+    // can move the task to another workspace while the sheet is open.
+    expect(source).toContain("const workspaceId = draft.home_workspace_id");
+    expect(source).toContain("attachRepositories(workspaceId, summary.outsiders)");
+    expect(source).toContain("outsiderLine(summary.outsiders, homeWorkspaceName)");
+    expect(source).toContain("Add to workspace");
+    // An unread membership is never drawn as an empty workspace.
+    expect(source).toContain("homeError = explainError(cause)");
+    expect(source).toMatch(/\{#if homeError\}[\s\S]*?\{:else if summary\.outsiders\.length\}/);
   });
 
   it("draws Manvi's suggestion beside the field it would change", () => {

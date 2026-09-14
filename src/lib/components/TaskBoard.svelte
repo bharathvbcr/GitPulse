@@ -15,15 +15,18 @@
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, putWorkspace, registerRepository,
-    STATUSES, STATUS_LABELS, taskDraft, taskWrite, workspaceDraft,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository,
+    STATUSES, STATUS_LABELS, taskDraft, taskWrite,
     type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskStatus, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
-  import { addableOpenTabs, membershipAfterAttach, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
+  import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
+  import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
+  import { workspaceMembershipLabel } from "../workbench/taskRepositories";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, type TaskFacet } from "../workbench/taskOrganize";
-  import { ARCHIVE_STATUS, offersArchive } from "../workbench/taskArchive";
+  import { plural } from "../format";
+  import { ARCHIVE_STATUS, archiveAction, archivable, archiveState, offersArchive } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
   import { parseQuickAddDue, quickAddDraft, type QuickAddResult } from "../workbench/taskQuickAdd";
@@ -97,6 +100,7 @@
   let adding = $state(false);
   let addMenuEl: HTMLDivElement | undefined = $state();
   let workspaceMemberIds = $state<string[] | null>(null);
+  let membershipToken = $state(0);
   let selected = $state<Set<string>>(new Set());
   let selectionAnchor = $state<string | null>(null);
   let menu = $state<{ cards: TaskCard[]; column: TaskStatus | null; x: number; y: number } | null>(null);
@@ -115,12 +119,24 @@
   const selectedForMenu = $derived(pickerSelectionIds(scope.kind, workspaceMemberIds, catalogIds));
   const menuTabs = $derived(addableOpenTabs(openMembershipCandidates(openTabRefs, repositories, selectedForMenu, pathOpts)));
   const emptyAddLabel = $derived(openAddActionLabel(menuTabs));
+  /**
+   * Registered repositories a workspace scope could still take in.
+   *
+   * Empty outside a workspace: in the global and repository scopes the catalog
+   * is the membership, so there is nothing to join.
+   */
+  const attachable = $derived.by(() => {
+    const members = workspaceMemberIds;
+    if (scope.kind !== "workspace" || !members) return [];
+    return repositories.filter((repo) => !members.includes(repo.id));
+  });
   const title = $derived.by(() => {
     const target = scope;
     return target.kind === "global" ? "Tasks" : target.kind === "workspace"
       ? workspaces.find((w) => w.id === target.id)?.name ?? "Workspace"
       : repositories.find((r) => r.id === target.id)?.name ?? "Repository";
   });
+  const addRepoLabel = $derived(scope.kind === "workspace" ? `Add repository to ${title}` : "Add repository");
   const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
@@ -143,9 +159,26 @@
    */
   const hiddenWork = $derived(initialized && !loading ? hiddenColumnReport(hiddenColumns, columnTotals) : null);
   const quickAddRepositories = $derived(repositories.map((repo) => ({ id: repo.id, name: repo.name })));
-  /** A scope can hold a new task only once it has a repository to link it to. */
-  const canCreate = $derived(Boolean(initialized && repositories.length && (scope.kind !== "workspace" || workspaceMemberIds?.length)));
+  /**
+   * Whether this scope can hold a new task, why not, and what one starts as.
+   *
+   * One answer, read by the header button, the empty state, quick add and the
+   * seed handed to the sheet. They used to decide separately and disagree: the
+   * empty state offered New task where the header refused it, and an empty
+   * workspace refused it everywhere with nothing on screen saying why.
+   */
+  const creation = $derived.by(() => {
+    const target = scope;
+    return taskCreation(target, {
+      initialized,
+      repositories,
+      workspaceMembers: workspaceMemberIds,
+      workspaceName: target.kind === "workspace" ? workspaces.find((group) => group.id === target.id)?.name ?? "" : "",
+    });
+  });
   const selectedCards = $derived(cardsById(displayColumns, selected));
+  /** Whether the selection bar's Archive would change anything. */
+  const selectionArchived = $derived(archiveState(selectedCards));
   const busy = $derived(moving || opening || deleting || actionDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
@@ -211,6 +244,11 @@
     }
   }
   async function refresh() {
+    catalogError = "";
+    // A refresh re-reads the workspace's membership too. Without this the
+    // Retry beside a failed membership read reloaded everything except the
+    // thing that failed.
+    membershipToken++;
     try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
     if (initialized && active && !disposed) { await loadBoard(); await loadUnread(); }
   }
@@ -257,7 +295,12 @@
     const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
   });
+  // `membershipToken` is what makes this read retryable. Keyed on `scope`
+  // alone, a failed membership read could never be repeated: the banner's
+  // Retry calls refresh(), which does not change the scope, so the effect
+  // never re-ran and the board stayed on a membership it had not read.
   $effect(() => {
+    membershipToken;
     if (scope.kind !== "workspace") {
       workspaceMemberIds = null;
       return;
@@ -272,17 +315,17 @@
   $effect(() => {
     if (addMenu && addMenuEl) addMenuEl.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
   });
-  async function attachRegistered(repos: Repository[]) {
-    if (scope.kind !== "workspace" || repos.length === 0) return;
-    const full = await getWorkspace(scope.id);
+  /** Join these repositories to the workspace scope, if that is where we are. */
+  async function attachToScope(ids: string[]) {
+    if (scope.kind !== "workspace" || ids.length === 0) return;
+    const saved = await attachRepositories(scope.id, ids);
     if (disposed) return;
-    const next = membershipAfterAttach(full.repository_ids, repos.map((repo) => repo.id));
-    if (next.length === full.repository_ids.length) {
-      workspaceMemberIds = full.repository_ids;
-      return;
-    }
-    const saved = await putWorkspace({ ...workspaceDraft(full), id: full.id, expected_revision: full.revision, request_id: newID(), repository_ids: next });
     if (scope.kind === "workspace" && scope.id === saved.id) workspaceMemberIds = saved.repository_ids;
+  }
+  /** What just happened, said in full: adding here also joins a workspace. */
+  function addedAnnouncement(names: string[]): string {
+    const what = names.length === 1 ? names[0] : `${names.length} repositories`;
+    return scope.kind === "workspace" ? `Added ${what} to ${title}` : `Added ${what}`;
   }
   async function addPaths(paths: string[]) {
     addMenu = false;
@@ -294,10 +337,31 @@
         added.push(await registerRepository(path));
         if (disposed) return;
       }
-      await attachRegistered(added);
+      await attachToScope(added.map((repo) => repo.id));
       if (disposed) return;
       await catalog();
-      announce = added.length === 1 ? `Added ${added[0].name}` : `Added ${added.length} repositories`;
+      announce = addedAnnouncement(added.map((repo) => repo.name));
+      toastStore.success(announce);
+    } catch (cause) { catalogError = explainError(cause); }
+    finally { adding = false; }
+  }
+  /**
+   * Join repositories the catalog already holds to this workspace.
+   *
+   * The add menu used to reach only open tabs and the folder picker, so a
+   * registered repository that happened to be closed could not be added to a
+   * workspace from this board at all — the workspace editor was the only way.
+   */
+  async function addRegistered(ids: string[]) {
+    addMenu = false;
+    if (ids.length === 0 || adding || scope.kind !== "workspace") return;
+    adding = true;
+    try {
+      await attachToScope(ids);
+      if (disposed) return;
+      await catalog();
+      announce = addedAnnouncement(ids.map((id) => repositories.find((repo) => repo.id === id)?.name ?? id));
+      toastStore.success(announce);
     } catch (cause) { catalogError = explainError(cause); }
     finally { adding = false; }
   }
@@ -311,7 +375,10 @@
   }
   function toggleAddMenu() {
     if (adding) return;
-    if (menuTabs.length === 0) { void pickFolder(); return; }
+    // With nothing to list, the menu would be one "Choose folder…" row; go
+    // straight there. A workspace with registered repositories to join has
+    // rows even when no tab is open, so it must not take that shortcut.
+    if (menuTabs.length === 0 && attachable.length === 0) { void pickFolder(); return; }
     addMenu = !addMenu;
   }
   function onAddMenuKey(event: KeyboardEvent) {
@@ -651,27 +718,51 @@
     if (busy || card.status === status && card.position === position) return;
     await applyUpdate(new TaskBatch([card], {kind:"update", changes:{status,position}}));
   }
-  async function patchCards(cards: TaskCard[], patch: TaskChanges) {
+  /**
+   * Run one already-built action over a selection.
+   *
+   * The single inline write path. `patchCards` builds the action from a field
+   * patch; Archive hands in `archiveAction()` instead, so what archiving *is*
+   * stays in `taskArchive.ts` and the board only decides when to run it.
+   */
+  async function applyTaskAction(cards: TaskCard[], action: TaskAction) {
     if (busy || !cards.length) return;
     if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
-    await applyUpdate(new TaskBatch(cards, {kind:"update", changes:patch}));
+    await applyUpdate(new TaskBatch(cards, action));
+  }
+  async function patchCards(cards: TaskCard[], patch: TaskChanges) {
+    await applyTaskAction(cards, {kind:"update", changes:patch});
+  }
+  /**
+   * Archive a selection from the card menu or the selection bar.
+   *
+   * Writes only the tasks archiving would change. A mixed selection is a
+   * normal thing to have — Command-click four cards, one of them already
+   * Done — and re-writing that one would spend a revision to store the value
+   * it already has and give the batch one more write to fail on.
+   *
+   * Silently doing nothing for an entirely archived selection would be the
+   * board answering a click with nothing, so that no-op is refused out loud.
+   * Both surfaces already disable the control; this is the guard for the one
+   * that is wrong, not a second copy of the rule.
+   */
+  async function archiveCards(cards: TaskCard[]) {
+    if (busy || !cards.length) return;
+    const wanted = archivable(cards);
+    if (!wanted.length) {
+      error = cards.length === 1 ? "That task is already archived." : "Those tasks are already archived.";
+      return;
+    }
+    const already = cards.length - wanted.length;
+    await applyTaskAction(wanted, archiveAction());
+    // `applyUpdate` announces what it wrote. The skipped tasks are not a
+    // failure and not a write, so they are said separately rather than
+    // folded into a count that would then not match the receipt.
+    if (already > 0 && !error) announce = `${announce} ${plural(already, "task")} already archived.`;
   }
   /** Defaults a quick-added task inherits from wherever it was typed. */
   function quickAddDefaults(status: TaskStatus) {
-    const primary = scope.kind === "repository"
-      ? scope.id
-      : scope.kind === "workspace"
-        ? workspaceMemberIds?.[0] ?? ""
-        : repositories[0]?.id ?? "";
-    const repositoryIds = primary ? [primary] : [];
-    return {
-      status,
-      kind: "feature",
-      repositoryIds,
-      primaryRepositoryId: primary,
-      homeWorkspaceId: scope.kind === "workspace" ? scope.id : null,
-      position: Date.now(),
-    };
+    return { status, kind: "feature", ...creation.seed, position: Date.now() };
   }
 
   /**
@@ -679,14 +770,14 @@
    *
    * Returns whether the field may clear, so a refused or failed write leaves
    * the typed line exactly where the reader can fix it. Nothing is invented:
-   * `quickAddDraft` refuses when no repository is linked, and the caller shows
-   * the same reason the board's New task button already gives.
+   * `quickAddDraft` refuses when no repository is linked, and the refusal names
+   * the two ways out — the `^` marker, or the editor.
    */
   async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox"): Promise<boolean> {
     if (busy || quickAdding) return false;
     const draft = quickAddDraft(parsed, quickAddDefaults(status));
     if (!draft) {
-      error = repositories.length ? "Link a repository to this scope before adding tasks." : "Add a repository to create tasks.";
+      error = quickAddRefusal(creation);
       return false;
     }
     quickAdding = true; error = "";
@@ -725,6 +816,10 @@
 
   async function createTask(status: TaskStatus = "inbox") {
     if (busy) return;
+    // Every caller reads `creation` before offering this, so a refusal here is
+    // a keyboard shortcut or a stale click — it still has to say why rather
+    // than open a sheet that can never be saved.
+    if (!creation.allowed) { error = creation.blocked ?? "This scope cannot hold a new task."; return; }
     const draftId = `draft-${newID()}`;
     if (refuseAtCeiling(draftId)) return;
     if (!(await confirmDiscard("Start a new task and discard the current unsaved edits?"))) return;
@@ -758,7 +853,7 @@
    * one confirm step, one batch, one interrupted-write recovery path for
    * every task mutation this board performs, wherever it was started.
    */
-  async function archiveAction(cards: TaskCard[], action: TaskAction) {
+  async function archiveDockAction(cards: TaskCard[], action: TaskAction) {
     if (busy || !cards.length) return;
     if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
     if (!await confirmDiscard("Change archived tasks?")) return;
@@ -887,6 +982,9 @@
       case "newInColumn":
         void createTask(item.action.status);
         break;
+      case "archive":
+        void archiveCards(cards);
+        break;
       case "delete":
         selected = new Set(cards.map((card) => card.id));
         void removeSelected();
@@ -920,15 +1018,21 @@
       <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></div>
       <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
       {#each [...visibleWorkspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
-        <div class="nav-row"><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</span></button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        <div class="nav-row"><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
       {/each}
       {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
       {#if workspaces.some((group) => group.archived)}
-        <label class="archive-toggle"><input type="checkbox" checked={showArchived} onchange={(e) => interfaceStore.setTaskShowArchivedWorkspaces(e.currentTarget.checked)} />Show archived</label>
+        <!-- "workspaces", not just "archived": this page also has an Archive
+             that holds completed tasks, and two unqualified uses of the word
+             on one screen read as one feature with a broken control. -->
+        <label class="archive-toggle"><input type="checkbox" checked={showArchived} onchange={(e) => interfaceStore.setTaskShowArchivedWorkspaces(e.currentTarget.checked)} />Show archived workspaces</label>
       {/if}
-      <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title="Add repository" aria-label="Add repository" disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
+      <!-- In a workspace scope this control has a second effect: whatever it
+           adds also joins the workspace. It says so rather than leaving the
+           membership write to be discovered. -->
+      <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
         {#if addMenu}
-          <div bind:this={addMenuEl} id="task-add-repo-menu" class="add-menu gp-menu" role="menu" aria-label="Add repository" tabindex="-1" style="z-index: {LAYERS.MENU}" onkeydown={onAddMenuKey}>
+          <div bind:this={addMenuEl} id="task-add-repo-menu" class="add-menu gp-menu" role="menu" aria-label={addRepoLabel} tabindex="-1" style="z-index: {LAYERS.MENU}" onkeydown={onAddMenuKey}>
             {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
             {#each menuTabs as tab (tab.path)}
               <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
@@ -937,6 +1041,15 @@
               </button>
             {/each}
             {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
+            {#if attachable.length}
+              <div class="add-menu-label">Registered</div>
+              {#each attachable as repo (repo.id)}
+                <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
+                  <span class="add-name">{repo.name}</span>
+                </button>
+              {/each}
+              {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
+            {/if}
             <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
           </div>
         {/if}
@@ -965,7 +1078,7 @@
             <Inbox size={13} />
             {#if !unreadError && unread > 0}<span class="gp-pill">{unread}</span>{/if}
           </button>
-          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-label="Archive" title="Archive — completed tasks in this scope" onclick={() => { showArchive = !showArchive; }}>
+          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title={`Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}`} onclick={() => { showArchive = !showArchive; }}>
             <Archive size={13} />
             {#if completedCount > 0}<span class="gp-pill">{completedCount}</span>{/if}
           </button>
@@ -973,12 +1086,16 @@
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
         <TaskViewMenu disabled={!initialized} />
-        <button type="button" class="gp-btn-primary" onclick={() => createTask()} disabled={!canCreate} aria-label="New task">New task</button>
-        {#if initialized && !repositories.length}
-          {#if emptyAddLabel}
+        <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
+        <!-- A disabled New task always says why, and a caveat says what the
+             sheet will ask for. This used to render only for a profile with no
+             repositories at all, so an empty workspace left the button dead
+             and silent. -->
+        {#if creation.blocked ?? creation.caveat}
+          {#if creation.blocked && emptyAddLabel}
             <button type="button" class="hint-action" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
           {:else}
-            <span class="hint">Add a repository to create tasks</span>
+            <span class="hint" data-testid="task-create-hint">{creation.blocked ?? creation.caveat}</span>
           {/if}
         {/if}
       </div>
@@ -1014,7 +1131,7 @@
         {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
       </div>
     {/if}
-    {#if initialized && canCreate}
+    {#if creation.allowed}
       <div class="quick-add-row">
         <TaskQuickAdd
           bind:this={quickAddEl}
@@ -1053,6 +1170,19 @@
           {/if}
         {/if}
         <button type="button" class="gp-btn" onclick={() => void copyCardsForAgent(selectedCards)} disabled={busy}><Clipboard size={12} /> Copy for agent</button>
+        <!-- The bulk half of the card menu's Archive row, disabled for the
+             same reason and titled with where the work goes. Without it the
+             only bulk end-of-life action on this bar was Delete. -->
+        <button
+          type="button"
+          class="gp-btn"
+          data-testid="task-archive-selected"
+          onclick={() => void archiveCards(selectedCards)}
+          disabled={busy || selectionArchived === "all"}
+          title={selectionArchived === "all"
+            ? `Already in ${STATUS_LABELS[ARCHIVE_STATUS]}`
+            : `Archive — moves to ${STATUS_LABELS[ARCHIVE_STATUS]}`}
+        ><Archive size={12} /> Archive</button>
         <button type="button" class="gp-btn-danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
         <button type="button" class="gp-btn" onclick={() => { selected = new Set(); selectionAnchor = null; }}>Clear</button>
       </div>
@@ -1067,7 +1197,7 @@
         {hiddenColumns}
         refreshToken={archiveToken}
         onopen={openTask}
-        onaction={(cards, action) => void archiveAction(cards, action)}
+        onaction={(cards, action) => void archiveDockAction(cards, action)}
         ontogglecolumn={() => interfaceStore.toggleTaskColumn(ARCHIVE_STATUS)}
       />
     {/if}
@@ -1079,7 +1209,10 @@
     {:else if initialized && error && loadedKey !== boardKey}
       <EmptyState icon={Inbox} title="Tasks unavailable" hint="Retry to load this scope." action={{label:"Retry loading tasks",onClick:()=>void loadBoard(),variant:"secondary"}} />
     {:else if initialized && !loading && total === 0 && !filtering}
-      <EmptyState icon={Inbox} title="No tasks yet" hint="Create a task in this scope. Cards stay on this board until you delete them." action={repositories.length ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
+      <!-- Gated on the same decision as the header button. Offering New task
+           here where the header refuses it opened a sheet that could never be
+           saved, because nothing had linked a repository. -->
+      <EmptyState icon={Inbox} title="No tasks yet" hint={creation.blocked ?? creation.caveat ?? "Create a task in this scope. Cards stay on this board until you delete them."} action={creation.allowed ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
     {:else if initialized && !loading && listCards.length === 0 && filtering}
       <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
@@ -1128,7 +1261,7 @@
               <span>{STATUS_LABELS[status]}</span>
               <span class="column-meta">
                 <span>{columns[status]?.total ?? "—"}</span>
-                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} disabled={!canCreate} onclick={() => void createTask(status)}><Plus size={11} /></button>
+                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
               </span>
             </div>
             <div class="cards">
@@ -1282,7 +1415,7 @@
       {#if session}
         {#key session.pane}
           <div id={TASK_EDITOR_PANE_ID} role="tabpanel" class="task-panel">
-            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : scope.kind === "workspace" ? workspaceMemberIds?.[0] ?? "" : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={onEditorSaved} onClose={onEditorClose} />
+            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={creation.seed.primaryRepositoryId} home={creation.seed.homeWorkspaceId} onSaved={onEditorSaved} onClose={onEditorClose} />
           </div>
         {/key}
       {/if}
