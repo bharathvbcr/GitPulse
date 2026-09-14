@@ -275,6 +275,13 @@ fn concurrent_hooks_each_answer_completely_and_none_interleave() {
 }
 
 /// Write an executable stand-in for `manvi` into a fresh directory.
+///
+/// Gated with its only caller. The body already branches on `cfg!(windows)` for
+/// the filename, so it was written to work on both, but the one test that
+/// stands these up is `#[cfg(unix)]` — it drives the harness through `#!/bin/sh`
+/// scripts and a colon-separated PATH. Ungated, this compiles on Windows with
+/// nothing to call it, which `-D warnings` reports as dead code.
+#[cfg(unix)]
 fn broken_harness(dir: &Path, name: &str, script: &str) -> PathBuf {
     let bin = dir.join(name);
     std::fs::create_dir_all(&bin).expect("mkdir");
