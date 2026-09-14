@@ -52,6 +52,13 @@ before that tag is pushed.
   when they are shortened or the list is capped. `stale_server_warning`
   enumerates one process id per running `devmap mcp` — 84 of them on the
   machine that reported this — into a single line.
+- The walkthrough no longer waits on a frame that may never arrive. Its
+  spotlight was positioned from a measurement taken inside
+  `requestAnimationFrame`, so on a host that had stopped painting — an occluded
+  or minimised window, a background tab, a headless runner — the measurement
+  never happened: no highlight was drawn, and the step said "The Open menu is
+  not currently visible" about a control that was on screen. The measurement is
+  now bounded, so it lands whether or not a frame does.
 
 ## [1.1.0] - 2026-09-14
 

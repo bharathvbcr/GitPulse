@@ -1,5 +1,21 @@
 # Runtime harness
 
+## Reporting a verdict
+
+`checks.ts` owns the reporting half of a harness: `createChecks()` returns the
+`results` rows the runner reads, a `check(name, () => assertion)` that evaluates
+the assertion itself, and a `stopped(error)` for the outer `catch`.
+
+Pass the assertion as a thunk. Evaluating it at the call site means an assertion
+that *throws* never reaches the helper, so no row is written for it and the
+verdict names a built-in rather than the check — which is how a null lookup one
+line above an assertion came to report `TypeError` and nothing else. `stopped`
+then writes down where the run ended, because the rows after a throw are absent,
+and absent reads exactly like never written.
+
+`harness/onboarding.html` uses it. The other harnesses still carry their own
+local helper; move them across as they are next edited.
+
 ## Uncommitted previews
 
 Run `npm run test:browser -- --harness uncommitted` or

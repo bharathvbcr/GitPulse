@@ -14,17 +14,26 @@ export function tourPosition(target: TourRect | null, card: { width: number; hei
     card.width, card.height, Math.max(0, width - gap), Math.max(0, height - gap));
 }
 
+/** A frame is a coalescing opportunity, not a guarantee. An occluded or
+ * minimised window, a background tab and a headless runner all leave
+ * `requestAnimationFrame` callbacks queued indefinitely, and a measurement that
+ * only ever arrives on a frame then never arrives at all: the tour draws no
+ * spotlight and tells the reader "The Open menu is not currently visible" about
+ * a control that is on screen — a claim it has not measured. Bound the wait, so
+ * a host that has stopped painting still reaches the measurement. */
+export const FRAME_FALLBACK_MS = 50;
+
 /** Observe only while a live tour step is mounted; never poll or leave listeners behind. */
 export function observeTourTarget(selector: string, card: HTMLElement,
   update: (rect: TourRect | null, position: { left: number; top: number }) => void) {
   let target: HTMLElement | null = null;
   let frame = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   let signature = "";
   const resize = new ResizeObserver(schedule);
   resize.observe(card);
 
   function measure() {
-    frame = 0;
     const next = Array.from(document.querySelectorAll<HTMLElement>(selector)).find(el =>
       el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden") ?? null;
     if (next !== target) {
@@ -44,7 +53,18 @@ export function observeTourTarget(selector: string, card: HTMLElement,
     const nextSignature = JSON.stringify([rect, position]);
     if (signature !== nextSignature) { signature = nextSignature; update(rect, position); }
   }
-  function schedule() { if (!frame) frame = requestAnimationFrame(measure); }
+  /** Whichever of the two arrives first measures; the other is cancelled. */
+  function run() {
+    cancelAnimationFrame(frame);
+    if (timer !== null) clearTimeout(timer);
+    frame = 0; timer = null;
+    measure();
+  }
+  function schedule() {
+    if (frame || timer !== null) return;
+    frame = requestAnimationFrame(run);
+    timer = setTimeout(run, FRAME_FALLBACK_MS);
+  }
   const mutations = new MutationObserver(schedule);
   mutations.observe(document.body, { childList: true, subtree: true, attributes: true,
     attributeFilter: ["hidden", "class", "data-tour"] });
@@ -53,6 +73,7 @@ export function observeTourTarget(selector: string, card: HTMLElement,
   schedule();
   return () => {
     cancelAnimationFrame(frame);
+    if (timer !== null) clearTimeout(timer);
     resize.disconnect(); mutations.disconnect();
     window.removeEventListener("resize", schedule);
     window.removeEventListener("scroll", schedule, true);
