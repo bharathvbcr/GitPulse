@@ -11,23 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Fixed
-
-- The DORA change-failure card no longer reports an empty window as `0%`. An
-  empty commit window, a repository with no commits, and a shallow clone all
-  left the rate at `0.0` with nothing to divide, and the card rendered that
-  beside three measured numbers — a check that could not run reading exactly
-  like one that ran and found nothing wrong. The sibling restore-time card had
-  always declined to invent a number here; the failure rate could not follow it,
-  because neither of its two existing signals can say "nothing to measure":
-  `is_cfr_approximation` is set unconditionally at both construction sites, so
-  it only ever means "heuristic", and unlike a restore time, `0%` is a
-  legitimate answer when commits *were* examined and none were reverts. So the
-  report now carries the denominator, `cfr_sample_commits`, and zero is the
-  sentinel: the card shows `—` and says there were no commits in the window to
-  examine. A measured zero still shows `0%`, and now names the sample it was
-  measured over rather than leaving the reader to assume the whole window was
-  read.
+Nothing yet.
 
 ## [1.2.0] - 2026-09-15
 
@@ -55,8 +39,48 @@ panel. What it buys is a join rather than a guess: App Hosting reports the full
 commit SHA it deployed, so "this commit is live" is looked up against the graph
 instead of inferred from a branch name and a timestamp.
 
+That panel can now also deploy, and one action in this release changes what
+production serves. Creating a rollout is neither reversible from GitPulse — App
+Hosting publishes no rollback verb — nor idempotent, so it is the one place
+here guarded twice rather than once: the target must be a full 40-character
+SHA, the confirmation names the exact project, backend and commit and says
+plainly that GitPulse cannot undo it, and editing any part of that target
+disarms the confirmation so the values sent are always the values reviewed. The
+policy gate runs before the process, not alongside it. And what the installed
+CLI can actually do is probed rather than assumed, because the upstream
+subcommand is registered only behind an experiment that is off by default — a
+capability that could not be probed is reported as unknown, never as absent.
+
 ### Added
 
+- App Hosting can deploy a named commit, not only report one. `Create rollout`
+  is the only command in the Firebase module that changes what production
+  traffic serves, and it is built to be refused easily and taken deliberately.
+  The commit must be a full 40-character SHA — an abbreviation is an ambiguous
+  target for something that reaches production, and is declined with the
+  reason — and the deploying button does not exist until a confirmation naming
+  the project, the backend, the commit and the fact that GitPulse cannot undo
+  it has been read; changing any part of that target disarms it again. The
+  write gate judges the argv before any process is spawned, and a contract test
+  asserts that ordering directly rather than trusting it, because this argv is
+  built in the Firebase module instead of being spelled out in the handler and
+  is therefore exempt from the literal comparison the other commands get.
+  `--token` is never passed, so no credential is placed on a command line other
+  local processes can read, and `--force` is never passed either, so nothing
+  here suppresses a prompt the user would otherwise have seen. A rollout that
+  started is never reported as failed: if the CLI exits zero without confirming
+  the result, the panel says so and warns against a blind retry, because
+  upstream allocates a new rollout id per call and a false failure is what
+  turns one deployment into two.
+- The Firebase panel asks the installed CLI what it can do instead of assuming.
+  `apphosting:rollouts:list` is registered upstream only behind the
+  `internaltesting` experiment, which is off by default, and an unregistered
+  subcommand exits non-zero having written nothing to either stream — which
+  would have read as "no rollouts" rather than as "this CLI cannot answer". The
+  probe lists a command *group*, so it needs no login, no project and no
+  network, and the action is offered only when the subcommand is really there.
+  A capability that could not be probed is reported as unknown rather than as
+  absent, because the two have different remedies.
 - The board's quick-add line can draft. Return still saves the typed line
   exactly as before, and then asks the configured model for a title and a
   description to review. Two rules keep it honest, and neither is a tiebreak
@@ -243,6 +267,27 @@ instead of inferred from a branch name and a timestamp.
 
 ### Fixed
 
+- The DORA change-failure card no longer reports an empty window as `0%`. An
+  empty commit window, a repository with no commits, and a shallow clone all
+  left the rate at `0.0` with nothing to divide, and the card rendered that
+  beside three measured numbers — a check that could not run reading exactly
+  like one that ran and found nothing wrong. The sibling restore-time card had
+  always declined to invent a number here; the failure rate could not follow it,
+  because neither of its two existing signals can say "nothing to measure":
+  `is_cfr_approximation` is set unconditionally at both construction sites, so
+  it only ever means "heuristic", and unlike a restore time, `0%` is a
+  legitimate answer when commits *were* examined and none were reverts. So the
+  report now carries the denominator, `cfr_sample_commits`, and zero is the
+  sentinel: the card shows `—` and says there were no commits in the window to
+  examine. A measured zero still shows `0%`, and now names the sample it was
+  measured over rather than leaving the reader to assume the whole window was
+  read.
+- The change-failure card's `Heuristic` pill was the literal word rather than
+  the flag. `is_cfr_approximation` crossed the wire, was set by Rust, and was
+  read by nobody, so a measured rate would have arrived still labelled a guess —
+  and a stale label on a number is worse than no label, because it is believed.
+  The pill and its caption now both follow the flag, as the restore-time card
+  beside them always has.
 - A repository approved before 1.1.0 made the repository the unit of trust kept
   every one of its worktrees refused, with nothing anywhere offering to fix it.
   The approval still admitted the checkout it named, so the app reported the
