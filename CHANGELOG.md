@@ -28,6 +28,22 @@ before that tag is pushed.
   examine. A measured zero still shows `0%`, and now names the sample it was
   measured over rather than leaving the reader to assume the whole window was
   read.
+- The DORA change-failure rate and restore time no longer present a capped
+  commit scan as the whole window. Both are derived from one `git log` that was
+  fixed at `-n 200`, so on this repository the rate covered the newest 200 of
+  532 commits in the default 90 days — 38% of the window — beside a card
+  reporting release tags across all of it. `cfr_sample_commits` could not
+  surface this: it separates "measured" from "nothing to measure", but `200` is
+  a plain positive number whether it is the whole window or a slice of it. The
+  cap bought nothing to justify the blind spot — measured over a
+  25,000-commit history, the scan costs 0.01s capped and 0.07s uncapped,
+  against the 0.32s the lead-time loop already spends on `git describe` — so it
+  now matches `MAX_PULSE_COMMITS` at 25,000, and the report carries
+  `commit_scan_truncated` with the window total behind it when the cap is still
+  reached. Both cards say when they read only the newest part of the window,
+  because one scan feeds them both. The uncapped count is only taken when the
+  scan actually hits the cap, and a count that cannot be read leaves the
+  truncation flag set rather than letting a partial scan report itself complete.
 
 ## [1.2.0] - 2026-09-15
 

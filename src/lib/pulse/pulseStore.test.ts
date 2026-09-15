@@ -212,6 +212,8 @@ describe("pulseStore", () => {
       change_failure_rate_pct: 5.0,
       is_cfr_approximation: true,
       cfr_sample_commits: 160,
+      commit_scan_truncated: false,
+      commit_scan_window_commits: null,
       mttr_hours: 2.0,
       is_mttr_approximation: true,
       window_days: 90,

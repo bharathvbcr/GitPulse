@@ -20,6 +20,8 @@ function doraReport(overrides: Partial<DoraReport> = {}): DoraReport {
     change_failure_rate_pct: 7.5,
     is_cfr_approximation: true,
     cfr_sample_commits: 160,
+    commit_scan_truncated: false,
+    commit_scan_window_commits: null,
     mttr_hours: 2,
     is_mttr_approximation: true,
     window_days: 90,
@@ -105,5 +107,61 @@ describe("PulseDora change failure rate", () => {
     const single = body({ cfr_sample_commits: 1 });
     expect(single).toContain("1 examined commit");
     expect(single).not.toContain("examined commits");
+  });
+});
+
+/**
+ * The sample size says "measured" versus "nothing to measure". It cannot say
+ * whether the scan covered the window, because 200 examined is the same number
+ * whether the window held 200 or 532. Card 1 reports release tags over the
+ * whole window beside these two, so a window the scan only partly read must
+ * say so on the tiles it actually applies to — and it applies to both, because
+ * the rate and the restore time come from one capped `git log`.
+ */
+describe("PulseDora commit-scan truncation", () => {
+  const truncated = {
+    cfr_sample_commits: 200,
+    commit_scan_truncated: true,
+    commit_scan_window_commits: 532,
+  };
+
+  it("says the change-failure rate covered only part of the window", () => {
+    const rendered = body(truncated);
+    expect(rendered).toContain("200 examined commits");
+    expect(rendered).toContain("the newest of 532 in the window, not all of it");
+  });
+
+  it("carries the same caveat on the restore time", () => {
+    // One capped log feeds both metrics, so a caveat on the rate alone would
+    // leave the restore time reading as if it had seen the whole window.
+    const rendered = body({ ...truncated, mttr_hours: 6 });
+    const occurrences = rendered.split("not all of it").length - 1;
+    expect(
+      occurrences,
+      "both the change-failure and restore tiles must carry the caveat",
+    ).toBe(2);
+    expect(rendered).toContain("Time to follow-up patch (heuristic)");
+  });
+
+  it("stays silent when the scan read the whole window", () => {
+    // Without this the caveat could be unconditional, which would make it
+    // meaningless — every report would warn and none would inform.
+    const rendered = body({ cfr_sample_commits: 160, commit_scan_truncated: false });
+    expect(rendered).not.toContain("not all of it");
+    expect(rendered).toContain("160 examined commits");
+  });
+
+  it("still reports truncation when the window total could not be read", () => {
+    // `commit_scan_window_commits` is null when the uncapped count failed.
+    // The scan was still cut, so silence here would let a partial answer
+    // render exactly like a complete one — the failure the flag exists for.
+    const rendered = body({
+      cfr_sample_commits: 200,
+      commit_scan_truncated: true,
+      commit_scan_window_commits: null,
+    });
+    expect(rendered).toContain("the newest in the window, not all of it");
+    // No fabricated total, and no stray "of undefined".
+    expect(rendered).not.toContain("undefined");
   });
 });

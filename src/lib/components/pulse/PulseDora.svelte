@@ -34,6 +34,23 @@
     const days = (hours / 24).toFixed(1);
     return `${days}d`;
   }
+
+  /**
+   * One sentence, appended to both commit-derived cards.
+   *
+   * The change-failure rate and the restore time come from a single capped
+   * `git log`, so a cut scan bounds both and the caveat belongs on each tile
+   * rather than once for the section — the same rule the export card follows.
+   * Card 1 states releases over the whole window beside them, so without this
+   * a reader has every reason to read the other two as covering it too.
+   */
+  const scanCaveat = $derived(
+    !dora?.commit_scan_truncated
+      ? ""
+      : dora.commit_scan_window_commits
+        ? ` — the newest of ${dora.commit_scan_window_commits} in the window, not all of it`
+        : " — the newest in the window, not all of it",
+  );
 </script>
 
 <div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
@@ -129,7 +146,7 @@
           </span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          {dora.cfr_sample_commits <= 0 ? "No commits in this window to examine" : `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}`}
+          {dora.cfr_sample_commits <= 0 ? "No commits in this window to examine" : `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}${scanCaveat}`}
         </p>
       </div>
 
@@ -147,7 +164,7 @@
           </span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "Could not estimate from commit patterns" : "Time to follow-up patch (heuristic)"}
+          {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "Could not estimate from commit patterns" : `Time to follow-up patch (heuristic)${scanCaveat}`}
         </p>
       </div>
     </div>

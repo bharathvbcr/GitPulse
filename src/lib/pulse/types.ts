@@ -185,6 +185,21 @@ export interface DoraReport {
    * `is_cfr_approximation` cannot carry this — it is always true.
    */
   cfr_sample_commits: number;
+  /**
+   * True when the commit scan hit its cap and the window held more than it
+   * read. `cfr_sample_commits` separates "measured" from "nothing to measure",
+   * but a plain positive number cannot say whether it covered the whole window
+   * or only the newest slice of it — and card 1 states releases over the full
+   * window right beside it.
+   */
+  commit_scan_truncated: boolean;
+  /**
+   * Commits in the window before the cap, present only when the scan was cut.
+   * Null when nothing was cut, and also when the scan was cut but the count
+   * could not be read — `commit_scan_truncated` stays true either way, so an
+   * unreadable total never lets a partial scan render as a complete one.
+   */
+  commit_scan_window_commits: number | null;
   mttr_hours: number;
   is_mttr_approximation: boolean;
   window_days: number;

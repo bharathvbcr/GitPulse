@@ -52,12 +52,20 @@ fn every_pulse_reader_answers_on_a_real_repository() {
             // cfr_n is the rate's denominator: a 0.0% over 0 commits is "not
             // measured", not "clean", so printing the rate alone would repeat
             // in the diagnostic exactly what the UI was fixed to stop doing.
-            "dora_report OK releases={} freq/wk={:.2} lead_h={:.1} cfr={:.1}% cfr_n={} mttr_h={:.1}",
+            // scan_of is the window behind that denominator — this diagnostic
+            // is where the cap was first visible as "cfr_n=200" against a
+            // 532-commit window, so it prints what the sample was cut from
+            // rather than leaving the reader to check with rev-list.
+            "dora_report OK releases={} freq/wk={:.2} lead_h={:.1} cfr={:.1}% cfr_n={} scan_of={} truncated={} mttr_h={:.1}",
             r.total_releases,
             r.deploy_frequency_per_week,
             r.median_lead_time_hours,
             r.change_failure_rate_pct,
             r.cfr_sample_commits,
+            r.commit_scan_window_commits
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            r.commit_scan_truncated,
             r.mttr_hours
         ),
         Err(e) => panic!("dora_report FAILED: {e}"),
