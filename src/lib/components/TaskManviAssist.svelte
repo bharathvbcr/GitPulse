@@ -60,7 +60,8 @@
     active = true,
     quick = false,
     startRequest = 0,
-    onSuggestion = (_state: AssistSuggestion) => {},
+    onFlash = (_fields: EnhancementField[]) => {},
+    onReview = (_ready: boolean) => {},
     onEngine = (_name: string) => {},
   }: {
     task: Task | null;
@@ -95,7 +96,10 @@
      * undoing — and hands the sheet just enough to draw the two "use this"
      * affordances beside the fields they would change.
      */
-    onSuggestion?: (state: AssistSuggestion) => void;
+    /** Fields just accepted, so the sheet can flash the ones that changed. */
+    onFlash?: (fields: EnhancementField[]) => void;
+    /** A suggestion is ready to review, so the sheet can mark the Task tab. */
+    onReview?: (ready: boolean) => void;
     /**
      * Which engine the ask button would actually use, by display name.
      *
@@ -106,31 +110,6 @@
      */
     onEngine?: (name: string) => void;
   } = $props();
-
-  /** What the sheet needs to render an inline suggestion beside a field. */
-  export interface AssistSuggestion {
-    title: string;
-    description: string;
-    /** True when a suggestion is ready and differs from what is typed. */
-    showTitle: boolean;
-    showDescription: boolean;
-    /** Why accepting is refused right now, or "" when it is allowed. */
-    blocked: string;
-    /** Fields just accepted, for the sheet to flash. */
-    flash: EnhancementField[];
-  }
-
-  /** Accept one or both suggested fields. Called by the sheet's buttons. */
-  export function acceptFields(fields: EnhancementField[]) {
-    void accept(fields);
-  }
-
-  /** Hide the current suggestion without dismissing it in Manvi's history. */
-  export function hideSuggestion() {
-    epoch++;
-    proposal = null;
-    note = "Suggestion hidden. It stays in Manvi history.";
-  }
 
   const labels = ENHANCEMENT_STATE_LABELS;
   /** Two of these mount at once (the sheet and Quick Enhance), so ids collide. */
@@ -227,22 +206,18 @@
   const applyBlock = $derived(enhancementApplyBlock(proposal, task));
   const liveAttempt = $derived(liveEnhancement(proposal) || entries.some((entry) => liveEnhancement(entry)));
   const stale = $derived(Boolean(proposal && task && proposal.source_revision !== task.revision));
-  const acceptDisabled = $derived(acting || disabled || dirty || stale);
   const ready = $derived(proposal?.state === "ready");
-  const titleSuggestion = $derived(ready && proposal ? proposal.proposed.title ?? "" : "");
-  const descriptionSuggestion = $derived(ready && proposal ? proposal.proposed.description ?? "" : "");
-  const showTitleSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("title") && suggestionDiffers(title, titleSuggestion)));
-  const showDescriptionSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("description") && suggestionDiffers(description, descriptionSuggestion)));
   /**
-   * Whether the review draws the accept controls, or only the diff.
+   * Why accepting is refused right now, or "" when it is allowed.
    *
-   * When the sheet is already drawing its own accept button beside the field a
-   * suggestion would replace, this section offering one too would be two
-   * controls writing the same thing. The review still renders — the reader
-   * needs to see *what* changed for the revision they picked — it just does
-   * not offer the write.
+   * A disabled button with no reason beside it is a refusal the reader cannot
+   * act on, so the review prints this instead of only greying out.
    */
-  const reviewOffersAccept = $derived(quick || !(showTitleSuggestion || showDescriptionSuggestion));
+  const acceptBlock = $derived(
+    dirty ? "Save or reload your edits before accepting a suggestion."
+      : stale ? "This suggestion is for an older task revision. Ask again to apply it."
+      : "",
+  );
   const gate = $derived(canAskManvi({ title, description, repository_ids: repositoryIds }, notes));
   const manviGate = $derived(canQuickEnhance({ locked_fields: lockedFields }, configuration, configurationError));
   const available = $derived(requested.filter((field) => !lockedFields.includes(field)));
@@ -323,16 +298,10 @@
 
   $effect(() => { onBusy(controlsLocked); });
   $effect(() => { onEngine(engineName); });
-  $effect(() => {
-    onSuggestion({
-      title: titleSuggestion,
-      description: descriptionSuggestion,
-      showTitle: showTitleSuggestion,
-      showDescription: showDescriptionSuggestion,
-      blocked: acceptDisabled ? (dirty ? "Save or reload your edits before accepting a suggestion." : stale ? "This suggestion is for an older task revision. Request a fresh suggestion." : "") : "",
-      flash: [...flash],
-    });
-  });
+  $effect(() => { onFlash([...flash]); });
+  // Whether something is waiting to be reviewed. The sheet draws a dot on the
+  // Task tab from this, so a reader sitting on Agent knows to come back.
+  $effect(() => { onReview(ready); });
   $effect(() => {
     // Configuration belongs to the shared model selection. A picker change
     // must recover this editor without closing it or losing the draft.
@@ -546,7 +515,7 @@
         suggestionDiffers(description, result.proposed.description ?? "")
       );
       note = result.state === "ready"
-        ? (changed ? "Suggestions ready under the fields they change." : `${engineName} kept your wording.`)
+        ? (changed ? "Ready to review below." : `${engineName} kept your wording.`)
         : `${engineName} is drafting title and description.`;
       await history();
     } catch (cause) {
@@ -554,25 +523,6 @@
     } finally {
       if (!disposed) { needsReconcile = action.pending !== null; busy = false; }
     }
-  }
-
-  async function accept(fields: EnhancementField[]) {
-    if (!task || !proposal || acceptDisabled) return;
-    const input = acceptEnhancementInput(proposal, task, fields, newID());
-    if (!input) { error = "Save or reload the task, then request a fresh suggestion."; return; }
-    busy = true; epoch++; error = "";
-    try {
-      const result = await action.run("enhancements.accept", input, task.id);
-      if (disposed) return;
-      proposal = result.proposal;
-      if (result.task) onApplied(result.task);
-      note = fields.length === 1 ? `Saved the suggested ${fields[0]}.` : "Saved the suggested title and description.";
-      flash = [...fields];
-      if (flashTimer) clearTimeout(flashTimer);
-      flashTimer = setTimeout(() => { flash = []; }, 1600);
-      await history();
-    } catch (cause) { if (!disposed) error = explainError(cause); }
-    finally { if (!disposed) { needsReconcile = action.pending !== null; busy = false; } }
   }
 
   function editSuggestion() {
@@ -600,7 +550,20 @@
       if (method === "enhancements.revise") { editing = false; revisionDraft = {}; }
       if (result.task) onApplied(result.task);
       needsReconcile = false;
-      note = method === "enhancements.revise" ? "Suggestion saved. The task has not changed." : labels[proposal.state];
+      if (method === "enhancements.accept") {
+        // What the store says was accepted, not what was asked for: the flash
+        // is a claim about fields that actually changed, so it reads the
+        // result rather than the request.
+        const changed = proposal.accepted_fields.filter((field) => field === "title" || field === "description");
+        note = changed.length === 1 ? `Saved the suggested ${changed[0]}.`
+          : changed.length ? "Saved the suggested title and description."
+          : labels[proposal.state];
+        flash = [...changed];
+        if (flashTimer) clearTimeout(flashTimer);
+        flashTimer = setTimeout(() => { flash = []; }, 1600);
+      } else {
+        note = method === "enhancements.revise" ? "Suggestion saved. The task has not changed." : labels[proposal.state];
+      }
       await history();
     } catch (cause) { if (!disposed) { error = explainError(cause); needsReconcile = action.pending !== null; } }
     finally { if (!disposed) busy = false; }
@@ -790,27 +753,36 @@
       {:else}Showing {entries.length} of {total}{/if}
     </p>
 
-    <!-- Always rendered for whatever is selected. The old condition hid this
-         whenever a ready suggestion was showing beside the fields, which meant
-         changing the picker could produce no visible change at all. The real
-         problem it was solving — two places offering acceptance — is solved by
-         `reviewOffersAccept` instead, so the diff is always readable and only
-         the buttons move. -->
+    <!-- Always rendered for whatever the picker selects, in every state.
+         Two conditions used to hide it: one suppressed the whole review
+         whenever a ready suggestion was showing beside the fields, and one
+         moved the accept buttons up to the sheet. Together they meant the one
+         control that chooses a revision could be operated with no visible
+         effect at all. Acceptance now has exactly one home — this diff — so
+         the picker always changes what is on screen. -->
     {#if proposal}
         <article aria-label="Enhancement review">
           <h3>{labels[proposal.state]}</h3>
           <small>{proposal.provider} / {proposal.model} · source revision {proposal.source_revision}</small>
           {#if applyBlock}<p class="warn" role="status">{applyBlock}</p>{/if}
+          <!-- A greyed-out Accept with no reason beside it is a refusal the
+               reader cannot act on. -->
+          {#if !applyBlock && acceptBlock && proposal.state === "ready"}<p class="warn" role="status">{acceptBlock}</p>{/if}
           {#if proposal.state === "ready" || proposal.state === "accepted" || proposal.state === "undone"}
             {#each proposal.fields as field}
               <div class="field-review">
-                {#if reviewOffersAccept}
-                  <label class="check" class:advanced-hidden={quick && !chooseFields}>
-                    <input class="gp-field" type="checkbox" checked={proposal.state === "ready" ? selected.includes(field) : proposal.accepted_fields.includes(field)} disabled={disabled || controlsLocked || proposal.state !== "ready" || lockedFields.includes(field)} onchange={(event) => toggleSelected(field, event.currentTarget.checked)} />
-                    {field === "title" ? "Title" : "Description"}
-                  </label>
-                {/if}
-                {#if !reviewOffersAccept || (quick && !chooseFields)}<h4>{field === "title" ? "Title" : "Description"}</h4>{/if}
+                <label class="check" class:advanced-hidden={quick && !chooseFields}>
+                  <!-- Both `input` and `change` are stopped, because a checkbox
+                       click fires both and the sheet marks the task dirty from
+                       either one anywhere inside its form. Which fields a
+                       reader intends to accept is not an edit to the task: left
+                       to bubble, ticking this box marked the draft unsaved, and
+                       the unsaved-edits guard then refused the very acceptance
+                       the box was selecting. -->
+                  <input class="gp-field" type="checkbox" checked={proposal.state === "ready" ? selected.includes(field) : proposal.accepted_fields.includes(field)} disabled={disabled || controlsLocked || proposal.state !== "ready" || lockedFields.includes(field)} oninput={(event) => event.stopPropagation()} onchange={(event) => { event.stopPropagation(); toggleSelected(field, event.currentTarget.checked); }} />
+                  {field === "title" ? "Title" : "Description"}
+                </label>
+                {#if quick && !chooseFields}<h4>{field === "title" ? "Title" : "Description"}</h4>{/if}
                 <details open={!quick}><summary>Original task</summary><pre>{proposal.source[field]}</pre></details>
                 {#if proposal.edited_fields.includes(field)}<small>Original suggestion</small><pre>{proposal.original_proposed?.[field]}</pre>{/if}
                 <small>{proposal.edited_fields.includes(field) ? "Edited suggestion" : "Suggestion"}</small>
@@ -825,14 +797,17 @@
               <button type="button" class="gp-btn" disabled={acting} onclick={() => { editing = false; revisionDraft = {}; }}>Discard suggestion edits</button>
             {/if}
             {#if proposal.state === "ready"}
-              <!-- Acceptance has one owner per surface. The sheet draws its
-                   own accept affordance beside the field the suggestion would
-                   replace, so offering one again here would be two buttons
-                   writing the same thing. -->
-              {#if reviewOffersAccept}
-                <button class="gp-btn-primary" type="button" disabled={disabled || controlsLocked || !selected.length} onclick={() => act("enhancements.accept")}>{quick ? "Apply enhancement" : "Accept selected fields"}</button>
-                {#if quick}<button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={() => { chooseFields = !chooseFields; }}>{chooseFields ? "Hide field choices" : "Choose fields"}</button>{/if}
-              {/if}
+              <!-- Acceptance has exactly one home, and it is here: beside the
+                   diff that shows what would change. -->
+              <!-- `acceptBlock`, so the refusal and its reason are one
+                   expression. The dirty and stale guards used to ride on the
+                   sheet's own inline buttons, and moving acceptance here
+                   without them would let an accept overwrite unsaved edits —
+                   but the sheet also disabled on `acting`, which is transient
+                   and has no sentence to show, so that stays with
+                   `controlsLocked` where it belongs. -->
+              <button class="gp-btn-primary" type="button" disabled={Boolean(acceptBlock) || disabled || controlsLocked || !selected.length} onclick={() => act("enhancements.accept")}>{quick ? "Apply enhancement" : "Accept selected fields"}</button>
+              {#if quick}<button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={() => { chooseFields = !chooseFields; }}>{chooseFields ? "Hide field choices" : "Choose fields"}</button>{/if}
               <button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={editSuggestion}>Edit suggestion</button>
             {/if}
             {#if proposal.state === "accepted"}<button type="button" class="gp-btn" disabled={disabled || acting} onclick={() => act("enhancements.undo")}>Undo accepted fields</button>{/if}

@@ -114,7 +114,6 @@ describe("TaskEditor", () => {
     expect(pane).toContain("Acceptance criteria");
     expect(pane).toContain("<TaskManviAssist");
     expect(pane).toContain("LabelInput");
-    expect(pane).toContain("Home workspace");
     expect(pane).toContain("Notifications (profile-wide; mute this task)");
     expect(source).not.toContain("More details");
     expect(source).not.toContain("showDetails");
@@ -123,6 +122,56 @@ describe("TaskEditor", () => {
     // what a saved task shows is an asymmetry with nothing behind it.
     expect(source).not.toContain("showOrganize");
     expect(source).not.toContain("Schedule and labels");
+  });
+
+  it("numbers the sections instead of splitting them into columns", () => {
+    // The two-column grid only applied past 520px and the dock's floor is
+    // 380px, so which layout a reader got depended on how far they had dragged
+    // the splitter. Five numbered sections read the same at every width.
+    const pane = taskPane();
+    expect(source).not.toContain("pane-grid");
+    expect(source).not.toContain("@container");
+    expect(pane).toContain('<div class="steps">');
+    for (const [n, heading] of [
+      ["1", "Repositories"],
+      ["2", "Quick add"],
+      ["3", "Title and description"],
+      ["4", "Status and scheduling"],
+      ["5", "Owner"],
+    ] as const) {
+      expect(pane).toContain(`<span class="step-n" aria-hidden="true">${n}</span><h3>${heading}</h3>`);
+    }
+    // In that order, and with nothing unnumbered between them.
+    const order = [...pane.matchAll(/<span class="step-n" aria-hidden="true">(\d)<\/span>/g)].map((m) => m[1]);
+    expect(order).toEqual(["1", "2", "3", "4", "5"]);
+  });
+
+  it("gives the due date the picker rather than the platform's datetime box", () => {
+    const pane = taskPane();
+    expect(pane).toContain("<TaskDuePicker");
+    expect(source).not.toContain("datetime-local");
+    expect(source).not.toContain("dueInputValue");
+    expect(source).not.toContain("parseDueInput");
+    // A day is chosen with a button, which fires no `input` event, so the
+    // form's own `oninput`/`onchange` dirty-marking cannot see it.
+    expect(pane).toContain("onChange={(next) => { draft.due_at = next; dirty = true; }}");
+    // The popover is portaled out of the sheet, so a disabled `<fieldset>`
+    // around the component would not reach the controls inside it.
+    expect(pane).toMatch(/<TaskDuePicker[\s\S]*?disabled=\{saving \|\| reloading \|\| pending !== null \|\| pendingDelete !== null \|\| enhancementBusy\}/);
+  });
+
+  it("drops the Home workspace control without dropping the value it held", () => {
+    // The control was removed because picking a home workspace from the sheet
+    // did not work; the field itself is still part of a task and still has to
+    // survive a save. The draft carries whatever was loaded (or seeded for a
+    // new task in a workspace) straight back to `taskWrite`.
+    const pane = taskPane();
+    expect(pane).not.toContain("Home workspace");
+    expect(pane).not.toMatch(/bind:value=\{draft\.home_workspace_id\}/);
+    expect(source).toContain("home_workspace_id: initial.home");
+    // And it is still read, for the membership notice under the picker.
+    expect(source).toContain("const workspaceId = draft.home_workspace_id");
+    expect(source).toContain("workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}");
   });
 
   it("leads the sheet with the repository control, ahead of the title", () => {
@@ -185,18 +234,28 @@ describe("TaskEditor", () => {
     expect(source).toContain("workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}");
   });
 
-  it("draws Manvi's suggestion beside the field it would change", () => {
-    expect(source).toContain('assist?.acceptFields(["title"])');
-    expect(source).toContain('assist?.acceptFields(["description"])');
-    expect(source).toContain('assist?.acceptFields(["title", "description"])');
-    expect(source).toContain("assist?.hideSuggestion()");
-    // The suggestion cards sit with Title and Description in the first column;
-    // the controls that produce them sit in the second. That is the whole
-    // reason the AI pane was merged away — pressing a button on one pane and
-    // reading the result on another.
+  it("leaves acceptance to the assist that produced the suggestion", () => {
+    // The sheet used to draw "Use this title" under each field while the
+    // assist's own review drew no buttons at all. One decision with two owners,
+    // and it left the assist's history dropdown able to change nothing visible.
+    // Acceptance now lives once, beside the diff; the sheet keeps only the
+    // flash, so a field that was just rewritten says so.
     const pane = taskPane();
-    expect(pane.indexOf('name="task-title"')).toBeLessThan(pane.indexOf("<TaskManviAssist"));
-    expect(pane).toMatch(/suggestion\.showTitle[\s\S]*?Use this title/);
+    expect(source).not.toContain("acceptFields");
+    expect(source).not.toContain("hideSuggestion");
+    expect(source).not.toContain("inline-suggestion");
+    // On the pane, not the whole file: the comment above `flash` names the
+    // button that used to be here, which is the point of the comment.
+    expect(pane).not.toContain("Use this title");
+    expect(pane).not.toContain("Use this description");
+    expect(source).toContain("onFlash={(fields) => { flash = fields; }}");
+    expect(source).toContain('class:flash={flash.includes("title")}');
+    expect(source).toContain('class:flash={flash.includes("description")}');
+
+    // The dictation and the fields it fills are in reading order: the capture
+    // surface first, then Title and Description under it. Pressing a button on
+    // one pane and reading the result on another is what the merge removed.
+    expect(pane.indexOf("<TaskManviAssist")).toBeLessThan(pane.indexOf('name="task-title"'));
   });
 
   it("keeps the assist outside the fieldset a running suggestion disables", () => {

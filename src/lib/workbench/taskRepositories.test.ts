@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   FILTER_THRESHOLD,
+  groupRows,
   linkSummary,
   outsiderLine,
   repositoryRows,
   shouldOfferFilter,
   summaryLine,
+  triggerChips,
 } from "./taskRepositories";
 
 const catalog = [
@@ -102,5 +104,80 @@ describe("summary lines", () => {
   it("counts the outsiders in the workspace it names", () => {
     expect(outsiderLine(["r0"], "Developer tools")).toBe("1 linked repository is not in Developer tools.");
     expect(outsiderLine(["r0", "r2"], "Developer tools")).toBe("2 linked repositories are not in Developer tools.");
+  });
+});
+
+describe("triggerChips", () => {
+  it("draws the primary first, so the closed trigger answers both questions", () => {
+    const { chips, overflow } = triggerChips(catalog, ["r0", "r1", "r3"], "r3");
+    expect(chips.map((chip) => chip.id)).toEqual(["r3", "r0", "r1"]);
+    expect(chips.filter((chip) => chip.primary).map((chip) => chip.id)).toEqual(["r3"]);
+    expect(overflow).toBe(0);
+  });
+
+  it("collapses the remainder to a count, never the primary", () => {
+    // The trigger has a fixed width and the dock goes down to 380px, so some
+    // chips have to go. Hiding the primary would leave it answering the easy
+    // question and dropping the one that decides where an agent runs.
+    const { chips, overflow } = triggerChips(catalog, ["r0", "r1", "r2", "r3"], "r3", 2);
+    expect(chips.map((chip) => chip.id)).toEqual(["r3", "r0"]);
+    expect(chips[0].primary).toBe(true);
+    expect(overflow).toBe(2);
+  });
+
+  it("always leaves room for at least one chip", () => {
+    for (const limit of [0, -5, Number.NaN]) {
+      const { chips } = triggerChips(catalog, ["r0", "r3"], "r3", limit);
+      expect(chips).toHaveLength(1);
+      expect(chips[0].primary).toBe(true);
+    }
+  });
+
+  it("skips a linked id this page of the catalog cannot name", () => {
+    // Drawing it would put a raw id in the trigger; `linkSummary().unknown`
+    // and the notice under the trigger are where that belongs.
+    const { chips, overflow } = triggerChips(catalog, ["r0", "gone"], "r0");
+    expect(chips.map((chip) => chip.id)).toEqual(["r0"]);
+    expect(overflow).toBe(0);
+    expect(linkSummary(catalog, ["r0", "gone"], "r0", null).unknown).toEqual(["gone"]);
+  });
+
+  it("marks no primary when the task has none", () => {
+    const { chips } = triggerChips(catalog, ["r0", "r1"], "");
+    expect(chips.some((chip) => chip.primary)).toBe(false);
+    expect(chips.map((chip) => chip.id)).toEqual(["r0", "r1"]);
+  });
+
+  it("has nothing to draw with nothing linked", () => {
+    expect(triggerChips(catalog, [], "")).toEqual({ chips: [], overflow: 0 });
+  });
+});
+
+describe("groupRows", () => {
+  it("splits rows into the three answers a reader is choosing between", () => {
+    const rows = repositoryRows(catalog, ["r3"], "r3", ["r0", "r3"], "");
+    const groups = groupRows(rows);
+    expect(groups.map((group) => group.id)).toEqual(["linked", "workspace", "other"]);
+    expect(groups[0].rows.map((row) => row.id)).toEqual(["r3"]);
+    expect(groups[1].rows.map((row) => row.id)).toEqual(["r0"]);
+    expect(groups[2].rows.map((row) => row.id)).toEqual(["r1", "r2"]);
+  });
+
+  it("keeps catalog order inside each group", () => {
+    const rows = repositoryRows(catalog, ["r3", "r1"], "r3", null, "");
+    expect(groupRows(rows)[0].rows.map((row) => row.id)).toEqual(["r1", "r3"]);
+  });
+
+  it("drops an empty group rather than drawing a heading over nothing", () => {
+    expect(groupRows(repositoryRows(catalog, [], "", null, "")).map((group) => group.id)).toEqual(["other"]);
+  });
+
+  it("has no workspace group when the task has no home workspace", () => {
+    expect(groupRows(repositoryRows(catalog, ["r0"], "r0", null, "")).map((group) => group.id)).toEqual(["linked", "other"]);
+  });
+
+  it("loses no row", () => {
+    const rows = repositoryRows(catalog, ["r3"], "r3", ["r0"], "");
+    expect(groupRows(rows).flatMap((group) => group.rows)).toHaveLength(rows.length);
   });
 });

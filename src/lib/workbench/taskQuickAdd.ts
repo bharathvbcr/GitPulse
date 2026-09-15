@@ -212,17 +212,64 @@ function atDueHour(date: Date): Date {
 }
 
 /**
+ * A clock written like one: `5pm`, `5:30pm`, `17:00`.
+ *
+ * A bare number is deliberately NOT a time. Without that rule `due:17` — which
+ * means nothing — would silently become five in the afternoon, so a meridiem
+ * or an explicit `:MM` is required. Anchored and fixed-length, like the other
+ * two regexes in this file.
+ */
+const CLOCK_SUFFIX = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$/;
+
+function readClock(text: string): { hour: number; minute: number } | null {
+  const match = CLOCK_SUFFIX.exec(text);
+  if (!match) return null;
+  const [, rawHour, rawMinute, meridiem] = match;
+  let hour = Number(rawHour);
+  const minute = rawMinute === undefined ? 0 : Number(rawMinute);
+  if (!Number.isSafeInteger(hour) || !Number.isSafeInteger(minute) || minute > 59) return null;
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    hour = (hour % 12) + (meridiem === "pm" ? 12 : 0);
+  } else if (rawMinute === undefined || hour > 23) {
+    return null;
+  }
+  return { hour, minute };
+}
+
+/**
  * A due-date word to epoch seconds, or null when it is not a date.
  *
  * Deliberately does not fall back to `Date.parse`: that accepts
  * implementation-defined strings, so `due:next` could become a date on one
  * engine and nothing on another. Anything not listed here is reported as a
  * warning instead of guessed at.
+ *
+ * A date word may carry a clock: `friday-5pm`, `tomorrow 09:30`. That is tried
+ * only after the whole string has failed to parse on its own, so no input that
+ * resolved before this existed can take the new path — `2026-02-03t14:30` still
+ * goes through `DATE_ABSOLUTE`, which carries its own time.
  */
 export function parseQuickAddDue(value: unknown, now = Date.now()): number | null {
   if (typeof value !== "string") return null;
   const text = value.trim().toLowerCase().replace(/\s+/g, "-");
   if (!text || text.length > 32) return null;
+  const whole = parseDueWords(text, now);
+  if (whole !== null) return whole;
+
+  const split = text.lastIndexOf("-");
+  if (split <= 0) return null;
+  const clock = readClock(text.slice(split + 1));
+  if (!clock) return null;
+  const day = parseDueWords(text.slice(0, split), now);
+  if (day === null) return null;
+  const dated = new Date(day * 1000);
+  dated.setHours(clock.hour, clock.minute, 0, 0);
+  return Number.isFinite(dated.getTime()) ? seconds(dated) : null;
+}
+
+/** The date-word grammar itself, over text this module has already normalized. */
+function parseDueWords(text: string, now: number): number | null {
   const base = Number.isFinite(now) ? new Date(now) : new Date();
   if (!Number.isFinite(base.getTime())) return null;
 

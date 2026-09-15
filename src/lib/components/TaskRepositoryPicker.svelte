@@ -10,10 +10,13 @@
    * edits never touch.
    *
    * Collapsing it costs nothing only if the closed trigger still answers the
-   * question the list answered: how many are linked, and which is primary.
-   * So the trigger's label *is* `summaryLine` — the same sentence the inline
-   * summary showed. Linking and the primary choice stay one control that
-   * cannot disagree with itself.
+   * question the list answered: how many are linked, and which is primary. It
+   * answers with a chip per link, the primary one starred and drawn first —
+   * naming them rather than counting them, because "2 repositories linked"
+   * still needs opening to find out *which*. `triggerChips` guarantees the
+   * primary is never the chip that gets collapsed into the overflow count, and
+   * `summaryLine` stays on screen beneath for what chips cannot say: a
+   * remainder, or a link with no primary chosen yet.
    *
    * Two deliberate choices about the widgets inside:
    *
@@ -29,18 +32,21 @@
    * inside it would be clipped by the scroller it is trying to escape.
    */
   import { onMount } from "svelte";
-  import { ChevronDown, FolderGit2 } from "@lucide/svelte";
+  import { ChevronDown, FolderGit2, Star } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { clampMenuPosition } from "../branches/menuPosition";
-  import { summaryLine, outsiderLine, type LinkSummary, type PickerRow } from "../workbench/taskRepositories";
+  import { groupRows, summaryLine, outsiderLine, type LinkSummary, type PickerRow, type TriggerChip } from "../workbench/taskRepositories";
   import type { OpenTabRef } from "../workbench/openMembership";
 
   let {
     /** Catalog rows, already filtered and ordered by `repositoryRows`. */
     rows,
     summary,
+    /** What the closed trigger draws, from `triggerChips`. */
+    chips = [],
+    overflow = 0,
     /** Whether the catalog is large enough to be worth filtering. */
     offerFilter = false,
     filter = $bindable(""),
@@ -61,6 +67,8 @@
   }: {
     rows: PickerRow[];
     summary: LinkSummary;
+    chips?: TriggerChip[];
+    overflow?: number;
     offerFilter?: boolean;
     filter?: string;
     knownCount?: number;
@@ -82,6 +90,7 @@
   let pos = $state({ left: 0, top: 0 });
 
   const label = $derived(summaryLine(summary));
+  const groups = $derived(groupRows(rows));
 
   function close(options?: { restoreFocus?: boolean }) {
     const opener = triggerEl;
@@ -181,9 +190,25 @@
     onclick={toggleOpen}
   >
     <FolderGit2 size={12} class="shrink-0 text-accent" aria-hidden="true" />
-    <span class="repo-trigger-label">{label}</span>
+    <span class="repo-chips">
+      {#each chips as chip (chip.id)}
+        <span class="gp-chip repo-chip" class:is-primary={chip.primary}>
+          {#if chip.primary}<Star size={9} fill="currentColor" class="shrink-0" aria-hidden="true" />{/if}
+          <span class="repo-chip-name">{chip.name}</span>
+        </span>
+      {/each}
+      {#if overflow > 0}<span class="repo-more">+{overflow}</span>{/if}
+      {#if summary.linked === 0}<span class="repo-trigger-label">{label}</span>{/if}
+    </span>
     <ChevronDown size={11} class="shrink-0 text-textMuted" aria-hidden="true" />
   </button>
+  <!-- `summaryLine` is still the single owner of "how many are linked, and
+       which is primary". The chips above answer it at a glance; this keeps the
+       exact sentence on screen for the cases chips cannot carry — a collapsed
+       remainder, or a link with no primary chosen. -->
+  {#if summary.linked > 0}
+    <p class="repo-summary-line" data-testid="task-repo-summary-line">{label}</p>
+  {/if}
   {#each summary.unknown as missing (missing)}
     <small class="repo-unknown">Linked repository {missing} (load more repositories to edit)</small>
   {/each}
@@ -223,27 +248,39 @@
       />
     {/if}
     <div class="repo-list" role="radiogroup" aria-label="Primary repository">
-      {#each rows as row (row.id)}
-        <div class="repo-row" class:linked={row.linked}>
-          <label class="check">
-            <input type="checkbox" checked={row.linked} onchange={(e) => onToggle(row.id, e.currentTarget.checked)} />
-            <span class="repo-name">{row.name}</span>
-            {#if row.member}<span class="repo-mark">In workspace</span>{/if}
-            {#if row.keptByLink}<span class="repo-mark">Linked</span>{/if}
-          </label>
-          {#if row.linked}
-            <label class="primary-pick">
-              <input
-                type="radio"
-                name="task-primary-{name}"
-                checked={row.primary}
-                onchange={() => onPrimary(row.id)}
-                aria-label="Make {row.name} the primary repository"
-              />
-              Primary
+      <!-- Grouped rather than flat: a reader looking for the two they linked
+           should not have to read every name in the catalog. `groupRows` keeps
+           catalog order inside each group, so a row still never moves out from
+           under the pointer that just checked it. -->
+      {#each groups as group (group.id)}
+        <p class="repo-group">{group.label}</p>
+        {#each group.rows as row (row.id)}
+          <div class="repo-row" class:linked={row.linked}>
+            <label class="check">
+              <input type="checkbox" checked={row.linked} onchange={(e) => onToggle(row.id, e.currentTarget.checked)} />
+              <span class="repo-name">{row.name}</span>
+              <!-- Only under "Linked", where the group heading does not
+                   already say it. A linked repository that is *not* a member
+                   is what the outsider notice under the trigger is about, so
+                   the reader needs to be able to tell the two apart here. -->
+              {#if row.linked && row.member}<span class="repo-mark">In workspace</span>{/if}
+              {#if row.keptByLink}<span class="repo-mark">Filtered out</span>{/if}
             </label>
-          {/if}
-        </div>
+            {#if row.linked}
+              <label class="primary-pick" class:is-primary={row.primary}>
+                <input
+                  type="radio"
+                  name="task-primary-{name}"
+                  checked={row.primary}
+                  onchange={() => onPrimary(row.id)}
+                  aria-label="Make {row.name} the primary repository"
+                />
+                <Star size={9} fill={row.primary ? "currentColor" : "none"} class="shrink-0" aria-hidden="true" />
+                Primary
+              </label>
+            {/if}
+          </div>
+        {/each}
       {/each}
       {#if knownCount === 0}
         <p class="repo-empty">No repositories are registered yet. Open one in GitPulse, then link it here.</p>
@@ -267,11 +304,24 @@
 <style>
   .repositories{border:0;padding:0;min-width:0;margin:0 0 13px}
   legend{color:rgb(var(--c-text-muted));font-size:11px}
-  .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left}
+  /* A field, not a pill: it holds chips and sits in a column of inputs, so it
+     takes the same geometry as the fields around it. */
+  .repo-trigger{width:100%;justify-content:flex-start;gap:7px;margin-top:4px;text-align:left;border-radius:12px;padding:6px 9px;min-height:38px;background:rgb(var(--c-bg) / 0.6);border-color:rgb(var(--c-border))}
+  .repo-chips{display:flex;flex-wrap:wrap;gap:5px;flex:1;min-width:0;align-items:center}
+  .repo-chip{background:rgb(var(--c-surface-hover) / 0.8);max-width:100%}
+  .repo-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* The primary is the one that decides where an agent runs, so it is the one
+     chip that is coloured rather than merely present. */
+  .repo-chip.is-primary{border-color:rgb(var(--c-accent) / 0.55);background:rgb(var(--c-accent) / 0.13);color:rgb(var(--c-text))}
+  .repo-more{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:11px}
   .repo-trigger-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   /* No repository linked is not a neutral state — it is the one thing that
      stops the task saving, so the trigger says so at full contrast. */
+  .repo-trigger.needs{border-color:rgb(var(--c-accent) / 0.5)}
   .repo-trigger.needs .repo-trigger-label{color:rgb(var(--c-text))}
+  .repo-summary-line{margin:5px 0 0;font-size:11px;color:rgb(var(--c-text-muted))}
+  .repo-group{margin:7px 0 2px;padding:0 6px;font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
+  .repo-group:first-child{margin-top:2px}
   .repo-unknown{display:block;color:rgb(var(--c-text-muted));font-size:11px;margin-top:4px}
   .repo-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0;font-size:12px;color:rgb(var(--c-text-muted))}
   .repo-popup{width:min(360px,92vw);padding:10px;font-size:12px;color:rgb(var(--c-text))}
@@ -281,13 +331,20 @@
   /* Only the rows scroll. The summary and the filter above them are how the
      picker stays readable at any catalog size, so they must not scroll away. */
   .repo-list{max-height:220px;overflow:auto;margin:2px 0 4px}
-  .repo-row{display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .repo-row{display:flex;align-items:center;gap:8px;justify-content:space-between;border-radius:8px;padding:3px 6px}
+  .repo-row:hover{background:rgb(var(--c-surface-hover) / 0.6)}
+  .repo-row.linked{background:rgb(var(--c-accent) / 0.08)}
   .repo-row .check{flex:1;min-width:0;gap:7px}
   .repo-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .repo-mark{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:10px}
-  .primary-pick{display:flex;flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:10px;color:rgb(var(--c-text-muted))}
+  .primary-pick{display:flex;flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:10px;color:rgb(var(--c-text-muted));border:1px solid transparent;border-radius:999px;padding:1px 7px;cursor:pointer}
+  .primary-pick:hover{border-color:rgb(var(--c-border))}
   .primary-pick input{width:auto}
   .repo-row.linked .primary-pick{color:rgb(var(--c-text))}
+  /* The radio stays the control — it is what makes this one-of-many for the
+     keyboard and for a screen reader. The star is the painting beside it, the
+     same trade `gp-select` makes with a native <select>. */
+  .primary-pick.is-primary{color:rgb(var(--c-accent));border-color:rgb(var(--c-accent) / 0.45);background:rgb(var(--c-accent) / 0.12)}
   .repo-empty{margin:6px 0;color:rgb(var(--c-text-muted))}
   .check{display:flex;flex-direction:row;align-items:center;margin:5px 0;gap:7px}
   .check input{width:auto}

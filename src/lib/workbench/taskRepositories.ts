@@ -77,6 +77,86 @@ export function repositoryRows(
   return rows;
 }
 
+/** One repository as the closed trigger draws it. */
+export interface TriggerChip {
+  id: string;
+  name: string;
+  primary: boolean;
+}
+
+/** How many chips the trigger draws before it collapses the rest to a count. */
+export const CHIP_LIMIT = 3;
+
+/**
+ * What the closed trigger shows.
+ *
+ * The trigger has to answer both questions without being opened — which
+ * repositories are linked, and which one is primary — and it has a fixed width
+ * to do it in, because the sheet's dock can be dragged down to 380px. So the
+ * list is capped and the remainder becomes a count.
+ *
+ * **The primary chip is never the one that gets collapsed.** Dropping it would
+ * leave the trigger answering the easy question and hiding the one that
+ * actually decides where an agent runs, which is the whole reason the control
+ * is not just a count. It is drawn first for the same reason.
+ *
+ * A linked id this page of the catalog does not carry has no name to draw, so
+ * it is left to `linkSummary().unknown` and the notice the sheet puts under
+ * the trigger rather than rendered as a chip reading like a UUID.
+ */
+export function triggerChips(
+  known: readonly PickerRepository[],
+  linked: readonly string[],
+  primary: string,
+  limit = CHIP_LIMIT,
+): { chips: TriggerChip[]; overflow: number } {
+  const names = new Map(known.map((repo) => [repo.id, repo.name]));
+  const named = linked.filter((id) => names.has(id));
+  const ordered = [...named].sort((a, b) => Number(b === primary) - Number(a === primary));
+  // `Math.max(1, NaN)` is NaN, and `slice(0, NaN)` is empty — a caller passing
+  // a bad limit would have emptied the trigger rather than narrowed it.
+  const requested = Math.floor(limit);
+  const room = Number.isFinite(requested) ? Math.max(1, requested) : 1;
+  return {
+    chips: ordered.slice(0, room).map((id) => ({ id, name: names.get(id) ?? id, primary: id === primary })),
+    overflow: Math.max(0, ordered.length - room),
+  };
+}
+
+/** A run of rows under one heading. */
+export interface PickerGroup {
+  id: "linked" | "workspace" | "other";
+  label: string;
+  rows: PickerRow[];
+}
+
+/**
+ * Rows split into the three answers a reader is actually choosing between.
+ *
+ * A flat list makes a reader read every name to find the two they linked. The
+ * split does not reorder within a group — `repositoryRows` keeps catalog order
+ * on purpose, so a row never moves out from under the pointer that just
+ * checked it — and an empty group is dropped rather than drawn as a heading
+ * with nothing under it.
+ *
+ * "In this workspace" only exists when the task has a home workspace to be a
+ * member of; with none, `member` is false everywhere and every unlinked row is
+ * simply "other".
+ */
+export function groupRows(rows: readonly PickerRow[]): PickerGroup[] {
+  const groups: PickerGroup[] = [
+    { id: "linked", label: "Linked", rows: [] },
+    { id: "workspace", label: "In this workspace", rows: [] },
+    { id: "other", label: "Other repositories", rows: [] },
+  ];
+  for (const row of rows) {
+    if (row.linked) groups[0].rows.push(row);
+    else if (row.member) groups[1].rows.push(row);
+    else groups[2].rows.push(row);
+  }
+  return groups.filter((group) => group.rows.length > 0);
+}
+
 export function linkSummary(
   known: readonly PickerRepository[],
   linked: readonly string[],

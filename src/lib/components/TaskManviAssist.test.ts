@@ -52,18 +52,24 @@ describe("TaskManviAssist", () => {
     expect(source).toMatch(/const page = await bounded\(listEnhancements\(saved\.id\)\)[\s\S]*?runAppleEnhancement/);
   });
 
-  it("publishes its suggestion instead of drawing its own copy of the fields", () => {
+  it("owns acceptance rather than publishing it to the sheet", () => {
     /*
-     * The assist used to carry a second Title and Description input and an
-     * "Use this title" button beside them, so a reader comparing a suggestion
-     * to what they wrote was looking at two pairs of fields in one sheet.
-     * It now owns the lifecycle and hands the *result* to the editor, which
-     * draws each suggestion under the field it would replace. The two exported
-     * functions are that seam: without them the editor's buttons do nothing.
+     * Three arrangements have been tried. The assist used to carry its own
+     * second Title and Description inputs; then it handed the suggestion up to
+     * the sheet, which drew "Use this title" beside each field and left the
+     * review with no buttons. Both split one decision across two places, and
+     * the second made the history picker able to change nothing visible.
+     *
+     * Acceptance now lives exactly once, beside the diff. The only thing that
+     * still crosses the seam is which fields just changed, so the sheet can
+     * flash them.
      */
-    expect(source).toContain("export function acceptFields");
-    expect(source).toContain("export function hideSuggestion");
-    expect(source).toContain("onSuggestion?: (state: AssistSuggestion) => void");
+    expect(source).toContain("onFlash?: (fields: EnhancementField[]) => void");
+    expect(source).toContain("$effect(() => { onFlash([...flash]); })");
+    expect(source).not.toContain("acceptFields");
+    expect(source).not.toContain("hideSuggestion");
+    expect(source).not.toContain("AssistSuggestion");
+    // And still no second copy of the fields themselves.
     expect(source).not.toContain("Use this title");
     expect(source).not.toContain("Use this description");
     expect(source).not.toMatch(/<label[^>]*>\s*Title/);
@@ -98,10 +104,58 @@ describe("TaskManviAssist", () => {
     // `quick || historyOpen || proposal.state !== "ready" || (!showTitle…)`.
     expect(source).not.toContain("historyOpen ||");
     expect(source).toMatch(/\{#if proposal\}\s*\n\s*<article aria-label="Enhancement review">/);
-    // The duplicate-acceptance problem that condition was really solving is
-    // now solved without hiding the diff.
-    expect(source).toContain("const reviewOffersAccept = $derived(");
-    expect(source).toMatch(/\{#if reviewOffersAccept\}[\s\S]*?enhancements\.accept/);
+    // Nothing between the picker and the diff. `reviewOffersAccept` was the
+    // last condition that could leave a selected suggestion showing no
+    // buttons; acceptance is unconditional now, so changing the dropdown
+    // always changes what is on screen.
+    expect(source).not.toContain("reviewOffersAccept");
+    expect(source).not.toContain("showTitleSuggestion");
+    expect(source).not.toContain("showDescriptionSuggestion");
+    // No `{#if` of any kind stands between "a suggestion is ready" and the
+    // button that accepts it.
+    expect(source).toMatch(/\{#if proposal\.state === "ready"\}(?:(?!\{#if)[\s\S])*?enhancements\.accept/);
+  });
+
+  it("flashes the fields the store says changed, on the path that actually accepts", () => {
+    /*
+     * The flash used to be set by a second accept function the sheet called
+     * directly. Removing that left `mutate` — the one path acceptance now
+     * takes — setting no flash at all, so the cue would have been permanently
+     * dead while still looking wired. It reads `accepted_fields` off the
+     * result rather than the selection it sent, because the flash is a claim
+     * about what changed.
+     */
+    expect(source).toMatch(/if \(method === "enhancements\.accept"\) \{[\s\S]*?flash = \[\.\.\.changed\]/);
+    expect(source).toContain("const changed = proposal.accepted_fields.filter(");
+    expect(source).toMatch(/flashTimer = setTimeout\(\(\) => \{ flash = \[\]; \}, 1600\)/);
+    // And exactly one function writes it.
+    expect([...source.matchAll(/flash = \[\.\.\./g)]).toHaveLength(1);
+  });
+
+  it("says why acceptance is refused instead of only greying the button out", () => {
+    expect(source).toContain("const acceptBlock = $derived(");
+    expect(source).toContain("Save or reload your edits before accepting a suggestion.");
+    expect(source).toContain("This suggestion is for an older task revision. Ask again to apply it.");
+    expect(source).toMatch(/\{#if !applyBlock && acceptBlock && proposal\.state === "ready"\}/);
+    // The refusal and its reason are one expression, so the button can never be
+    // disabled with nothing beside it — nor enabled while the sentence shows.
+    expect(source).toContain("disabled={Boolean(acceptBlock) || disabled || controlsLocked || !selected.length}");
+  });
+
+  it("choosing which fields to accept is not an edit to the task", () => {
+    /*
+     * The sheet marks the task dirty from any `input` or `change` anywhere
+     * inside its form, and this checkbox lives inside it. Left to bubble,
+     * ticking a field marked the draft unsaved — and the unsaved-edits guard
+     * then refused the very acceptance the checkbox was selecting.
+     *
+     * Both events, because a checkbox click fires both. Stopping only `change`
+     * left `input` to mark it dirty and looked fixed while nothing had changed.
+     */
+    // One contiguous string, so both handlers are provably on the same element.
+    expect(source).toContain(
+      'oninput={(event) => event.stopPropagation()} onchange={(event) => { event.stopPropagation(); toggleSelected(',
+    );
   });
 
   it("never shows a suggestion the review is not rendering", () => {

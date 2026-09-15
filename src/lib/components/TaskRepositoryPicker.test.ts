@@ -28,11 +28,21 @@ describe("TaskRepositoryPicker", () => {
 
   it("keeps the answer on the closed trigger", () => {
     // A dropdown is only an improvement if collapsing it costs no information.
-    // `summaryLine` is the single owner of "how many are linked, and which is
-    // primary", and it is the trigger's own label.
-    expect(source).toContain("summaryLine(summary)");
+    // The trigger now names the repositories rather than counting them, so the
+    // guard is that both halves of the answer survive being closed: a chip per
+    // link, and the primary marked among them.
+    expect(source).toMatch(/class="gp-btn repo-trigger"[\s\S]*?\{#each chips as chip \(chip\.id\)\}/);
+    expect(source).toContain("class:is-primary={chip.primary}");
+    expect(source).toContain("{#if chip.primary}<Star");
+    // A collapsed remainder is still counted, never silently dropped.
+    expect(source).toContain("{#if overflow > 0}<span class=\"repo-more\">+{overflow}</span>{/if}");
+    // `summaryLine` stays the single owner of the sentence, and stays on
+    // screen — chips cannot say "no primary chosen".
     expect(source).toContain("const label = $derived(summaryLine(summary))");
-    expect(source).toMatch(/class="gp-btn repo-trigger"[\s\S]*?repo-trigger-label">\{label\}/);
+    expect(source).toMatch(/repo-summary-line"[^>]*>\{label\}/);
+    // With nothing linked the trigger carries the refusal itself, because that
+    // is the one state that stops the task saving.
+    expect(source).toMatch(/\{#if summary\.linked === 0\}<span class="repo-trigger-label">\{label\}<\/span>\{\/if\}/);
     expect(source).toContain('aria-expanded={open}');
     expect(source).toContain('aria-haspopup="dialog"');
   });
@@ -88,11 +98,27 @@ describe("TaskRepositoryPicker", () => {
   });
 
   it("never renders an unread workspace membership as an empty one", () => {
-    // `workspace` is null for "no home workspace"; `member` marks come from the
-    // rows, which the sheet derives with `members === null` meaning unread.
-    expect(source).toContain("row.member");
+    // `workspace` is null for "no home workspace". Membership is no longer a
+    // per-row mark — it is the "In this workspace" group, and `groupRows` only
+    // emits that group when some row carries `member`. With `members === null`
+    // the sheet leaves `member` false everywhere, so an unread membership
+    // produces no group at all rather than an empty one. `groupRows` owns that
+    // rule and taskRepositories.test.ts holds it; what this file guards is that
+    // the component asks that owner instead of splitting rows itself.
+    expect(source).toContain("const groups = $derived(groupRows(rows))");
+    expect(source).not.toMatch(/rows\.filter\(/);
+    // Reading the membership can also fail outright, which is a different
+    // thing from a workspace with nothing in it, and still says so.
     expect(source).toMatch(/\{#if workspace\.error\}[\s\S]*?\{:else if summary\.outsiders\.length\}/);
     expect(source).toContain("outsiderLine(summary.outsiders, workspace.name)");
+  });
+
+  it("groups the rows instead of listing the whole catalog flat", () => {
+    expect(source).toContain("{#each groups as group (group.id)}");
+    expect(source).toContain('<p class="repo-group">{group.label}</p>');
+    // A row filtered out but kept because it is linked still says why it is
+    // there, so the filter never looks like it is lying.
+    expect(source).toContain("row.keptByLink");
   });
 
   it("says which empty it is", () => {

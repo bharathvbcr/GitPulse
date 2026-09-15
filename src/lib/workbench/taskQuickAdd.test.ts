@@ -238,6 +238,43 @@ describe("parseQuickAddDue", () => {
     expect(parseQuickAddDue("today", Number.NaN)).toBeGreaterThan(0);
     expect(parseQuickAddDue("today", Number.POSITIVE_INFINITY)).toBeGreaterThan(0);
   });
+
+  it("reads a clock after a date word", () => {
+    expect(parseQuickAddDue("friday 5pm", NOW)).toBe(at(2026, 9, 11, 17, 0));
+    expect(parseQuickAddDue("friday-5:30pm", NOW)).toBe(at(2026, 9, 11, 17, 30));
+    expect(parseQuickAddDue("tomorrow 09:30", NOW)).toBe(at(2026, 9, 10, 9, 30));
+    expect(parseQuickAddDue("+2w 8am", NOW)).toBe(at(2026, 9, 23, 8, 0));
+    expect(parseQuickAddDue("today 00:00", NOW)).toBe(at(2026, 9, 9, 0, 0));
+  });
+
+  it("does not read a bare number as a clock", () => {
+    // `due:17` means nothing; silently turning it into five in the afternoon
+    // would be a guess, which is the one thing this grammar refuses to do.
+    expect(parseQuickAddDue("friday 17", NOW)).toBeNull();
+    expect(parseQuickAddDue("17", NOW)).toBeNull();
+  });
+
+  it("rejects an out-of-range clock rather than rolling it into the next day", () => {
+    expect(parseQuickAddDue("friday 25:00", NOW)).toBeNull();
+    expect(parseQuickAddDue("friday 10:75", NOW)).toBeNull();
+    expect(parseQuickAddDue("friday 13pm", NOW)).toBeNull();
+    expect(parseQuickAddDue("friday 0pm", NOW)).toBeNull();
+  });
+
+  it("leaves every date that already parsed on its own path", () => {
+    // The clock split runs only after the whole string fails, so an absolute
+    // date carrying its own time is untouched by it.
+    expect(parseQuickAddDue("2026-09-30T08:15", NOW)).toBe(at(2026, 9, 30, 8, 15));
+    expect(parseQuickAddDue("2026-09-30 08:15", NOW)).toBe(at(2026, 9, 30, 8, 15));
+    expect(parseQuickAddDue("2026-09-30-08:15", NOW)).toBe(at(2026, 9, 30, 8, 15));
+    expect(parseQuickAddDue("next-week", NOW)).toBe(at(2026, 9, 16));
+  });
+
+  it("refuses a clock with no date in front of it", () => {
+    expect(parseQuickAddDue("5pm", NOW)).toBeNull();
+    expect(parseQuickAddDue("-5pm", NOW)).toBeNull();
+    expect(parseQuickAddDue("someday 5pm", NOW)).toBeNull();
+  });
 });
 
 describe("matchQuickAddRepository", () => {

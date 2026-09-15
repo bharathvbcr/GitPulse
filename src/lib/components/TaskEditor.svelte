@@ -7,14 +7,14 @@
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import TaskManviAssist from "./TaskManviAssist.svelte";
   import TaskRepositoryPicker from "./TaskRepositoryPicker.svelte";
+  import TaskDuePicker from "./TaskDuePicker.svelte";
   import LabelInput from "./LabelInput.svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { askConfirm } from "../stores/modalStore";
   import { deleteTask, explainError, getTask, getTaskBrief, getWorkspace, newID, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, WorkbenchError, type EnhancementField, type Repository, type Task, type TaskDraft, type TaskStatus, type WorkspaceCard } from "../workbench/client";
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
   import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
-  import { linkSummary, repositoryRows, shouldOfferFilter } from "../workbench/taskRepositories";
-  import { dueInputValue, parseDueInput } from "../workbench/taskOrganize";
+  import { linkSummary, repositoryRows, shouldOfferFilter, triggerChips } from "../workbench/taskRepositories";
   import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
   import { editorTabBadge, editorTabHint, editorTabs, resolveEditorTab, type TaskEditorTab } from "../workbench/taskEditorTabs";
@@ -96,16 +96,22 @@
    * and sends a merged-away pane to the one that absorbed it.
    */
   let requestedTab = $state<TaskEditorTab>("task");
-  let suggestion = $state<{ title: string; description: string; showTitle: boolean; showDescription: boolean; blocked: string; flash: EnhancementField[] }>({
-    title: "", description: "", showTitle: false, showDescription: false, blocked: "", flash: [],
-  });
-  let assist = $state<{ acceptFields: (fields: EnhancementField[]) => void; hideSuggestion: () => void }>();
+  /**
+   * Fields a just-accepted suggestion rewrote, so they can flash.
+   *
+   * The only thing that crosses back from the assist. Accepting itself lives
+   * entirely inside the assist's review, beside the diff that shows what would
+   * change — the sheet used to draw a second "Use this title" button under
+   * each field, which left one decision with two owners.
+   */
+  let flash = $state<EnhancementField[]>([]);
+  /** A suggestion is waiting on the Task pane; the tab dot is drawn from this. */
+  let reviewable = $state(false);
   let runCount = $state(0);
   /** Display name of the engine the assist section would use; it owns the picker. */
   let assistName = $state(assistEngineName(DEFAULT_ASSIST_ENGINE));
   const tabs = $derived(editorTabs(Boolean(current)));
   const tab = $derived(resolveEditorTab(requestedTab, Boolean(current)));
-  const reviewable = $derived(suggestion.showTitle || suggestion.showDescription);
   let disposed = false;
   const kindIsCustom = $derived(!KIND_OPTIONS.includes(draft.kind as typeof KIND_OPTIONS[number]));
   $effect(() => { if (kindIsCustom) customKind = true; });
@@ -136,6 +142,7 @@
   );
   const rows = $derived(repositoryRows(known, draft.repository_ids, draft.primary_repository_id, homeMembers, repoFilter));
   const summary = $derived(linkSummary(known, draft.repository_ids, draft.primary_repository_id, homeMembers));
+  const trigger = $derived(triggerChips(known, draft.repository_ids, draft.primary_repository_id));
   const offerFilter = $derived(shouldOfferFilter(known.length));
   // Membership follows the draft's home workspace, not the board's scope: the
   // Home workspace control can move a task while the sheet is open.
@@ -439,73 +446,95 @@
   >
     <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
       <div class="pane" hidden={Boolean(current) && tab !== "task"} id={panelId(group, "task")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "task") : undefined}>
-        <!-- Two columns, not two panes. Writing a task, scheduling it and
-             asking the model to improve the wording are one sitting; the
-             suggestion cards below Title and Description are the reason —
-             they are drawn beside the field each one would replace, so the
-             controls that produce them cannot live behind another tab.
+        <!--
+          One column, five numbered sections, in the order a task actually gets
+          written: what it touches, what you dictated, what it says, how it is
+          scheduled, who owns it.
 
-             The columns are a container query, not a media query: the sheet
-             is a dock whose width the window only partly decides. -->
-        <div class="pane-grid">
-          <!-- `enhancementBusy` disables the fields a running suggestion may
-               rewrite. It wraps the columns' *fields* and never the assist,
-               which owns the cancel button for that same run. -->
-          <fieldset class="col" disabled={enhancementBusy}>
-            <TaskRepositoryPicker
-              {rows}
-              {summary}
-              {offerFilter}
-              bind:filter={repoFilter}
-              knownCount={known.length}
-              name={id}
-              {addable}
-              {adding}
-              {attaching}
-              workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}
-              disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
-              onToggle={membership}
-              onPrimary={setPrimary}
-              onAddPaths={(paths) => void addOpenPaths(paths)}
-              onAttachOutsiders={() => void attachOutsiders()}
+          This replaces a two-column grid. The columns were a container query
+          rather than a media query, which was the right call for a dock whose
+          width the window only partly decides — but the dock's floor is 380px
+          and the columns only fit past 520px, so the layout a reader got
+          depended on how far they had dragged a splitter. Numbering survives
+          that: the sheet reads as five things at every width.
+
+          Nothing is unnumbered and nothing is behind a disclosure. The model's
+          suggestions are not a sixth section either — they belong to the field
+          they were dictated into, so they live inside section 2.
+        -->
+        <div class="steps">
+          <section class="step">
+            <div class="step-head"><span class="step-n" aria-hidden="true">1</span><h3>Repositories</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <!-- `enhancementBusy` disables the fields a running suggestion may
+                 rewrite. It wraps the *fields* and never the assist, which owns
+                 the cancel button for that same run. -->
+            <fieldset disabled={enhancementBusy}>
+              <TaskRepositoryPicker
+                {rows}
+                {summary}
+                {offerFilter}
+                chips={trigger.chips}
+                overflow={trigger.overflow}
+                bind:filter={repoFilter}
+                knownCount={known.length}
+                name={id}
+                {addable}
+                {adding}
+                {attaching}
+                workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}
+                disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
+                onToggle={membership}
+                onPrimary={setPrimary}
+                onAddPaths={(paths) => void addOpenPaths(paths)}
+                onAttachOutsiders={() => void attachOutsiders()}
+              />
+            </fieldset>
+          </section>
+
+          <section class="step">
+            <div class="step-head"><span class="step-n" aria-hidden="true">2</span><h3>Quick add</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <!-- Dictating the task, choosing which model reads it, and
+                 reviewing what came back are one surface, above the fields the
+                 result lands in. The assist owns the whole lifecycle (polling,
+                 history, accept, undo) and sits outside the enhancement-busy
+                 fieldset so a running suggestion cannot disable its own
+                 cancel. -->
+            <TaskManviAssist
+              task={current}
+              {notes}
+              {dirty}
+              {active}
+              onNotes={(value) => { notes = value; dirty = true; }}
+              bind:title={draft.title}
+              bind:description={draft.description}
+              bind:lockedFields={draft.locked_fields!}
+              repositoryIds={draft.repository_ids}
+              repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
+              prepareTask={prepareForManvi}
+              onApplied={applied}
+              onBusy={(busy) => { enhancementBusy = busy; }}
+              onFlash={(fields) => { flash = fields; }}
+              onReview={(ready) => { reviewable = ready; }}
+              onEngine={(name) => { assistName = name; }}
+              disabled={saving || reloading || pending !== null || pendingDelete !== null}
             />
-            <label class:flash={suggestion.flash.includes("title")}>Title
-              <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
-            </label>
-            {#if suggestion.showTitle}
-              <div class="inline-suggestion">
-                <p class="meta">Suggested title</p>
-                <p class="suggestion-body suggested">{suggestion.title}</p>
-                <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title"])}>Use this title</button>
-              </div>
-            {/if}
-            <label class:flash={suggestion.flash.includes("description")}>Description
-              <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
-            </label>
-            {#if suggestion.showDescription}
-              <div class="inline-suggestion">
-                <p class="meta">Suggested description</p>
-                <pre class="suggestion-body suggested">{suggestion.description}</pre>
-                <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["description"])}>Use this description</button>
-              </div>
-            {/if}
-            {#if reviewable}
-              <div class="review-actions">
-                {#if suggestion.showTitle && suggestion.showDescription}
-                  <button type="button" class="gp-btn-primary" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title", "description"])}>Use both</button>
-                {/if}
-                <button type="button" class="gp-btn" disabled={enhancementBusy} onclick={() => assist?.hideSuggestion()}>Not now</button>
-                {#if suggestion.blocked}<p class="warn">{suggestion.blocked}</p>{/if}
-              </div>
-            {/if}
-            <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
-          </fieldset>
+          </section>
 
-          <div class="col">
-            <!-- A draft used to fold these away behind a disclosure because
-                 one column had no room for them. Two columns do, and a draft
-                 that hides fields a saved task shows is an asymmetry the
-                 reader has to learn for no reason. -->
+          <section class="step">
+            <div class="step-head"><span class="step-n" aria-hidden="true">3</span><h3>Title and description</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <fieldset disabled={enhancementBusy}>
+              <label class:flash={flash.includes("title")}>Title
+                <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
+              </label>
+              <label class:flash={flash.includes("description")}>Description
+                <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+              </label>
+              <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
+            </fieldset>
+          </section>
+
+          <section class="step">
+            <div class="step-head"><span class="step-n" aria-hidden="true">4</span><h3>Status and scheduling</h3><span class="step-rule" aria-hidden="true"></span></div>
             <fieldset disabled={enhancementBusy}>
               <div class="pair">
                 <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
@@ -525,14 +554,20 @@
                 </label>
                 <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
               </div>
-              <div class="pair">
-                <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
-                <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
+              <div class="due-field">
+                <span class="field-label">Due</span>
+                <!-- `disabled` is passed rather than inherited: the popover is
+                     portaled to the body, so a disabled fieldset around this
+                     component would not reach the controls inside it. -->
+                <TaskDuePicker
+                  value={draft.due_at}
+                  disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
+                  onChange={(next) => { draft.due_at = next; dirty = true; }}
+                />
               </div>
               <label>Labels
                 <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
               </label>
-              <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
               {#if current}
                 <div class="notifications-row">
                   <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
@@ -540,29 +575,18 @@
                 </div>
               {/if}
             </fieldset>
-            <!-- The assist owns the enhancement lifecycle (polling, history,
-                 accept/undo). It sits outside the enhancement-busy fieldset so
-                 a running suggestion cannot disable its own cancel. -->
-            <TaskManviAssist
-              bind:this={assist}
-              task={current}
-              {notes}
-              {dirty}
-              {active}
-              onNotes={(value) => { notes = value; dirty = true; }}
-              bind:title={draft.title}
-              bind:description={draft.description}
-              bind:lockedFields={draft.locked_fields!}
-              repositoryIds={draft.repository_ids}
-              repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
-              prepareTask={prepareForManvi}
-              onApplied={applied}
-              onBusy={(busy) => { enhancementBusy = busy; }}
-              onSuggestion={(state) => { suggestion = state; }}
-              onEngine={(name) => { assistName = name; }}
-              disabled={saving || reloading || pending !== null || pendingDelete !== null}
-            />
-          </div>
+          </section>
+
+          <section class="step">
+            <div class="step-head"><span class="step-n" aria-hidden="true">5</span><h3>Owner</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <fieldset disabled={enhancementBusy}>
+              <!-- The section heading already says "Owner", so the label is
+                   there for a screen reader rather than repeated on screen.
+                   Written on one line deliberately: the label's first child has
+                   to be the name, not a whitespace text node. -->
+              <label class="owner-field"><span class="sr-only">Owner</span><input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" placeholder="Unassigned" /></label>
+            </fieldset>
+          </section>
         </div>
       </div>
     </fieldset>
@@ -604,12 +628,6 @@
   .tab-hint{flex-shrink:0;margin:0 18px 10px;font-size:11px;color:rgb(var(--c-text-muted))}
   .tab-badge{margin-left:5px;padding:0 4px;border-radius:999px;font-size:9px;line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
   .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:999px;background:rgb(var(--c-accent));display:inline-block}
-  .inline-suggestion{margin:-6px 0 13px;padding:9px 10px;border:1px solid rgb(var(--c-border) / 0.7);border-radius:8px;background:rgb(var(--c-bg) / 0.45)}
-  .inline-suggestion .meta{margin:0 0 5px}
-  .suggestion-body{margin:0 0 8px;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:11rem;overflow:auto;font-family:inherit}
-  .suggested{color:rgb(var(--c-text))}
-  .review-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:13px}
-  .warn{margin:0;color:rgb(var(--c-text-muted));font-size:11px;flex-basis:100%}
   .flash :is(input,textarea){animation:gp-task-flash 1.1s ease-out}
   @keyframes gp-task-flash{from{border-color:rgb(var(--c-accent));box-shadow:0 0 0 3px rgb(var(--c-accent) / 0.18)}to{border-color:rgb(var(--c-border));box-shadow:none}}
   @media (prefers-reduced-motion: reduce){.flash :is(input,textarea){animation:none}}
@@ -622,11 +640,21 @@
      makes this a containing block for fixed descendants, which is why the
      repository popover is portaled to the body. */
   .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px;container-type:inline-size}
-  .pane-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 18px;align-items:start}
-  .pane-grid > .col{min-width:0}
-  @container (min-width: 520px){
-    .pane-grid{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)}
-  }
+  /* One column at every width. The two-column grid this replaces only applied
+     past 520px, so which layout a reader got depended on how far they had
+     dragged the dock's splitter. */
+  .steps{display:flex;flex-direction:column;gap:20px}
+  .step{min-width:0}
+  .step-head{display:flex;align-items:center;gap:7px;margin:0 0 8px}
+  .step-head h3{margin:0;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
+  .step-n{flex-shrink:0;width:16px;height:16px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.34)}
+  .step-rule{flex:1;height:1px;background:linear-gradient(to right,rgb(var(--c-border) / 0.55),transparent)}
+  /* The last field in a section carries the section's own bottom gap, not a
+     second one of its own. */
+  .step fieldset > :last-child{margin-bottom:0}
+  .due-field{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;min-width:0}
+  .field-label{color:rgb(var(--c-text-muted));font-size:11px}
+  .owner-field{margin-bottom:0;gap:0}
   header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
   .error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
 </style>

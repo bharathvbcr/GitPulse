@@ -220,13 +220,19 @@ const card = id => root.querySelector(`[data-task-card][data-card-id="${id}"]`);
 // the body, which is outside `root` — so these reach it through `document`,
 // the same way the context-menu helpers above already do.
 const repoToggle = () => editor()?.querySelector("[data-task-repo-picker] .repo-trigger");
+// Due is not a labelled input any more, so `field("Due")` cannot reach it.
+const dueTrigger = () => editor()?.querySelector('[data-testid="task-due-trigger"]');
 const repoPopup = () => document.querySelector("[data-task-repo-popup]");
 const openRepoPicker = async () => { if (!repoPopup()) repoToggle()?.click(); await settle(80); return repoPopup(); };
 // Dismissed the way a reader dismisses it: a pointerdown outside. The picker
 // listens on the capture phase, so this reaches it from `body`.
 const closeRepoPicker = async () => { if (repoPopup()) document.body.dispatchEvent(new PointerEvent("pointerdown", {bubbles:true})); await settle(60); };
 const repoRow = name => [...(repoPopup()?.querySelectorAll(".repo-row") ?? [])].find(row => row.querySelector(".repo-name")?.textContent.trim() === name);
-const repoSummaryText = () => repoToggle()?.textContent ?? "";
+// The whole closed control, not just the button: the trigger names the linked
+// repositories as chips and the `summaryLine` sentence sits directly under it,
+// because chips cannot say "no primary chosen". Both are what a reader sees
+// without opening anything, so both count as the summary.
+const repoSummaryText = () => editor()?.querySelector("[data-task-repo-picker]")?.textContent ?? "";
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
 const change = async (el, value, event = "input") => { if(!el) throw Error("Missing form field"); el.value = value; el.dispatchEvent(new Event(event, {bubbles:true})); await settle(); };
@@ -336,7 +342,7 @@ if (params.has("check")) {
     // Schedule and labels are on this pane too, beside the description rather
     // than behind a second tab.
     check("the merged pane carries schedule and labels beside the task text",
-      onScreen(field("Title")) && onScreen(field("Owner")) && onScreen(field("Due")) && onScreen(field("Labels")));
+      onScreen(field("Title")) && onScreen(field("Owner")) && onScreen(dueTrigger()) && onScreen(field("Labels")));
     paneTab("task").focus();
     paneTab("task").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
     await settle();
@@ -624,6 +630,12 @@ if (params.has("check")) {
       const descriptionCheck=[...review.querySelectorAll('label')].find(label=>label.textContent.trim()==="Description")?.querySelector('input');
       if(descriptionCheck?.checked) { descriptionCheck.click(); await settle(); }
     }
+    // Choosing which fields to accept must not mark the task edited: the sheet
+    // marks dirty from any change inside its form, and the unsaved-edits guard
+    // would then refuse the acceptance this checkbox was selecting.
+    check("choosing which fields to accept is not an edit to the task",
+      Boolean(button("Accept selected fields")) && !button("Accept selected fields").disabled
+      && !(editor()?.textContent ?? "").includes("before accepting a suggestion"));
     loseEnhancement=true;
     if(button("Accept selected fields")) await click("Accept selected fields");
     else if(button("Use this title")) await click("Use this title");
@@ -691,8 +703,25 @@ if (params.has("check")) {
       check("the picker never names a suggestion the review is not rendering", false);
     }
 
-    await change(field("Due"),"2026-09-01T09:30"); await click("Save task"); await settle(100);
-    check("due dates round-trip through the task editor", field("Due").value==="2026-09-01T09:30");
+    // Due is a picker now, not a `datetime-local` box: a trigger, a portaled
+    // popover, and a word box that shares quick add's `due:` grammar. Driving
+    // it the way a reader does is also what proves the grammar is wired —
+    // typing the date and pressing Return is the whole interaction.
+    dueTrigger().click(); await settle(80);
+    const duePhrase = document.querySelector('[data-testid="task-due-phrase"]');
+    await change(duePhrase, "2026-09-01 09:30");
+    duePhrase.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await settle(120);
+    const dueExpected = Math.floor(new Date(2026, 8, 1, 9, 30, 0, 0).getTime() / 1000);
+    check("the due picker reads a typed date through quick add's own grammar",
+      dueTrigger().textContent.includes("2026") && !dueTrigger().textContent.includes("No due date"));
+    document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+    await click("Save task"); await settle(100);
+    // The stored second, not the rendered string: the trigger formats for the
+    // reader's locale, so asserting its text would only test the runner's.
+    check("due dates round-trip through the task editor",
+      tasks.some(task => task.id === "task-2" && task.due_at === dueExpected)
+      && dueTrigger().textContent.includes("2026"));
     editor().querySelector('[data-sheet-tab="agent"]').click(); await settle();
     await change(field("Owner"),"ada"); await click("Save task"); await settle(100);
     check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="agent"]').getAttribute("aria-selected")==="true");
@@ -721,24 +750,34 @@ if (params.has("check")) {
     check("one click saves the rough idea and starts Manvi with both fields", quickProposal.fields.length===2 && quickProposal.source.description.includes("explain recovery steps") && quickProposal.source.repository_ids[0]==="repo-0");
     check("Draft with Manvi consumes notes after extract", idea.value.trim() === "");
     check("drafted sheet keeps a single Manvi assist section", Boolean(editor().querySelector('[aria-label="Manvi task assist"]')) && !editor().querySelector('[aria-label="Manvi task enhancements"]'));
-    check("inline suggestions own acceptance, and the review still shows the diff",
+    // Acceptance has exactly one home now: the review, beside the diff. The
+    // sheet used to draw "Use this title" under each field while the review
+    // drew no buttons at all, which is what let the history picker change
+    // nothing visible. A vacuous version of this check passed either way, so
+    // it asserts both halves: the review offers it, and the sheet does not.
+    const acceptButton = () => button("Accept selected fields") ?? button("Apply enhancement");
+    proposals.set(quickProposal.id,{...quickProposal,revision:quickProposal.revision+1,state:"ready",proposed:{title:"Reliable task notifications",description:"Preserve saved evidence, route notifications to the correct task, and verify recovery."}});
+    await wait(()=>acceptButton());
+    // Asserted once the suggestion is ready, which is the only state in which
+    // acceptance is offered at all.
+    check("acceptance lives once, in the review that shows the diff",
       (() => {
         const article = editor().querySelector('article[aria-label="Enhancement review"]');
         if (!article) return false;
-        const inline = Boolean(button("Use both") || button("Use this title") || button("Use this description"));
-        if (!inline) return true;
-        return !button("Accept selected fields", article) && article.querySelectorAll('input[type="checkbox"]').length === 0;
+        if (button("Use both") || button("Use this title") || button("Use this description")) return false;
+        return Boolean(acceptButton()) && article.contains(acceptButton())
+          && article.querySelectorAll('input[type="checkbox"]').length > 0;
       })());
-    proposals.set(quickProposal.id,{...quickProposal,revision:quickProposal.revision+1,state:"ready",proposed:{title:"Reliable task notifications",description:"Preserve saved evidence, route notifications to the correct task, and verify recovery."}});
-    await wait(()=>button("Use both"));
     await change(field("Description"),"Unsaved evidence that must survive");
-    check("inline acceptance refuses to overwrite unsaved task edits", button("Use both").matches(":disabled"));
+    check("acceptance refuses to overwrite unsaved task edits, and says why",
+      acceptButton().matches(":disabled")
+      && editor().textContent.includes("before accepting a suggestion"));
     await change(field("Description"),quickProposal.source.description);
     // Reload the saved revision so this acceptance starts from clean state.
     await click("Reload saved"); await settle(100);
-    loseEnhancement=true; await click("Use both");
+    loseEnhancement=true; acceptButton().click(); await settle();
     const retryInline=button("Retry pending action");
-    check("lost inline acceptance retains a retry and blocks closing", Boolean(retryInline) && button("Close task details").disabled);
+    check("a lost acceptance retains a retry and blocks closing", Boolean(retryInline) && button("Close task details").disabled);
     if(retryInline) await click("Retry pending action");
     await wait(()=>tasks.find(task=>task.id===quickProposal.task_id)?.title==="Reliable task notifications");
     check("applying the default quick enhancement updates title and description together", tasks.find(task=>task.id===quickProposal.task_id).description.includes("verify recovery"));
@@ -1176,7 +1215,7 @@ if (params.has("check")) {
     check("choosing the on-device engine renames the action and says where it runs",
       /Apple Intelligence/.test(enhanceButton().textContent) && editor().textContent.includes("Nothing leaves this Mac"));
     const writesBefore = enhancementWrites.length;
-    enhanceButton().click(); await wait(() => button("Use both"));
+    enhanceButton().click(); await wait(() => button("Accept selected fields"));
     const appleWrites = enhancementWrites.slice(writesBefore);
     check("the on-device draft is one proposal in the same store, generated here",
       appleWrites[0].method === "enhancements.create" && appleWrites[0].provider === "apple-intelligence"
@@ -1190,9 +1229,17 @@ if (params.has("check")) {
       && [appleDrafts[0].notes, appleDrafts[0].title, appleDrafts[0].description].join(" ").includes("wrong task after a rename")
       && appleDrafts[0].context.includes(`Repository: ${repos[0].name}`)
       && !("model" in appleDrafts[0]) && !("base_url" in appleDrafts[0]));
+    // "Exactly like a Manvi one" is the point: one review, both fields
+    // selectable, one accept, one dismiss — whoever wrote the text.
     check("an on-device suggestion is reviewed exactly like a Manvi one",
-      Boolean(button("Use this title")) && Boolean(button("Use this description")) && Boolean(button("Not now")));
-    await click("Use both"); await settle(150);
+      (() => {
+        const article = editor().querySelector('article[aria-label="Enhancement review"]');
+        if (!article) return false;
+        const labels = [...article.querySelectorAll("label")].map(el => el.textContent.trim());
+        return labels.includes("Title") && labels.includes("Description")
+          && Boolean(button("Accept selected fields", article)) && Boolean(button("Dismiss", article));
+      })());
+    await click("Accept selected fields"); await settle(150);
     const drafted = [...proposals.values()].at(-1);
     check("accepting an on-device suggestion goes through the same acceptance",
       drafted.state === "accepted" && field("Title").value === "Route notifications to the right task");
