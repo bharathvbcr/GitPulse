@@ -737,7 +737,12 @@ if (params.has("check")) {
     confirmAnswer=true; await click("Close task details");
     await click("New task");
     const idea=root.querySelector(".notes-label textarea");
-    check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Improve with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    // "Draft", not "Improve": an empty new task has no notes, title or
+    // description, so `draftingKind` is `draft` and the verb follows the kind.
+    // This line pinned "Improve" — the exact disagreement between the button's
+    // verb and the request's kind that `draftingKind`/`draftingVerb` were
+    // extracted to end, so it was asserting the bug rather than the fix.
+    check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Draft with Manvi")) && !editor().querySelector('.sheet-tabs'));
     await change(idea,"Fix notification routing\nKeep saved task evidence and explain recovery steps.");
     await wait(() => button("Draft with Manvi") && !button("Draft with Manvi").disabled);
     await click("Draft with Manvi");
