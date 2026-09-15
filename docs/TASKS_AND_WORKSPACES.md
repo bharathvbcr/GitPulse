@@ -60,29 +60,54 @@ focuses the field from anywhere on the board. Where the scope supplies no
 repository — an empty workspace — the line needs `^name`, and the refusal names
 both that marker and Shift+Return rather than only failing.
 
+The line has two modes, and the choice is remembered per profile and restored by
+**Reset board view**. **Manual** saves what you typed. **Draft** saves exactly
+the same task and *then* asks the configured model for a title and description,
+opening **Quick Enhance** on the new task so you can accept or reject them. Three
+things follow from that order, and the preview states them before you press
+Return:
+
+* The card reaches the board carrying your own words. A line with no title is
+  refused in this mode too, so a placeholder task never exists.
+* The markers are never in scope for the model. It can propose a title and a
+  description and nothing else, so priority, labels, owner, type, repository and
+  due date are whatever you typed.
+* A model that is not configured, cannot be reached, or is refused costs you
+  nothing: the task is already saved, and the sheet says what went wrong with
+  the same **Retry Manvi configuration** and **Start again** controls the editor
+  has. Closing the sheet keeps the suggestion in history.
+
 For anything longer:
 
 1. Choose a scope and select **New task**. **Repositories** leads the sheet,
    because a task cannot be saved without one. Then enter a title and
    description, or use notes to seed them.
 2. Set its type, status and details: priority, severity, owner, due date, labels,
-   acceptance criteria and optional home workspace. A draft keeps these under one
-   **Schedule and labels** disclosure; a saved task gets its own **Organize** pane.
+   acceptance criteria and optional home workspace. They sit in the second
+   column, beside the description, for a draft and a saved task alike.
 3. Save, then use **Board** or **List** to organize the same results. Statuses are
    Inbox, Backlog, Ready, In progress, Review and Done.
 
 ### Choosing repositories
 
-One control links repositories and picks the primary among them: check a
-repository to link it, then choose **Primary** on any linked row. A line above
-the list reports how many are linked and which is primary, so the answer stays
-on screen while the rows scroll. Past six repositories the picker offers a
-filter; a linked repository is never hidden by it, and is marked **Linked** when
-it is only on screen because you linked it. Repositories keep catalog order, so
-a row cannot move out from under the pointer that just checked it.
+One control links repositories and picks the primary among them. It is a
+dropdown, and its closed label is the answer: "2 repositories linked · primary
+GitPulse", or "No repository linked yet — a task needs one." Open it to check a
+repository to link it, then choose **Primary** on any linked row; the label
+updates without the dropdown closing, so linking several in a row is one
+gesture. Past six repositories it offers a filter; a linked repository is never
+hidden by it, and is marked **Linked** when it is only on screen because you
+linked it. Repositories keep catalog order, so a row cannot move out from under
+the pointer that just checked it.
+
+The dropdown closes on Escape — without closing the task behind it — on a click
+outside, and when the sheet scrolls, because a popover that outlives the control
+it is anchored to lies about what it is editing.
 
 When the task has a home workspace, its member repositories are marked **In
-workspace**. Linking one that is not a member is allowed and the sheet says so,
+workspace**. Linking one that is not a member is allowed and the sheet says so —
+on the sheet itself, not inside the dropdown, because it is a consequence of the
+current links and something to act on rather than something to go looking for —
 with **Add to workspace** to close the gap. Nothing is joined silently. A
 membership the sheet could not read is reported as unread rather than drawn as
 an empty workspace.
@@ -92,14 +117,20 @@ it also joins what it adds to that workspace — its label names the workspace, 
 does the confirmation. It offers the repositories already open in GitPulse, the
 registered ones that workspace has not joined yet, and a folder picker.
 
-A saved task's sheet has four panes. **Task** carries what the work is —
-repository links, title, description, status, priority, type and acceptance
-criteria — and is where Manvi's suggestions appear, under the field each one
-would replace.
-**Organize** holds severity, owner, due date, labels, home workspace and
-notifications. **Agent** hands the saved revision to a coding agent and lists
-that task's runs. **AI** holds the drafting controls and suggestion history. A
-new task has only the first pane and no tab strip.
+A saved task's sheet has two panes. **Task** is the whole task in two columns:
+on the left, repository links, title, description and acceptance criteria, with
+the model's suggestions under the field each one would replace; on the right,
+status, priority, type, severity, due date, owner, labels, home workspace,
+notifications, and the drafting controls and suggestion history that produce
+those suggestions. Writing a task, scheduling it and asking for better wording
+are one sitting, and they used to be three panes — with the AI pane's output
+drawn on the Task pane, so you pressed a button on one pane and read the result
+on another. On a narrow window the two columns become one, in that order.
+
+**Agent** hands the saved revision to a coding agent and lists that task's runs;
+it stays separate because launching something that will act on the work is a
+different decision from writing it. A new task has only the first pane and no
+tab strip.
 
 **View** above the board chooses the layout, how tightly cards pack, which of the
 six columns are on screen and which chips a card carries. The choices are saved
@@ -174,23 +205,36 @@ all; a Mac that has Apple Intelligence switched off, still preparing the model, 
 that cannot run it shows the option with that reason and keeps Manvi selected.
 Very long tasks are refused before the model runs, with the limit named.
 
-**Task model settings** lets you choose a provider and model for suggestions in
-this editor and reload Manvi's configuration. This uses Manvi's task provider
-configuration, independently of the application header's model selection. Missing
-configuration is shown before generation; no model or endpoint is substituted.
+The assist section names the model it would use and links to **Local model
+servers** to change it. This uses Manvi's task provider configuration,
+independently of the application header's model selection. Missing configuration
+is shown before generation; no model or endpoint is substituted.
 
 The proposed title and description appear beside their editable fields. Choose
 **Use this title**, **Use this description** or **Use both**. **Not now** hides the
 suggestion while retaining it in Manvi history. Field locks prevent enhancement
 of the locked title or description; acceptance requires saved edits and checks
-the saved task revision. A running suggestion blocks another generation from the
+the saved task revision.
+
+Every attempt a task has had is in the **Suggestion** dropdown beside them, each
+row naming its number, state, model, time and the task revision it was written
+against — enough to tell two runs of one model apart. Changing the selection
+always shows that attempt's text straight away; when the accept buttons are
+already beside the fields the review shows the difference without offering a
+second way to accept it, so the two cannot disagree. An attempt that cannot be
+applied — superseded by a newer task revision, already accepted, or blocked by a
+field lock — says which of those it is instead of quietly having no button. The
+list loads the 30 newest and reports how many of how many are on screen;
+**Load more** pages without moving your selection. A running suggestion blocks another generation from the
 same surface. If an action's reply is lost, **Retry pending action** reconciles
 the same request before editing or closing. Once acceptance is confirmed, a failed
 task refresh retries only the read.
 
 **Quick Enhance** opens a separate sheet for an existing task. It exposes details
 omitted from compact cards, lets you select unlocked fields, and shows proposal
-history with **Apply enhancement** and dismissal controls. It shares the editor's
+history with **Apply enhancement** and dismissal controls. It is also where a
+quick-added task lands when the line was added in **Draft** mode, with its
+suggestion already being written. It shares the editor's
 enhancement review and retry lifecycle. Automatic suggestion
 settings are separate from this manual request; generated text still needs review.
 
@@ -260,7 +304,7 @@ failed and skipped tasks remain selected. An uncertain editor deletion offers
 
 This guide describes the current source paths in `src/lib/workbench/`,
 `src/lib/ai/appleIntelligence.ts`, `src-tauri/src/ai/apple.rs`, `TaskBoard.svelte`,
-`TaskEditor.svelte`, `TaskQuickAdd.svelte`, `TaskViewMenu.svelte`,
+`TaskEditor.svelte`, `TaskRepositoryPicker.svelte`, `TaskQuickAdd.svelte`, `TaskViewMenu.svelte`,
 `TaskHandoffForm.svelte`, `TaskAgentPanel.svelte`, `TaskManviAssist.svelte` and
 `QuickEnhanceSheet.svelte`. Whether a scope can hold a new task lives in
 `taskCreation.ts`, the sheet's repository picker in `taskRepositories.ts`, and

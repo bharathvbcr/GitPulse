@@ -70,10 +70,14 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   await wait(() => !enhance().matches(":disabled"));
   enhance().click();
   await wait(() => state("Ready for review") || Boolean(button("Use both", editor())) || Boolean(button("Use this title", editor())));
-  if (!editor().querySelector('article[aria-label="Enhancement review"]')) {
-    editor().querySelector<HTMLElement>(".history-drawer > summary")?.click();
-    await wait(() => Boolean(editor().querySelector('article[aria-label="Enhancement review"]')));
-  }
+  // This used to click open a `<details>` when the review was missing. The
+  // review being missing *was* the defect: it was suppressed whenever a ready
+  // suggestion was already showing beside the fields, so a reader changing the
+  // history selection saw nothing change. A fallback here would hide that.
+  assert(
+    Boolean(editor().querySelector('article[aria-label="Enhancement review"]')),
+    "Review is not on screen for the selected suggestion",
+  );
   assert(field("Title", "input").value === title, "Generation changed the task before acceptance");
   assert(field("Description", "textarea").value === description, "Generation changed description before acceptance");
   results.push("Generation leaves saved task fields unchanged");

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { Sparkles, X } from "@lucide/svelte";
+  import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { cardScale, backdropFade, backdropFadeOut } from "../ui/transitions";
@@ -14,12 +15,22 @@
   let {
     taskId,
     repoName,
+    startRequest = 0,
     onClose,
     onApplied,
     onOpenEditor,
   }: {
     taskId: string;
     repoName: (id: string) => string | undefined;
+    /**
+     * Bumped by the board to start a draft as soon as this opens.
+     *
+     * Quick add's drafting mode lands here: the task is already saved and on
+     * the board, and this sheet is where its suggestion is reviewed. Zero
+     * means the reader opened the sheet themselves and nothing runs until
+     * they ask.
+     */
+    startRequest?: number;
     onClose: () => void;
     onApplied: (task: Task) => void;
     onOpenEditor: (task: Task) => void;
@@ -59,7 +70,13 @@
   }
 </script>
 
+<!--
+  Portaled like the other two task dialogs. This was the one that was not, and
+  a right-edge drawer rendered in place is one `contain:paint` ancestor away
+  from being clipped by a pane it is supposed to float over.
+-->
 <div
+  use:portal={"body"}
   class="gp-scrim bg-black/40 flex justify-end gp-gpu"
   style="z-index: {LAYERS.MODAL}"
   role="presentation"
@@ -68,28 +85,35 @@
   in:fade={backdropFade()}
   out:fade={backdropFadeOut()}
 >
+  <!-- Same material, width token and header/footer rhythm as the task sheet
+       it sits beside: these two are read one after the other, and a drawer
+       that looks like a different application is the tell that they were
+       styled by two people. -->
   <div
     use:trapFocus={{ autofocus: true }}
     in:scale={cardScale()}
-    class="gp-card shadow-float h-full w-[min(440px,96vw)] flex flex-col overflow-hidden text-xs text-textPrimary gp-gpu"
+    class="gp-card gp-glass shadow-float h-full flex flex-col overflow-hidden text-xs text-textPrimary gp-gpu"
+    style="width: min(var(--gp-task-sheet-w), 96vw)"
     role="dialog"
     aria-modal="true"
     aria-labelledby="quick-enhance-title"
   >
-    <header class="p-4 border-b border-border/60 gp-section-edge flex items-start justify-between gap-3">
+    <header class="px-[18px] pt-4 pb-2.5 border-b border-border/60 gp-section-edge flex items-start justify-between gap-3">
       <div class="min-w-0">
         <p id="quick-enhance-title" class="text-sm font-semibold flex items-center gap-1.5">
           <Sparkles size={14} class="text-accent shrink-0" />
           Quick Enhance
         </p>
         <p class="text-[11px] text-textMuted mt-1 leading-relaxed">
-          Review hidden fields, then let Manvi rewrite title and description.
+          {startRequest > 0
+            ? "Task saved. A title and description are being drafted for you to accept or reject."
+            : "Review hidden fields, then let Manvi rewrite title and description."}
         </p>
       </div>
       <button type="button" class="gp-icon-btn" aria-label="Close Quick Enhance" onclick={onClose} disabled={busy}><X size={14} /></button>
     </header>
 
-    <div class="flex-1 overflow-auto p-4 space-y-4">
+    <div class="flex-1 overflow-auto px-[18px] py-4 space-y-4">
       {#if loading}<p role="status" class="text-textMuted">Loading task…</p>{/if}
       {#if error}<p role="alert" class="text-rose-400">{error}</p>{/if}
       {#if task}
@@ -119,6 +143,7 @@
         </div>
         <TaskManviAssist
           {task}
+          {startRequest}
           bind:title
           bind:description
           bind:lockedFields
@@ -130,7 +155,7 @@
         />
       {/if}
     </div>
-    <footer class="p-3 border-t border-border/60 gp-section-edge flex justify-between gap-2">
+    <footer class="px-[18px] pt-2.5 pb-4 border-t border-border/45 flex justify-between gap-2">
       <button type="button" class="gp-btn" disabled={!task || busy} onclick={() => { if (task) onOpenEditor(task); }}>Open full editor</button>
     </footer>
   </div>

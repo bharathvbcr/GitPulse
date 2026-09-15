@@ -155,13 +155,78 @@ describe("TaskBoard", () => {
     expect(source).toContain("showAllTaskColumns");
   });
 
-  it("adds a task from one line and can hand that line to the full editor", () => {
+  it("adds a task from one line, and can hand it to the editor or to the model", () => {
     expect(source).toContain("TaskQuickAdd");
     expect(source).toContain("createFromQuickAdd");
     expect(source).toContain("quickAddDraft");
     expect(source).toContain("expandQuickAdd");
     // The quick-add path saves through the same write the editor uses.
     expect(source).toContain("putTask(taskWrite(");
+    // The drafting mode is a preference, not a per-keystroke choice, and it is
+    // read from the one place board preferences live.
+    expect(source).toContain("$interfaceStore.taskQuickAddAssist");
+    expect(source).toContain("interfaceStore.setTaskQuickAddAssist");
+    expect(source).toContain("startRequest={enhanceStart}");
+  });
+
+  it("keeps the drafting request tied to the sheet that asked for it", () => {
+    /*
+     * `startRequest` is a counter each Quick Enhance instance compares against
+     * its own zero, so two things have to hold or it aims at the wrong task.
+     *
+     * The sheet is keyed: it loads its task once, on mount, so swapping the id
+     * under a live instance would leave the reader reading the previous task.
+     * And opening the sheet to *read* resets the counter: left standing from a
+     * drafting run, it would auto-start on whatever is opened next and spend a
+     * model request nobody asked for.
+     */
+    expect(source).toMatch(/\{#key enhanceId\}\s*\n\s*<QuickEnhanceSheet/);
+    const start = source.indexOf("async function openQuickEnhance(");
+    expect(start, "openQuickEnhance is missing").toBeGreaterThan(0);
+    const end = source.indexOf("\n  function refuseAtCeiling(", start);
+    expect(end, "openQuickEnhance has no end anchor").toBeGreaterThan(start);
+    expect(source.slice(start, end)).toContain("enhanceStart = 0");
+    // And only asking raises it.
+    expect([...source.matchAll(/enhanceStart\s*\+=/g)]).toHaveLength(1);
+  });
+
+  it("asks before discarding editor edits, and asks before it writes", () => {
+    /*
+     * The drafting mode ends by opening Quick Enhance over whatever sheet is
+     * open, so it has to ask the discard question first. Reversed, a reader
+     * who answers "Keep editing" has already had a task created that they
+     * cannot review — the write happened, the review surface did not open.
+     *
+     * Sliced by index, not matched with a lazy regex across the file: a
+     * `[\s\S]*?` here would happily find a `putTask` in some later function
+     * and report an ordering this function does not have.
+     */
+    const start = source.indexOf("async function createFromQuickAdd(");
+    expect(start).toBeGreaterThan(0);
+    const end = source.indexOf("\n  /** Hand a typed quick-add line", start);
+    expect(end, "createFromQuickAdd has no end anchor").toBeGreaterThan(start);
+    const body = source.slice(start, end);
+    const confirm = body.indexOf("confirmDiscard(");
+    const write = body.indexOf("putTask(taskWrite(");
+    expect(confirm, "the drafting mode must confirm").toBeGreaterThan(0);
+    expect(write).toBeGreaterThan(0);
+    expect(confirm).toBeLessThan(write);
+    // And only the drafting mode asks: a plain Add never had a sheet to lose.
+    expect(body).toContain('mode === "assist" && !(await confirmDiscard(');
+  });
+
+  it("gives both quick-add modes the same refusal", () => {
+    // Drafting cannot open a repository picker any more than typing can, so a
+    // second refusal string here would be two answers to one question.
+    const start = source.indexOf("async function createFromQuickAdd(");
+    const end = source.indexOf("\n  /** Hand a typed quick-add line", start);
+    const body = source.slice(start, end);
+    // Enumerated rather than counted: what matters is that no *hand-written*
+    // message appears here, in either mode. `quickAddRefusal` owns the
+    // no-repository answer and `explainError` owns the write failure; the
+    // empty string is the reset before the write.
+    const assigned = [...body.matchAll(/error = ([^;]+);/g)].map((match) => match[1].trim());
+    expect(assigned).toEqual(['quickAddRefusal(creation)', '""', "explainError(cause)"]);
   });
 
   it("offers an agent handoff from the card menu and the selection bar", () => {

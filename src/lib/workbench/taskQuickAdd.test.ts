@@ -6,6 +6,8 @@ import {
   matchQuickAddRepository,
   parseQuickAdd,
   parseQuickAddDue,
+  quickAddAssistPlan,
+  isQuickAddMode,
   quickAddDraft,
 } from "./taskQuickAdd";
 
@@ -401,5 +403,69 @@ describe("quick add under hostile input", () => {
     const result = parseQuickAdd("Title ^xxx", { repositories: hostile, now: NOW });
     expect(result.repositoryId).toBeNull();
     expect(result.warnings.map((w) => w.code)).toContain("unknown_repository");
+  });
+});
+
+describe("quickAddAssistPlan", () => {
+  const plan = (line: string) => quickAddAssistPlan(parseQuickAdd(line, { repositories: [{ id: "r1", name: "GitPulse" }], now: NOW }));
+
+  it("builds its sentence from the fields it asks for, and names no others", () => {
+    // The sentence is the whole contract this function exists to state, so it
+    // is derived from `asks` rather than written out beside it. A line thick
+    // with markers must not widen the promise: everything those markers set is
+    // already saved, and the model is never offered them.
+    expect(plan("Fix the retry loop").sentence).toContain("a title and a description");
+    const marked = plan("Fix the retry loop !high #ci @ada ~bug ^GitPulse due:friday :: it drops the last attempt");
+    expect(marked.sentence).toContain("a title and a description");
+    for (const field of ["priority", "label", "owner", "repository", "due", "type", "notes"]) {
+      expect(marked.sentence.toLowerCase(), field).not.toContain(field);
+    }
+  });
+
+  it("asks the model for exactly the two fields it is allowed to write", () => {
+    // EnhancementField is `"title" | "description"`, enforced by the store's
+    // decoder and the field-lock table. Everything the markers set is out of
+    // scope by type, which is why "markers win" needs no tiebreak rule.
+    expect(plan("Fix the retry loop").asks).toEqual(["title", "description"]);
+    expect(plan("Fix it !urgent #ci @ada ~bug ^GitPulse due:friday").asks).toEqual(["title", "description"]);
+  });
+
+  it("refuses a line that is not a task, and asks for nothing", () => {
+    // Drafting improves a task; it cannot invent one. Gating on the same
+    // `usable` the manual path uses is what stops a placeholder card ever
+    // reaching the board.
+    const refused = plan("!high #ci");
+    expect(refused.asks).toEqual([]);
+    expect(refused.sentence).toContain("Type a title first");
+  });
+
+  it("states what happens before anything is written", () => {
+    const sentence = plan("Fix the retry loop").sentence;
+    expect(sentence).toContain("Saves this line now");
+    expect(sentence).toContain("accept or reject");
+  });
+
+  it("never throws, and never claims a field the draft does not carry, on hostile input", () => {
+    const repositories = [{ id: "r1", name: "GitPulse" }];
+    for (const line of ["", "   ", "::", "!", "#", "@", "~", "^", "due:", "a".repeat(MAX_QUICK_ADD_LENGTH + 50), "__proto__", "constructor !1", String.fromCharCode(0, 1), "x :: " + "y".repeat(5000)]) {
+      const parsed = parseQuickAdd(line, { repositories, now: NOW });
+      const result = quickAddAssistPlan(parsed);
+      expect(typeof result.sentence, line).toBe("string");
+      expect(result.sentence.length, line).toBeGreaterThan(0);
+      // Never a field outside the store's closed union, whatever was typed.
+      expect(result.asks.filter((field) => field !== "title" && field !== "description"), line).toEqual([]);
+      // A line that is not a task asks for nothing, and a line that is asks
+      // for both — so the sentence and the request can never come apart.
+      expect(result.asks, line).toEqual(parsed.usable ? ["title", "description"] : []);
+      for (const field of result.asks) expect(result.sentence, line).toContain(`a ${field}`);
+    }
+  });
+});
+
+describe("isQuickAddMode", () => {
+  it("accepts the two modes and nothing else", () => {
+    expect(isQuickAddMode("manual")).toBe(true);
+    expect(isQuickAddMode("assist")).toBe(true);
+    for (const value of ["", "ai", null, undefined, 0, {}, "constructor"]) expect(isQuickAddMode(value)).toBe(false);
   });
 });

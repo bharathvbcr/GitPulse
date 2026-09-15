@@ -40,6 +40,17 @@ describe("interfaceStore", () => {
     expect(get(interfaceStore).statusIconCounts).toBe(false);
   });
 
+  it("leaves quick-add drafting off until it is asked for, and resets with the board view", () => {
+    // It changes what Return does and spends a model call, so it is opt-in.
+    // A reader who never touches the segment never meets the model at all.
+    expect(get(interfaceStore).taskQuickAddAssist).toBe(false);
+    interfaceStore.setTaskQuickAddAssist(true);
+    expect(get(interfaceStore).taskQuickAddAssist).toBe(true);
+    // It is a board-level choice, so "Reset board view" means all of it.
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskQuickAddAssist).toBe(false);
+  });
+
   it("hides and re-shows the language bar independently", () => {
     interfaceStore.setShowLanguageBar(false);
     expect(get(interfaceStore).showLanguageBar).toBe(false);

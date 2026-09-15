@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { Task } from "./client";
+import { ENHANCEMENT_STATES, type Enhancement, type EnhancementSummary, type Task } from "./client";
 import { acceptEnhancementInput, createEnhancementInput, runAppleEnhancement,
   assistEngineName,
+  enhancementApplyBlock,
+  enhancementOptionLabel,
   DEFAULT_ASSIST_ENGINE,
   ASSIST_ENGINE_LIST,
+  ENHANCEMENT_STATE_LABELS,
 } from "./taskEnhance";
 
 const task: Task = {
@@ -163,5 +166,111 @@ describe("engine names", () => {
   it("cannot be reached through a polluted prototype", () => {
     expect(assistEngineName("constructor" as never)).toBeUndefined();
     expect(assistEngineName("__proto__" as never)).toBeUndefined();
+  });
+});
+
+const summary = (over: Partial<EnhancementSummary> = {}): EnhancementSummary => ({
+  id: "e1", revision: 2, updated_at: 10, task_id: "t1", source_revision: 4,
+  fields: ["title"], state: "ready", provider: "local", model: "qwen", automatic: false,
+  created_at: 100, expires_at: 200, worker_id: null, failure: "",
+  accepted_fields: [], edited_fields: [], outcome_uncertain: false, ...over,
+});
+
+describe("ENHANCEMENT_STATE_LABELS", () => {
+  it("names every state the store can return", () => {
+    // A total map: a state added upstream must not render `undefined` in a
+    // picker option, which is where a missing label would first be seen.
+    for (const state of ENHANCEMENT_STATES) {
+      expect(ENHANCEMENT_STATE_LABELS[state], state).toBeTruthy();
+    }
+    expect(Object.keys(ENHANCEMENT_STATE_LABELS).sort()).toEqual([...ENHANCEMENT_STATES].sort());
+  });
+
+  it("cannot be reached through a polluted prototype", () => {
+    expect(ENHANCEMENT_STATE_LABELS["constructor" as never]).toBeUndefined();
+  });
+});
+
+describe("enhancementOptionLabel", () => {
+  it("names the attempt, its state, its model, when it ran and what it was written against", () => {
+    expect(enhancementOptionLabel(summary(), { ordinal: 7, when: "3m ago" }))
+      .toBe("#7 · Ready for review · qwen · 3m ago · rev 4");
+  });
+
+  it("tells two runs of the same model on the same revision apart", () => {
+    // The old rows read `state · model` + `Task revision N` — for two attempts
+    // against one revision with one model that is the same string twice, which
+    // is what made the list unusable. Same second, same everything else: the
+    // ordinal is what has to separate them.
+    const a = enhancementOptionLabel(summary({ id: "a" }), { ordinal: 7, when: "just now" });
+    const b = enhancementOptionLabel(summary({ id: "b" }), { ordinal: 6, when: "just now" });
+    expect(a).not.toBe(b);
+  });
+
+  it("adds a qualifier only when it applies, and only at the end", () => {
+    expect(enhancementOptionLabel(summary({ automatic: true }), { ordinal: 1, when: "x" }))
+      .toBe("#1 · Ready for review · qwen · x · rev 4 · Automatic");
+    expect(enhancementOptionLabel(summary({ edited_fields: ["title"] }), { ordinal: 1, when: "x" }))
+      .toMatch(/· Edited$/);
+    expect(enhancementOptionLabel(summary({ outcome_uncertain: true }), { ordinal: 1, when: "x" }))
+      .toMatch(/· Uncertain$/);
+    expect(enhancementOptionLabel(summary(), { ordinal: 1, when: "x" })).not.toMatch(/Automatic|Edited|Uncertain/);
+  });
+
+  it("stays readable when the summary is missing its model or its timestamp", () => {
+    // `gp-select` truncates, so the identifying part is written first and a
+    // blank tail must not leave a dangling separator.
+    expect(enhancementOptionLabel(summary({ model: "" }), { ordinal: 2, when: "" }))
+      .toBe("#2 · Ready for review · unnamed model · rev 4");
+  });
+});
+
+describe("enhancementApplyBlock", () => {
+  const ready = { state: "ready" as const, source_revision: 4 };
+
+  it("allows a ready suggestion written against the task in front of the reader", () => {
+    expect(enhancementApplyBlock(ready, { revision: 4, locked_fields: [] })).toBe("");
+  });
+
+  it("names the revision gap rather than rendering no button", () => {
+    // `acceptEnhancementInput` returns null here and the store re-checks
+    // `expected_task_revision`, so this is a fact to state, not a UI choice.
+    expect(enhancementApplyBlock(ready, { revision: 6, locked_fields: [] }))
+      .toBe("Written against revision 4; this task is at revision 6. Ask for a fresh suggestion.");
+  });
+
+  it("names the state when there is nothing left to apply", () => {
+    expect(enhancementApplyBlock({ state: "accepted", source_revision: 4 }, { revision: 4, locked_fields: [] }))
+      .toBe("This suggestion is accepted, so there is nothing left to apply.");
+    expect(enhancementApplyBlock({ state: "dismissed", source_revision: 4 }, { revision: 4, locked_fields: [] }))
+      .toMatch(/^This suggestion is dismissed/);
+  });
+
+  it("names a fully locked task", () => {
+    expect(enhancementApplyBlock(ready, { revision: 4, locked_fields: ["title", "description"] }))
+      .toBe("Title and description are locked against enhancement.");
+  });
+
+  it("says nothing when there is nothing selected", () => {
+    expect(enhancementApplyBlock(null, { revision: 4, locked_fields: [] })).toBe("");
+    expect(enhancementApplyBlock(ready, null)).toBe("");
+  });
+
+  it("agrees with the input builder about what can be accepted", () => {
+    // The message and the refusal must not be able to disagree: a block with
+    // an empty reason beside a null input would be a dead Accept button, and a
+    // reason beside a live input would be a lie.
+    const cases: { proposal: Pick<Enhancement, "state" | "source_revision">; revision: number; locked: Task["locked_fields"] }[] = [
+      { proposal: ready, revision: 4, locked: [] },
+      { proposal: ready, revision: 5, locked: [] },
+      { proposal: { state: "accepted", source_revision: 4 }, revision: 4, locked: [] },
+      { proposal: ready, revision: 4, locked: ["title", "description"] },
+    ];
+    for (const entry of cases) {
+      const full = { ...task, revision: entry.revision, locked_fields: entry.locked } satisfies Task;
+      const proposal = { ...entry.proposal, id: "e1", revision: 2, task_id: full.id, fields: ["title", "description"] } as Enhancement;
+      const input = acceptEnhancementInput(proposal, full, ["title", "description"], "req");
+      expect(Boolean(enhancementApplyBlock(entry.proposal, full)), JSON.stringify(entry)).toBe(input === null);
+    }
   });
 });

@@ -32,7 +32,7 @@
  * reader never saves a task that quietly lost half of what they typed.
  */
 
-import type { TaskDraft, TaskStatus } from "./client";
+import type { EnhancementField, TaskDraft, TaskStatus } from "./client";
 
 /** Longest quick-add line accepted. Past this the input is refused, not truncated. */
 export const MAX_QUICK_ADD_LENGTH = 4_096;
@@ -515,3 +515,63 @@ export function quickAddDraft(
 
 /** The one-line syntax reminder shown under the quick-add field. */
 export const QUICK_ADD_HINT = "!priority  #label  @owner  ~type  ^repo  due:friday  ::notes";
+
+/** Which Return the reader gets: save the line, or save it and ask for a draft. */
+export type QuickAddMode = "manual" | "assist";
+
+export function isQuickAddMode(value: unknown): value is QuickAddMode {
+  return value === "manual" || value === "assist";
+}
+
+export interface QuickAddAssistPlan {
+  /** Fields the model would be asked for; empty when the line is not a task. */
+  asks: EnhancementField[];
+  /** One sentence stating what happens on Return, before anything is written. */
+  sentence: string;
+}
+
+const ASK_NAMES: Readonly<Record<EnhancementField, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<EnhancementField, string>, {
+    title: "a title",
+    description: "a description",
+  }),
+);
+
+/**
+ * What the drafting mode would do with this line, worked out before it runs.
+ *
+ * Two rules, and neither is a tiebreak applied afterwards:
+ *
+ * 1. **Markers always win, structurally.** The task is written from `parseQuickAdd`
+ *    first; the model is asked afterwards and proposes against the saved
+ *    result. It cannot overwrite anything — acceptance is a separate, explicit
+ *    step in the review.
+ * 2. **The model cannot touch the marker fields at all.** `EnhancementField` is
+ *    `"title" | "description"`, enforced by the store's decoder and the field
+ *    lock table, so priority, labels, owner, type, repository and due date are
+ *    out of scope by type rather than by policy.
+ *
+ * The sentence lives here, beside `asks` and derived from it, rather than in
+ * the component: the promise shown before Return and the request made after it
+ * then come from one value, and a field cannot be named on screen that the
+ * request does not carry.
+ */
+export function quickAddAssistPlan(parsed: QuickAddResult): QuickAddAssistPlan {
+  // Gated on the same `usable` the manual path uses. Drafting improves a task;
+  // it cannot invent one, and this is what stops a placeholder card ever
+  // reaching the board while a model thinks.
+  if (!parsed.usable) {
+    return { asks: [], sentence: "Type a title first. Drafting improves a task; it does not invent one." };
+  }
+  // Both fields, always. A description the reader did not write is the point of
+  // the mode, and a title they did write is still worth a proposal — they keep
+  // theirs unless they accept the replacement.
+  const asks: EnhancementField[] = ["title", "description"];
+  // Built from `asks` rather than written out, so the promise on screen cannot
+  // name a field the request does not carry.
+  const names = asks.map((field) => ASK_NAMES[field]).join(" and ");
+  return {
+    asks,
+    sentence: `Saves this line now, then asks for ${names} you can accept or reject. Nothing else changes.`,
+  };
+}

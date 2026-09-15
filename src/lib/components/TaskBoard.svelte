@@ -29,7 +29,7 @@
   import { ARCHIVE_STATUS, archiveAction, archivable, archiveState, offersArchive } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
-  import { parseQuickAddDue, quickAddDraft, type QuickAddResult } from "../workbench/taskQuickAdd";
+  import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction, type TaskChanges } from "../workbench/taskActions";
@@ -105,6 +105,14 @@
   let selectionAnchor = $state<string | null>(null);
   let menu = $state<{ cards: TaskCard[]; column: TaskStatus | null; x: number; y: number } | null>(null);
   let enhanceId = $state<string | null>(null);
+  /**
+   * Bumped to ask a freshly opened Quick Enhance to start generating at once.
+   *
+   * A counter rather than a boolean: quick-adding two tasks in a row must
+   * start two drafts, and a flag that is already true the second time would
+   * start none.
+   */
+  let enhanceStart = $state(0);
   let facet = $state<TaskFacet>(emptyFacet());
   let showFilters = $state(false);
   let quickAdding = $state(false);
@@ -417,6 +425,11 @@
     if (!(await confirmDiscard("Open Quick Enhance? Unsaved edits in the current editor will be discarded."))) return;
     session = null;
     enhanceId = id;
+    // Opening the sheet to look at a task must never spend a model request.
+    // The counter is compared against a fresh instance's zero, so leaving a
+    // drafting run's value standing would auto-start on whatever is opened
+    // next. Asking is the only thing that raises it.
+    enhanceStart = 0;
   }
   function refuseAtCeiling(id: string): boolean {
     if (canOpenTaskTab(taskTabs, id)) return false;
@@ -773,13 +786,20 @@
    * `quickAddDraft` refuses when no repository is linked, and the refusal names
    * the two ways out — the `^` marker, or the editor.
    */
-  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox"): Promise<boolean> {
+  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox", mode: QuickAddMode = "manual"): Promise<boolean> {
     if (busy || quickAdding) return false;
     const draft = quickAddDraft(parsed, quickAddDefaults(status));
     if (!draft) {
+      // One refusal for both modes. Drafting cannot open a picker either, so
+      // inventing a second message here would give the reader two different
+      // answers to the same question.
       error = quickAddRefusal(creation);
       return false;
     }
+    // Asked *before* the write, not after. Drafting ends by opening a sheet
+    // over the editor, and reversing these leaves a reader who answers "Keep
+    // editing" with a task already on the board and no way to review it.
+    if (mode === "assist" && !(await confirmDiscard("Draft this task? Unsaved edits in the current editor will be discarded."))) return false;
     quickAdding = true; error = "";
     try {
       const saved = await bounded(putTask(taskWrite(newID(), 0, draft)));
@@ -787,6 +807,16 @@
       announce = `Added ${saved.title}`;
       toastStore.success(`Added ${saved.title}`);
       await loadBoard();
+      if (disposed) return true;
+      // The card is already on the board carrying the reader's own words, so a
+      // model that never answers costs them nothing. Opening the sheet is what
+      // makes the request reviewable — and refusable, with a reason.
+      if (mode === "assist") {
+        session = null;
+        workspaceEditor = null;
+        enhanceId = saved.id;
+        enhanceStart += 1;
+      }
       return true;
     } catch (cause) {
       if (!disposed) error = explainError(cause);
@@ -1140,7 +1170,9 @@
           disabled={busy}
           compact={compact}
           placeholder="Add a task — try: Fix retry loop !1 #ci @ada due:friday"
-          onSubmit={(parsed) => createFromQuickAdd(parsed)}
+          mode={$interfaceStore.taskQuickAddAssist ? "assist" : "manual"}
+          onMode={(next) => interfaceStore.setTaskQuickAddAssist(next === "assist")}
+          onSubmit={(parsed, mode) => createFromQuickAdd(parsed, "inbox", mode)}
           onExpand={(parsed) => void expandQuickAdd(parsed)}
         />
       </div>
@@ -1340,10 +1372,16 @@
     />
   {/if}
   {#if enhanceId}
+    <!-- Keyed on the task: the sheet loads once, on mount, so swapping the id
+         under a live instance would leave it showing the previous task — and
+         now also aim a drafting request at it. A different task is a different
+         sheet. -->
+    {#key enhanceId}
     <QuickEnhanceSheet
       taskId={enhanceId}
+      startRequest={enhanceStart}
       {repoName}
-      onClose={() => { enhanceId = null; if (!session && taskTabs.activeId) void restoreActiveTab(); }}
+      onClose={() => { enhanceId = null; if (!session && taskTabs.activeId) void restoreActiveTab(); else quickAddEl?.focus(); }}
       onApplied={(saved) => {
         void loadBoard();
         if (session?.value?.id === saved.id) {
@@ -1361,6 +1399,7 @@
         });
       }}
     />
+    {/key}
   {/if}
   {#if taskTabs.tabs.length}
     <div class="editor-dock">
@@ -1485,7 +1524,9 @@
   .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
   .open-mark{font-size:9px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-accent));flex-shrink:0;margin-top:2px}
   .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
-  .task-tabs{position:relative;width:min(430px,48vw);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);border-bottom:1px solid rgb(var(--c-border) / 0.65)}
+  /* Same token the sheet below uses (app.css): the strip and the sheet are
+     one column and must not be able to disagree about its width. */
+  .task-tabs{position:relative;width:var(--gp-task-sheet-w);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);border-bottom:1px solid rgb(var(--c-border) / 0.65)}
   .task-tab-strip{display:flex;align-items:stretch;gap:4px;min-width:0;overflow-x:auto;padding:6px 8px}
   .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:8px;border:1px solid transparent;padding:0 2px 0 8px}
   .task-tab-shell.is-active{border-color:rgb(var(--c-accent) / 0.45);background:color-mix(in srgb,rgb(var(--c-accent)) 12%,transparent)}

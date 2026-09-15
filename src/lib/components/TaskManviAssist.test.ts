@@ -69,13 +69,93 @@ describe("TaskManviAssist", () => {
     expect(source).not.toMatch(/<label[^>]*>\s*Title/);
   });
 
-  it("keeps quick enhance, compact history, and field locks in one section", () => {
+  it("keeps quick enhance, suggestion history, and field locks in one section", () => {
     expect(source).toContain("startQuickEnhance");
-    expect(source).toContain("history-drawer");
     expect(source).toContain("Keep title");
     expect(source).toContain("Keep description");
     expect(source).toContain("explainEnhancementFailure");
     expect(source).toContain("Resolve uncertain attempt");
     expect(source).toContain('{proposal.state === "running" ? "Cancel" : "Dismiss"}');
+  });
+
+  it("picks a past suggestion with a dropdown, not a collapsed drawer", () => {
+    /*
+     * History used to be a `<details>` holding a 150px scroller of buttons.
+     * Three things were wrong with it at once, and only the third was fatal:
+     * the list was folded away by default, its rows carried no time so two
+     * runs of one model read identically, and the review it selected was
+     * suppressed whenever a ready suggestion was already showing beside the
+     * fields — so changing the selection could do nothing visible at all.
+     */
+    expect(source).toContain('data-testid="task-assist-history"');
+    expect(source).toContain("enhancementOptionLabel");
+    expect(source).not.toContain("history-drawer");
+    expect(source).not.toContain("historyOpen");
+  });
+
+  it("always renders the review for whatever suggestion is selected", () => {
+    // The suppression this replaces read
+    // `quick || historyOpen || proposal.state !== "ready" || (!showTitle…)`.
+    expect(source).not.toContain("historyOpen ||");
+    expect(source).toMatch(/\{#if proposal\}\s*\n\s*<article aria-label="Enhancement review">/);
+    // The duplicate-acceptance problem that condition was really solving is
+    // now solved without hiding the diff.
+    expect(source).toContain("const reviewOffersAccept = $derived(");
+    expect(source).toMatch(/\{#if reviewOffersAccept\}[\s\S]*?enhancements\.accept/);
+  });
+
+  it("never shows a suggestion the review is not rendering", () => {
+    // A `<select>` displays the reader's pick immediately; loading it is a
+    // round trip that can fail or be superseded. Without its own state the
+    // control would name a revision the diff below is not showing.
+    expect(source).toContain("let selectedId = $state");
+    expect(source).toContain("const ticket = ++selecting");
+    expect(source).toMatch(/finally \{[\s\S]*?selectedId = proposal\?\.id \?\? ""/);
+    // One sync point for the five other paths that replace `proposal`.
+    expect(source).toMatch(/if \(!selectPending\) selectedId = id/);
+  });
+
+  it("says why a selected suggestion cannot be applied, instead of hiding the button", () => {
+    // Picking an older entry and finding no Apply was the drawer's quietest
+    // dead end: the store refuses on `expected_task_revision`, so the refusal
+    // is a fact to state, not an absence to render.
+    expect(source).toContain("enhancementApplyBlock");
+    expect(source).toContain("{#if applyBlock}");
+  });
+
+  it("reports the page it loaded rather than implying the list is complete", () => {
+    expect(source).toContain("Showing {entries.length} of {total}");
+    expect(source).toContain("Load more");
+  });
+
+  it("holds an auto-start request until the surface can act on it", () => {
+    /*
+     * `startEnhancement` refuses while `disabled` and says nothing, so an
+     * effect that consumed the request first would drop the draft with no
+     * trace. The condition therefore carries `disabled` itself, which also
+     * makes it a dependency: the request survives until the surface is ready.
+     */
+    expect(source).toContain("if (active && !disabled && startRequest > lastStart)");
+    expect(source).toMatch(/lastStart = startRequest;[\s\S]*?startEnhancement\(\)/);
+  });
+
+  it("lets concurrent callers await the same configuration read", () => {
+    /*
+     * Two things ask for configuration the moment a surface opens to start
+     * work: the selection effect, and `startEnhancement`. The old guard
+     * returned early for the second — reporting "loaded" while the request was
+     * still in flight — and it keyed on `acting`, which `startEnhancement`
+     * itself sets via `preparing` around its own call. Between them the
+     * auto-start could never read a configuration and silently did nothing.
+     *
+     * Only the browser harness can catch the behaviour (vitest runs SSR, so no
+     * `$effect` ever fires). This pins the shape that makes it correct.
+     */
+    expect(source).toContain("configLoad ??=");
+    expect(source).toMatch(/configLoad = null/);
+    expect(source).toContain("if (busy || needsReconcile || disabled) return Promise.resolve()");
+    // The bound on the coalescing loop: a selection that never settles must
+    // not spin the request forever.
+    expect(source).toMatch(/for \(let attempt = 0; attempt < \d+; attempt\+\+\)/);
   });
 });
