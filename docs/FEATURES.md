@@ -91,17 +91,34 @@ repository's shared task board.
 - **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
 - **Fetched, Not Merely Present**: The header stamps how long ago the context on screen was fetched, and a listing hydrated from cache on a repository switch loses the stamp rather than inheriting a fetch that never happened.
 - **Firebase Deploys, Joined To Commits**: For a repository carrying `.firebaserc`
-  or `firebase.json`, the CI rail lists App Hosting rollouts and matches each one
-  to the commit it shipped — App Hosting reports the full SHA, so "this commit is
-  live" is a lookup rather than a guess. Detection is a local file read; the
-  listing runs only when asked, because the Firebase CLI enables the App Hosting
-  API when it is off and that is a change to a Cloud project, not a read. The
-  project is always picked by hand: `.firebaserc`'s `default` alias is frequently
-  production, so nothing is aimed there by a default nobody saw. A rollout whose
-  commit is absent from this checkout — a force-push, a fork, a shallow clone — is
-  shown and marked rather than dropped, a state Firebase has not published yet is
-  rendered as unknown instead of inheriting a green badge, and a listing that
-  could not run says so rather than reading as a backend that never deployed.
+  or `firebase.json`, the CI rail lists the project's App Hosting backends and,
+  where the CLI supports it, the rollouts of one — matching each rollout to the
+  commit it shipped, since App Hosting reports the full SHA and "this commit is
+  live" is therefore a lookup rather than a guess. Detection is a local file read;
+  both listings run only when asked, because the Firebase CLI enables the App
+  Hosting API when it is off and that is a change to a Cloud project, not a read.
+  The project is always picked by hand: `.firebaserc`'s `default` alias is
+  frequently production, so nothing is aimed there by a default nobody saw, and
+  changing project clears the backend with it because backend ids are not unique
+  across projects. **Rollout listing depends on the installed CLI**: upstream
+  ships `apphosting:rollouts:list` only behind an experiment that is off by
+  default, so GitPulse asks the CLI what it has and, when the subcommand is
+  absent, says so and names the trade-off instead of offering a button that
+  cannot work. A rollout whose commit is absent from this checkout — a
+  force-push, a fork, a shallow clone — is shown and marked rather than dropped,
+  a state Firebase has not published yet is rendered as unknown instead of
+  inheriting a green badge, and a listing that could not run says so rather than
+  reading as a backend that never deployed.
+- **Deploying A Commit, Behind Two Steps**: A rollout can be created against one
+  full commit SHA. It is the only Firebase action that changes what production
+  serves and the only one GitPulse cannot undo — App Hosting has no rollback
+  command, so reverting means deploying an earlier commit — and it is not
+  idempotent, so a repeat click would deploy twice. The panel therefore refuses
+  an abbreviated SHA *with the reason*, spells out the exact project, backend
+  and commit before the deploying button exists, disarms that confirmation the
+  moment any part of the target changes, and disarms again after a deploy. A
+  rollout that started is never reported as failed: when the CLI exits cleanly
+  without confirming, the panel says so and warns against a blind retry.
 - **CI:Local Runner**: Runs the repository CI pipeline locally before pushing commits. When a fresh
   DevMap index can answer, test steps may be scoped to **affected test files** for the change set;
   a stale map, incomplete walk, or unmatched seed **fails closed** to the full suite and says why —

@@ -119,15 +119,23 @@
       <div class="p-3.5 rounded-xl border border-border/60 bg-surface flex flex-col justify-between">
         <div class="flex items-center justify-between text-textMuted text-xs">
           <span class="font-medium uppercase tracking-wider text-[10px]">Change Failure Rate</span>
+          <!-- Derived from the flag the backend already sends, not hard-coded.
+               `is_cfr_approximation` was declared, set by Rust and read by
+               nobody, so a measured change-failure rate would have arrived and
+               still been labelled a heuristic — a stale label on a number is
+               worse than no label, because it is believed. Card 4 has read its
+               own flag all along; this one now matches it. -->
           <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surfaceMuted text-textMuted border border-border/50">
-            Heuristic
+            {dora.is_cfr_approximation ? "Heuristic" : "Measured"}
           </span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
           <span class="text-3xl font-extrabold text-textPrimary">{dora.change_failure_rate_pct}%</span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          Approx. from revert & hotfix commits
+          {dora.is_cfr_approximation
+            ? "Approx. from revert & hotfix commits"
+            : "From recorded deployment outcomes"}
         </p>
       </div>
 

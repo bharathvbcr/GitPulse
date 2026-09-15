@@ -1913,14 +1913,12 @@ pub async fn cmd_github_cancel_run(
 /// answer, not a failure.
 #[tauri::command(async)]
 pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::FirebaseStatus {
-    off_thread(move || {
-        Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path))
-    })
-    .await
-    // A thread-pool failure is not "no Firebase config": it is a status that
-    // could not be read, and it says so rather than rendering as a repository
-    // that does not use Firebase.
-    .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
+    off_thread(move || Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path)))
+        .await
+        // A thread-pool failure is not "no Firebase config": it is a status that
+        // could not be read, and it says so rather than rendering as a repository
+        // that does not use Firebase.
+        .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
 }
 
 /// Lists App Hosting backends for one project.
@@ -1965,7 +1963,6 @@ pub async fn cmd_firebase_rollouts(
     repo_path: String,
     project_id: String,
     backend_id: String,
-    location: Option<String>,
 ) -> Result<Guarded<crate::firebase::apphosting::FirebaseRolloutsReport>, String> {
     off_thread(move || {
         let probe = crate::firebase::firebase_cli_probe();
@@ -1974,11 +1971,7 @@ pub async fn cmd_firebase_rollouts(
                 .reason
                 .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
         }
-        let argv_owned = crate::firebase::apphosting::rollouts_list_argv(
-            &project_id,
-            &backend_id,
-            location.as_deref(),
-        )?;
+        let argv_owned = crate::firebase::apphosting::rollouts_list_argv(&project_id, &backend_id)?;
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
         let output = crate::firebase::apphosting::load_rollouts_report(
@@ -1988,6 +1981,64 @@ pub async fn cmd_firebase_rollouts(
             &argv_owned,
             probe.present,
         );
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Creates an App Hosting rollout pinned to one commit.
+///
+/// ## Security impact
+///
+/// This is the only command in the Firebase module that changes what the
+/// user's production traffic serves, and it is not reversible by this app:
+/// App Hosting publishes no rollback verb, so undoing a rollout means creating
+/// another one against an earlier commit. It is also **not idempotent** —
+/// upstream allocates the next rollout id per call — so calling it twice
+/// deploys twice.
+///
+/// The containment is the same as every other action here, in the same order
+/// `cmd_publish_release` establishes: validate every input before it can reach
+/// argv, resolve nothing implicitly, build the argv through the *single*
+/// builder that also names the program, hand that exact line to the write gate,
+/// and only then execute the very bytes the gate judged. A refused verdict
+/// returns `Err` before any process is spawned.
+///
+/// What it does **not** do: hold a credential (the user's `firebase` login
+/// owns that), accept an abbreviated SHA (an ambiguous target for something
+/// that reaches production), or pass `--force`. Upstream prompts only when
+/// neither a branch nor a commit was named, and this always names a commit —
+/// so nothing here suppresses a confirmation the user would otherwise see.
+#[tauri::command(async)]
+pub async fn cmd_firebase_create_rollout(
+    repo_path: String,
+    project_id: String,
+    backend_id: String,
+    git_commit: String,
+) -> Result<Guarded<crate::firebase::apphosting::RolloutCreateOutcome>, String> {
+    off_thread(move || {
+        let probe = crate::firebase::firebase_cli_probe();
+        if !probe.present {
+            return Err(probe
+                .reason
+                .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
+        }
+        let argv_owned = crate::firebase::apphosting::rollout_create_argv(
+            &project_id,
+            &backend_id,
+            &git_commit,
+        )?;
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        // Gate first, spawn second. `?` here is what keeps a refusal from
+        // reaching production: nothing below runs on a blocked verdict.
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::firebase::apphosting::create_rollout(
+            &repo_path,
+            &project_id,
+            &backend_id,
+            &git_commit,
+            &argv_owned,
+        )?;
         Ok(Guarded { policy, output })
     })
     .await

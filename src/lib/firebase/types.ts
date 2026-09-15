@@ -78,6 +78,20 @@ export interface FirebaseCliProbe {
   reason: string | null;
 }
 
+/**
+ * Whether one subcommand exists in the installed CLI.
+ *
+ * `checked` is separate from `available` for the usual reason: an uninstalled
+ * CLI cannot be asked what it supports, and "we could not look" must not render
+ * as "your CLI does not have it" — the first sends a reader to install
+ * Firebase, the second to enable an experiment they do not need.
+ */
+export interface FirebaseCapability {
+  available: boolean;
+  checked: boolean;
+  reason: string | null;
+}
+
 /** Wire shape of `cmd_firebase_status` — computed from files, never the network. */
 export interface FirebaseStatus {
   configured: boolean;
@@ -90,8 +104,26 @@ export interface FirebaseStatus {
    * chose.
    */
   default_alias: string | null;
+  /**
+   * True when more aliases exist than the picker cap allowed through.
+   *
+   * `.firebaserc` is repository content, so the row count is not ours to
+   * assume. A capped list that renders like a complete one is exactly the
+   * substitution every other field here exists to prevent.
+   */
+  projects_truncated: boolean;
   has_apphosting_config: boolean;
   cli: FirebaseCliProbe;
+  /**
+   * Whether the installed CLI exposes `apphosting:rollouts:list`.
+   *
+   * Asked, never assumed. Upstream registers that subcommand only behind the
+   * `internaltesting` experiment, which is off by default — so on a stock
+   * install it does not exist, and an unregistered subcommand exits non-zero
+   * having printed nothing, which reaches a reader as a parse error rather
+   * than as the missing feature it is.
+   */
+  rollout_listing: FirebaseCapability;
   firebaserc_error: string | null;
   firebasejson_error: string | null;
 }
@@ -132,4 +164,22 @@ export interface FirebaseRolloutsReport extends FirebaseListing {
 /** Wire shape of `cmd_firebase_backends`. */
 export interface FirebaseBackendsReport extends FirebaseListing {
   backends: BackendInfo[];
+}
+
+/**
+ * Wire shape of `cmd_firebase_create_rollout` — what the attempt actually did.
+ *
+ * `created` is the CLI's exit status and nothing else. Creating a rollout is
+ * not idempotent: upstream allocates the next rollout id per call, so a run
+ * that succeeded and is reported as failed costs a second deployment when the
+ * user retries. `unconfirmed` carries the case where the CLI exited zero
+ * without confirming it — the rollout started, and saying so is more useful
+ * than picking one of the two clean answers we do not have.
+ */
+export interface RolloutCreateOutcome {
+  project_id: string;
+  backend_id: string;
+  git_commit: string;
+  created: boolean;
+  unconfirmed: string | null;
 }

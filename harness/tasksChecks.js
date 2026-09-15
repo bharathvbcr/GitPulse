@@ -737,7 +737,13 @@ if (params.has("check")) {
     confirmAnswer=true; await click("Close task details");
     await click("New task");
     const idea=root.querySelector(".notes-label textarea");
-    check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Improve with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    // "Draft", not "Improve": `draftingKind({})` returns `draft` when notes,
+    // title and description are all empty, and the verb follows the kind. This
+    // check asserted "Improve with Manvi" — the exact wording the verb-follows-
+    // kind fix removed, because an empty task used to read "Improve" while the
+    // request it sent carried `draft`. `button()` matches text exactly, so the
+    // stale wording made this pin the bug rather than the fix.
+    check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Draft with Manvi")) && !editor().querySelector('.sheet-tabs'));
     await change(idea,"Fix notification routing\nKeep saved task evidence and explain recovery steps.");
     await wait(() => button("Draft with Manvi") && !button("Draft with Manvi").disabled);
     await click("Draft with Manvi");

@@ -103,3 +103,26 @@ export function currentRollout(rollouts: readonly RolloutInfo[]): RolloutInfo | 
 export function shortSha(hash: string): string {
   return hash.slice(0, 7);
 }
+
+/**
+ * Why a commit is not a usable rollout target, or null when it is.
+ *
+ * Mirrors the Rust validator rather than replacing it — the backend refuses the
+ * same values, and must, because a UI check is a courtesy and not a boundary.
+ * What this adds is the reason: a disabled button with no explanation is the
+ * shape people work around by pasting something else.
+ *
+ * Abbreviations are refused on purpose. This value names which commit reaches
+ * production, and a prefix that resolves today can become ambiguous tomorrow.
+ */
+export function commitShaProblem(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return "Enter the full commit SHA to deploy.";
+  if (!/^[0-9a-fA-F]+$/.test(trimmed)) {
+    return "A commit SHA is hexadecimal — this contains other characters.";
+  }
+  if (trimmed.length !== 40) {
+    return `A full 40-character SHA is required; this is ${trimmed.length}. An abbreviation is an ambiguous target for something that reaches production.`;
+  }
+  return null;
+}
