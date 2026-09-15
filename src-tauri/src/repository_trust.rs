@@ -18,6 +18,20 @@ use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 pub const REQUIRED: &str = "REPOSITORY_TRUST_REQUIRED";
+/// The Worktrees-panel control this refusal points at, spelled exactly as the
+/// button is labelled.
+///
+/// A refusal that names a control by a different name than the UI gives it is
+/// worse than one that names no control: the reader searches for the words
+/// they were handed, does not find them, and concludes the control is gone.
+/// This message said "Extend Trust" while the button read "Extend trust to
+/// every worktree", and someone following it had to read the source to find
+/// a banner that was on screen the whole time.
+///
+/// `repository-trust-control-contract.test.ts` pins this against the button's
+/// own label, because the two live in different languages and nothing else
+/// would notice them drifting apart.
+pub const EXTEND_TRUST_CONTROL: &str = "Extend trust to every worktree";
 /// A refusal that approving the repository cannot fix, so it must not carry
 /// [`REQUIRED`]: the desktop reads that marker as "ask for approval and retry"
 /// (`repoStore.openRepo`, `externalTools`), and a prompt whose approval
@@ -473,12 +487,24 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
         // approve it is advice they have followed and watched fail; naming the
         // older scheme is the difference between a dead end and one click.
         if predates_worktree_coverage(&current) {
-            refusal.push_str(
+            // Why they are being asked again, then the fallback — and nothing
+            // else. The sentence above already says approving any working tree
+            // covers the family, so the first line's "open this one and trust
+            // it" is the cheap path in full; restating it here made the
+            // message longer and said the same thing twice.
+            //
+            // The panel is named for the one case that path cannot serve: this
+            // worktree is already gone by the time someone reads this. Naming
+            // the button as it is actually labelled, and saying where it is,
+            // is the difference between that and a hunt.
+            refusal.push_str(&format!(
                 " That repository was approved before GitPulse covered worktrees, \
-                 so the earlier approval reaches only the checkout it named. \
-                 Open that repository in GitPulse; its Worktrees panel offers \
-                 Extend Trust, which covers this worktree and every other.",
-            );
+                 so the earlier approval reaches only the checkout it named — \
+                 which is why you are asked again here. If this worktree is \
+                 already gone, open that repository instead and use \
+                 \"{EXTEND_TRUST_CONTROL}\" in the Worktrees section of the \
+                 left sidebar."
+            ));
         }
     }
     Err(refusal)
@@ -1204,7 +1230,7 @@ mod tests {
         assert!(refusal.contains(REQUIRED));
         assert!(refusal.contains("linked worktree"));
         assert!(
-            !refusal.contains("Extend Trust"),
+            !refusal.contains(EXTEND_TRUST_CONTROL),
             "must not claim an earlier approval that does not exist: {refusal}"
         );
 
