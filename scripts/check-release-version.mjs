@@ -180,6 +180,7 @@ export const REQUIRED_PLUGIN_MANIFEST = "plugin.json";
 export const OPTIONAL_PLUGIN_MANIFESTS = Object.freeze([
   path.join(".claude-plugin", "plugin.json"),
   path.join(".codex-plugin", "plugin.json"),
+  path.join(".cursor-plugin", "plugin.json"),
   path.join(".agents", "plugin.json"),
 ]);
 

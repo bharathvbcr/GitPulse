@@ -16,5 +16,6 @@
     "worktrees",
     "code-intelligence",
     "insights"
-  ]
+  ],
+  "logo": "assets/logo.png"
 }
