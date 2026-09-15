@@ -282,6 +282,22 @@ pub struct LanguageStatsReport {
 pub const DEFAULT_PULSE_COMMITS: usize = 5_000;
 pub const MAX_PULSE_COMMITS: usize = 25_000;
 
+/// Commits [`GitReader::dora_report`] reads when scanning for reverts, hotfixes
+/// and restore intervals.
+///
+/// This was 200, which cut the scan far short of any window a user would pick:
+/// this repository alone puts 532 commits in the default 90 days and 216 in
+/// *seven*, so the rate was quoted over the most recent 38% of the window with
+/// nothing saying so. The cap bought nothing — measured over a 25,000-commit
+/// history with every commit in the window, `git log --since --format=%s%x00%ct`
+/// costs 0.01s at `-n 200` and 0.07s uncapped, against the 0.32s the lead-time
+/// loop already spends spawning `git describe --tags --contains` thirty times.
+/// Matching [`MAX_PULSE_COMMITS`] keeps a real bound on pathological histories
+/// while covering every repository anyone is likely to open, and the scan still
+/// reports when it was reached — a bound without that signal is how a partial
+/// answer comes to read as a complete one.
+const MAX_DORA_SCAN_COMMITS: usize = 25_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PulseCommitSummary {
     pub sha: String,
@@ -401,6 +417,26 @@ pub struct DoraReport {
     /// reverts. Zero here is the only signal that the check could not run, so
     /// callers must render it as "no sample" rather than as a confident 0%.
     pub cfr_sample_commits: usize,
+    /// True when the commit scan reached [`MAX_DORA_SCAN_COMMITS`] and the
+    /// window held more commits than it read.
+    ///
+    /// `cfr_sample_commits` separates "measured" from "nothing to measure", but
+    /// it cannot separate "measured the whole window" from "measured the most
+    /// recent N of it" — both are a plain positive number. Card 1 reports
+    /// releases over the full window beside it, so a reader has every reason to
+    /// assume the same span. `git log -n N` returns the *newest* N, so a
+    /// truncated scan drops the oldest commits and skews both the rate and the
+    /// restore times recent.
+    pub commit_scan_truncated: bool,
+    /// Commits in the window before the scan cap, when the scan was cut.
+    ///
+    /// `None` when nothing was cut, matching `files_total_count`: a total that
+    /// equals the sample says nothing worth a wire field. Also `None` when the
+    /// scan was cut but the count could not be read — `commit_scan_truncated`
+    /// stays true, because reaching the cap is itself evidence the walk stopped
+    /// early, and an unavailable count must never let a partial scan report
+    /// itself complete.
+    pub commit_scan_window_commits: Option<usize>,
     pub mttr_hours: f64,
     pub is_mttr_approximation: bool,
     pub window_days: u32,
@@ -1912,6 +1948,22 @@ impl GitReader {
     }
 
     pub fn dora_report(repo_path: &str, window_days: Option<u32>) -> Result<DoraReport, String> {
+        Self::dora_report_scanning(repo_path, window_days, MAX_DORA_SCAN_COMMITS)
+    }
+
+    /// [`Self::dora_report`] with the commit-scan cap injected.
+    ///
+    /// The cap exists to bound a pathological history, so in production it sits
+    /// far above any real window — which would leave the truncation signal
+    /// untestable, because no fixture repository can reach 25,000 commits. A
+    /// signal whose reporting path never runs in a test is the same unexamined
+    /// -reads-as-verified failure it was added to prevent, so the cap is a
+    /// parameter and the tests drive the real scan with a small one.
+    fn dora_report_scanning(
+        repo_path: &str,
+        window_days: Option<u32>,
+        max_scan_commits: usize,
+    ) -> Result<DoraReport, String> {
         let repo = validate_repo(repo_path)?;
         let window = window_days.unwrap_or(90).clamp(7, 365);
         let now_secs = SystemTime::now()
@@ -1948,6 +2000,11 @@ impl GitReader {
                         // No commit log was ever read on this path, so the
                         // rate has an empty sample behind it, not a clean one.
                         cfr_sample_commits: 0,
+                        // Nothing was cut: the scan never reached the cap
+                        // because there was no history to walk. The empty
+                        // sample is `cfr_sample_commits`, not truncation.
+                        commit_scan_truncated: false,
+                        commit_scan_window_commits: None,
                         mttr_hours: 0.0,
                         is_mttr_approximation: true,
                         window_days: window,
@@ -2045,9 +2102,10 @@ impl GitReader {
         };
 
         let since_arg = format!("--since={window}.days");
+        let scan_limit = max_scan_commits.to_string();
         let log_stdout = git_text(
             &repo,
-            &["log", "-n", "200", &since_arg, "--format=%s%x00%ct"],
+            &["log", "-n", &scan_limit, &since_arg, "--format=%s%x00%ct"],
         )
         .unwrap_or_default();
 
@@ -2090,6 +2148,26 @@ impl GitReader {
             0.0
         };
 
+        // Only a scan that reached the cap can have been cut, so the second git
+        // call is paid for only then; every repository under the cap — which is
+        // all but the pathological ones — costs nothing. `rev-list --count` and
+        // `log` are given the same `--since`, so they prune the walk the same
+        // way and their counts describe one population; comparing a differently
+        // filtered total against this sample would invent truncation.
+        let reached_cap = total_commits >= max_scan_commits;
+        let window_commits = if reached_cap {
+            git_text(&repo, &["rev-list", "--count", &since_arg, "HEAD"])
+                .ok()
+                .and_then(|out| out.trim().parse::<usize>().ok())
+        } else {
+            None
+        };
+        // A count that could not be read must not report the scan complete:
+        // reaching the cap is itself evidence the walk stopped early.
+        let commit_scan_truncated =
+            window_commits.map_or(reached_cap, |total| total > total_commits);
+        let commit_scan_window_commits = commit_scan_truncated.then_some(window_commits).flatten();
+
         restore_times_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mttr_hours = if !restore_times_hours.is_empty() {
             (restore_times_hours[restore_times_hours.len() / 2] * 10.0).round() / 10.0
@@ -2108,6 +2186,8 @@ impl GitReader {
             change_failure_rate_pct: cfr_pct,
             is_cfr_approximation: true,
             cfr_sample_commits: total_commits,
+            commit_scan_truncated,
+            commit_scan_window_commits,
             mttr_hours,
             is_mttr_approximation: true,
             window_days: window,
@@ -6543,6 +6623,137 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
         assert_eq!(
             report.change_failure_rate_pct, 0.0,
             "the rate stays 0.0; cfr_sample_commits is what makes it readable as 'no sample'"
+        );
+        assert!(
+            !report.commit_scan_truncated,
+            "an empty history was not cut short; the empty sample is the signal"
+        );
+        assert_eq!(report.commit_scan_window_commits, None);
+    }
+
+    /// Seeds `count` commits whose subjects alternate so the scan has both
+    /// failure remedies and ordinary work to count.
+    fn repo_with_commits(count: usize) -> tempfile::TempDir {
+        let dir = init_repo_with_remotes(&[], "main");
+        for i in 0..count {
+            let subject = if i % 3 == 0 {
+                format!("fix: correct regression {i}")
+            } else {
+                format!("feat: add capability {i}")
+            };
+            git_in(dir.path(), &["commit", "--allow-empty", "-m", &subject]);
+        }
+        dir
+    }
+
+    /// A window holding more commits than the scan reads must not render as if
+    /// the whole window was examined.
+    ///
+    /// `cfr_sample_commits` alone cannot say this: 4 examined is a plain
+    /// positive number whether it is the whole window or the newest 4 of 12.
+    /// Card 1 states releases over the full window beside the rate, so "200" on
+    /// a 532-commit window reads as complete coverage unless something says
+    /// otherwise. Both numbers are carried for the same reason
+    /// `KnowledgeReport` carries `scanned_files` beside `candidate_files`.
+    #[test]
+    fn dora_report_reports_a_commit_scan_cut_short_by_the_cap() {
+        // 12 commits + the seed, scanned with a cap of 4.
+        let dir = repo_with_commits(12);
+        let path = dir.path().to_str().unwrap();
+
+        let report = GitReader::dora_report_scanning(path, Some(90), 4)
+            .expect("dora_report should succeed on a seeded repository");
+
+        assert_eq!(
+            report.cfr_sample_commits, 4,
+            "the scan reads exactly the cap"
+        );
+        assert!(
+            report.commit_scan_truncated,
+            "a window larger than the cap must report that it was cut"
+        );
+        assert_eq!(
+            report.commit_scan_window_commits,
+            Some(13),
+            "the window total must be the uncapped count, not the sample"
+        );
+        // The pairing is what makes the caveat legible: a bare `truncated` flag
+        // cannot say how much was missed.
+        assert!(
+            report.commit_scan_window_commits.unwrap() > report.cfr_sample_commits,
+            "the total must exceed the sample whenever truncation is reported"
+        );
+    }
+
+    /// The other half: a scan that read the whole window must not claim it was
+    /// cut, or every report would carry a caveat and the signal would mean
+    /// nothing. A cap above the window is the ordinary case.
+    #[test]
+    fn dora_report_does_not_claim_truncation_when_the_window_fits() {
+        let dir = repo_with_commits(5);
+        let path = dir.path().to_str().unwrap();
+
+        let report = GitReader::dora_report_scanning(path, Some(90), 4_096)
+            .expect("dora_report should succeed on a seeded repository");
+
+        assert_eq!(report.cfr_sample_commits, 6, "seed plus five commits");
+        assert!(
+            !report.commit_scan_truncated,
+            "the scan read the whole window, so nothing was cut"
+        );
+        assert_eq!(
+            report.commit_scan_window_commits, None,
+            "a total equal to the sample says nothing and is not carried"
+        );
+    }
+
+    /// A window of exactly the cap is read completely, and must not be reported
+    /// as cut. `reached_cap` alone would say it was: the sample equals the cap,
+    /// which is why the uncapped count decides the flag rather than the cap
+    /// comparison that merely triggers the lookup.
+    #[test]
+    fn dora_report_does_not_claim_truncation_at_exactly_the_cap() {
+        // Seed plus five commits is six; scan with a cap of exactly six.
+        let dir = repo_with_commits(5);
+        let path = dir.path().to_str().unwrap();
+
+        let report = GitReader::dora_report_scanning(path, Some(90), 6)
+            .expect("dora_report should succeed on a seeded repository");
+
+        assert_eq!(report.cfr_sample_commits, 6);
+        assert!(
+            !report.commit_scan_truncated,
+            "the scan reached the cap but the window held no more, so nothing was cut"
+        );
+        assert_eq!(report.commit_scan_window_commits, None);
+    }
+
+    /// The scan the change-failure rate reads is the same scan the restore time
+    /// is derived from — `restore_times_hours` is accumulated inside the loop
+    /// that counts `cfr_sample_commits`. So truncation is not a caveat on one
+    /// card: whatever the cap cuts is missing from both numbers, and the report
+    /// must let the view say so on each.
+    #[test]
+    fn a_truncated_scan_bounds_the_restore_time_too() {
+        let dir = repo_with_commits(12);
+        let path = dir.path().to_str().unwrap();
+
+        let capped =
+            GitReader::dora_report_scanning(path, Some(90), 4).expect("capped scan should succeed");
+        let full = GitReader::dora_report_scanning(path, Some(90), 4_096)
+            .expect("full scan should succeed");
+
+        assert!(capped.commit_scan_truncated);
+        assert!(!full.commit_scan_truncated);
+        // Both metrics come from the one capped read, so the sample the restore
+        // time was drawn from is bounded by the same number.
+        assert!(
+            capped.cfr_sample_commits < full.cfr_sample_commits,
+            "the capped scan must examine fewer commits, bounding both metrics"
+        );
+        assert!(
+            capped.is_mttr_approximation && full.is_mttr_approximation,
+            "the restore time stays a heuristic either way; truncation is the added caveat"
         );
     }
 }

@@ -34,6 +34,23 @@
     const days = (hours / 24).toFixed(1);
     return `${days}d`;
   }
+
+  /**
+   * One sentence, appended to both commit-derived cards.
+   *
+   * The change-failure rate and the restore time come from a single capped
+   * `git log`, so a cut scan bounds both and the caveat belongs on each tile
+   * rather than once for the section — the same rule the export card follows.
+   * Card 1 states releases over the whole window beside them, so without this
+   * a reader has every reason to read the other two as covering it too.
+   */
+  const scanCaveat = $derived(
+    !dora?.commit_scan_truncated
+      ? ""
+      : dora.commit_scan_window_commits
+        ? ` — the newest of ${dora.commit_scan_window_commits} in the window, not all of it`
+        : " — the newest in the window, not all of it",
+  );
 </script>
 
 <div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
@@ -135,18 +152,21 @@
           </span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          <!-- Two guards, and the nesting is the decision. The empty-sample
+          <!-- Three guards, and the nesting is the decision. The empty-sample
                check is outermost so this line always agrees with the value
                above it, which shows an em dash on an empty sample whatever the
                flag says — a caption naming a source for a number that is not
                being shown would be its own small dishonesty. Inside it the
                wording follows `is_cfr_approximation` rather than assuming the
                heuristic, and the heuristic branch names the denominator it was
-               measured over instead of letting the reader assume the window. -->
+               measured over instead of letting the reader assume the window.
+               `scanCaveat` rides only on that branch: it describes the commit
+               scan, so it belongs to the rate derived from commits and not to
+               one read from recorded deployment outcomes. -->
           {dora.cfr_sample_commits <= 0
             ? "No commits in this window to examine"
             : dora.is_cfr_approximation
-              ? `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}`
+              ? `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}${scanCaveat}`
               : "From recorded deployment outcomes"}
         </p>
       </div>
@@ -165,7 +185,7 @@
           </span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "Could not estimate from commit patterns" : "Time to follow-up patch (heuristic)"}
+          {dora.is_mttr_approximation && dora.mttr_hours <= 0 ? "Could not estimate from commit patterns" : `Time to follow-up patch (heuristic)${scanCaveat}`}
         </p>
       </div>
     </div>
