@@ -4,6 +4,7 @@
   import BranchList from "./BranchList.svelte";
   import CommitComposer from "./CommitComposer.svelte";
   import WorktreesPanel from "./WorktreesPanel.svelte";
+  import TrustExtensionBanner from "./TrustExtensionBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { formatPathParts } from "../files/formatPath";
   import { hasUnstagedChanges, statusForSide } from "../files/fileStatus";
@@ -341,6 +342,13 @@
     <!-- Main Scrollable Section -->
     <div class="relative flex-1 min-h-0 mt-2">
     <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 space-y-5">
+      <!-- Above the branch list on purpose. This says why everything below it
+           may be incomplete, and the branch list has no height cap in this
+           scroller — under it, on a repository with many branches, the notice
+           sat below the fold. It renders nothing when there is nothing to
+           extend, so it costs no space on a repository that is already fine. -->
+      <TrustExtensionBanner />
+
       <BranchList />
 
       <WorktreesPanel />

@@ -133,7 +133,20 @@ describe("WorktreesPanel store-emission churn guards", () => {
 
   it("memo-guards the load effect so unrelated store emissions are no-ops", () => {
     const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("if (repo === prevRepoPath && generation === prevGeneration) return;");
+    const guard = effect.match(/if \(([^)]*)\) return;/)?.[1] ?? "";
+    expect(guard, "the load effect must open with a memo guard").not.toBe("");
+    // Derived rather than spelled out: every reactive value the effect reads
+    // has to appear in the memo key. One that is read but not compared makes
+    // the guard a no-op for that value, and the ~6s poll tick publishes on
+    // every repository — which is the churn this guard exists to absorb. A
+    // literal copy of the condition had to be re-typed each time the effect
+    // learned to watch something new, and re-typing it is how a term gets
+    // dropped.
+    const reads = [...effect.matchAll(/const (\w+) = \$[\w.]+;/g)].map((m) => m[1]);
+    expect(reads.length, "the effect must read something").toBeGreaterThan(0);
+    for (const name of reads) {
+      expect(guard, `${name} is read by the effect but absent from the memo key`).toContain(name);
+    }
   });
 
   it("resets the armed remove confirm only on real repo/generation change or unmount", () => {
@@ -145,45 +158,30 @@ describe("WorktreesPanel store-emission churn guards", () => {
 });
 
 describe("WorktreesPanel legacy-trust extension", () => {
-  it("offers the extension only when inspection said so", () => {
-    // The banner is gated on the backend's own scope answer, never on the row
-    // count or on an error string: an offer to fix a condition nobody
-    // established is a guess wearing a button.
-    expect(source).toContain("needsExtension(preview)");
-    expect(source).toContain("{#if trustExtendable}");
-    const fn = source.slice(
-      source.indexOf("async function loadTrustScope"),
-      source.indexOf("async function extendTrust")
-    );
-    expect(fn).toContain('invoke<TrustPreview>("cmd_repository_trust"');
-    // A failed inspection hides the offer rather than showing it.
-    expect(fn).toMatch(/catch[\s\S]*?trustExtendable = false/);
+  // The offer itself moved to TrustExtensionBanner, mounted above the branch
+  // list so it cannot scroll out of sight; its invariants moved with it, to
+  // TrustExtensionBanner.test.ts. What stays here is the half this panel still
+  // owns: a grant made up there has to reach these rows.
+
+  it("reloads when trust is extended from outside this panel", () => {
+    // The panel used to call `load()` itself from the banner's own handler.
+    // With the banner gone, the only thing that can reload these rows is the
+    // announcement — and it has to be part of the effect's change check, not
+    // merely read by it: the repository and generation are both unchanged
+    // across a grant, so an unconsidered count would return early and leave
+    // every row showing the gaps the grant just closed.
+    expect(source).toContain('import { trustExtended } from "../repos/trustExtension"');
+    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    expect(effect).toContain("const extended = $trustExtended;");
+    expect(effect).toMatch(/if \(repo === prevRepoPath &&[\s\S]*?extended === prevExtended\) return;/);
+    expect(effect).toContain("prevExtended = extended;");
   });
 
-  it("drops a stale inspection like every other load in this panel", () => {
-    const fn = source.slice(
-      source.indexOf("async function loadTrustScope"),
-      source.indexOf("async function extendTrust")
-    );
-    expect(fn.match(/guard\.isLive\(\)/g)?.length).toBe(2);
-  });
-
-  it("re-guards the active repository across the extension dialog", () => {
-    // The dialog is awaited, so the tab can change under it; reloading then
-    // would land this repository's rows on another repository's panel.
-    const fn = source.slice(
-      source.indexOf("async function extendTrust"),
-      source.indexOf("async function loadTaskState")
-    );
-    expect(fn).toMatch(
-      /await repoStore\.trustRepo\(repo\)[\s\S]*?\$repoStore\.currentPath !== repo[\s\S]*?await load\(\)/
-    );
-  });
-
-  it("says what is currently unreadable, not just that trust is old", () => {
-    const banner = source.slice(source.indexOf("{#if trustExtendable}"));
-    expect(banner).toMatch(/before GitPulse covered worktrees/i);
-    expect(banner).toMatch(/left out of comparisons and collision checks/i);
-    expect(banner).toContain("Extend trust to every worktree");
+  it("no longer carries a second copy of the offer", () => {
+    // Two banners gated on two inspections of the same question is the state
+    // this refactor exists to avoid; leaving the old one behind would look
+    // like it worked.
+    expect(source).not.toContain("trustExtendable");
+    expect(source).not.toContain("cmd_repository_trust");
   });
 });

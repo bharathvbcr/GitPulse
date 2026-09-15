@@ -22,7 +22,11 @@ import { describe, expect, it } from "vitest";
  */
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TRUST_RS = path.join(ROOT, "src-tauri", "src", "repository_trust.rs");
-const PANEL = path.join(ROOT, "src", "lib", "components", "WorktreesPanel.svelte");
+// The button lives in the banner, not the panel it started in: it was hoisted
+// above the branch list so it cannot scroll out of sight. This pin followed it
+// — and caught the move, which is the point of naming a file rather than
+// grepping the tree for the words.
+const BANNER = path.join(ROOT, "src", "lib", "components", "TrustExtensionBanner.svelte");
 const SIDEBAR = path.join(ROOT, "src", "lib", "components", "Sidebar.svelte");
 
 function read(file: string): string {
@@ -49,8 +53,8 @@ function rustControlLabel(source: string): string {
   return match![1];
 }
 
-/** Every button label rendered by the worktrees panel. */
-function panelButtonLabels(source: string): string[] {
+/** Every button label the banner renders. */
+function bannerButtonLabels(source: string): string[] {
   return [...source.matchAll(/>([^<>{}]+)<\/button>/g)].map((m) => m[1].trim());
 }
 
@@ -59,17 +63,21 @@ describe("the trust refusal names a real control", () => {
   const label = rustControlLabel(rust);
 
   it("spells the control exactly as the button is labelled", () => {
-    const labels = panelButtonLabels(read(PANEL));
+    const labels = bannerButtonLabels(read(BANNER));
     expect(
       labels,
-      `WorktreesPanel has no button labelled ${JSON.stringify(label)}; it renders ${JSON.stringify(labels)}`,
+      `TrustExtensionBanner has no button labelled ${JSON.stringify(label)}; it renders ${JSON.stringify(labels)}`,
     ).toContain(label);
   });
 
   it("uses the constant in the refusal rather than retyping the words", () => {
     // A second copy of the label inside the message would satisfy the test
     // above and still drift the next time the button is renamed.
-    expect(rust).toContain('use \\"{EXTEND_TRUST_CONTROL}\\" in');
+    //
+    // Only the interpolation itself is asserted. An earlier version pinned the
+    // word that happened to follow it, and rewording the sentence around the
+    // control broke a test whose subject is not the sentence.
+    expect(rust).toContain('\\"{EXTEND_TRUST_CONTROL}\\"');
     const retyped = rust.split(`pub const EXTEND_TRUST_CONTROL: &str = "${label}";`).join("");
     expect(
       retyped.includes(`"${label}"`),
@@ -114,10 +122,19 @@ describe("the trust refusal names a real control", () => {
   });
 
   it("puts the control where the refusal says it is", () => {
-    // The message tells the reader to look in the left sidebar. That is only
-    // true while the panel is mounted there, and it is one refactor from not
-    // being.
-    expect(rust).toContain("Worktrees section of the left sidebar");
-    expect(read(SIDEBAR)).toContain("<WorktreesPanel");
+    // Directions go stale the moment something moves, and this pair already
+    // did: the message said "the Worktrees section" while the banner was being
+    // hoisted out of that panel to the top of the sidebar. Checking only that
+    // the sidebar mounts it somewhere was too weak to notice — so the position
+    // the words claim is what gets asserted.
+    expect(rust).toContain("at the top of the left sidebar");
+    const sidebarSource = read(SIDEBAR);
+    const banner = sidebarSource.indexOf("<TrustExtensionBanner />");
+    expect(banner, "Sidebar must mount the banner").toBeGreaterThan(-1);
+    for (const below of ["<BranchList />", "<WorktreesPanel />"]) {
+      const index = sidebarSource.indexOf(below);
+      expect(index, `Sidebar must still mount ${below}`).toBeGreaterThan(-1);
+      expect(banner, `the banner must precede ${below} to be "at the top"`).toBeLessThan(index);
+    }
   });
 });

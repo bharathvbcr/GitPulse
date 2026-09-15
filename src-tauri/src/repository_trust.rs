@@ -502,8 +502,7 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
                  so the earlier approval reaches only the checkout it named — \
                  which is why you are asked again here. If this worktree is \
                  already gone, open that repository instead and use \
-                 \"{EXTEND_TRUST_CONTROL}\" in the Worktrees section of the \
-                 left sidebar."
+                 \"{EXTEND_TRUST_CONTROL}\" at the top of the left sidebar."
             ));
         }
     }
