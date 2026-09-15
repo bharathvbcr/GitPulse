@@ -35,6 +35,15 @@ being read: extending is a decision you take, through the same dialog.
   ceiling alone instead of appending to it. Growing a near-limit environment
   turns a working spawn into `E2BIG`, surfacing as "Failed to spawn git:
   Argument list too long" with nothing naming the cause.
+- The vendored DevCouncil crates move to `b366f42`, taking the devmap store's
+  schema from 20 to 22. A GitPulse built from the previous vendored tree
+  refused the store its own repository already had — "schema version 22 is not
+  supported by this binary (schema 20)" — and the code graph then answered
+  "nothing" to every question, which reads exactly like a repository with no
+  callers. `dc-proc` joins the vendored closure at the same time: it had never
+  been vendored, but `dc-verify` and `devmap-extract` both took it as a hard
+  dependency upstream, so a re-vendor without it fails to resolve rather than
+  quietly building a stale tree.
 
 ### Fixed
 
@@ -90,6 +99,41 @@ being read: extending is a decision you take, through the same dialog.
   never happened: no highlight was drawn, and the step said "The Open menu is
   not currently visible" about a control that was on screen. The measurement is
   now bounded, so it lands whether or not a frame does.
+- Hook payloads from Cursor are read and answered in Cursor's schema rather
+  than Claude's, which had broken the session brief in both directions. Cursor
+  native `sessionStart` sends `workspace_roots` and usually no `cwd`, so every
+  Cursor session looked like a session with no repository and got no brief at
+  all; and Cursor injects only a top-level `additional_context`, so a brief
+  that *was* generated parsed as valid JSON and was then ignored. Cursor
+  `preToolUse` is a permission hook whose schema is not Claude's either, and
+  emitting Claude's nested `permissionDecision` there blocked the tool — it now
+  emits nothing and fails open. The host is chosen by a non-null
+  `cursor_version`, not by event-name casing: Claude plugins running on Cursor
+  still send camelCase `sessionStart`. Claude's own output is unchanged.
+- An agent worktree's kind and slug come from one scan instead of two searches
+  that could disagree. The kind was found by locating `/.<name>/worktrees`, the
+  slug by independently finding the first `/worktrees/` in the whole path — so
+  any ancestor directory named `worktrees` captured it, and
+  `~/worktrees/app/.claude/worktrees/session-abc` reported its slug as `app`.
+  Every session under such a parent collapsed into one label, which is the
+  exact merging the slug exists to prevent. Two further shapes were misread on
+  the way: `.GIT/worktrees` is git's own metadata store on the
+  case-insensitive volumes macOS and Windows ship by default, and was reported
+  as a real agent of kind `GIT`; and `/repo/../worktrees/x` reported an agent
+  of kind `.`. Windows separators are matched in the same pass, so an agent
+  worktree there is no longer labelled hand-made. Both implementations of the
+  rule — the Work view's and the backend's — now answer to one shared corpus,
+  so they cannot drift apart silently again.
+- An agent-session count taken from a capped sample no longer reads as an exact
+  total. The worktree walk is bounded, and a kind whose only worktrees fell
+  past the cap was missing from the list outright rather than undercounted. The
+  cell now carries the bound with it.
+- The rule deciding whether a vendored manifest still inherits from a workspace
+  has one owner. The vendor contract test carried its own copy, and when the
+  copy in `vendor-crates.mjs` learned that a description is prose, the test's
+  did not — so `dc-proc`, which describes itself as "shared by every place this
+  workspace shells out", vendored cleanly and then failed the very contract
+  that confirms it vendored cleanly.
 
 ## [1.1.0] - 2026-09-14
 
