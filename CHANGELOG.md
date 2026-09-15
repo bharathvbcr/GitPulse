@@ -468,63 +468,92 @@ capability that could not be probed is reported as unknown, never as absent.
 
 ### Verification
 
-Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at `0836d65`,
-after the Firebase App Hosting work was merged and the two gate failures it
-exposed were fixed. The tagged commit differs from that built tree only by this
-changelog entry.
+Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at `28e6f3a`,
+after three branches were merged into it: the App Hosting rollout work, the
+empty-window change-failure fix, and the capped-commit-scan disclosure. The
+tagged commit differs from that built tree only by this changelog entry.
 
 - `npm run ci:local` → exit 0, **15 passed · 0 failed · 0 skipped of 15 gates**.
-  The whole gate list, end to end. The previous build of this section could not
-  make that claim and said so; that caveat is withdrawn rather than left to look
-  satisfied. Every number below comes from that single run.
+  Every number below comes from that single run.
+
+  An earlier run of the same gates is *not* reported here, and the distinction
+  matters more than the result did. Sources were edited while it was still
+  running, so its later gates describe a tree that no longer exists; reporting
+  them would have been the exact substitution this release is about — a check
+  that could not run reading like one that ran and passed. It was discarded and
+  the gates were re-run from a clean tree.
 - `npm run check` → `svelte-check` over **5087 files: 0 errors, 0 warnings, 0
   files with problems**, then `tsc --noEmit` clean.
-- `npm run coverage` → **7073 passed, 0 failed** across 504 test files.
-- Rust tests under `cargo llvm-cov` → **2566 passed, 0 failed, 19 ignored**
+- `npm run coverage` → **7100 passed, 0 failed** across 504 test files.
+- Rust tests under `cargo llvm-cov` → **2584 passed, 0 failed, 19 ignored**
   across 79 test binaries, summed from the individual `test result:` lines
   rather than read off a tail: this shell is zsh, where a piped `tail` launders
   both the counts and the exit status.
-- `npm run test:browser:all` and `npm run test:webkit:all` → **845 checks across
-  13 harnesses on each engine, 1690 in total**, headless Chrome 152 and
-  WKWebView both green. Both engines ran for this build; the previous section
-  had to record that neither did.
+- `npm run test:browser:all` and `npm run test:webkit:all` → **894 checks across
+  13 harnesses on each engine, 1788 in total**, headless Chrome 152 and
+  WKWebView both green. The Firebase harness accounts for 85 of each engine's
+  checks, up from 36, covering the rollout confirmation and the capability probe.
 - `npm run check:coverage` → floors hold: frontend lines **96.17%**
-  (12835/13346), frontend branches **89.47%** (12548/14025), Rust lines
-  **85.32%** (68659/80472).
+  (12842/13354), frontend branches **89.47%** (12554/14032), Rust lines
+  **85.36%** (69057/80902).
+- `npm run check:ipc` → **224 handlers**, 0 orphaned, 0 missing.
+  `npm run check:types` → **67 contracts, 167 structs, 1168 fields**, 0 drift.
+  Both counts moved twice as branches landed and were read back from the
+  checkers at each step rather than added up by hand; the documented-counts
+  contract passes 13/13 over the four tracked docs.
 - `npm run check:release` → `OK: all version sources agree on 1.2.0` across all
   ten manifests.
-- `npm run tauri build` → exit 0, first attempt. `GitPulse.app` and
-  `GitPulse_1.2.0_aarch64.dmg` (21,981,845 bytes), every nested helper
-  (`gitpulsed`, `gitpulse-mcp`, `gitpulse-hook`) ad-hoc signed before the outer
-  bundle. `codesign --verify --deep --strict` on the installed copy: *valid on
-  disk*, *satisfies its Designated Requirement*, all three helpers validated.
-  Not notarized — no Apple credentials in the environment, as usual for a local
-  build.
+- `npm run tauri build` → exit 0, first attempt, release profile in 1m 30s.
+  `GitPulse.app` and `GitPulse_1.2.0_aarch64.dmg` (21,974,040 bytes), every
+  nested helper (`gitpulsed`, `gitpulse-mcp`, `gitpulse-hook`) ad-hoc signed
+  before the outer bundle.
 
-  The stale-mounted-volume failure recorded against the previous build did not
-  recur, because `hdiutil info` was checked for an attached `dmg.*` volume
-  *before* the build rather than after one failed naming only a script.
+  The install was verified rather than assumed: `diff -r` between the built
+  bundle and `/Applications/GitPulse.app` reports them identical, and all four
+  binaries match by SHA-256. `codesign --verify --deep --strict` on the
+  installed copy: *valid on disk*, *satisfies its Designated Requirement*, all
+  three helpers validated, designated cdhash `a755a292ca1f8749…`. Not notarized
+  — no Apple credentials in the environment, as usual for a local build.
+
+  `hdiutil info` was checked for an attached `dmg.*` volume before the build,
+  not after one failed; only system simulator runtimes were mounted.
 - `npm run mcp:install` → `gitpulse-mcp` and `gitpulse-hook` replaced at 1.2.0,
-  provenance recorded at source digest `06abf2cc16fb5fed…` over **676 files**.
-  `npm run mcp:doctor` → OK on all three claims, including that both binaries
-  were built from the source this tree holds.
+  provenance recorded at source digest `36f4f49a2e01672c…` over **676 files**.
+  `npm run mcp:doctor` → OK on all three claims.
 
-  The digest is what moved: the previous record was `d733533a741f5104…` over
-  **674** files, the two added being `src-tauri/src/firebase/mod.rs` and
-  `apphosting.rs`. Version and store schema read 1.2.0 and 22 on both sides
-  before the reinstall, and would have reported a clean match on their own.
-- Superseded build evidence was pruned to the single entry whose chunk names
-  match the shipped `dist/index.html`. Revision alone could not identify it:
-  two builds of the same commit `0836d65` produced *different* chunk hashes, so
-  an entry can carry the right revision and still not be the one that shipped.
+  The digest is the whole reason this was caught. Before the reinstall, the
+  doctor reported the version it wanted (1.2.0) and the store schema it wanted
+  (22) on *both* sides and still failed, because the recorded digest was
+  `06abf2cc16fb5fed…` over the same 676 files while the tree had moved to
+  `36f4f49a2e01672c…`. Version is a release identity and does not move between
+  releases, so two of the three verdicts would have passed a binary running
+  pre-merge code.
+- Superseded build evidence was pruned to the single entry whose chunks match
+  the shipped build, **39 MB down to 9.8 MB**. Revision alone could not identify
+  it: two builds of the same commit `28e6f3a` produced *different* chunk hashes
+  (`main-1nI-zcB3.js` and `main-CJc8Sj5r.js`), so an entry can carry the right
+  revision and still not be the one that shipped. The surviving entry was
+  matched two independent ways — `dist/index.html`, and the chunk name embedded
+  in the installed binary itself, which agree on `main-CJc8Sj5r.js`.
+- Consolidation removed seven worktrees and three branches. Each branch was
+  deleted with `git branch -d`, which refuses an unmerged branch, so the merge
+  was confirmed by the tool rather than asserted; every worktree HEAD was
+  separately checked to be an ancestor of `main` with zero unique commits, using
+  a test carrying its own discrimination case so that an always-true check could
+  not pass for one. About **57 GB** was reclaimed: 38 GB of worktrees, 18.7 GB
+  of `target/debug` and stale coverage instrumentation, and the pruned evidence.
 
 **What is not verified here.** Notarization is absent, as above. Nothing was
 pushed: `main` is ahead of `origin/main` and the tag is local, so the
 CI-provenance precondition in `release:ready` — a successful push run of
 `ci.yml` and `coverage.yml` on the tagged commit — is not satisfied, and no
-draft was prepared. The App Hosting panel was exercised by its own harness and
-unit tests only; no live Firebase project was contacted, deliberately, because
-both listings enable the API on the project they read.
+draft was prepared. The App Hosting panel, including the new rollout action, was
+exercised by its own harness and unit tests only; no live Firebase project was
+contacted and no rollout was created, deliberately, because creating one changes
+what production serves and both listings enable the API on the project they
+read. `docs/PROMO.md` needed a handler-count correction that is not in any
+commit: `.gitignore` excludes it, and its contract test reports *skipped* rather
+than passed where the file is absent.
 
 ### Changed — vendored crates
 
