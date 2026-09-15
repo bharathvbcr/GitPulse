@@ -381,38 +381,39 @@
           class="px-2 py-1 rounded-2xl flex flex-col hover:bg-surfaceHover group transition-colors
             {wt.is_main ? '' : 'ring-1 ring-inset ring-accent/25'}"
         >
-         <div class="flex items-center justify-between">
+         <!--
+           Line one is the name's alone; line two carries everything that used
+           to compete with it.
+
+           The one-line row could not hold both. The name was the only flex
+           item among shrink-0 chips, a branch capped at 90px and a
+           permanently reserved action rail, so it was the only thing that
+           could give — and it gave all of it. Measured at the 360px default
+           width, `gitpulse-prompting-extraction-c8e628` rendered in 79px of
+           the 210px it needs; at the 264px minimum it rendered in 0px, and
+           the branch beside it painted straight through the change count.
+           Branch rows hit this first and answered it the same way; the
+           reasoning is written up in `sidebar/metrics.ts`.
+         -->
+         <div class="flex items-center gap-1.5 min-w-0">
           <button
             class="flex items-center gap-1.5 min-w-0 flex-1 text-left"
             onclick={() => open(wt)}
             title="{wt.path}\n{wt.branch ?? 'detached'} · {wt.dirty_files === null ? 'not scanned' : wt.dirty_files + ' change(s)'}"
           >
             <span class="truncate text-[11px] font-medium text-textPrimary">{wt.name}</span>
-            {#if isAgentWorktree(wt.path)}
-              <span
-                class="shrink-0 text-[9px] uppercase rounded-full bg-accent/10 px-1 text-accent"
-                title="Agent session {agentSessionSlug(wt.path) || agentKind(wt.path)}"
-              >{agentKind(wt.path)}</span>
-            {/if}
-            {#if wt.is_bare}
-              <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1 text-textMuted">bare</span>
-            {/if}
-            {#if wt.is_locked}
-              <Lock size={10} class="shrink-0 text-textMuted" />
-            {/if}
-            {#if wt.is_prunable}
-              <AlertTriangle size={10} class="shrink-0 text-amber-400" />
-            {/if}
-            <span class="shrink-0 text-[10px] font-mono text-textMuted truncate max-w-[90px]">
-              {wt.branch ?? (wt.is_detached ? wt.head.slice(0, 7) : "")}
+            <!-- Glyphs only, never text: the two marks small enough to share
+                 line one without taking back what the name just gained. -->
+            <span class="ml-auto flex items-center gap-1 shrink-0">
+              {#if wt.is_locked}
+                <Lock size={10} class="text-textMuted" />
+              {/if}
+              {#if wt.is_prunable}
+                <AlertTriangle size={10} class="text-amber-400" />
+              {/if}
             </span>
           </button>
-          {#if (wt.dirty_files ?? 0) > 0}
-            <button type="button" class="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400 hover:bg-amber-500/10"
-              title="Preview {wt.dirty_files} uncommitted changes in {wt.path}"
-              onclick={() => void repoStore.previewUncommitted(wt.path)}>{wt.dirty_files} changed</button>
-          {/if}
-          <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 shrink-0">
+          <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 shrink-0">
             <button
               onclick={() => open(wt)}
               title="Open in a new tab"
@@ -434,15 +435,6 @@
                   <Lock size={11} />
                 {/if}
               </button>
-              {#if removingPath === wt.path}
-                <span class="shrink-0 text-[9px] font-semibold text-rose-400 whitespace-nowrap">
-                  {typeof wt.dirty_files === "number" && wt.dirty_files > 0
-                  ? `Discard ${wt.dirty_files} changed files?`
-                  : wt.dirty_files === null
-                    ? "Not scanned — clean remove?"
-                    : "Remove?"}
-                </span>
-              {/if}
               <button
                 onclick={() => void remove(wt)}
                 title={removeArmTitle(wt)}
@@ -453,6 +445,64 @@
               </button>
             {/if}
           </div>
+         </div>
+
+         <!--
+           Line two: the branch, the session chips, and the change count.
+
+           `overflow-hidden` plus the right-edge fade is load-bearing rather
+           than tidiness. The chips are shrink-0, so on a sidebar dragged to
+           its 264px minimum they would otherwise paint through the row's edge
+           and under the count — which is precisely how `claude/gitpul` came
+           to sit on top of `12 changed`. The mask only bites when content
+           actually reaches the last 14px, so a clipped row looks clipped
+           instead of looking like a shorter branch name.
+         -->
+         <div class="flex items-center gap-1 min-w-0 leading-none">
+          <span
+            class="flex-1 min-w-0 flex items-center gap-1 overflow-hidden"
+            style="mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent);"
+          >
+            {#if isAgentWorktree(wt.path)}
+              <span
+                class="shrink-0 text-[9px] uppercase rounded-full bg-accent/10 px-1 text-accent"
+                title="Agent session {agentSessionSlug(wt.path) || agentKind(wt.path)}"
+              >{agentKind(wt.path)}</span>
+            {/if}
+            {#if wt.is_bare}
+              <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1 text-textMuted">bare</span>
+            {/if}
+            <span
+              class="truncate text-[10px] font-mono text-textMuted"
+            >{wt.branch ?? (wt.is_detached ? wt.head.slice(0, 7) : "")}</span>
+          </span>
+          {#if removingPath === wt.path}
+            <!--
+              The armed confirm reads here, under the trash button that armed
+              it, rather than inside the action cluster on line one. There it
+              was a 119px sentence spliced into the same flex line as the
+              name, taking that width from the only item on the line that
+              could give — at the exact moment the reader needs to know which
+              worktree is about to lose work.
+
+              It does not move the button it asks to click again, and did not
+              before either: the cluster is right-anchored and the trash
+              button is its last child, so the button stays pinned to the
+              row's edge. `harness/branches.html` measures that, because line
+              two must not be what finally breaks it.
+            -->
+            <span class="shrink-0 text-[9px] font-semibold text-rose-400 whitespace-nowrap">
+              {typeof wt.dirty_files === "number" && wt.dirty_files > 0
+              ? `Discard ${wt.dirty_files} changed files?`
+              : wt.dirty_files === null
+                ? "Not scanned — clean remove?"
+                : "Remove?"}
+            </span>
+          {:else if (wt.dirty_files ?? 0) > 0}
+            <button type="button" class="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400 hover:bg-amber-500/10"
+              title="Preview {wt.dirty_files} uncommitted changes in {wt.path}"
+              onclick={() => void repoStore.previewUncommitted(wt.path)}>{wt.dirty_files} changed</button>
+          {/if}
          </div>
 
           <!--

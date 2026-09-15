@@ -4,13 +4,14 @@
 <body><main><div id="sidebar"></div><article><h1>Branch merging</h1><p>Copy a full branch name from the sidebar, or choose Merge to review a local or remote source and its destination. Branch actions also open the review with a source selected.</p><p>This preview uses fixture repositories. Merge actions here do not change a real repository.</p></article></main><div id="toasts"></div><output id="verdict"></output>
 <script type="module">
 import "../src/app.css";
-import { mount, tick } from "svelte";
+import { mount, unmount, tick } from "svelte";
 import { get } from "svelte/store";
 import { themeStore } from "../src/lib/stores/themeStore";
 import { repoStore } from "../src/lib/stores/repoStore";
 import { filterStore } from "../src/lib/stores/filterStore";
 import { toastStore } from "../src/lib/stores/toastStore";
 import BranchList from "../src/lib/components/BranchList.svelte";
+import WorktreesPanel from "../src/lib/components/WorktreesPanel.svelte";
 import { sidebarRowHeight } from "../src/lib/sidebar/metrics";
 import ToastContainer from "../src/lib/components/ToastContainer.svelte";
 const params = new URLSearchParams(location.search);
@@ -40,6 +41,10 @@ const branch = (name, remote = false) => ({name, is_current: name === current &&
 // exact figure and the verdict computed from it — so a fixture where every
 // branch is seconds old cannot show that path at all.
 const STALE_AGE = 120 * 86400;
+/** The repository every fixture below speaks for. */
+const REPO = "/fixture/branches";
+/** A real Claude session directory name, at its real length. */
+const LONG_WORKTREE = "gitpulse-prompting-extraction-c8e628";
 const names = ["main", "feature/branch-selection", "feature/keyboard-navigation", "release/0.0.9"];
 let branches = [...names.map(n => branch(n)), branch("origin/feature/branch-selection", true), branch("upstream/main", true), branch("origin/HEAD", true)];
 const fixture = {
@@ -53,6 +58,14 @@ const fixture = {
   cmd_provenance_freshness_batch: a => a.revisions.map(commit_sha=>({commit_sha,distance:null,confidence:null,is_fresh:false,unmeasured_reason:"Fixture",notes_readable:true,verification:null,session:null})),
   cmd_branch_stats: () => ({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
   cmd_repo_operation: () => {if(probeFailed)throw Error("Fixture probe failed");return operation;},
+  // A real agent session name and a real agent branch, both long: a fixture
+  // of short names cannot show the layout the worktree row broke.
+  cmd_list_worktrees: () => [
+    {path:REPO,name:"GitPulse",branch:"main",head:"f".repeat(40),is_main:true,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:1},
+    {path:`${REPO}/.claude/worktrees/${LONG_WORKTREE}`,name:LONG_WORKTREE,branch:`claude/${LONG_WORKTREE}`,head:"b".repeat(40),is_main:false,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:12}],
+  cmd_repository_trust: () => ({path:REPO,git_dir:`${REPO}/.git`,common_dir:`${REPO}/.git`,identity:"fixture",scope:"repository",worktrees:2}),
+  cmd_task_view: () => ({available:false,store_path:"",leases:[],error:""}),
+  cmd_worktree_task: () => null,
   cmd_merge_branch: async a => {merges.push(a);if(pendingMerge)await new Promise(resolve => {pendingMerge(resolve);});if(failMerge)throw Error("Fixture merge failed");return "Merged";},
 };
 window.__TAURI_INTERNALS__ = {invoke:async(cmd,args) => {if(fixture[cmd])return fixture[cmd](args);if(cmd.startsWith("plugin:event|"))return 1;unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
@@ -142,6 +155,65 @@ if(params.has("check")) {
     const freshAge = [...lines(navRow)[1].querySelectorAll("span")]
       .find(el => el.title.startsWith("Last commit"));
     check("a fresh branch's age is not tinted",!freshAge.className.includes("amber"));
+
+    // --- two-line worktree rows -----------------------------------------
+    // Same defect, same sidebar, same fix — so the same harness. The
+    // worktree row kept its single line long after branch rows gave theirs
+    // up, and it failed harder: its name competed with a session chip, a
+    // branch capped at 90px, a change count AND a permanently reserved
+    // action rail, so `gitpulse-prompting-extraction-c8e628` rendered in
+    // 79px of the 210px it needs at the 360px default width, and in 0px at
+    // the 264px minimum. Mounted and unmounted here so the merge checks
+    // below keep the exact document they were written against.
+    const wtHost = document.createElement("div");
+    wtHost.style.cssText = "width:304px";
+    document.getElementById("sidebar").appendChild(wtHost);
+    const wtPanel = mount(WorktreesPanel,{target:wtHost});
+    await waitFor(() => wtHost.textContent.includes(LONG_WORKTREE));
+    const wtRows = [...wtHost.querySelectorAll("div.rounded-2xl")]
+      .filter(r => r.querySelector('button[aria-label^="Open "]'));
+    const wtLines = row => [...(row?.children ?? [])].filter(c => c.getBoundingClientRect().height > 0);
+    const longRow = wtRows.find(r => r.textContent.includes(LONG_WORKTREE));
+    const wtName = longRow?.querySelector(".truncate");
+    // Read through optionals throughout. Collapsing the row back to one line
+    // is the regression these checks exist to catch, and it is exactly what
+    // makes `wtLines(longRow)[1]` undefined — so a bare `.textContent` would
+    // throw, and a check that throws writes no row at all. Absent reads like
+    // never written; see harness/README.md.
+    const wtLine = i => wtLines(longRow)[i]?.textContent ?? "";
+    check("worktree rows exist to measure",wtRows.length===2);
+    check("every worktree row has two lines",wtRows.every(r => wtLines(r).length===2));
+    check("the worktree name is shown in full, not ellipsised",
+      !!wtName && wtName.scrollWidth <= wtName.clientWidth + 1);
+    check("the worktree name owns line one",
+      !!wtName && !!wtLines(longRow)[0]?.contains(wtName)
+      && !/\d+ changed/.test(wtLine(0)) && !wtLine(0).includes("claude/"));
+    check("line two carries the branch, the session chip and the count",
+      wtLine(1).includes("claude/" + LONG_WORKTREE)
+      && /CLAUDE/i.test(wtLine(1)) && /12 changed/.test(wtLine(1)));
+    // Same rule line two of a branch row lives by: clip, never overflow.
+    check("no worktree row paints past its own edge",wtRows.every(row => {
+      const edge = row.getBoundingClientRect().right + 0.5;
+      return [...row.querySelectorAll("span,button")]
+        .every(el => el.getBoundingClientRect().right <= edge);
+    }));
+    // The confirm asks for a second click on the button that armed it, so
+    // that button must not move. It does not today and did not before —
+    // the action cluster is right-anchored and the trash button is its last
+    // child — and this pins it, because moving the confirm to line two is
+    // exactly the kind of change that could have cost it.
+    // Looked up BEFORE the click, so it is the un-armed label; arming swaps
+    // it for the cost sentence that `removeArmTitle` builds.
+    const trash = [...(longRow?.querySelectorAll("button") ?? [])]
+      .find(b => b.getAttribute("aria-label")==="Remove this worktree");
+    const armedFrom = trash?.getBoundingClientRect().left;
+    trash?.click();await settle();
+    check("arming the remove confirm does not move the button it asks to click again",
+      !!trash && Math.abs(trash.getBoundingClientRect().left - armedFrom) < 0.5);
+    check("the armed confirm names the cost, inside the row",
+      !!longRow && longRow.textContent.includes("Discard 12 changed files?")
+      && longRow.scrollWidth <= Math.ceil(longRow.getBoundingClientRect().width) + 1);
+    await unmount(wtPanel);wtHost.remove();
 
     check("visible merge entry point",button("Merge branches"));
     await click("Copy branch name feature/branch-selection");
