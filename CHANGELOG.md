@@ -45,6 +45,24 @@ being read: extending is a decision you take, through the same dialog.
   it is chosen once rather than every time, and a stored value this build
   cannot read falls back to manual — the mode that spends a model call must not
   be the one a failed decode selects.
+- Due is a control the sheet owns rather than the browser's `datetime-local`
+  box. A trigger, a portaled month grid, and a word box that shares the board's
+  quick-add grammar — type `friday 09:30` and press Return, the same phrasing
+  that works on the quick-add line, which is also what proves the grammar is
+  wired rather than duplicated. `taskDue` owns only what was unowned: the
+  grammar of a date word stays with `parseQuickAddDue` and how urgent a deadline
+  is stays with `dueState`, because the board sorts and filters on that and the
+  sheet must not answer it a second way. All of it is local time — a due date is
+  a day in the reader's week, not an instant, so the sheet cannot show "Sep 18"
+  for a timestamp the board files under the 19th.
+- The plugin package has a display name, and a mark where a client will actually
+  render it. `name` is the install identifier, so the list showed `gitpulse`.
+  The logo lives in `.cursor-plugin/plugin.json` and nowhere else: Cursor is the
+  only one of the three hosts that renders a `logo`, Claude Code documents no
+  field for one, and the Agent Plugins schema sets `additionalProperties: false`,
+  so the same key in the portable manifest invalidates the package for a
+  conformant client. `check-release-version` walks the Cursor manifest with the
+  other three, so its version cannot drift from the release.
 
 ### Changed
 
@@ -78,6 +96,28 @@ being read: extending is a decision you take, through the same dialog.
   been vendored, but `dc-verify` and `devmap-extract` both took it as a hard
   dependency upstream, so a re-vendor without it fails to resolve rather than
   quietly building a stale tree.
+- Anchored popovers have one owner. Ten surfaces hand-rolled the same panel — a
+  clamp call, a dismiss call, and an `onMount` block pairing `addEventListener`
+  with `removeEventListener` for some subset of pointerdown / click /
+  contextmenu / scroll / resize / keydown — and they had drifted into ten
+  different answers to the same questions, none of them visible at the call
+  site. The action attaches to the popover node itself, so listener lifetime
+  becomes popover lifetime: the old blocks lived for the whole component behind
+  `if (!open) return` guards, so a component could hold four window listeners
+  while showing nothing, and a node inside `{#if open}` cannot. What stays at the
+  call site is what genuinely differs there — the dismiss selector, because what
+  counts as "inside" is a per-surface fact and most sites must count their own
+  trigger or the opening pointerdown closes the panel; focus restoration; and
+  keyboard ownership, since a menu with roving focus already owns keydown and
+  Escape is one branch of it.
+- The task sheet's repository control names its links instead of counting them.
+  The closed trigger draws a chip per linked repository, primary first and
+  starred, with the summary sentence beneath for what chips cannot say — a
+  remainder, or a link with no primary chosen. Its two rules moved out of the
+  markup into `taskRepositories`, where they can be tested: a filter never hides
+  a linked repository, because hiding a chosen row makes the control lie about
+  what the task links to; and rows keep catalog order, because sorting linked
+  rows to the top moves a row out from under the pointer that just checked it.
 
 ### Fixed
 
@@ -168,6 +208,32 @@ being read: extending is a decision you take, through the same dialog.
   did not — so `dc-proc`, which describes itself as "shared by every place this
   workspace shells out", vendored cleanly and then failed the very contract
   that confirms it vendored cleanly.
+- The worktree trust refusal named a control the UI does not have. It said
+  "Extend Trust" while the button read "Extend trust to every worktree" in the
+  left sidebar's Worktrees section, so a reader handed those words found nothing
+  on screen and concluded the control had been removed — one of them read the
+  source to find a banner that was visible the whole time. Naming a control by
+  the wrong name is worse than naming none. The message is also shorter: the
+  sentence before it already says approving any working tree covers the family,
+  so restating the cheap path said the same thing twice. A new contract test
+  pins the string against the button's own label, because Rust owns the message
+  and Svelte owns the button and nothing else compares them.
+- Choosing which suggested fields to accept no longer marks the task edited. The
+  sheet marks dirty from any change inside its form, so the unsaved-edits guard
+  was refusing the very acceptance the checkbox was selecting.
+- The platform-vocabulary guard reads a comment for its whole length, and
+  resumes scanning the moment it ends. It decided comment-or-not one line at a
+  time, and the house style indents a block comment's continuation lines as prose
+  rather than gutter-marking them, so line two was read as template text and a
+  platform named in the explanation was reported as output. 629 comment lines in
+  the scanned trees read that way; the guard was green only because none of them
+  happened to name a platform, and the first that did was reworded to appease the
+  bug. The reverse half matters as much — `<!-- why --> ⌘K` really does print a
+  glyph, and the old line test skipped that line whole. The one way comment
+  tracking can fail silently is an opener it should not have believed, which
+  skips the rest of the file as prose, so the scanner now reports whether it
+  closed what it opened and every scanned file is asserted to do so: a blinded
+  scanner must not read as a clean one.
 
 ## [1.1.0] - 2026-09-14
 
