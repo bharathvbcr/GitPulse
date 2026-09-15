@@ -47,6 +47,17 @@ describe("PulseDora component", () => {
     expect(source).toContain("heuristic");
   });
 
+  it("derives the change-failure label from the flag rather than asserting it", () => {
+    // `is_cfr_approximation` crossed the wire unread: the pill was the literal
+    // "Heuristic", so a measured rate would have arrived still labelled a
+    // guess. A stale label on a number is worse than none, because it is
+    // believed.
+    expect(source).toContain("dora.is_cfr_approximation ?");
+    const pill = source.indexOf("Change Failure Rate");
+    const literal = source.indexOf(">\n            Heuristic\n", pill);
+    expect(literal, "the hard-coded pill must be gone").toBe(-1);
+  });
+
   it("declines to invent a restore time when there were no samples", () => {
     expect(source).toContain("Could not estimate from commit patterns");
     expect(source).toMatch(/is_mttr_approximation && dora\.mttr_hours <= 0/);

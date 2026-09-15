@@ -119,8 +119,14 @@
       <div class="p-3.5 rounded-xl border border-border/60 bg-surface flex flex-col justify-between">
         <div class="flex items-center justify-between text-textMuted text-xs">
           <span class="font-medium uppercase tracking-wider text-[10px]">Change Failure Rate</span>
+          <!-- Derived from the flag the backend already sends, not hard-coded.
+               `is_cfr_approximation` was declared, set by Rust and read by
+               nobody, so a measured change-failure rate would have arrived and
+               still been labelled a heuristic — a stale label on a number is
+               worse than no label, because it is believed. Card 4 has read its
+               own flag all along; this one now matches it. -->
           <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surfaceMuted text-textMuted border border-border/50">
-            Heuristic
+            {dora.is_cfr_approximation ? "Heuristic" : "Measured"}
           </span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
@@ -129,7 +135,19 @@
           </span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          {dora.cfr_sample_commits <= 0 ? "No commits in this window to examine" : `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}`}
+          <!-- Two guards, and the nesting is the decision. The empty-sample
+               check is outermost so this line always agrees with the value
+               above it, which shows an em dash on an empty sample whatever the
+               flag says — a caption naming a source for a number that is not
+               being shown would be its own small dishonesty. Inside it the
+               wording follows `is_cfr_approximation` rather than assuming the
+               heuristic, and the heuristic branch names the denominator it was
+               measured over instead of letting the reader assume the window. -->
+          {dora.cfr_sample_commits <= 0
+            ? "No commits in this window to examine"
+            : dora.is_cfr_approximation
+              ? `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}`
+              : "From recorded deployment outcomes"}
         </p>
       </div>
 

@@ -190,10 +190,10 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` (TypeScript 6 compatibility API for Svelte) and stable TypeScript 7 `tsc` type validation on `tsconfig.node.json` |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (223 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (224 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `npm run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 67 contracts (165 structs, 1156 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 67 contracts (167 structs, 1165 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `npm run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -295,12 +295,12 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (223 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (224 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
     ├── harness/          Manvi wrap: policy gate, sidecar protocol
-    ├── firebase/         firebase CLI integration (App Hosting backends, rollouts, commit join)
+    ├── firebase/         firebase CLI integration (App Hosting backends, rollouts, commit join, gated deploy)
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot, code scanning)
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution

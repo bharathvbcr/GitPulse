@@ -13,6 +13,7 @@ import type {
   FirebaseBackendsReport,
   FirebaseRolloutsReport,
   FirebaseStatus,
+  RolloutCreateOutcome,
 } from "./types";
 
 export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -49,18 +50,53 @@ export function listFirebaseBackends(
   });
 }
 
-/** Lists rollouts for one backend, joined to local commits. Gated as above. */
+/**
+ * Lists rollouts for one backend, joined to local commits. Gated as above.
+ *
+ * There is no `location` argument. Upstream's `--location` on this subcommand
+ * is documented as "being removed in the next major release", and its default
+ * of `-` already means every region — which is the answer a deployment panel
+ * wants. Check `FirebaseStatus.rollout_listing` before calling: this
+ * subcommand ships behind an experiment that is off by default.
+ */
 export function listFirebaseRollouts(
   repoPath: string,
   projectId: string,
   backendId: string,
-  location: string | null,
   invokeFn: InvokeFn = invoke,
 ): Promise<Guarded<FirebaseRolloutsReport>> {
   return invokeFn<Guarded<FirebaseRolloutsReport>>("cmd_firebase_rollouts", {
     repoPath,
     projectId,
     backendId,
-    location,
+  });
+}
+
+/**
+ * Creates an App Hosting rollout pinned to one commit.
+ *
+ * The only call here that changes what production serves, and the only one this
+ * app cannot undo: App Hosting publishes no rollback verb, so reverting a
+ * rollout means creating another against an earlier commit. It is also not
+ * idempotent — calling it twice deploys twice — which is why the panel confirms
+ * the exact target before calling, and why a zero exit is never re-reported as
+ * a failure.
+ *
+ * The commit must be a full 40-character SHA, and it must exist in the
+ * *backend's connected GitHub repository*, which is not necessarily this
+ * checkout.
+ */
+export function createFirebaseRollout(
+  repoPath: string,
+  projectId: string,
+  backendId: string,
+  gitCommit: string,
+  invokeFn: InvokeFn = invoke,
+): Promise<Guarded<RolloutCreateOutcome>> {
+  return invokeFn<Guarded<RolloutCreateOutcome>>("cmd_firebase_create_rollout", {
+    repoPath,
+    projectId,
+    backendId,
+    gitCommit,
   });
 }

@@ -233,6 +233,7 @@ pub fn run() {
             cmd_firebase_status,
             cmd_firebase_backends,
             cmd_firebase_rollouts,
+            cmd_firebase_create_rollout,
             cmd_github_trigger_workflow,
             cmd_github_rerun_run,
             cmd_github_cancel_run,

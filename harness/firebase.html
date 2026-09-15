@@ -10,6 +10,11 @@
    * component's source; only a rendered page can show that the sentence
    * actually reaches a reader, in the right state, and that a listing which
    * could not run never renders as a backend that has never deployed.
+   *
+   * The newest group covers a capability, not a payload. `apphosting:rollouts:list`
+   * ships behind an experiment that is off by default, so for most installs the
+   * honest rendering is a reason and no button — and "no button, no reason" is
+   * indistinguishable from a feature nobody built.
    */
   import "../src/app.css";
   import { mount, unmount, tick } from "svelte";
@@ -25,6 +30,7 @@
   const SHA = "0123456789abcdef0123456789abcdef01234567";
 
   const cliPresent = { present: true, program: "firebase", version: "15.25.1", reason: null };
+  const listingAvailable = { available: true, checked: true, reason: null };
   const status = (over = {}) => ({
     configured: true,
     projects: [
@@ -32,8 +38,10 @@
       { alias: "staging", project_id: "acme-staging" },
     ],
     default_alias: "default",
+    projects_truncated: false,
     has_apphosting_config: true,
     cli: cliPresent,
+    rollout_listing: listingAvailable,
     firebaserc_error: null,
     firebasejson_error: null,
     ...over,
@@ -52,20 +60,46 @@
     rollouts: [rollout("succeeded")],
     truncated: false, unreachable: [], walk_incomplete: null, error: null, ...over,
   });
+  const backendListing = (over = {}) => ({
+    available: true, checked: true, cli_present: true,
+    project_id: "acme-prod",
+    backends: [
+      { id: "web", location: "us-central1", uri: "https://web--acme.web.app" },
+      { id: "admin", location: "europe-west4", uri: null },
+    ],
+    truncated: false, unreachable: [], walk_incomplete: null, error: null, ...over,
+  });
+
+  const createOutcome = (over = {}) => ({
+    project_id: "acme-prod", backend_id: "web", git_commit: SHA,
+    created: true, unconfirmed: null, ...over,
+  });
 
   /** What the mocked backend answers next; each scenario swaps these. */
   let statusReply = status();
   let rolloutsReply = { policy: null, output: listing() };
+  let backendsReply = { policy: null, output: backendListing() };
+  let createReply = { policy: null, output: createOutcome() };
   let rolloutsThrows = null;
+  let backendsThrows = null;
+  let createThrows = null;
   const invoked = [];
   const unexpected = [];
   window.__TAURI_INTERNALS__ = {
     invoke: async (cmd, args) => {
       invoked.push({ cmd, args });
       if (cmd === "cmd_firebase_status") return statusReply;
+      if (cmd === "cmd_firebase_backends") {
+        if (backendsThrows) throw new Error(backendsThrows);
+        return backendsReply;
+      }
       if (cmd === "cmd_firebase_rollouts") {
         if (rolloutsThrows) throw new Error(rolloutsThrows);
         return rolloutsReply;
+      }
+      if (cmd === "cmd_firebase_create_rollout") {
+        if (createThrows) throw new Error(createThrows);
+        return createReply;
       }
       unexpected.push(cmd);
       throw new Error(`Unconfigured command: ${cmd}`);
@@ -77,27 +111,52 @@
   const settle = async () => { await tick(); await new Promise(r => setTimeout(r, 40)); await tick(); };
   const root = () => document.querySelector('[data-panel="firebase"]');
   const text = () => root()?.textContent ?? "";
+  /**
+   * Visible text with runs of whitespace collapsed.
+   *
+   * Prose in the markup wraps across source lines, so `textContent` carries the
+   * newline and indentation between two words a reader sees side by side.
+   * Asserting on the raw text makes every sentence check hostage to where the
+   * formatter happened to break the line.
+   */
+  const flat = () => text().replace(/\s+/g, " ");
   const remount = async () => {
     if (app) { await unmount(app); app = null; }
     document.getElementById("app").innerHTML = "";
     app = mount(FirebasePanel, { target: document.getElementById("app"), props: { repoPath: REPO } });
     await settle();
   };
-  const selectProject = async alias => {
-    const select = root().querySelector("select");
-    select.value = alias;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+  const selects = () => [...root().querySelectorAll("select")];
+  const setSelect = async (element, value) => {
+    element.value = value;
+    element.dispatchEvent(new Event("change", { bubbles: true }));
     await settle();
   };
+  const selectProject = async alias => setSelect(selects()[0], alias);
   const typeBackend = async value => {
     const input = root().querySelector("input");
     input.value = value;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     await settle();
   };
-  const checkButton = () =>
-    [...root().querySelectorAll("button")].find(b => b.textContent.trim() === "Check rollouts");
+  const button = label =>
+    [...root().querySelectorAll("button")].find(b => b.textContent.trim() === label);
+  const checkButton = () => button("Check rollouts");
+  const backendsButton = () => button("List backends");
+  const reviewButton = () => button("Review deploy");
+  const deployButton = () =>
+    [...root().querySelectorAll("button")].find(b => b.textContent.trim().startsWith("Deploy "));
   const runListing = async () => { checkButton().click(); await settle(); };
+  const runBackends = async () => { backendsButton().click(); await settle(); };
+  const shaInput = () =>
+    [...root().querySelectorAll("input")].find(i => i.placeholder.includes("commit SHA"));
+  const typeSha = async value => {
+    const input = shaInput();
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+  };
+  const created = () => invoked.filter(c => c.cmd === "cmd_firebase_create_rollout");
 
   if (params.get("theme") === "light") document.documentElement.classList.add("light");
   await remount();
@@ -108,30 +167,129 @@
       check("panel renders its heading", () => text().includes("Firebase App Hosting"));
       check("status is read on mount", () => invoked.some(c => c.cmd === "cmd_firebase_status"));
       check("mount never lists rollouts", () => !invoked.some(c => c.cmd === "cmd_firebase_rollouts"));
+      check("mount never lists backends either",
+        () => !invoked.some(c => c.cmd === "cmd_firebase_backends"));
       check("both aliases are offered", () => root().querySelectorAll("option").length === 3);
       check("the default alias is marked", () => text().includes("default"));
       check("no alias is preselected when there is a choice",
-        () => root().querySelector("select").value === "");
-      check("the check button is disabled without a target", () => checkButton().disabled);
+        () => selects()[0].value === "");
+      check("the rollout action is disabled without a target", () => checkButton().disabled);
+      check("the backends action is disabled without a project", () => backendsButton().disabled);
 
       // --- the API-enablement disclosure is before the action --------------
       check("the Cloud-project side effect is disclosed", () => text().includes("the CLI enables it"));
-      check("the disclosure precedes the button", () => {
-        const html = root().innerHTML;
-        return html.indexOf("the CLI enables it") < html.indexOf("Check rollouts")
-          || html.includes("enables it");
-      });
+      check("the disclosure names both gated calls",
+        () => text().includes("Listing backends or rollouts"));
+
+      // --- backends are discoverable, not typed from memory -----------------
+      await selectProject("default");
+      check("the backends action enables once a project is named",
+        () => !backendsButton().disabled);
+      await runBackends();
+      check("the backends listing ran on the click",
+        () => invoked.some(c => c.cmd === "cmd_firebase_backends"));
+      check("the resolved project id is sent, not the alias",
+        () => invoked.find(c => c.cmd === "cmd_firebase_backends").args.projectId === "acme-prod");
+      check("both backends become selectable", () => selects().length === 2);
+      check("a backend's region is shown beside it", () => text().includes("europe-west4"));
+      check("two backends stay unselected until one is named",
+        () => selects()[1].value === "");
 
       // --- a live rollout, joined to a local commit ------------------------
-      await selectProject("default");
-      await typeBackend("web");
-      check("the button enables once a target is named", () => !checkButton().disabled);
+      await setSelect(selects()[1], "web");
+      check("the rollout action enables once a backend is named", () => !checkButton().disabled);
       await runListing();
       check("the listing ran on the click", () => invoked.some(c => c.cmd === "cmd_firebase_rollouts"));
-      check("the resolved project id is sent, not the alias",
-        () => invoked.find(c => c.cmd === "cmd_firebase_rollouts").args.projectId === "acme-prod");
+      check("no location is sent with the rollouts call",
+        () => !("location" in invoked.find(c => c.cmd === "cmd_firebase_rollouts").args));
       check("the live commit is shown", () => text().includes(SHA.slice(0, 7)));
       check("a live rollout reads as Live", () => text().includes("Live"));
+      check("the listing names the backend it is of", () => text().includes("Rollouts for"));
+
+      // --- the deploy action: two steps, and never one click from prod -----
+      check("the deploy form appears once a project and backend are named",
+        () => Boolean(shaInput()) && Boolean(reviewButton()));
+      check("nothing has been deployed yet", () => created().length === 0);
+      check("review is refused with no commit", () => reviewButton().disabled);
+
+      await typeSha("0123456");
+      check("an abbreviated SHA is refused", () => reviewButton().disabled);
+      check("and the refusal says why", () => flat().includes("ambiguous target"));
+      await typeSha("nothexadecimal-not-a-sha-at-all-nope-xyz");
+      check("a non-hex value is refused", () => reviewButton().disabled);
+      check("with its own reason", () => text().includes("hexadecimal"));
+
+      await typeSha(SHA);
+      check("a full SHA enables the review step", () => !reviewButton().disabled);
+      check("reviewing is still not deploying", () => created().length === 0);
+      reviewButton().click();
+      await settle();
+      check("the confirmation names the commit, backend and project",
+        () => text().includes(SHA.slice(0, 7)) && text().includes("web") && text().includes("acme-prod"));
+      check("the confirmation states that GitPulse cannot undo it",
+        () => flat().includes("no rollback command"));
+      check("the confirmation warns the commit must be in the connected repository",
+        () => flat().includes("connected GitHub"));
+      check("still nothing deployed at the review step", () => created().length === 0);
+
+      // Editing the target must invalidate a confirmation of the old one.
+      await typeSha(SHA.slice(0, 39) + "0");
+      check("editing the commit disarms the confirmed deploy", () => !deployButton());
+      await typeSha(SHA);
+      reviewButton().click();
+      await settle();
+      await setSelect(selects()[1], "admin");
+      check("changing the backend disarms the confirmed deploy", () => !deployButton());
+
+      await setSelect(selects()[1], "web");
+      await typeSha(SHA);
+      reviewButton().click();
+      await settle();
+      deployButton().click();
+      await settle();
+      check("confirming deploys exactly once", () => created().length === 1);
+      check("the full SHA is sent, never the abbreviation",
+        () => created()[0].args.gitCommit === SHA);
+      check("the deployed target is the confirmed one",
+        () => created()[0].args.projectId === "acme-prod" && created()[0].args.backendId === "web");
+      check("a started rollout is reported", () => flat().includes("Rollout started"));
+      check("the button disarms after a deploy, so a second click cannot repeat it",
+        () => !deployButton());
+
+      createReply = { policy: null, output: createOutcome({
+        unconfirmed: "The Firebase CLI exited successfully but its output could not be parsed, so the rollout could not be confirmed here. Check the Firebase console before retrying — creating a rollout twice deploys twice.",
+      }) };
+      await typeSha(SHA);
+      reviewButton().click();
+      await settle();
+      deployButton().click();
+      await settle();
+      check("an unconfirmed zero-exit still reads as started, not failed",
+        () => flat().includes("Rollout started") && !text().includes("was not created"));
+      check("and warns against a blind retry", () => flat().includes("twice deploys twice"));
+
+      createThrows = "gate refused: scope.unplanned";
+      await typeSha(SHA);
+      reviewButton().click();
+      await settle();
+      deployButton().click();
+      await settle();
+      check("a refused deploy says the rollout was not created",
+        () => flat().includes("Rollout was not created"));
+      check("and surfaces the gate's refusal", () => text().includes("gate refused"));
+      createThrows = null;
+      createReply = { policy: null, output: createOutcome() };
+      await typeSha("");
+
+      // --- changing project abandons the previous project's target ---------
+      await selectProject("staging");
+      check("switching project clears the rollouts on screen",
+        () => !text().includes("Rollouts for"));
+      check("switching project clears the backend picker",
+        () => selects().length === 1 && root().querySelector("input").value === "");
+      await selectProject("default");
+      await runBackends();
+      await setSelect(selects()[1], "web");
 
       // --- a commit that is not in this checkout is marked, not dropped ----
       rolloutsReply = { policy: null, output: listing({
@@ -191,29 +349,104 @@
       rolloutsThrows = "gate refused: scope.unplanned";
       await runListing();
       check("a refused call surfaces the refusal", () => text().includes("gate refused"));
-      check("a refused call does not render rollouts", () => !text().includes("Live"));
+      check("a refused call does not render rollouts", () => !text().includes("Rollouts for"));
       rolloutsThrows = null;
+
+      // --- the same honesty rules apply to the backends listing ------------
+      backendsReply = { policy: null, output: backendListing({ backends: [] }) };
+      await remount();
+      await selectProject("default");
+      await runBackends();
+      check("an empty complete backends listing may say the project has none",
+        () => text().includes("No App Hosting backends exist on acme-prod"));
+      check("an empty backends listing leaves the free-text entry available",
+        () => Boolean(root().querySelector("input")));
+
+      backendsReply = { policy: null, output: backendListing({ backends: [], truncated: true }) };
+      await runBackends();
+      check("an empty bounded backends listing does not claim the project has none",
+        () => !text().includes("No App Hosting backends exist"));
+
+      backendsReply = { policy: null, output: {
+        ...backendListing({ backends: [] }), available: false, checked: false,
+        error: "Not logged in",
+      } };
+      await runBackends();
+      check("an unchecked backends listing says it did not run",
+        () => text().includes("Backend listing did not run"));
+      check("an unchecked backends listing never populates the picker",
+        () => selects().length === 1);
+
+      backendsThrows = "gate refused: scope.unplanned";
+      await runBackends();
+      check("a refused backends call surfaces the refusal", () => text().includes("gate refused"));
+      backendsThrows = null;
+      backendsReply = { policy: null, output: backendListing() };
+
+      // --- a capability this CLI does not have reads as absent, with a reason
+      statusReply = status({ rollout_listing: {
+        available: false, checked: true,
+        reason: "Rollout listing is not in this build of the Firebase CLI. Upstream ships `apphosting:rollouts:list` only behind the `internaltesting` experiment, which is off by default.",
+      } });
+      await remount();
+      check("a CLI without rollout listing hides the rollout action", () => !checkButton());
+      check("and says why, rather than showing nothing",
+        () => text().includes("internaltesting"));
+      check("the supported backends action is still offered", () => Boolean(backendsButton()));
+
+      statusReply = status({ rollout_listing: {
+        available: false, checked: false,
+        reason: "The Firebase CLI could not be run, so what it supports is unknown.",
+      } });
+      await remount();
+      check("an unchecked capability is not reported as a missing feature",
+        () => text().includes("what it supports is unknown"));
 
       // --- configuration gaps read as gaps, not faults --------------------
       statusReply = status({ cli: { ...cliPresent, present: false,
         reason: "The Firebase CLI could not be run. If it is installed under nvm, set GITPULSE_FIREBASE_BIN." } });
       await remount();
       check("a missing CLI names the nvm remedy", () => text().includes("GITPULSE_FIREBASE_BIN"));
-      check("a missing CLI hides the action", () => !checkButton());
+      check("a missing CLI hides both actions", () => !checkButton() && !backendsButton());
 
       statusReply = status({ configured: false, projects: [], has_apphosting_config: false });
       await remount();
       check("a repository with no Firebase config says so",
         () => text().includes("No Firebase config in this repository"));
 
+      statusReply = status({ has_apphosting_config: false });
+      await remount();
+      check("a firebase.json without an apphosting key says so, without calling it an error",
+        () => text().includes("carries no") && !text().includes("could not be read"));
+
+      statusReply = status({ projects_truncated: true });
+      await remount();
+      check("a capped alias list says the file names more",
+        () => flat().includes("not complete coverage of the file"));
+
       statusReply = status({ firebaserc_error: "could not parse .firebaserc: expected value" });
       await remount();
       check("an unreadable .firebaserc is reported", () => text().includes("could not parse .firebaserc"));
 
+      // A selection restored from an earlier visit can name an alias
+      // `.firebaserc` no longer has. Left in place it resolves to no project
+      // id, disabling both actions with nothing saying why — and the previous
+      // project's listings stay on screen beside it.
+      statusReply = status();
+      await remount();
+      await selectProject("staging");
+      await runBackends();
+      statusReply = status({ projects: [{ alias: "renamed", project_id: "acme-renamed" }], default_alias: null });
+      await remount();
+      check("an alias .firebaserc no longer has is dropped, not left selected",
+        () => selects()[0].value === "renamed");
+      check("and the previous project's backends go with it",
+        () => !text().includes("europe-west4"));
+
       statusReply = status({ projects: [{ alias: "only", project_id: "acme-solo" }], default_alias: null });
       await remount();
       check("a single alias is preselected, because it is not a choice",
-        () => root().querySelector("select").value === "only");
+        () => selects()[0].value === "only");
 
       check("no unconfigured command was invoked", () => unexpected.length === 0);
       check("no runtime errors", () => errors.length === 0);

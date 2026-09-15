@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  commitShaProblem,
   currentRollout,
   isFailed,
   isInFlight,
@@ -98,5 +99,27 @@ describe("rollout state vocabulary", () => {
 
   it("abbreviates a SHA for display only", () => {
     expect(shortSha("0123456789abcdef0123456789abcdef01234567")).toBe("0123456");
+  });
+
+  it("refuses a deploy target that is not a full SHA, and says why", () => {
+    const full = "0123456789abcdef0123456789abcdef01234567";
+    expect(commitShaProblem(full)).toBeNull();
+    expect(commitShaProblem(`  ${full.toUpperCase()}  `)).toBeNull();
+
+    // Each refusal carries a reason. A disabled control with no explanation is
+    // the shape people work around by pasting something else.
+    for (const bad of ["", "   ", "0123456", `${full}0`, "z".repeat(40), "HEAD", "main"]) {
+      const problem = commitShaProblem(bad);
+      expect(problem, `"${bad}" must be refused`).not.toBeNull();
+      expect(problem!.length, `"${bad}" must be refused with a reason`).toBeGreaterThan(10);
+    }
+  });
+
+  it("names the ambiguity that makes an abbreviation the wrong deploy target", () => {
+    // The value decides what production serves, so the refusal has to explain
+    // itself rather than read as arbitrary strictness.
+    const problem = commitShaProblem("0123456")!;
+    expect(problem).toContain("40");
+    expect(problem.toLowerCase()).toContain("ambiguous");
   });
 });

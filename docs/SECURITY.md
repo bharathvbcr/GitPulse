@@ -169,6 +169,46 @@ flowchart TD
   non-interactive, so a prompt fails loudly instead of enabling something quietly.
 - A listing that could not run is reported as a reason, never as a backend with
   no deployments.
+- **What the CLI can do is asked, not assumed.** `apphosting:rollouts:list` is
+  registered upstream only behind the `internaltesting` experiment, which is off
+  by default, and an unregistered subcommand exits non-zero having written
+  nothing to either stream. GitPulse therefore probes the installed CLI — by
+  listing a command *group*, which needs no login, no project and no network —
+  and offers the rollout action only when the subcommand is really there. A
+  capability that could not be probed is reported as unknown rather than as
+  absent: the two have different remedies.
+- Only three `firebase` subcommands can ever be spawned, each built by a single
+  argv builder that includes the program name, so the line the policy gate judges
+  is the line that runs. A contract test reads the module and fails on any
+  subcommand literal outside that allow-list, on any flag the subcommand does not
+  declare, and on `--token`, which would place a credential on a command line
+  that other local processes can read.
+
+#### Creating A Rollout Is The One Firebase Action That Changes Production
+- `apphosting:rollouts:create` is the only command in this module that changes
+  what the user's production traffic serves. It is **not reversible from
+  GitPulse** — App Hosting publishes no rollback verb, so undoing a rollout
+  means creating another against an earlier commit — and it is **not
+  idempotent**: upstream allocates a new rollout id per call, so running it
+  twice deploys twice.
+- It is therefore behind two steps, not one. The commit must be a full
+  40-character SHA (an abbreviation is an ambiguous target for something that
+  reaches production, and is refused with the reason), and the panel spells out
+  the exact project, backend and commit — plus the fact that GitPulse cannot
+  undo it — before the deploying button exists at all. Changing any part of that
+  target disarms the confirmation, so the values sent are always the values
+  reviewed.
+- The gate runs before the process. A refused verdict returns an error and
+  nothing is spawned; a contract test asserts that ordering directly, because
+  this command's argv is built in the Firebase module rather than spelled out in
+  the handler and is therefore exempt from the literal-argv comparison.
+- `--force` is never passed. Upstream prompts only when neither a branch nor a
+  commit was named, and GitPulse always names a commit, so nothing here
+  suppresses a confirmation the user would otherwise have seen.
+- A rollout that started is never reported as failed. If the CLI exits zero
+  without confirming the result, the panel says the rollout started but could
+  not be confirmed, and warns against a blind retry — because a false failure is
+  what turns one deployment into two.
 
 ### Loopback-Only Local AI Transport
 - Built-in local AI completions (commit messages, explanations and branch names)

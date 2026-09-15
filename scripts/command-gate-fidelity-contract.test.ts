@@ -58,6 +58,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_github_cancel_run: "shells out to gh, not git",
   cmd_firebase_backends: "shells out to firebase, not git; apphosting::backends_list_argv is the one builder the gate and the executor both read",
   cmd_firebase_rollouts: "shells out to firebase, not git; apphosting::rollouts_list_argv is the one builder the gate and the executor both read",
+  cmd_firebase_create_rollout: "shells out to firebase, not git; apphosting::rollout_create_argv is the one builder the gate and the executor both read, and the gate runs before any process is spawned",
   cmd_add_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_remove_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_lock_worktree: "worktree argv is built in engine::worktree, not git_writer",
@@ -160,6 +161,51 @@ describe("the command gate judges the command that actually runs", () => {
       undocumented,
       `these guarded commands are neither compared nor documented as derived: ${undocumented.join(", ")}`,
     ).toEqual([]);
+  });
+
+  it("gates every firebase command before it spawns, on the argv it will spawn", () => {
+    // These commands are in DERIVED_ARGV, which exempts them from the literal
+    // comparison above — the argv is built in the firebase module, not spelled
+    // out in the handler. An exemption from *comparison* must not become an
+    // exemption from *ordering*, so the property that actually protects a
+    // Google Cloud project is checked here directly: one builder produces the
+    // argv, the gate judges exactly that, and nothing is spawned before it.
+    const executors: Record<string, string> = {
+      cmd_firebase_backends: "load_backends_report",
+      cmd_firebase_rollouts: "load_rollouts_report",
+      cmd_firebase_create_rollout: "create_rollout",
+    };
+    for (const [command, executor] of Object.entries(executors)) {
+      const body = fnBody(PRODUCTION_COMMANDS, command);
+      expect(body, `${command} must exist`).not.toBeNull();
+      const built = body!.indexOf("let argv_owned =");
+      const gated = body!.indexOf("guard(&repo_path, &refs)?");
+      const spawned = body!.indexOf(executor);
+      expect(built, `${command} must build its argv through one builder`).toBeGreaterThan(-1);
+      expect(gated, `${command} must hand that argv to the write gate`).toBeGreaterThan(-1);
+      expect(spawned, `${command} must call ${executor}`).toBeGreaterThan(-1);
+      expect(built, `${command} must build argv before gating it`).toBeLessThan(gated);
+      expect(gated, `${command} must gate before it spawns`).toBeLessThan(spawned);
+      // The executor receives the same value that was gated, not a rebuild.
+      expect(body).toContain("&argv_owned");
+      expect(body).toContain("argv_owned.iter().map(String::as_str)");
+    }
+  });
+
+  it("never lets a firebase command reach production without the gate's verdict", () => {
+    // `guard(...)?` — the `?` is the whole protection. Written as
+    // `let _ = guard(...)` or with the result ignored, a Blocked verdict would
+    // be recorded and then deployed anyway.
+    for (const command of [
+      "cmd_firebase_backends",
+      "cmd_firebase_rollouts",
+      "cmd_firebase_create_rollout",
+    ]) {
+      const body = fnBody(PRODUCTION_COMMANDS, command)!;
+      expect(body, `${command} must propagate a refusal`).toContain(
+        "let policy = guard(&repo_path, &refs)?;",
+      );
+    }
   });
 
   it("conflict transactions gate the argv built by their canonical mutation owner", () => {

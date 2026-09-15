@@ -14,11 +14,26 @@
 //! Hosting API on the project when it is off. A read that can change the
 //! user's Cloud project is a mutation, so it is judged like one.
 //!
-//! ## `apphosting:rollouts:list` is undocumented
+//! ## `apphosting:rollouts:list` is not merely undocumented — it is usually absent
 //!
-//! It exists in `firebase-tools`' source but on none of Firebase's published
-//! command pages, so its JSON envelope can change without a deprecation
-//! cycle. Everything here parses strictly and fails loudly: a shape we do not
+//! Verified against firebase-tools 15.25.1 rather than inferred: upstream
+//! registers the subcommand inside `if (experiments.isEnabled("internaltesting"))`,
+//! and that experiment is off by default, with a description saying its
+//! commands "are not meant for public consumption and may break or disappear
+//! without a notice". So on a stock install the subcommand *does not exist*,
+//! and firebase-tools answers an unregistered subcommand by exiting non-zero
+//! having written nothing to either stream.
+//!
+//! Two consequences shape this module. [`super::probe_rollout_listing`] asks
+//! the CLI what it has before anything tries to use it, so an absent feature
+//! reads as an absent feature. And [`failure_reason`] never lets an
+//! unparseable stdout hide the real message, because "no output at all" was
+//! previously reported as a JSON parse error.
+//!
+//! `apphosting:backends:list` carries no such gate and is the surface this
+//! panel can rely on everywhere.
+//!
+//! Everything here parses strictly and fails loudly: a shape we do not
 //! recognise is an error, never an empty rollout list. An empty list is a
 //! claim — "this backend has never deployed" — and only a real answer may
 //! make it.
@@ -40,10 +55,41 @@ pub const BACKEND_DISPLAY_LIMIT: usize = 50;
 /// without limit.
 const MAX_UNREACHABLE_ENTRIES: usize = 20;
 
+/// Bound on each free-text field carried out of a rollout.
+///
+/// Nothing upstream bounds a commit message, an author or a branch name, and
+/// the subprocess output cap is 64 MiB — a backstop against a runaway process,
+/// not a size a panel can render or a cache should hold. A commit subject is
+/// tens of bytes; a kilobyte is already generous.
+const MAX_COMMIT_TEXT_BYTES: usize = 1024;
+
+/// Clips text to the cap on a character boundary, marking that it was cut.
+///
+/// The ellipsis is not decoration. A silently shortened commit message sends a
+/// reader looking for text that is not missing, only cut — and this codebase
+/// does not let a partial answer wear a complete one's clothes, at any scale.
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_COMMIT_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_COMMIT_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// Upper bound for a backend id reaching argv.
 const MAX_BACKEND_ID_LEN: usize = 63;
-/// Upper bound for a location reaching argv.
-const MAX_LOCATION_LEN: usize = 63;
+
+/// The subcommand that lists rollouts.
+///
+/// Named once because three things must agree on it: the argv builder, the
+/// capability probe in [`super`] that decides whether the CLI exposes it at
+/// all, and the failure message that tells a reader which subcommand went
+/// missing. Two of those are strings a reader compares by eye, which is how
+/// they drift.
+pub const ROLLOUTS_LIST_SUBCOMMAND: &str = "apphosting:rollouts:list";
 
 /// App Hosting's rollout lifecycle, as the API's discovery document defines it.
 ///
@@ -247,10 +293,6 @@ pub fn validate_backend_id(backend_id: &str) -> Result<String, String> {
     validate_identifier(backend_id, "Backend id", MAX_BACKEND_ID_LEN)
 }
 
-pub fn validate_location(location: &str) -> Result<String, String> {
-    validate_identifier(location, "Location", MAX_LOCATION_LEN)
-}
-
 /// Validates a full 40-character hex commit SHA.
 ///
 /// Abbreviations are refused on purpose: the value names which commit reaches
@@ -275,11 +317,17 @@ pub fn validate_commit_sha(sha: &str) -> Result<String, String> {
 /// `--project` is always the resolved id and never an alias, so the string the
 /// gate judges names the project the call actually hits; an alias could be
 /// re-pointed by `.firebaserc` between the judgment and the run.
-fn push_common_flags(args: &mut Vec<String>, project_id: &str, location: Option<&str>) {
-    if let Some(location) = location {
-        args.push("--location".to_string());
-        args.push(location.to_string());
-    }
+///
+/// There is deliberately no `--location`. Neither App Hosting subcommand this
+/// module calls accepts one: `apphosting:backends:list` declares no options at
+/// all, `apphosting:rollouts:create` declares only `--git-branch`,
+/// `--git-commit` and `--force`, and `apphosting:rollouts:list`'s `--location`
+/// is documented upstream as "being removed in the next major release" — its
+/// default of `-` already means every region, which is the answer this panel
+/// wants. Sending a flag a subcommand does not declare is not ignored: the CLI
+/// exits with `unknown option`, so an unused parameter here would be a
+/// guaranteed failure rather than a harmless one.
+fn push_common_flags(args: &mut Vec<String>, project_id: &str) {
     args.push("--project".to_string());
     args.push(project_id.to_string());
     args.push("--non-interactive".to_string());
@@ -289,24 +337,19 @@ fn push_common_flags(args: &mut Vec<String>, project_id: &str, location: Option<
 pub fn backends_list_argv(project_id: &str) -> Result<Vec<String>, String> {
     let project_id = validate_project_id(project_id)?;
     let mut args = vec![firebase_program(), "apphosting:backends:list".to_string()];
-    push_common_flags(&mut args, &project_id, None);
+    push_common_flags(&mut args, &project_id);
     Ok(args)
 }
 
-pub fn rollouts_list_argv(
-    project_id: &str,
-    backend_id: &str,
-    location: Option<&str>,
-) -> Result<Vec<String>, String> {
+pub fn rollouts_list_argv(project_id: &str, backend_id: &str) -> Result<Vec<String>, String> {
     let project_id = validate_project_id(project_id)?;
     let backend_id = validate_backend_id(backend_id)?;
-    let location = location.map(validate_location).transpose()?;
     let mut args = vec![
         firebase_program(),
-        "apphosting:rollouts:list".to_string(),
+        ROLLOUTS_LIST_SUBCOMMAND.to_string(),
         backend_id,
     ];
-    push_common_flags(&mut args, &project_id, location.as_deref());
+    push_common_flags(&mut args, &project_id);
     Ok(args)
 }
 
@@ -316,24 +359,31 @@ pub fn rollouts_list_argv(
 /// lie the gate then renders to the user. A rollback *is* this call with an
 /// earlier SHA — same builder, same flags — so what the user approves is what
 /// actually happens.
+///
+/// The flag is `--git-commit`, spelled exactly as upstream declares it. It was
+/// `--git_commit` here until the CLI was asked: commander does not fold
+/// underscores into hyphens, so that spelling exited 1 with
+/// `error: unknown option '--git_commit'` and no rollout could ever have been
+/// created. `--force` is deliberately absent — upstream only prompts when
+/// *neither* a branch nor a commit is given, and this builder always gives a
+/// commit, so nothing here suppresses a confirmation the user would otherwise
+/// have seen.
 pub fn rollout_create_argv(
     project_id: &str,
     backend_id: &str,
-    location: Option<&str>,
     git_commit: &str,
 ) -> Result<Vec<String>, String> {
     let project_id = validate_project_id(project_id)?;
     let backend_id = validate_backend_id(backend_id)?;
-    let location = location.map(validate_location).transpose()?;
     let git_commit = validate_commit_sha(git_commit)?;
     let mut args = vec![
         firebase_program(),
         "apphosting:rollouts:create".to_string(),
         backend_id,
-        "--git_commit".to_string(),
+        "--git-commit".to_string(),
         git_commit,
     ];
-    push_common_flags(&mut args, &project_id, location.as_deref());
+    push_common_flags(&mut args, &project_id);
     Ok(args)
 }
 
@@ -452,7 +502,7 @@ fn parse_commit(rollout: &serde_json::Value) -> Option<RolloutCommit> {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(str::to_string)
+            .map(clip)
     };
     Some(RolloutCommit {
         hash: hash.to_string(),
@@ -494,8 +544,9 @@ pub fn parse_rollouts(
                 .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(serde_json::Value::as_str)
-                .map(|m| m.trim().to_string())
-                .filter(|m| !m.is_empty());
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(clip);
             let text = |key: &str| {
                 rollout
                     .get(key)
@@ -566,21 +617,118 @@ pub(crate) fn run_firebase_in(repo_path: &str, args: &[String]) -> Result<Vec<u8
     let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let output = capture_command(&program, &refs, Some(&repo), FIREBASE_CALL_TIMEOUT, &[])?;
     if !output.success {
-        // The CLI writes its `{status:"error"}` envelope to stdout even on a
-        // non-zero exit, so prefer that message over raw stderr: it is the one
-        // written for a human.
-        // The Ok value is deliberately discarded: a *successful* envelope
-        // alongside a non-zero exit is not an answer to return, it just means
-        // stdout carried no reason, so the stderr tail below is the better one.
-        unwrap_envelope(&output.stdout)?;
-        let err = byte_tail(&output.stderr, MAX_FIREBASE_ERROR_BYTES);
-        return Err(if err.trim().is_empty() {
-            format!("firebase exited {}", output.status_code)
-        } else {
-            err.trim().to_string()
-        });
+        return Err(failure_reason(
+            &output.stdout,
+            &output.stderr,
+            output.status_code,
+            args.get(1).map(String::as_str).unwrap_or("firebase"),
+        ));
     }
     Ok(output.stdout)
+}
+
+/// The best reason available for a non-zero `firebase` exit.
+///
+/// The three sources are tried in the order a reader would want them, and
+/// crucially none of them can swallow the next. An earlier version ran
+/// `unwrap_envelope(&stdout)?`, which meant an *unparseable* stdout — the empty
+/// one every argument-level failure produces — short-circuited with
+/// "could not parse firebase --json output: EOF while parsing a value", and the
+/// stderr line that actually said `unknown option '--git_commit'` was never
+/// reached. A diagnostic that hides the diagnosis is worse than none: it sends
+/// the reader after a JSON bug that does not exist.
+fn failure_reason(stdout: &[u8], stderr: &[u8], status_code: i32, subcommand: &str) -> String {
+    // 1. The CLI's own `{status:"error"}` envelope, which is written for a human.
+    if let Err(message) = unwrap_envelope(stdout) {
+        if !message.trim().is_empty() && !message.starts_with("could not parse") {
+            return message;
+        }
+    }
+    // 2. Whatever it wrote to stderr — commander's option and argument errors
+    //    land here and nowhere else.
+    let tail = byte_tail(stderr, MAX_FIREBASE_ERROR_BYTES);
+    if !tail.trim().is_empty() {
+        return tail.trim().to_string();
+    }
+    // 3. Silence. firebase-tools exits non-zero and prints nothing at all when
+    //    the subcommand is not registered in this build, so name the
+    //    subcommand rather than reporting a bare exit code the reader cannot
+    //    act on. Hedged deliberately: this is the shape of that failure, not
+    //    proof of it, and a cause stated as certain would be a guess wearing a
+    //    fact's clothes.
+    format!(
+        "firebase exited {status_code} without writing any output. This usually means \
+         `{subcommand}` is not available in this build of the Firebase CLI."
+    )
+}
+
+/// What a rollout-create attempt actually did.
+///
+/// `created` is the exit status and nothing else, deliberately. Creating a
+/// rollout is **not idempotent** — upstream allocates the next rollout id per
+/// call — so a run that succeeded and is reported as failed costs the user a
+/// second deployment when they retry. The envelope is treated as corroboration
+/// only: see [`create_rollout`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutCreateOutcome {
+    pub project_id: String,
+    pub backend_id: String,
+    pub git_commit: String,
+    pub created: bool,
+    /// Set when the CLI exited zero but did not confirm it in its output.
+    ///
+    /// The rollout was still started. This field exists so the panel can say
+    /// "started, but the CLI did not confirm it" rather than pick one of the
+    /// two clean answers it does not have.
+    pub unconfirmed: Option<String>,
+}
+
+/// Confirms a zero-exit envelope, without ever turning a success into an error.
+///
+/// `apphosting:rollouts:create` returns nothing from its action, so `--json`
+/// emits `{"status":"success"}` with **no** `result` — which is why
+/// [`unwrap_envelope`] cannot be reused here: it requires a result and would
+/// report a completed deployment as a failure.
+fn confirm_created(stdout: &[u8]) -> Option<String> {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return Some(
+            "The Firebase CLI exited successfully but its output could not be parsed, so the \
+             rollout could not be confirmed here. Check the Firebase console before retrying — \
+             creating a rollout twice deploys twice."
+                .to_string(),
+        );
+    };
+    match root.get("status").and_then(serde_json::Value::as_str) {
+        Some("success") => None,
+        _ => Some(
+            "The Firebase CLI exited successfully but did not report success in its output, so \
+             the rollout could not be confirmed here. Check the Firebase console before retrying \
+             — creating a rollout twice deploys twice."
+                .to_string(),
+        ),
+    }
+}
+
+/// Creates a rollout pinned to one commit.
+///
+/// The argv is built by the caller and passed through whole, so the line the
+/// policy gate judged is the line that runs — the property that matters most
+/// for the one command here that changes what production serves.
+pub fn create_rollout(
+    repo_path: &str,
+    project_id: &str,
+    backend_id: &str,
+    git_commit: &str,
+    argv: &[String],
+) -> Result<RolloutCreateOutcome, String> {
+    let stdout = run_firebase_in(repo_path, argv)?;
+    Ok(RolloutCreateOutcome {
+        project_id: project_id.to_string(),
+        backend_id: backend_id.to_string(),
+        git_commit: git_commit.to_string(),
+        created: true,
+        unconfirmed: confirm_created(&stdout),
+    })
 }
 
 /// Marks which rollout commits exist in the opened checkout.
@@ -588,6 +736,21 @@ pub(crate) fn run_firebase_in(repo_path: &str, args: &[String]) -> Result<Vec<u8
 /// A rollout whose SHA does not resolve locally is kept and flagged, never
 /// dropped: it is a true statement about production that this working copy
 /// simply cannot show a commit for.
+/// Whether a hash is safe and specific enough to ask git about.
+///
+/// `hash` arrives from the App Hosting API — a field nothing in this process
+/// wrote — and [`mark_local_presence`] turns it into an argument for
+/// `git cat-file -e`. A value beginning with `-` would be re-parsed by git as
+/// an *option* rather than an object, which is argument injection through a
+/// payload field; a ref name like `HEAD` would resolve to something that is not
+/// the deployed commit and quietly report the wrong answer. Only a full SHA is
+/// both safe to pass and specific enough to mean anything, and the resulting
+/// `present_locally: false` is true either way — this checkout cannot resolve
+/// it.
+fn resolvable_locally(hash: &str) -> bool {
+    hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn mark_local_presence(repo_path: &str, rollouts: &mut [RolloutInfo]) {
     let Ok(repo) = validate_repo(repo_path) else {
         return;
@@ -596,6 +759,9 @@ fn mark_local_presence(repo_path: &str, rollouts: &mut [RolloutInfo]) {
         let Some(commit) = rollout.commit.as_mut() else {
             continue;
         };
+        if !resolvable_locally(&commit.hash) {
+            continue;
+        }
         let spec = format!("{}^{{commit}}", commit.hash);
         // `git_captured` returns `Ok` for a non-zero exit — that is the whole
         // point of it, because "this object is absent" is an answer rather
@@ -836,17 +1002,28 @@ mod tests {
         assert!(parse_rollouts(&value("[]"), 50).is_ok());
     }
 
+    /// Every argv this module can build, so no test below has to remember to
+    /// add itself to a second list. A new builder that is not routed through
+    /// here is the one thing this file cannot catch, which is what
+    /// `every_subcommand_literal_in_this_module_is_on_the_allow_list` is for.
+    fn every_argv() -> Vec<Vec<String>> {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        vec![
+            backends_list_argv("acme-prod").expect("valid"),
+            rollouts_list_argv("acme-prod", "web").expect("valid"),
+            rollout_create_argv("acme-prod", "web", sha).expect("valid"),
+        ]
+    }
+
     #[test]
     fn argv_leads_with_the_program_and_pins_the_project() {
-        let argv = rollouts_list_argv("acme-prod", "web", Some("us-central1")).expect("valid");
+        let argv = rollouts_list_argv("acme-prod", "web").expect("valid");
         assert_eq!(
             argv,
             vec![
                 firebase_program(),
                 "apphosting:rollouts:list".to_string(),
                 "web".to_string(),
-                "--location".to_string(),
-                "us-central1".to_string(),
                 "--project".to_string(),
                 "acme-prod".to_string(),
                 "--non-interactive".to_string(),
@@ -858,24 +1035,83 @@ mod tests {
     #[test]
     fn a_rollback_is_the_create_builder_with_an_earlier_sha() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
-        let argv = rollout_create_argv("acme-prod", "web", None, sha).expect("valid");
+        let argv = rollout_create_argv("acme-prod", "web", sha).expect("valid");
         assert_eq!(argv[1], "apphosting:rollouts:create");
-        assert!(argv.contains(&"--git_commit".to_string()));
+        assert!(argv.contains(&"--git-commit".to_string()));
         assert!(argv.contains(&sha.to_string()));
         // No separate rollback verb exists to drift from this one.
         assert!(!argv.iter().any(|a| a.contains("rollback")));
+        // `--force` suppresses upstream's confirmation prompt. Upstream only
+        // prompts when neither a branch nor a commit was named, and this
+        // builder always names a commit — so the flag would buy nothing and
+        // cost the one prompt a user might still see.
+        assert!(!argv.iter().any(|a| a == "--force"));
+    }
+
+    #[test]
+    fn no_flag_is_spelled_with_an_underscore() {
+        // The class behind a real defect: this builder emitted `--git_commit`,
+        // and commander does not fold underscores into hyphens, so the CLI
+        // answered `error: unknown option '--git_commit'` and no rollout could
+        // ever have been created. Asserting the one corrected spelling would
+        // fix the case; refusing the shape fixes the class, and costs nothing
+        // because no Firebase flag contains an underscore.
+        for argv in every_argv() {
+            for arg in argv.iter().filter(|a| a.starts_with("--")) {
+                assert!(
+                    !arg.contains('_'),
+                    "`{arg}` would be rejected as an unknown option: {argv:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_flag_is_one_its_own_subcommand_declares() {
+        // Verified against firebase-tools 15.25.1's own command definitions.
+        // A flag a subcommand does not declare is not ignored — commander
+        // exits non-zero with `unknown option` — so an extra flag is a
+        // guaranteed failure, which is exactly how `--location` survived on
+        // two builders that cannot accept it.
+        const GLOBAL: [&str; 3] = ["--project", "--non-interactive", "--json"];
+        let declared = |subcommand: &str| -> Vec<&'static str> {
+            match subcommand {
+                // `.option()` appears nowhere in apphosting-backends-list.js.
+                "apphosting:backends:list" => vec![],
+                // `-l, --location` exists but upstream logs that it "is being
+                // removed in the next major release", and its default of `-`
+                // already means every region.
+                "apphosting:rollouts:list" => vec!["--location"],
+                "apphosting:rollouts:create" => {
+                    vec!["--git-branch", "--git-commit", "--force"]
+                }
+                other => panic!("unknown subcommand {other} — add its declared flags"),
+            }
+        };
+        for argv in every_argv() {
+            let subcommand = argv[1].clone();
+            let allowed = declared(&subcommand);
+            for arg in argv.iter().filter(|a| a.starts_with("--")) {
+                assert!(
+                    GLOBAL.contains(&arg.as_str()) || allowed.contains(&arg.as_str()),
+                    "`{subcommand}` does not declare `{arg}`, so the CLI would refuse it: {argv:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn flag_shaped_and_malformed_inputs_never_reach_argv() {
-        assert!(rollouts_list_argv("acme-prod", "-f", None).is_err());
-        assert!(rollouts_list_argv("acme-prod", "web app", None).is_err());
-        assert!(rollouts_list_argv("acme-prod", "web\u{7}", None).is_err());
-        assert!(rollouts_list_argv("-evil", "web", None).is_err());
-        assert!(rollouts_list_argv("acme-prod", "web", Some("--project=evil")).is_err());
+        assert!(rollouts_list_argv("acme-prod", "-f").is_err());
+        assert!(rollouts_list_argv("acme-prod", "web app").is_err());
+        assert!(rollouts_list_argv("acme-prod", "web\u{7}").is_err());
+        assert!(rollouts_list_argv("-evil", "web").is_err());
+        assert!(rollouts_list_argv("acme-prod", "--project=evil").is_err());
+        assert!(rollouts_list_argv("acme-prod", "").is_err());
         // Abbreviated SHAs are ambiguous targets for a production rollout.
-        assert!(rollout_create_argv("acme-prod", "web", None, "0123456").is_err());
-        assert!(rollout_create_argv("acme-prod", "web", None, &"z".repeat(40)).is_err());
+        assert!(rollout_create_argv("acme-prod", "web", "0123456").is_err());
+        assert!(rollout_create_argv("acme-prod", "web", &"z".repeat(40)).is_err());
+        assert!(rollout_create_argv("acme-prod", "web", "").is_err());
     }
 
     #[test]
@@ -884,22 +1120,20 @@ mod tests {
         // `firestore:indexes` and `firestore:delete` are one word apart. These
         // builders are the only place argv is constructed, so this is where
         // that class is refused.
-        const DENIED: [&str; 8] = [
+        const DENIED: [&str; 9] = [
             "deploy",
             "firestore:delete",
             "firestore:bulkdelete",
             "functions:delete",
             "hosting:disable",
-            "backends:delete",
+            "apphosting:backends:delete",
+            "apphosting:backends:create",
             "databases:delete",
+            // A credential on argv, readable by any local process through
+            // /proc/<pid>/cmdline or ps. Deprecated upstream as well.
             "--token",
         ];
-        let sha = "0123456789abcdef0123456789abcdef01234567";
-        for argv in [
-            backends_list_argv("acme-prod").unwrap(),
-            rollouts_list_argv("acme-prod", "web", None).unwrap(),
-            rollout_create_argv("acme-prod", "web", None, sha).unwrap(),
-        ] {
+        for argv in every_argv() {
             for denied in DENIED {
                 assert!(
                     !argv.iter().any(|arg| arg == denied),
@@ -908,7 +1142,195 @@ mod tests {
             }
             assert!(argv.contains(&"--json".to_string()));
             assert!(argv.contains(&"--non-interactive".to_string()));
+            assert_eq!(argv[0], firebase_program(), "the gate judges argv[0] too");
         }
+    }
+
+    #[test]
+    fn every_subcommand_literal_in_this_module_is_on_the_allow_list() {
+        // Derived, not hand-listed: it reads this file and finds every literal
+        // shaped like a firebase subcommand, so a builder added tomorrow is
+        // covered whether or not anyone remembers `every_argv`. The allow-list
+        // holds only verbs that read, plus the one create verb the user
+        // explicitly confirms.
+        const ALLOWED: [&str; 4] = [
+            "apphosting:backends:list",
+            "apphosting:rollouts:list",
+            "apphosting:rollouts:create",
+            // The capability probe lists a command *group*; it runs no verb.
+            "apphosting:rollouts",
+        ];
+        // Only the shipping half. The test module below deliberately spells
+        // out verbs it exists to forbid, and a scanner that read those would
+        // fail on its own deny-list — so the cut is load-bearing, and the
+        // assertions that follow it prove it landed where it was meant to
+        // rather than at the end of an empty string.
+        const TEST_MODULE_MARKER: &str = "#[cfg(test)]";
+        let whole = include_str!("apphosting.rs");
+        let cut = whole
+            .find(TEST_MODULE_MARKER)
+            .expect("the test module marker must exist, or this scan covers the wrong text");
+        let source = &whole[..cut];
+        assert!(
+            source.contains("apphosting:rollouts:create"),
+            "the production half must still be inside the scanned region"
+        );
+        assert!(
+            !source.contains("apphosting:backends:delete"),
+            "the deny-list in the test module must be outside the scanned region"
+        );
+        let mut seen = Vec::new();
+        for (index, _) in source.match_indices('"') {
+            let rest = &source[index + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            let literal = &rest[..end];
+            if literal.contains(':')
+                && !literal.contains(' ')
+                && literal.starts_with("apphosting")
+                && literal
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == ':' || c.is_ascii_digit())
+            {
+                seen.push(literal.to_string());
+            }
+        }
+        assert!(
+            !seen.is_empty(),
+            "the scanner found no subcommand literals at all, so it proves nothing"
+        );
+        for literal in seen {
+            assert!(
+                ALLOWED.contains(&literal.as_str()),
+                "`{literal}` is not an allowed firebase subcommand — add it deliberately, \
+                 with a reason, or use a read verb"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_real_sha_is_ever_handed_to_git() {
+        // `hash` arrives from the App Hosting API, and `mark_local_presence`
+        // turns it into an argument for `git cat-file -e`. A value beginning
+        // with `-` would be re-parsed by git as an option rather than as an
+        // object — argument injection from a field nothing here wrote. The
+        // presence check must decline such a value instead of spawning it.
+        for hostile in [
+            "--batch",
+            "-e",
+            "--help",
+            "HEAD",
+            "master:../../etc/passwd",
+            "",
+            "   ",
+            "0123456",
+            &"f".repeat(41),
+        ] {
+            assert!(
+                !resolvable_locally(hostile),
+                "`{hostile}` must never reach git as an object spec"
+            );
+        }
+        assert!(resolvable_locally(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(resolvable_locally(
+            "0123456789ABCDEF0123456789abcdef01234567"
+        ));
+    }
+
+    #[test]
+    fn a_runaway_commit_message_is_clipped_rather_than_carried_whole() {
+        // Nothing upstream bounds these strings, and the subprocess cap is 64
+        // MiB — a backstop, not a size a panel can render or a cache should
+        // hold. Clipped visibly, because silently truncating a commit message
+        // is the kind of edit that has a reader hunting for text that is not
+        // missing, only cut.
+        let long = "x".repeat(MAX_COMMIT_TEXT_BYTES * 3);
+        let payload = value(&format!(
+            r#"{{"rollouts":[{{"name":"p/r/1","state":"SUCCEEDED","build":{{"source":{{"codebase":{{"hash":"{}","commit":"{long}","author":"{long}","branch":"{long}"}}}}}}}}]}}"#,
+            "a".repeat(40)
+        ));
+        let (rows, _) = parse_rollouts(&payload, 50).expect("parses");
+        let commit = rows[0].commit.as_ref().expect("a commit is present");
+        for field in [&commit.message, &commit.author, &commit.branch] {
+            let text = field.as_ref().expect("field is present");
+            assert!(
+                text.len() <= MAX_COMMIT_TEXT_BYTES + 4,
+                "field was {} bytes, past the cap",
+                text.len()
+            );
+            assert!(
+                text.ends_with('…'),
+                "a clipped field must show that it was cut"
+            );
+        }
+        // A short field is untouched — the cap must not mark everything.
+        let ok = value(&format!(
+            r#"{{"rollouts":[{{"name":"p/r/1","build":{{"source":{{"codebase":{{"hash":"{}","commit":"ship it"}}}}}}}}]}}"#,
+            "a".repeat(40)
+        ));
+        let (rows, _) = parse_rollouts(&ok, 50).expect("parses");
+        assert_eq!(
+            rows[0].commit.as_ref().unwrap().message.as_deref(),
+            Some("ship it")
+        );
+    }
+
+    #[test]
+    fn a_zero_exit_is_never_re_reported_as_a_failed_deployment() {
+        // `apphosting:rollouts:create` returns nothing from its action, so
+        // `--json` emits `{"status":"success"}` with no `result` — which is why
+        // `unwrap_envelope` cannot be reused here: it requires a result and
+        // would call a completed deployment a failure.
+        assert_eq!(confirm_created(br#"{"status":"success"}"#), None);
+        assert_eq!(
+            confirm_created(br#"{"status":"success","result":null}"#),
+            None
+        );
+
+        // Everything else is *unconfirmed*, never failed. Creating a rollout
+        // allocates a new id per call, so a false failure costs the user a
+        // second deployment when they retry — and the message has to say so.
+        for ambiguous in [&b""[..], b"not json", br#"{"status":"error"}"#, br#"{}"#] {
+            let note = confirm_created(ambiguous)
+                .expect("an unconfirmable envelope must be reported, not swallowed");
+            assert!(
+                note.contains("twice deploys twice"),
+                "the note must warn against a blind retry: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_never_hides_its_reason_behind_a_parse_error() {
+        // The CLI's own envelope wins when it carries one.
+        assert_eq!(
+            failure_reason(
+                br#"{"status":"error","error":"Not logged in"}"#,
+                b"",
+                1,
+                "x"
+            ),
+            "Not logged in"
+        );
+        // An unparseable stdout must fall THROUGH to stderr rather than
+        // short-circuit on it. This is the regression: commander writes
+        // `unknown option` to stderr and nothing at all to stdout, and the
+        // previous code answered "could not parse firebase --json output".
+        assert_eq!(
+            failure_reason(b"", b"error: unknown option '--git_commit'\n", 1, "x"),
+            "error: unknown option '--git_commit'"
+        );
+        assert_eq!(
+            failure_reason(b"not json", b"real reason", 1, "x"),
+            "real reason"
+        );
+        // Silence on both streams is firebase-tools' unregistered-subcommand
+        // signature, so the message names the subcommand instead of reporting
+        // a bare exit code.
+        let silent = failure_reason(b"", b"", 1, "apphosting:rollouts:list");
+        assert!(silent.contains("apphosting:rollouts:list"), "{silent}");
+        assert!(!silent.contains("could not parse"), "{silent}");
     }
 
     #[test]
