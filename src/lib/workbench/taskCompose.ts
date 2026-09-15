@@ -3,8 +3,37 @@ import { STATUS_LABELS, type TaskDraft, type TaskStatus } from "./client";
 import { displayTitle } from "./taskDelete";
 
 export const MAX_AGENT_COPY_TASKS = 8;
-export const AGENT_COPY_PREAMBLE =
-  "GitPulse task for an AI agent. Use the title as the goal, the description as context, and the acceptance criteria as the definition of done. Do not invent repositories or skip criteria.";
+
+/**
+ * The instruction every copied task carries into an agent.
+ *
+ * This is the whole prompt. A run started from the handoff form sends only
+ * `{id, request_id, expected_revision}` to Manvi, and a clipboard copy is
+ * pasted into a session that knows nothing about this task — so whatever is
+ * not said here is not said at all.
+ *
+ * Three things it has to do, and the second and third were missing:
+ *
+ *  1. **Name the field roles.** Without them an agent reads the acceptance
+ *     criteria as suggestions.
+ *  2. **Keep the author's words intact.** The board's own tests are written
+ *     around this ("Preserve E42"): a task's description is evidence, and an
+ *     agent that paraphrases a reproduction step into a tidier one has
+ *     answered a different question. `improve` already told the on-device
+ *     model this; the agent handoff never did.
+ *  3. **Point at the tools this project ships.** GitPulse and DevMap both
+ *     expose skills and MCP tools that answer "who else is editing this" and
+ *     "what calls this" directly, and an agent that does not know they exist
+ *     greps instead — or, worse, concludes from silence.
+ *
+ * Named skills are asserted against the directories that ship them, so a
+ * skill added or renamed cannot quietly fall out of this text.
+ */
+export const AGENT_COPY_PREAMBLE = [
+  "GitPulse task for an AI agent. Use the title as the goal, the description as context, and the acceptance criteria as the definition of done. Do not invent repositories or skip criteria.",
+  "Preserve the author's intent and message. The wording below is evidence: keep error codes, identifiers, paths, versions, commands and quoted text exactly as written, carry the original meaning into whatever you produce, and do not restate the task as a smaller or easier one.",
+  "Orient with the tools this project ships before you edit, and skip any this session does not have. GitPulse — the gitpulse-insights and gitpulse-collisions skills, and the gitpulse_* MCP tools — for worktrees, in-flight changes and overlapping edits. DevMap — the devmap, devmap-debugging, devmap-exploring, devmap-impact and devmap-refactoring skills, and the devmap_* MCP tools — for symbols, callers, blast radius and affected tests. Pass the repository's absolute repo_path on every call. A tool that is unavailable, truncated or empty is not evidence that a symbol, caller or collision does not exist; name the check you could not run instead of reporting it as clean.",
+].join("\n\n");
 
 const TITLE_CAP = 300;
 const NOTES_CAP = 65_536;
@@ -132,9 +161,30 @@ export interface DraftAgentCopy {
   repositoryNames?: readonly string[];
 }
 
+/**
+ * The description as the agent will read it, with any cut announced.
+ *
+ * An unsaved draft can hold more than a saved one: `applyNotesToDraft` raises
+ * its own cap on purpose so nothing the author typed is lost before the save
+ * boundary reports it, while a saved brief's description is bounded at
+ * `NOTES_CAP` by the store. So this is the one path where the copy can be
+ * shorter than the draft it came from.
+ *
+ * Bounding the packet is right; bounding it silently is not. A copy that stops
+ * mid-sentence with no marker reads to the agent as the whole description, and
+ * it answers as though it had seen the rest. Same contract as the model
+ * budgeters in `ai/prompt.rs`: cut, and say so in the text that was cut.
+ */
+function copyDescription(value: unknown): string {
+  const text = sanitizeNotes(value, Number.MAX_SAFE_INTEGER);
+  const characters = [...text];
+  if (characters.length <= NOTES_CAP) return text;
+  return `${characters.slice(0, NOTES_CAP).join("")}\n\n[description truncated: ${NOTES_CAP} of ${characters.length} characters shown]`;
+}
+
 export function formatDraftAgentCopy(draft: DraftAgentCopy): string | null {
   const title = displayTitle(draft.title, TITLE_CAP);
-  const description = sanitizeNotes(draft.description);
+  const description = copyDescription(draft.description);
   if (title === "(untitled)" && !description) return null;
   const criteria = (draft.acceptance_criteria ?? []).map((item) => item.trim()).filter(Boolean);
   const labels = (draft.labels ?? []).map((item) => item.trim()).filter(Boolean);

@@ -129,6 +129,38 @@ describe("agent copy", () => {
     expect(formatDraftAgentCopy({ title: "   ", description: "" })).toBeNull();
   });
 
+  it("announces a description it had to cut instead of shortening the copy in silence", () => {
+    // `applyNotesToDraft` raises its own cap on purpose, so an unsaved draft
+    // can carry more than a saved task's 64 KiB — this is the one path where
+    // the packet can be shorter than what the author typed. A copy that stops
+    // mid-sentence with no marker reads as the whole description.
+    const tail = "the reproduction ends with E42";
+    const oversized = `${"x".repeat(65_536)}\n${tail}`;
+    const copy = formatDraftAgentCopy({ title: "Keep E42", description: oversized })!;
+    expect(copy).not.toContain(tail);
+    expect(copy).toContain(`[description truncated: 65536 of ${[...oversized].length} characters shown]`);
+    // A description that fits is passed through untouched, marker and all.
+    const exact = formatDraftAgentCopy({ title: "Keep E42", description: "x".repeat(65_536) })!;
+    expect(exact).not.toContain("[description truncated");
+    expect(formatDraftAgentCopy({ title: "Keep E42", description: `exact error: E42\n${tail}` }))
+      .toContain(tail);
+  });
+
+  it("carries the tool guidance and the preservation rule into every packet", () => {
+    // Both copy paths share one preamble, and both reach an agent that has
+    // never seen this repository: whatever is missing here is missing entirely.
+    const draft = formatDraftAgentCopy({ title: "Keep E42", description: "exact error: E42" })!;
+    const saved = wrapSavedBriefForAgent("# Task brief v1\n\n## Title\nKeep E42")!;
+    for (const packet of [draft, saved]) {
+      expect(packet).toContain("Preserve the author's intent and message");
+      expect(packet).toContain("gitpulse-insights");
+      expect(packet).toContain("devmap-impact");
+      expect(packet).toContain("devmap_* MCP tools");
+      expect(packet).toContain("gitpulse_* MCP tools");
+      expect(packet).toContain("absolute repo_path");
+    }
+  });
+
   it("wraps a saved brief and refuses empty or hostile markdown", () => {
     const wrapped = wrapSavedBriefForAgent("# Task brief v1\n\n## Title\nKeep E42");
     expect(wrapped?.startsWith(AGENT_COPY_PREAMBLE)).toBe(true);

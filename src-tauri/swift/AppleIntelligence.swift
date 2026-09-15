@@ -58,18 +58,36 @@ private struct Status: Encodable {
 // MARK: - Generated shapes
 
 #if canImport(FoundationModels)
+  /// The shape the decoder enforces, and therefore the strongest instruction
+  /// in the whole bridge.
+  ///
+  /// A `@Guide` outranks the session instructions in practice — the decoder is
+  /// steering toward this text token by token, while the instructions are
+  /// something the model merely read. Two of them used to pull against the
+  /// rules the instructions state, and the guide was winning:
+  ///
+  ///  - **"at most 12 words"** is a budget a title cannot always pay. A note
+  ///    whose point is `E42 in resolveWorktreeIdentity after 1.2.0` spends most
+  ///    of it on the evidence, so the model bought the word count by rewording
+  ///    the identifier — exactly what the instructions forbid. The bound that
+  ///    is actually enforced is 300 characters, in `interpret` and again in the
+  ///    store, so that is the one to state; brevity stays a preference.
+  ///  - **"Two to five sentences"** is a floor, and a floor on a thin note is
+  ///    an instruction to invent. "If the notes are thin, stay general rather
+  ///    than guessing" cannot survive a schema that will not accept one
+  ///    sentence.
   @available(macOS 26.0, *)
   @Generable
   private struct TaskText {
     @Guide(
       description:
-        "An imperative one-line summary of the work, at most 12 words. No trailing period, no markdown, no quotes."
+        "An imperative one-line summary of the work, at most 300 characters. Aim for about a dozen words, but never buy that brevity by dropping or rewording an error code, identifier, path or version the notes rely on — go longer instead. No trailing period, no markdown, no quotes."
     )
     var title: String
 
     @Guide(
       description:
-        "Two to five sentences describing what to change and how to tell it worked. Plain prose, no markdown headings, no bullet characters."
+        "What to change and how to tell it worked, in plain prose: no markdown headings, no bullet characters. At most five sentences, and only as many as the notes actually support — one accurate sentence is better than three where the third is padding. Reproduce the notes' own error codes, identifiers, paths and commands exactly rather than describing them in your own words."
     )
     var description: String
   }
@@ -258,39 +276,78 @@ public func gitpulseAppleIntelligenceFree(_ pointer: UnsafeMutablePointer<CChar>
     }
   }
 
+  /// The rules for one drafting kind, all of them built on `shared`.
+  ///
+  /// Preserving the author's meaning belongs in `shared` and not in a branch.
+  /// It used to sit only on `improve`, which left the two kinds that need it
+  /// most without it: `draft` writes the first version of a task from raw
+  /// notes, and `extract` is under explicit instruction to leave material out
+  /// — the one place a model will happily drop the error code the note was
+  /// written to record. Each branch may only *add* to `shared`; a branch that
+  /// replaced it would take the rule back out for that kind.
   private func instructions(for kind: String) -> String {
     let shared = """
       You turn engineering notes into one task's title and description for a \
       developer's own task board. Write plain prose in the notes' own language. \
-      Never invent file names, ticket numbers, people, dates, or decisions that \
-      the notes do not contain. If the notes are thin, stay general rather than \
-      guessing. Do not address the reader, do not add a preamble, and do not \
-      explain what you are doing.
+      Preserve the author's intent and message: keep their meaning and their \
+      terminology, and reproduce exactly any error code, identifier, path, \
+      version, command or quoted text they wrote. Never invent file names, \
+      ticket numbers, people, dates, or decisions that the notes do not \
+      contain. If the notes are thin, stay general rather than guessing. Do \
+      not address the reader, do not add a preamble, and do not explain what \
+      you are doing.
       """
     switch kind {
     case "improve":
       return shared
-        + " Keep the author's meaning and terminology; make the wording clearer and more specific without adding new claims."
+        + " Make the wording clearer and more specific without adding new claims."
     case "extract":
       return shared
-        + " The notes are raw and unstructured. Pull out the single piece of work they describe and leave everything else out."
+        + " The notes are raw and unstructured. Pull out the single piece of work they describe and leave the rest out, keeping that piece in the author's own words."
     default:
       return shared
     }
   }
 
+  /// The request body, ending in the one thing being asked for.
+  ///
+  /// A field the caller did not request is still *shown*, because it is
+  /// context the other field has to agree with — but the model was never told
+  /// it is off limits. Asked for a description with a title already present,
+  /// it would restate the title as the opening sentence; asked for a title
+  /// with a description present, it would quietly propose a better
+  /// description too. The decoder fills both properties either way and the
+  /// bridge blanks the unwanted one, so the waste was invisible from here and
+  /// showed up as a worse answer for the field that *was* asked for.
+  ///
+  /// The clause is conditional on the other field actually being in the
+  /// prompt. Telling a model to leave a title alone when no title was supplied
+  /// is a sentence about nothing, and it reads as though one exists.
   private func prompt(for request: Request, wantsTitle: Bool, wantsDescription: Bool) -> String {
     var parts: [String] = []
     if let context = trimmed(request.context) { parts.append("Context: \(context)") }
-    if let title = trimmed(request.title) { parts.append("Current title: \(title)") }
-    if let description = trimmed(request.description) {
+    let currentTitle = trimmed(request.title)
+    let currentDescription = trimmed(request.description)
+    if let title = currentTitle { parts.append("Current title: \(title)") }
+    if let description = currentDescription {
       parts.append("Current description:\n\(description)")
     }
     if let notes = trimmed(request.notes) { parts.append("Notes:\n\(notes)") }
-    let asked =
-      wantsTitle && wantsDescription
-      ? "Write both the title and the description."
-      : wantsTitle ? "Write the title." : "Write the description."
+    let asked: String
+    switch (wantsTitle, wantsDescription) {
+    case (true, true):
+      asked = "Write both the title and the description."
+    case (true, false):
+      asked =
+        currentDescription == nil
+        ? "Write the title only."
+        : "Write the title only. The current description stays exactly as it is — do not rewrite it, and do not repeat it in the title."
+    default:
+      asked =
+        currentTitle == nil
+        ? "Write the description only."
+        : "Write the description only. The current title stays exactly as it is — do not rewrite it, and do not restate it as the description's first sentence."
+    }
     parts.append(asked)
     return parts.joined(separator: "\n\n")
   }
@@ -314,8 +371,33 @@ public func gitpulseAppleIntelligenceFree(_ pointer: UnsafeMutablePointer<CChar>
     if text.count > 1, text.hasPrefix("\""), text.hasSuffix("\"") {
       text = String(text.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    if text.count > limit { text = String(text.prefix(limit)) }
-    return text
+    return cut(text, toScalars: limit)
+  }
+
+  /// Bounds a string by the unit everything downstream counts in.
+  ///
+  /// `String.prefix` counts *grapheme clusters*; `interpret` and the store both
+  /// count `chars()`, which is Unicode scalars. Those are not the same number —
+  /// one family emoji is 1 grapheme and 5 scalars — so `prefix(300)` could hand
+  /// back 1500 scalars and the store would refuse the proposal after the model
+  /// had already run. In the other direction, on plain ASCII the clip landed
+  /// exactly on 300 and made the downstream refusal unreachable, so the check
+  /// that was supposed to catch an over-long title could never fire.
+  ///
+  /// Whole characters, counted in scalars: the result satisfies the bound the
+  /// store actually enforces, and never leaves a combining mark or a ZWJ
+  /// sequence severed from the character it belonged to.
+  private func cut(_ text: String, toScalars limit: Int) -> String {
+    guard text.unicodeScalars.count > limit else { return text }
+    var kept = ""
+    var used = 0
+    for character in text {
+      let width = character.unicodeScalars.count
+      if used + width > limit { break }
+      kept.append(character)
+      used += width
+    }
+    return kept
   }
 #endif
 

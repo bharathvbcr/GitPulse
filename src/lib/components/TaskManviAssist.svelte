@@ -20,7 +20,7 @@
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, assistEngineName, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, liveEnhancement, type AssistEngine } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, liveEnhancement, type AssistEngine } from "../workbench/taskEnhance";
   import { timestampFormat } from "../ui/timestampFormat";
   import {
     appleBadge,
@@ -235,9 +235,13 @@
     context: appleContext({ kind: task?.kind, repositories: [...repositoryNames], labels: task?.labels ?? [] }),
   });
   const appleAsk = $derived(appleGate(apple, appleRequest));
+  // One derivation: the verb below and the `kind` the request carries are the
+  // same value rendered two ways, so the button cannot promise an operation
+  // other than the one that runs.
+  const askKind = $derived(draftingKind({ notes, title, description }));
   const askLabel = $derived(busy || preparing
     ? (quick ? "Enhancing…" : `Asking ${engineName}…`)
-    : notes.trim() ? `Draft with ${engineName}` : quick ? `Enhance with ${engineName}` : `Improve with ${engineName}`);
+    : `${draftingVerb(askKind, quick)} with ${engineName}`);
   const selectionSummary = $derived(liveSelection ? describeSelection(liveSelection) : "");
   const confirmedModel = $derived(configuration?.model_source === "env" && configuration.model.trim()
     ? (liveSelection ? describeSelection({ base_url: liveSelection.base_url, model: configuration.model }) : `${configuration.provider} / ${configuration.model}`)
@@ -500,7 +504,7 @@
       }
       const result = engine === "apple"
         ? await runAppleEnhancement(saved, available, {
-            kind: notes.trim() ? "extract" : title.trim() || description.trim() ? "improve" : "draft",
+            kind: askKind,
             notes,
             title,
             description,

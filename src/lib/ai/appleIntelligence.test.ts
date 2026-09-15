@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_APPLE_INPUT_CHARS,
+  MAX_CONTEXT_LABELS,
+  MAX_CONTEXT_REPOSITORIES,
   appleBadge,
   appleContext,
   appleErrorCode,
@@ -82,6 +84,23 @@ describe("appleContext", () => {
     expect(context).not.toContain("repo-8");
     expect(context).toContain("label-11");
     expect(context).not.toContain("label-12");
+  });
+
+  it("says how many it withheld, so a bounded list does not read as the whole set", () => {
+    // Eight of forty presented as a closed list is how the model comes to
+    // write "affects both repositories" about a task that spans five more.
+    const context = appleContext({
+      repositories: Array.from({ length: 40 }, (_, i) => `repo-${i}`),
+      labels: Array.from({ length: 40 }, (_, i) => `label-${i}`),
+    });
+    expect(context).toContain(`(and ${40 - MAX_CONTEXT_REPOSITORIES} more not listed)`);
+    expect(context).toContain(`(and ${40 - MAX_CONTEXT_LABELS} more not listed)`);
+    // A list that fits is stated plainly; a marker there would be a lie.
+    expect(appleContext({ repositories: ["GitPulse", "Manvi"], labels: ["ci"] }))
+      .toBe("Repository: GitPulse, Manvi. Labels: ci");
+    // The cap counts what survives filtering, not what was passed in.
+    const padded = [...Array.from({ length: MAX_CONTEXT_REPOSITORIES }, (_, i) => `r${i}`), "  ", ""];
+    expect(appleContext({ repositories: padded })).not.toContain("not listed");
   });
 });
 

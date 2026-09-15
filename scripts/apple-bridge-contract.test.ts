@@ -31,6 +31,9 @@ import { describe, expect, it } from "vitest";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const buildRs = readFileSync(path.join(REPO_ROOT, "src-tauri", "build.rs"), "utf8");
 const swift = readFileSync(path.join(REPO_ROOT, "src-tauri", "swift", "AppleIntelligence.swift"), "utf8");
+/** The two validators that reject an unknown drafting kind before the bridge runs. */
+const appleRs = readFileSync(path.join(REPO_ROOT, "src-tauri", "src", "ai", "apple.rs"), "utf8");
+const appleTs = readFileSync(path.join(REPO_ROOT, "src", "lib", "ai", "appleIntelligence.ts"), "utf8");
 /** Only the lines build.rs actually prints to cargo; comments are not rules. */
 const directives = [...buildRs.matchAll(/println!\("(cargo:[^"]*)"/g)].map((match) => match[1]);
 
@@ -78,5 +81,109 @@ describe("the Apple Intelligence bridge links without changing the rest of the p
     // feature and nobody finds out until a user asks for it.
     const skips = buildRs.match(/cargo:warning=Apple Intelligence bridge/g) ?? [];
     expect(skips.length).toBeGreaterThanOrEqual(5);
+  });
+});
+
+/**
+ * Every drafting kind keeps the author's meaning.
+ *
+ * Preserving intent used to be one branch's clause, so the two kinds that need
+ * it most went without it: `draft` writes a task from raw notes, and `extract`
+ * is under explicit instruction to leave material out. The rule now lives in
+ * the `shared` block every branch is built from, and the point of asserting it
+ * *structurally* — rather than checking three strings — is that adding a
+ * fourth kind cannot reintroduce the gap.
+ *
+ * The kind list is derived from the two validators that actually reject an
+ * unknown kind, not written down here, and they are cross-checked against each
+ * other so a broken parse fails instead of passing empty.
+ */
+const rustKinds = [
+  ...(appleRs.match(/matches!\(\s*request\.kind\.as_str\(\),([^)]*)\)/)?.[1] ?? "").matchAll(/"([a-z_]+)"/g),
+].map((match) => match[1]!);
+const tsKinds = [
+  ...(appleTs.match(/^\s*kind:\s*((?:"[a-z_]+"\s*\|\s*)*"[a-z_]+")\s*;/m)?.[1] ?? "").matchAll(/"([a-z_]+)"/g),
+].map((match) => match[1]!);
+/** `instructions(for:)` only — the rest of the file also says `return`. */
+const instructions = swift.slice(
+  swift.indexOf("private func instructions(for kind: String) -> String {"),
+  swift.indexOf("private func prompt(for request: Request"),
+);
+
+describe("every Apple Intelligence drafting kind preserves the author's meaning", () => {
+  it("derives the same kinds from the Rust and TypeScript validators", () => {
+    // Non-vacuity: an empty parse on either side is a broken test, not a pass.
+    expect(rustKinds.length).toBeGreaterThanOrEqual(2);
+    expect([...tsKinds].sort()).toEqual([...rustKinds].sort());
+    expect(instructions).not.toBe("");
+  });
+
+  it("states the preservation rule once, in the block every kind is built from", () => {
+    const shared = instructions.match(/let shared = """([\s\S]*?)"""/)?.[1] ?? "";
+    expect(shared).toContain("Preserve the author's intent and message");
+    // The specifics matter more than the slogan: a model that keeps the "gist"
+    // still rewrites the error code the note was written to record.
+    expect(shared).toMatch(/keep their meaning and their\s*\\?\s*terminology/);
+    expect(shared).toMatch(/reproduce exactly any error code/);
+  });
+
+  it("lets a kind add to the shared rules but never replace them", () => {
+    const returns = [...instructions.matchAll(/\breturn\s+(\w+)/g)].map((match) => match[1]);
+    expect(returns.length).toBeGreaterThanOrEqual(rustKinds.length);
+    expect(new Set(returns)).toEqual(new Set(["shared"]));
+  });
+
+  it("does not let a @Guide contradict the rules the instructions state", () => {
+    // A @Guide steers the decoder token by token; the instructions are only
+    // something the model read. Where they disagree the guide wins, so a guide
+    // that forces padding or forces brevity silently repeals the rule above it.
+    const guides = [...swift.matchAll(/@Guide\(\s*description:\s*\n?\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]!);
+    expect(guides).toHaveLength(2);
+    const [title, description] = guides as [string, string];
+    // A word budget is what the model spends by rewording an identifier.
+    expect(title).not.toMatch(/at most \d+ words/);
+    // State the bound that is actually enforced, in the unit it is enforced in.
+    expect(title).toContain("at most 300 characters");
+    expect(title).toMatch(/never buy that brevity by dropping or rewording/);
+    // A sentence floor on a thin note is an instruction to invent.
+    expect(description).not.toMatch(/\b(?:two|three|four) to (?:three|four|five)\b/i);
+    expect(description).toMatch(/only as many as the notes actually support/);
+    for (const guide of guides) expect(guide).toMatch(/error code/);
+  });
+
+  it("bounds a reply in the unit every reader downstream counts in", () => {
+    // Swift's `prefix` counts grapheme clusters; `interpret` and the store both
+    // count Unicode scalars. One family emoji is 1 grapheme and 5 scalars, so a
+    // grapheme-based cut could hand back 1500 scalars for a 300 bound — refused
+    // by the store after the model had already run — while on plain ASCII it
+    // landed exactly on the bound and made that refusal unreachable.
+    expect(swift).toContain("toScalars");
+    expect(swift).toMatch(/text\.unicodeScalars\.count > limit/);
+    expect(swift).not.toMatch(/text\.count > limit/);
+    // The bound Swift cuts to is the one Rust refuses past.
+    const refusal = appleRs.match(/name == "title" && text\.chars\(\)\.count\(\) > (\d+)/)?.[1];
+    expect(refusal).toBeDefined();
+    expect(swift).toContain(`clean(content.title, limit: ${refusal})`);
+  });
+
+  it("tells the model which field it must leave alone, and only when there is one", () => {
+    const body = swift.slice(
+      swift.indexOf("private func prompt(for request: Request"),
+      swift.indexOf("private func trimmed("),
+    );
+    expect(body).not.toBe("");
+    expect(body).toMatch(/stays exactly as it is/);
+    // Conditional on the field actually being in the prompt: telling a model to
+    // leave a title alone when none was supplied asserts one exists.
+    expect(body).toMatch(/currentDescription == nil/);
+    expect(body).toMatch(/currentTitle == nil/);
+  });
+
+  it("cases only kinds the validators accept, and defaults the rest", () => {
+    const cased = [...instructions.matchAll(/case "([a-z_]+)":/g)].map((match) => match[1]!);
+    expect(cased.length).toBeGreaterThan(0);
+    for (const kind of cased) expect(rustKinds).toContain(kind);
+    // Whatever is not cased reaches `default`, which must therefore exist.
+    if (rustKinds.some((kind) => !cased.includes(kind))) expect(instructions).toContain("default:");
   });
 });

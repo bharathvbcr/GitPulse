@@ -51,6 +51,51 @@ export const DEFAULT_ASSIST_ENGINE: AssistEngine = "manvi";
 
 export const assistEngineName = (engine: AssistEngine): string => ASSIST_ENGINE_NAMES[engine];
 
+/**
+ * What the model is being asked to do, as the request names it.
+ *
+ * Accepted by `validate` in `src-tauri/src/ai/apple.rs` and cased by
+ * `instructions(for:)` in the Swift bridge; a value that is not one of these
+ * is refused before any model runs.
+ */
+export type DraftingKind = "draft" | "improve" | "extract";
+
+/**
+ * The one decision, made once.
+ *
+ * The sheet used to derive this twice from the same three fields — an inline
+ * expression at the request site chose the kind, and a separate expression
+ * chose the button's verb — and the two disagreed. With notes present the
+ * button read "Draft" while the request carried `extract`, and on an empty
+ * task it read "Improve" while the request carried `draft`. Nothing caught it
+ * because neither expression was reachable from a test: both lived inside the
+ * component.
+ *
+ * The verb is now a function of the kind rather than a second reading of the
+ * state, so the button cannot name an operation other than the one that runs.
+ */
+export function draftingKind(source: { notes?: string; title?: string; description?: string }): DraftingKind {
+  if (source.notes?.trim()) return "extract";
+  if (source.title?.trim() || source.description?.trim()) return "improve";
+  return "draft";
+}
+
+/**
+ * The button's verb for a kind.
+ *
+ * `extract` reads as "Draft" on purpose: from the reader's side, turning notes
+ * into a task *is* drafting one, and `extract` is the model-side name for the
+ * same operation. That is a rendering of one value, not a second opinion about
+ * which operation to run. A quick enhancement says "Enhance" instead, except
+ * when there are notes to consume — that is the one case where the button is
+ * about the notes rather than about the saved task.
+ */
+export function draftingVerb(kind: DraftingKind, quick: boolean): string {
+  if (kind === "extract") return "Draft";
+  if (quick) return "Enhance";
+  return kind === "improve" ? "Improve" : "Draft";
+}
+
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
   proposal !== null && ["pending", "running", "cancel_requested"].includes(proposal.state);
 

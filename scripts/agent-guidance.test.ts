@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { AGENT_COPY_PREAMBLE } from "../src/lib/workbench/taskCompose";
 
 it.each(["AGENTS.md", "CLAUDE.md"])("%s is DevMap-pivotal and has no GitNexus block", (name) => {
   const guide = readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
@@ -62,4 +63,67 @@ it("does not ship GitNexus skills under .claude/skills", () => {
     cwd: new URL("..", import.meta.url),
   });
   expect(result.status).toBe(0);
+});
+
+/**
+ * The guidance an agent gets when it is handed a *task*, rather than when it
+ * opens the repository.
+ *
+ * `AGENTS.md` and `CLAUDE.md` reach an agent that is already working in this
+ * checkout. A copied task reaches one that is not: the handoff sends only
+ * `{id, request_id, expected_revision}` to Manvi, and a clipboard copy is
+ * pasted into a session that has never seen this repository. Everything the
+ * two guides say about DevMap and GitPulse was therefore unavailable on
+ * exactly the path where an agent is least oriented, and the preamble said
+ * nothing about either.
+ *
+ * The skill names are read from the directories that ship them rather than
+ * listed here, so adding or renaming a skill fails this test instead of
+ * quietly leaving the preamble a version behind.
+ */
+const skillNames = (dir: string): string[] =>
+  readdirSync(new URL(`../${dir}`, import.meta.url), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+const bundledSkills = [...skillNames(".agents/skills"), ...skillNames("plugins/gitpulse/skills")];
+/** "devmap" must match on its own, not inside "devmap-impact". */
+const namesWhole = (haystack: string, needle: string): boolean =>
+  new RegExp(`(?<![\\w-])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`).test(haystack);
+
+describe("the task handoff preamble carries this project's own guidance", () => {
+  it("names every bundled GitPulse and DevMap skill", () => {
+    // Non-vacuity: an empty read would make every assertion below trivially true.
+    expect(bundledSkills.length).toBeGreaterThanOrEqual(6);
+    for (const skill of bundledSkills) {
+      expect(namesWhole(AGENT_COPY_PREAMBLE, skill), `preamble omits ${skill}`).toBe(true);
+    }
+  });
+
+  it("names both MCP tool families and the argument every call needs", () => {
+    expect(AGENT_COPY_PREAMBLE).toContain("devmap_* MCP tools");
+    expect(AGENT_COPY_PREAMBLE).toContain("gitpulse_* MCP tools");
+    expect(AGENT_COPY_PREAMBLE).toContain("absolute repo_path");
+  });
+
+  it("repeats the repository's own rule that an unanswered query is not an answer", () => {
+    // The same invariant AGENTS.md and CLAUDE.md state, and the one an agent
+    // reaching for these tools for the first time is most likely to break.
+    expect(AGENT_COPY_PREAMBLE).toMatch(/unavailable, truncated or empty is not evidence/);
+    expect(AGENT_COPY_PREAMBLE).toMatch(/name the check you could not run/);
+  });
+
+  it("tells the agent to preserve the author's wording, not just the gist", () => {
+    expect(AGENT_COPY_PREAMBLE).toContain("Preserve the author's intent and message");
+    expect(AGENT_COPY_PREAMBLE).toMatch(/exactly as written/);
+    expect(AGENT_COPY_PREAMBLE).toMatch(/not restate the task as a smaller or easier one/);
+  });
+
+  it("keeps the field roles the preamble already established", () => {
+    // The addition must not have displaced what was there: an agent that
+    // reads acceptance criteria as suggestions is the older failure.
+    expect(AGENT_COPY_PREAMBLE).toContain("Use the title as the goal");
+    expect(AGENT_COPY_PREAMBLE).toContain("acceptance criteria as the definition of done");
+    expect(AGENT_COPY_PREAMBLE).toContain("Do not invent repositories or skip criteria");
+  });
 });
