@@ -286,6 +286,35 @@ const PACKAGE_KEYS = [
 ];
 
 /**
+ * The first line of `text` that still inherits from a workspace, else `null`.
+ *
+ * A key inherits by *referencing* the workspace — `version.workspace = true`,
+ * `serde = { workspace = true }`. Prose does not. String literals are blanked
+ * before matching, because a value may legitimately contain the word:
+ * `dc-proc` describes itself as "shared by every place this workspace shells
+ * out", which is not an inheritance reference. Matching the raw line rejected
+ * that crate outright, which is how it stayed unvendored while two crates in
+ * the closure had already taken a hard dependency on it.
+ *
+ * This is the single owner of that rule. `resolveManifest` refuses to emit a
+ * manifest it matches, and `scripts/vendor-contract.test.ts` asserts no
+ * vendored manifest matches — the two had their own copies once, and the copy
+ * in the test still rejected `dc-proc` after the one here was fixed.
+ *
+ * @param {string} text one manifest, or a single line of one
+ * @returns {string | null} the offending line, trimmed
+ */
+export function workspaceReference(text) {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("#")) continue;
+    const withoutStrings = trimmed.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    if (/\bworkspace\b/.test(withoutStrings)) return trimmed;
+  }
+  return null;
+}
+
+/**
  * Rewrites one crate manifest so it stands on its own.
  *
  * @param {string} text the upstream manifest
@@ -380,19 +409,8 @@ export function resolveManifest(text, workspace) {
   const result = out.join("\n");
   // Nothing may reference the workspace afterwards. A survivor would surface
   // later as a cargo error about a manifest this script claimed it had fixed.
-  const leftover = result.split("\n").find((l) => {
-    const trimmed = l.trim();
-    if (trimmed.startsWith("#")) return false;
-    // Blank the contents of string literals first. A value is prose, and prose
-    // may legitimately contain the word: `dc-proc` describes itself as "shared
-    // by every place this workspace shells out", which is not an inheritance
-    // reference and must not fail the vendor. Matching the raw line rejected
-    // that crate outright, which is how it stayed unvendored while two crates
-    // in the closure had already taken a hard dependency on it.
-    const withoutStrings = trimmed.replace(/"(?:[^"\\]|\\.)*"/g, '""');
-    return /\bworkspace\b/.test(withoutStrings);
-  });
-  if (leftover) throw new Error(`unresolved workspace reference: ${leftover.trim()}`);
+  const leftover = workspaceReference(result);
+  if (leftover) throw new Error(`unresolved workspace reference: ${leftover}`);
 
   return { text: result, rewrites };
 }

@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { check, main, MANIFEST, readToml, resolveManifest, sources, VENDOR_DIR } from "./vendor-crates.mjs";
+import { check, main, MANIFEST, readToml, resolveManifest, sources, VENDOR_DIR, workspaceReference } from "./vendor-crates.mjs";
 
 /**
  * GitPulse must build from a checkout of GitPulse.
@@ -91,11 +91,19 @@ describe("GitPulse builds standalone", () => {
     // about a manifest this repository appears to own.
     for (const crate of readdirSync(VENDOR_DIR).filter((e) => existsSync(path.join(VENDOR_DIR, e, "Cargo.toml")))) {
       const text = readFileSync(path.join(VENDOR_DIR, crate, "Cargo.toml"), "utf8");
-      const offending = text
-        .split("\n")
-        .filter((line) => /\bworkspace\b/.test(line) && !line.trim().startsWith("#"));
-      expect(offending, `${crate} still inherits from a workspace`).toEqual([]);
+      expect(workspaceReference(text), `${crate} still inherits from a workspace`).toBeNull();
     }
+
+    // The rule is imported, not restated. This test used to carry its own copy
+    // of it, and when the copy in vendor-crates.mjs learned that a description
+    // is prose, this one did not — so `dc-proc`, whose description says
+    // "shared by every place this workspace shells out", failed here after it
+    // vendored cleanly. Both directions are pinned so the shared rule cannot
+    // pass this check by never matching anything.
+    expect(workspaceReference("version.workspace = true")).toBe("version.workspace = true");
+    expect(workspaceReference("serde = { workspace = true }")).toBe("serde = { workspace = true }");
+    expect(workspaceReference('description = "this workspace shells out"')).toBeNull();
+    expect(workspaceReference("# version.workspace = true")).toBeNull();
   });
 });
 
