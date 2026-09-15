@@ -13,7 +13,7 @@ before that tag is pushed.
 
 Nothing yet.
 
-## [1.2.0] - 2026-09-14
+## [1.2.0] - 2026-09-15
 
 A release about checks that were not telling the truth. Every fix here is a
 report that read as an answer without being one: a doctor that compared a
@@ -30,6 +30,14 @@ checks and the fleet view quietly dropped every sibling. Trust is now reported
 as a scope rather than a yes/no, and the sidebar offers to extend an
 approval that predates worktree coverage. Approvals are still never widened by
 being read: extending is a decision you take, through the same dialog.
+
+The new surface in this release, Firebase App Hosting, is built on the same
+rule. Its backend and rollout listings are click-only rather than loaded on
+render, because the upstream commands enable the App Hosting API on the project
+they read — a read that bills is a decision, not a side effect of opening a
+panel. What it buys is a join rather than a guess: App Hosting reports the full
+commit SHA it deployed, so "this commit is live" is looked up against the graph
+instead of inferred from a branch name and a timestamp.
 
 ### Added
 
@@ -65,6 +73,27 @@ being read: extending is a decision you take, through the same dialog.
   so the same key in the portable manifest invalidates the package for a
   conformant client. `check-release-version` walks the Cursor manifest with the
   other three, so its version cannot drift from the release.
+- Firebase App Hosting backends and rollouts, read through the `firebase` CLI
+  and joined to the commit graph. `Build.source.codebase` carries `hash` — a
+  full SHA-1, the same key `git cat-file` speaks — so "is this commit live?"
+  becomes a lookup rather than an inference, and presence is read from the
+  command's own `success` flag rather than from `is_ok()`, because
+  `git_captured` returns `Ok` on a non-zero exit: absence is data, not failure,
+  and reading it the other way would have made every rollout look locally
+  present.
+
+  The two listings are click-only and wear `Guarded<T>` on purpose, and this is
+  the part worth stating plainly: `apphosting:backends:list` and
+  `apphosting:rollouts:list` both declare `.before(ensureApiEnabled)` upstream,
+  so *reading* them enables the App Hosting API on the Cloud project. REST does
+  not avoid it — App Hosting's only OAuth scope is `cloud-platform`, full
+  read/write, with no read-only counterpart of the kind classic Hosting accepts.
+  A read that mutates a billed resource must be something you choose, never
+  something a panel does because it rendered. Passing `--json` also implies
+  non-interactive, which turns a would-be enablement prompt into a loud error
+  rather than a silent one. `apphosting:rollouts:list` exists only in
+  firebase-tools' source and is documented nowhere, so its envelope is parsed
+  strictly and fixture-pinned instead of trusted to keep its shape.
 
 ### Changed
 
@@ -341,61 +370,83 @@ being read: extending is a decision you take, through the same dialog.
   and still hold — `work_items` has no `archived` column, `put_item` accepts
   exactly its eighteen named fields, `list_items` filters on exactly six, and
   the schema version is unchanged — so only the reference had gone stale.
+- A task harness check asserted the button verb a bug used to produce, and so
+  failed on both renderers. On a brand-new task — no notes, no title, no
+  description — `draftingKind` returns `draft` and `draftingVerb` renders that
+  as "Draft", but the check looked for `button("Improve with Manvi")`, and the
+  harness matches button text exactly, so the lookup returned `undefined`.
+  "On an empty task it read 'Improve' while the request carried `draft`" is the
+  precise disagreement `draftingKind`/`draftingVerb` were extracted to end, so
+  this line had been pinning the defect rather than the repair — it would have
+  gone green again only if the bug came back. It now asserts "Draft with
+  Manvi", which fails if the verb ever drifts off the kind again.
+
+  Worth recording because of how it was nearly dismissed: it was carried in
+  notes as a known pre-existing failure, on the strength of it also failing
+  against a reverted baseline. That only established it predated one branch.
+  The same check reads `"pass":true` in the 2026-09-14 CI log, so it was a
+  regression with a cause, not a standing exception. "Fails on the baseline
+  too" is not evidence that a failure is expected.
 
 ### Verification
 
-Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at `5fa7615`,
-the tip of this section's work, after the prompting-fidelity, two-line worktree
-row and trust-banner branches were merged.
+Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at `0836d65`,
+after the Firebase App Hosting work was merged and the two gate failures it
+exposed were fixed. The tagged commit differs from that built tree only by this
+changelog entry.
 
-- `npm test` → exit 0, **7056 passed, 0 failed** across 502 test files. This is
-  the whole suite as the repository runs it, from the repository root. The
-  previous build of this section could not make that claim and said so; it can
-  be made now, and the subset caveat that stood here is withdrawn rather than
-  left to look satisfied.
-- `npm run check` → exit 0. `svelte-check` over **5081 files: 0 errors, 0
-  warnings**, then `tsc --noEmit` clean. This is what proves the two branches
-  that both edited `WorktreesPanel.svelte` merged semantically and not merely
-  textually — the trust-extension side deleted the banner, its state and its
-  loader, while the row side rewrote the markup below them, and a leftover
-  reference to either would surface here.
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast` →
-  exit 0, **2548 passed, 0 failed, 19 ignored** across 80 test binaries, summed
-  from the individual `test result:` lines rather than read off a tail.
-- `npm run tauri build` → exit 0. `GitPulse.app` and
-  `GitPulse_1.2.0_aarch64.dmg`, every nested helper (`gitpulsed`,
-  `gitpulse-mcp`, `gitpulse-hook`) ad-hoc signed before the outer bundle.
-  `codesign --verify --deep --strict` on the installed copy: *valid on disk*,
-  *satisfies its Designated Requirement*. Not notarized — no Apple credentials
-  in the environment, as usual for a local build.
-
-  The first attempt exited 1 in `bundle_dmg.sh` with no reason of its own. The
-  cause was outside the tree: a previous run had left its read-write image
-  attached at `/Volumes/dmg.fyYBMH`, and `hdiutil` will not stage a second one
-  over it. Ejecting the volume and deleting the orphaned `rw.*.dmg` made the
-  same command exit 0. Recorded because the error text named a script rather
-  than a mounted volume, and the next person to hit it will search for the
-  script.
+- `npm run ci:local` → exit 0, **15 passed · 0 failed · 0 skipped of 15 gates**.
+  The whole gate list, end to end. The previous build of this section could not
+  make that claim and said so; that caveat is withdrawn rather than left to look
+  satisfied. Every number below comes from that single run.
+- `npm run check` → `svelte-check` over **5087 files: 0 errors, 0 warnings, 0
+  files with problems**, then `tsc --noEmit` clean.
+- `npm run coverage` → **7073 passed, 0 failed** across 504 test files.
+- Rust tests under `cargo llvm-cov` → **2566 passed, 0 failed, 19 ignored**
+  across 79 test binaries, summed from the individual `test result:` lines
+  rather than read off a tail: this shell is zsh, where a piped `tail` launders
+  both the counts and the exit status.
+- `npm run test:browser:all` and `npm run test:webkit:all` → **845 checks across
+  13 harnesses on each engine, 1690 in total**, headless Chrome 152 and
+  WKWebView both green. Both engines ran for this build; the previous section
+  had to record that neither did.
+- `npm run check:coverage` → floors hold: frontend lines **96.17%**
+  (12835/13346), frontend branches **89.47%** (12548/14025), Rust lines
+  **85.32%** (68659/80472).
 - `npm run check:release` → `OK: all version sources agree on 1.2.0` across all
   ten manifests.
-- `npm run mcp:install` → `gitpulse-mcp` and `gitpulse-hook` replaced at 1.2.0.
-  `npm run mcp:doctor` → OK on all three of its claims: the version matches, the
-  hook serves every subcommand `hooks.json` declares, and both binaries were
-  built from the source this tree holds (digest `d733533a741f5104…`, 674 files).
+- `npm run tauri build` → exit 0, first attempt. `GitPulse.app` and
+  `GitPulse_1.2.0_aarch64.dmg` (21,981,845 bytes), every nested helper
+  (`gitpulsed`, `gitpulse-mcp`, `gitpulse-hook`) ad-hoc signed before the outer
+  bundle. `codesign --verify --deep --strict` on the installed copy: *valid on
+  disk*, *satisfies its Designated Requirement*, all three helpers validated.
+  Not notarized — no Apple credentials in the environment, as usual for a local
+  build.
 
-  The doctor earned its third claim here. Before the reinstall it reported the
-  version and the store schema as matching — 1.2.0 and 22 on both sides — and
-  still failed, because the recorded source digest was `329c17f746065005…`
-  against this tree's `d733533a741f5104…`. Version alone could not see that the
-  binaries on `PATH` were built from different source.
+  The stale-mounted-volume failure recorded against the previous build did not
+  recur, because `hdiutil info` was checked for an attached `dmg.*` volume
+  *before* the build rather than after one failed naming only a script.
+- `npm run mcp:install` → `gitpulse-mcp` and `gitpulse-hook` replaced at 1.2.0,
+  provenance recorded at source digest `06abf2cc16fb5fed…` over **676 files**.
+  `npm run mcp:doctor` → OK on all three claims, including that both binaries
+  were built from the source this tree holds.
 
-**What is not verified here.** The browser harnesses (`npm run test:browser`,
-`--webkit`) were not run for this build, so the sidebar row geometry is covered
-by `harness/branches.html`'s assertions only as far as unit tests reach them —
-the measured 264px and 360px claims in the changelog entry come from the
-authoring session, not from a run recorded here. Notarization is absent, as
-above. `npm run ci:local` was not run end to end; the gates it chains were run
-individually and are listed above.
+  The digest is what moved: the previous record was `d733533a741f5104…` over
+  **674** files, the two added being `src-tauri/src/firebase/mod.rs` and
+  `apphosting.rs`. Version and store schema read 1.2.0 and 22 on both sides
+  before the reinstall, and would have reported a clean match on their own.
+- Superseded build evidence was pruned to the single entry whose chunk names
+  match the shipped `dist/index.html`. Revision alone could not identify it:
+  two builds of the same commit `0836d65` produced *different* chunk hashes, so
+  an entry can carry the right revision and still not be the one that shipped.
+
+**What is not verified here.** Notarization is absent, as above. Nothing was
+pushed: `main` is ahead of `origin/main` and the tag is local, so the
+CI-provenance precondition in `release:ready` — a successful push run of
+`ci.yml` and `coverage.yml` on the tagged commit — is not satisfied, and no
+draft was prepared. The App Hosting panel was exercised by its own harness and
+unit tests only; no live Firebase project was contacted, deliberately, because
+both listings enable the API on the project they read.
 
 ### Changed — vendored crates
 
