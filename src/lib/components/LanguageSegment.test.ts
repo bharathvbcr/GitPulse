@@ -45,9 +45,27 @@ describe("LanguageSegment", () => {
   });
 
   it("dismisses the breakdown the way every other overlay does", () => {
-    expect(source).toContain("shouldDismissOverlay");
-    expect(source).toContain('event.key === "Escape"');
+    // Literally the same way now: the shared popover owner registers the
+    // listeners and `popover.test.ts` holds their phases to account. What
+    // stays this component's own contract is which surfaces count as inside
+    // — the trigger among them, or its own pointerdown would close the panel
+    // a beat before its click reopened it — and that Escape closes it.
+    expect(source).toContain("use:popover={dismissal}");
+    expect(source).toContain("[data-language-panel], [data-language-trigger]");
+    expect(source).toContain('escape: "bubble"');
+    expect(source).toContain("resize: true");
     expect(source).toContain('aria-expanded={open}');
+  });
+
+  it("opens upward from the status bar, by its own measured height", () => {
+    // The status bar is the last row on screen: "below" is off the window.
+    // The owner derives a top from the measured height, so the panel still
+    // grows upward but can no longer grow off the top of the screen.
+    expect(source).toContain('place: "above"');
+    expect(source).toContain("element: triggerEl");
+    // Replaced, not accumulated: the hand-rolled bottom anchor is gone.
+    expect(source).not.toContain("window.innerHeight - rect.top");
+    expect(source).not.toContain("bottom: {anchor.bottom}px");
   });
 
   it("has a rescan button that force-refreshes the LOC metric", () => {

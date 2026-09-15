@@ -65,26 +65,43 @@ describe("TaskRepositoryPicker", () => {
     // makes it a containing block for fixed descendants. Either one alone
     // would clip an in-place popover.
     expect(source).toContain('use:portal={"body"}');
-    expect(source).toContain("clampMenuPosition");
+    // Placement comes from the shared popover owner, applied after the portal
+    // so it measures the popup where it actually paints.
+    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{dismissal\}/);
+    expect(source).toContain("element: triggerEl");
     expect(source).toContain("LAYERS.MENU");
   });
 
   it("dismisses for every reason the anchor stops being where it was", () => {
-    expect(source).toContain('shouldDismissOverlay(event.target, "[data-task-repo-picker], [data-task-repo-popup]")');
+    expect(source).toContain('inside: "[data-task-repo-picker], [data-task-repo-popup]"');
     // Scroll does not bubble, so only a capture listener on window sees the
-    // sheet's own scroller move the trigger out from under the popup.
-    expect(source).toMatch(/addEventListener\("scroll", onScroll, true\)/);
-    expect(source).toMatch(/addEventListener\("resize", onResize\)/);
+    // sheet's own scroller move the trigger out from under the popup — and a
+    // scroll inside the popup must not dismiss. Both are the owner's job now,
+    // and popover.test.ts holds it to them; this is the opt-in.
+    expect(source).toContain("scroll: true");
+    expect(source).toContain("resize: true");
     // A popover left open over a saving sheet is a panel of dead checkboxes.
     expect(source).toMatch(/if \(disabled && open\) close\(\)/);
   });
 
   it("closes itself on Escape without closing the task behind it", () => {
-    // The sheet also closes on Escape. This listener is on the capture phase
-    // and stops propagation, so one Escape dismisses one thing.
+    // The sheet also closes on Escape. `capture` is the owner's spelling for
+    // "listen on the capture phase and stop propagation", so one Escape
+    // dismisses one thing.
+    expect(source).toContain('escape: "capture"');
+    expect(source).toContain('close({ restoreFocus: reason === "escape" })');
+    // Only Escape hands focus back; a pointer dismissal leaves the reader
+    // wherever they clicked.
+    expect(source).not.toContain("close({ restoreFocus: true })");
+  });
+
+  it("closes when Tab leaves the popup, and owns that itself", () => {
+    // The only surface with an *edge* check — the other menus that close on
+    // Tab close on any Tab — so it stays here rather than becoming a
+    // one-caller option on the shared owner, which does not reach into focus.
     expect(source).toMatch(/addEventListener\("keydown", onKey, true\)/);
-    expect(source).toMatch(/event\.key === "Escape"[\s\S]*?event\.stopPropagation\(\)/);
-    expect(source).toContain("close({ restoreFocus: true })");
+    expect(source).toMatch(/event\.key !== "Tab"/);
+    expect(source).toContain("document.activeElement === edge");
   });
 
   it("never renders an unread workspace membership as an empty one", () => {

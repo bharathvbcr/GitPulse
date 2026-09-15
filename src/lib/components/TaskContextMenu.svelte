@@ -2,10 +2,9 @@
   import { onMount } from "svelte";
   import { Archive, ArrowLeft, Bot, Calendar, Check, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
   import { portal } from "../dom/portal";
-  import { shouldDismissOverlay } from "../ui/dismiss";
+  import { popover } from "../ui/popover";
   import { cycleFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { clampMenuPosition } from "../branches/menuPosition";
   import { menuPageItems, submenuTitle, typeAheadIndex, type TaskMenuIcon, type TaskMenuItem, type TaskMenuSubmenu } from "../workbench/taskMenu";
 
   let {
@@ -25,8 +24,6 @@
   } = $props();
 
   let menuEl: HTMLDivElement | undefined = $state();
-  let left = $state(0);
-  let top = $state(0);
   let page = $state<"root" | TaskMenuSubmenu>("root");
   const shown = $derived(menuPageItems(items, page));
 
@@ -37,58 +34,40 @@
   let typed = "";
   let typedTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function fit() {
-    if (!menuEl) return;
-    // Layout dimensions remain stable while the opening animation scales the menu.
-    const next = clampMenuPosition(x, y, menuEl.offsetWidth, menuEl.offsetHeight, window.innerWidth - 8, window.innerHeight - 8);
-    left = Math.max(8, next.left);
-    top = Math.max(8, next.top);
-  }
-
-  onMount(() => {
-    fit();
-    const onPointer = (event: PointerEvent) => {
-      if (shouldDismissOverlay(event.target, "[data-task-menu]")) onClose(false);
-    };
-    const onContext = (event: MouseEvent) => {
-      if (shouldDismissOverlay(event.target, "[data-task-menu]")) onClose(false);
-    };
-    const onViewport = () => onClose(false);
-    /**
-     * A page scroll moves the anchor out from under the menu, so the menu
-     * closes. Its *own* scroll does not.
-     *
-     * This listener is on the capture phase, so it sees the menu's internal
-     * scrolling too — and focusing a row below the fold scrolls the menu,
-     * which closed it. End, ArrowDown past the fold and type-ahead all
-     * dismissed the menu instead of moving through it, and the longer the
-     * page (Labels, Owner) the more often it happened.
-     */
-    const onScroll = (event: Event) => {
-      const target = event.target;
-      if (menuEl && target instanceof Node && menuEl.contains(target)) return;
-      onClose(false);
-    };
-    window.addEventListener("pointerdown", onPointer, true);
-    window.addEventListener("contextmenu", onContext);
-    window.addEventListener("resize", onViewport);
-    window.addEventListener("scroll", onScroll, true);
-    return () => {
-      window.removeEventListener("pointerdown", onPointer, true);
-      window.removeEventListener("contextmenu", onContext);
-      window.removeEventListener("resize", onViewport);
-      window.removeEventListener("scroll", onScroll, true);
-      if (typedTimer) clearTimeout(typedTimer);
-    };
+  /**
+   * Dismissal and placement, from the shared popover owner.
+   *
+   * `scroll` is the one worth reading twice. A page scroll moves the anchor
+   * out from under the menu, so the menu closes; its *own* scroll does not.
+   * The owner registers that listener on the capture phase — scroll does not
+   * bubble — and judges it by containment, which is what keeps focusing a row
+   * below the fold from dismissing the menu it is navigating. End, ArrowDown
+   * past the fold and type-ahead all used to close the menu instead of moving
+   * through it, and the longer the page (Labels, Owner) the more often it
+   * happened.
+   *
+   * `revision` re-measures when a submenu page or a changed item list changes
+   * the menu's height under an already-clamped position. Escape stays with
+   * `onKey` below: this menu owns its keyboard, and Escape there backs out of
+   * a submenu before it closes anything.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "point" as const, x, y },
+    inset: 8,
+    revision: `${items.length}:${page}`,
+    dismiss: {
+      inside: "[data-task-menu]",
+      contextmenu: true,
+      scroll: true,
+      resize: true,
+      escape: "none" as const,
+    },
+    onDismiss: () => onClose(false),
   });
 
-  $effect(() => {
-    left = x;
-    top = y;
-    items.length;
-    page;
-    queueMicrotask(fit);
-  });
+  // The type-ahead buffer outlives any one open menu page, so its timer is
+  // cleared on the component's own teardown rather than the popover's.
+  onMount(() => () => { if (typedTimer) clearTimeout(typedTimer); });
 
   /**
    * Every focusable row, in DOM order.
@@ -196,9 +175,10 @@
 <div
   bind:this={menuEl}
   use:portal={"body"}
+  use:popover={dismissal}
   data-task-menu
   class="gp-menu gp-pop fixed min-w-56 max-w-[min(18rem,calc(100vw-1rem))] max-h-[min(32rem,calc(100vh-1rem))] overflow-y-auto text-xs text-textPrimary py-1"
-  style="left: {left}px; top: {top}px; z-index: {LAYERS.MENU}"
+  style="z-index: {LAYERS.MENU}"
   role="menu"
   aria-label={label}
   tabindex="-1"

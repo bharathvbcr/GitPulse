@@ -63,19 +63,20 @@ describe("the work-in-progress roll-up panel", () => {
   });
 
   it("dismisses the way every other overlay in the app does", () => {
-    expect(source).toContain("shouldDismissOverlay");
-    expect(source).toContain('event.key === "Escape"');
+    // Literally the same way now: the shared popover owner registers the
+    // listeners, and because it lives on the panel node rather than on the
+    // component, teardown IS the close — the pairing this used to assert by
+    // hand cannot come apart. `popover.test.ts` proves that; what stays this
+    // component's own contract is what it declares.
+    expect(source).toContain("use:popover={dismissal}");
     // The trigger has to count as inside, or its own pointerdown would close
     // the panel a beat before its click reopened it.
     expect(source).toContain("[data-workspace-wip], [data-workspace-wip-trigger]");
     expect(source).toContain("data-workspace-wip-trigger");
+    expect(source).toContain('escape: "bubble"');
     expect(source).toContain('aria-haspopup="dialog"');
-    // Registered and torn down together — a window listener that outlives the
-    // component keeps closing a panel that no longer exists.
-    expect(source).toContain('window.addEventListener("pointerdown", handlePointerDown, true)');
-    expect(source).toContain('window.removeEventListener("pointerdown", handlePointerDown, true)');
-    expect(source).toContain('window.addEventListener("keydown", handleKey)');
-    expect(source).toContain('window.removeEventListener("keydown", handleKey)');
+    // Replaced, not accumulated: no second, hand-rolled dismissal beside it.
+    expect(source).not.toContain("addEventListener");
   });
 
   it("closes from one red control at the top, not a button below the content", () => {

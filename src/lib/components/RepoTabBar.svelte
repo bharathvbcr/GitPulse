@@ -10,8 +10,7 @@
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
   import { classifyShortcut, shouldSkipWebviewShortcut } from "../ui/webviewShortcuts";
   import { LAYERS } from "../ui/layers";
-  import { shouldDismissOverlay } from "../ui/dismiss";
-  import { clampMenuPosition } from "../branches/menuPosition";
+  import { popover } from "../ui/popover";
   import { copyText } from "../desktop/clipboard";
   import { enumerateFocusables } from "../ui/focusTrap";
   import {
@@ -34,12 +33,11 @@
     onOpen?: () => void;
   } = $props();
 
-  let menu: { x: number; y: number; id: string } | null = $state(null);
+  let menu = $state<{ x: number; y: number; id: string } | null>(null);
   // Measured menu box feeds the shared clamp so the tab menu can never open
   // off-screen (the old innerWidth-200 guess overflowed on short windows).
   let menuEl: HTMLDivElement | undefined = $state();
   let menuOpener: HTMLElement | null = null;
-  let menuPos = $state({ left: 0, top: 0 });
   let recentsOpen = $state(false);
   let recentsTriggerEl: HTMLButtonElement | undefined = $state();
   let recentsEl: HTMLDivElement | undefined = $state();
@@ -89,23 +87,30 @@
       ? e.currentTarget.querySelector<HTMLElement>('[role="tab"]')
       : null;
     menu = { x: e.clientX, y: e.clientY, id };
-    // First paint at the raw anchor (clamped by estimate); the effect below
-    // repositions from the real measured box once it exists.
-    menuPos = clampMenuPosition(e.clientX, e.clientY, 176, 150, window.innerWidth, window.innerHeight);
     recentsOpen = false;
   }
 
-  $effect(() => {
-    if (!menu || !menuEl) return;
-    menuPos = clampMenuPosition(
-      menu.x,
-      menu.y,
-      menuEl.offsetWidth,
-      menuEl.offsetHeight,
-      window.innerWidth,
-      window.innerHeight,
-    );
+  /**
+   * The tab menu and the recents dropdown are two popovers, and they get two
+   * instances of the shared owner rather than one hand-written listener block
+   * that has to ask which of them is open before deciding anything.
+   *
+   * Only the tab menu has an anchor: recents is placed by CSS, `absolute`
+   * under its own trigger. Both leave Escape to `handlePopupKeydown`, which
+   * owns the popup keyboard and hands focus back to the opener.
+   */
+  const menuDismissal = $derived({
+    anchor: { kind: "point" as const, x: menu?.x ?? 0, y: menu?.y ?? 0 },
+    estimate: { width: 176, height: 150 },
+    revision: menu?.id,
+    dismiss: { inside: "[data-repo-menu]", resize: true, escape: "none" as const },
+    onDismiss: () => closeMenu(),
   });
+
+  const recentsDismissal = {
+    dismiss: { inside: "[data-recents-menu]", resize: true, escape: "none" as const },
+    onDismiss: () => { recentsOpen = false; },
+  };
 
   function focusPopup(element: HTMLElement | undefined) {
     window.setTimeout(() => {
@@ -230,27 +235,11 @@
     }
   }
 
-  function handlePointerDown(e: PointerEvent) {
-    if (menu && shouldDismissOverlay(e.target, "[data-repo-menu]")) {
-      closeMenu();
-    }
-    if (recentsOpen && shouldDismissOverlay(e.target, "[data-recents-menu]")) {
-      recentsOpen = false;
-    }
-  }
-
   onMount(() => {
+    // The app-wide shortcut owner (tab cycling, digit switching, Open) is a
+    // window listener for the component's whole life, not a popover's.
     window.addEventListener("keydown", handleKey);
-    window.addEventListener("pointerdown", handlePointerDown, true);
-    // Same contract as BranchList's menu: a resized window can leave the
-    // clamped position pointing at nothing useful, so close instead.
-    const handleResize = () => closeMenu();
-    window.addEventListener("resize", handleResize);
-    return () => {
-      window.removeEventListener("keydown", handleKey);
-      window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("resize", handleResize);
-    };
+    return () => window.removeEventListener("keydown", handleKey);
   });
 
   function endDrag() {
@@ -614,6 +603,7 @@
       {#if recentsOpen}
         <div
           bind:this={recentsEl}
+          use:popover={recentsDismissal}
           id="recent-repositories-menu"
           role="menu"
           aria-label="Recent repositories"
@@ -681,13 +671,14 @@
     <div
       bind:this={menuEl}
       use:portal={"body"}
+      use:popover={menuDismissal}
       data-repo-menu
       role="menu"
       aria-label={`Repository actions for ${tab.label}`}
       tabindex="-1"
       onkeydown={handlePopupKeydown}
       class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
-      style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU}"
+      style="z-index: {LAYERS.MENU}"
     >
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {tab.pinned ? "Unpin" : "Pin"} tab

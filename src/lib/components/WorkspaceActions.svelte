@@ -21,7 +21,6 @@
    * always names failures and skips, and the detail list says why each one was
    * skipped rather than leaving the user to guess.
    */
-  import { onMount } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
@@ -33,7 +32,7 @@
   } from "../repos/workspaceOps";
   import { describeWorkspace, wipDestination } from "../repos/wipSummary";
   import { describeDestination } from "../views/viewRegistry";
-  import { shouldDismissOverlay } from "../ui/dismiss";
+  import { popover } from "../ui/popover";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { CloudDownload, Loader2, AlertTriangle, CircleCheck, X } from "@lucide/svelte";
@@ -101,31 +100,21 @@
     detailsOpen = false;
   }
 
-  function handlePointerDown(event: PointerEvent) {
-    if (!detailsOpen) return;
-    // The trigger counts as inside: dismissing on its own pointerdown would
-    // close the panel a beat before its click reopened it.
-    if (!shouldDismissOverlay(event.target, "[data-workspace-wip], [data-workspace-wip-trigger]")) {
-      return;
-    }
-    detailsOpen = false;
-  }
-
-  function handleKey(event: KeyboardEvent) {
-    if (event.key === "Escape" && detailsOpen) {
-      event.preventDefault();
-      detailsOpen = false;
-    }
-  }
-
-  onMount(() => {
-    window.addEventListener("pointerdown", handlePointerDown, true);
-    window.addEventListener("keydown", handleKey);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("keydown", handleKey);
-    };
-  });
+  /**
+   * Dismissal only, from the shared popover owner: this panel docks at a
+   * fixed corner of the window rather than against a trigger, so there is no
+   * anchor to clamp and the owner leaves its position alone.
+   *
+   * The trigger counts as inside, or its own pointerdown would close the
+   * panel a beat before its click reopened it.
+   */
+  const dismissal = {
+    dismiss: {
+      inside: "[data-workspace-wip], [data-workspace-wip-trigger]",
+      escape: "bubble" as const,
+    },
+    onDismiss: () => { detailsOpen = false; },
+  };
 
   async function run(kind: "fetch" | "pull") {
     if (running) return;
@@ -220,6 +209,7 @@
     {#if detailsOpen}
       <div
         use:portal
+        use:popover={dismissal}
         data-workspace-wip
         class="fixed right-3 top-20 w-80 gp-pop shadow-float rounded-xl p-3 text-[11px] bg-surface/95 border border-border/80"
         style="z-index: {LAYERS.MENU}"

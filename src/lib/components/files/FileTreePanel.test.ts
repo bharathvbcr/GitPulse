@@ -158,7 +158,15 @@ describe("FileTreePanel", () => {
 
   it("uses a real labelled action button and clamps the popup to the viewport", () => {
     expect(source).toContain('aria-label={`Actions for ${r.path}`}');
-    expect(source).toContain("clampMenuPosition(");
+    // Clamping comes from the shared popover owner, which measures the real
+    // menu instead of clamping once against a 208×360 guess and never
+    // re-measuring — which is how a menu with enough conditional items used
+    // to paint off the bottom edge.
+    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{dismissal\}/);
+    expect(source).toContain("estimate: { width: 208, height: 360 }");
+    expect(source).toContain('inside: "[data-file-tree-menu]"');
+    expect(source).toContain("resize: true");
+    expect(source).not.toContain("clampMenuPosition");
     expect(source).not.toContain('<span\n                    role="button"');
   });
 
@@ -225,7 +233,10 @@ describe("FileTreePanel", () => {
     expect(effect).toContain("untrack(() => {");
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("locatePath = selected"));
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("{ ...collapsed }"));
-    expect(source).toContain('import { onMount, untrack } from "svelte"');
+    // `untrack` has to be the real one, not a local shadow. The rest of the
+    // import list is not this test's business: it used to be pinned verbatim,
+    // which made an unrelated import change look like a reveal regression.
+    expect(source).toMatch(/^\s*import \{[^}]*\buntrack\b[^}]*\} from "svelte";$/m);
   });
 
   /**

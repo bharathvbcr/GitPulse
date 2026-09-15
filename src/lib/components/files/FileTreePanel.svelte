@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { untrack } from "svelte";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
   import { repoStore, type FileStatus } from "../../stores/repoStore";
@@ -53,8 +53,7 @@
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
-  import { shouldDismissOverlay } from "../../ui/dismiss";
-  import { clampMenuPosition } from "../../branches/menuPosition";
+  import { popover, restoreFocusTo } from "../../ui/popover";
   import { enumerateFocusables } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
   import EmptyState from "../EmptyState.svelte";
@@ -110,7 +109,7 @@
   let locatePath = $state<string | null>(null);
 
   let contextMenuRow = $state<FileRow | null>(null);
-  let menuPos = $state<{ x: number; y: number } | null>(null);
+  let menuAnchor = $state<{ x: number; y: number } | null>(null);
   let menuEl: HTMLDivElement | undefined = $state();
   let contextMenuOpener: HTMLElement | null = null;
 
@@ -391,24 +390,40 @@
     const y = event instanceof MouseEvent && event.clientY > 0
       ? event.clientY
       : (rect?.bottom ?? 8);
-    const clamped = clampMenuPosition(x, y, 208, 360, window.innerWidth, window.innerHeight);
     const active = document.activeElement;
     contextMenuOpener = active instanceof HTMLElement && active !== document.body
       ? active
       : anchor;
     contextMenuRow = row;
-    menuPos = { x: clamped.left, y: clamped.top };
+    menuAnchor = { x, y };
   }
 
   function closeContextMenu(options?: { restoreFocus?: boolean }) {
     const opener = contextMenuOpener;
     contextMenuRow = null;
-    menuPos = null;
+    menuAnchor = null;
     contextMenuOpener = null;
-    if (options?.restoreFocus && opener?.isConnected) {
-      window.setTimeout(() => opener.focus(), 0);
-    }
+    if (options?.restoreFocus) restoreFocusTo(opener);
   }
+
+  /**
+   * Placement and dismissal, from the shared popover owner.
+   *
+   * The estimate is the size this menu used to be *assumed* to have: it
+   * clamped once against 208×360 and never re-measured, so a menu whose
+   * conditional items ran taller than that painted off the bottom edge. The
+   * owner measures the real box instead and keeps the estimate only as the
+   * no-layout fallback.
+   *
+   * Escape stays with `handleMenuKeydown`, which owns this menu's keyboard.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "point" as const, x: menuAnchor?.x ?? 0, y: menuAnchor?.y ?? 0 },
+    estimate: { width: 208, height: 360 },
+    revision: contextMenuRow?.key,
+    dismiss: { inside: "[data-file-tree-menu]", resize: true, escape: "none" as const },
+    onDismiss: () => closeContextMenu(),
+  });
 
   $effect(() => {
     if (!contextMenuRow || !menuEl) return;
@@ -755,20 +770,6 @@
   });
 
 
-  onMount(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!contextMenuRow) return;
-      if (!shouldDismissOverlay(event.target, "[data-file-tree-menu]")) return;
-      closeContextMenu();
-    };
-    window.addEventListener("pointerdown", handlePointerDown, true);
-    const handleResize = () => closeContextMenu();
-    window.addEventListener("resize", handleResize);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("resize", handleResize);
-    };
-  });
 </script>
 
 <div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 border-r border-border/70 select-none">
@@ -1120,19 +1121,20 @@
 </div>
 
 <!-- Context Menu Popover -->
-{#if contextMenuRow && menuPos}
+{#if contextMenuRow && menuAnchor}
   {@const row = contextMenuRow}
   {@const status = row.kind === "file" ? statusMap.get(row.path) : null}
   <div
     bind:this={menuEl}
     use:portal={"body"}
+    use:popover={dismissal}
     data-file-tree-menu
     role="menu"
     aria-label={`File actions for ${row.path}`}
     tabindex="-1"
     onkeydown={handleMenuKeydown}
     class="fixed min-w-52 max-h-[calc(100vh-1rem)] overflow-y-auto gp-menu gp-pop text-xs text-textPrimary py-1"
-    style="left: {menuPos.x}px; top: {menuPos.y}px; z-index: {LAYERS.MENU}"
+    style="z-index: {LAYERS.MENU}"
   >
     <div class="px-2.5 py-1 text-[10px] text-textMuted font-mono border-b border-border/60 truncate max-w-xs font-semibold">
       {row.path}
