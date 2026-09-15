@@ -235,6 +235,46 @@ being read: extending is a decision you take, through the same dialog.
   closed what it opened and every scanned file is asserted to do so: a blinded
   scanner must not read as a clean one.
 
+### Verification
+
+Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at the tip of
+this section's work.
+
+- `npm run tauri build` → exit 0. `GitPulse.app` and
+  `GitPulse_1.2.0_aarch64.dmg`, every nested helper (`gitpulsed`,
+  `gitpulse-mcp`, `gitpulse-hook`) ad-hoc signed before the outer bundle.
+  `codesign --verify --deep --strict` on the installed copy: *valid on disk*,
+  *satisfies its Designated Requirement*. Not notarized — no Apple credentials
+  in the environment, as usual for a local build.
+- `npm run check:release` → `OK: all version sources agree on 1.2.0` across all
+  ten, the new `.cursor-plugin/plugin.json` among them.
+- `npm run mcp:install` → `gitpulse-mcp` and `gitpulse-hook` replaced at 1.2.0.
+  `npm run mcp:doctor` → OK on all three of its claims: the version matches,
+  the hook serves every subcommand `hooks.json` declares, and both binaries were
+  built from the source this tree holds (digest `fbd633f1b157bf91…`, 674 files).
+- The four contract tests bearing on this section — `cursor-plugin-contract`,
+  `repository-trust-control-contract`, `platform-vocabulary-contract` and
+  `plugin-contract` — **44 passed, 0 failed**.
+
+**What is not verified here.** `npm test` could not be run as the repository
+runs it. The harness this was built under cannot change directories, and vitest
+driven from outside the repository root leaves `vite-plugin-svelte` unable to
+find `svelte.config.js`, so 43 component files fail to load with `Unknown file
+extension ".svelte"` and three `scripts/` tests that spawn Vite or read `git
+HEAD` fail on the cwd. Those failures are the harness, not the code, and that
+claim was measured rather than assumed: the identical command against the
+pre-merge commit reports the **same 46 files and the same 3 named tests**
+failing — 6218 passing there against 6255 here, so this work adds 37 passing
+tests and no new failure. A green subset is still a subset: run `npm test` from
+the repository root for the real number.
+
+`npm run vendor:check` **fails**, and did so before this release: every vendored
+DevCouncil crate reports `local: clean` with `upstream: drifted`, because the
+vendor record is pinned at DevCouncil `b366f420` and that repository's `main` has
+moved past it. Nothing here edited a vendored file — the drift is upstream
+motion, not local divergence — and re-vendoring is a decision about what the app
+embeds rather than a step in building it, so it is left open.
+
 ## [1.1.0] - 2026-09-14
 
 A feature release that began as a patch. What was staged as 1.0.1 — the
