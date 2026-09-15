@@ -8,8 +8,11 @@
 //! artifacts has to produce the same two strings — not an equivalent digest, the
 //! same one — or every map it writes reads permanently stale.
 //!
-//! No hashing crate is linked in this workspace and none may be added, so both
-//! algorithms live here. Both are pinned to published vectors: FIPS 180-4 for
+//! The workspace does link a hashing crate — `sha2`, for the SHA-256 the CLI
+//! reports against build artifacts — but it provides neither of these two, and
+//! pulling in a `sha1` and a `blake2` crate to replace code that is already
+//! pinned to published test vectors buys nothing the parity tests do not
+//! already guarantee. Both are pinned: FIPS 180-4 for
 //! SHA-1, RFC 7693 Appendix A for BLAKE2b-512, and CPython `hashlib` output for
 //! the BLAKE2b-128 shape Python actually calls (`blake2b(digest_size=16)`),
 //! which is the implementation this code has to agree with.

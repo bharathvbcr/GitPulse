@@ -362,7 +362,39 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// v49 records `dsl.Matcher` Go parameters as `RuntimeEntryPoint` wiring so
 /// ruleguard rules are not confident-dead. A v48 row has no such annotation.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "49";
+///
+/// v50 invalidates generations whose attribution classification preceded the
+/// import/local-binding precedence and Rust `self` receiver fixes. This key
+/// also gates the unchanged-source shortcut before resolution: a resolver
+/// semantics change must invalidate it even when extraction bytes are stable.
+///
+/// v51 invalidates classifications that omitted exact receiver-binding facts
+/// for captured values. An unchanged v50 generation may still explain a local
+/// parameter named `Math` as a runtime global, even after the resolver is fixed.
+///
+/// v52 drops the second `Name` reference a call's own callee already accounts
+/// for — see `treesitter::drop_duplicate_callee_names`. Eleven of the twenty
+/// languages with a call extractor were measured emitting one, and a v51 row
+/// still carries it, so a warm cache would keep reporting a Rust method call as two
+/// attribution sites and filing the second as a failure even where the first
+/// resolved. It also invalidates the classification of a **prelude-type
+/// receiver**: `Vec::new()` is a language type, not a value whose type went
+/// uninferred, and an unchanged v51 generation keeps the older tier even
+/// though no extraction byte moved — the same reason v50 gates the
+/// unchanged-source shortcut ahead of resolution.
+///
+/// v53 reduces a receiver past a leading `&`, `*` or `!` when what follows is a
+/// plain path — see `treesitter::strip_prefix_operators`. A v52 row records
+/// `*path` and `!Self`, whose leftmost *segment* is an operator, so the binding
+/// that would have typed the receiver is invisible to both the classifier and
+/// the receiver-type rung.
+///
+/// v54 reads a declared field's type in every grammar that declares one, not
+/// just Rust and Go — see `langfields`. A v53 generation holds no `Type`
+/// reference for a Swift, Kotlin, TypeScript, Java, C#, Python, PHP, Scala,
+/// Dart, Objective-C, C, C++, Solidity or Pascal field, so every receiver typed
+/// only by one stays `UninferredReceiver` until the file is re-extracted.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "54";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

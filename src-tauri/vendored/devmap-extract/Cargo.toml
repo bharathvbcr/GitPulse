@@ -1,12 +1,13 @@
 [package]
 name = "devmap-extract"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Tree-sitter extraction frontend for the DevCouncil code-intelligence kernel"
 
 [dependencies]
+dc-proc = { path = "../dc-proc" }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 rayon = { version = "1.10" }
@@ -146,6 +147,18 @@ name = "capped_reads_say_so"
 required-features = ["parse"]
 
 [[test]]
+name = "a_call_is_one_site_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "a_receiver_is_not_its_operator"
+required-features = ["parse"]
+
+[[test]]
+name = "a_call_is_one_site_not_two"
+required-features = ["parse"]
+
+[[test]]
 name = "cprobe"
 required-features = ["parse"]
 
@@ -271,5 +284,16 @@ required-features = ["parse"]
 
 [[test]]
 name = "extract_bindings"
+required-features = ["parse"]
+
+
+[[test]]
+name = "nested_source_limits"
+required-features = ["parse"]
+
+
+
+[[test]]
+name = "a_declared_field_has_a_type"
 required-features = ["parse"]
 

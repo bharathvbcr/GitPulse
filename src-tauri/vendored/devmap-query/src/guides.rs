@@ -308,31 +308,55 @@ Before editing a symbol, run impact analysis. Before committing, review the diff
     )
 }
 
-fn write_marked_file(
+enum PreparedGuide {
+    Preserve,
+    Unchanged,
+    Create,
+    Replace(Box<devmap_extract::safe_fs::SafeFile>),
+}
+
+fn prepare_marked_file(
     path: &Path,
     text: &str,
     ours: impl Fn(&str) -> bool,
-) -> std::io::Result<GuideDisposition> {
-    match std::fs::read_to_string(path) {
-        Ok(existing) => {
+) -> std::io::Result<PreparedGuide> {
+    use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    match SafeFile::open(path, Access::Read, Creation::Never) {
+        Ok(mut file) => {
+            let existing = file.read_text(devmap_extract::MAX_SOURCE_BYTES)?;
             if !ours(&existing) {
-                Ok(GuideDisposition::NotOurs)
+                Ok(PreparedGuide::Preserve)
             } else if existing == text {
-                Ok(GuideDisposition::Unchanged)
+                Ok(PreparedGuide::Unchanged)
             } else {
-                std::fs::write(path, text)?;
+                file.require_owned()?;
+                let writer = SafeFile::open(path, Access::ReadWrite, Creation::Never)?;
+                // Acquire write access only for a selected replacement, while
+                // the marker inspection still names this exact file.
+                file.check_unchanged()?;
+                Ok(PreparedGuide::Replace(Box::new(writer)))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PreparedGuide::Create),
+        Err(error) => Err(error),
+    }
+}
+
+impl PreparedGuide {
+    fn write(self, path: &Path, text: &str) -> std::io::Result<GuideDisposition> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        match self {
+            Self::Preserve => Ok(GuideDisposition::NotOurs),
+            Self::Unchanged => Ok(GuideDisposition::Unchanged),
+            Self::Create => {
+                SafeFile::open(path, Access::ReadWrite, Creation::New)?.rewrite(text.as_bytes())?;
+                Ok(GuideDisposition::Created)
+            }
+            Self::Replace(mut writer) => {
+                writer.rewrite(text.as_bytes())?;
                 Ok(GuideDisposition::Updated)
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, text)?;
-            Ok(GuideDisposition::Created)
-        }
-        // Unreadable is not the same as absent: leave somebody's file alone.
-        Err(_) => Ok(GuideDisposition::NotOurs),
     }
 }
 
@@ -349,24 +373,25 @@ pub fn write_agent_guides(
     store_rel: &str,
 ) -> std::io::Result<Vec<GuideOutcome>> {
     let text = agent_guide_text(map, map_rel, graph_rel, store_rel) + "\n";
-    let mut outcomes = Vec::with_capacity(GUIDE_FILENAMES.len() + 1);
-
+    let rule_text = cursor_rule_text(map_rel);
+    let mut prepared = Vec::with_capacity(GUIDE_FILENAMES.len() + 1);
+    // Inspect the entire set before creating or modifying any destination.
+    // A readable unmarked guide needs neither write access nor ownership.
     for filename in GUIDE_FILENAMES {
         let path = repo_root.join(filename);
-        let disposition = write_marked_file(&path, &text, |existing| {
+        let plan = prepare_marked_file(&path, &text, |existing| {
             existing.contains(AGENT_GUIDE_MARKER) || existing.contains(LEGACY_AGENT_GUIDE_MARKER)
         })?;
+        prepared.push((path, plan, text.as_str()));
+    }
+    let rule_path = repo_root.join(CURSOR_RULE_REL);
+    let rule = prepare_marked_file(&rule_path, &rule_text, |_| true)?;
+    prepared.push((rule_path, rule, rule_text.as_str()));
+    let mut outcomes = Vec::with_capacity(prepared.len());
+    for (path, plan, content) in prepared {
+        let disposition = plan.write(&path, content)?;
         outcomes.push(GuideOutcome { path, disposition });
     }
-
-    let rule_path = repo_root.join(CURSOR_RULE_REL);
-    let rule_text = cursor_rule_text(map_rel);
-    // Owned by path: this exact relative name is DevMap's. Idempotent rewrite.
-    let disposition = write_marked_file(&rule_path, &rule_text, |_| true)?;
-    outcomes.push(GuideOutcome {
-        path: rule_path,
-        disposition,
-    });
     Ok(outcomes)
 }
 

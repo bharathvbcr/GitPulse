@@ -219,7 +219,7 @@ fn spawn_with_retry(
                 return Err(Failure::Spawn {
                     program: program.to_owned(),
                     error,
-                })
+                });
             }
         }
     }
@@ -357,6 +357,7 @@ fn kill_and_reap(
 /// group cannot be signalled at all the direct child is killed the old way,
 /// because "the group call failed" must never come out as "nothing was killed".
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "one audited libc::kill on a group we lead")]
 fn kill_descendants(child: &mut std::process::Child) {
     let Ok(leader) = i32::try_from(child.id()) else {
         let _ = child.kill();

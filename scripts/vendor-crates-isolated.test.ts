@@ -16,24 +16,36 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { sources } from "./vendor-crates.mjs";
+
+/**
+ * Which crates the fixture creates upstream, derived from the script instead of
+ * re-typed here.
+ *
+ * This is fixture *navigation* — which directories to build — not an assertion
+ * about the list's contents, so deriving it costs no falsifying power. A
+ * hand-copied list silently stops matching the moment the closure gains a
+ * crate, and every test here then fails for a reason that has nothing to do
+ * with what it tests. That is not hypothetical: `dc-proc` became a hard
+ * dependency of `dc-verify` and `devmap-extract` upstream and stayed unvendored,
+ * and adding it to the script broke all 13 tests in this file until this list
+ * was taught to follow along.
+ *
+ * The roots are deliberately bogus: `sources()` only consults them to fall back
+ * to a sibling-directory search, which must not run from a unit test.
+ */
 const SOURCE_TABLE = [
   {
     id: "devcouncil",
     workspace: "rust",
     crateBase: "rust",
-    crates: [
-      "dc-glob",
-      "dc-evidence",
-      "dc-store",
-      "dc-verify",
-      "devmap-analyze",
-      "devmap-extract",
-      "devmap-query",
-      "devmap-resolve",
-      "devmap-store",
-    ],
+    crates:
+      sources(
+        { GITPULSE_DEVCOUNCIL_ROOT: "/nonexistent", GITPULSE_MARKDEV_ROOT: "/nonexistent" },
+        process.cwd(),
+      ).find((source) => source.id === "devcouncil")?.crates ?? [],
   },
-] as const;
+];
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 

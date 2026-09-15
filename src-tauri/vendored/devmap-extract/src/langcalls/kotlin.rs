@@ -105,9 +105,17 @@ fn call_site<'tree>(node: Node<'tree>, source: &str) -> Option<CallSite<'tree>> 
 
 /// `(callee name node, receiver)` for whatever stands in a call's callee slot.
 fn callee_target<'tree>(
-    callee: Node<'tree>,
+    mut callee: Node<'tree>,
     source: &str,
 ) -> Option<(Node<'tree>, Option<String>)> {
+    // The grammar binds prefix operators inside the callee slot. Unwrap them
+    // without spending native stack space on repository-controlled nesting.
+    while callee.kind() == "unary_expression" {
+        if crate::treesitter::walk_deadline_passed() {
+            return None;
+        }
+        callee = callee.named_child(callee.named_child_count().checked_sub(1)?)?;
+    }
     match callee.kind() {
         "identifier" => Some((callee, None)),
         // `o.m()`, `a?.b()`, `obj?.deep?.call()`, `x.let { }`, `it.x()`.
@@ -130,19 +138,6 @@ fn callee_target<'tree>(
         // A trailing lambda applied to a call, or a call of a call. The inner
         // node is visited in its own right and carries the edge.
         "call_expression" => None,
-        // `!h()` and `-g()`. tree-sitter-kotlin-ng binds the prefix operator
-        // *before* the argument list, so the callee of the `call_expression` is
-        // the `unary_expression` `!h` — not the identifier the call actually
-        // names. Refusing it dropped the call entirely: measured on a 1,032-file
-        // Android corpus, `if (!markerPromoted(k))` produced **no call edge and
-        // no unresolved row**, and the function it calls was reported dead at
-        // 0.9 confidence — a proposal to delete working code, from a call the
-        // graph never saw. A postfix `a!!.b()` is a `navigation_expression` and
-        // does not arrive here.
-        "unary_expression" => {
-            let operand = callee.named_child(callee.named_child_count().checked_sub(1)?)?;
-            callee_target(operand, source)
-        }
         // An immediately-invoked literal has no callee identity by
         // construction. `split_call_target` would refuse it too; refusing it
         // here keeps the reason at the shape that causes it.

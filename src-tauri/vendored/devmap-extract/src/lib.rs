@@ -15,6 +15,10 @@ pub mod heritage;
 pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
+// Takes a `tree_sitter::Node` for the same reason `langimports` does, and is
+// called from the same seam.
+#[cfg(feature = "parse")]
+pub mod langfields;
 // Every extractor here takes a `tree_sitter::Node`, and the only caller is
 // `treesitter::extract_treesitter`, which is itself behind the gate.
 #[cfg(feature = "parse")]
@@ -26,7 +30,12 @@ pub mod model;
 mod git_metadata;
 pub mod paths;
 pub mod progress;
-pub mod subprocess;
+pub mod safe_fs;
+/// The bounded subprocess runner, re-exported at the path its callers have
+/// always used. The implementation lives in `dc-proc` because nothing in this
+/// crate uses it and `dc-verify` needs it without compiling tree-sitter
+/// grammars — a second copy there is the drift this module exists to prevent.
+pub use dc_proc as subprocess;
 pub use git_metadata::{git_metadata, GitMetadata};
 // Needs the grammars: a notebook's cells are reconstructed and then handed to
 // the real extractor, so this module is only meaningful with `parse` on.
@@ -99,24 +108,79 @@ pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886
 /// This is **not** a replacement for [`is_ignored_path`]: many caches carry no
 /// tag (this workspace's own long-lived `target/` has none), so the two are
 /// complementary. Absence of a tag says nothing.
-pub fn is_cache_directory(dir: &Path) -> bool {
-    use std::io::Read;
+pub fn is_cache_directory(dir: &Path) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind, Read};
 
-    let Ok(mut file) = fs::File::open(dir.join(CACHEDIR_TAG_FILE)) else {
-        return false;
-    };
-    let mut head = vec![0u8; CACHEDIR_TAG_SIGNATURE.len()];
-    // `read_exact`: a file shorter than the signature cannot carry it, and the
-    // error path is the same "not a cache directory" answer.
-    if file.read_exact(&mut head).is_err() {
-        return false;
+    let path = dir.join(CACHEDIR_TAG_FILE);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    head == CACHEDIR_TAG_SIGNATURE
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Inspect reparse points themselves, including directory markers.
+        options.custom_flags(0x00200000 | 0x02000000);
+    }
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(false)
+        }
+        Err(error) => return Err(error),
+    };
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "cache marker is not a regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if before.file_attributes() & 0x400 != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "cache marker is a reparse point",
+            ));
+        }
+    }
+    let mut head = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    match file.read_exact(&mut head) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let current = fs::symlink_metadata(&path)?;
+    if !current.is_file()
+        || before.len() != current.len()
+        || before.modified()? != current.modified()?
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "cache marker changed while being read",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != current.dev() || before.ino() != current.ino() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "cache marker was replaced while being read",
+            ));
+        }
+    }
+    Ok(head == CACHEDIR_TAG_SIGNATURE)
 }
 
 /// What [`CacheDirectoryCache::tagged_ancestor`] was able to determine.
 ///
-/// Three states, not two, because "I opened every ancestor and none carried a
+/// Separate states because "I opened every ancestor and none carried a
 /// tag" and "I was handed something that is not a repo-relative path, so I
 /// never opened anything" are different answers. Collapsing them into `None`
 /// let a path the walk could not evaluate read as one it evaluated and
@@ -130,6 +194,8 @@ pub enum CacheVerdict {
     /// The path is not repo-relative, so no ancestor was opened. The payload
     /// says which rule it broke, for the caller's refusal message.
     NotRepoRelative(&'static str),
+    /// A marker could not be safely examined; this is not a cleared path.
+    Unreadable { directory: String, reason: String },
 }
 
 /// Memoised ancestor lookup for [`is_cache_directory`].
@@ -151,7 +217,7 @@ pub enum CacheVerdict {
 #[derive(Debug, Default)]
 pub struct CacheDirectoryCache {
     root: Option<std::path::PathBuf>,
-    verdict: std::collections::HashMap<String, bool>,
+    verdict: std::collections::HashMap<String, Result<bool, String>>,
 }
 
 impl CacheDirectoryCache {
@@ -196,15 +262,23 @@ impl CacheDirectoryCache {
             }
             prefix.push_str(part);
             let tagged = match self.verdict.get(&prefix) {
-                Some(known) => *known,
+                Some(known) => known.clone(),
                 None => {
-                    let known = is_cache_directory(&root.join(&prefix));
-                    self.verdict.insert(prefix.clone(), known);
+                    let known =
+                        is_cache_directory(&root.join(&prefix)).map_err(|error| error.to_string());
+                    self.verdict.insert(prefix.clone(), known.clone());
                     known
                 }
             };
-            if tagged {
-                return CacheVerdict::Inside(prefix);
+            match tagged {
+                Ok(true) => return CacheVerdict::Inside(prefix),
+                Ok(false) => {}
+                Err(reason) => {
+                    return CacheVerdict::Unreadable {
+                        directory: prefix,
+                        reason,
+                    }
+                }
             }
         }
         CacheVerdict::Outside
@@ -965,6 +1039,8 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
     // back out of it.
     let pruned: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let unreadable = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let unreadable_writer = std::sync::Arc::clone(&unreadable);
     let walk_root = root.to_path_buf();
     let pruned_writer = std::sync::Arc::clone(&pruned);
     let walker = ignore::WalkBuilder::new(root)
@@ -979,8 +1055,18 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
             if entry.path() == walk_root {
                 return true;
             }
-            if !is_cache_directory(entry.path()) {
-                return true;
+            match is_cache_directory(entry.path()) {
+                Ok(false) => return true,
+                Ok(true) => {}
+                Err(error) => {
+                    if let Ok(relative) = entry.path().strip_prefix(&walk_root) {
+                        recover_lock(&unreadable_writer).insert(
+                            relative.to_string_lossy().replace('\\', "/"),
+                            error.to_string(),
+                        );
+                    }
+                    return false;
+                }
             }
             if let Ok(relative) = entry.path().strip_prefix(&walk_root) {
                 recover_lock(&pruned_writer).insert(relative.to_string_lossy().replace('\\', "/"));
@@ -1121,6 +1207,15 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
         report
             .skipped_paths
             .push((directory.clone(), DiscoverySkipReason::NonSource));
+    }
+
+    for (directory, reason) in recover_lock(&unreadable).iter() {
+        report.skipped_paths.push((
+            directory.clone(),
+            DiscoverySkipReason::Unreadable {
+                reason: format!("CACHEDIR.TAG could not be examined: {reason}"),
+            },
+        ));
     }
 
     // Not sorted here: `scan_tree` sorts both outputs once the reads are in,

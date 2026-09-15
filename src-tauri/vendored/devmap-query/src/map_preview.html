@@ -679,7 +679,7 @@ function applyLayoutForces() {
 
 if (g) {
   g.nodeId('id')
-    .nodeLabel(n => (n.entry ? '★ ' : '') + (n.area || n.id) + ' — ' + labelFor(n.lang) + ' · ' + fmt(n.file_count) + ' files')
+    .nodeLabel(n => escapeHtml((n.entry ? '★ ' : '') + (n.area || n.id) + ' — ' + labelFor(n.lang) + ' · ' + fmt(n.file_count) + ' files'))
     .nodeColor(n => colorFor(n.lang))
     .linkColor(l => l.kind === 'handoff' ? '#a78bfa' : '#3d8bfd')
     .linkDirectionalParticles(l => l.kind === 'handoff' ? 2 : 1)

@@ -297,7 +297,7 @@ pub enum Resolution {
         family: LangFamily,
     },
     AmbiguousGlobal {
-        candidates: Vec<(String, String)>, // (file_path, symbol_name)
+        candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
         family: LangFamily,
     },
     Unresolved {
@@ -676,6 +676,40 @@ pub struct UnresolvedReference {
     /// instead of an instrumented rebuild.
     pub receiver: Option<String>,
 }
+
+/// Aggregate limits for global-candidate lookup and repeated ambiguity evidence.
+/// Exceeding one refuses the complete resolution before it can be published.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolutionLimits {
+    pub candidate_visits: u64,
+    pub retained_candidate_bytes: u64,
+    pub ambiguity_evidence_bytes: u64,
+}
+
+impl Default for ResolutionLimits {
+    fn default() -> Self {
+        Self {
+            candidate_visits: 4_000_000,
+            retained_candidate_bytes: 32 * 1024 * 1024,
+            ambiguity_evidence_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionLimitError {
+    pub resource: &'static str,
+    pub limit: u64,
+    pub attempted: u64,
+}
+
+impl std::fmt::Display for ResolutionLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "resolution refused: {} requires {} units, exceeding the {} limit; narrow the indexed scope; no partial graph was produced", self.resource, self.attempted, self.limit)
+    }
+}
+
+impl std::error::Error for ResolutionLimitError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolutionResult {

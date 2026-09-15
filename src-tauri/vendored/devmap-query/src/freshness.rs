@@ -32,11 +32,24 @@ use devmap_extract::subprocess::{self, run_bounded, Bounds};
 use serde::{Deserialize, Serialize};
 
 use crate::digest::{hex, sha1_hex, Blake2b};
+use crate::stat_memo::{read_bounded, stat_key};
 
 /// Bumped whenever the digest algorithm changes, and identical to
 /// `indexing.graph.build._CONTENT_SCHEME`: a fingerprint stamped under an older
 /// scheme must never compare equal to one computed under a newer one.
 pub const CONTENT_SCHEME: &str = "c2";
+
+/// Ceiling on the memo this module will read back.
+///
+/// One entry is a repository-relative path, a `size:mtime:ctime` key and a
+/// 32-character digest — call it 150 bytes, so this admits roughly 450,000
+/// files against an [`InventoryLimits::max_indexed_files`] default of 50,000.
+/// The two have to stay in that order: a ceiling below what the writer can
+/// produce is a memo that writes files it will not read, which never hits and
+/// never says why. Past the ceiling the memo reads as absent, which costs a
+/// rehash and never a wrong answer. Unbounded, a memo something else had grown
+/// would be read into memory whole on a path whose entire purpose is cheapness.
+const MAX_CONTENT_CACHE_BYTES: u64 = 64 << 20;
 
 /// Read size for file digests, matching `_HASH_CHUNK` in the Python writer.
 /// The value does not affect the digest — only how much of a file is resident
@@ -340,19 +353,24 @@ fn keep_indexable(
     root: &Path,
     caches: &mut devmap_extract::CacheDirectoryCache,
     paths: Vec<String>,
-) -> Vec<String> {
-    paths
+) -> Result<Vec<String>, String> {
+    let mut kept = Vec::new();
+    for path in paths {
+        if is_runtime_or_generated_file(&path) {
+            continue;
+        }
+        match caches.tagged_ancestor(root, &path) {
+            devmap_extract::CacheVerdict::Unreadable { directory, reason } => {
+                return Err(format!("cannot examine {directory}/CACHEDIR.TAG: {reason}"))
+            }
+            devmap_extract::CacheVerdict::Outside => {}
+            _ => continue,
+        }
+        kept.push(path);
+    }
+    Ok(kept
         .into_iter()
         .filter(|path| {
-            if is_runtime_or_generated_file(path) {
-                return false;
-            }
-            if !matches!(
-                caches.tagged_ancestor(root, path),
-                devmap_extract::CacheVerdict::Outside
-            ) {
-                return false;
-            }
             // A tracked symlink whose target resolves outside the repository is
             // the second shape of the disagreement this function exists to
             // close. `git ls-files` lists it — it is an ordinary mode-120000
@@ -378,7 +396,7 @@ fn keep_indexable(
             // bulk of a tree whose build output is not ignored.
             root.join(path).is_file()
         })
-        .collect()
+        .collect())
 }
 
 /// `RepoMapper.get_git_files`, git path only.
@@ -396,8 +414,8 @@ pub fn inventory_with_program(program: &OsStr, root: &Path, limits: InventoryLim
     let mut caches = devmap_extract::CacheDirectoryCache::default();
     let mut keep = |paths: Vec<String>| keep_indexable(root, &mut caches, paths);
 
-    let tracked = match ls_files(program, root, &["--cached"]) {
-        Ok(paths) => keep(paths),
+    let tracked = match ls_files(program, root, &["--cached"]).and_then(&mut keep) {
+        Ok(paths) => paths,
         Err(reason) => {
             return Inventory {
                 files: Vec::new(),
@@ -407,11 +425,11 @@ pub fn inventory_with_program(program: &OsStr, root: &Path, limits: InventoryLim
         }
     };
     let untracked = if limits.include_untracked {
-        match ls_files(program, root, &["--others", "--exclude-standard"]) {
+        match ls_files(program, root, &["--others", "--exclude-standard"]).and_then(&mut keep) {
             Ok(paths) => {
                 let tracked_set: std::collections::HashSet<&str> =
                     tracked.iter().map(String::as_str).collect();
-                keep(paths)
+                paths
                     .into_iter()
                     .filter(|path| !tracked_set.contains(path.as_str()))
                     .collect()
@@ -494,7 +512,7 @@ fn content_cache_path(root: &Path) -> PathBuf {
 }
 
 fn load_content_cache(root: &Path) -> BTreeMap<String, Vec<String>> {
-    let Ok(text) = std::fs::read_to_string(content_cache_path(root)) else {
+    let Some(text) = read_bounded(&content_cache_path(root), MAX_CONTENT_CACHE_BYTES) else {
         return BTreeMap::new();
     };
     let Ok(cache) = serde_json::from_str::<ContentCache>(&text) else {
@@ -525,29 +543,6 @@ fn save_content_cache(root: &Path, entries: &BTreeMap<String, Vec<String>>) {
     // Through the artifact writer so a crashed process cannot leave a partial
     // memo for the next run to read as authoritative.
     let _ = crate::artifacts::write_atomic(&path, text.as_bytes());
-}
-
-/// A stat key identical to `indexing.graph.build._stat_key`:
-/// `"{size}:{mtime_ns}:{ctime_ns}"`.
-///
-/// `ctime_ns` is what makes the key safe — unlike `mtime_ns` it cannot be
-/// back-dated by `utime`, `cp -p`, `rsync --times` or tar extraction, so a
-/// rewrite that restores the old mtime still moves ctime and can never present
-/// the key of the content it replaced.
-#[cfg(unix)]
-fn stat_key(meta: &std::fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
-    let mtime_ns = meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128;
-    let ctime_ns = meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128;
-    format!("{}:{}:{}", meta.len(), mtime_ns, ctime_ns)
-}
-
-/// Off unix there is no `st_ctime`, so the key cannot be the one Python writes.
-/// A key the other side rejects costs a rehash on each crossing and never a
-/// wrong digest, because the digest itself is recomputed from the bytes.
-#[cfg(not(unix))]
-fn stat_key(meta: &std::fs::Metadata) -> String {
-    format!("{}:-:-", meta.len())
 }
 
 fn file_digest(path: &Path) -> std::io::Result<String> {

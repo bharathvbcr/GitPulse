@@ -30,7 +30,8 @@
 use std::env;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use dc_verify::json_stdout::{ContractError, holds_exactly_one_value, holds_json_lines};
 
@@ -40,10 +41,10 @@ fn main() -> ExitCode {
         Err(message) => return fail_hard(&message),
     };
 
-    let mut manifest = String::new();
-    if let Err(err) = std::io::stdin().read_to_string(&mut manifest) {
-        return fail_hard(&format!("could not read the manifest from stdin: {err}"));
-    }
+    let manifest = match read_manifest() {
+        Ok(manifest) => manifest,
+        Err(message) => return fail_hard(&message),
+    };
 
     let invocations = match parse_manifest(&manifest) {
         Ok(invocations) if invocations.is_empty() => {
@@ -58,7 +59,7 @@ fn main() -> ExitCode {
 
     let mut results = Vec::with_capacity(invocations.len());
     for invocation in &invocations {
-        match run_one(invocation, options.cwd.as_deref()) {
+        match run_one(invocation, options.cwd.as_deref(), options.deadline) {
             Ok(result) => results.push(result),
             Err(message) => return fail_hard(&message),
         }
@@ -82,11 +83,13 @@ fn fail_hard(message: &str) -> ExitCode {
 
 struct Options {
     cwd: Option<PathBuf>,
+    deadline: Duration,
 }
 
 impl Options {
     fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut cwd = None;
+        let mut deadline = INVOCATION_DEADLINE;
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -96,14 +99,30 @@ impl Options {
                         .ok_or_else(|| "--cwd needs a directory".to_string())?;
                     cwd = Some(PathBuf::from(value));
                 }
+                // A harness that runs someone else's commands needs the bound
+                // to be the operator's: CI wants it well under its own job
+                // timeout, and a slow integration check may want it higher.
+                "--deadline-secs" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--deadline-secs needs a whole number".to_string())?;
+                    let secs: u64 = value
+                        .parse()
+                        .map_err(|_| format!("--deadline-secs {value:?} is not a whole number"))?;
+                    if secs == 0 {
+                        return Err("--deadline-secs must be at least 1".to_string());
+                    }
+                    deadline = Duration::from_secs(secs);
+                }
                 other => {
                     return Err(format!(
-                        "unknown argument {other:?}; usage: dcjsoncheck [--cwd DIR] < manifest"
+                        "unknown argument {other:?}; \
+usage: dcjsoncheck [--cwd DIR] [--deadline-secs N] < manifest"
                     ));
                 }
             }
         }
-        Ok(Self { cwd })
+        Ok(Self { cwd, deadline })
     }
 }
 
@@ -167,32 +186,99 @@ fn parse_manifest(text: &str) -> Result<Vec<Invocation>, String> {
     Ok(invocations)
 }
 
-fn run_one(invocation: &Invocation, cwd: Option<&std::path::Path>) -> Result<Outcome, String> {
+/// The most a manifest may weigh. One byte over is taken so the cap can be
+/// *detected*: a manifest stopped exactly at the limit is very likely still a
+/// well-formed prefix, and running its first N invocations while silently
+/// dropping the rest is a checked-everything report over a partial list.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// The most of one command's stdout or stderr that is kept. Past this the
+/// invocation has already failed its contract — a JSON contract check reads one
+/// value or a line stream, not a megabyte — so the excess is drained and
+/// dropped rather than buffered whole.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default wall clock for one checked invocation, overridable with
+/// `--deadline-secs`.
+///
+/// These are CLI calls that print a JSON value and exit; a command still alive
+/// after this is wedged, not working. Without a deadline the harness inherited
+/// the hang, and "the manifest never finished" is not a contract result.
+const INVOCATION_DEADLINE: Duration = Duration::from_secs(120);
+
+fn read_manifest() -> Result<String, String> {
+    let mut manifest = String::new();
+    let read = std::io::stdin()
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_string(&mut manifest)
+        .map_err(|err| format!("could not read the manifest from stdin: {err}"))?;
+    if read as u64 > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "the manifest is larger than the {MAX_MANIFEST_BYTES}-byte limit"
+        ));
+    }
+    Ok(manifest)
+}
+
+fn run_one(
+    invocation: &Invocation,
+    cwd: Option<&std::path::Path>,
+    deadline: Duration,
+) -> Result<Outcome, String> {
     let mut command = Command::new(&invocation.argv[0]);
-    command
-        .args(&invocation.argv[1..])
-        // stdin is closed rather than inherited: a command that reads stdin (as
-        // `dev apply-patch` does) must see EOF, not block the harness forever.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(&invocation.argv[1..]);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
 
-    let output = command.output().map_err(|err| {
-        format!(
-            "line {}: could not run {:?}: {err}",
-            invocation.line_number, invocation.argv[0]
-        )
-    })?;
+    // The workspace's one bounded runner. It owns the properties a harness
+    // cannot get right by hand: both pipes drained on their own threads (a
+    // reader that takes stdout to EOF *before* touching stderr deadlocks the
+    // moment a child fills the stderr pipe), a wall-clock deadline, and a kill
+    // that reaches the process group rather than the direct child alone. It
+    // also closes stdin, so a command that reads stdin — `dev apply-patch`
+    // does — still sees EOF instead of blocking the harness forever.
+    let label = invocation.argv.join(" ");
+    let captured = match dc_proc::run_bounded(
+        &mut command,
+        dc_proc::Bounds {
+            deadline,
+            stdout_cap: MAX_CAPTURE_BYTES,
+            stderr_cap: MAX_CAPTURE_BYTES,
+        },
+    ) {
+        Ok(captured) => captured,
+        // A command that never exits is a failed invocation, not a harness
+        // error: the manifest named it, it ran, and it did not answer.
+        Err(dc_proc::Failure::Deadline { deadline, .. }) => {
+            return Ok(Outcome {
+                label,
+                passed: false,
+                exit_code: None,
+                detail: Some(format!("did not exit within {deadline:?} and was killed")),
+            });
+        }
+        Err(err) => return Err(format!("line {}: {err}", invocation.line_number)),
+    };
+
+    let exit_code = captured.status.code();
+    // Output past the cap is a contract failure in its own right: the check
+    // below would be reading a prefix and calling it the whole answer.
+    if captured.stdout_truncated {
+        return Ok(Outcome {
+            label,
+            passed: false,
+            exit_code,
+            detail: Some(format!(
+                "stdout exceeded the {MAX_CAPTURE_BYTES}-byte capture limit"
+            )),
+        });
+    }
 
     // Invalid UTF-8 on stdout is itself a contract violation, so it is checked
     // rather than papered over — but it is reported as a failed invocation, not
     // as a harness error, because the command did run.
-    let label = invocation.argv.join(" ");
-    let exit_code = output.status.code();
-    let stdout = match String::from_utf8(output.stdout) {
+    let stdout = match String::from_utf8(captured.stdout) {
         Ok(text) => text,
         Err(_) => {
             return Ok(Outcome {
@@ -308,6 +394,112 @@ mod tests {
         assert!(err.starts_with("line 2:"), "got {err:?}");
     }
 
+    /// A command that never exits used to hang the harness with it. `exec` so
+    /// the deadline's group kill reaches the sleep itself rather than a shell
+    /// that outlives it.
+    #[test]
+    fn a_command_that_never_exits_is_a_failed_invocation_not_a_hung_harness() {
+        let invocation = Invocation {
+            line_number: 1,
+            mode: Mode::Json,
+            argv: vec!["sh".into(), "-c".into(), "exec sleep 120".into()],
+        };
+        let started = std::time::Instant::now();
+        let outcome = run_one(&invocation, None, Duration::from_secs(1)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            !outcome.passed,
+            "a command that never answered is not a pass"
+        );
+        assert_eq!(
+            outcome.exit_code, None,
+            "there is no exit status for a child that was killed"
+        );
+        let detail = outcome.detail.unwrap_or_default();
+        assert!(
+            detail.contains("did not exit"),
+            "the detail must say what happened, got {detail:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "returned after {elapsed:?}; the deadline did not bound it"
+        );
+    }
+
+    /// A child that fills stderr while stdout stays open deadlocks any reader
+    /// that drains stdout to EOF first. Both pipes must be drained
+    /// concurrently, which is what the shared runner does.
+    #[test]
+    fn a_child_flooding_stderr_does_not_deadlock_the_reader() {
+        let invocation = Invocation {
+            line_number: 1,
+            mode: Mode::Json,
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                // Far past any pipe buffer, written before stdout closes.
+                "yes xxxxxxxxxxxxxxxx | head -c 4000000 >&2; echo '{\"ok\":true}'".into(),
+            ],
+        };
+        let started = std::time::Instant::now();
+        let outcome = run_one(&invocation, None, Duration::from_secs(30)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.passed,
+            "stderr flood changed the verdict: {:?}",
+            outcome.detail
+        );
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "took {elapsed:?}; a deadlocked reader only ends at the deadline"
+        );
+    }
+
+    /// The cap is a refusal, not a silent truncation: checking a prefix and
+    /// reporting a pass is the failure mode the bound exists to prevent.
+    #[test]
+    fn stdout_past_the_capture_cap_fails_the_invocation() {
+        let invocation = Invocation {
+            line_number: 1,
+            mode: Mode::Json,
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "yes xxxxxxxxxxxxxxxx | head -c {}",
+                    MAX_CAPTURE_BYTES + (1 << 20)
+                ),
+            ],
+        };
+        let outcome = run_one(&invocation, None, Duration::from_secs(60)).unwrap();
+        assert!(!outcome.passed);
+        let detail = outcome.detail.unwrap_or_default();
+        assert!(
+            detail.contains("capture limit"),
+            "the detail must name the bound, got {detail:?}"
+        );
+    }
+
+    #[test]
+    fn the_deadline_flag_is_parsed_and_validated() {
+        let ok = Options::from_args(["--deadline-secs".to_string(), "7".to_string()].into_iter())
+            .unwrap();
+        assert_eq!(ok.deadline, Duration::from_secs(7));
+        assert_eq!(
+            Options::from_args([].into_iter()).unwrap().deadline,
+            INVOCATION_DEADLINE
+        );
+        for bad in ["0", "-1", "abc", ""] {
+            assert!(
+                Options::from_args(["--deadline-secs".to_string(), bad.to_string()].into_iter())
+                    .is_err(),
+                "--deadline-secs {bad:?} was accepted"
+            );
+        }
+    }
+
     #[test]
     fn a_command_emitting_one_object_passes() {
         let invocation = Invocation {
@@ -315,7 +507,7 @@ mod tests {
             mode: Mode::Json,
             argv: vec!["echo".into(), "{\"ok\": true}".into()],
         };
-        let outcome = run_one(&invocation, None).unwrap();
+        let outcome = run_one(&invocation, None, INVOCATION_DEADLINE).unwrap();
         assert!(outcome.passed, "detail: {:?}", outcome.detail);
         assert_eq!(outcome.exit_code, Some(0));
     }
@@ -329,7 +521,7 @@ mod tests {
             mode: Mode::Json,
             argv: vec!["echo".into(), "Set budget = 5.00\n{\"ok\": true}".into()],
         };
-        let outcome = run_one(&invocation, None).unwrap();
+        let outcome = run_one(&invocation, None, INVOCATION_DEADLINE).unwrap();
         assert!(!outcome.passed);
         assert_eq!(outcome.exit_code, Some(0));
         assert!(
@@ -350,7 +542,7 @@ mod tests {
             mode: Mode::Json,
             argv: vec!["true".into()],
         };
-        let outcome = run_one(&invocation, None).unwrap();
+        let outcome = run_one(&invocation, None, INVOCATION_DEADLINE).unwrap();
         assert!(!outcome.passed);
         assert!(
             outcome.detail.as_deref().unwrap().contains("zero objects"),
@@ -370,7 +562,7 @@ mod tests {
                 "echo 'a diagnostic' >&2; echo '{\"ok\": true}'".into(),
             ],
         };
-        let outcome = run_one(&invocation, None).unwrap();
+        let outcome = run_one(&invocation, None, INVOCATION_DEADLINE).unwrap();
         assert!(outcome.passed, "detail: {:?}", outcome.detail);
     }
 
@@ -385,7 +577,7 @@ mod tests {
                 "echo '{\"ok\": false}'; exit 2".into(),
             ],
         };
-        let outcome = run_one(&failing, None).unwrap();
+        let outcome = run_one(&failing, None, INVOCATION_DEADLINE).unwrap();
         assert!(
             outcome.passed,
             "a failing command may still honour the contract"
@@ -397,7 +589,7 @@ mod tests {
             mode: Mode::Json,
             argv: vec!["sh".into(), "-c".into(), "echo 'boom' >&2; exit 2".into()],
         };
-        let outcome = run_one(&silent, None).unwrap();
+        let outcome = run_one(&silent, None, INVOCATION_DEADLINE).unwrap();
         assert!(
             !outcome.passed,
             "exiting non-zero does not excuse an empty stdout"
@@ -411,7 +603,7 @@ mod tests {
             mode: Mode::Json,
             argv: vec!["definitely-not-a-real-binary-xyzzy".into()],
         };
-        let err = run_one(&invocation, None).unwrap_err();
+        let err = run_one(&invocation, None, INVOCATION_DEADLINE).unwrap_err();
         assert!(err.starts_with("line 7:"), "got {err:?}");
     }
 

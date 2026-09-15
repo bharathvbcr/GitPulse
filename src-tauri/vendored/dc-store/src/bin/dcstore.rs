@@ -33,11 +33,24 @@ use std::process::ExitCode;
 
 use dc_store::{AcquireRequest, Lease, LeaseCode, ScopeWrite, Store, StoreError};
 
+// A disconnected consumer is a transport failure, not a Rust panic. Keep
+// diagnostics off this JSON protocol, including the error response path.
+macro_rules! respond {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
+            .and_then(|()| out.flush()).is_err() {
+            return ExitCode::FAILURE;
+        }
+    }};
+}
+
 fn main() -> ExitCode {
     let args = match collect_args() {
         Ok(args) => args,
         Err(message) => {
-            println!("{}", fatal_object(&message));
+            respond!("{}", fatal_object(&message));
             return ExitCode::from(2);
         }
     };
@@ -53,17 +66,17 @@ fn main() -> ExitCode {
     }
     match run(&args) {
         Ok(json) => {
-            println!("{json}");
+            respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(Failure::Conflict(json)) => {
             // Contention is an outcome, not a fault: exit 0 so a caller that
             // does check the exit code does not treat a busy task as an outage.
-            println!("{json}");
+            respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(Failure::Fatal(message)) => {
-            println!("{}", fatal_object(&message));
+            respond!("{}", fatal_object(&message));
             ExitCode::from(2)
         }
     }
@@ -894,7 +907,7 @@ fn serve_one(store: &mut Option<Store>, db: &str, args: &[String]) -> (&'static 
 /// Answers framed requests on stdin until the caller closes it.
 fn serve(parsed: &Parsed) -> ExitCode {
     let Some(db) = parsed.db.as_deref() else {
-        println!("{}", fatal_object("--db is required"));
+        respond!("{}", fatal_object("--db is required"));
         return ExitCode::from(2);
     };
     let stdin = std::io::stdin();

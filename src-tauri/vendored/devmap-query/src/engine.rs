@@ -1723,7 +1723,8 @@ impl<'a> StoreQueryEngine<'a> {
         // Containment is enforced *before* the read: `path` arrives from an IPC
         // caller, and this is the only query that reads a file the caller
         // names. See `contained_repo_path`.
-        let resolved = contained_repo_path(self.store.latest_repo_root()?.as_deref(), path)?;
+        let source_root = self.store.latest_repo_root()?;
+        contained_repo_path(source_root.as_deref(), path)?;
         // `.ok()` here used to collapse two different facts into one. "There is
         // no such file" and "the file is there and I could not read it"
         // (non-UTF-8, EACCES, EISDIR) both became `None`, and `None` means
@@ -1736,7 +1737,11 @@ impl<'a> StoreQueryEngine<'a> {
         // `["mod.py:Added", "alpha:Added"]` with `degraded_reason: null` and
         // `delta_available: true`. The caller is handed a clean bill of health
         // by a comparison that never ran.
-        let (on_disk, read_failure) = match devmap_extract::read_source(&resolved) {
+        let (on_disk, read_failure) = match devmap_extract::safe_fs::read_repo_source(
+            source_root.as_deref().map(Path::new),
+            path,
+            devmap_extract::MAX_SOURCE_BYTES,
+        ) {
             Ok(source) => (Some(source), None),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, None),
             Err(err) => (None, Some(err)),
@@ -2703,18 +2708,6 @@ pub(crate) fn contained_repo_path(
         }
     }
     Ok(candidate)
-}
-
-/// Stored node paths are repo-relative. Resolving them against the recorded
-/// build root — rather than the query process's working directory — is what
-/// lets `devmap search` return real source spans from anywhere on the machine.
-/// With no recorded root the relative path is used unchanged, which keeps the
-/// pre-v7 behaviour for generations built before the root was captured.
-pub(crate) fn resolve_source_path(repo_root: &Option<String>, path: &str) -> std::path::PathBuf {
-    match repo_root {
-        Some(root) => std::path::Path::new(root).join(path),
-        None => std::path::PathBuf::from(path),
-    }
 }
 
 pub fn resolved_edge_from_stored(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
@@ -3861,7 +3854,7 @@ fn attribution_coverage_gap(
         Some(coverage) if coverage.unresolved_sites == total && coverage.explained_sites <= total => {
             let remaining = total - coverage.explained_sites;
             (remaining > 0).then(|| format!(
-                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it",
+                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it",
                 coverage.explained_sites,
             ))
         }
@@ -3885,7 +3878,7 @@ mod attribution_disclosure_tests {
     fn a_composed_read_retries_once_and_keeps_all_existing_qualifications() {
         for moving_reads in [0, 1, 2, usize::MAX] {
             let store = devmap_store::Store::open_in_memory().unwrap();
-            let resolution = devmap_resolve::Resolver::new().resolve_all(&[]);
+            let resolution = devmap_resolve::Resolver::new().resolve_all(&[]).unwrap();
             let analysis = devmap_analyze::AnalysisSummary {
                 status: devmap_analyze::AnalysisStatus::Partial {
                     reason: "parse coverage gap".into(),
@@ -4122,11 +4115,16 @@ thread_local! {
 /// A bounded prefix alone can belong to a different file revision. Reads stay
 /// within discovery's source ceiling and only cover files selected for hits.
 fn read_verified_source(
-    path: &std::path::Path,
+    repo_root: Option<&str>,
+    path: &str,
     span: std::ops::Range<usize>,
     expected_hash: u64,
 ) -> std::io::Result<String> {
-    let source = devmap_extract::read_source(path)?;
+    let source = devmap_extract::safe_fs::read_repo_source(
+        repo_root.map(std::path::Path::new),
+        path,
+        devmap_extract::MAX_SOURCE_BYTES,
+    )?;
     #[cfg(test)]
     SOURCE_SPAN_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(source.len() as u64)));
     if devmap_extract::content_hash(&source) != expected_hash {
@@ -4156,11 +4154,11 @@ fn hit_from_stored(
     token_budget: u32,
     score: f32,
 ) -> SymbolHit {
-    let owned_root = repo_root.map(str::to_string);
     #[cfg(test)]
     SOURCE_SPAN_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     let source_result = read_verified_source(
-        &resolve_source_path(&owned_root, &row.path),
+        repo_root,
+        &row.path,
         row.span_start..row.span_end,
         row.content_hash,
     );
@@ -4478,7 +4476,7 @@ mod tests {
         let ext = extract_file("mod.py", &src);
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let exts = [ext];
         let engine = QueryEngine::new(&exts, &resolution);
         let resp = engine.search(Request {
@@ -4504,7 +4502,9 @@ mod tests {
         );
         let mut resolver = Resolver::new();
         resolver.index_extractions(&[target.clone(), caller.clone()]);
-        let resolution = resolver.resolve_all(&[target.clone(), caller.clone()]);
+        let resolution = resolver
+            .resolve_all(&[target.clone(), caller.clone()])
+            .unwrap();
         let analysis = analyze(&[target.clone(), caller.clone()], &resolution);
         let store = Store::open_in_memory().unwrap();
         store
@@ -4554,7 +4554,7 @@ mod tests {
         let ext = extract_file("dead.py", "def abandoned():\n    return 1\n");
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let store = Store::open_in_memory().unwrap();
         store
@@ -4814,7 +4814,7 @@ mod tests {
         let ext = extract_file("things.py", &source);
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let store = Store::open_in_memory().unwrap();
         store
@@ -4867,7 +4867,7 @@ mod tests {
         let ext = extract_file("things.py", &source);
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let store = Store::open_in_memory().unwrap();
         store
@@ -4933,7 +4933,7 @@ mod tests {
         let ext = extract_file("things.py", &source);
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let store = Store::open_in_memory().unwrap();
         store
@@ -5444,7 +5444,7 @@ mod search_bounds_tests {
         );
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let store = Store::open_in_memory().expect("store");
         store
@@ -5756,7 +5756,7 @@ mod composition_cancellation_tests {
             .collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = devmap_analyze::analyze(&extractions, &resolution);
         let store = Store::open_in_memory().unwrap();
         store

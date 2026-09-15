@@ -161,28 +161,38 @@ fn is_type_argument_node(kind: &str) -> bool {
 
 /// Every supertype `node` names.
 fn names_under(node: Node, source: &str, out: &mut Vec<String>) {
-    if is_modifier_node(node.kind()) || is_type_argument_node(node.kind()) {
-        return;
-    }
-    if is_terminal_type_node(node.kind()) {
-        if let Some(name) = supertype_name(text(node, source)) {
-            out.push(name);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if crate::treesitter::walk_deadline_passed() {
+            return;
         }
-        return;
-    }
-    let mut cursor = node.walk();
-    let children: Vec<Node> = node
-        .named_children(&mut cursor)
-        .filter(|child| !is_modifier_node(child.kind()) && !is_type_argument_node(child.kind()))
-        .collect();
-    if children.is_empty() {
-        if let Some(name) = supertype_name(text(node, source)) {
-            out.push(name);
+        if is_modifier_node(node.kind()) || is_type_argument_node(node.kind()) {
+            continue;
         }
-        return;
-    }
-    for child in children {
-        names_under(child, source, out);
+        if is_terminal_type_node(node.kind()) {
+            if let Some(name) = supertype_name(text(node, source)) {
+                out.push(name);
+            }
+            continue;
+        }
+        let start = pending.len();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if crate::treesitter::walk_deadline_passed() {
+                return;
+            }
+            if !is_modifier_node(child.kind()) && !is_type_argument_node(child.kind()) {
+                pending.push(child);
+            }
+        }
+        if pending.len() == start {
+            if let Some(name) = supertype_name(text(node, source)) {
+                out.push(name);
+            }
+        } else {
+            // A LIFO worklist must visit siblings in the original source order.
+            pending[start..].reverse();
+        }
     }
 }
 

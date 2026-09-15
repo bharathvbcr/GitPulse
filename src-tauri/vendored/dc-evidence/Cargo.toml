@@ -1,6 +1,6 @@
 [package]
 name = "dc-evidence"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Deterministic acceptance verification over independently bound execution evidence"
@@ -8,7 +8,7 @@ description = "Deterministic acceptance verification over independently bound ex
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9" }
 
 [lints.rust]
 unsafe_code = "forbid"

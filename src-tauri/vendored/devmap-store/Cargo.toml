@@ -1,6 +1,6 @@
 [package]
 name = "devmap-store"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -16,8 +16,27 @@ serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
 rayon = { version = "1.10" }
 
+[package.metadata.dist]
+# hold_uncommitted_child is a test helper. cargo-dist announced it as a
+# v0.2.0 artifact until this flag was set; a GitHub Release must not ship it.
+dist = false
+
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse"]
+
+[[test]]
+name = "retention_churn"
+required-features = ["parse"]
+
+# The carry-forward guards these tests exercise only exist when an identity can
+# be computed: with `parse` off, `current_payload_identity` returns `None`, no
+# payload is ever carried, and the partial-extraction write is refused outright
+# rather than reaching the decision under test. Gated rather than listed as
+# feature-off-safe because the tests would not merely fail to compile -- they
+# would assert something else.
+[[test]]
+name = "a_differential_write_trusts_what_it_read"
+required-features = ["parse"]

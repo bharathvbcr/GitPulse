@@ -1,6 +1,6 @@
 [package]
 name = "devmap-query"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -15,6 +15,10 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
 regex = { version = "1.10" }
+# For `O_NONBLOCK` on the memo read: opening a fifo without it blocks in
+# `open(2)` forever. Already a workspace dependency, linked by dc-grep and
+# devmap-cli, so nothing new enters the tree.
+libc = { version = "0.2" }
 
 [features]
 default = ["parse"]
@@ -203,4 +207,8 @@ required-features = ["parse"]
 
 [[test]]
 name = "unwired_never_names_a_non_code_file"
+required-features = ["parse"]
+
+[[test]]
+name = "source_read_security"
 required-features = ["parse"]

@@ -22,52 +22,71 @@ pub struct ArtifactFingerprint {
 static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    // A *unique* temp name per writer. `path.with_extension("tmp")` is shared by
-    // every concurrent process writing the same artifact: two `dev map` runs
-    // against one repository both create `repo_map.tmp`, the first rename moves
-    // it away, and the second fails with ENOENT. Measured at 24-way
-    // concurrency: 8 of 24 workers died in `manifest` with
-    // `No such file or directory (os error 2)`. The store itself survived —
-    // SC28 hardened it — so this was the last unguarded writer.
-    //
-    // pid separates processes; the counter separates the two artifacts one
-    // process writes in a single `manifest` run.
-    let stamp = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = format!(
-        "{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("artifact"),
-        std::process::id(),
-        stamp
-    );
-    let tmp = parent.join(unique);
-
-    // Any early return past this point must not strand the temp file, so the
-    // body is run once and the temp cleaned on failure.
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    devmap_extract::safe_fs::preflight_write(path)?;
+    let parent = PinnedDir::open(path.parent().unwrap_or(Path::new(".")), true)?;
+    let target = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no filename")
+    })?;
+    let unchanged = || -> std::io::Result<bool> {
+        // A concurrent atomic publisher can unlink the snapshot between open
+        // and comparison. Re-read that snapshot within a finite retry budget;
+        // an unsafe live file still refuses publication.
+        for attempt in 0..16 {
+            let comparison = (|| -> std::io::Result<bool> {
+                let mut existing = parent.open_file(target, Access::Read, Creation::Never)?;
+                existing.require_owned()?;
+                existing.matches_contents(content)
+            })();
+            match comparison {
+                Ok(true) => return Ok(true),
+                Ok(false) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted && attempt < 15 => {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    };
+    // An unchanged artifact needs no temporary file or directory write access.
+    if unchanged()? {
+        return Ok(false);
+    }
+    let mut created = None;
+    for _ in 0..16 {
+        let stamp = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = target.to_os_string();
+        name.push(format!(".{}.{}.tmp", std::process::id(), stamp));
+        match parent.open_file(&name, Access::ReadWrite, Creation::New) {
+            Ok(file) => {
+                created = Some((name, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (temporary, mut file) = created.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "all 16 artifact temporary names already exist",
+        )
+    })?;
     let result = (|| -> std::io::Result<bool> {
-        let mut file = fs::File::create(&tmp)?;
         file.write_all(content)?;
         file.sync_all()?;
         drop(file);
-        if path.exists() {
-            let existing = fs::read(path)?;
-            if existing == content {
-                return Ok(false);
-            }
+        if unchanged()? {
+            return Ok(false);
         }
-        // Windows can transiently deny replacement while another publisher is
-        // completing its rename. Retry only that sharing/permission class,
-        // within both a deadline and an attempt cap; leave the old file intact.
         #[cfg(windows)]
         {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             let mut attempts = 0;
             loop {
-                match fs::rename(&tmp, path) {
+                match parent.rename_child(&temporary, target) {
                     Ok(()) => break,
                     Err(error)
                         if (error.kind() == std::io::ErrorKind::PermissionDenied
@@ -83,11 +102,22 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
             }
         }
         #[cfg(not(windows))]
-        fs::rename(&tmp, path)?;
+        parent.rename_child(&temporary, target)?;
         Ok(true)
     })();
     if !matches!(result, Ok(true)) {
-        fs::remove_file(&tmp).ok();
+        // Only remove the temporary file created exclusively by this call.
+        // A pre-existing attacker-chosen name was never opened or removed.
+        if let Err(cleanup) = parent.remove_child(&temporary) {
+            if cleanup.kind() != std::io::ErrorKind::NotFound {
+                return Err(std::io::Error::new(
+                    cleanup.kind(),
+                    format!(
+                        "artifact temporary cleanup failed: {cleanup}; write result: {result:?}"
+                    ),
+                ));
+            }
+        }
     }
     result
 }

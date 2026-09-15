@@ -11,11 +11,33 @@ use crate::model::*;
 /// and the one downstream verb matching already understands as a wildcard.
 const UNSPECIFIED_METHOD: &str = "ANY";
 
+/// A Python route decorator: any receiver, and a path the framework would accept.
+///
+/// The receiver used to be an allow-list of three names — `app`, `router`,
+/// `api` — which is not how either framework is written. A Flask blueprint is
+/// `bp = Blueprint(...)` and a FastAPI router is `users = APIRouter()`, so the
+/// receiver is whatever the author named the object, and `@bp.route("/users")`
+/// extracted nothing at all. A module holding only blueprint routes answered
+/// `count: 0` over a scan reporting `complete: true`.
+///
+/// Precision moves from the receiver's *name* to the path's *shape*, which is a
+/// property of the frameworks rather than a guess about how authors name
+/// things: Werkzeug's `Rule.__init__` raises `ValueError` unless the rule
+/// starts with `/`, and Starlette's `Route.__init__` asserts
+/// `path.startswith("/")`. A decorator whose first argument is a string literal
+/// not starting with `/` is therefore not a route in either framework. That one
+/// test is what keeps `@mock.patch("os.path.exists")` out of the route table:
+/// it has an identifier receiver, an HTTP-verb attribute, a string literal and
+/// a decorated `def`, so every *other* signal admits it.
+///
+/// Anchored to the start of a line because a Python decorator can begin nowhere
+/// else — which also stops a commented-out `# @app.route("/x")` from binding a
+/// handler that nothing reaches any more.
 fn python_route_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?m)@(app|router|api)\.(get|post|put|delete|patch|options|head|route)\s*\(\s*["']([^"']+)["']"#,
+            r#"(?m)^[ \t]*@(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(get|post|put|delete|patch|options|head|route)\s*\(\s*["'](/[^"']*)["']"#,
         )
         .map_err(|error| format!("invalid Python route matcher: {error}"))
     })
@@ -53,11 +75,35 @@ fn axum_re() -> Result<&'static Regex, String> {
     .map_err(Clone::clone)
 }
 
+/// An Express route: any receiver, a path, and a handler argument after it.
+///
+/// `(app|router)` missed every router bound to another name —
+/// `const api = express.Router()`, `const v1 = Router()`, `this.router` — and
+/// the widening the Python matcher gets applies here for the same reason.
+///
+/// JavaScript then needs a second guard that Python does not, because `X.get`
+/// with a string argument is one of the most common shapes in the language:
+/// `axios.get('/api/users')`, `redis.get('key')`, `cache.get(k)`. Two
+/// properties separate a route from all of those. The path starts with `/`, or
+/// is the `*` catch-all Express documents. And the call has a *second*
+/// argument, because a route without a handler is not a route.
+///
+/// That second test also closes a false positive the old `app` receiver already
+/// had: `app.get(name)` with one argument is Express's settings *getter*, so
+/// `app.get('view engine')` was recorded as a `GET view engine` route carrying
+/// no handler — verified against the pre-change matcher.
+///
+/// The receiver is captured, not discarded, because two things downstream need
+/// it: `non_router_receivers` asks whether this file bound it to a package, and
+/// nothing else in the match can answer that. What it is *not* used for is a
+/// list of acceptable names — that is the defect this matcher exists to undo.
 fn express_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?m)\b(app|router)\.(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']"#)
-            .map_err(|error| format!("invalid Express route matcher: {error}"))
+        Regex::new(
+            r#"(?m)\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\.(get|post|put|delete|patch)\s*\(\s*["'](\*|/[^"']*)["']\s*,"#,
+        )
+        .map_err(|error| format!("invalid Express route matcher: {error}"))
     })
     .as_ref()
     .map_err(Clone::clone)
@@ -256,27 +302,37 @@ fn python_route_methods(verb: &str, arguments: Option<&str>) -> Vec<String> {
     declared
 }
 
-/// Name of the function a Python route decorator is attached to.
+/// Name of the definition a Python route decorator is attached to.
 ///
 /// `@app.get("/items")` carries no handler name of its own — the handler is the
-/// `def` the decorator is applied to, which may sit several stacked decorators
-/// later. Scanning forward for it is what makes a FastAPI or Flask route
-/// resolvable at all; without it the route names nothing and its handler has no
-/// incoming edge, so an endpoint reachable only over HTTP reads as dead.
+/// definition the decorator is applied to, which may sit several stacked
+/// decorators later. Scanning forward for it is what makes a FastAPI or Flask
+/// route resolvable at all; without it the route names nothing and its handler
+/// has no incoming edge, so an endpoint reachable only over HTTP reads as dead.
 ///
-/// Returns `None` when the decorator is not attached to a function, rather than
-/// guessing: a route bound to the wrong symbol is worse than one bound to none.
+/// The three prefixes below are the whole of what a decorator may target:
+/// Python's grammar is `decorated: decorators (classdef | funcdef |
+/// async_funcdef)`. `class` belongs here because a class-based view — Flask's
+/// `MethodView`, or any callable class — is as much a handler as a `def`, and
+/// reading only the two function forms made the third resolve to `""`, which
+/// `resolver.rs` cannot tell from an Express arrow function that has no name by
+/// design and so skips without a ledger entry.
+///
+/// Returns `None` when the decorator is not attached to a definition, rather
+/// than guessing: a route bound to the wrong symbol is worse than one bound to
+/// none.
 fn python_decorated_handler(source: &str, after: usize) -> Option<String> {
     for line in source.get(after..)?.lines().skip(1) {
         let trimmed = line.trim();
         // Blank lines, comments and further stacked decorators sit between the
-        // route decorator and its function.
+        // route decorator and its definition.
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('@') {
             continue;
         }
         let definition = trimmed
             .strip_prefix("async def ")
-            .or_else(|| trimmed.strip_prefix("def "))?;
+            .or_else(|| trimmed.strip_prefix("def "))
+            .or_else(|| trimmed.strip_prefix("class "))?;
         let name: String = definition
             .chars()
             .take_while(|character| character.is_alphanumeric() || *character == '_')
@@ -523,10 +579,130 @@ fn django_regex_to_template(pattern: &str) -> String {
 /// function expression — named or anonymous. An anonymous handler genuinely has
 /// no name, and yields `None` rather than a placeholder: a placeholder would
 /// resolve to any symbol that happened to share it.
-fn express_handler_name(source: &str, after: usize) -> Option<String> {
-    let (arguments, _) = call_arguments(source, after)?;
+/// Names this file binds to a third-party package, which is not a router.
+///
+/// The shape test on the final argument settles `axios.get(url, {headers})`,
+/// but not `axios.get(url, config)` — an identifier config is shaped exactly
+/// like a handler. The receiver is what separates them, and the file says what
+/// the receiver is without any need to resolve across modules.
+///
+/// An Express router is *constructed* — `express()`, `express.Router()`,
+/// `Router()` — never imported ready-made from a package. So a receiver this
+/// file binds directly to a **bare** specifier other than express is not a
+/// router: `require('axios')`, `import got from 'got'`,
+/// `import * as ky from 'ky'`. A relative specifier (`./routes/users`) is left
+/// alone, because a local module genuinely can export a router.
+///
+/// This is a deny-list of *bindings read out of this file*, not a list of names
+/// anyone guessed. That distinction is the whole point: an allow-list of
+/// receiver names is what produced the defect this pass exists to fix, and it
+/// failed on every name nobody thought of. A binding cannot be missing from a
+/// list of things the author wrote — at worst the author wrote nothing here,
+/// and an unknown receiver stays a candidate rather than being turned away.
+fn non_router_receivers(source: &str) -> std::collections::HashSet<String> {
+    let mut bound = std::collections::HashSet::new();
+    let Ok(imports) = package_binding_re() else {
+        return bound;
+    };
+    for capture in imports.captures_iter(source) {
+        // The require arm and the import arm each carry their own specifier
+        // group, because one regex cannot name the same group twice.
+        let Some(specifier) = capture
+            .name("from")
+            .or_else(|| capture.name("from2"))
+            .map(|m| m.as_str())
+        else {
+            continue;
+        };
+        // A relative or absolute path may export a router; express itself and
+        // its own subpaths are the router's source, not a rival to it.
+        if specifier.starts_with('.')
+            || specifier.starts_with('/')
+            || specifier == "express"
+            || specifier.starts_with("express/")
+        {
+            continue;
+        }
+        for group in ["default", "namespace", "required"] {
+            if let Some(name) = capture.name(group) {
+                bound.insert(name.as_str().to_string());
+            }
+        }
+        if let Some(named) = capture.name("named") {
+            for entry in named.as_str().split(',') {
+                // `{ get as httpGet }` binds the alias, which is the name a
+                // call site would use.
+                let binding = entry.rsplit(" as ").next().unwrap_or(entry).trim();
+                if !binding.is_empty() && binding.chars().all(is_binding_char) {
+                    bound.insert(binding.to_string());
+                }
+            }
+        }
+    }
 
-    // The handler is the last top-level argument; earlier ones are middleware.
+    // One hop of propagation, for the client-factory idiom: `axios.create()`
+    // returns a client, so whatever it was assigned to is no more a router than
+    // `axios` is. One hop is enough for every form of this in the wild, and
+    // stopping there keeps the scan linear.
+    if let Ok(factory) = factory_binding_re() {
+        for capture in factory.captures_iter(source) {
+            let (Some(name), Some(source_name)) = (capture.get(1), capture.get(2)) else {
+                continue;
+            };
+            if bound.contains(source_name.as_str()) {
+                bound.insert(name.as_str().to_string());
+            }
+        }
+    }
+    bound
+}
+
+fn is_binding_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_' || character == '$'
+}
+
+/// `const X = require("pkg")` and the three ESM import forms, as whole bindings.
+///
+/// The require arm is anchored to end of statement so `require("express")
+/// .Router()` is not read as a bare package binding: that expression
+/// *constructs* a router, and only the un-suffixed form binds the module
+/// itself.
+fn package_binding_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?:(?:const|let|var)[ \t]+(?P<required>[A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=[ \t]*require[ \t]*\([ \t]*["'](?P<from>[^"']+)["'][ \t]*\)[ \t]*;?[ \t]*$|import[ \t]+(?:(?P<default>[A-Za-z_$][A-Za-z0-9_$]*)|\*[ \t]+as[ \t]+(?P<namespace>[A-Za-z_$][A-Za-z0-9_$]*)|\{(?P<named>[^}]*)\})[ \t]+from[ \t]*["'](?P<from2>[^"']+)["'])"#,
+        )
+        .map_err(|error| format!("invalid package binding matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// `const client = axios.create(...)` — a binding whose value comes from a call
+/// on another binding.
+fn factory_binding_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=[ \t]*([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*[ \t]*\("#,
+        )
+        .map_err(|error| format!("invalid factory binding matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// The final top-level argument of a call, trimmed.
+///
+/// One owner for a question two callers ask of the same text: which argument is
+/// the handler, and is it shaped like one at all. Nesting and string literals
+/// are tracked so a comma inside an arrow body, a nested call, an array of
+/// middleware, an options object or a quoted string is not read as a separator.
+///
+/// An argument list with no top-level comma yields the whole list, which is the
+/// right answer: a call with one argument has that argument as its last.
+fn last_top_level_argument(arguments: &str) -> &str {
     let mut depth = 0i32;
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -542,7 +718,44 @@ fn express_handler_name(source: &str, after: usize) -> Option<String> {
             _ => {}
         }
     }
-    let candidate = last.trim();
+    last.trim()
+}
+
+/// Whether a call's final argument is shaped like an Express handler.
+///
+/// `app.METHOD(path, ...callbacks)` is Express's whole signature: every
+/// argument after the path is a callback, and the framework has no form that
+/// takes trailing options. An HTTP client's `get` is the opposite shape —
+/// `axios.get(url, config)` — so the final argument is the one place the two
+/// differ structurally, whatever the receiver is called.
+///
+/// Data is rejected: an object literal (`{headers}`, `{params: {...}}` — the
+/// axios config), a string, a template literal, a number, a boolean, `null` and
+/// `undefined`. Everything callable is accepted: an identifier, a member
+/// expression, a function expression, an arrow function, a call returning a
+/// handler (`asyncHandler(getUsers)` — the wrapper idiom), and an array literal,
+/// because Express documents `app.get(path, [mw1, mw2])`.
+///
+/// An empty argument is not a handler: that is the settings getter,
+/// `app.get('view engine')`, whose argument list ends at the path.
+fn express_final_argument_is_a_handler(candidate: &str) -> bool {
+    let Some(first) = candidate.chars().next() else {
+        return false;
+    };
+    // An object literal is data. `{` opening an arrow body cannot appear here:
+    // an arrow's `{` always follows its `=>`, never starts the argument.
+    if first == '{' || first == '"' || first == '\'' || first == '`' {
+        return false;
+    }
+    if first.is_ascii_digit() || (first == '-' && candidate.len() > 1) {
+        return false;
+    }
+    !matches!(candidate, "null" | "undefined" | "true" | "false")
+}
+
+fn express_handler_name(source: &str, after: usize) -> Option<String> {
+    let (arguments, _) = call_arguments(source, after)?;
+    let candidate = last_top_level_argument(arguments);
 
     // A named function expression names the handler.
     if let Some(tail) = candidate.strip_prefix("function") {
@@ -588,11 +801,11 @@ pub fn extract_framework_routes(
             let call = call_arguments(source, full.end());
             let handler = python_decorated_handler(source, call.map_or(full.end(), |(_, end)| end))
                 .unwrap_or_default();
-            for method in python_route_methods(&cap[2], call.map(|(arguments, _)| arguments)) {
+            for method in python_route_methods(&cap[1], call.map(|(arguments, _)| arguments)) {
                 routes.push(ExtractedRoute {
                     framework: "fastapi/flask".to_string(),
                     http_method: method,
-                    path_pattern: cap[3].to_string(),
+                    path_pattern: cap[2].to_string(),
                     handler_name: handler.clone(),
                     span: Span {
                         start_byte: full.start(),
@@ -677,10 +890,37 @@ pub fn extract_framework_routes(
         || framework_name == "typescript"
         || framework_name == "express"
     {
+        // Scanned once per file, not once per site: the bindings are a property
+        // of the file, and a site-by-site scan would be quadratic in a server
+        // that registers many routes.
+        let not_routers = non_router_receivers(source);
         for cap in express_re()?.captures_iter(source) {
-            let Some(full) = cap.get(0) else {
+            let (Some(full), Some(receiver)) = (cap.get(0), cap.get(1)) else {
                 continue;
             };
+            // `axios.get('/api/users', config)` is shaped exactly like a route
+            // and is not one. The file's own bindings say so: only the root of
+            // the receiver carries the binding, since `client.api.get(...)`
+            // reaches through whatever `client` was bound to.
+            let root = receiver.as_str().split('.').next().unwrap_or_default();
+            if not_routers.contains(root) {
+                continue;
+            }
+            // Express takes callbacks after the path and nothing else, so an
+            // options object in the final position means this call belongs to
+            // some other API.
+            //
+            // A call whose arguments cannot be read — unbalanced, or longer
+            // than the shared scan cap — is left as it was found rather than
+            // dropped: the check did not run, and reporting "not a handler" for
+            // a list nobody could read would turn an unread call into a
+            // deletion. The path and the trailing comma already matched.
+            let readable_arguments = call_arguments(source, full.end())
+                .map(|(arguments, _)| last_top_level_argument(arguments));
+            if matches!(readable_arguments, Some(last) if !express_final_argument_is_a_handler(last))
+            {
+                continue;
+            }
             routes.push(ExtractedRoute {
                 framework: "express".to_string(),
                 http_method: cap[2].to_uppercase(),
@@ -1139,6 +1379,155 @@ def get_user(uid):
             "an argument list longer than the cap names no handler"
         );
     }
+
+    /// A route decorator's receiver is whatever the author named the object.
+    ///
+    /// The matcher used to hard-code `app`, `router` or `api`, which is not how
+    /// either framework is written: a Flask blueprint is `bp = Blueprint(...)`
+    /// and a FastAPI router is `users = APIRouter()`. A module holding only
+    /// blueprint routes produced no routes at all — and `devmap routes --json`
+    /// reported `count: 0` under a scan claiming `complete: true`, which is an
+    /// answer that ran and is wrong presented as one that is whole.
+    ///
+    /// Losing the route loses the handler's only inbound edge, so the endpoint
+    /// is absent from `routes`, `api-impact`, `shape-check`, `cypher` and the
+    /// `HandlesRoute` edges the graph carries.
+    #[test]
+    fn a_route_decorators_receiver_may_be_any_name() {
+        assert_eq!(
+            python_routes(
+                "@bp.route(\"/users\")\ndef list_users():\n    return []\n\n\
+                 @bp.post(\"/users/new\")\ndef create_user():\n    return {}\n"
+            ),
+            [
+                ("ANY".into(), "/users".into(), "list_users".into()),
+                ("POST".into(), "/users/new".into(), "create_user".into())
+            ],
+            "a blueprint-only module holds real routes, and must not answer none"
+        );
+        assert_eq!(
+            python_routes("@users.get(\"/items\")\ndef list_items():\n    return []\n"),
+            [("GET".into(), "/items".into(), "list_items".into())],
+            "a FastAPI router bound to its own name is still a router"
+        );
+        assert_eq!(
+            python_routes("@api_v2.router.get(\"/x\")\ndef read_x():\n    return 1\n"),
+            [("GET".into(), "/x".into(), "read_x".into())],
+            "a router reached through an attribute chain is still a router"
+        );
+
+        // The mixed module that reproduced the defect: one of its four routes
+        // survived the receiver allow-list.
+        assert_eq!(
+            python_routes(
+                "@app.route(\"/health\")\ndef health():\n    return \"ok\"\n\n\
+                 @bp.route(\"/users\")\ndef list_users():\n    return []\n\n\
+                 @users.get(\"/items\")\ndef list_items():\n    return []\n\n\
+                 @bp.post(\"/users/new\")\ndef create_user():\n    return {}\n"
+            )
+            .len(),
+            4,
+            "every route in a mixed module is extracted, not only the `app` one"
+        );
+    }
+
+    /// A Python decorator may target a class, and the handler is then the class.
+    ///
+    /// Python's grammar is `decorated: decorators (classdef | funcdef |
+    /// async_funcdef)`, so `class` is one of exactly three things a decorator
+    /// can be applied to. Reading only `def` and `async def` left the third
+    /// resolving to `""`, which `resolver.rs`'s route arm treats as a
+    /// deliberately anonymous Express arrow function and skips without a
+    /// ledger entry — a handler that could not be extracted reporting the same
+    /// outcome as one that has no name by design.
+    ///
+    /// Measured against seven `site-packages` trees: 103 route-decorator
+    /// matches, none of them over a class, so this is a latent shape rather
+    /// than an observed loss. It is fixed because the omission is a missing
+    /// grammar case and not a judgement call, and because the silence is the
+    /// expensive part.
+    #[test]
+    fn a_route_decorator_over_a_class_names_the_class_as_its_handler() {
+        assert_eq!(
+            python_routes(
+                "@app.route(\"/users\")\nclass UserView(MethodView):\n    \
+                 def get(self):\n        return []\n"
+            ),
+            [("ANY".into(), "/users".into(), "UserView".into())],
+            "a class-based view is the route's handler, not an empty name"
+        );
+        // This assertion is also the composition guard for the two halves of
+        // this pass, and the receiver `bp` is load-bearing rather than
+        // decorative: it needs the widened receiver *and* the `class` prefix
+        // together. Verified by mutation — restoring the old `(app|router|api)`
+        // allow-list while keeping the `class` prefix fails here with `left:
+        // []`, no route at all, and keeping the allow-list wide while dropping
+        // `class` yields `("POST", "/items", "")`. Do not "simplify" the
+        // receiver to `app`; that silently drops the intersection to whichever
+        // half is still present.
+        assert_eq!(
+            python_routes(
+                "@bp.post(\"/items\")\n@login_required\nclass Create(MethodView):\n    \
+                 pass\n"
+            ),
+            [("POST".into(), "/items".into(), "Create".into())],
+            "stacked decorators above a class are skipped the same as above a def"
+        );
+    }
+
+    /// What tells a route decorator from a look-alike: the shape of its path.
+    ///
+    /// Once the receiver stops being an allow-list, the receiver's name carries
+    /// no information, so precision has to come from somewhere the frameworks
+    /// themselves define. Werkzeug's `Rule.__init__` raises `ValueError` unless
+    /// the rule starts with `/`, and Starlette's `Route.__init__` asserts
+    /// `path.startswith("/")` — so a decorator whose first argument is a string
+    /// literal not starting with `/` is not a route in either framework.
+    ///
+    /// `@mock.patch` is the case that needs it: an identifier receiver, an
+    /// HTTP-verb attribute, a string literal first argument and a decorated
+    /// `def` — every other signal admits it. A false `HandlesRoute` edge is not
+    /// merely a wrong row in a listing: it is what tells liveness a symbol is
+    /// reached from outside the call graph, so it also silences a genuinely
+    /// dead symbol.
+    #[test]
+    fn a_decorators_path_must_be_one_the_framework_would_accept() {
+        for (source, why) in [
+            (
+                "@mock.patch(\"os.path.exists\")\ndef test_it(exists):\n    return 1\n",
+                "a patch target is not a route path: no framework would accept it",
+            ),
+            (
+                "@cache.get(\"session:1\")\ndef loader():\n    return 1\n",
+                "a cache key is not a route path",
+            ),
+            (
+                "# @app.route(\"/x\")\ndef handle():\n    return 1\n",
+                "a commented-out route decorates nothing, and must not bind a \
+                 handler nothing reaches any more",
+            ),
+            (
+                "value = registry.get(\"/x\")\ndef handle():\n    return 1\n",
+                "a decorator can begin nowhere but the start of a line",
+            ),
+        ] {
+            assert!(
+                python_routes(source).is_empty(),
+                "{why}: {:?}",
+                python_routes(source)
+            );
+        }
+
+        // An indented decorator is still a decorator: a router registered on a
+        // method inside a class is ordinary FastAPI.
+        assert_eq!(
+            python_routes(
+                "class Api:\n    @router.get(\"/x\")\n    def read_x(self):\n        return 1\n"
+            ),
+            [("GET".into(), "/x".into(), "read_x".into())],
+            "leading indentation does not stop a decorator from being one"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1533,6 +1922,239 @@ mod django_route_tests {
             django_routes(&urlconf("    path(\"x/\", views.detail\n")),
             [],
             "an entry whose call never closes is not a route"
+        );
+    }
+}
+
+#[cfg(test)]
+mod express_receiver_tests {
+    use super::*;
+
+    /// `METHOD /path -> handler` for every route the Express matcher finds.
+    fn routes(source: &str) -> Vec<String> {
+        extract_framework_routes("javascript", source)
+            .expect("matcher compiles")
+            .into_iter()
+            .map(|route| {
+                format!(
+                    "{} {} -> {}",
+                    route.http_method, route.path_pattern, route.handler_name
+                )
+            })
+            .collect()
+    }
+
+    /// A router bound to any name is still a router.
+    ///
+    /// The same `(app|router)` allow-list as the Python side, with the same
+    /// consequence: `const api = express.Router()` — the idiom the Express
+    /// router guide itself uses — extracted nothing, so every handler mounted
+    /// on it lost its only inbound edge.
+    #[test]
+    fn extracts_routes_from_a_router_bound_to_any_name() {
+        assert_eq!(
+            routes("const api = express.Router();\napi.get('/users', handleUsers);\n"),
+            ["GET /users -> handleUsers"]
+        );
+        assert_eq!(
+            routes("v1.post('/users/new', createUser);\n"),
+            ["POST /users/new -> createUser"]
+        );
+        assert_eq!(
+            routes("this.router.put('/x', handlePut);\n"),
+            ["PUT /x -> handlePut"],
+            "a class-based server reaches its router through a dotted receiver"
+        );
+        assert_eq!(
+            routes("app.get('*', handleFallback);\n"),
+            ["GET * -> handleFallback"],
+            "the catch-all Express documents is a path, and its handler is real"
+        );
+    }
+
+    /// What tells a route from an ordinary `X.get("string")` call.
+    ///
+    /// JavaScript needs a guard Python does not: `@` makes a Python decorator
+    /// unmistakable, while `X.get('/thing')` is one of the most common shapes
+    /// in JavaScript and would flood the route table once the receiver stopped
+    /// being an allow-list. Two properties separate a route: a path that starts
+    /// with `/` (or the `*` catch-all), and a second argument, because a route
+    /// with no handler is not a route.
+    ///
+    #[test]
+    fn a_route_is_told_from_a_get_call_by_its_path_and_its_handler() {
+        for (source, why) in [
+            (
+                "axios.get('/api/users');\n",
+                "an HTTP client call names no handler",
+            ),
+            (
+                "redis.get('session:1', loadSession);\n",
+                "a cache key is not a route path, even with a callback after it",
+            ),
+            (
+                "const id = headers.get('x-request-id', fallback);\n",
+                "a header name is not a route path, even with a second argument",
+            ),
+            (
+                "cache.get('users', () => load());\n",
+                "a cache lookup with a callback is not a route",
+            ),
+        ] {
+            assert!(routes(source).is_empty(), "{why}: {:?}", routes(source));
+        }
+    }
+
+    /// `app.get(name)` with one argument is Express's settings getter.
+    ///
+    /// This is a *separate* defect from the receiver allow-list, and predates
+    /// it: `app` was already on that list, so `app.get('view engine')` matched,
+    /// and the site was pushed anyway because an absent handler became `""`
+    /// rather than a reason to reject it. `devmap routes --json` listed a route
+    /// `GET view engine` with `normalized_path: "/view engine"` and an empty
+    /// handler list — reproduced against the pre-change release binary.
+    ///
+    /// It gets its own test because the requirement that closes it — a second
+    /// argument — is not scaffolding for widening the receiver, and must not be
+    /// dropped by whoever next touches the receiver logic.
+    ///
+    /// The harm is a phantom row in `routes`, `api-impact` and `shape-check`
+    /// and a route node binding nothing — *not* a wrongly exempted dead symbol.
+    /// With an empty handler name the resolver has no symbol to bind, so the
+    /// node dangles rather than producing a live `HandlesRoute` edge to
+    /// something real.
+    #[test]
+    fn a_settings_getter_is_not_a_route() {
+        assert!(
+            routes("const engine = app.get('view engine');\n").is_empty(),
+            "a one-argument app.get reads a setting and registers no route: {:?}",
+            routes("const engine = app.get('view engine');\n")
+        );
+        assert_eq!(
+            routes("app.set('view engine', 'pug');\napp.get('/x', handleX);\n"),
+            ["GET /x -> handleX"],
+            "the real route beside a settings call is still extracted"
+        );
+    }
+
+    /// An HTTP client call with a config argument is not a route.
+    ///
+    /// This is the case the path test and the second-argument test both let
+    /// through: `axios.get('/api/users', {headers})` has a `/` path and a
+    /// second argument, and once the receiver stopped being an allow-list there
+    /// was nothing left to tell it from `app.get('/api/users', handler)`.
+    ///
+    /// Two properties settle it, neither of them a list of names. Express's
+    /// signature is `app.METHOD(path, ...callbacks)` — every argument after the
+    /// path is a callback and the framework has no form taking trailing options
+    /// — so an object literal in the final position is some other API. And an
+    /// Express router is constructed, never imported ready-made, so a receiver
+    /// this file binds to a bare package specifier is not a router whatever it
+    /// was named.
+    ///
+    /// The second property is what makes an *identifier* config decidable:
+    /// `axios.get(url, config)` is shaped exactly like a route, and only the
+    /// binding of `axios` says otherwise.
+    #[test]
+    fn an_http_client_call_is_not_a_route() {
+        for (source, why) in [
+            (
+                "app.get('/api/users', {headers});\n",
+                "an options object is data; Express takes only callbacks after the path",
+            ),
+            (
+                "client.get('/api/users', { params: { page: 1 } });\n",
+                "a nested options object is still an options object",
+            ),
+            (
+                "const axios = require('axios');\naxios.get('/api/users', config);\n",
+                "an identifier config is shaped like a handler; the require says it is not",
+            ),
+            (
+                "import axios from 'axios';\naxios.get('/api/users', config);\n",
+                "the ESM default import binds the same evidence",
+            ),
+            (
+                "import * as ky from 'ky';\nky.get('/api/users', options);\n",
+                "a namespace import binds it too",
+            ),
+            (
+                "const axios = require('axios');\nconst client = axios.create({});\n\
+                 client.get('/api/users', config);\n",
+                "a client built by a factory is no more a router than its factory",
+            ),
+            (
+                "const got = require('got');\ngot.get('/x', opts);\n",
+                "no client is named in the matcher; the binding is read from the file",
+            ),
+        ] {
+            assert!(routes(source).is_empty(), "{why}: {:?}", routes(source));
+        }
+    }
+
+    /// The client guards must not cost a single real route.
+    ///
+    /// Both new tests reject, so both can be satisfied by rejecting too much.
+    /// A router is *constructed*, and every construction form has to survive —
+    /// including in the file that also imports a client, which is the ordinary
+    /// shape of a server that makes outbound calls.
+    #[test]
+    fn a_router_beside_an_http_client_still_registers_its_routes() {
+        assert_eq!(
+            routes(
+                "const express = require('express');\nconst axios = require('axios');\n\
+                 const app = express();\nconst api = express.Router();\n\
+                 app.get('/health', health);\napi.get('/users', listUsers);\n\
+                 axios.get('/upstream', config);\n"
+            ),
+            ["GET /health -> health", "GET /users -> listUsers"],
+            "the client's call drops out and both real routes stay"
+        );
+        assert_eq!(
+            routes(
+                "const usersRouter = require('./routes/users');\nusersRouter.get('/x', handleX);\n"
+            ),
+            ["GET /x -> handleX"],
+            "a relative import may export a router, so it is not treated as a client"
+        );
+        assert_eq!(
+            routes(
+                "import express from 'express';\nconst app = express();\napp.get('/x', handleX);\n"
+            ),
+            ["GET /x -> handleX"],
+            "express is the router's own source and never a rival to it"
+        );
+        assert_eq!(
+            routes("const router = require('express').Router();\nrouter.get('/x', handleX);\n"),
+            ["GET /x -> handleX"],
+            "a suffixed require constructs a router rather than binding a module"
+        );
+        assert_eq!(
+            routes("app.get('/x', asyncHandler(getUsers));\n"),
+            ["GET /x -> "],
+            "a wrapper call returns a handler; it is callable, not data"
+        );
+        assert_eq!(
+            routes("app.get('/x', [auth, log]);\n"),
+            ["GET /x -> "],
+            "Express documents an array of callbacks as the final argument"
+        );
+    }
+
+    /// A path Express itself would never route is not a route.
+    ///
+    /// The `/`-or-`*` test is the JS side's only discriminator once the
+    /// receiver stops being an allow-list, so it is worth stating what it
+    /// costs. Express matches a request's `req.path`, which always begins with
+    /// `/`, so a *string* path without one routes nothing — there is no real
+    /// route this turns away. A RegExp path — `app.get(/^\/x/, h)` — is not a
+    /// string literal, so neither this matcher nor the one it replaces ever saw
+    /// it: that gap is unchanged, not newly introduced.
+    #[test]
+    fn a_regexp_path_is_out_of_reach_of_a_string_literal_matcher() {
+        assert!(
+            routes("app.get(/^\\/users/, handleUsers);\n").is_empty(),
+            "a RegExp path is not a string literal, before or after this change"
         );
     }
 }

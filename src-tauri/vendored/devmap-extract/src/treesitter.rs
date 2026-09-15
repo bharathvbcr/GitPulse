@@ -712,6 +712,10 @@ fn extract_treesitter_before_deadline(
                     lang,
                     deadline,
                 );
+                // After the merge, so an embedded `<script>`'s references are
+                // deduplicated against its own calls too, and once for the
+                // whole file rather than per language arm.
+                drop_duplicate_callee_names(&mut extraction.references);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1699,65 +1703,67 @@ pub(crate) fn enclosing_callable_qualified(
     source: &str,
     file_symbol_name: &str,
 ) -> Option<String> {
+    let mut scope_node = node;
     let mut ancestor = bounded_parent(node);
+    let mut names = Vec::new();
+    let mut base = None;
+    let mut since_check = 0;
     while let Some(parent) = ancestor {
+        since_check += 1;
+        if walk_overran() || (since_check >= PARENT_CHECK_STRIDE && walk_deadline_passed()) {
+            return None;
+        }
+        if since_check >= PARENT_CHECK_STRIDE {
+            since_check = 0;
+        }
         // Python defaults are evaluated by the enclosing scope, before the
         // function's parameters exist. Calls in the body keep the callable.
         if parent.kind() == "function_definition"
-            && node.kind() == "call"
+            && scope_node.kind() == "call"
             && parent.child_by_field_name("name").is_some()
-            && field_contains(parent, "parameters", node)
+            && field_contains(parent, "parameters", scope_node)
         {
             ancestor = bounded_parent(parent);
             continue;
         }
-        // The C family derives its name and its owner together: no C-family
-        // declaration has a `name` field for `callable_binding_name` to read,
-        // and an out-of-line definition names its owner inside its own
-        // declarator rather than through any ancestor. Both come from the same
-        // helper the symbol emitter uses, so the scope string and the node
-        // identity cannot drift apart — which is precisely how they drifted
-        // before: `callable_binding_name` returned `None` for every C-family
-        // function, so every reference and every call made inside one was
-        // attributed to the *file*. On the measurement corpus all 117 C-family
-        // `References` edges had the file as their source.
+        // Use the symbol emitter's owner/name pair for C-family out-of-line
+        // definitions; their owner is not necessarily an ancestor node.
         if is_c_family_callable(parent) {
             if let Some((owner, name)) = c_callable_identity(parent, source) {
-                return Some(match owner {
+                base = Some(match owner {
                     Some(type_name) => format!("{file_symbol_name}::{type_name}.{name}"),
                     None => format!("{file_symbol_name}::{name}"),
                 });
+                break;
             }
         }
         if let Some(name) = callable_binding_name(parent, source) {
-            // A Go method is owned by its receiver type, which is a field of
-            // the `method_declaration` itself rather than an enclosing node, so
-            // the ancestor walk in `enclosing_type_name` cannot find it.
-            //
-            // Without this, every method in a file reported the bare
-            // `file::name`, so `func (a *A) Read()` and `func (b *B) Read()`
-            // were indistinguishable as scopes — which is what let two types'
-            // receiver bindings collide (SC9). It also left Go method call
-            // edges naming a source symbol (`file::Read`) that matches no
-            // node's qualified name (`file::A.Read`), making those edges
-            // unjoinable to the node they come from.
+            // Go receivers live on the declaration itself. Other method
+            // owners are found through the same type lookup used by symbols.
             let owner = (parent.kind() == "method_declaration")
                 .then(|| go_receiver(parent, source).map(|(_, type_name)| type_name))
                 .flatten()
                 .or_else(|| enclosing_type_name(parent, source));
-            // Must produce exactly the identity the symbol itself carries, or
-            // every call made inside a nested function names a source no node
-            // has — the same unjoinable-edge failure as SC9/SC10. `parent` is
-            // the callable we just matched, so recursing from it walks the rest
-            // of the enclosing scope chain.
-            return Some(match owner {
-                Some(type_name) => format!("{file_symbol_name}::{type_name}.{name}"),
-                None => scoped_qualified_name(parent, source, file_symbol_name, &name),
-            });
+            if let Some(type_name) = owner {
+                base = Some(format!("{file_symbol_name}::{type_name}.{name}"));
+                break;
+            }
+            names.push(name);
+            // This is the starting node the former recursive scope lookup
+            // would receive, including its Python-default evaluation rules.
+            scope_node = parent;
         }
         ancestor = bounded_parent(parent);
     }
-    None
+    let mut qualified = match base {
+        Some(base) => base,
+        None => format!("{file_symbol_name}::{}", names.pop()?),
+    };
+    for name in names.iter().rev() {
+        qualified.push('.');
+        qualified.push_str(name);
+    }
+    Some(qualified)
 }
 
 /// Whether `node` is a C-family callable.
@@ -1829,6 +1835,120 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
 /// that `except Exception as e` cannot bind to an unrelated `def e`; without
 /// the distinction that refusal swallowed every property read and every
 /// callback passed by attribute along with it.
+/// Drop the `Name` reference that a call's own callee already accounts for.
+///
+/// Every call extractor records a `Call` (or `Constructor`) reference naming
+/// the callee and spanning the callee *expression* — `r.mm` for `r.mm()`,
+/// `Z::pp` for `Z::pp()`. The generic identifier walker then visits the same
+/// method identifier and, unless [`is_call_callee`] recognises the grammar's
+/// spelling for it, records a **second** reference for it as an ordinary `Name`
+/// use of a symbol.
+///
+/// That suppression had drifted out of step with the very facts it depends on.
+/// Three functions each carry their own copy of "which grammars spell a name
+/// reached through something else, and in which fields":
+/// [`member_access_fields`] lists four spellings, [`member_access_receiver`]
+/// five, and `is_call_callee` three. The reference the walker emits is recorded
+/// by the resolver exactly when `member_access_receiver` gives it a receiver —
+/// so every spelling in the five-entry list and not in the three-entry one
+/// produced a duplicate row, and the two missing entries are Rust's and Scala's
+/// `field_expression` and Rust's `scoped_identifier`.
+///
+/// **Eleven** languages were measured emitting the duplicate — C, C++, Java,
+/// Kotlin, Lua, R, Ruby, Rust, Scala, Solidity, Swift — by running
+/// `a_call_is_one_site_not_two`'s matrix against the code this replaces; CUDA
+/// and Luau share the C++ and Lua grammars and the shapes that produced it.
+/// Seven were already correct: Go, Python, JS/TS, C#, PHP, Dart, Objective-C.
+///
+/// On this repository it cost Rust **49,989** of its 150,163 attribution sites
+/// — 27% of the corpus total of 182,181, every one of them a call already
+/// counted once. And the second copy was filed as a *failure* even where the
+/// first resolved: a `Widget::omegafn()` that produced a `Calls` edge at full
+/// confidence also produced an `uninferred_receiver` row claiming it had not.
+/// 1,937 resolved `References` edges duplicated a `Calls` edge to the same
+/// pair, and four more bound a C function-pointer field (`lexer->advance`) to
+/// the file's own same-named `static` function at confidence 1.0.
+///
+/// The test is structural and needs no grammar table, which is why it is here
+/// rather than a fourteenth arm in `is_call_callee`: a callee's name is the
+/// **last** token of the callee expression in every grammar that spells a call
+/// as `<receiver> <separator> <name>`, so a `Name` reference is the callee's
+/// own second copy exactly when a `Call`/`Constructor` reference of the same
+/// name ends at the same byte and starts at or before it.
+///
+/// The suffix requirement is what keeps the receiver, which is the property the
+/// three-entry list was written to protect (see `is_call_callee`, and
+/// `member_use_liveness`): in `mm::mm()` both halves are spelled `mm` and both
+/// lie inside the callee span, and only the right-hand one ends where the
+/// call's does. Requiring the *name* to match as well keeps a whole-expression
+/// callee span — an Objective-C `message_expression`, a C `Type` reference over
+/// a declarator — from swallowing an unrelated identifier that happens to end
+/// where it does.
+///
+/// # What this deliberately leaves behind
+///
+/// A callee reference whose span is *wider than the callee expression* keeps
+/// its duplicate. Two shapes have one: a Rust turbofish, where `::<_, String>`
+/// follows the name inside the `generic_function` the call records; and a call
+/// recovered from a Rust macro body, which is stamped with the whole
+/// `macro_invocation`'s span because the re-parsed tree has no coordinates in
+/// this file. `assert_eq!(calls_of(src), 3)` is the common one.
+///
+/// A second tier — "the callee is the only mention of its own name inside the
+/// span" — takes those, and was built and measured rather than reasoned about.
+/// A/B over one snapshot of this repository, 1,101 files: it removes **1,164**
+/// edges, of which **1,150** are genuine duplicates of a `Calls` edge to the
+/// same pair and **14** are the only edge that pair has. All 14 are a call
+/// inside a Rust macro whose *macro-borne call* did not resolve while the
+/// identifier did — `RpcError::new -> codes::is_reserved_and_undefined` in
+/// `devmap-serve`, where the receiver is a module path — so the identifier is
+/// the whole of the evidence that the target is reached.
+///
+/// Extraction cannot tell the 1,150 from the 14: they are the same syntax, and
+/// what separates them is what the *resolver* later makes of each. A duplicate
+/// edge costs a row; a dropped reference can report a live symbol dead. So this
+/// abstains, and the residue is stated rather than hidden —
+/// `a_turbofish_keeps_its_duplicate_and_that_is_known` pins it, and
+/// `a_macro_borne_calls_argument_keeps_its_reference` pins why.
+fn drop_duplicate_callee_names(references: &mut Vec<ExtractedReference>) {
+    // Keyed on the byte the callee's name ends at, which is a position in one
+    // file and therefore unique; the value is the leftmost byte a callee
+    // expression of that name reaches back to.
+    let mut callee_ends: HashMap<(&str, usize), usize> = HashMap::new();
+    for reference in references.iter() {
+        if matches!(
+            reference.kind,
+            ReferenceKind::Call | ReferenceKind::Constructor
+        ) {
+            let start = callee_ends
+                .entry((reference.name.as_str(), reference.span.end_byte))
+                .or_insert(reference.span.start_byte);
+            *start = (*start).min(reference.span.start_byte);
+        }
+    }
+    if callee_ends.is_empty() {
+        return;
+    }
+    // Two passes rather than one `retain` closure, because the map borrows the
+    // names it is keyed by.
+    let mut keep = Vec::with_capacity(references.len());
+    for reference in references.iter() {
+        keep.push(
+            reference.kind != ReferenceKind::Name
+                || !callee_ends
+                    .get(&(reference.name.as_str(), reference.span.end_byte))
+                    .is_some_and(|start| *start <= reference.span.start_byte),
+        );
+    }
+    drop(callee_ends);
+    let mut index = 0;
+    references.retain(|_| {
+        let keep_this = keep[index];
+        index += 1;
+        keep_this
+    });
+}
+
 fn member_access_receiver(node: Node, source: &str) -> Option<String> {
     let parent = bounded_parent(node)?;
     // The grammars spell the same shape several ways: `attribute` in Python,
@@ -2060,37 +2180,6 @@ fn rust_string_literal_content(node: Node, source: &str) -> Option<String> {
         .and_then(|rest| rest.strip_suffix('"'))
         .map(str::to_string)
         .filter(|text| !text.is_empty())
-}
-
-/// The struct/enum/union that owns a field declaration.
-fn rust_type_item_name(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = bounded_parent(node);
-    while let Some(parent) = ancestor {
-        if matches!(parent.kind(), "struct_item" | "enum_item" | "union_item") {
-            return get_child_text(parent, "name", source);
-        }
-        if is_callable_node(parent) {
-            return None;
-        }
-        ancestor = bounded_parent(parent);
-    }
-    None
-}
-
-/// The Go type that owns a `field_declaration` — walked up through
-/// `field_declaration_list` / `struct_type` to the enclosing `type_spec`.
-fn go_field_owner_name(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = bounded_parent(node);
-    while let Some(parent) = ancestor {
-        if parent.kind() == "type_spec" {
-            return get_child_text(parent, "name", source).filter(|name| !name.is_empty());
-        }
-        if is_callable_node(parent) {
-            return None;
-        }
-        ancestor = bounded_parent(parent);
-    }
-    None
 }
 
 /// Why a Rust `fn` can never be observed as `pub` regardless of its liveness.
@@ -3423,30 +3512,6 @@ fn extract_node(
             "use_declaration" => {
                 rust_use_imports(node, source, span, imports);
             }
-            "field_declaration" => {
-                // Struct field types are the evidence `let x = self.field`
-                // needs to type `x`. Without them a field used only as a
-                // receiver (`adjacency.run()`) left its method callerless.
-                if let Some(field_name) = get_child_text(node, "name", source) {
-                    if let Some(type_name) = node
-                        .child_by_field_name("type")
-                        .and_then(|ty| rust_type_name(ty, source, 0))
-                    {
-                        if let Some(owner) = rust_type_item_name(node, source) {
-                            if !field_name.is_empty() && !type_name.is_empty() {
-                                references.push(ExtractedReference {
-                                    name: type_name,
-                                    kind: ReferenceKind::Type,
-                                    span: span.clone(),
-                                    enclosing_symbol: Some(format!("{file_symbol_name}::{owner}")),
-                                    assigned_to: Some(field_name),
-                                    receiver_expr: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
             "attribute_item" => {
                 rust_attribute_callback_refs(node, source, file_symbol_name, references);
             }
@@ -3684,45 +3749,6 @@ fn extract_node(
                     });
                 }
             }
-            // Struct field types are the evidence `w.Priority.valid()` needs to
-            // type the field receiver. Rust already emits this; Go did not, so
-            // every method reached only through a typed field stayed untyped.
-            "field_declaration" => {
-                if let Some(field_name) = get_child_text(node, "name", source) {
-                    if let Some(type_name) = node
-                        .child_by_field_name("type")
-                        .and_then(|ty| go_type_name(ty, source, 0))
-                    {
-                        if let Some(owner) = go_field_owner_name(node, source) {
-                            if !field_name.is_empty() && !type_name.is_empty() {
-                                let qualifier = node
-                                    .child_by_field_name("type")
-                                    .and_then(|ty| go_type_qualifier(ty, source, 0));
-                                if let Some(qualifier) = qualifier {
-                                    references.push(ExtractedReference {
-                                        name: qualifier,
-                                        kind: ReferenceKind::TypeQualifier,
-                                        span: span.clone(),
-                                        enclosing_symbol: Some(format!(
-                                            "{file_symbol_name}::{owner}"
-                                        )),
-                                        assigned_to: Some(field_name.clone()),
-                                        receiver_expr: None,
-                                    });
-                                }
-                                references.push(ExtractedReference {
-                                    name: type_name,
-                                    kind: ReferenceKind::Type,
-                                    span: span.clone(),
-                                    enclosing_symbol: Some(format!("{file_symbol_name}::{owner}")),
-                                    assigned_to: Some(field_name),
-                                    receiver_expr: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
             "call_expression" | "composite_literal" => {
                 let callee_node = if kind == "call_expression" {
                     node.child_by_field_name("function")
@@ -3942,6 +3968,11 @@ fn extract_node(
     // Languages whose arm already pushes imports — Python, JS/TS, Rust, Go —
     // are absent from the dispatcher's match, so nothing is counted twice.
     crate::langimports::extract_imports(lang, node, source, imports);
+    // A declared field's type, for the same reason and from the same position:
+    // Rust, Go, Python and HCL take specialised arms above and the C family
+    // takes `c_family`, so the one position that serves every grammar — and
+    // keeps serving one that gains a specialised arm later — is this one.
+    let _ = crate::langfields::extract_field_type(lang, node, source, file_symbol_name, references);
     maybe_push_name_reference(node, source, lang, file_symbol_name, references);
 }
 
@@ -4830,12 +4861,85 @@ const MAX_RECEIVER_CHARS: usize = 64;
 /// whose job is to name a value.
 fn bound_receiver_text(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = strip_prefix_operators(&flat);
     if flat.chars().count() <= MAX_RECEIVER_CHARS {
-        return flat;
+        return flat.to_string();
     }
     let mut out: String = flat.chars().take(MAX_RECEIVER_CHARS).collect();
     out.push('\u{2026}');
     out
+}
+
+/// Strip a leading `&` / `*` / `!` from a receiver that is otherwise a plain
+/// path of names.
+///
+/// `(*path).to_string()` records the receiver `*path`, `(&x).use()` records
+/// `&x`, and Swift's `!Self.check(v)` records `!Self` — tree-sitter-swift makes
+/// `!Self` the navigation target rather than negating the call's result. The
+/// classifier and the receiver-type rung both read a receiver's **leftmost
+/// segment**, and `*` is not a segment: every one of these rows reached
+/// `UninferredReceiver` with the binding that would have typed it sitting one
+/// character to the right. Measured: 370 rows on this repository (`*path`,
+/// `*name`, `&…`) and 107 on a 306-file Swift corpus, where `!Self.containsNul`
+/// is a call to the enclosing type's own static method that the `self` rung
+/// could not see.
+///
+/// **Only when the remainder is a plain path**, and that restriction is the
+/// whole of the argument. A reference or a dereference denotes the *same value*
+/// as its operand, so the operand's declared type is the receiver's and reading
+/// it is not a guess. `!name.is_empty()` does not: it denotes a `bool` computed
+/// from a call, and rooting it at `name` would claim the method belongs to
+/// whatever `name` is. Requiring what follows to be an identifier or a dotted
+/// path — no parentheses, no brackets, no further operators — separates them
+/// exactly, and it is why `!Self` is taken and `!a.ok()` is left alone.
+///
+/// Arithmetic is deliberately absent. `-x` is a different value of a possibly
+/// different type, and the reduction has no way to know; it costs a row and
+/// invents nothing.
+pub(crate) fn strip_prefix_operators(text: &str) -> &str {
+    let mut rest = text;
+    let mut stripped_any = false;
+    // Bounded: `&&x` and `&mut *p` are real, a thousand leading `&` is not.
+    for _ in 0..4 {
+        let Some(next) = rest
+            .strip_prefix('&')
+            .or_else(|| rest.strip_prefix('*'))
+            .or_else(|| rest.strip_prefix('!'))
+            .map(|after| after.strip_prefix("mut ").unwrap_or(after))
+            .map(str::trim_start)
+            .filter(|next| !next.is_empty())
+        else {
+            break;
+        };
+        rest = next;
+        stripped_any = true;
+    }
+    if !stripped_any {
+        return text;
+    }
+    // What is left must be a path of names and nothing else: a parenthesis, a
+    // bracket, a quote or a second operator means the operand was an
+    // expression, not a binding, and its type is not the receiver's.
+    //
+    // `$` and `#` are names here for the reason `is_callee_identity` admits
+    // them: Swift spells a closure's parameter `$0`, PHP spells every variable
+    // `$r`, and a JavaScript private member is `#name`. Refusing them would
+    // leave `!$0` and `&$row` rooted at an operator in the two languages whose
+    // ordinary bindings look like that.
+    let is_name_char =
+        |character: char| character.is_alphanumeric() || matches!(character, '_' | '$' | '#');
+    let is_plain_path = rest
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || matches!(first, '_' | '$' | '#'))
+        && rest
+            .split(['.', ':'])
+            .all(|segment| segment.chars().all(is_name_char));
+    if is_plain_path {
+        rest
+    } else {
+        text
+    }
 }
 
 /// Grammar keys for a call, across the languages this crate splits receivers
@@ -5896,7 +6000,7 @@ fn c_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
 /// Separate from `go_type_name` for the SC17 reason — that function answers
 /// "what type is this value, for dispatch", and must keep returning the bare
 /// name. Bounded depth so a pathological nesting cannot recurse without end.
-fn go_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String> {
+pub(crate) fn go_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
     }
@@ -6641,7 +6745,7 @@ fn extraction_overran(deadline: std::time::Instant) -> bool {
 }
 
 /// Deadline check for a helper running inside the walk. Latches the flag.
-fn walk_deadline_passed() -> bool {
+pub(crate) fn walk_deadline_passed() -> bool {
     match WALK_DEADLINE.with(|slot| slot.get()) {
         Some(deadline) if std::time::Instant::now() >= deadline => {
             WALK_OVERRAN.with(|slot| slot.set(true));
@@ -6671,7 +6775,7 @@ fn scope_locals_len() -> usize {
     SCOPE_LOCALS.with(|cache| cache.borrow().len())
 }
 
-fn is_callable_node(node: Node) -> bool {
+pub(crate) fn is_callable_node(node: Node) -> bool {
     matches!(
         node.kind(),
         "function_definition"

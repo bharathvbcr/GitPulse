@@ -7,19 +7,20 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-evidence",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.license = \"Apache-2.0\"",
+        "dependencies.sha2 from the workspace",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "419ad8c990f3cd7b0aa6a148d2cc2b9bd9fc9f37fef83da46e0af8235d52a3db",
+        "Cargo.toml": "3d0d99763b937ce0aa6a9310e4ff6baee2078647a93a9e11ca225e0530362a0f",
         "src/lib.rs": "48a0f0ce84cac350ec7f3f5bf0a2573915ae5457994bd166260a538e7a423bd6",
         "src/strict_json.rs": "1e0cc3930c1ae107abed7a866cb69db9196b42dc802d9e05812e614699897043",
         "src/types.rs": "0a688a75bc03c8a17046f59a9bd9d3f4080814dbe1db89ae9e59b35f32a44cad"
@@ -31,20 +32,42 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-glob",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.license = \"Apache-2.0\"",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "fa24803efb06ca5d88b592fd3d8ed9b7e72c91d1f469cc8e9f808cee42d30e3d",
+        "Cargo.toml": "972285bc26c57e350c88f3c4675cb36c83732bdaed636b76e7903079f6a510af",
         "src/lib.rs": "d147353a2b82c0ede269f54387b38af3bdfbc20c24683544fa471d49cd735129"
+      }
+    },
+    {
+      "name": "dc-proc",
+      "origin": {
+        "repo": "devcouncil",
+        "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
+        "path": "rust/dc-proc",
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
+      },
+      "omitted": [
+        "tests/",
+        "[dev-dependencies]"
+      ],
+      "rewrites": [
+        "package.version = \"0.2.2\"",
+        "package.license = \"Apache-2.0\"",
+        "dependencies.libc from the workspace"
+      ],
+      "files": {
+        "Cargo.toml": "3672db45c6d9b157971897cdb6ac0efcb8b4a840c7601aa16c52d30bc846278b",
+        "src/lib.rs": "800cd7e0c0caf92ab9a6332975f2bd736442de6b697f34155ad88160720cee54"
       }
     },
     {
@@ -53,23 +76,23 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.license = \"Apache-2.0\"",
         "dependencies.rusqlite from the workspace",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "2692d47ca4abdfc657b5ad791053e641a8d325336034d72d946b05697991f019",
-        "src/bin/dcstore.rs": "b0bd22daac7171b374015107d9400d4f923cbb68116c2f2bbff0d1b7f2e611e3",
+        "Cargo.toml": "a54b3c7259256a9e9944440629549147e130420514fe924d1d6de868b498bcc3",
+        "src/bin/dcstore.rs": "faed061d81a6791e7b245ed4c3c0508a647764d7ac339458719db46e92857655",
         "src/json.rs": "00fad17a5c902c59eafce74ca45c8bd68859ee898bbeb898854cded0a5d6f2ea",
-        "src/lib.rs": "1a8de12c320e8f7b947bf2960e627ebb61d2f4ccb94c1c7a6749ecc17392fd86",
+        "src/lib.rs": "01eb3e6d6fb1ffa91a86920067367cd2ebb0d4ad075e285c844ac7cadef031f6",
         "src/records.rs": "52a713431be5e31bc277c5891ddd563dcee6bc6c1578d3586e1c49d0cb830bf3",
         "src/schema.rs": "95ede2fea671310a70767a3cfe6166e84492ee12d3d6c9e0727bf4bef83dc3e2",
         "src/workbench/attention.rs": "397f944e3257ab186c3a5db7c90cd30811e7e493e41c934fde289bdce67fdf08",
@@ -98,26 +121,26 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-verify",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.license = \"Apache-2.0\"",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "150004c9ea5d4e91de9c27acfb21ab84072423ee1fadacc4e3a28b2e8c191b53",
-        "src/bin/dcjsoncheck.rs": "13ec7dc9475cea6309794146dc5bb3b2c34b591277d744b94bdc944ddc75dc7f",
-        "src/bin/dcverify.rs": "aa7a690347ee53d268732ea57c68395300db6b13fe90f68e93797fcbd059cad1",
+        "Cargo.toml": "b9609439d17bae061ec569b12019e33cc3d1cf9cafb2abfa527a89527baa1141",
+        "src/bin/dcjsoncheck.rs": "ad468d90a4ff9f8cd74ffad1ea9be48773c4c2266754926b11f5203731eabacd",
+        "src/bin/dcverify.rs": "43a0e539c75ac89a58f4b224876775b0ddbb497560ad597b5fc8dce746025a16",
         "src/coverage.rs": "b6c99639a33041662db25956193f62ca3dee94480a55762e3012e94bfc1d611a",
         "src/evidence_cli.rs": "129bbd2c98cb1525843d933566b5cbf2399db37d57408eeecb96882ca8de067c",
         "src/json_stdout.rs": "d79284aa1f7d2148266c74151071bf4a1bb6dd3b93e34fafb646bc2d7de10336",
         "src/lib.rs": "6e317c6e7839721f4854719b0a80997c1faf86279e0fb14b6581dd9bb5484185",
-        "src/rigor.rs": "df8c399778d81836a9595143ce4f0e133cf74c4e41708353686c067e505202c8"
+        "src/rigor.rs": "c5245fdf57907976f755419ce562c196886bd29f5402a018ca946164589f0e52"
       }
     },
     {
@@ -126,14 +149,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-analyze",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -144,13 +167,13 @@
         "dependencies.tree-sitter-python from the workspace"
       ],
       "files": {
-        "Cargo.toml": "c660e2b934f813c6c1d7aeaabd662c2c25b82622ba635dbcc7480476f849d1b5",
+        "Cargo.toml": "239b30c825ddbe26c42e6f61b3de5a39f913d006d3ca9fe86dfedbaacbe588c5",
         "src/clones.rs": "0e57179bd70dc8e40aadc4e9e8b0914202101b2e047381dd54478522a39956f4",
         "src/clustering.rs": "a154f73f80f7b95838207aeaf4f3a903a473bb90cf2330ce0013e53a79b13b6c",
         "src/dead_clusters.rs": "072634f595063d7f3a9045280f28ee3f5d2e279b8ef23b79acf88737bd1957ef",
         "src/graph_intel.rs": "5771edd83891421a06916e04f352d6bc0e74312dc8817ef46f8fce5f31a6cad9",
         "src/lib.rs": "ecee6fcfea99bc6b5a6333d142444aafa828759482cd6c5b7e767b03f6b13a61",
-        "src/liveness.rs": "c647b3bc1832f24af3fdfd7fbd8413edb8e5ae548faad46ecc6ec1101bf4fa1c",
+        "src/liveness.rs": "2804674305b19542e2122bf258fbe70fb754164c500ade5d7880ee06673b45be",
         "src/model.rs": "20e3b4e89dfd75da9d57ef960b1a4b4beb7890fa2a0a5f32751166b77f99cd8e",
         "src/pdg.rs": "412e148c3837acdded9f6e467347b877afed88fc19f2978ac28936b9a49cc786",
         "src/pdgsrc.rs": "ca5d3dea9cb36a8d4a0e162b15a3b28ec0d419f96e0779e62df878e95fa8902e",
@@ -164,14 +187,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-extract",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -217,22 +240,22 @@
         "target.'cfg(unix)'.dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "090356afabc7d56acff8a2e4a71e52e2593d27c3979f03e34dfecee0e8022472",
+        "Cargo.toml": "ec9b41ce3a8807744d6e45acda37fe9549dff6190dc4449cf72d45c23209f689",
         "build.rs": "b0714b359f5862b7cbe8b852a04b2402f85b65f1917f950d136fcca14ed0d5de",
-        "src/cache.rs": "00fba910ad84851aac3b51522c78c4960814e212aa42ad1431aeb6e96202838b",
+        "src/cache.rs": "1df4a426dee6785987722345460988c5a65a140e82680774713c637fcdd0f136",
         "src/clonesig.rs": "11afa842f06228636d7cc0271e83925347108ed44a8c70502dfb480e47a0ea43",
         "src/embedded.rs": "8e910facc7aabb4d21f77a2a5cc15767ccb72c0481177d46887140d42cafdf63",
         "src/fallback.rs": "35c7bb1dde061964e8ecfb92fae823ea191abcba7a20c0a5f38dd24a14635e62",
-        "src/frameworks.rs": "1899508a57f6b4a06c01fc9b9852ce5a667573460619e9ac18582f97a3b4d4e0",
+        "src/frameworks.rs": "06bd69df6ee1864e24c013746c27c26311d81a37542a2732105cf1a6511d1be6",
         "src/git_metadata.rs": "38bd4f6e6703e140c699d9a93751bfbd812cad10965a59d03101fb3b4c7d4f22",
-        "src/gomod.rs": "748f65fd657ab7a43e1d8b41733c3fe6512cb55b663335aff9a5bd9c756496a6",
-        "src/heritage.rs": "6f4682ef7cb0d5e5e57aa6543df57a23ab4d7133288968fb474993496b7b4ff0",
+        "src/gomod.rs": "14acce1b34d2b1edf6ba4af640d3448de52e918f5c27be0816ed277a9a4d0a2c",
+        "src/heritage.rs": "c8d14d0f50a9c15dcf151ad20b20b74f0676a48c3b8f7065718e377b867e6dcb",
         "src/langcalls/csharp.rs": "cccad4267800c472c1a43bd06b460a5c42e3143d1ee97f0ec8329ebbc531a05c",
         "src/langcalls/dart.rs": "bbd82289bd96b106d4ccb361453f61deed1861ab69084a8cc7083cd1df4025b0",
         "src/langcalls/erlang.rs": "da58e9561d228129a2680361138ee2246b108fc2d98d719e57dc9a80c9b96ede",
         "src/langcalls/java.rs": "383a8f8475c6cb6836b805a4627fb1aa32e2326b624555370d28b13d0d2748ec",
         "src/langcalls/jvm_dotnet.rs": "5fca9319964a1b2f8ba0a1fee10d51582d14f9db9ebdb39e6c2bb09749fe5e40",
-        "src/langcalls/kotlin.rs": "8943edf81b622284edc7a9b9685f9efbcc74c7c77380bb993477ed61ab071b92",
+        "src/langcalls/kotlin.rs": "e5409a57643d810367b95b7d86733f446cb870c5375e65e32593c7ec20e3e7d7",
         "src/langcalls/lua.rs": "93c890e29a28a8184eb51cda87de695fb67784f86c5bfa5821ac87fc98f6ca63",
         "src/langcalls/mod.rs": "5d2094cbe64e34fc7240c83eee598909dde0eacc2d178c02edb681d9b1a1c571",
         "src/langcalls/nix.rs": "6441077a6a655ea3fa79583795403a54f0b5f3898aa3c0b7cd13ac123ee9e18a",
@@ -241,7 +264,7 @@
         "src/langcalls/r.rs": "b7bc20a8d0913d050974dbd083c2c4c69d196c52407152427507926157b26c25",
         "src/langcalls/ruby.rs": "4f4517abed956efd85a387682ceaf1c5f0736e8ffd516cfe0d1c4e3c78117d2c",
         "src/langcalls/scala.rs": "9ae4ecef4d5afbac2cfd45cb71f565fb0a554fc9e8496c99c2a1d5896b043332",
-        "src/langcalls/scope.rs": "0381759ba816a9166a3c541bf22a828c0ecc27ed93e73859979a090706845bb1",
+        "src/langcalls/scope.rs": "5840b448015aa47801f392badaadd0bffeacdf690a824f7afc15a2fda9840dc1",
         "src/langcalls/shell.rs": "02d745e342e6fb38297fde16e1ec406f5305e6fca9cce0dfb9ae8db422a5f561",
         "src/langcalls/solidity.rs": "cb31515fbd5be4a9235225a6479a000e494600b7f1f249716f7e52269c725c90",
         "src/langcalls/sql.rs": "e4cd7539e4f30dfa540d7e9eb8439874cc1b2759d812db9dbf35af57138e68b2",
@@ -255,6 +278,7 @@
         "src/langdecl/r.rs": "3d6dff0b2432bae475c040665e790720890cd06f46568395612b9ee23340e5c4",
         "src/langdecl/solidity.rs": "696df03a24f1856fdb1dbfbcbc8cb697b5ff999b19caa72e3b270eacf91ab98d",
         "src/langdecl/swift.rs": "fdbb4765e7fbc8cee0f7aafb188f908ddaade43ac89f1b1f676bdb83e6c28356",
+        "src/langfields.rs": "7364fcd48b55b5f56165870ae1482357b51141d8f531bbab8ebed0d34c8fd0a6",
         "src/langimports/cfamily.rs": "6fa9ca24a0b800f1d6dd39b44fcb5b2ef410fdd5bde28e9677934f0f00c87a87",
         "src/langimports/cfml.rs": "5a041aec5abb944a17d4f2d4830061f752e74ec01109c4f40dd355567042accd",
         "src/langimports/dart.rs": "33e16116ffdab5597dc63990814826adafd1781b5d0228cca37137a3380c2a1b",
@@ -275,14 +299,14 @@
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
         "src/langimports/swift.rs": "7e7e09d2a5557f886724cd538e8a0abebc41a5292f4d3538f3e2ae5b56da538f",
         "src/languages.rs": "90c7e3af930c1dbfb5cf6c2a1283e67b62245c23f473bd4115b8c2d5f1eb5ca7",
-        "src/lib.rs": "74f59f36af71a12cfa61ca2d91cebbc484941d2d15d3d7e57e94a2316f27d721",
+        "src/lib.rs": "950d29bed56a9fccba03af9c72940e2e43875dbd94468ace2a6c494a0557a566",
         "src/model.rs": "173bbd54d9384570f62a4f71c109f74f9bea66e9ce94c680068a8d8b24aef21a",
         "src/notebook.rs": "1b6ab33c53cf96895327a2176c8d71df59098f99d69b12d1da2325307b985164",
         "src/parent_index.rs": "3117a0e489e04f71e5a7879a0a3c14a8515ec10e35df529e3f05a9c950748311",
-        "src/paths.rs": "b6ae2251c5d04c9dd3943499a771a0de9db443d87e7d8151ceb3a9a90d4027f3",
+        "src/paths.rs": "7a364ecd5c0a30583c3aaf7fb864bc10737e61c4963e510a1160c15f6bc3a4f8",
         "src/progress.rs": "b7de434d9647a53e124e478b10e7c4bd9214445c98a6ec3ce4ff3477d51d1a4e",
-        "src/subprocess.rs": "3df93eb228ff663224c9a13cf45780b7939fa0b7513bde7978e6cc6ce1a27156",
-        "src/treesitter.rs": "97a7596d9dc298cfa7f68394c8318c9f9909ea7ef33d00b01eeac39e8c767ea7",
+        "src/safe_fs.rs": "41b62e6ff9dd6ab9d8e71f92b6d6e55ab0543ad4eba02ebfd411032dee25180e",
+        "src/treesitter.rs": "e163be0a58f493e4072173b03636133dfa250d15c52e7b2459b39a14d487b46c",
         "src/wiring.rs": "c6ac8b3648a78c442d693ca2dd22c33cbe0e84ecb51ce011319dd805caa1868d"
       }
     },
@@ -292,52 +316,54 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-query",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
         "dependencies.serde from the workspace",
         "dependencies.serde_json from the workspace",
         "dependencies.anyhow from the workspace",
-        "dependencies.regex from the workspace"
+        "dependencies.regex from the workspace",
+        "dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "6cc52153206bf371753a914e13609e53ee6dbf94fb4a674c7c19117828f6d046",
+        "Cargo.toml": "3c4912dc75ef7710d297b0b6040188484273273b2ef90d6360ee56386c046789",
         "assets/force-graph.min.js.bundle": "1008539bb9e171a0dc343453366451a1b3a6ded06028ef4f978608b658ba2d0a",
-        "src/api_routes.rs": "3758344d1bd33fc3506df19d9d29f682ff5468b6af9abba68d723b5ba7926743",
-        "src/artifacts.rs": "dd0e76cfd767dbda8a21ba02fe8f8185d024188245377bfc5af655b9055237bc",
+        "src/api_routes.rs": "161e0b6cffe011ba8e027a28ca47f87c3ab0c41383092f4e5efd8b82fc3af39d",
+        "src/artifacts.rs": "290a8b1548fa6d3e7ad3bd936f4067c9615d87a6212dd56d71756bd3f68d44cd",
         "src/ast.rs": "6ec0da5812f4036a78976a45b183ff8fb000f7b817403e352487034101d7a6f0",
         "src/cancel.rs": "63bd23f9604231f538f0db079502db8b0c23bebf4f0eaf64216a53d3c1c00ffb",
-        "src/code_graph.rs": "d196a5b30956134ca471a54d973c7a44cbe3f55b6ac5a05155d05c6ee55a06d6",
+        "src/code_graph.rs": "ab7396e4a6f2d0f34f92c7cf46d58cf346e1d76ca696b9bf916e8c3d16cbfb14",
         "src/cypher.rs": "c3716fe9931d2a3e70b4890deb139ad0e4f9cc0dfbebaa483258b3138d3f30f9",
-        "src/digest.rs": "400ce85d492added4723f5f0b01ffd858a2837bb77b3f4adf214ce0a9cb44fb1",
-        "src/engine.rs": "bc3872e00ffd56a71a9cd0ba99a238a82bd92a50162f9d8199050248ace3baff",
+        "src/digest.rs": "df17f3a75d756fcbe6045b43d03fe7081299db2edcccc8c5b2c444e234124b0f",
+        "src/engine.rs": "cdb32cd746d57a04b5026d7baa3ab6fddaaa9f8cd5a6aa8cb5c988f3e76f9b9b",
         "src/escape.rs": "d87b290b8613736bf735d4424495b33dfbbda99e1d944abb5507ef63a9b8b27e",
         "src/export.rs": "3bfb15986ff49dba6ebbf4af82d9050c34931e6397a04e2c8031aa2fcb4b529d",
-        "src/freshness.rs": "98bee50f623540732cdf1cbe3c614ea81246530a7e4b1f3d294142a8977a3bba",
-        "src/guides.rs": "53b115f063fcb683c9006f836935ebfce4b9a60286775a15a9c093529b17079c",
+        "src/freshness.rs": "f43d4966df6c9b7e99d04a53ba5de2706396c9e4689aee3cd1f40c9caa119db2",
+        "src/guides.rs": "19656d067169f0737cd87536d54b53a7fd593ae512e9437b328d509d1d718879",
         "src/host.rs": "9341d12d28352ff73fbe4e7dc8a2004bf664471b115e67feca14473e5ef3b7ae",
         "src/hygiene.rs": "a94bb601725c5d4382d8415aba7ad3908a061591e25b8041fdd478678636f763",
         "src/inventory.rs": "41c133af8ad8a345aa8a273811af5c70e26a4a34fefed3b410cbc34c863a58af",
-        "src/lib.rs": "599fa0de33c447302395d0dbd61e8fa4e0f109b2682350a9f38bd9fca650618e",
+        "src/lib.rs": "97f021531559284ca76cdfc405bb4b4314a1c1e747ec03df6a24c67899d5e173",
         "src/linguist.rs": "08832b5a4215e7c3242f31af0672391ad9c33b25e1d050e7c365b11b3a418908",
         "src/manifest.rs": "64637df6b1cd68dfff4b7d5f6fb57a5495f1200981674d71d9389510b8fe73d8",
-        "src/map_preview.html": "090e7abcb22ca1e091de2f4158f316e481610c2821f7e5c054260c34333aa185",
+        "src/map_preview.html": "d092ac949bdf314922d5fa230825f23aa683d61117f30da52f9aa114f1823f13",
         "src/map_preview.rs": "ab3e8abfbdb30cccab224f8462a29ccd1cedb9495e7cc27aebb90796f5b2ba95",
         "src/model.rs": "6d28255eacc98ae60bb14739523f6fb8d99fb440c2ed796b2cc440ab46548e52",
         "src/query_match.rs": "d3895702cdfac77fe87cfffb7f729555f7da5f20a762c58c7437fa92c51ca51d",
         "src/rung.rs": "e962ef23a3dc51e7595bb0708bb6a132cf5bf3172f8c2b9b1050ffeaf0c7f243",
         "src/semantic.rs": "bf045dad9afd1e87a50872983081db999575d9aae54ece304c2cd9c563fc38e4",
         "src/snapshots.rs": "fb292ad99c43706672f61968c2e1a91c419654ba2d91e847ac477b8471173bb6",
+        "src/stat_memo.rs": "d5923e0c34c2df820c2bc1a31d47e2dfb5ba35e5de6a81b6e7403867ec345e03",
         "src/tests/inventory_reader.rs": "79449cf26dcf7e9e0c69894168b4b6575c46aa0a07feb974c9a9027d4099cac4",
-        "src/viz.rs": "52933fe62c2a554d1582255b1e7fa6030614c8a3ad25ab4023295ffbfd23eb17",
+        "src/viz.rs": "5821c72da38a046b0a0e028897d85290ea008e311f1c7def54b3b26dba3d4c01",
         "src/workspace.rs": "a143523a44881f0f4589a38d8edf2d0ca676747b41f530a1cd9c5ca56ddb32ee"
       }
     },
@@ -347,14 +373,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-resolve",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -362,12 +388,12 @@
         "dependencies.serde from the workspace"
       ],
       "files": {
-        "Cargo.toml": "3a57db31a1eb20939784c7318ac201e6f553075cf196509d1a235d063b93a10b",
+        "Cargo.toml": "625414ba2d9da8dcee512088ba4e2c349274c01240e37adec5e315d26da84077",
         "src/builtins.rs": "5239e2fcb8a20bcf5d3c96aefec78a551a06e338add2201031a05185009fff47",
         "src/importpath.rs": "e27c28198c50f797032e5cc7a43366fdaca1db55849756f1c9778a97917c72bb",
         "src/lib.rs": "ad28406823b9fef01b30e881780561ae5557c9dc4a6315a71e97d9a7aaccd183",
-        "src/model.rs": "afe1f08c1595ef867bdb9c9da692de5d29bdbdf4bef480db2a1950a151efe6eb",
-        "src/resolver.rs": "4a7aaa6600437e2f895e4b80e16bf28d048e7fd2550806c66d64f7e1b31f2ed9"
+        "src/model.rs": "1203b10a4766e0d05f1ed2d76c6acf8e417c4f01e5d2d3261b816167e5691028",
+        "src/resolver.rs": "2e6bafb376b6baf8a782eda8929f55000c91a55b65372381ee7a5422204da785"
       }
     },
     {
@@ -376,14 +402,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-store",
-        "commit": "a31918e2effbd301e9707a1daecde0fd4106fbdc"
+        "commit": "b366f42099d1d7a523dcb861b265323ba86a922a"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.0\"",
+        "package.version = \"0.2.2\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -395,14 +421,14 @@
         "dropped [dev-dependencies]"
       ],
       "files": {
-        "Cargo.toml": "a3c012050bfcbfa2950ce1d6c2a524126db7480e3ea59eb8ef2d92d13f57bbad",
+        "Cargo.toml": "8eec37051d723fbc43b8426bb4521df81ad0d0973ff2d22933c2ab6d9f2e4631",
         "src/bin/hold_uncommitted_child.rs": "99d06534e8155f43fcba3291b816a681a1de9de4dab02ca84cbbcc891758a807",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "c0cbd7a1d245d0604cef8281237edfea860493c1d489dc0ff677917246795d6a",
+        "src/db.rs": "35288d4ba0a9a86294d0ec75f53d8ad16c393ffe4b6685edc39cf6ca9bd4a0e2",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
         "src/lib.rs": "d456fdce206f81331a0d2f8d3686520be0eb135c98f3fb71305afc89c70e3c8f",
-        "src/schema.rs": "872e889252bafc98f6b5dd4ee4c18cd9aaf5ed5a502db18bd8f1759484764d7a"
+        "src/schema.rs": "1de6b89263899bb4c931bd90ae9d711d35de3b076b3869e2a4b564de261e38fa"
       }
     },
     {
@@ -411,7 +437,7 @@
         "repo": "markdev",
         "root_env": "GITPULSE_MARKDEV_ROOT",
         "path": "core",
-        "commit": "5b212ddeca214aad4c1990e514409aa00297f66d"
+        "commit": "1e1cb66fa4d8977b0e0f220673e59a73c7f658c4"
       },
       "omitted": [
         "tests/",

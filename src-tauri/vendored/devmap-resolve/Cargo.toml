@@ -1,6 +1,6 @@
 [package]
 name = "devmap-resolve"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -37,6 +37,10 @@ required-features = ["parse"]
 
 [[test]]
 name = "audit_regressions"
+required-features = ["parse"]
+
+[[test]]
+name = "a_prelude_type_receiver_is_not_a_value"
 required-features = ["parse"]
 
 [[test]]
@@ -117,4 +121,22 @@ required-features = ["parse"]
 
 [[test]]
 name = "dead_hardening_characterization"
+required-features = ["parse"]
+
+[[test]]
+name = "ambiguity_budget"
+required-features = ["parse"]
+
+[[test]]
+name = "captured_receiver_attribution"
+required-features = ["parse"]
+
+[[test]]
+name = "self_in_a_type_is_that_type"
+required-features = ["parse"]
+
+
+
+[[test]]
+name = "a_field_types_its_receiver"
 required-features = ["parse"]

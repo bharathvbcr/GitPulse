@@ -73,6 +73,9 @@ impl Default for ScanBudget {
 pub struct ScanReport {
     pub files_eligible: usize,
     pub files_read: usize,
+    pub files_attempted: usize,
+    pub source_bytes_read: u64,
+    pub handler_sources_unavailable: usize,
     pub files_over_size: usize,
     pub files_unreadable: usize,
     pub files_skipped_budget: usize,
@@ -82,13 +85,21 @@ pub struct ScanReport {
 
 impl ScanReport {
     fn complete(&self) -> bool {
-        self.files_skipped_budget == 0 && self.sites_dropped_budget == 0
+        self.files_skipped_budget == 0
+            && self.sites_dropped_budget == 0
+            && self.files_unreadable == 0
+            && self.files_over_size == 0
+            && self.handler_sources_unavailable == 0
     }
 
     fn to_json(&self) -> Value {
         json!({
             "files_eligible": self.files_eligible,
             "files_read": self.files_read,
+            "files_attempted": self.files_attempted,
+            "source_bytes_read": self.source_bytes_read,
+            "source_bytes_limit": SOURCE_BYTES_LIMIT,
+            "handler_sources_unavailable": self.handler_sources_unavailable,
             "files_over_size": self.files_over_size,
             "files_unreadable": self.files_unreadable,
             "files_skipped_budget": self.files_skipped_budget,
@@ -262,14 +273,21 @@ fn graph_files(graph: &Value) -> Vec<String> {
     for node in graph["nodes"].as_array().into_iter().flatten() {
         if let Some(path) = node["path"].as_str() {
             if !path.is_empty() {
-                files.insert(path.replace('\\', "/"));
+                files.insert(path.to_string());
             }
         }
     }
     files.into_iter().collect()
 }
 
-fn scan_sites(root: &Path, graph: &Value, budget: &ScanBudget) -> (Vec<Site>, ScanReport) {
+const SOURCE_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
+const HANDLER_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
+
+fn scan_sites(
+    root: &Path,
+    graph: &Value,
+    budget: &ScanBudget,
+) -> (Vec<Site>, ScanReport, BTreeMap<String, String>) {
     let pat = patterns();
     let files = graph_files(graph);
     let mut report = ScanReport {
@@ -277,31 +295,39 @@ fn scan_sites(root: &Path, graph: &Value, budget: &ScanBudget) -> (Vec<Site>, Sc
         ..Default::default()
     };
     let mut sites: Vec<Site> = Vec::new();
+    let mut sources = BTreeMap::new();
 
     for rel in &files {
-        if report.files_read >= budget.max_files {
+        if report.files_attempted >= budget.max_files.min(5_000)
+            || report.source_bytes_read >= SOURCE_BYTES_LIMIT
+        {
             report.files_skipped_budget += 1;
             continue;
         }
-        let full = root.join(rel);
-        match std::fs::metadata(&full) {
-            Ok(meta) if meta.len() > budget.max_file_bytes => {
-                report.files_over_size += 1;
+        report.files_attempted += 1;
+        let remaining = SOURCE_BYTES_LIMIT - report.source_bytes_read;
+        let file_limit = budget.max_file_bytes.min(devmap_extract::MAX_SOURCE_BYTES);
+        let text = match devmap_extract::safe_fs::read_repo_source(
+            Some(root),
+            rel,
+            file_limit.min(remaining),
+        ) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+                if remaining < file_limit {
+                    report.files_skipped_budget += 1;
+                } else {
+                    report.files_over_size += 1;
+                }
                 continue;
             }
-            Ok(_) => {}
             Err(_) => {
                 report.files_unreadable += 1;
                 continue;
             }
-        }
-        let Ok(text) = std::fs::read_to_string(&full) else {
-            // Read as text; a binary that slipped past discovery is not a
-            // client call site, but it is also not a file we examined.
-            report.files_unreadable += 1;
-            continue;
         };
         report.files_read += 1;
+        report.source_bytes_read += text.len() as u64;
         let lines: Vec<&str> = text.lines().collect();
 
         for (index, line) in lines.iter().enumerate() {
@@ -317,15 +343,16 @@ fn scan_sites(root: &Path, graph: &Value, budget: &ScanBudget) -> (Vec<Site>, Sc
             }
             for (url, verb) in found {
                 report.sites_found += 1;
-                if sites.len() >= budget.max_sites {
+                if sites.len() >= budget.max_sites.min(2_000) {
                     report.sites_dropped_budget += 1;
                     continue;
                 }
                 sites.push(build_site(rel, index + 1, &url, &verb, &lines));
             }
         }
+        sources.insert(rel.clone(), text);
     }
-    (sites, report)
+    (sites, report, sources)
 }
 
 fn build_site(path: &str, line: usize, url: &str, verb: &str, lines: &[&str]) -> Site {
@@ -590,13 +617,13 @@ fn resolve_handler(
     if let Some(node) = by_id.get(reference) {
         return json!({
             "id": node["id"], "path": node["path"], "name": node["name"],
-            "line": node["line"], "kind": node["kind"], "resolution": "id",
+            "line": node["line"], "end_line": node["end_line"], "kind": node["kind"], "resolution": "id",
         });
     }
     match by_name.get(reference).map(Vec::as_slice) {
         Some([node]) => json!({
             "id": node["id"], "path": node["path"], "name": node["name"],
-            "line": node["line"], "kind": node["kind"], "resolution": "name",
+            "line": node["line"], "end_line": node["end_line"], "kind": node["kind"], "resolution": "name",
         }),
         Some(many) if many.len() > 1 => json!({
             "id": reference,
@@ -613,25 +640,19 @@ fn resolve_handler(
 /// the Python re-parses the entire module per handler, and its fallback when
 /// the name does not match is to accept any function whose span contains the
 /// line — which for a nested function is the enclosing one.
-fn handler_return_keys(root: &Path, handler: &Value, budget: &ScanBudget) -> Vec<String> {
-    let Some(rel) = handler["path"].as_str() else {
-        return Vec::new();
-    };
-    let full = root.join(rel);
-    match std::fs::metadata(&full) {
-        Ok(meta) if meta.len() <= budget.max_file_bytes => {}
-        _ => return Vec::new(),
-    }
-    let Ok(text) = std::fs::read_to_string(&full) else {
-        return Vec::new();
-    };
+fn handler_return_keys(text: &str, handler: &Value) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let start = handler["line"].as_u64().unwrap_or(1).max(1) as usize - 1;
+    let start = handler["line"]
+        .as_u64()
+        .and_then(|line| usize::try_from(line).ok())
+        .unwrap_or(1)
+        .max(1)
+        - 1;
     let end = handler["end_line"]
         .as_u64()
-        .map(|l| l as usize)
+        .and_then(|line| usize::try_from(line).ok())
         .filter(|l| *l > start)
-        .unwrap_or(start + 120)
+        .unwrap_or(start.saturating_add(120))
         .min(lines.len());
     if start >= lines.len() {
         return Vec::new();
@@ -651,7 +672,9 @@ fn handler_return_keys(root: &Path, handler: &Value, budget: &ScanBudget) -> Vec
 /// Routes, their handlers and the clients that call them.
 pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
     let (by_id, by_name) = node_index(graph);
-    let (sites, report) = scan_sites(root, graph, budget);
+    let (sites, mut report, sources) = scan_sites(root, graph, budget);
+    let mut handler_bytes_remaining = HANDLER_BYTES_LIMIT;
+    let mut handler_cache = BTreeMap::new();
     let (rows, provenance) = routes_from_graph(graph);
 
     let mut routes = Vec::new();
@@ -662,9 +685,26 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
             .map(|h| resolve_handler(h, &by_id, &by_name))
             .collect();
         let mut handler_keys: BTreeSet<String> = BTreeSet::new();
+        let mut handler_keys_available = !handlers.is_empty();
         for handler in &handlers {
-            if handler["path"].is_string() {
-                handler_keys.extend(handler_return_keys(root, handler, budget));
+            let path = handler["path"].as_str().unwrap_or("");
+            let key = (path, handler["line"].as_u64(), handler["end_line"].as_u64());
+            let keys = handler_cache
+                .entry((key.0.to_string(), key.1, key.2))
+                .or_insert_with(|| {
+                    let source = sources.get(path)?;
+                    if source.len() as u64 > handler_bytes_remaining {
+                        return None;
+                    }
+                    handler_bytes_remaining -= source.len() as u64;
+                    Some(handler_return_keys(source, handler))
+                });
+            match keys {
+                Some(keys) => handler_keys.extend(keys.iter().cloned()),
+                None => {
+                    handler_keys_available = false;
+                    report.handler_sources_unavailable += 1;
+                }
             }
         }
         let consumers: Vec<Value> = sites
@@ -697,7 +737,8 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
                 None => Value::Null,
             },
             "handlers": handlers,
-            "handler_keys": handler_keys.into_iter().collect::<Vec<_>>(),
+            "handler_keys": if handler_keys_available { json!(handler_keys.into_iter().collect::<Vec<_>>()) } else { Value::Null },
+            "handler_keys_available": handler_keys_available,
             "consumers": consumers,
             // Absent by name when absent. A null `framework` means no route
             // node declared one — an edge-only route out of a generation older
@@ -790,13 +831,24 @@ pub fn shape_check_over(mapped: &Value, route_filter: Option<&str>) -> Value {
             }
         }
 
-        let missing: Vec<&String> = consumer_keys.difference(&handler_keys).collect();
-        let unused: Vec<&String> = handler_keys.difference(&consumer_keys).collect();
+        let available = route["handler_keys_available"].as_bool().unwrap_or(false);
+        let missing: Vec<&String> = if available {
+            consumer_keys.difference(&handler_keys).collect()
+        } else {
+            Vec::new()
+        };
+        let unused: Vec<&String> = if available {
+            handler_keys.difference(&consumer_keys).collect()
+        } else {
+            Vec::new()
+        };
         // A mismatch is a positive finding and needs both sides actually read.
         // With no consumer keys there is nothing to compare, and with an
         // incomplete scan the consumer side is a lower bound — neither is a
         // clean bill of health, so neither reports one.
-        let verdict = if consumer_keys.is_empty() {
+        let verdict = if !available {
+            "handler_source_unavailable"
+        } else if consumer_keys.is_empty() {
             "no_consumer_keys"
         } else if !missing.is_empty() {
             "mismatch"
@@ -810,7 +862,8 @@ pub fn shape_check_over(mapped: &Value, route_filter: Option<&str>) -> Value {
             "route": route["path"],
             "verb": route["verb"],
             "route_id": route["id"],
-            "handler_keys": handler_keys.iter().collect::<Vec<_>>(),
+            "handler_keys": route["handler_keys"],
+            "handler_keys_available": available,
             "consumer_keys": consumer_keys.iter().collect::<Vec<_>>(),
             "missing_in_handler": missing,
             "unused_by_consumers": unused,
@@ -877,7 +930,14 @@ pub fn api_impact(root: &Path, graph: &Value, budget: &ScanBudget, target: &str)
 
     let consumers = route["consumers"].as_array().cloned().unwrap_or_default();
     let scan_complete = mapped["scan"]["complete"].as_bool().unwrap_or(false);
-    let (risk, reason) = risk_band(consumers.len(), mismatches.len(), scan_complete);
+    let (risk, reason) = if route["handler_keys_available"] != true {
+        (
+            "unknown",
+            "handler source was unavailable or exceeded the analysis budget; absence here is not evidence of no caller or no response keys".to_string(),
+        )
+    } else {
+        risk_band(consumers.len(), mismatches.len(), scan_complete)
+    };
 
     json!({
         "route": route["path"],

@@ -126,14 +126,23 @@ pub(crate) fn clamp_receiver(text: &str) -> Option<String> {
     Some(format!("{clipped}…"))
 }
 
-/// A receiver taken from a node, unwrapping Swift's `?` and `!` postfixes.
+/// A receiver taken from a node, unwrapping Swift's `?` and `!` postfixes and
+/// the `&` / `*` / `!` prefixes the whole crate strips.
 ///
 /// `opt?.warm()` and `opt!.warm()` are calls on `opt`, and the binding the
 /// resolver would match is keyed by the bare name, so leaving the operator on
 /// the text costs a receiver-type resolution for no gain.
+///
+/// The *prefix* half is the same fact and it is deliberately not a second copy
+/// of the rule: `crate::treesitter::strip_prefix_operators` owns it, and this
+/// is its second reader. The receivers the generic walker builds and the ones
+/// the per-language extractors build had drifted apart on exactly this — Swift
+/// records `!Self` for `!Self.containsNul(v)`, because tree-sitter-swift makes
+/// `!Self` the navigation target, and the `self` rung reads a receiver as a
+/// name and so could not see its own type's static method.
 pub(crate) fn receiver_from(node: Node, source: &str) -> Option<String> {
     let text = get_node_text(node, source);
-    let trimmed = text.trim();
+    let trimmed = crate::treesitter::strip_prefix_operators(text.trim());
     let unwrapped = trimmed.trim_end_matches(['!', '?']);
     if is_callee_identity(unwrapped) {
         return Some(unwrapped.to_string());

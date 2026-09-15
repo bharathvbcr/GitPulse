@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::artifacts::write_atomic;
-use crate::engine::{byte_span_to_line_range_in, resolve_source_path};
+use crate::engine::byte_span_to_line_range_in;
 use crate::manifest::{entry_root_paths, CONSUMER_MAP_ENGINE, UNWIRED_CANDIDATE_CAP};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
@@ -776,7 +776,6 @@ fn graph_core(
     let coverage = devmap_analyze::extraction_coverage(extractions);
     provenance.regex_fallback_files = coverage.pattern_recovered_files;
     provenance.parse_failed_files = coverage.parse_failed_files;
-    let root = repo_root.map(str::to_string);
     let communities = community_by_file(analysis);
 
     let mut ordered: Vec<&Extraction> = extractions.iter().collect();
@@ -788,9 +787,14 @@ fn graph_core(
     for ext in &ordered {
         // One pass over the file's bytes for every span in it; the string form
         // of the conversion scans from the top of the file per call.
-        let lines = std::fs::read_to_string(resolve_source_path(&root, &ext.file_path))
-            .ok()
-            .map(|text| LineIndex::new(&text));
+        let lines = devmap_extract::safe_fs::read_repo_source(
+            repo_root.map(Path::new),
+            &ext.file_path,
+            devmap_extract::MAX_SOURCE_BYTES,
+        )
+        .ok()
+        .filter(|text| devmap_extract::content_hash(text) == ext.content_hash)
+        .map(|text| LineIndex::new(&text));
         if lines.is_none() {
             provenance.files_without_readable_source += 1;
         }
@@ -3208,7 +3212,7 @@ mod tests {
 
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
 
         let json = generate_code_graph_json(
             &extractions,

@@ -91,6 +91,11 @@ export function sources(env = process.env, from = REPO) {
       crates: [
         "dc-glob",
         "dc-evidence",
+        // Bounded subprocess helper. Not vendored originally, because nothing
+        // in the closure depended on it; `dc-verify` and `devmap-extract` both
+        // took it as a hard dependency upstream after that, so a re-vendor
+        // without it fails to resolve rather than building a stale tree.
+        "dc-proc",
         "dc-store",
         "dc-verify",
         "devmap-analyze",
@@ -375,7 +380,18 @@ export function resolveManifest(text, workspace) {
   const result = out.join("\n");
   // Nothing may reference the workspace afterwards. A survivor would surface
   // later as a cargo error about a manifest this script claimed it had fixed.
-  const leftover = result.split("\n").find((l) => /\bworkspace\b/.test(l) && !l.trim().startsWith("#"));
+  const leftover = result.split("\n").find((l) => {
+    const trimmed = l.trim();
+    if (trimmed.startsWith("#")) return false;
+    // Blank the contents of string literals first. A value is prose, and prose
+    // may legitimately contain the word: `dc-proc` describes itself as "shared
+    // by every place this workspace shells out", which is not an inheritance
+    // reference and must not fail the vendor. Matching the raw line rejected
+    // that crate outright, which is how it stayed unvendored while two crates
+    // in the closure had already taken a hard dependency on it.
+    const withoutStrings = trimmed.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    return /\bworkspace\b/.test(withoutStrings);
+  });
   if (leftover) throw new Error(`unresolved workspace reference: ${leftover.trim()}`);
 
   return { text: result, rewrites };

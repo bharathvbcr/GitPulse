@@ -2007,7 +2007,7 @@ mod tests {
             ambiguous.confidence = devmap_extract::model::Confidence::SPECULATIVE;
             ambiguous.resolution = Some(std::sync::Arc::new(
                 devmap_resolve::model::Resolution::AmbiguousGlobal {
-                    candidates: vec![("f.py".to_string(), "helper".to_string())],
+                    candidates: vec![("f.py".to_string(), "helper".to_string())].into(),
                     family: devmap_resolve::model::LangFamily::Python,
                 },
             ));

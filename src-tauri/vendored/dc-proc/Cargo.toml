@@ -1,0 +1,21 @@
+[package]
+name = "dc-proc"
+version = "0.2.2"
+edition = "2024"
+license = "Apache-2.0"
+description = "One bounded subprocess, shared by every place this workspace shells out"
+
+[dependencies]
+libc = { version = "0.2" }
+
+# Not `[lints] workspace = true`. That sets `unsafe_code = "forbid"`, which no
+# `allow` can override, and delivering a signal to a process group is one
+# `libc::kill` call that cannot be written in safe Rust. `deny` keeps the same
+# rule everywhere else in the crate while letting the single audited block
+# opt out by name — tighter than the kernel crate this code came from, which
+# opts into no lints at all. The block carries its own SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"

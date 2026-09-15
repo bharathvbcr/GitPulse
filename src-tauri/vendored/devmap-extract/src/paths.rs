@@ -73,6 +73,15 @@ pub const CODE_GRAPH_RELPATH: &str = "graph/code_graph.json";
 pub const CODE_GRAPH_COMPACT_RELPATH: &str = "graph/code_graph.compact.json";
 /// The content-hash memo, relative to the state directory.
 pub const CONTENT_CACHE_RELPATH: &str = "cache/content_hashes.json";
+/// The `devmap`-binary digest memo, relative to the state directory.
+///
+/// Beside `content_hashes.json` in `cache/` because it is the same kind of
+/// thing — a stat-keyed memo of a digest, advisory in both directions — and
+/// separate from it because the two answer about different subjects with
+/// different algorithms: repository sources under BLAKE2b at relative paths,
+/// executables under SHA-256 at absolute ones. Merging them would put paths
+/// from outside the repository into a file the Python side reads.
+pub const BINARY_DIGEST_CACHE_RELPATH: &str = "cache/binary_digests.json";
 /// The workspace registry, relative to the state directory.
 pub const WORKSPACE_RELPATH: &str = "workspace.json";
 /// The emitted Claude Code plugin bundle, relative to the state directory.
@@ -158,6 +167,11 @@ pub fn compact_code_graph_path(root: impl AsRef<Path>) -> PathBuf {
 /// Path to the content-hash memo for `root`.
 pub fn content_cache_path(root: impl AsRef<Path>) -> PathBuf {
     state_dir(root).join(CONTENT_CACHE_RELPATH)
+}
+
+/// Path to the `devmap`-binary digest memo for `root`.
+pub fn binary_digest_cache_path(root: impl AsRef<Path>) -> PathBuf {
+    state_dir(root).join(BINARY_DIGEST_CACHE_RELPATH)
 }
 
 /// Path to the workspace registry for `root`.
@@ -317,6 +331,7 @@ mod tests {
             code_graph_path(root),
             compact_code_graph_path(root),
             content_cache_path(root),
+            binary_digest_cache_path(root),
             workspace_path(root),
             plugin_dir(root),
         ] {

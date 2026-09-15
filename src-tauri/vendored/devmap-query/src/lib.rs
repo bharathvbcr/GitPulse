@@ -27,6 +27,7 @@ pub mod model;
 pub mod query_match;
 pub mod rung;
 pub mod snapshots;
+pub mod stat_memo;
 
 pub mod semantic;
 pub mod viz;

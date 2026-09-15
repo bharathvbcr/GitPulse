@@ -151,39 +151,57 @@ impl SecretPattern {
     /// they disagree about where secrets are, which is how a key redacted by
     /// one gate leaks out of another's evidence field.
     fn matches(&self, content: &str) -> Option<String> {
-        // The prefix has to begin a token, not merely appear inside one. Without
-        // this, `sk-` matched the middle of `task-`, `disk-` and `risk-`, and a
-        // long enough kebab-case identifier would have been reported as an
-        // OpenAI key — the false positive that gets a secret gate switched off.
-        let start = content
+        self.spans(content)
+            .next()
+            .map(|span| content[span].to_string())
+    }
+
+    /// Validated UTF-8 byte spans. Rejected prefixes do not hide subsequent
+    /// candidates; a matched token is consumed once, including nested prefixes.
+    fn spans<'a>(&'a self, content: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        let mut token_end = 0;
+        let mut consumed = 0;
+        content
             .match_indices(self.prefix)
-            .map(|(at, _)| at)
-            .find(|at| starts_a_token(content, *at))?;
-        let token: String = content[start..]
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ',')
-            .collect();
-        if self.alphanumeric_body
-            && !token[self.prefix.len()..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric())
-        {
-            return None;
-        }
-        // A PEM block is identified by its full header, not by the dashes
-        // alone: certificates and public keys are ordinary trust-store
-        // content, and blocking them taught operators to wave findings
-        // through.
-        if self.prefix == "-----BEGIN" {
-            let upper = content.to_ascii_lowercase();
-            if !upper.contains("private key") {
-                return None;
-            }
-        }
-        if token.len() < self.min_len && !self.prefix.starts_with("-----") {
-            return None;
-        }
-        Some(token)
+            .filter_map(move |(start, _)| {
+                if start < consumed || !starts_a_token(content, start) {
+                    return None;
+                }
+                let end = if self.prefix == "-----BEGIN" {
+                    // Validate this header, not unrelated private-key words
+                    // elsewhere on the line. Redact the complete private header.
+                    let suffix = start + self.prefix.len();
+                    let end = suffix + content[suffix..].find("-----")? + 5;
+                    let header = &content[start..end];
+                    if header.contains(['\n', '\r'])
+                        || !header.to_ascii_lowercase().contains("private key")
+                    {
+                        return None;
+                    }
+                    end
+                } else {
+                    // Reuse the token boundary when rejected prefixes occur in
+                    // one long token, avoiding repeated scans of the same suffix.
+                    if start >= token_end {
+                        token_end = start
+                            + content[start..]
+                                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ','))
+                                .unwrap_or(content.len() - start);
+                    }
+                    let token = &content[start..token_end];
+                    if token.len() < self.min_len
+                        || (self.alphanumeric_body
+                            && !token[self.prefix.len()..]
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric()))
+                    {
+                        return None;
+                    }
+                    token_end
+                };
+                consumed = end;
+                Some(start..end)
+            })
     }
 }
 
@@ -442,31 +460,38 @@ fn safe_evidence(line: &str) -> String {
 /// gate reports. A token is replaced wherever it appears, not only at its
 /// first occurrence.
 pub fn redact_secrets(text: &str) -> String {
-    // Collect first, mutate after. Replacing while scanning would shift the
-    // offsets `matches` just computed, and a pattern matching inside the
-    // replacement text would then redact the redaction.
-    let mut tokens: Vec<(String, usize)> = Vec::new();
-    for line in text.lines() {
-        for pattern in SECRET_PATTERNS {
-            if let Some(token) = pattern.matches(line) {
-                tokens.push((token, pattern.prefix.len()));
-            }
-        }
-    }
-    if tokens.is_empty() {
-        return text.to_string();
-    }
-    // Longest first, so a short prefix cannot partially rewrite a longer token
-    // that contains it and leave the tail in place.
-    tokens.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
-
-    let mut out = text.to_string();
-    for (token, keep) in tokens {
-        if !out.contains(&token) {
+    // Preserve byte offsets until every family has been checked. Sorting and
+    // merging overlaps keeps the most specific prefix at a shared start and
+    // prevents replacement text from being interpreted as another credential.
+    let mut spans: Vec<_> = SECRET_PATTERNS
+        .iter()
+        .flat_map(|pattern| pattern.spans(text).map(|span| (span, pattern.prefix.len())))
+        .collect();
+    spans.sort_by_key(|(span, keep)| {
+        (
+            span.start,
+            std::cmp::Reverse(span.end),
+            std::cmp::Reverse(*keep),
+        )
+    });
+    let mut merged: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
+    for (span, keep) in spans {
+        if let Some((previous, _)) = merged.last_mut()
+            && span.start < previous.end
+        {
+            previous.end = previous.end.max(span.end);
             continue;
         }
-        out = out.replace(&token, &redact(&token, keep));
+        merged.push((span, keep));
     }
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (span, keep) in merged {
+        out.push_str(&text[copied..span.start]);
+        out.push_str(&redact(&text[span.clone()], keep));
+        copied = span.end;
+    }
+    out.push_str(&text[copied..]);
     out
 }
 

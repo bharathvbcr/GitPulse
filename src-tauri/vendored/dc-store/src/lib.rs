@@ -530,14 +530,33 @@ impl Store {
         if active.token != token {
             return Ok(None);
         }
-        let expires = self.iso(self.now_epoch().saturating_add(ttl_seconds));
-        // The status predicate keeps a renewal racing a force-steal from
-        // extending a row that was just marked stale.
-        self.conn.execute(
-            "UPDATE task_leases SET expires_at = ?1 WHERE id = ?2 AND status = 'active'",
-            params![expires, active.id],
-        )?;
-        self.select_active(task_id)
+        let now = self.now_epoch();
+        if let Some(expiry) = active.expires_at.as_deref() {
+            let epoch = parse_iso_utc(expiry).ok_or_else(|| StoreError::BadTimestamp {
+                value: expiry.to_string(),
+            })?;
+            if now > epoch {
+                return Ok(None);
+            }
+        }
+        let expires = self.iso(now.saturating_add(ttl_seconds));
+        // Mutation and receipt are one SQLite statement tied to the exact
+        // authenticated lease. A replacement or release returns None. Another
+        // renewal by this same holder remains valid; check the live expiry
+        // instead of requiring its earlier snapshot to remain unchanged.
+        Ok(self
+            .conn
+            .query_row(
+                "UPDATE task_leases SET expires_at = ?1
+             WHERE id = ?2 AND task_id = ?3 AND lease_token = ?4
+               AND status = 'active'
+               AND (expires_at IS NULL OR unixepoch(expires_at) >= ?5)
+             RETURNING id, task_id, owner, agent, client_id, run_id, branch,
+                       lease_token, status, created_at, expires_at, released_at",
+                params![expires, active.id, task_id, token, now],
+                row_to_lease,
+            )
+            .optional()?)
     }
 
     /// Every currently-live lease, with expiry applied.

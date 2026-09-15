@@ -18,21 +18,34 @@ use dc_verify::{classify_scope, parse_unified};
 #[path = "../evidence_cli.rs"]
 mod evidence_cli;
 
+// A disconnected consumer is a transport failure, not a Rust panic. Keep
+// diagnostics off this JSON protocol, including the error response path.
+macro_rules! respond {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
+            .and_then(|()| out.flush()).is_err() {
+            return ExitCode::FAILURE;
+        }
+    }};
+}
+
 fn main() -> ExitCode {
     let args = match collect_args() {
         Ok(args) => args,
         Err(message) => {
-            println!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
             return ExitCode::from(2);
         }
     };
     match run(&args) {
         Ok(json) => {
-            println!("{json}");
+            respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(message) => {
-            println!("{{\"ok\":false,\"error\":{}}}", quote(&message));
+            respond!("{{\"ok\":false,\"error\":{}}}", quote(&message));
             ExitCode::from(2)
         }
     }

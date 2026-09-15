@@ -17,6 +17,7 @@
 //! counts ride in the payload and both are printed in the page header, so
 //! "1,000 of 12,103 nodes" is what the reader sees, never "1,000 nodes".
 
+use crate::escape::html_escape;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
@@ -642,7 +643,7 @@ if (!DATA.nodes.length) {{
   const graph = ForceGraph()(el)
     .backgroundColor('#0f1419')
     .nodeId('id')
-    .nodeLabel(n => n.name + '  ·  ' + n.path)
+    .nodeLabel(n => esc(n.name + '  ·  ' + n.path))
     .nodeColor(colorFor)
     .nodeRelSize(3)
     .nodeVal(n => 1 + Math.min(n.degree || 0, VIEW.degree_cap || 40))
@@ -774,11 +775,18 @@ if (!DATA.nodes.length) {{
   document.getElementById('q').addEventListener('input', apply);
   document.getElementById('hideNotes').addEventListener('change', apply);
   for (const [flag, label] of (VIEW.flag_filters || [])) {{
+    // Built as nodes, not markup: the id is read back verbatim by
+    // getElementById below, so escaping it into an HTML string would either
+    // break the lookup or leave the attribute breakable.
     const wrap = document.createElement('label');
     wrap.className = 'row';
-    wrap.innerHTML = '<input type="checkbox" id="flag-' + flag + '"/> ' + esc(label);
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.id = 'flag-' + flag;
+    wrap.appendChild(box);
+    wrap.appendChild(document.createTextNode(' ' + label));
     document.getElementById('flagFilters').appendChild(wrap);
-    wrap.querySelector('input').addEventListener('change', apply);
+    box.addEventListener('change', apply);
   }}
   document.getElementById('labels').addEventListener('change', e => {{
     showLabels = e.target.checked;
@@ -798,13 +806,6 @@ if (!DATA.nodes.length) {{
         force_graph = FORCE_GRAPH_JS,
         data_literal = embed_json(&Value::String(data)),
     )
-}
-
-fn html_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 #[cfg(test)]

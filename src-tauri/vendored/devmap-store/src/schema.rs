@@ -825,10 +825,41 @@ CREATE INDEX IF NOT EXISTS idx_edge_rows_target ON edge_rows(target_file_id);
 CREATE INDEX IF NOT EXISTS idx_edge_rows_closed
     ON edge_rows(valid_to) WHERE valid_to IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
-    ON unresolved_rows(callee_name);
-CREATE INDEX IF NOT EXISTS idx_unresolved_rows_class
-    ON unresolved_rows(classification);
+-- The ledger's prune index, and only the prune's, for the reason the edge
+-- comment above gives.
+--
+-- There were two more here — `idx_unresolved_rows_callee` on `callee_name` and
+-- `idx_unresolved_rows_class` on `classification` — dropped in v21 because
+-- nothing read them. They are the v18 residue of
+-- `idx_generation_unresolved_callee`/`_class`, which indexed
+-- `(generation_id, callee_name)` and `(generation_id, classification)` on the
+-- per-generation *table*. v18 turned that table into a view over
+-- `unresolved_rows`, the leading `generation_id` column stopped existing, and
+-- the indexes were carried across as single-column ones. What survived the
+-- rename was the half that never had a query.
+--
+-- Confirmed two ways before removing them, because a static "no caller" is
+-- weak evidence for an index: no *production* statement filters this relation
+-- on either column — every statement in `db.rs` that touches it restricts on
+-- `valid_to` or `unresolved_id`, reaches it through the `generation_unresolved`
+-- view's join to `generations`, or counts — and `EXPLAIN QUERY PLAN` picks
+-- neither index for any of them (they plan `SCAN unresolved_rows`; the prune
+-- uses `_closed`). There is no ad-hoc SQL surface, and no reader outside this
+-- workspace.
+--
+-- One statement in the tree does filter `callee_name`, and saying so is the
+-- point of writing the evidence down rather than the conclusion:
+-- `devmap-cli/tests/incremental_equivalence.rs` plants a deliberately wrong
+-- classification on one named call. It runs once, against a store holding a
+-- handful of rows, where a scan is the correct plan — an index earns nothing
+-- there and would still cost a b-tree insertion on each of the 180,679 rows a
+-- real build writes. A fixture is not a reader an index exists for.
+--
+-- They were not free. This repository writes 180,679 ledger rows on a cold
+-- build, so the pair cost two b-tree insertions per row and 8 MB of a 162 MB
+-- store, to serve nothing. `classification` could not have earned it in any
+-- case: eight distinct values over 180,679 rows is a key that selects a
+-- twentieth of the table.
 CREATE INDEX IF NOT EXISTS idx_unresolved_rows_closed
     ON unresolved_rows(valid_to) WHERE valid_to IS NOT NULL;
 
@@ -986,6 +1017,178 @@ CREATE TABLE IF NOT EXISTS generation_file_digests (
 ) WITHOUT ROWID;
 "#;
 
+/// Drop the two unread indexes on the unresolved-call ledger.
+///
+/// See the comment beside `idx_unresolved_rows_closed` in
+/// [`VALIDITY_RANGE_TABLES`] for what they were and how "nothing reads them"
+/// was established. This rung is what takes them off stores that already have
+/// them; removing the `CREATE INDEX` statements only stops new stores getting
+/// them.
+///
+/// `DROP INDEX IF EXISTS`, so the rung is idempotent and a store built by a
+/// binary that never created them migrates as cleanly as one that did.
+///
+/// The pages the indexes held return to the freelist rather than to the
+/// filesystem. `auto_vacuum = INCREMENTAL` is set on every connection and
+/// `vacuum_if_needed` reclaims on its own schedule, which is the same path
+/// every other deletion in this store takes; a `VACUUM` here would rewrite the
+/// whole database inside a migration, which is the one place it must not
+/// happen.
+pub const MIGRATION_V20_TO_V21: &str = r#"
+DROP INDEX IF EXISTS idx_unresolved_rows_callee;
+DROP INDEX IF EXISTS idx_unresolved_rows_class;
+"#;
+
+/// Intern the ledger's three repeating columns out of `unresolved_rows`.
+///
+/// `unresolved_rows` was 50.8 MB of a 147 MB store — a third of it — and three
+/// of its columns were the same handful of strings written over and over. On
+/// this repository's 181,163 rows, measured:
+///
+/// ```text
+///   reason          130.1 B/row   23.5 MB    46,978 distinct
+///   source_file      40.4 B/row    7.3 MB     1,093 distinct
+///   classification   14.2 B/row    2.6 MB         8 distinct
+/// ```
+///
+/// `source_file` becomes a `paths(id)`, which is what `edge_rows` has always
+/// stored and what the ledger should have taken in v18 — the two relations now
+/// key their per-file digests the same way instead of one by id and one by
+/// text. `reason` and `classification` become ids into `unresolved_texts`.
+///
+/// **One pool for both**, not one table each. The id is what the row stores and
+/// uniqueness is on the text, so a classification label that happened to equal
+/// a reason would share an id and mean the same string either way. Two tables
+/// would be two schemas, two prunes and two lookups for one question: "what
+/// integer stands for this text".
+///
+/// `AUTOINCREMENT`, like `paths`, and load-bearing rather than decorative: the
+/// row identity the write path compares — and the digest it folds into
+/// `generation_file_digests` — is now built from these ids, so an id that was
+/// retired and later handed to *different* text would make a stale digest
+/// compare equal to a changed ledger. AUTOINCREMENT is what makes an id mean
+/// one string for the life of the store.
+///
+/// The first build after this migration re-derives every digest, because the
+/// stored ones were folded from text and the fresh ones are folded from ids.
+/// That costs one full comparison pass and rewrites nothing: the rows still
+/// match, so they are kept and only the digests are replaced. Failing that way
+/// round is the safe one — a digest that no longer matches makes the next build
+/// do more work, never less.
+///
+/// # The three `REFERENCES` are not free, and are kept anyway
+///
+/// `foreign_keys` is `ON` for every connection, so each of this repository's
+/// 181,163 ledger rows costs three parent lookups on insert — 543,489 of them,
+/// measured at 56 ms of a cold build. Dropping the three declarations takes the
+/// ledger write from 215 ms to 158 ms, and that was measured rather than
+/// guessed before deciding to keep them.
+///
+/// They are kept because of what they catch. `prune_generations_except_latest`
+/// retires a `paths` row once no relation names it, as an anti-join listing
+/// every such relation by hand — and v22 adds one to that list. Get that list
+/// wrong and the delete succeeds, the ledger's `source_file_id` dangles, and
+/// `generation_unresolved` inner-joins those rows straight out of every
+/// reader's view: unresolved calls silently stop existing, which is the exact
+/// shape of dishonesty this store is built to refuse. With the foreign key the
+/// delete fails loudly instead.
+///
+/// Every other relation keyed on `paths` declares the same constraint —
+/// `edge_rows` twice, and it carries the cost on the same builds — so this is
+/// the house rule rather than an exception made for the ledger. The cost falls
+/// on cold builds alone: an incremental write inserts few rows and pays it few
+/// times.
+///
+/// # What interning costs the *reader*
+///
+/// Recorded because the write-side gain is the number everyone will quote and
+/// it is only half the trade. `generation_unresolved` now resolves three
+/// `INTEGER PRIMARY KEY` lookups per row — path, reason, classification — that
+/// the flat table did not do at all. Measured on this repository's store
+/// (181,303 rows), interleaved, min of five, v20 store against v22:
+///
+/// | query over the view          | v20     | v22     |       |
+/// |------------------------------|---------|---------|-------|
+/// | `COUNT(*)`                   | 0.015 s | 0.047 s | 3.19x |
+/// | project all six columns      | 0.108 s | 0.157 s | 1.45x |
+/// | the same, ordered            | 0.111 s | 0.149 s | 1.34x |
+///
+/// `COUNT(*)` suffers most because the joins are inner joins and SQLite may
+/// not omit them: every row has to be shown to have a parent even when no
+/// column of that parent is selected.
+///
+/// Accepted, on two grounds that are facts rather than judgement. Nothing in
+/// this workspace reads the view in production — `latest_unresolved` (which is
+/// `LIMIT`ed) and `count_unresolved_rows` are its only callers and both are
+/// reached only from tests — and no crate outside `devmap-store` touches the
+/// relation at all. And the shape measured above is a whole-view scan, which
+/// no caller performs.
+///
+/// It is written down anyway because the view's column names are the contract
+/// an outside reader holds, so one may appear; if a caller ever does scan the
+/// whole view, this table is where the cost was already known. Making the three
+/// joins `LEFT` would let SQLite omit them and take `COUNT(*)` back, and is
+/// deliberately not done: an inner join makes a row with a dangling id vanish
+/// and fail a count, where a left join would hand the reader a plausible
+/// `NULL`.
+pub const MIGRATION_V21_TO_V22: &str = r#"
+CREATE TABLE IF NOT EXISTS unresolved_texts (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE unresolved_rows_v22 (
+    unresolved_id     INTEGER PRIMARY KEY,
+    source_file_id    INTEGER NOT NULL REFERENCES paths(id),
+    source_symbol     TEXT NOT NULL,
+    callee_name       TEXT NOT NULL,
+    reason_id         INTEGER NOT NULL REFERENCES unresolved_texts(id),
+    classification_id INTEGER NOT NULL REFERENCES unresolved_texts(id),
+    receiver          TEXT,
+    valid_from        INTEGER NOT NULL,
+    valid_to          INTEGER,
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+INSERT OR IGNORE INTO unresolved_texts (text) SELECT DISTINCT reason FROM unresolved_rows;
+INSERT OR IGNORE INTO unresolved_texts (text) SELECT DISTINCT classification FROM unresolved_rows;
+INSERT OR IGNORE INTO paths (path) SELECT DISTINCT source_file FROM unresolved_rows;
+
+INSERT INTO unresolved_rows_v22
+    (unresolved_id, source_file_id, source_symbol, callee_name,
+     reason_id, classification_id, receiver, valid_from, valid_to)
+SELECT u.unresolved_id, p.id, u.source_symbol, u.callee_name,
+       r.id, c.id, u.receiver, u.valid_from, u.valid_to
+  FROM unresolved_rows u
+  JOIN paths p            ON p.path = u.source_file
+  JOIN unresolved_texts r ON r.text = u.reason
+  JOIN unresolved_texts c ON c.text = u.classification;
+
+DROP VIEW IF EXISTS generation_unresolved;
+DROP TABLE unresolved_rows;
+ALTER TABLE unresolved_rows_v22 RENAME TO unresolved_rows;
+
+CREATE INDEX IF NOT EXISTS idx_unresolved_rows_closed
+    ON unresolved_rows(valid_to) WHERE valid_to IS NOT NULL;
+
+CREATE VIEW generation_unresolved AS
+SELECT g.id             AS generation_id,
+       u.unresolved_id  AS ordinal,
+       p.path           AS source_file,
+       u.source_symbol  AS source_symbol,
+       u.callee_name    AS callee_name,
+       r.text           AS reason,
+       c.text           AS classification,
+       u.receiver       AS receiver
+  FROM unresolved_rows u
+  JOIN generations g
+    ON g.id >= u.valid_from
+   AND (u.valid_to IS NULL OR g.id < u.valid_to)
+  JOIN paths p            ON p.id = u.source_file_id
+  JOIN unresolved_texts r ON r.id = u.reason_id
+  JOIN unresolved_texts c ON c.id = u.classification_id;
+"#;
+
 /// The schema this binary writes.
 ///
 /// # Why there is no v20 putting the nodes on ranges
@@ -1061,7 +1264,7 @@ VALUES (1, lower(hex(randomblob(16))), 1,
 UPDATE pending_paths SET revision = 1;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 20;
+pub const CURRENT_SCHEMA_VERSION: i32 = 22;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1094,6 +1297,8 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     COVERAGE_GAPS_TABLE,
     MIGRATION_V18_TO_V19,
     MIGRATION_V19_TO_V20,
+    MIGRATION_V20_TO_V21,
+    MIGRATION_V21_TO_V22,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.
@@ -1135,8 +1340,28 @@ fn without_sql_comments(sql: &str) -> String {
 /// statement here is `IF NOT EXISTS`, so replaying them on a store that has
 /// the index is a no-op; `every_declared_index_statement_is_idempotent` pins
 /// that.
+///
+/// One statement per index, even when two batches declare the same one.
+///
+/// [`declared_index_names`] has always deduplicated and this did not, which was
+/// invisible while no index appeared in two batches. v22 makes one appear in
+/// two: it drops `unresolved_rows` to reinterned columns and so has to recreate
+/// `idx_unresolved_rows_closed`, which `VALIDITY_RANGE_TABLES` also declares
+/// because that is where the table is first built. Both declarations are
+/// right, and replaying an identical `CREATE … IF NOT EXISTS` twice is simply
+/// nothing happening twice.
+///
+/// Deduplicated on the **whole statement**, not on the index name. Two batches
+/// declaring one name with different definitions is a genuine contradiction
+/// about what the index is, and it must keep reaching
+/// `every_declared_index_statement_is_idempotent_and_names_a_gated_index` as
+/// the mismatch it is rather than being collapsed away here.
+///
+/// Insertion order is kept rather than sorted: these are replayed as DDL, and
+/// DDL that reads in schema order is easier to follow when one of them fails.
 pub fn declared_index_statements() -> Vec<String> {
     let mut statements = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for batch in FRESH_SCHEMA_BATCHES {
         let sql = without_sql_comments(batch);
         for chunk in sql.split("CREATE ").skip(1) {
@@ -1147,7 +1372,10 @@ pub fn declared_index_statements() -> Vec<String> {
             let Some(end) = chunk.find(';') else {
                 continue;
             };
-            statements.push(format!("CREATE {};", chunk[..end].trim()));
+            let statement = format!("CREATE {};", chunk[..end].trim());
+            if seen.insert(statement.clone()) {
+                statements.push(statement);
+            }
         }
     }
     statements

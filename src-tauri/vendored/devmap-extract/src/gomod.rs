@@ -96,13 +96,34 @@ fn parse_replace_spec(spec: &str) -> Option<(String, String)> {
 pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
     let mut modules = Vec::new();
     let walk_root = root.to_path_buf();
+    let marker_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let marker_error_writer = std::sync::Arc::clone(&marker_error);
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .filter_entry(move |entry| {
-            entry.path() == walk_root
-                || !entry.file_type().is_some_and(|kind| kind.is_dir())
-                || !crate::is_cache_directory(entry.path())
+            if entry.path() == walk_root || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                return true;
+            }
+            match crate::is_cache_directory(entry.path()) {
+                Ok(tagged) => !tagged,
+                Err(error) => {
+                    // Let the walk report a directory it cannot open through
+                    // the below-root refusal path below. Discovery already
+                    // accounts for that hole; an unreadable marker inside an
+                    // otherwise readable directory still fails this pass.
+                    if fs::read_dir(entry.path()).is_err() {
+                        return true;
+                    }
+                    crate::recover_lock(&marker_error_writer).get_or_insert_with(|| {
+                        format!(
+                            "cannot examine {}/CACHEDIR.TAG: {error}",
+                            entry.path().display()
+                        )
+                    });
+                    false
+                }
+            }
         })
         .build();
     for result in walker {
@@ -154,6 +175,9 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
         if let Some(module) = parse_go_mod(&rel_str, &source) {
             modules.push(module);
         }
+    }
+    if let Some(reason) = crate::recover_lock(&marker_error).take() {
+        anyhow::bail!("{reason}");
     }
     modules.sort_by(|left, right| {
         right

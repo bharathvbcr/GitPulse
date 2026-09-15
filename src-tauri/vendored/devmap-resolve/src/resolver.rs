@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
@@ -16,6 +17,78 @@ type PackageDecl = (String, String, SymbolKind);
 /// Candidate file, kind, language family, and stable qualified identity.
 type IndexedSymbol = (String, SymbolKind, LangFamily, Arc<str>);
 
+type CandidateSet = Arc<[(String, String)]>;
+
+fn escaped_evidence_bytes(value: &str) -> u64 {
+    value.bytes().fold(0u64, |total, byte| {
+        // Ordinary printable ASCII is literal in both compact JSON and Rust
+        // Debug strings. Keep the six-byte bound for quotes, backslashes,
+        // control characters and each UTF-8 byte that may need escaping.
+        total.saturating_add(
+            if (0x20..=0x7e).contains(&byte) && !matches!(byte, b'"' | b'\\') {
+                1
+            } else {
+                6
+            },
+        )
+    })
+}
+
+struct GlobalCandidates {
+    rows: CandidateSet,
+    declarations: usize,
+    evidence_bytes: u64,
+}
+type CandidateKey = (LangFamily, String, String);
+
+#[derive(Default)]
+struct GlobalCandidateCache {
+    sets: BTreeMap<CandidateKey, Arc<GlobalCandidates>>,
+    visits: u64,
+    retained_bytes: u64,
+}
+
+fn charge(
+    value: &mut u64,
+    additional: u64,
+    limit: u64,
+    resource: &'static str,
+) -> Result<(), ResolutionLimitError> {
+    let attempted = value.saturating_add(additional);
+    if attempted > limit {
+        return Err(ResolutionLimitError {
+            resource,
+            limit,
+            attempted,
+        });
+    }
+    *value = attempted;
+    Ok(())
+}
+
+fn charge_ambiguity(
+    counter: &AtomicU64,
+    candidates: &GlobalCandidates,
+    limit: u64,
+) -> Result<(), ResolutionLimitError> {
+    let rows = if candidates.rows.len() > AMBIGUOUS_FANOUT_CAP {
+        1
+    } else {
+        candidates.rows.len() as u64
+    };
+    let additional = candidates.evidence_bytes.saturating_mul(rows);
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(additional).filter(|next| *next <= limit)
+        })
+        .map(|_| ())
+        .map_err(|used| ResolutionLimitError {
+            resource: "ambiguity evidence bytes",
+            limit,
+            attempted: used.saturating_add(additional),
+        })
+}
+
 /// Where the name a resolution rung failed on was written.
 ///
 /// The tiers in [`UnresolvedClass`] are stated over evidence, and the evidence
@@ -27,17 +100,52 @@ type IndexedSymbol = (String, SymbolKind, LangFamily, Arc<str>);
 /// actually exists, instead of a caller pre-deciding which class to file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsePosition<'a> {
-    /// A call, or an identifier in expression position.
-    Value,
+    /// A call or expression-position identifier, with its exact receiver
+    /// binding. Graph caller scopes cannot distinguish anonymous callbacks.
+    Value {
+        receiver_binding: Option<&'a LocalBinding>,
+    },
     /// A type annotation. `types` names the value this annotation types — `t`
     /// for `t *testing.T` — when the extractor recorded one, because that is
     /// the key the `TypeQualifier` sibling was indexed under.
     Type { types: Option<&'a str> },
 }
 
+impl<'a> UsePosition<'a> {
+    fn value_at(extraction: &'a Extraction, start_byte: usize, receiver: Option<&str>) -> Self {
+        Self::Value {
+            receiver_binding: receiver.and_then(|receiver| {
+                extraction
+                    .local_binding_at(start_byte, Resolver::path_root(receiver))
+                    .or_else(|| extraction.local_binding_at(start_byte, receiver))
+            }),
+        }
+    }
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
+    /// Every indexed file, grouped by its parent directory, each group sorted.
+    ///
+    /// Three call sites answered "which files sit directly in this directory"
+    /// by scanning *every* key of `file_symbols` and calling `parent_dir` on
+    /// each: `go_files_in_dir`, the package-suffix fallback in
+    /// `resolve_go_import`, and `files_in_dir_with_extensions`. Go import
+    /// resolution calls the first up to four times per import, so the cost was
+    /// O(imports x files in the repository) — and `parent_dir` allocates twice
+    /// per call, through `Path::parent` and `to_string_lossy().replace()`.
+    ///
+    /// Measured on scholarlm (1,942 Go files) with `sample`: 500 of the 825
+    /// samples inside `index_extractions` were this scan, 267 of them in
+    /// `parent_dir` alone.
+    ///
+    /// Grouping once costs one `parent_dir` per file per build and turns each
+    /// of those scans into a lookup. Built from `file_symbols` rather than from
+    /// the extractions so it holds exactly the population the scans walked —
+    /// `file_symbols` takes an entry per extraction unconditionally, including
+    /// files that declare no symbol.
+    files_by_dir: BTreeMap<String, Vec<String>>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -235,6 +343,7 @@ impl Resolver {
         Self {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
+            files_by_dir: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -369,7 +478,20 @@ impl Resolver {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self
                 .receiver_type_for(file, scope, root, root_binding)
-                .or_else(|| self.lookup_declared_type_name(file, scope, root))?;
+                .or_else(|| self.lookup_declared_type_name(file, scope, root))
+                .or_else(|| {
+                    // `self.lease.run()`. No map records a type under the
+                    // keyword, because `self` is not a binding any declaration
+                    // wrote — it is the type the call is written inside, which
+                    // is what X42 already reads it as one rung down. Without
+                    // this the explicit spelling resolved nothing while the bare
+                    // `lease.run()` beside it resolved, which is the wrong way
+                    // round: the explicit one says strictly more.
+                    Self::receiver_is_self(root)
+                        .then(|| scope.and_then(|scope| self.declaring_type_of(file, scope)))
+                        .flatten()
+                        .map(str::to_string)
+                })?;
             return self.field_type_on(file, &owner, field);
         }
 
@@ -395,6 +517,14 @@ impl Resolver {
             }
             if self.scope_declares_local(file, scope, name) {
                 return None;
+            }
+            // An implicit `self`: a bare name inside a method can be the
+            // enclosing type's own member. Asked after the scope's own bindings
+            // — a local named `lease` shadows the field `lease`, in every
+            // language that allows both — and before the file-wide map, which
+            // knows nothing about which type a name belongs to.
+            if let Some(member) = self.member_declared_type(file, Some(scope), name) {
+                return Some(member);
             }
         }
         self.receiver_types
@@ -494,6 +624,27 @@ impl Resolver {
         }
         self.declared_types
             .get(&format!("{file}:{name}@type"))
+            .and_then(|typed| Self::admissible_nominal_type(typed))
+    }
+
+    /// The declared type of a member named `name` on the type `scope` sits in.
+    ///
+    /// What a bare receiver means in a language with an implicit `self`:
+    /// `lease.revalidate()` written inside `Holder.run` is `self.lease`, and
+    /// `Holder`'s own declaration of `lease` is the file's written answer.
+    ///
+    /// Reads the *owner-scoped* key, which is the only one a member writes, so
+    /// a namesake member on a sibling type in the same file cannot answer here.
+    /// Swift, Kotlin, Scala, C#, Java, Python, Ruby and PHP all spell field
+    /// access this way; Rust and Go cannot, and reach fields through
+    /// [`Self::field_type_on`] instead.
+    fn member_declared_type(&self, file: &str, scope: Option<&str>, name: &str) -> Option<String> {
+        let enclosing = self.declaring_type_of(file, scope?)?;
+        // `declaring_type_of` reduces to the bare name; the key is written with
+        // the qualified spelling the extractor recorded.
+        let qualified = format!("{file}::{enclosing}");
+        self.declared_types
+            .get(&format!("{file}:{qualified}:{name}@type"))
             .and_then(|typed| Self::admissible_nominal_type(typed))
     }
 
@@ -667,7 +818,7 @@ impl Resolver {
         // Ordered the way the value rungs are: file-specific evidence (the
         // qualifier the author wrote) outranks a name list, for the same reason
         // an import outranks the host-global table.
-        if let UsePosition::Type { types } = position {
+        if let UsePosition::Type { types: Some(typed) } = position {
             // `t *testing.T`. The extractor splits the written type into a bare
             // name for dispatch and a `TypeQualifier` sibling for provenance
             // (SC25), so by the time the bare `T` fails the ladder the qualifier
@@ -675,59 +826,28 @@ impl Resolver {
             // through `declared_types`, which is where that sibling was
             // indexed, and scoped-first for the SC9 reason: a qualifier this
             // scope wrote may not speak for a same-named binding in another.
-            if let Some(typed) = types {
-                let qualifier = self
-                    .declared_types
-                    .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
-                    .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
-                if let Some(qualifier) = qualifier {
-                    if let Some(module) = self
-                        .external_imports
-                        .get(file_path)
-                        .and_then(|imports| imports.get(qualifier.as_str()))
-                    {
-                        return UnresolvedClass::External {
-                            module: module.clone(),
-                        };
-                    }
-                    // A repo-relative qualifier that named no indexed file is an
-                    // index gap, exactly as it is for a call — never `External`.
-                    if self
-                        .unindexed_local_imports
-                        .get(file_path)
-                        .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
-                    {
-                        return UnresolvedClass::Unresolved;
-                    }
-                }
-            }
-            // X43. The qualifier itself, when it *is* a reserved standard-library
-            // root: `p: std::path::PathBuf` emits a `TypeQualifier` reference
-            // named `std`, which is a module and not a type anything declares.
-            if crate::builtins::is_reserved_module_root(family, callee_name) {
-                return UnresolvedClass::External {
-                    module: callee_name.to_string(),
-                };
-            }
-            // A prelude type, and **nothing in this corpus declares the name**.
-            // The second half is the whole guard: where a file does declare it,
-            // the reference either resolved to that declaration or the resolver
-            // abstained between several, and an abstention is not evidence that
-            // the language owns the name. See `builtins::RUST_PRELUDE_TYPES`.
-            if crate::builtins::is_prelude_type(family, callee_name)
-                && !self.family_declares(family, callee_name)
-            {
-                return UnresolvedClass::Builtin;
-            }
-            if family == LangFamily::Swift && !self.family_declares(family, callee_name) {
-                let modules = self.imported_swift_modules(file_path);
-                if let Some(module) = crate::builtins::swift_sdk_module(
-                    modules.iter().map(String::as_str),
-                    callee_name,
-                ) {
+            let qualifier = self
+                .declared_types
+                .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
+                .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
+            if let Some(qualifier) = qualifier {
+                if let Some(module) = self
+                    .external_imports
+                    .get(file_path)
+                    .and_then(|imports| imports.get(qualifier.as_str()))
+                {
                     return UnresolvedClass::External {
-                        module: module.to_string(),
+                        module: module.clone(),
                     };
+                }
+                // A repo-relative qualifier that named no indexed file is an
+                // index gap, exactly as it is for a call — never `External`.
+                if self
+                    .unindexed_local_imports
+                    .get(file_path)
+                    .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
+                {
+                    return UnresolvedClass::Unresolved;
                 }
             }
         }
@@ -745,28 +865,6 @@ impl Resolver {
             return UnresolvedClass::LocalBinding;
         }
 
-        // A bare callee that the language itself declares. Checked only without
-        // a receiver: `strings.TrimSpace` is library API, and treating a
-        // matching method name as a builtin would exempt real calls.
-        if receiver.is_none() && crate::builtins::is_builtin(family, callee_name) {
-            return UnresolvedClass::Builtin;
-        }
-        if receiver.is_none()
-            && family == LangFamily::Swift
-            && !self.family_declares(family, callee_name)
-        {
-            if crate::builtins::is_prelude_type(family, callee_name) {
-                return UnresolvedClass::Builtin;
-            }
-            let modules = self.imported_swift_modules(file_path);
-            if let Some(module) =
-                crate::builtins::swift_sdk_module(modules.iter().map(String::as_str), callee_name)
-            {
-                return UnresolvedClass::External {
-                    module: module.to_string(),
-                };
-            }
-        }
         let external = self.external_imports.get(file_path);
         // An import whose specifier is repo-relative and whose target is not
         // indexed. Consulted at every point `external` is, and *ahead* of it in
@@ -790,6 +888,42 @@ impl Resolver {
             if local_gap.is_some_and(|imports| imports.contains_key(callee_name)) {
                 return UnresolvedClass::Unresolved;
             }
+            // Type names obey the same binding precedence as callees:
+            // `use other::String` and a generic `<String>` both shadow the
+            // prelude. Qualified types were handled above; only a bare name
+            // with no stronger origin may be explained by a name table.
+            if matches!(position, UsePosition::Type { .. }) {
+                if crate::builtins::is_reserved_module_root(family, callee_name) {
+                    return UnresolvedClass::External {
+                        module: callee_name.to_string(),
+                    };
+                }
+                if crate::builtins::is_prelude_type(family, callee_name)
+                    && !self.family_declares(family, callee_name)
+                {
+                    return UnresolvedClass::Builtin;
+                }
+            }
+            // Written imports outrank the language/prelude table. In
+            // particular, `from .missing import len` is an index gap rather
+            // than a builtin merely because its spelling matches one.
+            if crate::builtins::is_builtin(family, callee_name) {
+                return UnresolvedClass::Builtin;
+            }
+            if family == LangFamily::Swift && !self.family_declares(family, callee_name) {
+                if crate::builtins::is_prelude_type(family, callee_name) {
+                    return UnresolvedClass::Builtin;
+                }
+                let modules = self.imported_swift_modules(file_path);
+                if let Some(module) = crate::builtins::swift_sdk_module(
+                    modules.iter().map(String::as_str),
+                    callee_name,
+                ) {
+                    return UnresolvedClass::External {
+                        module: module.to_string(),
+                    };
+                }
+            }
             // `setTimeout()` / `fetch()`: no import binds it because the
             // runtime puts it on the global object. Checked *after* the import
             // rung on purpose — an explicit `import { fetch } from 'node-fetch'`
@@ -807,14 +941,21 @@ impl Resolver {
         // `std::fs::write()` is evidence about `std`. Both separators are
         // handled because Rust's `scoped_identifier` receivers use `::`.
         let root = Self::path_root(receiver);
+        let receiver_binding = match position {
+            UsePosition::Value { receiver_binding } => receiver_binding,
+            UsePosition::Type { .. } => None,
+        };
 
         if let Some(imports) = external {
             // `strings.TrimSpace()` / `assert.Equal()`: the receiver is the
             // local handle for a module that resolved to no indexed file.
-            if let Some(module) = imports.get(root) {
-                return UnresolvedClass::External {
-                    module: module.clone(),
-                };
+            // A captured value bearing that name is a different binding.
+            if receiver_binding.is_none() {
+                if let Some(module) = imports.get(root) {
+                    return UnresolvedClass::External {
+                        module: module.clone(),
+                    };
+                }
             }
 
             // SC25. `t.Fatalf()` where `t` is a `*testing.T`: the receiver is a
@@ -833,30 +974,26 @@ impl Resolver {
             //
             // So: if this scope says anything at all about the receiver, only
             // this scope may speak for it.
-            let scoped = |slot: &str| {
-                self.declared_types
-                    .get(&format!("{file_path}:{enclosing_symbol}:{root}{slot}"))
-            };
-            let scope_knows_receiver = scoped("@mod").is_some() || scoped("@type").is_some();
             let declared = |slot: &str| {
-                if scope_knows_receiver {
-                    scoped(slot)
-                } else {
-                    self.declared_types
-                        .get(&format!("{file_path}:{root}{slot}"))
-                }
+                self.declared_receiver_slot(
+                    file_path,
+                    enclosing_symbol,
+                    root,
+                    receiver_binding,
+                    slot,
+                )
             };
 
             // `t *testing.T`: the type is written with its package, and that
             // package is the import that resolved to nothing.
-            if let Some(module) = declared("@mod").and_then(|q| imports.get(q.as_str())) {
+            if let Some(module) = declared("@mod").and_then(|q| imports.get(q)) {
                 return UnresolvedClass::External {
                     module: module.clone(),
                 };
             }
             // `use reqwest::Client; c: &Client`: no qualifier survives at the
             // use site, but the bare type name is itself an imported binding.
-            if let Some(module) = declared("@type").and_then(|t| imports.get(t.as_str())) {
+            if let Some(module) = declared("@type").and_then(|t| imports.get(t)) {
                 return UnresolvedClass::External {
                     module: module.clone(),
                 };
@@ -868,9 +1005,13 @@ impl Resolver {
         // language type, not an imported binding. Prelude answers without an
         // import; SDK types answer only when this file imported that module.
         if family == LangFamily::Swift {
-            if let Some(declared_type) =
-                self.declared_receiver_type(file_path, enclosing_symbol, root)
-            {
+            if let Some(declared_type) = self.declared_receiver_slot(
+                file_path,
+                enclosing_symbol,
+                root,
+                receiver_binding,
+                "@type",
+            ) {
                 if crate::builtins::is_prelude_type(family, declared_type)
                     && !self.family_declares(family, declared_type)
                 {
@@ -894,7 +1035,8 @@ impl Resolver {
         // and that module is not indexed. The receiver *is* typed — by an
         // import — so this is not an uninferred receiver; it is the same index
         // gap as the bare case above.
-        if local_gap.is_some_and(|imports| imports.contains_key(root)) {
+        if receiver_binding.is_none() && local_gap.is_some_and(|imports| imports.contains_key(root))
+        {
             return UnresolvedClass::Unresolved;
         }
 
@@ -922,7 +1064,11 @@ impl Resolver {
         //   reduces to the same string — the scope's own binding tables are the
         //   only thing that separates them, and they are asked in the same
         //   direction the `LocalBinding` rung asks them.
-        let root_is_a_value_here = self.scope_declares_local(file_path, enclosing_symbol, root)
+        // A positive use-site fact is authoritative even for an untyped
+        // capture. Absence is not proof of no binding: older/hand-built
+        // extractions may omit site facts, so retain their wider evidence.
+        let root_is_a_value_here = receiver_binding.is_some()
+            || self.scope_declares_local(file_path, enclosing_symbol, root)
             || self
                 .declared_types
                 .contains_key(&format!("{file_path}:{root}@type"))
@@ -940,11 +1086,19 @@ impl Resolver {
             // Repo-relative by construction: `crate::missing::helper()` cannot
             // name anything outside this tree, so a miss is an index gap and
             // keeps the tier that says a human should look.
-            if matches!(root, "crate" | "self" | "super")
-                || self
-                    .local_module_roots
-                    .get(file_path)
-                    .is_some_and(|roots| roots.contains(root))
+            // These module roots are Rust evidence. A Python closure's
+            // `self.member`, or a Rust `self.field`, is a value access. The
+            // reduced receiver "self" cannot distinguish `self::item` from
+            // `self.item`, so only a surviving `self::module` path proves a
+            // module; keep the bare ambiguous form in the attribution gaps.
+            if family == LangFamily::Rust
+                && ((matches!(root, "crate" | "super")
+                    || (root == "self" && Self::receiver_is_module_path(receiver)))
+                    || (root != "self"
+                        && self
+                            .local_module_roots
+                            .get(file_path)
+                            .is_some_and(|roots| roots.contains(root))))
             {
                 return UnresolvedClass::ModulePath;
             }
@@ -957,6 +1111,34 @@ impl Resolver {
                 return UnresolvedClass::External {
                     module: root.to_string(),
                 };
+            }
+            // The receiver is a **prelude type**, not a module and not a value:
+            // `Vec::new()`, `String::from(s)`, `Default::default()`,
+            // `Option::Some`. These reached `UninferredReceiver`, the tier that
+            // means "the receiver is a value whose type we could not infer",
+            // and `Vec` is not a value at all — the language's own standard
+            // library declares it, so no indexed file can ever own the method.
+            // Measured on this repository: 1,532 rows, led by `Vec` (777),
+            // `String` (514) and `Default` (169).
+            //
+            // The same sentence the Swift rung two blocks above already makes
+            // for `s.count` where `s` is a `String`, in the language whose
+            // spelling for it is a path rather than a value. It carries the
+            // same veto, and the veto is the point: a repository that declares
+            // its own `Vec` keeps `Vec::new` in the attribution gaps, because
+            // there the corpus — not the prelude — is the authority.
+            //
+            // Placed after the module-root rungs on purpose. A `use
+            // other::Vec` made this file's `Vec` something else, and that
+            // import is file-specific evidence that outranks a name table —
+            // the rule the bare-name ladder states where it checks imports
+            // before `is_builtin`.
+            if !root_is_a_value_here
+                && receiver == root
+                && crate::builtins::is_prelude_type(family, root)
+                && !self.family_declares(family, root)
+            {
+                return UnresolvedClass::Builtin;
             }
         }
 
@@ -1081,6 +1263,7 @@ impl Resolver {
         // for a rebuild.
         self.symbol_index.clear();
         self.file_symbols.clear();
+        self.files_by_dir.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -1254,6 +1437,27 @@ impl Resolver {
                 }
             }
         }
+
+        // Group the indexed files by directory once, now that `file_symbols`
+        // holds the complete set and before pass two asks the first "what is in
+        // this directory" question. Built into a local because the loop borrows
+        // `file_symbols` for the whole walk.
+        //
+        // Each group comes out ascending — `BTreeMap::keys` yields sorted keys
+        // and the push preserves that — but the sort is explicit rather than
+        // inherited, so the ordering `go_files_in_dir` and
+        // `files_in_dir_with_extensions` promise survives a change of source.
+        let mut files_by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in self.file_symbols.keys() {
+            files_by_dir
+                .entry(Self::parent_dir(path))
+                .or_default()
+                .push(path.clone());
+        }
+        for files in files_by_dir.values_mut() {
+            files.sort();
+        }
+        self.files_by_dir = files_by_dir;
 
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
@@ -1550,7 +1754,8 @@ impl Resolver {
                     } else {
                         "@type"
                     };
-                    if let Some(scope) = reference.enclosing_symbol.as_deref() {
+                    let scope = reference.enclosing_symbol.as_deref();
+                    if let Some(scope) = scope {
                         Self::bind_receiver(
                             &mut self.declared_types,
                             &mut self.poisoned_receiver_keys,
@@ -1767,7 +1972,20 @@ impl Resolver {
         chains
     }
 
-    pub fn resolve_all(&self, extractions: &[Extraction]) -> ResolutionResult {
+    pub fn resolve_all(
+        &self,
+        extractions: &[Extraction],
+    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        self.resolve_all_with_limits(extractions, ResolutionLimits::default())
+    }
+
+    pub fn resolve_all_with_limits(
+        &self,
+        extractions: &[Extraction],
+        limits: ResolutionLimits,
+    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        let global_candidates = Mutex::new(GlobalCandidateCache::default());
+        let ambiguity_bytes = AtomicU64::new(0);
         // Per-file resolution runs in parallel.
         //
         // Sound because the loop body below reads only `self` — the symbol and
@@ -1796,7 +2014,8 @@ impl Resolver {
         );
         let per_file: Vec<FileResolution> = extractions
             .par_iter()
-            .map(|ext| {
+            .map(|ext| -> Result<FileResolution, ResolutionLimitError> {
+                let mut local_candidates: BTreeMap<&str, Arc<GlobalCandidates>> = BTreeMap::new();
                 let mut edges: Vec<ResolvedEdge> = Vec::new();
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
                 let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -2276,86 +2495,30 @@ impl Resolver {
                         }));
                     }
 
-                    // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
-                    //
-                    // Bare names only. A call with an explicit receiver is
-                    // resolved only through the receiver rungs above (1, 1b,
-                    // 2b, 2d). Falling through to bare-name global here is what
-                    // turned `String::new()` / `map.get()` into AmbiguousGlobal
-                    // edges to every `new` / `get` in the corpus — 71% of
-                    // GitPulse edges before this gate.
+                    // Bare global names share one immutable set per visibility
+                    // scope. Receiver and earlier proven rungs stay unchanged.
                     if resolution.is_none() && call.receiver_expr.is_none() {
-                        if let Some(hits) = self.symbol_index.get(&call.callee_name) {
-                            // The same scope test rung 2c applies, for the same
-                            // reason: a bare `run()` cannot reach a method of
-                            // some class, and letting the global rung do what
-                            // 2c was stopped from doing would move the
-                            // fabricated edge rather than remove it — the
-                            // fabricated caller still shields the method from
-                            // the dead-code pass, only at HIGH instead of
-                            // DETERMINISTIC.
-                            //
-                            // Cross-file, the sibling shape cannot apply at all:
-                            // an implicit receiver reaches the enclosing type,
-                            // which is a different symbol in a different file.
-                            // So the test is a plain "declared at file level",
-                            // and it is applied only to the families whose
-                            // scoping rules are stated in `bare_name_is_in_scope`
-                            // — a C++ method defined in a `.cpp` and declared in
-                            // its header is exactly the cross-file sibling this
-                            // would otherwise sever.
-                            let family_hits: Vec<_> = hits
-                                .iter()
-                                .filter(|(path, _kind, candidate_family, identity)| {
-                                    family.admits(*candidate_family)
-                                        && (*candidate_family != LangFamily::Go
-                                            || Self::go_symbol_visible_from(
-                                                &ext.file_path,
-                                                path,
-                                                &call.callee_name,
-                                            ))
-                                        && (!Self::family_needs_explicit_receiver(family)
-                                            || self.declared_at_file_level(path, identity))
-                                })
-                                .collect();
-                            if family_hits.len() == 1 {
-                                let (target_f, _, _, target_identity) = family_hits[0];
-                                // G3: Python stdlib-name guard inside UniqueGlobal rung only
-                                let is_python_stdlib_guard = family == LangFamily::Python
-                                    && matches!(
-                                        call.callee_name.as_str(),
-                                        "open" | "dir" | "print" | "type" | "id" | "len"
-                                    )
-                                    && target_f != &ext.file_path;
-
-                                if !is_python_stdlib_guard {
-                                    resolution = Some(Arc::new(Resolution::UniqueGlobal {
-                                        target_symbol: target_identity.to_string(),
-                                        target_file: target_f.clone(),
-                                        family,
-                                    }));
-                                }
-                            } else if family_hits.len() > 1 {
-                                // G5: Multi-candidate pick MUST NOT emit Extracted / HIGH confidence
-                                let mut candidates: Vec<(String, String)> = family_hits
-                                    .iter()
-                                    .map(|(f, _, _, identity)| ((*f).clone(), identity.to_string()))
-                                    .collect();
-                                // R4. `symbol_index` values are in input-slice
-                                // order, and that order used to flow straight
-                                // into `candidates` — a field of every emitted
-                                // edge, a key in the sort comparator and a term
-                                // in the dedup predicate. Reversing the input
-                                // slice reversed every candidate list. Sorting
-                                // here is also what makes the fan-out ceiling
-                                // below decide on a stable total.
-                                candidates.sort();
-                                candidates.dedup();
-                                resolution = Some(Arc::new(Resolution::AmbiguousGlobal {
-                                    candidates,
-                                    family,
+                        let candidates = match local_candidates.get(call.callee_name.as_str()) {
+                            Some(candidates) => Arc::clone(candidates),
+                            None => {
+                                let candidates = self.global_candidates(&global_candidates, &ext.file_path, family, &call.callee_name, limits)?;
+                                local_candidates.insert(&call.callee_name, Arc::clone(&candidates));
+                                candidates
+                            }
+                        };
+                        if candidates.declarations == 1 {
+                            let (target_f, target_identity) = &candidates.rows[0];
+                            let is_python_stdlib_guard = family == LangFamily::Python
+                                && matches!(call.callee_name.as_str(), "open" | "dir" | "print" | "type" | "id" | "len")
+                                && target_f != &ext.file_path;
+                            if !is_python_stdlib_guard {
+                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
                                 }));
                             }
+                        } else if candidates.declarations > 1 {
+                            charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
+                            resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));
                         }
                     }
 
@@ -2433,7 +2596,11 @@ impl Resolver {
                             &call.callee_name,
                             call.receiver_expr.as_deref(),
                             &caller_sym,
-                            UsePosition::Value,
+                            UsePosition::value_at(
+                                ext,
+                                call.span.start_byte,
+                                call.receiver_expr.as_deref(),
+                            ),
                         );
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
@@ -2514,7 +2681,11 @@ impl Resolver {
                             types: reference.assigned_to.as_deref(),
                         }
                     } else {
-                        UsePosition::Value
+                        UsePosition::value_at(
+                            ext,
+                            reference.span.start_byte,
+                            reference.receiver_expr.as_deref(),
+                        )
                     };
                     let class = self.classify_unresolved(
                         &ext.file_path,
@@ -2660,9 +2831,9 @@ impl Resolver {
                         Some(route.framework.clone()),
                     ));
                 }
-                (edges, unresolved, package_groups)
+                Ok((edges, unresolved, package_groups))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut edges: Vec<ResolvedEdge> = Vec::new();
         let mut unresolved: Vec<UnresolvedReference> = Vec::new();
@@ -2752,12 +2923,79 @@ impl Resolver {
             ))
         });
 
-        ResolutionResult {
+        Ok(ResolutionResult {
             edges,
             receiver_types: self.receiver_types.clone(),
             reexport_chains: self.reexport_chains.clone(),
             unresolved,
+        })
+    }
+    fn global_candidates(
+        &self,
+        cache: &Mutex<GlobalCandidateCache>,
+        file: &str,
+        family: LangFamily,
+        name: &str,
+        limits: ResolutionLimits,
+    ) -> Result<Arc<GlobalCandidates>, ResolutionLimitError> {
+        // Unexported Go names have directory visibility. Exported Go names and
+        // other families share the same family/name view across source files.
+        let visibility = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
+            Self::parent_dir(file)
+        } else {
+            String::new()
+        };
+        let key = (family, name.to_string(), visibility);
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(known) = cache.sets.get(&key) {
+            return Ok(Arc::clone(known));
         }
+        let hits = self
+            .symbol_index
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        charge(
+            &mut cache.visits,
+            hits.len() as u64,
+            limits.candidate_visits,
+            "candidate visits",
+        )?;
+        let mut candidates = Vec::new();
+        for (path, _, candidate_family, identity) in hits {
+            if family.admits(*candidate_family)
+                && (*candidate_family != LangFamily::Go
+                    || Self::go_symbol_visible_from(file, path, name))
+                && (!Self::family_needs_explicit_receiver(family)
+                    || self.declared_at_file_level(path, identity))
+            {
+                let bytes =
+                    (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64;
+                charge(
+                    &mut cache.retained_bytes,
+                    bytes,
+                    limits.retained_candidate_bytes,
+                    "retained candidate bytes",
+                )?;
+                candidates.push((path.clone(), identity.to_string()));
+            }
+        }
+        let declarations = candidates.len();
+        candidates.sort();
+        candidates.dedup();
+        // Conservative JSON/Debug upper bound, computed once per shared set.
+        let evidence_bytes = candidates.iter().fold(64u64, |total, (file, symbol)| {
+            total.saturating_add(16 + escaped_evidence_bytes(file) + escaped_evidence_bytes(symbol))
+        });
+        let candidates = Arc::new(GlobalCandidates {
+            rows: candidates.into(),
+            declarations,
+            evidence_bytes,
+        });
+        cache.sets.insert(key, Arc::clone(&candidates));
+        Ok(candidates)
     }
 
     fn parent_dir(current_file: &str) -> String {
@@ -2997,6 +3235,66 @@ impl Resolver {
             .filter(|type_name| !type_name.is_empty())
     }
 
+    /// What `self` / `Self` denotes at a call attributed to `caller_symbol`.
+    ///
+    /// Usually the caller is a *member* of a type and the answer is its parent,
+    /// which is all `declaring_type_of` gives. But a call can be attributed to
+    /// the type itself — a Swift `private static func` body, a property
+    /// initializer, a Python class-body statement — and then the parent is the
+    /// file, `declaring_type_of` abstains, and X42 never runs even though the
+    /// enclosing type is sitting in the caller's own name.
+    ///
+    /// Measured: 9 Swift targets on a 306-file corpus lost their last
+    /// non-structural inbound edge to exactly this, every one a
+    /// `Self.staticMethod()` whose caller symbol was the `struct`. The rung
+    /// could not see the type because it only ever looked one level *up*.
+    ///
+    /// The caller must be a type **declared in this file**: the answer is the
+    /// key `type_methods` is built with, so an unqualified match elsewhere
+    /// would dispatch `self.m()` onto a namesake in another file. Ambiguity
+    /// inside the file is left to the caller's own `local.len() > 1` guard,
+    /// which already abstains when one name declares the method twice.
+    ///
+    /// `Module` is in the list because Ruby's `module M; def self.m` is this
+    /// exact shape and `self` there *is* `M`. The kind is shared with Go
+    /// packages, TypeScript namespaces, C# namespaces and Terraform blocks, so
+    /// it was admitted only after checking each: none of them ever reaches here,
+    /// because a namespace-level call arrives with no caller symbol at all and
+    /// the others have no `self` keyword to spell.
+    fn self_type_at(&self, file: &str, family: LangFamily, caller_symbol: &str) -> Option<String> {
+        if let Some(parent) = self.declaring_type_of(file, caller_symbol) {
+            return Some(parent.to_string());
+        }
+        let declares_a_type_here = self
+            .symbol_index
+            .get(caller_symbol)
+            .into_iter()
+            .flatten()
+            .any(|(path, kind, candidate_family, _)| {
+                path == file
+                    && family.admits(*candidate_family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                            | SymbolKind::Module
+                    )
+            });
+        if !declares_a_type_here {
+            return None;
+        }
+        // Reduced exactly as `declaring_type_of` reduces a parent, so a caller
+        // that *is* a type and a caller that is *inside* one key identically.
+        caller_symbol
+            .rsplit("::")
+            .next()
+            .filter(|type_name| !type_name.is_empty())
+            .map(str::to_string)
+    }
+
     /// Whether exactly one indexed file declares a type of this name.
     ///
     /// The identifiability test for the supertype walk. `type_methods` and
@@ -3045,7 +3343,7 @@ impl Resolver {
         caller_symbol: &str,
         method: &str,
     ) -> Option<(String, String, String)> {
-        let enclosing = self.declaring_type_of(file, caller_symbol)?.to_string();
+        let enclosing = self.self_type_at(file, family, caller_symbol)?;
         // The caller's declaring type is an exact identity even when another
         // file declares a namesake. Only inherited lookup needs a global name.
         if let Some(hits) = self
@@ -3291,22 +3589,33 @@ impl Resolver {
         modules.into_iter().collect()
     }
 
-    fn declared_receiver_type<'a>(
+    fn declared_receiver_slot<'a>(
         &'a self,
         file_path: &str,
         enclosing_symbol: &str,
         root: &str,
+        binding: Option<&LocalBinding>,
+        slot: &str,
     ) -> Option<&'a str> {
-        let scoped = |slot: &str| {
-            self.declared_types
-                .get(&format!("{file_path}:{enclosing_symbol}:{root}{slot}"))
+        let scope = match binding {
+            Some(binding) => binding.scope.as_deref(),
+            None => Some(enclosing_symbol),
         };
-        let scope_knows = scoped("@mod").is_some() || scoped("@type").is_some();
+        let scoped = |slot: &str| {
+            scope.and_then(|scope| {
+                self.declared_types
+                    .get(&format!("{file_path}:{scope}:{root}{slot}"))
+            })
+        };
+        // A known capture belongs only to its recorded declaring scope. A
+        // missing annotation there cannot inherit a sibling's imported type.
+        let scope_knows =
+            binding.is_some() || scoped("@mod").is_some() || scoped("@type").is_some();
         if scope_knows {
-            scoped("@type").map(String::as_str)
+            scoped(slot).map(String::as_str)
         } else {
             self.declared_types
-                .get(&format!("{file_path}:{root}@type"))
+                .get(&format!("{file_path}:{root}{slot}"))
                 .map(String::as_str)
         }
     }
@@ -3357,20 +3666,40 @@ impl Resolver {
         nodes.into_iter().collect()
     }
 
+    /// A `.go` file that is part of the importable package.
+    ///
+    /// `_test.go` files are compiled only for the package's own test binary, so
+    /// an importer never sees them. One owner for the predicate because
+    /// `go_files_in_dir` and the package-suffix fallback below must agree on
+    /// what a package contains — they answer the same import.
+    fn is_go_package_file(path: &str) -> bool {
+        path.ends_with(".go") && !path.ends_with("_test.go")
+    }
+
+    /// Every directory holding at least one importable Go file, ascending.
+    ///
+    /// The keys of `files_by_dir` are parent directories already, so this is
+    /// the same set the previous `parent_dir`-per-file scan collected, without
+    /// the scan.
+    fn go_package_dirs(&self) -> impl Iterator<Item = String> + '_ {
+        self.files_by_dir
+            .iter()
+            .filter(|(_, files)| files.iter().any(|path| Self::is_go_package_file(path)))
+            .map(|(dir, _)| dir.clone())
+    }
+
     fn go_files_in_dir(&self, dir: &str) -> Vec<String> {
         let dir = dir.trim_end_matches('/');
-        let mut files: Vec<String> = self
-            .file_symbols
-            .keys()
-            .filter(|path| {
-                path.ends_with(".go")
-                    && !path.ends_with("_test.go")
-                    && Self::parent_dir(path) == dir
+        self.files_by_dir
+            .get(dir)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|path| Self::is_go_package_file(path))
+                    .cloned()
+                    .collect()
             })
-            .cloned()
-            .collect();
-        files.sort();
-        files
+            .unwrap_or_default()
     }
 
     fn apply_go_replace(&self, spec: &str) -> Option<(String, Option<String>)> {
@@ -3459,12 +3788,7 @@ impl Resolver {
             return Vec::new();
         }
         let mut matches: Vec<(usize, String)> = self
-            .file_symbols
-            .keys()
-            .filter(|path| path.ends_with(".go") && !path.ends_with("_test.go"))
-            .map(|path| Self::parent_dir(path))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .go_package_dirs()
             .filter(|dir| {
                 let components = dir.split('/').filter(|part| !part.is_empty()).count();
                 components >= 2
@@ -3580,19 +3904,20 @@ impl Resolver {
     /// `extensions`. Sorted, so an expansion is deterministic across runs.
     fn files_in_dir_with_extensions(&self, dir: &str, extensions: &[&str]) -> Vec<String> {
         let dir = dir.trim_end_matches('/');
-        let mut files: Vec<String> = self
-            .file_symbols
-            .keys()
-            .filter(|path| {
-                Self::parent_dir(path) == dir
-                    && extensions
-                        .iter()
-                        .any(|extension| !extension.is_empty() && path.ends_with(extension))
+        self.files_by_dir
+            .get(dir)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|path| {
+                        extensions
+                            .iter()
+                            .any(|extension| !extension.is_empty() && path.ends_with(extension))
+                    })
+                    .cloned()
+                    .collect()
             })
-            .cloned()
-            .collect();
-        files.sort();
-        files
+            .unwrap_or_default()
     }
 
     /// A member reference resolved through its receiver.
@@ -4392,6 +4717,19 @@ fn go_package_name_of(ext: &Extraction) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn evidence_size_keeps_an_escape_bound_for_hostile_names() {
+        assert_eq!(super::escaped_evidence_bytes("defs/ordinary.rs"), 16);
+        for value in (0u8..=127)
+            .map(|byte| char::from(byte).to_string())
+            .chain(["é", "\u{85}", "\u{200d}", "\u{2028}", "😀"].map(str::to_owned))
+        {
+            let debug_bytes = format!("{value:?}").len() - 2;
+            assert!(super::escaped_evidence_bytes(&value) >= debug_bytes as u64);
+        }
+        assert_eq!(super::escaped_evidence_bytes("\"\\\n\0"), 24);
+    }
+
     #[cfg(feature = "parse")]
     use super::*;
     #[cfg(feature = "parse")]
@@ -4404,7 +4742,7 @@ mod tests {
         let b = extract_file("pkg/b.js", "export function fromB() {}\n");
         let mut resolver = Resolver::new();
         resolver.index_extractions(&[a.clone(), b.clone()]);
-        let result = resolver.resolve_all(&[a, b]);
+        let result = resolver.resolve_all(&[a, b]).unwrap();
         assert!(
             result.edges.iter().any(|e| {
                 e.edge_kind == EdgeKind::Imports
@@ -5021,6 +5359,178 @@ mod import_resolution_tests {
         assert!(resolver.go_files_in_dir("").is_empty());
     }
 
+    /// The directory index carries the current snapshot and nothing older.
+    ///
+    /// `index_extractions` resets every other map for exactly this reason: a
+    /// caller may reuse the object for a rebuild. An index that accumulated
+    /// would answer a Go import with a file the snapshot no longer contains,
+    /// and the resulting edge is stamped with the same confidence as a real
+    /// one — a deleted file reappearing as a live import target.
+    ///
+    /// Fails against an index that is built but never cleared.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn the_directory_index_holds_only_the_current_snapshot() {
+        use devmap_extract::extract_file;
+        let mut resolver = Resolver::new();
+
+        let first = [extract_file(
+            "internal/svc/a.go",
+            "package svc\nfunc A() {}\n",
+        )];
+        resolver.index_extractions(&first);
+        assert_eq!(
+            resolver.go_files_in_dir("internal/svc"),
+            ["internal/svc/a.go"]
+        );
+
+        let second = [extract_file(
+            "internal/other/b.go",
+            "package other\nfunc B() {}\n",
+        )];
+        resolver.index_extractions(&second);
+        assert!(
+            resolver.go_files_in_dir("internal/svc").is_empty(),
+            "a directory absent from the new snapshot must not survive the rebuild"
+        );
+        assert_eq!(
+            resolver.go_files_in_dir("internal/other"),
+            ["internal/other/b.go"]
+        );
+    }
+
+    /// Grouping *every* indexed file by directory moves the `.go` filter from
+    /// the scan to the reader, so the reader has to still apply it.
+    ///
+    /// A real package directory holds a README, a generated `.json` and often a
+    /// helper script. Returning those as package files makes each one an import
+    /// target for `example.com/svc`, and the first of them wins the edge.
+    ///
+    /// Fails against a reader that returns the directory's files unfiltered.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn go_files_in_dir_returns_no_non_go_sibling() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("pkg/svc/a.go", "package svc\nfunc A() {}\n"),
+            ("pkg/svc/README.md", "# svc\n"),
+            ("pkg/svc/helper.py", "def helper():\n    pass\n"),
+            ("pkg/svc/a_test.go", "package svc\nfunc T() {}\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert_eq!(
+            resolver.go_files_in_dir("pkg/svc"),
+            ["pkg/svc/a.go"],
+            "only the importable Go file belongs to the package"
+        );
+    }
+
+    /// The suffix fallback ranks directories that hold importable Go.
+    ///
+    /// The index holds every directory, including ones with no Go in them at
+    /// all. Handing that set to the fallback unfiltered lets `docs/api` claim
+    /// an `example.com/api` import, and a directory holding only `_test.go`
+    /// claim its package — both resolve to an empty file set, so the import
+    /// binds to nothing while reporting that it matched.
+    ///
+    /// Fails against a fallback that walks the index keys directly.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn go_package_dirs_names_only_directories_holding_importable_go() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("pkg/real/a.go", "package real\nfunc A() {}\n"),
+            ("pkg/testonly/a_test.go", "package testonly\nfunc T() {}\n"),
+            ("docs/api/guide.md", "# guide\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert_eq!(
+            resolver.go_package_dirs().collect::<Vec<_>>(),
+            ["pkg/real"],
+            "a test-only directory and a docs directory are not Go packages"
+        );
+    }
+
+    /// A `doc.go` carrying only a package clause is still a package file, and
+    /// answers come back sorted.
+    ///
+    /// This pins membership and ordering, not a symbol-free path. The extractor
+    /// gives every file a file-level symbol named after its basename — measured,
+    /// including for an empty `.go` and for a `.txt` — so `file_symbols` never
+    /// holds an empty entry, and no mutation of the index's *population* can be
+    /// caught here. It is a contract test, and the mutation harness records it
+    /// as one rather than counting it as mutation-covered.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn a_package_file_that_declares_nothing_is_still_in_the_package() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("pkg/svc/z.go", "package svc\nfunc Z() {}\n"),
+            ("pkg/svc/doc.go", "package svc\n"),
+            ("pkg/svc/a.go", "package svc\nfunc A() {}\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert_eq!(
+            resolver.go_files_in_dir("pkg/svc"),
+            ["pkg/svc/a.go", "pkg/svc/doc.go", "pkg/svc/z.go"],
+            "a symbol-free file belongs to the package, and answers are sorted"
+        );
+    }
+
+    /// An empty extension matches every path through `ends_with`.
+    ///
+    /// The guard refusing it is what stops a rule that names no extension from
+    /// claiming every file in the directory.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn an_empty_extension_claims_no_file() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("infra/main.tf", "resource \"null_resource\" \"a\" {}\n"),
+            ("infra/notes.md", "# notes\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert!(
+            resolver
+                .files_in_dir_with_extensions("infra", &[""])
+                .is_empty(),
+            "an empty extension must not match by `ends_with`"
+        );
+        assert_eq!(
+            resolver.files_in_dir_with_extensions("infra", &[".tf"]),
+            ["infra/main.tf"]
+        );
+        // A trailing slash names the same directory here too.
+        assert_eq!(
+            resolver.files_in_dir_with_extensions("infra/", &[".tf"]),
+            resolver.files_in_dir_with_extensions("infra", &[".tf"])
+        );
+    }
+
     /// An import edge points at the package node, except for `package main`.
     ///
     /// `go_import_edge_targets` was replaceable with `vec![]` and with a
@@ -5311,7 +5821,7 @@ mod ladder_tests {
             ),
             ("helpers.py", "def open(path):\n    return path\n"),
         ]);
-        let result = cross.resolve_all(&cross_exts);
+        let result = cross.resolve_all(&cross_exts).unwrap();
         assert!(
             !result.edges.iter().any(|edge| {
                 edge.source_file == "caller.py"
@@ -5333,7 +5843,7 @@ mod ladder_tests {
             "local.py",
             "def open(path):\n    return path\n\ndef go():\n    return open('x')\n",
         )]);
-        let local = same.resolve_all(&same_exts);
+        let local = same.resolve_all(&same_exts).unwrap();
         assert!(
             local.edges.iter().any(|edge| {
                 edge.edge_kind == EdgeKind::Calls && edge.target_symbol.ends_with("open")
@@ -5357,7 +5867,7 @@ mod ladder_tests {
                 "package pkg\nfunc use() string { return open(\"x\") }\n",
             ),
         ]);
-        let go_result = go.resolve_all(&go_exts);
+        let go_result = go.resolve_all(&go_exts).unwrap();
         assert!(
             go_result
                 .edges
@@ -5389,7 +5899,7 @@ mod reference_resolution_tests {
             .collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        resolver.resolve_all(&extractions)
+        resolver.resolve_all(&extractions).unwrap()
     }
 
     #[cfg(feature = "parse")]
