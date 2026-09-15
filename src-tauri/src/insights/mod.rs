@@ -10,7 +10,7 @@ use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
-use crate::engine::worktree::{self, agent_kind, agent_session_slug, changed_paths, WorktreeInfo};
+use crate::engine::worktree::{self, agent_kind, agent_layout, changed_paths, WorktreeInfo};
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,16 @@ pub struct AgentSummary {
     pub ok: bool,
     pub sessions: u32,
     pub kinds: Vec<AgentKindCount>,
+    /// True when these numbers came from a capped sample of the repository's
+    /// worktrees rather than all of them.
+    ///
+    /// `sessions` is then a **floor**, and a kind whose only worktrees fall
+    /// past the cap is missing from `kinds` entirely — not undercounted,
+    /// absent. Without this field a repository past
+    /// [`MAX_SNAPSHOT_WORKTREES`] reported its capped count as an exact one,
+    /// which is the same "a bounded sample rendered as complete coverage"
+    /// mistake the rest of this module exists to avoid.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +300,10 @@ fn unknown_agents() -> AgentSummary {
         ok: false,
         sessions: 0,
         kinds: Vec::new(),
+        // Not "we saw everything there was": `ok: false` already says the
+        // listing never ran, and claiming a complete sample on top of that
+        // would be a second false statement rather than a safer default.
+        truncated: false,
     }
 }
 
@@ -356,6 +370,10 @@ fn summarise_worktree(
     operation_kind: String,
     operation_ok: bool,
 ) -> WorktreeSummary {
+    // One scan for both labels. Asking twice would re-walk the path for every
+    // worktree of every repository in a fleet sweep, and — worse — would let
+    // the kind and the slug come from two different matches.
+    let layout = agent_layout(&info.path);
     WorktreeSummary {
         path: info.path.clone(),
         name: info.name.clone(),
@@ -364,8 +382,8 @@ fn summarise_worktree(
         is_main: info.is_main,
         is_bare: info.is_bare,
         dirty_files: info.dirty_files.map(|n| n as u32),
-        agent_kind: agent_kind(&info.path).unwrap_or_default(),
-        session_slug: agent_session_slug(&info.path).unwrap_or_default(),
+        agent_kind: layout.as_ref().map(|l| l.kind.clone()).unwrap_or_default(),
+        session_slug: layout.map(|l| l.slug).unwrap_or_default(),
         operation_kind,
         operation_ok,
     }
@@ -373,11 +391,13 @@ fn summarise_worktree(
 
 /// Rolls per-worktree agent labels into counts.
 ///
-/// `ok` travels in from the caller because it is a fact about the listing
-/// these items came from, which this function never sees: an empty slice from
-/// a failed listing and an empty slice from a repository with no agents are
-/// the same input and must not be the same answer.
-fn agent_summary(ok: bool, items: &[WorktreeSummary]) -> AgentSummary {
+/// `ok` and `truncated` both travel in from the caller because they are facts
+/// about the listing these items came from, which this function never sees.
+/// An empty slice from a failed listing and an empty slice from a repository
+/// with no agents are the same input and must not be the same answer; and a
+/// slice that is all of a repository's worktrees is indistinguishable here
+/// from the first 64 of 300, which is why the caller has to say which it is.
+fn agent_summary(ok: bool, truncated: bool, items: &[WorktreeSummary]) -> AgentSummary {
     let mut counts: Vec<AgentKindCount> = Vec::new();
     for item in items {
         if item.agent_kind.is_empty() {
@@ -397,6 +417,7 @@ fn agent_summary(ok: bool, items: &[WorktreeSummary]) -> AgentSummary {
         ok,
         sessions,
         kinds: counts,
+        truncated,
     }
 }
 
@@ -561,21 +582,23 @@ const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 /// Work view does: worktrees, agent sessions, dirty files, collisions, ledger
 /// and code graph. Individual facets fail independently.
 pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
-    snapshot_within(repo_path, SNAPSHOT_DEADLINE)
+    snapshot_within(repo_path, SNAPSHOT_DEADLINE, MAX_SNAPSHOT_WORKTREES)
 }
 
-/// [`snapshot`] with the deadline as an argument, so the partial-snapshot path
-/// is reachable in a test without a pathological repository.
-fn snapshot_within(repo_path: &str, deadline: Duration) -> InsightsSnapshot {
+/// [`snapshot`] with the deadline and the worktree cap as arguments, so both
+/// partial-snapshot paths are reachable in a test without a pathological
+/// repository. Sixty-five real worktrees to prove one boolean would be a slow,
+/// load-sensitive test of git rather than of this function.
+fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) -> InsightsSnapshot {
     let started = Instant::now();
     let listed = worktree::list_worktrees(repo_path);
     let mut deadline_expired = false;
     let (worktrees, agents) = match &listed {
         Ok(list) => {
-            let truncated = list.len() > MAX_SNAPSHOT_WORKTREES;
+            let truncated = list.len() > max_worktrees;
             let items: Vec<WorktreeSummary> = list
                 .iter()
-                .take(MAX_SNAPSHOT_WORKTREES)
+                .take(max_worktrees)
                 .map(|info| {
                     // Sequential on purpose: `repo_op::detect` spawns several
                     // git processes per worktree, and 64 of those at once is
@@ -589,7 +612,10 @@ fn snapshot_within(repo_path: &str, deadline: Duration) -> InsightsSnapshot {
                 })
                 .collect();
             let facet = worktree_facet(list.len() as u32, truncated, items);
-            let agents = agent_summary(true, &facet.items);
+            // The same `truncated` the facet carries: these counts are rolled
+            // from `facet.items`, which is the capped list, so a repository
+            // past the cap must not report its floor as an exact count.
+            let agents = agent_summary(true, truncated, &facet.items);
             (facet, agents)
         }
         Err(error) => (empty_worktrees(error.clone()), unknown_agents()),
@@ -1043,7 +1069,10 @@ fn fleet_facet(repo_path: &str, anchor_epoch: i64, window_days: u32) -> FleetRep
                     true,
                     String::new(),
                     list.len() as u32,
-                    agent_summary(true, &items),
+                    // `list_worktrees_lite` returns every worktree — the cost
+                    // this facet avoids is the per-worktree `git status`, not
+                    // the listing — so this sample is complete.
+                    agent_summary(true, false, &items),
                 )
             }
             Err(error) => (false, error, 0, unknown_agents()),
@@ -1366,6 +1395,7 @@ fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChange
 /// labels are derived from the path text alone, so they are as true here as
 /// anywhere.
 fn unlisted_worktree(target: &str, operation_kind: String, operation_ok: bool) -> WorktreeSummary {
+    let layout = agent_layout(target);
     WorktreeSummary {
         path: target.to_string(),
         name: Path::new(target)
@@ -1377,8 +1407,10 @@ fn unlisted_worktree(target: &str, operation_kind: String, operation_ok: bool) -
         is_main: false,
         is_bare: false,
         dirty_files: None,
-        agent_kind: agent_kind(target).unwrap_or_default(),
-        session_slug: agent_session_slug(target).unwrap_or_default(),
+        // One scan, so the kind and the slug on this summary can never come
+        // from two different matches in the same path.
+        agent_kind: layout.as_ref().map(|l| l.kind.clone()).unwrap_or_default(),
+        session_slug: layout.map(|l| l.slug).unwrap_or_default(),
         operation_kind,
         operation_ok,
     }
@@ -2315,6 +2347,81 @@ mod tests {
         assert!(!unread.agents.ok, "{:?}", unread.agents);
         assert_eq!(unread.agents.sessions, 0);
         assert_ne!(read.agents.ok, unread.agents.ok);
+        // Neither of those came from a capped sample, so neither may claim to.
+        assert!(!read.agents.truncated, "{:?}", read.agents);
+        assert!(!unread.agents.truncated, "{:?}", unread.agents);
+    }
+
+    #[test]
+    fn a_capped_snapshot_reports_its_agent_count_as_a_floor() {
+        // The agent counts are rolled from the *capped* worktree list. Without
+        // the flag, a repository with three hundred worktrees reported the
+        // first sixty-four of them as an exact total — a bounded sample
+        // rendered as complete coverage, and a kind whose worktrees all fall
+        // past the cap disappeared rather than being undercounted.
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        for (dir, kind) in [(".claude", "claude"), (".cursor", "cursor")] {
+            fs::create_dir_all(main.path().join(dir).join("worktrees")).unwrap();
+            let wt = main.path().join(dir).join("worktrees").join("s1");
+            worktree::add_worktree(
+                repo,
+                wt.to_str().unwrap(),
+                Some(&format!("{kind}/s1")),
+                Some("main"),
+                false,
+            )
+            .expect("add worktree");
+            crate::test_support::trust_repo(&wt);
+        }
+
+        // Uncapped: both kinds visible, the count exact.
+        let whole = snapshot_within(repo, SNAPSHOT_DEADLINE, MAX_SNAPSHOT_WORKTREES);
+        assert!(!whole.worktrees.truncated, "{:?}", whole.worktrees);
+        assert!(!whole.agents.truncated, "{:?}", whole.agents);
+        assert_eq!(whole.agents.sessions, 2, "{:?}", whole.agents);
+        assert_eq!(whole.agents.kinds.len(), 2, "{:?}", whole.agents);
+
+        // Capped to the main checkout plus one: the second agent worktree is
+        // past the cap, so the count is short AND its kind is absent. The
+        // flag is the only thing standing between that and a confident lie.
+        let capped = snapshot_within(repo, SNAPSHOT_DEADLINE, 2);
+        assert!(capped.worktrees.truncated, "{:?}", capped.worktrees);
+        assert!(capped.agents.truncated, "{:?}", capped.agents);
+        assert!(capped.agents.ok, "{:?}", capped.agents);
+        assert!(
+            capped.agents.sessions < whole.agents.sessions,
+            "the cap must actually bite: {:?}",
+            capped.agents
+        );
+        assert!(
+            capped.agents.kinds.len() < whole.agents.kinds.len(),
+            "a kind past the cap is absent, not undercounted: {:?}",
+            capped.agents
+        );
+    }
+
+    #[test]
+    fn agent_summary_never_infers_completeness_from_its_own_input() {
+        // The rollup cannot see whether the slice it was handed is all of a
+        // repository or the front of it, which is exactly why both facts are
+        // arguments. An empty slice has three distinct meanings and this is
+        // the function that must keep them apart.
+        let none = agent_summary(true, false, &[]);
+        assert!(none.ok && !none.truncated && none.sessions == 0);
+
+        let unreadable = agent_summary(false, false, &[]);
+        assert!(!unreadable.ok && unreadable.sessions == 0);
+
+        let capped = agent_summary(true, true, &[]);
+        assert!(capped.ok && capped.truncated && capped.sessions == 0);
+
+        // Same zero, three different facts — and no two of them compare equal.
+        assert_ne!(
+            (none.ok, none.truncated),
+            (unreadable.ok, unreadable.truncated)
+        );
+        assert_ne!((none.ok, none.truncated), (capped.ok, capped.truncated));
     }
 
     #[test]
@@ -2356,7 +2463,7 @@ mod tests {
 
         // Zero budget: the fixed-cost stages still run, and every stage whose
         // cost grows with the worktree count is skipped and says so.
-        let rushed = snapshot_within(repo, Duration::ZERO);
+        let rushed = snapshot_within(repo, Duration::ZERO, MAX_SNAPSHOT_WORKTREES);
         assert!(rushed.deadline_expired, "{rushed:?}");
         assert!(rushed.worktrees.ok, "{:?}", rushed.worktrees);
         assert_eq!(rushed.worktrees.count, 3);

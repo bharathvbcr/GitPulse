@@ -34,6 +34,16 @@ export interface AgentSummary {
   ok: boolean;
   sessions: number;
   kinds: AgentKindCount[];
+  /**
+   * True when these numbers came from a capped sample of the repository's
+   * worktrees.
+   *
+   * `sessions` is then a floor, and a kind whose only worktrees fall past the
+   * cap is absent from `kinds` rather than undercounted. Render the count as
+   * "at least n" — a bounded sample shown as an exact total is the reporting
+   * bug this field exists to prevent.
+   */
+  truncated: boolean;
 }
 
 export interface WorktreeFacet {

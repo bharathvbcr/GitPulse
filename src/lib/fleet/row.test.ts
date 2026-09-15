@@ -79,7 +79,7 @@ function facet(path: string, overrides: Partial<FleetRepoFacet> = {}): FleetRepo
     worktrees_ok: true,
     worktrees_error: "",
     worktrees: 1,
-    agents: { ok: true, sessions: 0, kinds: [] },
+    agents: { ok: true, sessions: 0, kinds: [], truncated: false },
     last_commit_ok: true,
     last_commit_epoch: 1_757_000_000,
     commits_ok: true,
@@ -234,7 +234,7 @@ describe("Tier 1 cells", () => {
         snapshot: snapshot([
           facet("/repo/a", {
             worktrees: 4,
-            agents: { ok: true, sessions: 3, kinds: [{ kind: "claude", sessions: 3 }] },
+            agents: { ok: true, sessions: 3, kinds: [{ kind: "claude", sessions: 3 }], truncated: false },
             last_commit_epoch: 1_757_000_000,
           }),
         ]),
@@ -243,8 +243,30 @@ describe("Tier 1 cells", () => {
     expect(row.work).toMatchObject({
       kind: "read",
       value: { worktrees: 4, agentSessions: 3, agentKinds: ["claude"] },
+      // A complete sample, so the cell reads as exact.
+      partial: false,
     });
     expect(row.activity).toMatchObject({ kind: "read", value: 1_757_000_000 * 1000 });
+  });
+
+  it("marks the work cell partial when the agent counts came from a capped sample", () => {
+    // Past the snapshot's worktree cap the session count is a floor and a
+    // kind can be missing outright. Rendering that as an exact "3 agents" is
+    // a bounded sample presented as complete coverage, which is the one
+    // reporting mistake this grid is built to avoid.
+    const [row] = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([
+          facet("/repo/a", {
+            worktrees: 400,
+            agents: { ok: true, sessions: 3, kinds: [{ kind: "claude", sessions: 3 }], truncated: true },
+          }),
+        ]),
+      }),
+    );
+    expect(row.work).toMatchObject({ kind: "read", partial: true });
+    expect(row.work.kind === "read" && row.work.value.agentSessions).toBe(3);
   });
 
   it("fails one repository's Tier 1 cells without touching the others", () => {
