@@ -35,7 +35,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::engine::agent_session_slug;
 use crate::engine::git_cli::find_git_root;
@@ -106,6 +106,10 @@ pub struct HookInput {
     pub command: String,
     /// SessionStart's `source`: startup, resume, clear, compact or fork.
     pub source: String,
+    /// Cursor native payloads carry a non-null `cursor_version`. Claude
+    /// and Codex do not. The stdout schema splits on this, not on event-name
+    /// casing: camelCase `sessionStart` is not a host signal.
+    pub is_cursor: bool,
 }
 
 impl HookInput {
@@ -124,16 +128,55 @@ impl HookInput {
         } else {
             file_path
         };
+        let cwd = string_at(Some(value), "cwd");
+        let cwd = if cwd.is_empty() {
+            first_workspace_root(value)
+        } else {
+            cwd
+        };
         HookInput {
             hook_event_name: string_at(Some(value), "hook_event_name"),
             session_id: string_at(Some(value), "session_id"),
-            cwd: string_at(Some(value), "cwd"),
+            cwd,
             tool_name: string_at(Some(value), "tool_name"),
             file_path,
             command: string_at(tool_input, "command"),
             source: string_at(Some(value), "source"),
+            is_cursor: is_cursor_payload(value),
         }
     }
+}
+
+/// Cursor native payloads name `cursor_version`. Event-name casing is not a
+/// host signal: Claude plugins on Cursor still send camelCase `sessionStart`.
+fn is_cursor_payload(value: &Value) -> bool {
+    value
+        .get("cursor_version")
+        .is_some_and(|version| !version.is_null())
+}
+
+/// How many `workspace_roots` entries we will examine. Cursor's array is
+/// unbounded; a pathological payload must not turn SessionStart into a
+/// walk of a million empty strings.
+const MAX_WORKSPACE_ROOTS: usize = 256;
+
+/// Cursor native sessionStart sends `workspace_roots` (and often no `cwd`).
+/// The first non-empty string is the repository we brief; everything else is
+/// ignored. Hostile shapes (a string, an object, numbers) yield empty, which
+/// is the same answer as "the host told us nothing".
+fn first_workspace_root(value: &Value) -> String {
+    value
+        .get("workspace_roots")
+        .or_else(|| value.get("workspaceRoots"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_WORKSPACE_ROOTS)
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|entry| !entry.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// A non-string (or absent) field reads as empty rather than failing the parse.
@@ -234,6 +277,29 @@ impl HookOutput {
             return None;
         }
         serde_json::to_string(self).ok()
+    }
+
+    /// Host-specific stdout. Claude pastes Claude nested JSON; Cursor native
+    /// sessionStart injects only top-level `additional_context`, and Cursor
+    /// `preToolUse` is a permission hook whose schema is not Claude's — a
+    /// nested `permissionDecision` there blocks the tool.
+    pub fn render_for_host(&self, is_cursor: bool) -> Option<String> {
+        if is_cursor {
+            return self.render_cursor();
+        }
+        self.render()
+    }
+
+    fn render_cursor(&self) -> Option<String> {
+        if let Some(specific) = &self.hook_specific_output {
+            if specific.permission_decision.is_some() {
+                return None;
+            }
+            if let Some(ctx) = &specific.additional_context {
+                return Some(json!({ "additional_context": ctx }).to_string());
+            }
+        }
+        self.render()
     }
 }
 
@@ -1256,6 +1322,112 @@ mod tests {
         );
     }
 
+    /// Cursor native sessionStart sends `workspace_roots` and often no `cwd`.
+    /// Treating that as "no cwd" made every Cursor session a non-brief.
+    #[test]
+    fn a_cursor_payload_with_workspace_roots_and_no_cwd_still_has_a_root() {
+        let input = parse_input(
+            &json!({
+                "hook_event_name": "sessionStart",
+                "cursor_version": "3.20.7",
+                "composer_mode": "agent",
+                "workspace_roots": ["/Users/bharath/Code/devtools/GitPulse"],
+            })
+            .to_string(),
+        )
+        .expect("Cursor payload parses");
+        assert_eq!(input.cwd, "/Users/bharath/Code/devtools/GitPulse");
+        assert!(
+            input.is_cursor,
+            "cursor_version must select the Cursor stdout schema"
+        );
+    }
+
+    /// `cwd` is the documented Claude field and must still win when both land.
+    #[test]
+    fn cwd_wins_over_workspace_roots() {
+        let input = parse_input(
+            &json!({
+                "cwd": "/repo/here",
+                "workspace_roots": ["/repo/elsewhere", "/repo/third"],
+            })
+            .to_string(),
+        )
+        .expect("parses");
+        assert_eq!(input.cwd, "/repo/here");
+    }
+
+    /// Empty strings, non-strings, and a string-typed field must degrade to
+    /// empty rather than panic or pick a number.
+    #[test]
+    fn hostile_workspace_roots_degrade_to_empty_cwd() {
+        for raw in [
+            r#"{"workspace_roots":[]}"#,
+            r#"{"workspace_roots":["", "  "]}"#,
+            r#"{"workspace_roots":[1,2]}"#,
+            r#"{"workspace_roots":"/not-an-array"}"#,
+            r#"{"workspace_roots":{"0":"/repo"}}"#,
+            r#"{"workspaceRoots":["/camel"]}"#,
+        ] {
+            let input = parse_input(raw).expect("hostile shape still parses");
+            if raw.contains("workspaceRoots") {
+                assert_eq!(
+                    input.cwd, "/camel",
+                    "camelCase workspaceRoots is the same field Cursor may emit: {raw}"
+                );
+            } else {
+                assert!(
+                    input.cwd.is_empty(),
+                    "{raw} must not invent a cwd, got {:?}",
+                    input.cwd
+                );
+            }
+        }
+    }
+
+    /// Skipping empty entries rather than taking the first slot is what a
+    /// multi-root workspace with a blank first folder needs.
+    #[test]
+    fn the_first_non_empty_workspace_root_is_used() {
+        let input = parse_input(
+            &json!({
+                "workspace_roots": ["", "  ", "/second", "/third"],
+            })
+            .to_string(),
+        )
+        .expect("parses");
+        assert_eq!(input.cwd, "/second");
+    }
+
+    #[test]
+    fn workspace_roots_past_the_cap_are_not_walked() {
+        let mut roots = vec![""; MAX_WORKSPACE_ROOTS];
+        roots.push("/late");
+        let input = parse_input(&json!({ "workspace_roots": roots }).to_string()).expect("parses");
+        assert!(
+            input.cwd.is_empty(),
+            "a root past the cap must not be taken: {:?}",
+            input.cwd
+        );
+
+        let mut under = vec![""; MAX_WORKSPACE_ROOTS - 1];
+        under.push("/just-in");
+        let input = parse_input(&json!({ "workspace_roots": under }).to_string()).expect("parses");
+        assert_eq!(input.cwd, "/just-in");
+    }
+
+    #[test]
+    fn a_session_with_no_cwd_and_no_workspace_roots_says_so() {
+        let output = run_session_brief(&HookInput {
+            hook_event_name: SESSION_START.to_string(),
+            cwd: String::new(),
+            source: "startup".to_string(),
+            ..Default::default()
+        });
+        assert!(!output.is_silent());
+        assert!(output.system_message.unwrap_or_default().contains("no cwd"));
+    }
+
     /* ── the honesty invariant ────────────────────────────────────────────── */
 
     #[test]
@@ -1924,6 +2096,86 @@ mod tests {
         assert!(rendered.contains("\"hookEventName\":\"SessionStart\""));
         assert!(rendered.contains("\"additionalContext\":\"brief\""));
         assert!(!rendered.contains("permissionDecision"));
+    }
+
+    /// Cursor sessionStart injects `additional_context`. Claude nested
+    /// `hookSpecificOutput` parses as JSON and is then ignored, so a successful
+    /// brief never reached the agent.
+    #[test]
+    fn a_cursor_session_brief_renders_top_level_additional_context() {
+        let output = HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: SESSION_START.to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some("repo brief".to_string()),
+            }),
+            system_message: None,
+        };
+        let rendered = output
+            .render_for_host(true)
+            .expect("Cursor brief must emit");
+        let value: Value = serde_json::from_str(&rendered).expect("JSON");
+        assert_eq!(value["additional_context"], "repo brief");
+        assert!(value.get("hookSpecificOutput").is_none());
+        assert!(value.get("permission").is_none());
+        assert_eq!(
+            output.render_for_host(false).as_deref(),
+            output.render().as_deref(),
+            "Claude must keep the nested document"
+        );
+    }
+
+    /// Cursor preToolUse is a permission hook. Claude's nested
+    /// `permissionDecision` is a schema mismatch that blocks the tool.
+    #[test]
+    fn a_cursor_permission_decision_renders_nothing() {
+        let output = HookOutput {
+            hook_specific_output: Some(decision(
+                PRE_TOOL_USE,
+                PermissionDecision::Deny,
+                "other worktree holds this file".to_string(),
+            )),
+            system_message: None,
+        };
+        assert_eq!(
+            output.render_for_host(true),
+            None,
+            "Cursor must fail open rather than block on a Claude permission document"
+        );
+        assert!(
+            output.render_for_host(false).is_some(),
+            "Claude must still receive deny/ask"
+        );
+    }
+
+    /// Notices (`systemMessage`) already parse on Cursor sessionStart. Keep
+    /// them: they are warnings, not decisions.
+    #[test]
+    fn a_cursor_notice_still_renders_system_message() {
+        let output =
+            HookOutput::notice("GitPulse could not brief this session: no cwd was supplied.");
+        let rendered = output.render_for_host(true).expect("notice still emits");
+        let value: Value = serde_json::from_str(&rendered).expect("JSON");
+        assert_eq!(
+            value["systemMessage"],
+            "GitPulse could not brief this session: no cwd was supplied."
+        );
+        assert!(value.get("additional_context").is_none());
+    }
+
+    #[test]
+    fn a_null_cursor_version_is_not_a_cursor_payload() {
+        let input = parse_input(
+            &json!({
+                "cwd": "/repo",
+                "cursor_version": null,
+            })
+            .to_string(),
+        )
+        .expect("parses");
+        assert!(!input.is_cursor);
+        assert_eq!(input.cwd, "/repo");
     }
 
     #[test]

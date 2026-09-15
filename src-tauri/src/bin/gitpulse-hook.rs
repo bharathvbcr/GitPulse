@@ -84,7 +84,7 @@ fn decide() {
 
     match hooks::dispatch(&subcommand, &input) {
         Ok(output) => {
-            if let Some(json) = output.render() {
+            if let Some(json) = output.render_for_host(input.is_cursor) {
                 emit(format!("{json}\n"));
             }
         }
