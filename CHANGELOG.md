@@ -11,80 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Changed
-
-- A task handed to an agent now says what to keep and what to ask with. The
-  preamble prepended to every copy — draft or saved brief — is the whole
-  prompt: a run started from the handoff form sends only the task identity to
-  Manvi, which reads the rest from the store, and a clipboard copy lands in a
-  session that has never seen this repository. So everything the two agent
-  guides say about DevMap and GitPulse was unavailable on exactly the path
-  where an agent is least oriented. It now names both — the `gitpulse-insights`
-  and `gitpulse-collisions` skills with the `gitpulse_*` MCP tools, the five
-  `devmap` skills with the `devmap_*` MCP tools, the absolute `repo_path` every
-  call needs, and this repository's own rule that a query which was unavailable,
-  truncated or empty is not evidence of absence. The skill names are asserted
-  against the directories that ship them, so the list cannot fall behind the
-  package. It also says the thing the board's own tests have always been
-  written around: the author's wording is evidence, not a first draft to tidy.
-- Preserving the author's meaning moved from one on-device drafting kind to the
-  block all three are built from. It sat only on `improve`, which left out the
-  two kinds that need it most — `draft` writes the first version of a task from
-  raw notes, and `extract` is under explicit instruction to leave material out,
-  which is precisely where a model drops the error code the note was written to
-  record. The contract asserts the structure rather than three strings: the
-  kinds are derived from the Rust and TypeScript validators and cross-checked,
-  and every branch may only add to the shared rules, so a fourth kind cannot
-  reintroduce the gap.
-
-- The two `@Guide` annotations no longer contradict the instructions above
-  them. A guide steers the structured decoder token by token while the
-  instructions are only something the model read, so where they disagree the
-  guide wins — and both of them disagreed. "At most 12 words" is a budget a
-  title cannot always pay: a note whose whole point is an error code and a
-  symbol name spends most of it on the evidence, so the model bought the word
-  count by rewording the identifier. And "two to five sentences" is a *floor*,
-  which on a thin note is an instruction to invent — it repealed "if the notes
-  are thin, stay general rather than guessing" from the layer that is actually
-  enforced. The title guide now states the bound that is really checked (300
-  characters, in `interpret` and again in the store) and says to go longer
-  rather than reword evidence; the description guide caps at five sentences
-  with no floor.
-- The on-device prompt names the field that is not being written. Asked for a
-  description with a title already present, the model would restate the title
-  as the opening sentence; asked for a title, it would spend effort proposing a
-  description the bridge then discarded. The clause appears only when that
-  other field is actually in the prompt, because telling a model to leave a
-  title alone when none was supplied asserts that one exists.
-- A repository or label list that had to be shortened says how many it left
-  out. Eight of forty presented as a closed list is how a model comes to write
-  "affects both repositories" about a task that spans five more.
-
-### Fixed
-
-- A draft copy that had to cut an oversized description said so instead of
-  ending mid-sentence. Notes are deliberately kept whole until the save
-  boundary reports them, so an unsaved draft can carry more than a saved task's
-  64 KiB — and the copy silently truncated to that cap, leaving an agent to
-  answer as though it had read the rest. Same contract the model budgeters in
-  `ai/prompt.rs` already follow: cut, and say so inside the text that was cut.
-- The Swift bridge bounds a generated title in the unit everything downstream
-  counts in. `String.prefix` counts grapheme clusters; `interpret` and the
-  store both count Unicode scalars, and those are not the same number — one
-  family emoji is one grapheme and five scalars. So the cut was wrong in both
-  directions: a 300-grapheme title could carry 1500 scalars and be refused by
-  the store *after* the model had already run, while on plain ASCII it landed
-  exactly on 300 and made that refusal unreachable, so an over-long title was
-  silently clipped instead of caught. The cut now counts scalars and stops on a
-  whole character, so it never severs a combining mark or a ZWJ sequence.
-- The assist button says which operation will actually run. The drafting kind
-  and the button's verb were two separate readings of the same three fields, so
-  they disagreed: with notes present the button read "Draft" while the request
-  carried `extract`, and on an empty task it read "Improve" while the request
-  carried `draft`. Neither expression was reachable from a test — both lived
-  inside the component — so nothing caught it. The verb is now derived from the
-  kind rather than re-read from the state, and both live in `taskEnhance` where
-  they are covered.
+Nothing yet.
 
 ## [1.2.0] - 2026-09-14
 
@@ -100,7 +27,7 @@ Repository trust is the other half. An approval made before 1.1.0 left every
 linked worktree refused with nothing offering a way out — the app reported the
 repository as trusted and never asked again, so worktree comparisons, collision
 checks and the fleet view quietly dropped every sibling. Trust is now reported
-as a scope rather than a yes/no, and the worktrees panel offers to extend an
+as a scope rather than a yes/no, and the sidebar offers to extend an
 approval that predates worktree coverage. Approvals are still never widened by
 being read: extending is a decision you take, through the same dialog.
 
@@ -193,6 +120,81 @@ being read: extending is a decision you take, through the same dialog.
   a linked repository, because hiding a chosen row makes the control lie about
   what the task links to; and rows keep catalog order, because sorting linked
   rows to the top moves a row out from under the pointer that just checked it.
+
+- A task handed to an agent now says what to keep and what to ask with. The
+  preamble prepended to every copy — draft or saved brief — is the whole
+  prompt: a run started from the handoff form sends only the task identity to
+  Manvi, which reads the rest from the store, and a clipboard copy lands in a
+  session that has never seen this repository. So everything the two agent
+  guides say about DevMap and GitPulse was unavailable on exactly the path
+  where an agent is least oriented. It now names both — the `gitpulse-insights`
+  and `gitpulse-collisions` skills with the `gitpulse_*` MCP tools, the five
+  `devmap` skills with the `devmap_*` MCP tools, the absolute `repo_path` every
+  call needs, and this repository's own rule that a query which was unavailable,
+  truncated or empty is not evidence of absence. The skill names are asserted
+  against the directories that ship them, so the list cannot fall behind the
+  package. It also says the thing the board's own tests have always been
+  written around: the author's wording is evidence, not a first draft to tidy.
+- Preserving the author's meaning moved from one on-device drafting kind to the
+  block all three are built from. It sat only on `improve`, which left out the
+  two kinds that need it most — `draft` writes the first version of a task from
+  raw notes, and `extract` is under explicit instruction to leave material out,
+  which is precisely where a model drops the error code the note was written to
+  record. The contract asserts the structure rather than three strings: the
+  kinds are derived from the Rust and TypeScript validators and cross-checked,
+  and every branch may only add to the shared rules, so a fourth kind cannot
+  reintroduce the gap.
+
+- The two `@Guide` annotations no longer contradict the instructions above
+  them. A guide steers the structured decoder token by token while the
+  instructions are only something the model read, so where they disagree the
+  guide wins — and both of them disagreed. "At most 12 words" is a budget a
+  title cannot always pay: a note whose whole point is an error code and a
+  symbol name spends most of it on the evidence, so the model bought the word
+  count by rewording the identifier. And "two to five sentences" is a *floor*,
+  which on a thin note is an instruction to invent — it repealed "if the notes
+  are thin, stay general rather than guessing" from the layer that is actually
+  enforced. The title guide now states the bound that is really checked (300
+  characters, in `interpret` and again in the store) and says to go longer
+  rather than reword evidence; the description guide caps at five sentences
+  with no floor.
+- The on-device prompt names the field that is not being written. Asked for a
+  description with a title already present, the model would restate the title
+  as the opening sentence; asked for a title, it would spend effort proposing a
+  description the bridge then discarded. The clause appears only when that
+  other field is actually in the prompt, because telling a model to leave a
+  title alone when none was supplied asserts that one exists.
+- A repository or label list that had to be shortened says how many it left
+  out. Eight of forty presented as a closed list is how a model comes to write
+  "affects both repositories" about a task that spans five more.
+- The offer to widen a pre-repository approval moved above the branch list. It
+  lived inside the worktrees panel, beside the rows it is about; adjacency read
+  well and placed it badly. The sidebar body is one scroller and the branch list
+  above it has no height cap, so on a repository with many branches the banner
+  sat below the fold — and the refusal that sends people looking for it named a
+  control they could not see. The refusal text now names the top of the sidebar,
+  where the control actually is. Because the offer and the rows it affects are
+  no longer one component, a grant made up there has to reach them:
+  `repoStore.refresh` cannot carry it, since it re-hydrates under the existing
+  `generation` and `generation` is precisely what panels compare to tell a stale
+  response from a current one. The signal is its own store, and a counter rather
+  than a flag — two extensions in one session are two events, and a boolean that
+  has to be reset has a window in which it is wrong.
+- A worktree row gives its name a line of its own. The single-line row could not
+  hold the name, the session chips, the branch and the action rail at once: the
+  name was the only flex item among shrink-0 chips, a branch capped at 90px and
+  a permanently reserved rail, so it was the only thing that could give — and it
+  gave all of it. Measured at the 360px default,
+  `gitpulse-prompting-extraction-c8e628` rendered in 79px of the 210px it needs;
+  at the 264px minimum it rendered in 0px and the branch painted straight
+  through the change count. Line two carries the chips, the branch and the
+  count, and the armed remove confirm moves there too — under the button that
+  armed it, instead of splicing a 119px sentence into the name's line at the
+  exact moment the reader needs to know which worktree is about to lose work.
+  The right-edge mask is load-bearing rather than tidiness: the chips are
+  shrink-0 and would otherwise paint through the row's edge, and the mask bites
+  only when content actually reaches the last 14px, so a clipped row looks
+  clipped instead of looking like a shorter branch name.
 
 ### Fixed
 
@@ -309,6 +311,36 @@ being read: extending is a decision you take, through the same dialog.
   skips the rest of the file as prose, so the scanner now reports whether it
   closed what it opened and every scanned file is asserted to do so: a blinded
   scanner must not read as a clean one.
+
+- A draft copy that had to cut an oversized description said so instead of
+  ending mid-sentence. Notes are deliberately kept whole until the save
+  boundary reports them, so an unsaved draft can carry more than a saved task's
+  64 KiB — and the copy silently truncated to that cap, leaving an agent to
+  answer as though it had read the rest. Same contract the model budgeters in
+  `ai/prompt.rs` already follow: cut, and say so inside the text that was cut.
+- The Swift bridge bounds a generated title in the unit everything downstream
+  counts in. `String.prefix` counts grapheme clusters; `interpret` and the
+  store both count Unicode scalars, and those are not the same number — one
+  family emoji is one grapheme and five scalars. So the cut was wrong in both
+  directions: a 300-grapheme title could carry 1500 scalars and be refused by
+  the store *after* the model had already run, while on plain ASCII it landed
+  exactly on 300 and made that refusal unreachable, so an over-long title was
+  silently clipped instead of caught. The cut now counts scalars and stops on a
+  whole character, so it never severs a combining mark or a ZWJ sequence.
+- The assist button says which operation will actually run. The drafting kind
+  and the button's verb were two separate readings of the same three fields, so
+  they disagreed: with notes present the button read "Draft" while the request
+  carried `extract`, and on an empty task it read "Improve" while the request
+  carried `draft`. Neither expression was reachable from a test — both lived
+  inside the component — so nothing caught it. The verb is now derived from the
+  kind rather than re-read from the state, and both live in `taskEnhance` where
+  they are covered.
+- The archive-separation plan names the commit its vendored store was re-synced
+  to. The closure moved to `0944ef51` and the plan still named `b366f42`, so the
+  plan's own drift guard was red. Its other five checks re-read the new source
+  and still hold — `work_items` has no `archived` column, `put_item` accepts
+  exactly its eighteen named fields, `list_items` filters on exactly six, and
+  the schema version is unchanged — so only the reference had gone stale.
 
 ### Verification
 
