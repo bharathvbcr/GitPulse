@@ -75,15 +75,68 @@ function stringLiterals(line: string): string[] {
     .filter((text) => text.length > 0);
 }
 
-/** Comment lines, where naming a platform is explanation and not output. */
-function isComment(line: string): boolean {
-  const trimmed = line.trim();
-  return (
-    trimmed.startsWith("//") ||
-    trimmed.startsWith("*") ||
-    trimmed.startsWith("/*") ||
-    trimmed.startsWith("<!--")
-  );
+/** Whether a line begins inside a comment an earlier line opened. */
+type CommentState = "code" | "block" | "html";
+
+const COMMENT_CLOSERS = { block: "*/", html: "-->" } as const;
+
+/**
+ * The part of a line outside comments, where naming a platform is output and
+ * not explanation, plus the state the NEXT line begins in.
+ *
+ * Carrying state is the whole point. The house style indents the continuation
+ * lines of a block comment as prose rather than gutter-marking them with `*`:
+ *
+ *     /* Slash-alpha, not a flat token: an alpha-less fill is a slab that paints
+ *        over the macOS window material instead of reading as a recess in it. *\/
+ *
+ * A per-line test sees line two start with a letter, calls it template text and
+ * reports "macOS" as a stray — which it is not. 629 comment lines in the scanned
+ * trees read that way when this was written; the guard was green only because
+ * none of them named a platform, and the first that did got reworded to appease
+ * a bug rather than fixing it.
+ * So the opener is tracked until its closer, in `/* *\/`, `<!-- -->` and the
+ * `{/* *\/}` form Svelte allows (the braces are ordinary characters either way).
+ *
+ * Everything after a closer on the same line stays visible: `<!-- why --> ⌘K`
+ * really does print a glyph, and the old line test skipped that line whole.
+ *
+ * `//` is honoured only where the trimmed line starts with it, as before: a bare
+ * `//` mid-line is a URL far more often than a comment, and in a template or a
+ * `<style>` block it is never a comment at all. Checking it first also stops a
+ * `/*` quoted inside a line comment from opening a block that was never opened.
+ *
+ * Deliberately not `portable-paths.contract`'s `code()`, which masks quoted text
+ * before stripping: that is right for the `.ts` trees it reads and wrong here,
+ * where an apostrophe in template prose ("the reader's view") is not a quote and
+ * masking spans between two of them would hide markup from the scan. The cost is
+ * that a comment opener inside a string — `"src/**\/*.ts"` — desynchronises the
+ * tracker. So rather than trust it, "every scanned file closes what it opens" is
+ * asserted below: a blinded scanner must not read as a clean one.
+ */
+function outsideComments(line: string, state: CommentState): { visible: string; next: CommentState } {
+  if (state === "code" && line.trim().startsWith("//")) return { visible: "", next: "code" };
+  let visible = "";
+  let rest = line;
+  let current = state;
+  for (;;) {
+    if (current === "code") {
+      const block = rest.indexOf("/*");
+      const html = rest.indexOf("<!--");
+      if (block < 0 && html < 0) return { visible: visible + rest, next: "code" };
+      const opensBlock = html < 0 || (block >= 0 && block < html);
+      const at = opensBlock ? block : html;
+      visible += rest.slice(0, at);
+      rest = rest.slice(at + (opensBlock ? "/*".length : "<!--".length));
+      current = opensBlock ? "block" : "html";
+    } else {
+      const closer = COMMENT_CLOSERS[current];
+      const at = rest.indexOf(closer);
+      if (at < 0) return { visible, next: current };
+      rest = rest.slice(at + closer.length);
+      current = "code";
+    }
+  }
 }
 
 interface Hit {
@@ -115,27 +168,46 @@ function visibleText(file: string, line: string, inTemplate: boolean): string[] 
   return file.endsWith(".svelte") && inTemplate ? [line] : stringLiterals(line);
 }
 
-function scan(pattern: RegExp, stripMapperCalls = true): Hit[] {
+/**
+ * One file's hits, plus the comment state its last line leaves open.
+ *
+ * Takes the source rather than reading it, so the tests below can run real
+ * multi-line markup through the same engine the trees are scanned with. A guard
+ * whose own cases exercise a reimplementation proves nothing about the guard.
+ */
+function scanSource(
+  file: string,
+  source: string,
+  pattern: RegExp,
+  stripMapperCalls = true,
+): { hits: Hit[]; unclosed: CommentState } {
   const hits: Hit[] = [];
-  for (const file of scannedFiles()) {
-    if (OWNERS.has(file)) continue;
-    const source = readFileSync(join(ROOT, file), "utf8");
-    let inTemplate = !file.endsWith(".svelte");
-    source.split("\n").forEach((line, index) => {
-      if (line.includes("</script>")) {
-        inTemplate = true;
-        return;
+  let inTemplate = !file.endsWith(".svelte");
+  let state: CommentState = "code";
+  source.split("\n").forEach((line, index) => {
+    const outside = outsideComments(line, state);
+    state = outside.next;
+    if (outside.visible.includes("</script>")) {
+      inTemplate = true;
+      return;
+    }
+    const mapped = stripMapperCalls ? outside.visible.replace(MAPPER_CALL, "") : outside.visible;
+    for (const candidate of visibleText(file, mapped, inTemplate)) {
+      if (pattern.test(candidate)) {
+        hits.push({ file, line: index + 1, text: candidate.trim().slice(0, 90) });
       }
-      if (isComment(line)) return;
-      const mapped = stripMapperCalls ? line.replace(MAPPER_CALL, "") : line;
-      for (const candidate of visibleText(file, mapped, inTemplate)) {
-        if (pattern.test(candidate)) {
-          hits.push({ file, line: index + 1, text: candidate.trim().slice(0, 90) });
-        }
-      }
-    });
-  }
-  return hits;
+    }
+  });
+  return { hits, unclosed: state };
+}
+
+function scan(pattern: RegExp, stripMapperCalls = true): Hit[] {
+  return scannedFiles()
+    .filter((file) => !OWNERS.has(file))
+    .flatMap(
+      (file) =>
+        scanSource(file, readFileSync(join(ROOT, file), "utf8"), pattern, stripMapperCalls).hits,
+    );
 }
 
 function describeHits(hits: readonly Hit[]): string {
@@ -164,6 +236,129 @@ describe("platform vocabulary has one owner", () => {
     // And must not fire on wording that is already platform-neutral.
     expect(PLATFORM_WORDS.test("Quiet hours in this computer's local time")).toBe(false);
     expect(PLATFORM_WORDS.test("Toggle the terminal dock")).toBe(false);
+  });
+});
+
+/**
+ * A comment cannot reach a reader, so it is skipped for its whole length —
+ * and the moment it ends, scanning resumes. Both halves matter: skipping too
+ * little reports prose about the defect AS the defect (the bug these cases
+ * pin), and skipping too much turns the guard off.
+ *
+ * Every case runs real markup through `scanSource`, the same engine the trees
+ * are scanned with, and asserts the LINE NUMBERS reported.
+ */
+describe("reads comments as explanation and everything else as output", () => {
+  /** The `<style>` shape that provoked this: prose wrapped without a gutter. */
+  const STYLE_BLOCK = [
+    `<script lang="ts">`,
+    `  let { open = false } = $props();`,
+    `</script>`,
+    ``,
+    `<div class="sheet" class:open></div>`,
+    ``,
+    `<style>`,
+    `  .sheet {`,
+    `    /* Slash-alpha, not a flat token: an alpha-less fill is a slab that paints`,
+    `       over the macOS window material instead of reading as a recess in it. */`,
+    `    background: color-mix(in oklab, var(--gp-surface) 82%, transparent);`,
+    `  }`,
+    `</style>`,
+  ].join("\n");
+
+  /**
+   * One comment and one paragraph, each wrapping onto a second line, each
+   * naming the platform. Only the paragraph prints.
+   */
+  const WRAPPED_MARKUP = [
+    `<script lang="ts">`,
+    `  let { granted = false } = $props();`,
+    `</script>`,
+    ``,
+    `<!-- Permission is the host's to grant, so this copy names the host rather`,
+    `     than macOS, which is only where the author happened to be. -->`,
+    `<p class="gp-note">`,
+    `  Desktop notifications stay silent until you allow them in`,
+    `  macOS System Settings, which GitPulse cannot do for you.`,
+    `</p>`,
+  ].join("\n");
+
+  /** The braced form, which Svelte allows and which wraps the same way. */
+  const BRACED_COMMENT = [
+    `<script lang="ts">`,
+    `  let { chord } = $props();`,
+    `</script>`,
+    ``,
+    `{/* The catalog authors this chord in macOS notation and CoachMark maps`,
+    `    it for every caller, so nothing below reaches a reader raw. */}`,
+    `<span class="gp-keycap">{chord}</span>`,
+    `<span class="gp-keycap">⌘K</span>`,
+  ].join("\n");
+
+  /** In `.ts` only literals are read — including literals inside comments. */
+  const TS_MODULE = [
+    `/* The packager produces the bundle, not this module, so the error says`,
+    `   "the application bundle" and never "the macOS bundle": the host that`,
+    `   hit it may not be a Mac. */`,
+    `export const MISSING = "Install the application bundle first.";`,
+    `export const WRONG = "Install the macOS application bundle first.";`,
+  ].join("\n");
+
+  const lines = (file: string, source: string, pattern: RegExp): number[] =>
+    scanSource(file, source, pattern).hits.map((hit) => hit.line);
+
+  it("skips a continuation line of a block comment in a style block", () => {
+    expect(lines("src/lib/components/Sheet.svelte", STYLE_BLOCK, PLATFORM_WORDS)).toEqual([]);
+  });
+
+  it("still reports a continuation line of real markup", () => {
+    // Line 6 is the comment's second line, line 9 the paragraph's. Only 9.
+    expect(lines("src/lib/components/Notice.svelte", WRAPPED_MARKUP, PLATFORM_WORDS)).toEqual([9]);
+  });
+
+  it("skips the braced comment form and keeps scanning after it", () => {
+    const file = "src/lib/components/Chord.svelte";
+    expect(lines(file, BRACED_COMMENT, PLATFORM_WORDS)).toEqual([]);
+    expect(lines(file, BRACED_COMMENT, GLYPHS)).toEqual([8]);
+  });
+
+  it("scans text that follows a comment closing on the same line", () => {
+    // Line 5 STARTS with `<!--`, so the old line test skipped it whole — glyph
+    // and all. A closed comment ends at its closer, not at the line's end.
+    const source = [
+      `<script lang="ts">`,
+      `  let { chord } = $props();`,
+      `</script>`,
+      ``,
+      `<!-- authored in Mac notation, mapped on the way out --> <kbd>⌘K</kbd>`,
+    ].join("\n");
+    expect(lines("src/lib/components/Keycap.svelte", source, GLYPHS)).toEqual([5]);
+  });
+
+  it("skips a quoted phrase inside a comment but not the literal below it", () => {
+    expect(lines("src/lib/desktop/bundleCopy.ts", TS_MODULE, PLATFORM_WORDS)).toEqual([5]);
+  });
+
+  /**
+   * The one way this tracking can fail silently: an opener it should not have
+   * believed — `"src/**\/*.ts"` in a literal — leaves a comment open to the end
+   * of the file, and every line after it is skipped as prose. A file that never
+   * closes what it opens would not compile, so the state is the scanner's own
+   * report on whether it read the whole file or stopped early.
+   */
+  it("closes every comment it opens, so no file is skipped wholesale", () => {
+    const files = scannedFiles();
+    expect(files.length, "the walk found no files to scan").toBeGreaterThan(50);
+    const unclosed = files.filter(
+      (file) =>
+        scanSource(file, readFileSync(join(ROOT, file), "utf8"), PLATFORM_WORDS).unclosed !==
+        "code",
+    );
+    expect(
+      unclosed,
+      "the scanner stopped reading these files partway, so their remaining " +
+        "lines were skipped rather than checked:\n" + unclosed.join("\n"),
+    ).toEqual([]);
   });
 });
 
