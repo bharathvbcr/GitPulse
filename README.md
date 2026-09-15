@@ -71,6 +71,8 @@ The [feature reference](docs/FEATURES.md) describes each surface and its limits.
 The [changelog](CHANGELOG.md) records release changes; [open qualification](docs/QUALIFICATION.md)
 tracks remaining platform, provider, and performance checks.
 
+![DevMap interactive dependency map and symbol graph in GitPulse](docs/assets/DevMap.png)
+
 | File explorer | Diff review |
 | --- | --- |
 | ![File explorer with working tree status](docs/assets/screenshot-files.png) | ![Commit diff with highlighted changes](docs/assets/screenshot-diff.png) |
