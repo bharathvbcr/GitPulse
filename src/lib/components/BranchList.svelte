@@ -44,7 +44,7 @@
     totalRowHeight,
     windowFromOffsets,
   } from "../sidebar/rowWindow";
-  import { clampMenuPosition } from "../branches/menuPosition";
+  import { popover } from "../ui/popover";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
   import { branchRowHeight, sidebarRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
@@ -116,8 +116,6 @@
   let locateName = $state<string | null>(null);
   let menu = $state<{ x: number; y: number; branch?: BranchInfo; tag?: TagInfo } | null>(null);
   let menuEl: HTMLDivElement | undefined = $state();
-  /** Measured size of the open menu; null until the portaled node mounts. */
-  let menuBox = $state<{ w: number; h: number } | null>(null);
   /** Element focused when the menu opened; Escape/Tab hand focus back to it. */
   let openerEl: HTMLElement | null = null;
   /** Roving index among [role=menuitem] children for arrow-key cycling. */
@@ -677,39 +675,6 @@
     await repoStore.selectRangeDiff(from, localNameFor(branch));
   }
 
-  function onWindowClick() {
-    closeMenu();
-  }
-
-  // Right-clicks outside a row/kebab bubble here (row handlers stopPropagation
-  // when they open their own menu); a stale menu must not survive them.
-  function onWindowContextmenu() {
-    closeMenu();
-  }
-
-  // A resize invalidates the clamped position; closing beats repositioning a
-  // menu the user has almost certainly abandoned.
-  function onWindowResize() {
-    closeMenu();
-  }
-
-  // Measure the portaled menu's real rendered size once mounted, then clamp
-  // its position so it fits the viewport. Conditional items make any static
-  // guess wrong, and focusing the container routes arrows/Escape/Tab straight
-  // into handleMenuKeydown.
-  let menuPos = $derived(
-    menu
-      ? clampMenuPosition(
-          menu.x,
-          menu.y,
-          menuBox?.w ?? MENU_ESTIMATED_W,
-          menuBox?.h ?? MENU_ESTIMATED_H,
-          window.innerWidth,
-          window.innerHeight
-        )
-      : { left: 0, top: 0 }
-  );
-
   // Which items the open menu renders. A background refresh can flip
   // is_current/is_remote while the menu is up; the item list then changes
   // height under the old clamp, so the measure effect must re-run on this
@@ -724,15 +689,41 @@
         : "";
   });
 
+  /**
+   * Placement and dismissal, from the shared popover owner.
+   *
+   * `click` on the bubble phase, not `pointerdown` on capture: the menu
+   * container stops propagation on its own clicks, and that is what keeps
+   * "Copy name" from closing the menu it was invoked from. Capture would
+   * silently take that away. A right-click elsewhere dismisses too — row
+   * handlers stop propagation when they open their own menu, so opening a
+   * second menu is not a dismissal of the first.
+   *
+   * `revision` is the menu's item signature, because a background refresh can
+   * flip is_current/is_remote while the menu is up and change its height
+   * under an already-clamped position. Conditional items are also why the
+   * estimate below is only a flash-length placeholder — the owner measures
+   * the real box. Escape stays with `handleMenuKeydown`.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "point" as const, x: menu?.x ?? 0, y: menu?.y ?? 0 },
+    estimate: { width: MENU_ESTIMATED_W, height: MENU_ESTIMATED_H },
+    revision: menuShape,
+    dismiss: {
+      pointer: "click" as const,
+      contextmenu: true,
+      resize: true,
+      escape: "none" as const,
+    },
+    // A resize invalidates the clamped position; closing beats repositioning
+    // a menu the user has almost certainly abandoned.
+    onDismiss: () => closeMenu(),
+  });
+
   $effect(() => {
     menuShape;
-    if (!menu) {
-      menuBox = null;
-      return;
-    }
     const el = menuEl;
-    if (!el) return;
-    menuBox = { w: el.offsetWidth, h: el.offsetHeight };
+    if (!menu || !el) return;
     // Initial open (or a refresh that left focus outside) routes keys into
     // the menu; never steal focus back from an item mid-navigation.
     if (!el.contains(document.activeElement)) el.focus();
@@ -749,13 +740,7 @@
     // the user never pins anything this session (a lazy first-save hook
     // would leave stale repos' keys accumulating forever).
     prunePinnedIndex(browserStorage());
-    window.addEventListener("click", onWindowClick);
-    window.addEventListener("contextmenu", onWindowContextmenu);
-    window.addEventListener("resize", onWindowResize);
     return () => {
-      window.removeEventListener("click", onWindowClick);
-      window.removeEventListener("contextmenu", onWindowContextmenu);
-      window.removeEventListener("resize", onWindowResize);
       applyFilter.cancel();
     };
   });
@@ -1337,8 +1322,8 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
+    use:popover={dismissal}
     class="fixed z-50 min-w-44 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden"
-    style="left: {menuPos.left}px; top: {menuPos.top}px"
     role="menu"
     aria-orientation="vertical"
     tabindex="-1"

@@ -35,8 +35,7 @@
   import { ChevronDown, FolderGit2, Star } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { shouldDismissOverlay } from "../ui/dismiss";
-  import { clampMenuPosition } from "../branches/menuPosition";
+  import { popover, restoreFocusTo } from "../ui/popover";
   import { groupRows, summaryLine, outsiderLine, type LinkSummary, type PickerRow, type TriggerChip } from "../workbench/taskRepositories";
   import type { OpenTabRef } from "../workbench/openMembership";
 
@@ -87,7 +86,6 @@
   let open = $state(false);
   let triggerEl: HTMLButtonElement | undefined = $state();
   let popupEl: HTMLDivElement | undefined = $state();
-  let pos = $state({ left: 0, top: 0 });
 
   const label = $derived(summaryLine(summary));
   const groups = $derived(groupRows(rows));
@@ -95,83 +93,66 @@
   function close(options?: { restoreFocus?: boolean }) {
     const opener = triggerEl;
     open = false;
-    if (options?.restoreFocus && opener?.isConnected) window.setTimeout(() => opener.focus(), 0);
-  }
-
-  /**
-   * Place the popup under the trigger, clamped into the viewport.
-   *
-   * Called once on open with an estimated size and again once the popup has
-   * measured itself, because a first-frame guess that is too short opens a
-   * tall list off the bottom edge.
-   */
-  function fit(estimate?: { width: number; height: number }) {
-    if (!triggerEl) return;
-    const rect = triggerEl.getBoundingClientRect();
-    const width = popupEl?.offsetWidth || estimate?.width || Math.max(rect.width, 300);
-    const height = popupEl?.offsetHeight || estimate?.height || 320;
-    pos = clampMenuPosition(rect.left, rect.bottom + 6, width, height, window.innerWidth, window.innerHeight);
+    if (options?.restoreFocus) restoreFocusTo(opener);
   }
 
   function toggleOpen() {
-    if (open) { close(); return; }
-    fit({ width: Math.max(triggerEl?.getBoundingClientRect().width ?? 0, 300), height: 320 });
-    open = true;
+    open = !open;
   }
 
-  $effect(() => { if (open && popupEl) fit(); });
   $effect(() => {
     // A disabled trigger with an open popup is a control that cannot be
     // dismissed by the thing that opened it.
     if (disabled && open) close();
   });
 
+  /**
+   * Placement and dismissal, from the shared popover owner.
+   *
+   * `scroll` is why this popup is portaled and why the listener has to be on
+   * the capture phase: `.sheet-body` is the scroller that moves the trigger
+   * out from under the popup, and scroll does not bubble. A scroll *inside*
+   * the popup is the reader reading the list, so the owner judges that one by
+   * containment rather than by the selector below.
+   *
+   * Escape is `capture` because the task sheet closes on Escape too; stopping
+   * propagation there is what keeps one Escape from dismissing the popover
+   * *and* the task behind it. `revision` re-measures when the filter changes
+   * how tall the list is.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: triggerEl, gap: 6 },
+    estimate: { width: 300, height: 320 },
+    revision: rows.length,
+    dismiss: {
+      inside: "[data-task-repo-picker], [data-task-repo-popup]",
+      scroll: true,
+      resize: true,
+      escape: "capture" as const,
+    },
+    onDismiss: (reason: string) => close({ restoreFocus: reason === "escape" }),
+  });
+
   onMount(() => {
-    const onPointer = (event: PointerEvent) => {
-      if (!open) return;
-      if (shouldDismissOverlay(event.target, "[data-task-repo-picker], [data-task-repo-popup]")) close();
-    };
+    /**
+     * Tab off either end of the popup closes it rather than leaving a
+     * floating panel behind the reader's focus. This stays here rather than
+     * moving to the popover owner: it is the only surface with an *edge*
+     * check — the other two menus that close on Tab close on any Tab — and
+     * the owner deliberately does not reach into focus. Capture, and on
+     * window rather than the popup, because a `role="group"` div is not an
+     * interactive element.
+     */
     const onKey = (event: KeyboardEvent) => {
-      if (!open) return;
-      if (event.key === "Escape") {
-        // The sheet closes on Escape too, and this listener is on the capture
-        // phase, so stopping here is what keeps one Escape from dismissing the
-        // popover *and* the task behind it.
-        event.preventDefault();
-        event.stopPropagation();
-        close({ restoreFocus: true });
-        return;
-      }
-      // Tab off either end of the popup closes it rather than leaving a
-      // floating panel behind the reader's focus. Handled here rather than
-      // with a listener on the popup itself: a `role="group"` div is not an
-      // interactive element, and one keyboard owner beats two.
-      if (event.key === "Tab" && popupEl && event.target instanceof Node && popupEl.contains(event.target)) {
-        const focusables = popupEl.querySelectorAll<HTMLElement>("input:not(:disabled), button:not(:disabled)");
-        if (!focusables.length) return;
-        const edge = event.shiftKey ? focusables[0] : focusables[focusables.length - 1];
-        if (document.activeElement === edge) close();
-      }
+      if (!open || event.key !== "Tab") return;
+      if (!popupEl || !(event.target instanceof Node) || !popupEl.contains(event.target)) return;
+      const focusables = popupEl.querySelectorAll<HTMLElement>("input:not(:disabled), button:not(:disabled)");
+      if (!focusables.length) return;
+      const edge = event.shiftKey ? focusables[0] : focusables[focusables.length - 1];
+      if (document.activeElement === edge) close();
     };
-    // Capture, because scroll does not bubble: this is how the sheet's own
-    // scroller reaches us. A scroll *inside* the popup is the reader reading
-    // the list, not leaving it, so only outside scrolls dismiss.
-    const onScroll = (event: Event) => {
-      if (!open) return;
-      if (event.target instanceof Node && popupEl?.contains(event.target)) return;
-      close();
-    };
-    const onResize = () => close();
-    window.addEventListener("pointerdown", onPointer, true);
     window.addEventListener("keydown", onKey, true);
-    window.addEventListener("scroll", onScroll, true);
-    window.addEventListener("resize", onResize);
-    return () => {
-      window.removeEventListener("pointerdown", onPointer, true);
-      window.removeEventListener("keydown", onKey, true);
-      window.removeEventListener("scroll", onScroll, true);
-      window.removeEventListener("resize", onResize);
-    };
+    return () => window.removeEventListener("keydown", onKey, true);
   });
 </script>
 
@@ -228,10 +209,11 @@
   <div
     bind:this={popupEl}
     use:portal={"body"}
+    use:popover={dismissal}
     data-task-repo-popup
     data-testid="task-repo-popup"
     class="fixed gp-menu gp-pop repo-popup"
-    style="left: {pos.left}px; top: {pos.top}px; z-index: {LAYERS.MENU}"
+    style="z-index: {LAYERS.MENU}"
     role="group"
     aria-label="Repositories for this task"
   >

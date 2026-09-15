@@ -1,11 +1,10 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { RefreshCw } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { shouldDismissOverlay } from "../ui/dismiss";
+  import { popover } from "../ui/popover";
   import { locMetric } from "../metrics/repoMetrics";
   import type { MetricSnapshot } from "../metrics/freshness";
   import {
@@ -44,7 +43,7 @@
   let mix = $state<LanguageMix>(EMPTY);
 
   let open = $state(false);
-  let anchor = $state<{ x: number; bottom: number } | null>(null);
+  let triggerEl: HTMLButtonElement | undefined = $state();
   let refreshing = $state(false);
 
   $effect(() => {
@@ -89,50 +88,36 @@
 
   function close() {
     open = false;
-    anchor = null;
   }
 
-  function toggle(event: MouseEvent) {
-    if (open) {
-      close();
-      return;
-    }
-    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    // Anchored from the bottom: the status bar is the last row on screen, so
-    // the panel has to grow upward or it opens off the window.
-    anchor = { x: rect.left, bottom: window.innerHeight - rect.top + 6 };
-    open = true;
+  function toggle() {
+    open = !open;
   }
 
-  function handlePointerDown(event: PointerEvent) {
-    if (!open) return;
-    if (!shouldDismissOverlay(event.target, "[data-language-panel], [data-language-trigger]")) {
-      return;
-    }
-    close();
-  }
-
-  function handleKey(event: KeyboardEvent) {
-    if (event.key === "Escape" && open) {
-      event.preventDefault();
-      close();
-    }
-  }
-
-  onMount(() => {
-    window.addEventListener("pointerdown", handlePointerDown, true);
-    window.addEventListener("keydown", handleKey);
-    window.addEventListener("resize", close);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("keydown", handleKey);
-      window.removeEventListener("resize", close);
-    };
+  /**
+   * Placement and dismissal, from the shared popover owner.
+   *
+   * `place: "above"` because the status bar is the last row on screen and
+   * "below" is off the window. The owner expresses that as a top derived from
+   * the panel's measured height, so it still grows upward as the breakdown
+   * grows — and, unlike the raw `bottom:` this used to carry, it cannot grow
+   * off the top of the window and put the head of the list out of reach.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: triggerEl, gap: 6, place: "above" as const },
+    revision: mix.stats.length,
+    dismiss: {
+      inside: "[data-language-panel], [data-language-trigger]",
+      resize: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: close,
   });
 </script>
 
 {#if mix.stats.length > 0 && mix.dominant}
   <button
+    bind:this={triggerEl}
     type="button"
     data-language-trigger
     aria-haspopup="dialog"
@@ -162,14 +147,15 @@
   </span>
 {/if}
 
-{#if open && anchor}
+{#if open}
   <div
     use:portal={"body"}
+    use:popover={dismissal}
     data-language-panel
     role="dialog"
     aria-label="Language breakdown"
     class="fixed w-72 gp-menu gp-pop p-3 text-xs text-textPrimary"
-    style="left: {anchor.x}px; bottom: {anchor.bottom}px; z-index: {LAYERS.MENU}"
+    style="z-index: {LAYERS.MENU}"
   >
     <div class="h-1.5 flex rounded-full overflow-hidden bg-background ring-1 ring-border/50 mb-2.5">
       {#each mix.stats as lang (lang.language)}

@@ -12,7 +12,7 @@
   import { toastStore } from "../stores/toastStore";
   import { copyText } from "../desktop/clipboard";
   import { LAYERS } from "../ui/layers";
-  import { shouldDismissOverlay } from "../ui/dismiss";
+  import { popover } from "../ui/popover";
   import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository,
@@ -97,6 +97,16 @@
   let archiveToken = $state(0);
   let unread = $state(0);
   let addMenu = $state(false);
+  /**
+   * Dismissal only, from the shared popover owner: the add-repository menu is
+   * placed by CSS under its own heading, so it has no anchor to clamp.
+   * `onAddMenuKey` takes Escape first whenever the menu has focus; this is the
+   * fallback for focus that has left it.
+   */
+  const addMenuDismissal = {
+    dismiss: { inside: "[data-add-repo]", escape: "bubble" as const },
+    onDismiss: () => { addMenu = false; },
+  };
   let adding = $state(false);
   let addMenuEl: HTMLDivElement | undefined = $state();
   let workspaceMemberIds = $state<string[] | null>(null);
@@ -280,18 +290,10 @@
   onMount(() => {
     const listeners = createListenerTracker();
     if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
-    const onPointerDown = (event: PointerEvent) => { if (addMenu && shouldDismissOverlay(event.target, "[data-add-repo]")) addMenu = false; };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && addMenu) addMenu = false;
-    };
     const clock = window.setInterval(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     window.addEventListener("focus", scheduleRefresh);
-    window.addEventListener("pointerdown", onPointerDown, true);
-    window.addEventListener("keydown", onKey);
     listeners.track(() => window.clearInterval(clock));
     listeners.track(() => window.removeEventListener("focus", scheduleRefresh));
-    listeners.track(() => window.removeEventListener("pointerdown", onPointerDown, true));
-    listeners.track(() => window.removeEventListener("keydown", onKey));
     return () => {
       disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); listeners.dispose();
     };
@@ -1062,7 +1064,7 @@
            membership write to be discovered. -->
       <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
         {#if addMenu}
-          <div bind:this={addMenuEl} id="task-add-repo-menu" class="add-menu gp-menu" role="menu" aria-label={addRepoLabel} tabindex="-1" style="z-index: {LAYERS.MENU}" onkeydown={onAddMenuKey}>
+          <div bind:this={addMenuEl} use:popover={addMenuDismissal} id="task-add-repo-menu" class="add-menu gp-menu" role="menu" aria-label={addRepoLabel} tabindex="-1" style="z-index: {LAYERS.MENU}" onkeydown={onAddMenuKey}>
             {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
             {#each menuTabs as tab (tab.path)}
               <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>

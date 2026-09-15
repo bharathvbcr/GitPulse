@@ -293,28 +293,38 @@ describe("BranchList two-line branch rows", () => {
 });
 
 describe("BranchList context menu hardening", () => {
-  it("positions via measured size through clampMenuPosition, not guesses", () => {
-    expect(source).toContain('from "../branches/menuPosition"');
-    expect(source).toContain("clampMenuPosition(");
-    // The old hardcoded viewport margins are gone.
+  it("positions via measured size through the shared popover owner, not guesses", () => {
+    // Measuring is the owner's job now and popover.test.ts proves the
+    // measured box beats the estimate; this holds the estimate to being only
+    // a flash-length placeholder, and the old hardcoded margins to staying
+    // gone.
+    expect(source).toContain('from "../ui/popover"');
+    expect(source).toContain("estimate: { width: MENU_ESTIMATED_W, height: MENU_ESTIMATED_H }");
     expect(source).not.toContain("innerWidth - 200");
     expect(source).not.toContain("innerHeight - 280");
+    // Replaced, not accumulated: no second clamp beside the owner's.
+    expect(source).not.toContain("clampMenuPosition");
   });
 
-  it("binds the portaled node and measures its real rendered size after mount", () => {
+  it("binds the portaled node and re-measures when its items change", () => {
+    // A background refresh can flip is_current/is_remote while the menu is
+    // up, changing its height under an already-clamped position.
     expect(source).toContain("bind:this={menuEl}");
-    expect(source).toContain("el.offsetWidth");
-    expect(source).toContain("el.offsetHeight");
+    expect(source).toContain("revision: menuShape");
+    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{dismissal\}/);
   });
 
   it("closes the menu on window resize", () => {
-    expect(source).toContain('window.addEventListener("resize"');
-    expect(source).toContain('window.removeEventListener("resize"');
+    expect(source).toContain("resize: true");
   });
 
-  it("dismisses a stale menu on right-clicks elsewhere via a window contextmenu listener", () => {
-    expect(source).toContain('window.addEventListener("contextmenu"');
-    expect(source).toContain('window.removeEventListener("contextmenu"');
+  it("dismisses a stale menu on right-clicks elsewhere", () => {
+    expect(source).toContain("contextmenu: true");
+    // Bubble-phase clicks, not capture: the menu container stops propagation
+    // on its own clicks, and that is what keeps "Copy name" from closing the
+    // menu it was invoked from.
+    expect(source).toContain('pointer: "click"');
+    expect(source).toContain("onclick={(e) => e.stopPropagation()}");
     // Every close funnels through one path so the opener ref is dropped too.
     expect(source.match(/closeMenu\(/g)?.length ?? 0).toBeGreaterThanOrEqual(10);
   });

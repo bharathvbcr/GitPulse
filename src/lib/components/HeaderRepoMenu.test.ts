@@ -37,11 +37,18 @@ describe("HeaderRepoMenu", () => {
   });
 
   it("portals the menu, clamps it to the viewport, and dismisses like other overlays", () => {
-    expect(source).toContain("use:portal");
-    expect(source).toContain("clampMenuPosition");
-    expect(source).toContain("shouldDismissOverlay");
+    // Literally the same way now: the shared popover owner places the menu
+    // against the trigger and registers the dismissal, applied after the
+    // portal so it measures the menu where it actually paints. The title bar
+    // clips overflow, which is why the menu has to escape it at all.
+    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{dismissal\}/);
+    expect(source).toContain("element: triggerEl");
     expect(source).toContain("[data-header-repo-menu], [data-header-repo-menu-popup]");
+    expect(source).toContain("resize: true");
     expect(source).toContain("LAYERS.MENU");
+    // Replaced, not accumulated: no hand-rolled clamp or listener beside it.
+    expect(source).not.toContain("clampMenuPosition");
+    expect(source).not.toContain("addEventListener");
   });
 
   it("gives the menu complete keyboard and assistive semantics", () => {

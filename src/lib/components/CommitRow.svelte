@@ -27,10 +27,10 @@
   import { repoStore } from "../stores/repoStore";
   import { filterStore } from "../stores/filterStore";
   import { askText } from "../stores/modalStore";
-  import { clampMenuPosition } from "../branches/menuPosition";
   import { shortRefLabel } from "../graph/refScope";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
+  import { popover } from "../ui/popover";
 
   export interface RefItem {
     name: string;
@@ -88,8 +88,28 @@
 
   let isCopied = $state(false);
   let isMenuOpen = $state(false);
-  let menuPos = $state<{ left: number; top: number }>({ left: 0, top: 0 });
+  let menuAnchor = $state<{ x: number; y: number }>({ x: 0, y: 0 });
   let menuEl = $state<HTMLDivElement | undefined>();
+
+  /**
+   * Placement and dismissal, from the shared popover owner.
+   *
+   * `click` rather than `pointerdown`, on the bubble phase, because that is
+   * what this menu has always used — and every item closes the menu itself
+   * before acting, so an outside-only click is the same dismissal the old
+   * `<svelte:window onclick>` provided without also firing on the way through
+   * the menu. The estimate is the size the menu used to be *assumed* to have;
+   * the owner now measures the real one and re-clamps, so a menu whose items
+   * make it taller than 280px can no longer paint off the bottom edge.
+   *
+   * Escape stays with `handleMenuKeydown`, which the menu element owns.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "point" as const, x: menuAnchor.x, y: menuAnchor.y },
+    estimate: { width: 200, height: 280 },
+    dismiss: { pointer: "click" as const, escape: "none" as const },
+    onDismiss: closeMenu,
+  });
 
   const isCompact = $derived(density === "compact");
   const isAbsoluteTime = $derived(timestampStyle === "absolute");
@@ -127,15 +147,7 @@
   }
 
   function openContextMenu(clientX: number, clientY: number) {
-    const clamped = clampMenuPosition(
-      clientX,
-      clientY,
-      200,
-      280,
-      window.innerWidth,
-      window.innerHeight
-    );
-    menuPos = clamped;
+    menuAnchor = { x: clientX, y: clientY };
     isMenuOpen = true;
   }
 
@@ -213,8 +225,6 @@
 
   let conventional = $derived(getConventionalType(row.summary || ""));
 </script>
-
-<svelte:window onclick={() => isMenuOpen && closeMenu()} />
 
 <div
   role="button"
@@ -362,8 +372,9 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
+    use:popover={dismissal}
     class="fixed z-50 min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden shadow-float"
-    style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU};"
+    style="z-index: {LAYERS.MENU};"
     role="menu"
     aria-orientation="vertical"
     tabindex="-1"

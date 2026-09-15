@@ -9,11 +9,10 @@
    */
   import { Settings2, Square, SquareCheck } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { shouldDismissOverlay } from "../ui/dismiss";
+  import { popover } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { STATUSES, STATUS_LABELS } from "../workbench/vocabulary";
   import { TASK_CARD_FIELDS, TASK_CARD_FIELD_LABELS, canHideStatus } from "../ui/taskView";
-  import { onMount } from "svelte";
 
   let { disabled = false }: { disabled?: boolean } = $props();
 
@@ -32,23 +31,24 @@
       $interfaceStore.taskLayout !== "board",
   );
 
-  onMount(() => {
-    const onPointer = (event: PointerEvent) => {
-      if (open && shouldDismissOverlay(event.target, "[data-task-view-menu]")) open = false;
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && open) {
-        open = false;
-        root?.querySelector<HTMLButtonElement>("[data-task-view-toggle]")?.focus();
-      }
-    };
-    window.addEventListener("pointerdown", onPointer, true);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("pointerdown", onPointer, true);
-      window.removeEventListener("keydown", onKey);
-    };
-  });
+  /**
+   * Dismissal only, from the shared popover owner: this panel is placed by
+   * CSS, `absolute` under its own trigger inside a `relative` wrapper, so it
+   * has no anchor to clamp and the owner leaves its position alone.
+   *
+   * Escape bubbles rather than capturing — nothing behind the board menu also
+   * closes on Escape, so there is nothing to stop propagation from.
+   */
+  const dismissal = {
+    dismiss: { inside: "[data-task-view-menu]", escape: "bubble" as const },
+    onDismiss: (reason: string) => {
+      open = false;
+      // Only Escape hands focus back. A pointer dismissal means the reader is
+      // already somewhere else, and pulling focus to the trigger would take
+      // them off whatever they just clicked.
+      if (reason === "escape") root?.querySelector<HTMLButtonElement>("[data-task-view-toggle]")?.focus();
+    },
+  };
 </script>
 
 <div class="relative" bind:this={root} data-task-view-menu>
@@ -68,6 +68,7 @@
   </button>
   {#if open}
     <div
+      use:popover={dismissal}
       class="absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
       style="z-index: {LAYERS.MENU}"
       role="group"

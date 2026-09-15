@@ -257,7 +257,11 @@ describe("TaskBoard", () => {
     expect(source).toContain("openTabs={openTabRefs}");
     expect(source).toContain('aria-haspopup="menu"');
     expect(source).toContain("data-add-repo");
-    expect(source).toContain('shouldDismissOverlay(event.target, "[data-add-repo]")');
+    // Dismissal comes from the shared popover owner, which counts the heading
+    // — trigger included — as inside; popover.test.ts holds the phases to
+    // account.
+    expect(source).toContain("use:popover={addMenuDismissal}");
+    expect(source).toContain('inside: "[data-add-repo]"');
     expect(source).toContain("emptyAddLabel");
     expect(source).toContain("pickerSelectionIds");
     expect(source).toContain('aria-controls="task-add-repo-menu"');

@@ -565,6 +565,12 @@ if (params.has("check")) {
     await openMenu("task-11");
     await settle(220); const rect=menu().getBoundingClientRect();
     check("task menus fit the bottom-right viewport boundary", rect.right <= innerWidth && rect.bottom <= innerHeight && rect.left >= 0 && rect.top >= 0);
+    // Fitting is only half the claim: a menu that never got positioned at all
+    // sits at the origin, which also "fits". The anchor was the bottom-right
+    // corner, so a menu that was actually placed is flush against it, one
+    // 8px inset away. This is what proves the shared popover owner's inline
+    // left/top survives to paint rather than being overwritten.
+    check("task menus are clamped to the anchor, not left at the origin", Math.abs(rect.right - (innerWidth - 8)) <= 1 && Math.abs(rect.bottom - (innerHeight - 8)) <= 1);
     menu().dispatchEvent(new KeyboardEvent("keydown",{key:"End",bubbles:true,cancelable:true})); await settle();
     check("End selects the last task menu action", document.activeElement.textContent.includes("Delete"));
     menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();

@@ -8,14 +8,12 @@
    * (`.gp-header-scroll` is overflow-x auto / overflow-y hidden) so a nested
    * dropdown would paint inside the 40px strip.
    */
-  import { onMount } from "svelte";
   import { ChevronDown, Download, FolderOpen } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { portal } from "../dom/portal";
   import { cycleFocus, enumerateFocusables } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { shouldDismissOverlay } from "../ui/dismiss";
-  import { clampMenuPosition } from "../branches/menuPosition";
+  import { popover, restoreFocusTo } from "../ui/popover";
 
   let {
     onOpen,
@@ -28,30 +26,37 @@
   let open = $state(false);
   let triggerEl: HTMLButtonElement | undefined = $state();
   let menuEl: HTMLDivElement | undefined = $state();
-  let menuPos = $state({ left: 0, top: 0 });
 
   function close(options?: { restoreFocus?: boolean }) {
     const opener = triggerEl;
     open = false;
-    if (options?.restoreFocus && opener?.isConnected) {
-      window.setTimeout(() => opener.focus(), 0);
-    }
+    if (options?.restoreFocus) restoreFocusTo(opener);
   }
 
   function openMenu() {
-    if (triggerEl) {
-      const rect = triggerEl.getBoundingClientRect();
-      menuPos = clampMenuPosition(
-        rect.left,
-        rect.bottom + 6,
-        176,
-        88,
-        window.innerWidth,
-        window.innerHeight,
-      );
-    }
     open = true;
   }
+
+  /**
+   * Placement and dismissal, from the shared popover owner. The title bar
+   * clips overflow (`.gp-header-scroll` is overflow-x auto / overflow-y
+   * hidden), so the menu is portaled and positioned against the trigger
+   * rather than nested under it.
+   *
+   * Escape bubbles here, as a fallback for focus that has left the menu;
+   * `onMenuKey` below handles it first — and stops propagation — whenever the
+   * menu itself has focus, which is the usual case.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: triggerEl, gap: 6 },
+    estimate: { width: 176, height: 88 },
+    dismiss: {
+      inside: "[data-header-repo-menu], [data-header-repo-menu-popup]",
+      resize: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => close({ restoreFocus: reason === "escape" }),
+  });
 
   function toggle() {
     if (open) close();
@@ -94,25 +99,8 @@
     window.setTimeout(() => target?.focus(), 0);
   }
 
-  function fit() {
-    if (!open || !menuEl || !triggerEl) return;
-    const rect = triggerEl.getBoundingClientRect();
-    menuPos = clampMenuPosition(
-      rect.left,
-      rect.bottom + 6,
-      menuEl.offsetWidth,
-      menuEl.offsetHeight,
-      window.innerWidth,
-      window.innerHeight,
-    );
-  }
-
   $effect(() => {
     if (open && menuEl) focusPopup();
-  });
-
-  $effect(() => {
-    if (open && menuEl && triggerEl) fit();
   });
 
   function onTriggerKey(event: KeyboardEvent) {
@@ -156,32 +144,6 @@
     }
   }
 
-  function handlePointerDown(event: PointerEvent) {
-    if (!open) return;
-    if (!shouldDismissOverlay(event.target, "[data-header-repo-menu], [data-header-repo-menu-popup]")) {
-      return;
-    }
-    close();
-  }
-
-  function handleKey(event: KeyboardEvent) {
-    if (event.key === "Escape" && open) {
-      event.preventDefault();
-      close({ restoreFocus: true });
-    }
-  }
-
-  onMount(() => {
-    const dismiss = () => close();
-    window.addEventListener("pointerdown", handlePointerDown, true);
-    window.addEventListener("keydown", handleKey);
-    window.addEventListener("resize", dismiss);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("keydown", handleKey);
-      window.removeEventListener("resize", dismiss);
-    };
-  });
 </script>
 
 <div class="relative shrink-0" data-header-repo-menu>
@@ -209,6 +171,7 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
+    use:popover={dismissal}
     id="header-repo-menu"
     data-header-repo-menu-popup
     role="menu"
@@ -216,7 +179,7 @@
     tabindex="-1"
     onkeydown={onMenuKey}
     class="fixed min-w-44 gp-menu gp-pop text-xs text-textPrimary"
-    style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU}"
+    style="z-index: {LAYERS.MENU}"
   >
     <button
       type="button"
