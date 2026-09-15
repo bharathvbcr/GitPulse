@@ -44,6 +44,7 @@
   } from "@lucide/svelte";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import FreshnessBadge from "./FreshnessBadge.svelte";
+  import FirebasePanel from "./FirebasePanel.svelte";
   import { freshnessStore } from "../provenance/store";
   import { prFreshness, prRevisions } from "../provenance/pullRequests";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -1145,6 +1146,12 @@
             {/if}
           {/if}
         </section>
+        <!-- Deploys sit in the CI rail beside the workflows and releases that
+             produce them, rather than in a section of their own: a Firebase
+             section would be empty for every repository that does not deploy
+             to Firebase, which is the shape the Insights registry already
+             records as a mistake. -->
+        <FirebasePanel repoPath={$repoStore.currentPath} />
       </div>
     </div>
   {/if}

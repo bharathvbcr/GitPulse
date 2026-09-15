@@ -1904,6 +1904,95 @@ pub async fn cmd_github_cancel_run(
     .await
 }
 
+/// What the working tree says about this repository's Firebase setup.
+///
+/// Reads `.firebaserc` and `firebase.json` plus a bounded `firebase --version`
+/// probe. No network, no credential, no possible mutation — so unlike the
+/// listings below it is free to run on panel mount, and it returns a report
+/// rather than a `Result`: "this repository does not use Firebase" is an
+/// answer, not a failure.
+#[tauri::command(async)]
+pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::FirebaseStatus {
+    off_thread(move || {
+        Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path))
+    })
+    .await
+    // A thread-pool failure is not "no Firebase config": it is a status that
+    // could not be read, and it says so rather than rendering as a repository
+    // that does not use Firebase.
+    .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
+}
+
+/// Lists App Hosting backends for one project.
+///
+/// Returns `Guarded` because this read can mutate: upstream runs
+/// `ensureApiEnabled` before the listing, which enables the App Hosting API on
+/// the user's Cloud project when it is off. In this codebase `Guarded<T>` *is*
+/// the declaration that a command mutates, and `command-policy-contract`
+/// enforces that anything wearing it calls the write gate — so the type is the
+/// honest one even though the verb reads like a query.
+#[tauri::command(async)]
+pub async fn cmd_firebase_backends(
+    repo_path: String,
+    project_id: String,
+) -> Result<Guarded<crate::firebase::apphosting::FirebaseBackendsReport>, String> {
+    off_thread(move || {
+        let probe = crate::firebase::firebase_cli_probe();
+        if !probe.present {
+            return Err(probe
+                .reason
+                .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
+        }
+        let argv_owned = crate::firebase::apphosting::backends_list_argv(&project_id)?;
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::firebase::apphosting::load_backends_report(
+            &repo_path,
+            &project_id,
+            &argv_owned,
+            probe.present,
+        );
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Lists rollouts for one App Hosting backend, joined to local commits.
+///
+/// Gated for the same reason as [`cmd_firebase_backends`].
+#[tauri::command(async)]
+pub async fn cmd_firebase_rollouts(
+    repo_path: String,
+    project_id: String,
+    backend_id: String,
+    location: Option<String>,
+) -> Result<Guarded<crate::firebase::apphosting::FirebaseRolloutsReport>, String> {
+    off_thread(move || {
+        let probe = crate::firebase::firebase_cli_probe();
+        if !probe.present {
+            return Err(probe
+                .reason
+                .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
+        }
+        let argv_owned = crate::firebase::apphosting::rollouts_list_argv(
+            &project_id,
+            &backend_id,
+            location.as_deref(),
+        )?;
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::firebase::apphosting::load_rollouts_report(
+            &repo_path,
+            &project_id,
+            &backend_id,
+            &argv_owned,
+            probe.present,
+        );
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
 /// CI:local — runs the repository's CI pipeline on this machine.
 ///
 /// Every step is judged by the harness command gate and reaches the ledger

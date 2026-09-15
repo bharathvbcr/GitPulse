@@ -90,6 +90,18 @@ repository's shared task board.
 - **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list, each carrying when it was last updated, and searchable by number, title, author or label.
 - **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
 - **Fetched, Not Merely Present**: The header stamps how long ago the context on screen was fetched, and a listing hydrated from cache on a repository switch loses the stamp rather than inheriting a fetch that never happened.
+- **Firebase Deploys, Joined To Commits**: For a repository carrying `.firebaserc`
+  or `firebase.json`, the CI rail lists App Hosting rollouts and matches each one
+  to the commit it shipped — App Hosting reports the full SHA, so "this commit is
+  live" is a lookup rather than a guess. Detection is a local file read; the
+  listing runs only when asked, because the Firebase CLI enables the App Hosting
+  API when it is off and that is a change to a Cloud project, not a read. The
+  project is always picked by hand: `.firebaserc`'s `default` alias is frequently
+  production, so nothing is aimed there by a default nobody saw. A rollout whose
+  commit is absent from this checkout — a force-push, a fork, a shallow clone — is
+  shown and marked rather than dropped, a state Firebase has not published yet is
+  rendered as unknown instead of inheriting a green badge, and a listing that
+  could not run says so rather than reading as a backend that never deployed.
 - **CI:Local Runner**: Runs the repository CI pipeline locally before pushing commits. When a fresh
   DevMap index can answer, test steps may be scoped to **affected test files** for the change set;
   a stale map, incomplete walk, or unmatched seed **fails closed** to the full suite and says why —

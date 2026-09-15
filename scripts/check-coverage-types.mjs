@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 65 contracts over
- * 157 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 67 contracts over
+ * 165 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -165,6 +165,11 @@ export const CONTRACTS = Object.freeze([
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
   { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo"] },
+  // Firebase deployment state. `RolloutCommit.hash` is the join key to local
+  // history, so a rename there would silently stop every commit matching and
+  // render as "nothing is deployed" rather than as an error.
+  { label: "firebase", rustPath: rust("firebase", "mod.rs"), tsPath: ts("firebase", "types.ts"), structs: ["FirebaseStatus", "FirebaseCliProbe", "FirebaseProjectAlias"] },
+  { label: "firebase-apphosting", rustPath: rust("firebase", "apphosting.rs"), tsPath: ts("firebase", "types.ts"), structs: ["FirebaseRolloutsReport", "FirebaseBackendsReport", "RolloutInfo", "RolloutCommit", "BackendInfo"] },
   { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
   { label: "code-scanning", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["CodeScanningReport", "CodeScanningAlertInfo"] },
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },

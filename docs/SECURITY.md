@@ -22,11 +22,13 @@ flowchart TD
 
     subgraph ExternalSurfaces["External Surface Isolation"]
         LocalGH["Local <code>gh</code> CLI<br/>(Uses existing local keychain)"]
+        LocalFB["Local <code>firebase</code> CLI<br/>(Uses existing local login)"]
         LocalAI["Local LLM Server<br/>(Loopback 127.0.0.1 / localhost Only)"]
         PTY["User Shell / Explicit Agent PTYs<br/>(Separate sessions)"]
     end
 
     LocalEngine --> LocalGH
+    LocalEngine --> LocalFB
     LocalEngine --> LocalAI
     LocalEngine --> PTY
     LocalEngine --> ProfileManvi["Profile Manvi Host<br/>(Configured provider / managed runs)"]
@@ -42,6 +44,9 @@ flowchart TD
   including scheduled release checks, automatic task suggestions, and the
   default-on GitHub alert scan (Dependabot and code scanning via the local `gh`
   CLI when a repository opens). A failed GitHub check does not toast.
+- Firebase App Hosting listings are user-action only, never automatic, because
+  they can enable an API on your Google Cloud project. See *Local `firebase`
+  Credential Safety* below.
 - The webview does not load external CDN scripts, styles, or telemetry trackers.
 
 ### Explicit Repository Trust
@@ -144,6 +149,26 @@ flowchart TD
 ### Local `gh` Credential Safety
 - GitPulse never requests, reads, stores, or transmits your GitHub personal access tokens or passwords.
 - All GitHub operations (PR inspection, workflow dispatch, Dependabot and code scanning queries) delegate exclusively to your locally installed and authenticated `gh` CLI.
+
+### Local `firebase` Credential Safety
+- The same rule holds for Firebase: GitPulse never requests, reads, stores or
+  transmits your Google credentials. App Hosting reads delegate to your locally
+  installed and authenticated `firebase` CLI, which owns the login.
+- Detecting that a repository uses Firebase is a local file read (`.firebaserc`,
+  `firebase.json`) and reaches no network. Those paths are resolved through the
+  repository sandbox, so a symlinked `.firebaserc` cannot be used to read a file
+  outside the checkout — including the CLI's own credential store.
+- **Listing backends or rollouts can enable an API on your Google Cloud
+  project.** The Firebase CLI runs `ensureApiEnabled` before those listings and
+  turns the App Hosting API on when it is off. App Hosting publishes no
+  read-only OAuth scope, so this is not avoidable by asking differently. GitPulse
+  therefore treats those listings as mutations: they never run on their own, only
+  from an explicit action, the panel states the side effect before the button,
+  and the exact command line is judged by the policy gate before any process
+  starts. Every invocation passes `--json`, which the CLI treats as implying
+  non-interactive, so a prompt fails loudly instead of enabling something quietly.
+- A listing that could not run is reported as a reason, never as a backend with
+  no deployments.
 
 ### Loopback-Only Local AI Transport
 - Built-in local AI completions (commit messages, explanations and branch names)

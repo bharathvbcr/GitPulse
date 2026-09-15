@@ -56,6 +56,8 @@ const DERIVED_ARGV = Object.freeze({
   cmd_github_trigger_workflow: "shells out to gh, not git",
   cmd_github_rerun_run: "shells out to gh, not git",
   cmd_github_cancel_run: "shells out to gh, not git",
+  cmd_firebase_backends: "shells out to firebase, not git; apphosting::backends_list_argv is the one builder the gate and the executor both read",
+  cmd_firebase_rollouts: "shells out to firebase, not git; apphosting::rollouts_list_argv is the one builder the gate and the executor both read",
   cmd_add_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_remove_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_lock_worktree: "worktree argv is built in engine::worktree, not git_writer",

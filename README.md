@@ -84,8 +84,9 @@ Screenshots are captures from the macOS app; appearance varies by release and pl
 ## Local state and explicit permissions
 
 Repository and task state are stored locally. The desktop app has no remote
-telemetry. Git remotes, GitHub operations, optional tool downloads, release checks,
-and configured agent providers can use the network.
+telemetry. Git remotes, GitHub operations, Firebase App Hosting checks you ask for,
+optional tool downloads, release checks, and configured agent providers can use the
+network.
 
 Built-in local AI connects to loopback model servers. Task enhancement and agent
 runs use their configured provider; supported Mac builds can also use Apple

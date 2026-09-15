@@ -13,7 +13,7 @@ flowchart TB
         Guards["Async cancellation guards"]
     end
     subgraph IPC["Tauri 2 IPC"]
-        Bridge["invoke('cmd_*') — 209 handlers, check:ipc"]
+        Bridge["invoke('cmd_*') — 223 handlers, check:ipc"]
     end
     subgraph Backend["Rust / Rayon"]
         Git["Git sandbox"]

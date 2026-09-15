@@ -9,6 +9,7 @@ pub mod devmap;
 pub mod diff;
 pub mod docs;
 pub mod engine;
+pub mod firebase;
 mod fs_entry;
 pub mod github;
 pub mod grants;
@@ -229,6 +230,9 @@ pub fn run() {
             cmd_github_create_issue,
             cmd_github_checkout_pr,
             cmd_github_workflows,
+            cmd_firebase_status,
+            cmd_firebase_backends,
+            cmd_firebase_rollouts,
             cmd_github_trigger_workflow,
             cmd_github_rerun_run,
             cmd_github_cancel_run,

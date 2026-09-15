@@ -25,6 +25,7 @@ export type PanelSource =
   | "storage"
   | "pulse"
   | "github"
+  | "firebase"
   | "health"
   | "ops"
   | "clone"
