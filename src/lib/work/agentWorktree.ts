@@ -20,42 +20,106 @@
  * worktree an agent session because of it would put a wrong label on real
  * work. Git's own metadata store (`.git/worktrees/`) is the same shape and
  * is excluded: that path is not a checkout.
+ *
+ * # The kind and the slug are one decision, not two
+ *
+ * Everything below derives from a single left-to-right scan that returns the
+ * position it matched at. An earlier version found the kind by locating
+ * `/.<name>/worktrees`, then found the slug by independently searching for
+ * the first `/worktrees/` in the whole path — two searches for one fact, and
+ * they disagreed whenever any ancestor directory happened to be named
+ * `worktrees`. `/Users/me/worktrees/app/.claude/worktrees/session-abc` read
+ * its slug as `app`, so every session under such a parent collapsed to one
+ * label: the exact merging-in-the-reader's-eye the slug exists to prevent.
+ * One scan cannot disagree with itself.
+ *
+ * Both implementations of this rule — this one and `agent_layout` in
+ * `src-tauri/src/engine/worktree.rs` — are held to the shared corpus in
+ * `agentWorktree.cases.json`, so they cannot drift apart silently.
  */
 
 /** The path segment Claude Code nests its worktrees under. */
 export const AGENT_WORKTREE_SEGMENT = ".claude/worktrees/";
 
-/** Git's linked-worktree metadata directory — never a working tree. */
-const GIT_INTERNAL_SEGMENT = "/.git/worktrees/";
+/** The directory name an agent nests its sessions under. */
+const WORKTREES_SEGMENT = "worktrees";
+
+/** What a matched agent layout yields: the tool, and the session under it. */
+export interface AgentLayout {
+  /** The hidden directory's name, without the leading dot. Never empty. */
+  kind: string;
+  /**
+   * The session directory under `worktrees`, or empty when the path stops at
+   * the container itself. Empty means "this path names no session" — never a
+   * session whose name could not be read.
+   */
+  slug: string;
+}
 
 /**
- * `/.<agent>/worktrees/` anywhere in a normalised path, except git's own
- * store. The agent name is the hidden directory, so a new tool that follows
- * the same layout is recognised without a code change.
+ * Path segments, separator-normalised.
+ *
+ * Windows separators go first: the same repository opened on Windows reports
+ * `\.claude\worktrees\`, and matching only the POSIX form would silently
+ * label every agent worktree there as hand-made. Splitting on runs of
+ * separators and dropping empties collapses `//` and any trailing slash in
+ * the same pass, so no quadratic de-duplication loop is needed.
  */
-const AGENT_LAYOUT = /\/\.(?!git(?:\/|$))([^/]+)\/worktrees(?:\/|$)/;
+function normalisedSegments(path: string): string[] {
+  return path.split(/[\\/]+/).filter(Boolean);
+}
 
-function normalisedPath(path: string): string {
-  // Leading slash so a bare `.claude/worktrees/…` still matches the layout,
-  // and so `C:\…` Windows paths become comparable to POSIX ones.
-  return `/${path.replace(/\\/g, "/")}`.replace(/\/{2,}/g, "/");
+/**
+ * The agent's name when `segment` is the hidden directory one nests worktrees
+ * under, else empty.
+ *
+ * Rejected, in order:
+ *
+ * * anything not starting with a dot — an ordinary directory;
+ * * a bare `.`, and anything starting with `..` — those are traversal, not
+ *   directory names, and no agent is called `.foo`. Without this,
+ *   `/repo/../worktrees/x` reported an agent of kind `.`;
+ * * `git` in any case. On the case-insensitive volumes macOS and Windows ship
+ *   by default, `.GIT/worktrees` IS git's own metadata store; an earlier
+ *   case-sensitive comparison let `/repo/.GIT/worktrees` through as an agent
+ *   of kind `GIT`.
+ */
+function agentDirectoryName(segment: string): string {
+  if (!segment.startsWith(".")) return "";
+  const name = segment.slice(1);
+  if (!name || name.startsWith(".")) return "";
+  if (name.toLowerCase() === "git") return "";
+  return name;
+}
+
+/**
+ * The agent layout this path sits in, or null when it is not an agent
+ * worktree.
+ *
+ * The single scan every other function here is built on. Left to right, so
+ * the outermost layout wins and the slug is always read from the match that
+ * named the kind.
+ */
+export function agentLayout(path: string): AgentLayout | null {
+  if (!path) return null;
+  const segments = normalisedSegments(path);
+  for (let i = 0; i + 1 < segments.length; i += 1) {
+    const kind = agentDirectoryName(segments[i]);
+    if (!kind || segments[i + 1] !== WORKTREES_SEGMENT) continue;
+    return { kind, slug: segments[i + 2] ?? "" };
+  }
+  return null;
 }
 
 /**
  * True when this path is a worktree an agent created.
  *
- * Windows separators are normalised first: the same repository opened on
- * Windows reports `\\.claude\\worktrees\\`, and matching only the POSIX form
- * would silently label every agent worktree there as hand-made.
+ * A path that stops at the container (`.claude/worktrees`) still counts: the
+ * layout is what is recognised here, and a caller that needs a session name
+ * asks for the slug and gets an honest empty string.
  */
 export function isAgentWorktree(path: string): boolean {
-  if (!path) return false;
-  const normalised = normalisedPath(path);
-  // Git's metadata dir is `.git` on every platform we ship; comparing
-  // case-insensitively covers a checkout on a case-insensitive volume
-  // that reports `.GIT`.
-  if (normalised.toLowerCase().includes(GIT_INTERNAL_SEGMENT)) return false;
-  return AGENT_LAYOUT.test(normalised);
+  return agentLayout(path) !== null;
 }
 
 /**
@@ -66,9 +130,7 @@ export function isAgentWorktree(path: string): boolean {
  * have about a tool we have only seen a folder of.
  */
 export function agentKind(path: string): string {
-  if (!isAgentWorktree(path)) return "";
-  const match = normalisedPath(path).match(AGENT_LAYOUT);
-  return match?.[1] ?? "";
+  return agentLayout(path)?.kind ?? "";
 }
 
 /**
@@ -97,15 +159,10 @@ export function agentKindsOn(paths: readonly string[]): string[] {
  * returned rather than a prettified prefix — it is the only thing that
  * distinguishes two sessions working the same feature, so trimming it would
  * merge them in the reader's eye.
+ *
+ * Read from the same match that named the kind, so an ancestor directory
+ * called `worktrees` cannot redirect it to an unrelated segment.
  */
 export function agentSessionSlug(path: string): string {
-  if (!isAgentWorktree(path)) return "";
-  const normalised = normalisedPath(path);
-  const marker = "/worktrees/";
-  const at = normalised.indexOf(marker);
-  if (at < 0) return "";
-  return normalised
-    .slice(at + marker.length)
-    .split("/")
-    .filter(Boolean)[0] ?? "";
+  return agentLayout(path)?.slug ?? "";
 }

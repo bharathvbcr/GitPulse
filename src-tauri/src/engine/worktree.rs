@@ -280,46 +280,89 @@ fn display_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Slash-normalised path with a leading `/`, matching the frontend detector.
+/// The directory name an agent nests its sessions under.
+const WORKTREES_SEGMENT: &str = "worktrees";
+
+/// A matched agent layout: the tool, and the session directory under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLayout {
+    /// The hidden directory's name, without the leading dot. Never empty.
+    pub kind: String,
+    /// The session directory under `worktrees`, or empty when the path stops
+    /// at the container itself. Empty means "this path names no session",
+    /// never a session whose name could not be read.
+    pub slug: String,
+}
+
+/// The agent's name when `segment` is the hidden directory one nests
+/// worktrees under, else `None`.
 ///
-/// Agent worktrees are recognised from directory layout, never from a branch
-/// name. The same repository opened on Windows reports backslashes, so both
-/// sides normalise before matching; a POSIX-only match would label every
-/// agent session there as hand-made.
-fn normalised_worktree_path(path: &str) -> String {
-    let mut out = String::from("/");
-    out.push_str(&path.replace('\\', "/"));
-    while out.contains("//") {
-        out = out.replace("//", "/");
+/// Rejected, in order:
+///
+/// * anything not starting with a dot — an ordinary directory;
+/// * a bare `.`, and anything starting with `..` — those are traversal, not
+///   directory names, and no agent is called `.foo`. Without this,
+///   `/repo/../worktrees/x` reported an agent of kind `.`;
+/// * `git` in any case. On the case-insensitive volumes macOS and Windows
+///   ship by default, `.GIT/worktrees` IS git's own metadata store; an
+///   earlier case-sensitive comparison let `/repo/.GIT/worktrees` through as
+///   an agent of kind `GIT`.
+fn agent_directory_name(segment: &str) -> Option<&str> {
+    let name = segment.strip_prefix('.')?;
+    if name.is_empty() || name.starts_with('.') || name.eq_ignore_ascii_case("git") {
+        return None;
     }
-    out
+    Some(name)
+}
+
+/// The agent layout this path sits in, or `None` when it is not an agent
+/// worktree.
+///
+/// Coding agents isolate a task under `<repo>/.<agent>/worktrees/<slug>`.
+/// Detection is from directory layout, never from a branch name — a human can
+/// name a branch `claude/…`. Git's own `.git/worktrees/` metadata is the same
+/// shape and is excluded: that path is not a checkout.
+///
+/// The scan runs left to right over separator-normalised segments, so the
+/// outermost layout wins and **the slug is always read from the match that
+/// named the kind**. Deriving the two separately is what let an ancestor
+/// directory called `worktrees` capture the slug: in
+/// `/Users/me/worktrees/app/.claude/worktrees/session-abc` the slug came back
+/// as `app`, collapsing every session under such a parent to one label.
+///
+/// Held with the frontend copy of this rule (`agentLayout` in
+/// `src/lib/work/agentWorktree.ts`) to the shared corpus in
+/// `src/lib/work/agentWorktree.cases.json`.
+pub fn agent_layout(path: &str) -> Option<AgentLayout> {
+    if path.is_empty() {
+        return None;
+    }
+    // Splitting on both separators and dropping empties normalises Windows
+    // paths and collapses `//` and any trailing slash in one pass.
+    let segments: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for i in 0..segments.len().saturating_sub(1) {
+        let Some(kind) = agent_directory_name(segments[i]) else {
+            continue;
+        };
+        if segments[i + 1] != WORKTREES_SEGMENT {
+            continue;
+        }
+        return Some(AgentLayout {
+            kind: kind.to_string(),
+            slug: segments.get(i + 2).copied().unwrap_or_default().to_string(),
+        });
+    }
+    None
 }
 
 /// The agent that created this worktree (`claude`, `cursor`, `codex`, …).
 ///
-/// `None` when the path is not an agent worktree. Coding agents isolate a
-/// task under `<repo>/.<agent>/worktrees/<slug>`. Git's own
-/// `.git/worktrees/` metadata is the same shape and is excluded: that path
-/// is not a checkout. Detection does not guess from the branch name — a
-/// human can name a branch `claude/…`.
+/// `None` when the path is not an agent worktree. See [`agent_layout`].
 pub fn agent_kind(path: &str) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-    let normalised = normalised_worktree_path(path);
-    if normalised.to_ascii_lowercase().contains("/.git/worktrees/") {
-        return None;
-    }
-    let parts: Vec<&str> = normalised.split('/').filter(|p| !p.is_empty()).collect();
-    for i in 0..parts.len().saturating_sub(1) {
-        let part = parts[i];
-        if let Some(kind) = part.strip_prefix('.') {
-            if kind != "git" && parts[i + 1] == "worktrees" && !kind.is_empty() {
-                return Some(kind.to_string());
-            }
-        }
-    }
-    None
+    agent_layout(path).map(|layout| layout.kind)
 }
 
 /// The session slug when `path` is an agent worktree.
@@ -327,15 +370,14 @@ pub fn agent_kind(path: &str) -> Option<String> {
 /// Claude Code appends a short hash so concurrent sessions on the same task
 /// stay distinct. The whole segment is returned rather than a prettified
 /// prefix — trimming it would merge two sessions in the reader's eye.
+///
+/// `None` covers both "not an agent worktree" and "the path names the
+/// container rather than a session"; every caller renders the two the same
+/// way, as no session name to show.
 pub fn agent_session_slug(path: &str) -> Option<String> {
-    agent_kind(path)?;
-    let normalised = normalised_worktree_path(path);
-    let marker = "/worktrees/";
-    let at = normalised.find(marker)?;
-    normalised[at + marker.len()..]
-        .split('/')
-        .find(|s| !s.is_empty())
-        .map(str::to_string)
+    agent_layout(path)
+        .map(|layout| layout.slug)
+        .filter(|slug| !slug.is_empty())
 }
 
 /// Ceiling on paths returned by [`changed_paths`]. Collision detection only
@@ -964,6 +1006,267 @@ some-future-field whatever
         assert_eq!(agent_session_slug("/repo"), None);
         assert_eq!(agent_session_slug("/repo/.git/worktrees/feature"), None);
         assert_eq!(agent_session_slug("/repo/.claude/worktrees/"), None);
+    }
+
+    #[test]
+    fn agent_session_slug_is_read_from_the_match_that_named_the_kind() {
+        // An ancestor directory called `worktrees` is an ordinary thing for a
+        // person to have, and deriving the slug by searching the whole path
+        // for `/worktrees/` found that one first: every session under such a
+        // parent came back with the same slug, which is exactly the merging
+        // the slug exists to prevent.
+        assert_eq!(
+            agent_session_slug("/Users/me/worktrees/myrepo/.claude/worktrees/session-abc")
+                .as_deref(),
+            Some("session-abc")
+        );
+        assert_eq!(
+            agent_session_slug("/work/worktrees/.claude/worktrees/a").as_deref(),
+            Some("a")
+        );
+        // A `worktrees` directory BELOW the session must not redirect it either.
+        assert_eq!(
+            agent_session_slug("/repo/.claude/worktrees/slug/worktrees/other").as_deref(),
+            Some("slug")
+        );
+    }
+
+    #[test]
+    fn agent_kind_rejects_git_in_any_case_and_dotted_traversal() {
+        // `.GIT` and `.git` are the same directory on the case-insensitive
+        // volumes macOS and Windows ship by default. The container spelling
+        // (no trailing separator) escaped the old guard and was reported as
+        // an agent of kind `GIT`.
+        assert_eq!(agent_kind("/repo/.GIT/worktrees"), None);
+        assert_eq!(agent_kind("/repo/.GIT/worktrees/feature"), None);
+        assert_eq!(agent_kind("/repo/.Git/worktrees/feature"), None);
+        assert_eq!(agent_kind("/repo/.gIt/worktrees/x"), None);
+        // `.` and `..` are traversal, not directory names. Stripping the
+        // leading dot from `..` left `.`, which was accepted as an agent.
+        assert_eq!(agent_kind("/repo/../worktrees/x"), None);
+        assert_eq!(agent_kind("/repo/..foo/worktrees/x"), None);
+        assert_eq!(agent_kind("/repo/.../worktrees/x"), None);
+        assert_eq!(agent_kind("/repo/./worktrees/x"), None);
+    }
+
+    /// Deterministic LCG: a fuzz run nobody can reproduce is not evidence.
+    fn lcg(seed: u32) -> impl FnMut() -> u32 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        }
+    }
+
+    /// Segments chosen to collide with every branch of the rule.
+    const FUZZ_ALPHABET: [&str; 15] = [
+        "a",
+        "z",
+        ".",
+        "..",
+        ".git",
+        ".GIT",
+        ".claude",
+        "worktrees",
+        "Worktrees",
+        "",
+        " ",
+        "-",
+        "é",
+        "0",
+        "..foo",
+    ];
+
+    fn fuzz_path(next: &mut impl FnMut() -> u32) -> String {
+        let depth = 1 + (next() % 12) as usize;
+        let separator = if next().is_multiple_of(2) { '/' } else { '\\' };
+        let mut parts: Vec<&str> = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            parts.push(FUZZ_ALPHABET[(next() as usize) % FUZZ_ALPHABET.len()]);
+        }
+        let mut path = String::new();
+        if next().is_multiple_of(2) {
+            path.push(separator);
+        }
+        path.push_str(&parts.join(&separator.to_string()));
+        path
+    }
+
+    fn swap_separators(path: &str) -> String {
+        if path.contains('\\') {
+            path.replace('\\', "/")
+        } else {
+            path.replace('/', "\\")
+        }
+    }
+
+    #[test]
+    fn agent_layout_holds_its_invariants_under_fuzzing() {
+        // The corpus pins the cases we decided about. This attacks the space
+        // nobody decided about, and asserts what has to be true of any answer
+        // at all: a wrong label here puts an agent chip on a person's own
+        // checkout, and a panic takes the whole snapshot with it.
+        let mut next = lcg(0x5eed);
+        let mut matched = 0usize;
+        let mut rejected = 0usize;
+        for _ in 0..20_000 {
+            let path = fuzz_path(&mut next);
+            let layout = agent_layout(&path);
+            // The accessors are views of one scan; if they can disagree, a
+            // snapshot and the row rendered from it describe different worlds.
+            assert_eq!(
+                agent_kind(&path),
+                layout.as_ref().map(|l| l.kind.clone()),
+                "{path:?}"
+            );
+            assert_eq!(
+                agent_session_slug(&path),
+                layout
+                    .as_ref()
+                    .map(|l| l.slug.clone())
+                    .filter(|s| !s.is_empty()),
+                "{path:?}"
+            );
+            // Windows and POSIX spellings of one path are one path.
+            assert_eq!(agent_layout(&swap_separators(&path)), layout, "{path:?}");
+            // Redundant separators are not information.
+            let padded = path.replace('/', "///").replace('\\', "\\\\\\");
+            assert_eq!(agent_layout(&padded), layout, "{path:?}");
+
+            match layout {
+                None => rejected += 1,
+                Some(found) => {
+                    matched += 1;
+                    assert!(!found.kind.is_empty(), "{path:?}");
+                    assert!(!found.kind.starts_with('.'), "{path:?}");
+                    assert!(!found.kind.eq_ignore_ascii_case("git"), "{path:?}");
+                    if found.slug.is_empty() {
+                        // The path stopped at the container. Appending to it
+                        // NAMES a session, so suffix-independence does not
+                        // apply — it only holds once a session exists. The
+                        // fuzzer found this by handing over
+                        // `-\worktrees\.GIT\.claude\worktrees`, where the
+                        // suffix supplies the slug rather than hiding it.
+                        assert_eq!(
+                            agent_layout(&format!("{path}/named")).map(|l| l.slug),
+                            Some("named".to_string()),
+                            "{path:?} must take its session name from the suffix"
+                        );
+                    } else {
+                        // A slug is a segment of the path it came from, never
+                        // a fragment and never a name borrowed from elsewhere.
+                        assert!(
+                            path.split(['/', '\\']).any(|s| s == found.slug),
+                            "{path:?} produced a slug that is not one of its segments: {:?}",
+                            found.slug
+                        );
+                        // Anything below a session still reports that session.
+                        for suffix in ["/src/lib.rs", "/worktrees/other", "/.git/worktrees/z"] {
+                            assert_eq!(
+                                agent_layout(&format!("{path}{suffix}")),
+                                Some(found.clone()),
+                                "{path:?} changed its mind because of {suffix:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // A generator that stopped producing matches would satisfy every
+        // assertion above while checking nothing — a check that did not run,
+        // reporting the same green as one that did.
+        assert!(matched > 100, "the fuzz corpus produced {matched} layouts");
+        assert!(rejected > 100, "the fuzz corpus rejected only {rejected}");
+    }
+
+    #[test]
+    fn agent_layout_stays_linear_on_hostile_input() {
+        // A tripwire, not a benchmark. The budget is loose on purpose: a
+        // machine under load must not fail this for being slow, but anything
+        // that reintroduces quadratic normalisation blows past it by orders
+        // of magnitude long before a user's Work view would.
+        let hostile = [
+            format!("/{}worktrees/slug", ".claude/".repeat(20_000)),
+            format!("/{}.claude/worktrees/slug", "a/".repeat(50_000)),
+            format!("/repo/{}/worktrees/x", ".".repeat(100_000)),
+            format!("/repo/.claude/worktrees/{}", "x".repeat(200_000)),
+            format!("/{}.claude/worktrees/s", "/".repeat(200_000)),
+        ];
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            for path in &hostile {
+                let _ = agent_layout(path);
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "hostile paths took {elapsed:?}"
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct LayoutCorpus {
+        cases: Vec<LayoutCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct LayoutCase {
+        path: String,
+        kind: String,
+        slug: String,
+        why: String,
+    }
+
+    #[test]
+    fn agent_layout_matches_the_shared_corpus() {
+        // The frontend carries a second implementation of this same rule, for
+        // labelling paths the Work view already holds without another IPC
+        // round trip. `src/lib/work/agentWorktree.cases.json` is the one
+        // corpus both are held to; the TypeScript half runs in
+        // `src/lib/work/agentWorktree.contract.test.ts`. Changing either
+        // implementation on its own turns one of the two red, which is the
+        // whole point of keeping the corpus outside both.
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/lib/work/agentWorktree.cases.json"
+        ))
+        .expect("reading src/lib/work/agentWorktree.cases.json");
+        let corpus: LayoutCorpus =
+            serde_json::from_str(&raw).expect("parsing agentWorktree.cases.json");
+        assert!(
+            corpus.cases.len() >= 40,
+            "the shared corpus shrank to {} cases; it is meant to keep growing",
+            corpus.cases.len()
+        );
+        for case in &corpus.cases {
+            let (kind, slug) = match agent_layout(&case.path) {
+                Some(layout) => (layout.kind, layout.slug),
+                None => (String::new(), String::new()),
+            };
+            assert_eq!(
+                (kind.as_str(), slug.as_str()),
+                (case.kind.as_str(), case.slug.as_str()),
+                "{:?} — {}",
+                case.path,
+                case.why
+            );
+            // The two public accessors must agree with the scan they wrap;
+            // an accessor that answered differently would put one label on a
+            // snapshot and another on the row rendered from it.
+            assert_eq!(
+                agent_kind(&case.path).unwrap_or_default(),
+                case.kind,
+                "agent_kind {:?}",
+                case.path
+            );
+            assert_eq!(
+                agent_session_slug(&case.path).unwrap_or_default(),
+                case.slug,
+                "agent_session_slug {:?}",
+                case.path
+            );
+        }
     }
 
     #[test]

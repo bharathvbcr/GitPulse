@@ -1211,6 +1211,7 @@ mod tests {
                 ok: true,
                 sessions: 1,
                 kinds: Vec::new(),
+                truncated: false,
             },
             changes: ChangesFacet {
                 ok: true,

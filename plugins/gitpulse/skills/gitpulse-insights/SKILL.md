@@ -40,5 +40,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 - Unscanned worktrees are counted, never implied clean.
 - A missing code graph is `available: false` with a reason, not an empty hit list.
 - Agent worktrees are recognised from `/.<agent>/worktrees/` layout, never from a branch name.
+- `agents.ok: false` is "the worktree listing failed", not "no agents"; `agents.truncated: true` means the counts came from a capped sample, so `agents.sessions` is a floor and a kind whose worktrees all fall past the cap is absent from `agents.kinds` rather than undercounted.
+- An agent worktree is a *checkout*, not a running process: this server reports the sessions a repository has on disk, and cannot tell one still running from one abandoned mid-change.
 
 Pass `repo_path` as an absolute filesystem path on every call. The protocol is MCP `2026-07-28`: include `_meta.io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on each request. Legacy `initialize` still works for older clients.

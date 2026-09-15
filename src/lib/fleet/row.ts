@@ -276,6 +276,10 @@ function tierOne(
             agentKinds: facet.agents.kinds.map((kind) => kind.kind),
           },
           null,
+          // The producer says whether it saw every worktree. When it did not,
+          // the agent count is a floor and a kind may be missing outright, so
+          // the cell wears the `≥` marker rather than reading as exact.
+          facet.agents.truncated,
         )
       : failedCell(facet.worktrees_error || "the worktree list could not be read"),
     activity:
