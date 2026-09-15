@@ -242,12 +242,27 @@ settings are separate from this manual request; generated text still needs revie
 
 **Copy for agent** adds task instructions to a brief; it does not launch an agent.
 
+Those instructions are the whole prompt: a run started from the handoff form
+sends only the task identity to Manvi, and a clipboard copy is pasted into a
+session that has never seen this repository. They say three things — how to
+read the fields, that the author's wording is evidence to keep rather than
+paraphrase, and which of this project's own tools to orient with (the
+`gitpulse-*` and `devmap-*` skills, and the `gitpulse_*` and `devmap_*` MCP
+tools, each called with the repository's absolute `repo_path`). The skills
+named there are asserted against the directories that ship them, so the list
+cannot fall behind.
+
 | Copy source | What is copied |
 | --- | --- |
 | New, unsaved task | Current draft fields with extracted notes, explicitly labeled as an unsaved draft |
 | Saved task editor | The saved revision; unsaved edits are excluded and the copy feedback says so |
 | Board selection | Up to eight saved task briefs per action, with partial results reported |
 | Context menu → Copy → Saved brief | The canonical saved brief without the extra agent instructions |
+
+An unsaved draft can hold more text than a saved task's 64 KiB description,
+because notes are kept whole until the save boundary reports them. When a
+draft copy has to cut one, the packet says how much it kept rather than ending
+mid-sentence.
 
 Saved briefs include the task, ordered repository references and home workspace
 with their revisions. Stale or incomplete snapshots are refused. Save edits

@@ -97,6 +97,28 @@ export function appleBadge(status: AppleIntelligenceStatus | null): string {
   return "Unavailable";
 }
 
+/** How much of each list the context line will spend on the 12,000-character budget. */
+export const MAX_CONTEXT_REPOSITORIES = 8;
+export const MAX_CONTEXT_LABELS = 12;
+
+/**
+ * One list, bounded, and honest about what it left out.
+ *
+ * The bound is right — a task linked to forty repositories would spend the
+ * input budget on names the model cannot use. Presenting eight of forty as
+ * though they were the set is what was wrong: the model reads a closed list
+ * and writes "affects both repositories" about a task that spans five more.
+ * Saying how many were withheld costs a few characters and turns a wrong
+ * answer into a general one.
+ */
+function boundedList(values: readonly string[] | undefined, limit: number): string {
+  const all = (values ?? []).filter((value) => value.trim());
+  const shown = all.slice(0, limit);
+  if (!shown.length) return "";
+  const omitted = all.length - shown.length;
+  return `${shown.join(", ")}${omitted > 0 ? ` (and ${omitted} more not listed)` : ""}`;
+}
+
 /**
  * The context line handed to the model.
  *
@@ -110,11 +132,11 @@ export function appleContext(input: {
   labels?: readonly string[];
 }): string {
   const parts: string[] = [];
-  const repositories = (input.repositories ?? []).filter((name) => name.trim()).slice(0, 8);
-  if (repositories.length) parts.push(`Repository: ${repositories.join(", ")}`);
+  const repositories = boundedList(input.repositories, MAX_CONTEXT_REPOSITORIES);
+  if (repositories) parts.push(`Repository: ${repositories}`);
   if (input.kind?.trim()) parts.push(`Task type: ${input.kind.trim()}`);
-  const labels = (input.labels ?? []).filter((label) => label.trim()).slice(0, 12);
-  if (labels.length) parts.push(`Labels: ${labels.join(", ")}`);
+  const labels = boundedList(input.labels, MAX_CONTEXT_LABELS);
+  if (labels) parts.push(`Labels: ${labels}`);
   return parts.join(". ");
 }
 

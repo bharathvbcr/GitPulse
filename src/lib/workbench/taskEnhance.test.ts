@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import { ENHANCEMENT_STATES, type Enhancement, type EnhancementSummary, type Task } from "./client";
 import { acceptEnhancementInput, createEnhancementInput, runAppleEnhancement,
   assistEngineName,
+  draftingKind,
+  draftingVerb,
   enhancementApplyBlock,
   enhancementOptionLabel,
   DEFAULT_ASSIST_ENGINE,
   ASSIST_ENGINE_LIST,
   ENHANCEMENT_STATE_LABELS,
+  type DraftingKind,
 } from "./taskEnhance";
 
 const task: Task = {
@@ -15,6 +18,46 @@ const task: Task = {
   labels: [], acceptance_criteria: [], repository_ids: ["r"], primary_repository_id: "r",
   home_workspace_id: null, position: 1, locked_fields: ["title"],
 };
+
+describe("the drafting kind and the button that names it", () => {
+  it("chooses from the three fields, notes first", () => {
+    expect(draftingKind({ notes: "raw E42 dump", title: "Keep E42", description: "d" })).toBe("extract");
+    expect(draftingKind({ title: "Keep E42" })).toBe("improve");
+    expect(draftingKind({ description: "evidence" })).toBe("improve");
+    expect(draftingKind({})).toBe("draft");
+    // Whitespace is not content in any of the three.
+    expect(draftingKind({ notes: "  \n ", title: " ", description: "\t" })).toBe("draft");
+    expect(draftingKind({ notes: " ", title: "Keep E42" })).toBe("improve");
+  });
+
+  it("only ever returns a kind the bridge accepts", () => {
+    // The Rust and Swift sides refuse anything else before a model runs, so a
+    // fourth value here would be a request that always fails.
+    const accepted: readonly DraftingKind[] = ["draft", "improve", "extract"];
+    for (const notes of ["", "n"]) {
+      for (const title of ["", "t"]) {
+        for (const description of ["", "d"]) {
+          expect(accepted).toContain(draftingKind({ notes, title, description }));
+        }
+      }
+    }
+  });
+
+  it("derives the verb from the kind, so the button cannot name a different operation", () => {
+    // The defect this replaces: the button read "Draft" while the request
+    // carried `extract`, and "Improve" while it carried `draft`, because the
+    // two were read from the state separately.
+    expect(draftingVerb(draftingKind({ notes: "raw notes" }), false)).toBe("Draft");
+    expect(draftingVerb(draftingKind({ notes: "raw notes" }), true)).toBe("Draft");
+    expect(draftingVerb(draftingKind({ title: "Keep E42" }), false)).toBe("Improve");
+    expect(draftingVerb(draftingKind({ title: "Keep E42" }), true)).toBe("Enhance");
+    expect(draftingVerb(draftingKind({}), false)).toBe("Draft");
+    // Every kind has a verb; a missing one would render "undefined with Manvi".
+    for (const kind of ["draft", "improve", "extract"] as const) {
+      for (const quick of [true, false]) expect(draftingVerb(kind, quick)).toMatch(/^[A-Z][a-z]+$/);
+    }
+  });
+});
 
 describe("createEnhancementInput", () => {
   it("drops locked fields, empty providers and oversize models", () => {
