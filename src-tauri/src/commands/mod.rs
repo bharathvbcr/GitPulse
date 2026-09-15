@@ -1913,14 +1913,12 @@ pub async fn cmd_github_cancel_run(
 /// answer, not a failure.
 #[tauri::command(async)]
 pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::FirebaseStatus {
-    off_thread(move || {
-        Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path))
-    })
-    .await
-    // A thread-pool failure is not "no Firebase config": it is a status that
-    // could not be read, and it says so rather than rendering as a repository
-    // that does not use Firebase.
-    .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
+    off_thread(move || Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path)))
+        .await
+        // A thread-pool failure is not "no Firebase config": it is a status that
+        // could not be read, and it says so rather than rendering as a repository
+        // that does not use Firebase.
+        .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
 }
 
 /// Lists App Hosting backends for one project.

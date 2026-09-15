@@ -235,7 +235,9 @@ fn read_repo_config(repo_path: &str, name: &str) -> Result<Option<String>, Strin
 /// near-universal, but `.firebaserc` has no equivalent and `default` is very
 /// often production. Auto-selecting it would aim a "Roll back" button at prod
 /// without the user ever naming the target.
-pub fn parse_firebaserc(source: &str) -> Result<(Vec<FirebaseProjectAlias>, Option<String>), String> {
+pub fn parse_firebaserc(
+    source: &str,
+) -> Result<(Vec<FirebaseProjectAlias>, Option<String>), String> {
     let root: serde_json::Value = serde_json::from_str(source)
         .map_err(|error| format!("could not parse .firebaserc: {error}"))?;
     let Some(projects) = root.get("projects").and_then(serde_json::Value::as_object) else {
@@ -352,10 +354,9 @@ mod tests {
 
     #[test]
     fn firebaserc_aliases_are_sorted_and_default_is_named_not_chosen() {
-        let (aliases, default_alias) = parse_firebaserc(
-            r#"{"projects":{"staging":"acme-staging","default":"acme-prod"}}"#,
-        )
-        .expect("valid .firebaserc parses");
+        let (aliases, default_alias) =
+            parse_firebaserc(r#"{"projects":{"staging":"acme-staging","default":"acme-prod"}}"#)
+                .expect("valid .firebaserc parses");
         assert_eq!(
             aliases,
             vec![

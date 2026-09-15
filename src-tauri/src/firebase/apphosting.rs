@@ -288,10 +288,7 @@ fn push_common_flags(args: &mut Vec<String>, project_id: &str, location: Option<
 
 pub fn backends_list_argv(project_id: &str) -> Result<Vec<String>, String> {
     let project_id = validate_project_id(project_id)?;
-    let mut args = vec![
-        firebase_program(),
-        "apphosting:backends:list".to_string(),
-    ];
+    let mut args = vec![firebase_program(), "apphosting:backends:list".to_string()];
     push_common_flags(&mut args, &project_id, None);
     Ok(args)
 }
@@ -743,22 +740,30 @@ mod tests {
 
     #[test]
     fn a_warning_preamble_before_the_envelope_is_a_parse_error() {
-        assert!(unwrap_envelope(b"! Warning: preview\n{\"status\":\"success\",\"result\":[]}").is_err());
+        assert!(
+            unwrap_envelope(b"! Warning: preview\n{\"status\":\"success\",\"result\":[]}").is_err()
+        );
     }
 
     #[test]
     fn unreachable_has_three_states_and_absence_is_not_emptiness() {
         // Present and non-empty: named regions, and every derived number is a
         // floor.
-        let (regions, note) =
-            incompleteness(&read_unreachable(&value(r#"{"unreachable":["us-central1"]}"#)));
+        let (regions, note) = incompleteness(&read_unreachable(&value(
+            r#"{"unreachable":["us-central1"]}"#,
+        )));
         assert_eq!(regions, vec!["us-central1".to_string()]);
-        assert!(note.expect("a named region must be disclosed").contains("us-central1"));
+        assert!(note
+            .expect("a named region must be disclosed")
+            .contains("us-central1"));
 
         // Present and empty: the producer told us it reached everything.
         let (regions, note) = incompleteness(&read_unreachable(&value(r#"{"unreachable":[]}"#)));
         assert!(regions.is_empty());
-        assert!(note.is_none(), "an empty unreachable list is a complete answer");
+        assert!(
+            note.is_none(),
+            "an empty unreachable list is a complete answer"
+        );
 
         // Absent: the CLI said nothing. This must NOT read as complete.
         let (regions, note) = incompleteness(&read_unreachable(&value(r#"{"rollouts":[]}"#)));
@@ -914,7 +919,10 @@ mod tests {
             "web".into(),
             Some("Firebase CLI is not installed".into()),
         );
-        assert!(!report.checked, "checked separates 'could not ask' from 'asked'");
+        assert!(
+            !report.checked,
+            "checked separates 'could not ask' from 'asked'"
+        );
         assert!(report.rollouts.is_empty());
         assert!(report.error.is_some());
     }
