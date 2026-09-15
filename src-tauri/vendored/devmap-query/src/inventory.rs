@@ -1057,6 +1057,11 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// Gated `unix` at the module, not just at its single test: with the test
+// compiled out on Windows the file's `use super::*` had nothing left to name,
+// and `-D warnings` turns that into a build failure rather than a skipped test.
+// A fifo cannot stand in for a manifest on Windows, so there is nothing here to
+// port — only somewhere honest to say so.
+#[cfg(all(test, unix))]
 #[path = "tests/inventory_reader.rs"]
 mod reader_tests;

@@ -252,9 +252,22 @@ this section's work.
   `npm run mcp:doctor` → OK on all three of its claims: the version matches,
   the hook serves every subcommand `hooks.json` declares, and both binaries were
   built from the source this tree holds (digest `fbd633f1b157bf91…`, 674 files).
-- The four contract tests bearing on this section — `cursor-plugin-contract`,
-  `repository-trust-control-contract`, `platform-vocabulary-contract` and
-  `plugin-contract` — **44 passed, 0 failed**.
+- The five contract tests bearing on this section — `cursor-plugin-contract`,
+  `repository-trust-control-contract`, `platform-vocabulary-contract`,
+  `plugin-contract` and `advisory-lockfile-contract` — **53 passed, 0 failed**.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast`
+  against the re-vendored crates → exit 0, **2548 passed, 0 failed, 19 ignored**
+  across 80 test binaries, summed from the individual `test result:` lines.
+
+  Two earlier runs of that suite were red and both are worth recording. The
+  first found the `EXTEND_TRUST_CONTROL` gap above — a real defect, fixed. The
+  second failed on `a_two_hundred_step_rebase_reports_coherent_progress` with
+  `git commit` reporting `fatal: could not parse HEAD` while a `cargo install`
+  release build was saturating the same disk. That one is the fixture losing a
+  race under load, not a regression: it passed in the run before it and three
+  times out of three unloaded, and the clean run above is the one being
+  reported. Both are named here because a suite that went green on the third
+  attempt should say so.
 
 **What is not verified here.** `npm test` could not be run as the repository
 runs it. The harness this was built under cannot change directories, and vitest
@@ -268,12 +281,26 @@ failing — 6218 passing there against 6255 here, so this work adds 37 passing
 tests and no new failure. A green subset is still a subset: run `npm test` from
 the repository root for the real number.
 
-`npm run vendor:check` **fails**, and did so before this release: every vendored
-DevCouncil crate reports `local: clean` with `upstream: drifted`, because the
-vendor record is pinned at DevCouncil `b366f420` and that repository's `main` has
-moved past it. Nothing here edited a vendored file — the drift is upstream
-motion, not local divergence — and re-vendoring is a decision about what the app
-embeds rather than a step in building it, so it is left open.
+### Changed — vendored crates
+
+- The vendored DevCouncil closure is re-synced to `devcouncil@0944ef51`, moving
+  the ten `dc-*` and `devmap-*` crates from 0.2.2 to 0.2.3. `vendor:check` had
+  been failing — every crate `local: clean`, `upstream: drifted` — because the
+  record was pinned at `b366f420` while that repository's `main` moved on; it
+  now reports `upstream: matches` for all eleven and exits 0.
+  `check:vendor-schema` confirms the vendored store schema is still 22, so this
+  is not a migration: an existing store opens unchanged.
+
+  Only the ten vendored packages moved in `Cargo.lock`, confirmed by name — a
+  blanket 0.2.2 → 0.2.3 rewrite is the shape that has corrupted an unrelated
+  dependency sharing that version before, and cargo resolved this rather than a
+  text substitution.
+- The end-to-end half of the pre-repository-approval test asserts
+  `EXTEND_TRUST_CONTROL` instead of its own copy of the button label. Spelled as
+  a literal it passed while the message and the button disagreed, then failed on
+  the commit that made them agree — the exact drift the constant exists to
+  prevent. The unit test beside the constant already referenced it; this one was
+  missed, and the suite rather than the diff is what found it.
 
 ## [1.1.0] - 2026-09-14
 

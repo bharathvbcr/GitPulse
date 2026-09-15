@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "dc-evidence"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -723,25 +723,25 @@ dependencies = [
 
 [[package]]
 name = "dc-glob"
-version = "0.2.2"
+version = "0.2.3"
 
 [[package]]
 name = "dc-proc"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "dc-store"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "dc-verify"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "dc-evidence",
  "dc-glob",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-analyze"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "devmap-extract",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-extract"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "cc",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-query"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "devmap-analyze",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-resolve"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "devmap-extract",
  "rayon",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-store"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "devmap-analyze",

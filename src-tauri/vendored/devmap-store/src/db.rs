@@ -180,12 +180,29 @@ fn is_control_token(entry: &str) -> bool {
 
 /// What [`canonical_pending_entry`] could establish about a raw queue entry.
 ///
-/// Three states, not two. "Outside the repository" is a positive claim that
+/// Four states, not two. "Outside the repository" is a positive claim that
 /// costs the row its place in the queue, and it must not be the answer given
 /// when the containment test itself could not run.
+///
+/// [`ControlToken`] is separate from [`Canonical`] so that `Canonical` means
+/// "a repo-relative *path*" and nothing else. It used to be folded into
+/// `Canonical`, which read as a harmless spelling detail right up until a
+/// caller did the obvious thing and applied a path test to the result: the K7
+/// build-cache check in [`Store::enqueue_pending_paths_under_root`] asked the
+/// OS about `root.join("\0devmap:git-head-changed")`, a path string cannot
+/// carry an interior NUL, and the resulting `Unreadable` verdict refused the
+/// daemon's git-HEAD sentinel at the door. A branch is now required of every
+/// caller, so the next path-shaped check cannot swallow a control token in
+/// silence.
+///
+/// [`ControlToken`]: PendingEntry::ControlToken
+/// [`Canonical`]: PendingEntry::Canonical
 enum PendingEntry {
-    /// The canonical repo-relative spelling.
+    /// The canonical repo-relative spelling of a path.
     Canonical(String),
+    /// A control token, verbatim: see [`is_control_token`]. Not a path, so no
+    /// path test may be applied to it.
+    ControlToken(String),
     /// Structurally outside the repository: no retry can change this.
     Outside,
     /// Containment is unknown because `root.canonicalize()` failed — a symlink
@@ -203,7 +220,7 @@ enum PendingEntry {
 /// [`Store::enqueue_pending_paths_under_root`].
 fn canonical_pending_entry(root: &Path, raw: &str) -> PendingEntry {
     if is_control_token(raw) {
-        return PendingEntry::Canonical(raw.to_string());
+        return PendingEntry::ControlToken(raw.to_string());
     }
     // Let Path parse platform separators. Replacing backslashes corrupts both
     // legal Unix filenames and Windows canonical \\?\ prefixes.
@@ -3956,6 +3973,13 @@ impl Store {
                     }
                     canonical.insert(entry);
                 }
+                // Not a path, so neither the containment test above nor the
+                // build-cache test applies. The daemon's git-HEAD sentinel is
+                // the only producer today, and dropping it is how a commit,
+                // branch switch or rebase became invisible to the index.
+                PendingEntry::ControlToken(token) => {
+                    canonical.insert(token);
+                }
                 PendingEntry::Outside => report.refused.push((
                     raw.clone(),
                     format!("outside the repository root {}", root.display()),
@@ -4050,12 +4074,17 @@ impl Store {
         let mut deletes: Vec<(String, i64)> = Vec::new();
         let mut rewrites: Vec<(String, String, f64, u32, i64)> = Vec::new();
         for (stored, queued_at, attempts, revision) in rows {
-            if is_control_token(&stored) {
-                outcome.retained += 1;
-                continue;
-            }
             let canonical = match canonical_pending_entry(root, &stored) {
                 PendingEntry::Canonical(entry) => entry,
+                // Never path-normalised and never structurally reconciled: it
+                // is retired by a build, not by this sweep. This used to be a
+                // separate `is_control_token` pre-check here, which left the
+                // rule spelled in two places and the other producer with no
+                // spelling of it at all.
+                PendingEntry::ControlToken(_) => {
+                    outcome.retained += 1;
+                    continue;
+                }
                 PendingEntry::Outside => {
                     deletes.push((stored.clone(), revision));
                     outcome.dropped.push((

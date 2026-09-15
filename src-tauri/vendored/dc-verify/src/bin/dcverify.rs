@@ -75,7 +75,29 @@ const KNOWN_FLAGS: &[&str] = &["planned", "coverage", "root"];
 const IDENTITY: &str = "dc-verify";
 const SCHEMA_VERSION: u32 = 1;
 
+/// What `--version` answers.
+///
+/// `CARGO_PKG_VERSION` and never a literal: every crate in this workspace takes
+/// `version.workspace = true`, so the one number in `rust/Cargo.toml` reaches
+/// here and a release has no second place to forget. Until this existed the
+/// binary answered `--version` with `unknown flag --version`, so a deployed
+/// verifier's version was simply not observable — the package said 0.2.3 and
+/// the program could not be asked.
+///
+/// JSON, like every other outcome on this boundary: a caller that parses each
+/// line must not have to special-case this one.
+fn version_object() -> String {
+    format!(
+        "{{\"ok\":true,\"component\":{},\"version\":{}}}",
+        quote(IDENTITY),
+        quote(env!("CARGO_PKG_VERSION"))
+    )
+}
+
 fn run(args: &[String]) -> Result<String, String> {
+    if args.first().is_some_and(|arg| arg == "--version") {
+        return Ok(version_object());
+    }
     if args.first().is_some_and(|arg| arg == "evidence-check") {
         return evidence_cli::run(&args[1..]);
     }

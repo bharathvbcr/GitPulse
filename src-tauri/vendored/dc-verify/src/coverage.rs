@@ -306,7 +306,13 @@ fn parse_lcov(
 /// is worse than reporting none.
 pub fn normalise_lcov_path(path: &str, root: Option<&std::path::Path>) -> String {
     let trimmed = path.trim_start_matches("./");
-    if !trimmed.starts_with('/') {
+    let absolute = std::path::Path::new(trimmed);
+    // `starts_with('/')` was the absoluteness test, and it is only ever true on
+    // Unix. Every `C:\...` path llvm-cov emits on Windows returned here
+    // unreduced and landed in `coverage_unmeasured` — the exact wall this
+    // function exists to prevent, on the one platform whose tests never ran.
+    // `has_root` is true for `/x`, `C:\x`, `\\?\C:\x` and `\\server\share`.
+    if !absolute.has_root() {
         return trimmed.to_string();
     }
     let candidates: Vec<std::path::PathBuf> = match root {
@@ -320,9 +326,25 @@ pub fn normalise_lcov_path(path: &str, root: Option<&std::path::Path>) -> String
         },
     };
     for base in candidates {
-        let prefix = format!("{}/", base.to_string_lossy());
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
-            return rest.to_string();
+        // Compared by component rather than by string prefix, so the reduction
+        // does not depend on the producer and the root agreeing on a separator;
+        // Windows accepts both, and llvm-cov and the root need not match.
+        let Ok(rest) = absolute.strip_prefix(&base) else {
+            continue;
+        };
+        // Rejoined with `/` because that is the spelling the diff paths this is
+        // matched against always use. Rebuilt from components rather than by
+        // replacing separators, so a Unix filename that legitimately contains a
+        // backslash is never rewritten.
+        let rest: Vec<_> = rest
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        // An `SF:` line naming the root itself reduces to nothing. Keeping the
+        // path verbatim reports it unmeasured; returning "" would attach its
+        // lines to an empty path and silently claim some other file's coverage.
+        if !rest.is_empty() {
+            return rest.join("/");
         }
     }
     trimmed.to_string()

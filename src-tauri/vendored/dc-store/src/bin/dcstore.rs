@@ -152,6 +152,26 @@ const KNOWN_FLAGS: &[&str] = &[
 /// to some other program that happens to print JSON.
 const STORE_IDENTITY: &str = "dc-store";
 
+/// What `--version` answers.
+///
+/// `CARGO_PKG_VERSION` and never a literal: every crate in this workspace takes
+/// `version.workspace = true`, so the one number in `rust/Cargo.toml` is what
+/// reaches here, and there is no second place for a release to forget. Before
+/// this existed the binary answered `--version` with `unknown flag --version`,
+/// which is the reason a deployed `dcstore` could not be told apart from one
+/// three releases old: the package was 0.2.3 and the program could not say so.
+///
+/// JSON rather than a bare string because this boundary's contract is that
+/// every outcome is a JSON object on stdout — a caller that parses each line
+/// must not have to special-case this one.
+fn version_object() -> String {
+    format!(
+        "{{\"ok\":true,\"component\":{},\"version\":{}}}",
+        quote(STORE_IDENTITY),
+        quote(env!("CARGO_PKG_VERSION"))
+    )
+}
+
 /// What `health` answers once the exclusion index in the opened database has
 /// been read back and found to be the partial unique index on `task_id`. The
 /// Go client requires this exact word, so a store that cannot make the
@@ -243,6 +263,9 @@ fn open_for(command: &str, db: &str) -> Result<Store, Failure> {
 }
 
 fn run(args: &[String]) -> Result<String, Failure> {
+    if args.first().is_some_and(|arg| arg == "--version") {
+        return Ok(version_object());
+    }
     let parsed = parse(args)?;
     let db = parsed
         .db

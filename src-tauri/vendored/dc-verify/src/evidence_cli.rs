@@ -120,6 +120,16 @@ fn reject_symlinks(path: &Path) -> Result<(), String> {
             return Err("parent path components are refused".into());
         }
         current.push(component);
+        // A prefix (`C:`, `\\?\C:`, `\\server\share`) and the root anchor the
+        // path; they are not entries. On Windows `symlink_metadata("\\?\C:")`
+        // fails with "Incorrect function" (os error 1), which refused every
+        // artifact, contract and bundle read on that platform — the tests that
+        // would have caught it had never run there. Neither anchor can be a
+        // symlink that redirects the walk, and every named component below is
+        // still inspected, so nothing that was refused before is allowed now.
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
         let meta = std::fs::symlink_metadata(&current)
             .map_err(|e| format!("cannot inspect input: {e}"))?;
         if meta.file_type().is_symlink() {

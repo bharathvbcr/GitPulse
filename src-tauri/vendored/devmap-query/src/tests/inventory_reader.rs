@@ -1,7 +1,9 @@
+//! Unix-only: the module is declared `#[cfg(all(test, unix))]` in
+//! `inventory.rs`, which is what keeps this file's imports honest on Windows.
+
 use super::*;
 
 #[test]
-#[cfg(unix)]
 fn a_manifest_replaced_by_fifo_cannot_block_the_reader() {
     const PROBE: &str = "DEVMAP_INVENTORY_FIFO_PROBE";
     if let Some(root) = std::env::var_os(PROBE) {

@@ -1,6 +1,6 @@
 [package]
 name = "dc-proc"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "One bounded subprocess, shared by every place this workspace shells out"
