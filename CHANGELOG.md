@@ -11,7 +11,23 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- The DORA change-failure card no longer reports an empty window as `0%`. An
+  empty commit window, a repository with no commits, and a shallow clone all
+  left the rate at `0.0` with nothing to divide, and the card rendered that
+  beside three measured numbers — a check that could not run reading exactly
+  like one that ran and found nothing wrong. The sibling restore-time card had
+  always declined to invent a number here; the failure rate could not follow it,
+  because neither of its two existing signals can say "nothing to measure":
+  `is_cfr_approximation` is set unconditionally at both construction sites, so
+  it only ever means "heuristic", and unlike a restore time, `0%` is a
+  legitimate answer when commits *were* examined and none were reverts. So the
+  report now carries the denominator, `cfr_sample_commits`, and zero is the
+  sentinel: the card shows `—` and says there were no commits in the window to
+  examine. A measured zero still shows `0%`, and now names the sample it was
+  measured over rather than leaving the reader to assume the whole window was
+  read.
 
 ## [1.2.0] - 2026-09-15
 

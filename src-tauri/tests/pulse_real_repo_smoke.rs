@@ -49,11 +49,15 @@ fn every_pulse_reader_answers_on_a_real_repository() {
 
     match GitReader::dora_report(&path, Some(90)) {
         Ok(r) => println!(
-            "dora_report OK releases={} freq/wk={:.2} lead_h={:.1} cfr={:.1}% mttr_h={:.1}",
+            // cfr_n is the rate's denominator: a 0.0% over 0 commits is "not
+            // measured", not "clean", so printing the rate alone would repeat
+            // in the diagnostic exactly what the UI was fixed to stop doing.
+            "dora_report OK releases={} freq/wk={:.2} lead_h={:.1} cfr={:.1}% cfr_n={} mttr_h={:.1}",
             r.total_releases,
             r.deploy_frequency_per_week,
             r.median_lead_time_hours,
             r.change_failure_rate_pct,
+            r.cfr_sample_commits,
             r.mttr_hours
         ),
         Err(e) => panic!("dora_report FAILED: {e}"),

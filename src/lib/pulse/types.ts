@@ -178,6 +178,13 @@ export interface DoraReport {
   lead_time_rating: string;
   change_failure_rate_pct: number;
   is_cfr_approximation: boolean;
+  /**
+   * Commits the change-failure rate was computed over. Zero means the scan had
+   * nothing to examine; `change_failure_rate_pct` is then 0 only because there
+   * was no denominator, and must not be rendered as a measured 0%.
+   * `is_cfr_approximation` cannot carry this — it is always true.
+   */
+  cfr_sample_commits: number;
   mttr_hours: number;
   is_mttr_approximation: boolean;
   window_days: number;

@@ -392,6 +392,15 @@ pub struct DoraReport {
     pub lead_time_rating: String,
     pub change_failure_rate_pct: f64,
     pub is_cfr_approximation: bool,
+    /// Commits the change-failure rate was computed over — its denominator.
+    ///
+    /// `is_cfr_approximation` only says the rate is a heuristic; it is set
+    /// unconditionally and so can never say "there was nothing to measure".
+    /// Unlike `mttr_hours`, the rate itself cannot carry that distinction
+    /// either: 0% is a real answer when commits were examined and none were
+    /// reverts. Zero here is the only signal that the check could not run, so
+    /// callers must render it as "no sample" rather than as a confident 0%.
+    pub cfr_sample_commits: usize,
     pub mttr_hours: f64,
     pub is_mttr_approximation: bool,
     pub window_days: u32,
@@ -1936,6 +1945,9 @@ impl GitReader {
                         lead_time_rating: "None".to_string(),
                         change_failure_rate_pct: 0.0,
                         is_cfr_approximation: true,
+                        // No commit log was ever read on this path, so the
+                        // rate has an empty sample behind it, not a clean one.
+                        cfr_sample_commits: 0,
                         mttr_hours: 0.0,
                         is_mttr_approximation: true,
                         window_days: window,
@@ -2072,6 +2084,9 @@ impl GitReader {
         let cfr_pct = if total_commits > 0 {
             (((revert_or_fix_commits as f64) / (total_commits as f64)) * 1000.0).round() / 10.0
         } else {
+            // A check that could not run must never report a made-up failure
+            // rate. 0% is indistinguishable from a real, measured 0%, so the
+            // empty-sample signal is `cfr_sample_commits`, not this value.
             0.0
         };
 
@@ -2092,6 +2107,7 @@ impl GitReader {
             lead_time_rating,
             change_failure_rate_pct: cfr_pct,
             is_cfr_approximation: true,
+            cfr_sample_commits: total_commits,
             mttr_hours,
             is_mttr_approximation: true,
             window_days: window,
@@ -6490,5 +6506,43 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
             "no restore samples must not invent a restore time"
         );
         assert!(report.is_cfr_approximation);
+        // The seed commit is neither a revert nor a hotfix, so this is a real
+        // measured 0% over a real sample — the case that must keep rendering
+        // as "0%" and that stops the empty-window fix from hiding every zero.
+        assert_eq!(report.change_failure_rate_pct, 0.0);
+        assert!(
+            report.cfr_sample_commits >= 1,
+            "a measured 0% must report the commits it examined"
+        );
+    }
+
+    /// The empty-window half of the change-failure rate.
+    ///
+    /// `is_cfr_approximation` is set unconditionally at both construction
+    /// sites, so it can only ever say "this is a heuristic" — never "there was
+    /// nothing to measure". And unlike `mttr_hours`, the rate itself cannot
+    /// double as the sentinel, because 0% is a legitimate measured answer
+    /// (asserted directly above). `cfr_sample_commits` is the only thing that
+    /// separates the two, and a check that could not run must never report the
+    /// same value as one that ran and found nothing wrong.
+    #[test]
+    fn dora_report_reports_an_empty_change_failure_sample_as_zero_commits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.email", "t@example.com"]);
+        git_in(dir.path(), &["config", "user.name", "T"]);
+        let path = dir.path().to_str().unwrap();
+
+        let report = GitReader::dora_report(path, Some(90))
+            .expect("dora_report should succeed on a repository with no commits");
+
+        assert_eq!(
+            report.cfr_sample_commits, 0,
+            "no commits were examined, so the rate has no denominator"
+        );
+        assert_eq!(
+            report.change_failure_rate_pct, 0.0,
+            "the rate stays 0.0; cfr_sample_commits is what makes it readable as 'no sample'"
+        );
     }
 }

@@ -1,7 +1,35 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { render } from "svelte/server";
+import PulseDora from "./PulseDora.svelte";
+import type { DoraReport } from "../../pulse/types";
 
 const source = readFileSync(new URL("./PulseDora.svelte", import.meta.url), "utf8");
+
+/**
+ * A report whose every other number is non-zero, so "0%" and "—" in the body
+ * can only have come from the change-failure card.
+ */
+function doraReport(overrides: Partial<DoraReport> = {}): DoraReport {
+  return {
+    deploy_frequency_per_week: 2.5,
+    deploy_rating: "High",
+    total_releases: 12,
+    median_lead_time_hours: 4.5,
+    lead_time_rating: "Elite",
+    change_failure_rate_pct: 7.5,
+    is_cfr_approximation: true,
+    cfr_sample_commits: 160,
+    mttr_hours: 2,
+    is_mttr_approximation: true,
+    window_days: 90,
+    ...overrides,
+  };
+}
+
+function body(overrides: Partial<DoraReport> = {}): string {
+  return render(PulseDora, { props: { dora: doraReport(overrides) } }).body;
+}
 
 /**
  * Two of the four DORA numbers are heuristics derived from commit patterns.
@@ -36,5 +64,46 @@ describe("PulseDora failure state", () => {
     expect(source).toMatch(/error\?: string \| null/);
     expect(source).toContain("{:else if error && !dora}");
     expect(source).toContain("not a delivery frequency of zero");
+  });
+});
+
+/**
+ * The change-failure rate is the one card whose value cannot double as its own
+ * "not measured" sentinel: 0% is a legitimate answer when commits were
+ * examined and none were reverts. `is_cfr_approximation` cannot carry the
+ * distinction either — both construction sites set it unconditionally, so it
+ * says "heuristic", never "nothing to measure". Only the denominator can, and
+ * a check that could not run must never render the same as one that ran.
+ */
+describe("PulseDora change failure rate", () => {
+  it("renders a real measured zero as 0%", () => {
+    const rendered = body({ change_failure_rate_pct: 0, cfr_sample_commits: 137 });
+    expect(rendered).toContain("0%");
+    expect(rendered).toContain("137 examined commits");
+    expect(rendered).not.toContain("No commits in this window to examine");
+  });
+
+  it("declines to render an empty window as 0%", () => {
+    const rendered = body({ change_failure_rate_pct: 0, cfr_sample_commits: 0 });
+    expect(rendered).not.toContain("0%");
+    expect(rendered).toContain("No commits in this window to examine");
+    expect(rendered).toContain("—");
+  });
+
+  it("does not present an empty window as clean even when the rate is non-zero", () => {
+    // Defensive: a future caller that forgets to zero the rate alongside the
+    // sample must still not get a confident number out of an empty scan.
+    const rendered = body({ change_failure_rate_pct: 7.5, cfr_sample_commits: 0 });
+    expect(rendered).not.toContain("7.5%");
+    expect(rendered).toContain("No commits in this window to examine");
+  });
+
+  it("names the sample the rate was measured over", () => {
+    expect(body({ cfr_sample_commits: 160 })).toContain("160 examined commits");
+    // `toContain` alone would pass on "1 examined commits", so pin the plural
+    // out as well rather than letting a substring match stand in for the text.
+    const single = body({ cfr_sample_commits: 1 });
+    expect(single).toContain("1 examined commit");
+    expect(single).not.toContain("examined commits");
   });
 });

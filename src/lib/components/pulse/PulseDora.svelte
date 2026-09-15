@@ -124,10 +124,12 @@
           </span>
         </div>
         <div class="flex items-baseline gap-1.5 mt-2">
-          <span class="text-3xl font-extrabold text-textPrimary">{dora.change_failure_rate_pct}%</span>
+          <span class="text-3xl font-extrabold text-textPrimary">
+            {dora.cfr_sample_commits <= 0 ? "—" : `${dora.change_failure_rate_pct}%`}
+          </span>
         </div>
         <p class="text-[11px] text-textMuted mt-2">
-          Approx. from revert & hotfix commits
+          {dora.cfr_sample_commits <= 0 ? "No commits in this window to examine" : `Approx. from reverts & hotfixes in ${dora.cfr_sample_commits} examined ${dora.cfr_sample_commits === 1 ? "commit" : "commits"}`}
         </p>
       </div>
 

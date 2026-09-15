@@ -211,6 +211,7 @@ describe("pulseStore", () => {
       lead_time_rating: "Elite",
       change_failure_rate_pct: 5.0,
       is_cfr_approximation: true,
+      cfr_sample_commits: 160,
       mttr_hours: 2.0,
       is_mttr_approximation: true,
       window_days: 90,
