@@ -8,6 +8,8 @@ import {
   type EnhancementConfiguration,
   type EnhancementField,
   type EnhancementMutation,
+  type EnhancementState,
+  type EnhancementSummary,
   type ModelSelection,
   type Task,
 } from "./client";
@@ -51,6 +53,88 @@ export const assistEngineName = (engine: AssistEngine): string => ASSIST_ENGINE_
 
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
   proposal !== null && ["pending", "running", "cancel_requested"].includes(proposal.state);
+
+/**
+ * How each proposal state reads.
+ *
+ * One map, read by the history picker's option text and by the heading of the
+ * review that option selects. They used to be the same literal table written
+ * once inside the component, which was fine while there was one reader; a
+ * picker whose row says "Ready for review" above a heading that says something
+ * else is the drift this prevents.
+ */
+export const ENHANCEMENT_STATE_LABELS: Readonly<Record<EnhancementState, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<EnhancementState, string>, {
+    pending: "Waiting to start", running: "Generating", cancel_requested: "Cancellation requested",
+    ready: "Ready for review", failed: "Generation failed", cancelled: "Cancelled",
+    interrupted: "Outcome uncertain", dismissed: "Dismissed", accepted: "Accepted", undone: "Undone",
+  }),
+);
+
+/**
+ * One line naming a past suggestion, built from the list payload alone.
+ *
+ * `enhancements.list` returns summaries — the proposed *text* only arrives with
+ * `enhancements.get` — so a picker that needed the wording to label its rows
+ * would have to fetch every entry to draw itself. Everything here is on the
+ * summary.
+ *
+ * The old rows read `state · model` plus `Task revision N`, which could not
+ * tell two attempts apart at all: same model, same revision, same string. The
+ * two additions that fix that are the time and the ordinal, and they fix
+ * different halves of it — the time separates attempts made minutes apart, the
+ * ordinal separates attempts made in the same second.
+ *
+ * `ordinal` is a reading aid, not an identity: it is derived from the store's
+ * total at the moment the page was read, so a proposal landing between pages
+ * shifts every one of them. Identity is the id, which is what the option
+ * carries as its value. Do not promote this to a stored field.
+ */
+export function enhancementOptionLabel(
+  entry: Pick<
+    EnhancementSummary,
+    "state" | "model" | "source_revision" | "automatic" | "edited_fields" | "outcome_uncertain"
+  >,
+  context: { ordinal: number; when: string },
+): string {
+  const parts = [
+    `#${context.ordinal}`,
+    ENHANCEMENT_STATE_LABELS[entry.state] ?? entry.state,
+    entry.model || "unnamed model",
+  ];
+  // Put identity first and the qualifiers last: `gp-select` truncates, and
+  // what must survive the ellipsis is what tells two rows apart.
+  if (context.when) parts.push(context.when);
+  parts.push(`rev ${entry.source_revision}`);
+  if (entry.automatic) parts.push("Automatic");
+  if (entry.edited_fields.length) parts.push("Edited");
+  if (entry.outcome_uncertain) parts.push("Uncertain");
+  return parts.join(" · ");
+}
+
+/**
+ * Why a selected proposal cannot be applied to the task in front of the reader,
+ * or "" when it can.
+ *
+ * Picking an older entry and finding no Apply button was the history drawer's
+ * quietest dead end. The refusal is not the picker's opinion — `enhancements.
+ * accept` carries `expected_task_revision` and the store checks it — so the
+ * honest thing is to name the reason rather than to render nothing.
+ */
+export function enhancementApplyBlock(
+  proposal: Pick<Enhancement, "state" | "source_revision"> | null,
+  task: Pick<Task, "revision" | "locked_fields"> | null,
+): string {
+  if (!proposal || !task) return "";
+  if (proposal.state !== "ready") {
+    return `This suggestion is ${(ENHANCEMENT_STATE_LABELS[proposal.state] ?? proposal.state).toLowerCase()}, so there is nothing left to apply.`;
+  }
+  if (proposal.source_revision !== task.revision) {
+    return `Written against revision ${proposal.source_revision}; this task is at revision ${task.revision}. Ask for a fresh suggestion.`;
+  }
+  if (enhanceableFields(task).length === 0) return "Title and description are locked against enhancement.";
+  return "";
+}
 
 type PendingEnhancement = { method: EnhancementMutation; input: Record<string, unknown>; taskID: string; result: Enhancement | null };
 

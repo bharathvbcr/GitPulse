@@ -163,6 +163,21 @@ export interface InterfacePrefs {
   /** Whether the scope navigator lists archived workspaces. */
   taskShowArchivedWorkspaces: boolean;
   /**
+   * What Return does in the board's quick-add line.
+   *
+   * `"assist"` saves the typed line exactly as `"manual"` does and then asks
+   * the configured model for a title and description to review. Off by
+   * default, and stored rather than derived: it changes what a keystroke does,
+   * so the reader has to choose it once, not every time.
+   *
+   * Note the asymmetry with the *engine* choice, which deliberately does not
+   * persist (see `TaskManviAssist`). Both modes always work — the manual one
+   * unconditionally, the drafting one degrading to "task saved, and here is
+   * why the model could not run" — whereas a remembered engine can become a
+   * dead button on a machine that later turned it off.
+   */
+  taskQuickAddAssist: boolean;
+  /**
    * The agent handoff a task launch starts from: provider, connection and
    * permission mode.
    *
@@ -251,6 +266,7 @@ const DEFAULTS: InterfacePrefs = {
   taskHiddenColumns: [],
   taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
   taskShowArchivedWorkspaces: true,
+  taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
   terminalDockOpen: false,
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
@@ -388,6 +404,9 @@ function readPrefs(): InterfacePrefs {
         parsed.taskShowArchivedWorkspaces,
         DEFAULTS.taskShowArchivedWorkspaces,
       ),
+      // Anything unrecognizable falls back to manual. A stored value this
+      // build cannot read must not be the one that spends a model call.
+      taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
       taskHandoff: sanitizeHandoff(parsed.taskHandoff),
       terminalDockOpen: bool(parsed.terminalDockOpen, DEFAULTS.terminalDockOpen),
       terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
@@ -547,6 +566,7 @@ function createInterfaceStore() {
         ),
       })),
     setTaskShowArchivedWorkspaces: (show: boolean) => patch({ taskShowArchivedWorkspaces: show }),
+    setTaskQuickAddAssist: (assist: boolean) => patch({ taskQuickAddAssist: assist }),
     /**
      * Remembers the last handoff a reader chose.
      *
@@ -564,6 +584,7 @@ function createInterfaceStore() {
         taskHiddenColumns: [],
         taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
+        taskQuickAddAssist: DEFAULTS.taskQuickAddAssist,
         taskHandoff: defaultHandoff(),
       }),
     setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),

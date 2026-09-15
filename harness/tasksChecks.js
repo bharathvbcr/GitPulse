@@ -104,7 +104,7 @@ mockIPC(async (cmd, args) => {
       let proposal = proposals.get(input.id);
       if(args.method === "enhancements.create") {
         const source = structuredClone(tasks.find(task=>task.id === input.task_id));
-        proposal = {id:input.id,revision:1,updated_at:1,task_id:input.task_id,source_revision:source.revision,source,fields:input.fields,state:"pending",provider:input.provider,model:input.model,automatic:false,created_at:1,expires_at:Math.floor(Date.now()/1000)+60};
+        proposal = {id:input.id,revision:1,updated_at:1,task_id:input.task_id,source_revision:source.revision,source,fields:input.fields,state:"pending",provider:input.provider,model:input.model,automatic:false,created_at:Math.floor(Date.now()/1000),expires_at:Math.floor(Date.now()/1000)+60};
       } else {
         if(!proposal || proposal.revision !== input.expected_revision) throw {code:"revision_conflict",message:"Suggestion changed"};
         proposal = {...proposal,revision:proposal.revision+1};
@@ -216,6 +216,17 @@ const enhanceButton = () => button("Improve with Manvi") ?? button("Enhance with
 // built on it would have failed for a reason that had nothing to do with what
 // it was testing.
 const card = id => root.querySelector(`[data-task-card][data-card-id="${id}"]`);
+// The repository control is a trigger on the pane plus a popover portaled to
+// the body, which is outside `root` — so these reach it through `document`,
+// the same way the context-menu helpers above already do.
+const repoToggle = () => editor()?.querySelector("[data-task-repo-picker] .repo-trigger");
+const repoPopup = () => document.querySelector("[data-task-repo-popup]");
+const openRepoPicker = async () => { if (!repoPopup()) repoToggle()?.click(); await settle(80); return repoPopup(); };
+// Dismissed the way a reader dismisses it: a pointerdown outside. The picker
+// listens on the capture phase, so this reaches it from `body`.
+const closeRepoPicker = async () => { if (repoPopup()) document.body.dispatchEvent(new PointerEvent("pointerdown", {bubbles:true})); await settle(60); };
+const repoRow = name => [...(repoPopup()?.querySelectorAll(".repo-row") ?? [])].find(row => row.querySelector(".repo-name")?.textContent.trim() === name);
+const repoSummaryText = () => repoToggle()?.textContent ?? "";
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
 const change = async (el, value, event = "input") => { if(!el) throw Error("Missing form field"); el.value = value; el.dispatchEvent(new Event(event, {bubbles:true})); await settle(); };
@@ -270,38 +281,78 @@ if (params.has("check")) {
     check("type offers all supported task kinds and permits custom names", field("Type") instanceof HTMLSelectElement && field("Type").options.length === 8 && [...field("Type").options].some(option => option.value === "__custom__"));
     // Repositories lead the sheet. A task cannot be saved without one, and
     // this used to be the last control on the pane, below the criteria box.
-    const picker = () => editor().querySelector("fieldset.repositories");
-    const primaryRadio = () => [...picker().querySelectorAll('input[type="radio"]')].find(el => el.checked);
-    check("the repository picker is available without expanding settings",
-      picker().getClientRects().length > 0 && !picker().closest("details"));
-    check("the repository picker comes before the title on the pane",
-      picker().compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING);
+    // Collapsing the row list into a dropdown is only an improvement if the
+    // closed control still answers what the list answered. Its label is
+    // `summaryLine`, the same sentence the inline summary carried.
+    check("the repository control is on the pane and already says what is linked",
+      Boolean(repoToggle()) && repoToggle().getClientRects().length > 0 && !repoToggle().closest("details")
+      && repoToggle().getAttribute("aria-expanded") === "false"
+      && repoSummaryText().includes("primary GitPulse"));
+    check("the repository control comes before the title on the pane",
+      Boolean(repoToggle()) && (repoToggle().compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING));
+    await openRepoPicker();
+    const primaryRadio = () => [...(repoPopup()?.querySelectorAll('input[type="radio"]') ?? [])].find(el => el.checked);
     check("linking and the primary choice are one control, not two that can disagree",
       Boolean(primaryRadio())
-      && primaryRadio().closest(".repo-row").querySelector('input[type="checkbox"]').checked
-      && picker().textContent.includes("primary GitPulse")
+      && Boolean(primaryRadio().closest(".repo-row")?.querySelector('input[type="checkbox"]')?.checked)
+      && repoSummaryText().includes("primary GitPulse")
       && !editor().textContent.includes("Linked repositories"));
-    const paneTab = id => editor().querySelector(`[data-sheet-tab="${id}"]`);
+    // A popover inside `.sheet-body` would be clipped by the scroller it is
+    // trying to escape, so it is portaled — and then clamped into the viewport.
+    const popupRect = () => repoPopup()?.getBoundingClientRect();
+    check("the repository dropdown escapes the sheet's own clip, and fits the viewport",
+      Boolean(repoPopup()) && !editor().contains(repoPopup())
+      && popupRect().width > 0 && popupRect().right <= innerWidth + 1 && popupRect().bottom <= innerHeight + 1 && popupRect().left >= -1);
+    // The sheet also closes on Escape. One Escape must dismiss one thing.
+    repoPopup()?.querySelector("input")?.focus();
+    document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await settle(80);
+    check("Escape in the repository dropdown closes the dropdown, not the task",
+      !repoPopup() && Boolean(editor()) && document.activeElement === repoToggle());
+    // The anchor scrolling away must not leave the popover behind it. Guarded
+    // throughout: if the Escape above closed the whole sheet instead of the
+    // dropdown, `editor()` is null here, and an unguarded probe would throw
+    // and hide every check after it behind one stack trace.
+    if (!editor()) { card("task-2").click(); await wait(editor); }
+    await openRepoPicker();
+    editor()?.querySelector(".sheet-body")?.dispatchEvent(new Event("scroll"));
+    await settle(80);
+    check("scrolling the sheet dismisses the repository dropdown instead of leaving it floating",
+      Boolean(editor()) && !repoPopup() && repoToggle()?.getAttribute("aria-expanded") === "false");
+    const paneTab = id => editor()?.querySelector(`[data-sheet-tab="${id}"]`);
     const onScreen = el => Boolean(el) && el.getClientRects().length > 0;
     check("a saved task opens on Task and draws exactly one pane",
-      [...editor().querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,organize,agent,ai"
+      [...editor().querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,agent"
       && paneTab("task").getAttribute("aria-selected") === "true"
       && [...editor().querySelectorAll(".pane")].filter(onScreen).length === 1);
-    // The assist and the run panel used to sit one above the other below every
-    // field, which is why reaching either meant scrolling past the whole task.
-    check("the assist and the agent panel are panes, not a stack below the fields",
-      !onScreen(editor().querySelector('[aria-label="Manvi task assist"]')) && !onScreen(editor().querySelector('[aria-label="Task agent runs"]')));
+    // This check used to assert the opposite for the assist: it lived behind
+    // its own tab while the suggestions it produced were drawn on this one, so
+    // the reader pressed a button on one pane and read the result on another.
+    // Both halves are asserted, because "on screen" alone would pass for a
+    // layout that had simply stopped hiding everything.
+    check("the assist writes where the reader is, and only the agent panel is a separate pane",
+      onScreen(editor().querySelector('[aria-label="Manvi task assist"]'))
+      && !onScreen(editor().querySelector('[aria-label="Task agent runs"]')));
+    // Schedule and labels are on this pane too, beside the description rather
+    // than behind a second tab.
+    check("the merged pane carries schedule and labels beside the task text",
+      onScreen(field("Title")) && onScreen(field("Owner")) && onScreen(field("Due")) && onScreen(field("Labels")));
     paneTab("task").focus();
     paneTab("task").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
     await settle();
     check("arrow keys move the sheet's tab strip and the focus with it",
-      paneTab("organize").getAttribute("aria-selected") === "true" && document.activeElement === paneTab("organize") && onScreen(field("Owner")));
-    paneTab("ai").click(); await settle();
-    check("optional Manvi history is folded when its pane opens", onScreen(editor().querySelector(".manvi-assist")) && editor().querySelector(".history-drawer")?.open !== true);
-    check("merged Manvi section has no model input", Boolean(editor().querySelector(".manvi-assist .change-link")) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
-    paneTab("agent").click(); await settle();
+      paneTab("agent").getAttribute("aria-selected") === "true" && document.activeElement === paneTab("agent")
+      && onScreen(editor().querySelector('[data-testid="task-handoff-form"]')));
     check("the agent pane offers the same handoff form the board sheet uses", onScreen(editor().querySelector('[data-testid="task-handoff-form"]')));
     paneTab("task").click(); await settle();
+    // History was a collapsed `<details>` whose rows carried no time, above a
+    // review that was suppressed whenever a ready suggestion was showing
+    // beside the fields — so changing the selection could do nothing visible.
+    const historyPicker = () => editor().querySelector('[data-testid="task-assist-history"]');
+    check("the suggestion picker is on screen the moment the assist is, and is a real picker",
+      onScreen(editor().querySelector(".manvi-assist")) && Boolean(historyPicker())
+      && historyPicker() instanceof HTMLSelectElement && !editor().querySelector(".history-drawer"));
+    check("merged Manvi section has no model input", Boolean(editor().querySelector(".manvi-assist .change-link")) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
     editor().querySelector(".sheet-body").scrollTop = 900; await settle();
     const saveRect = button("Save task").getBoundingClientRect();
     check("save remains visible while the sheet scrolls", saveRect.top >= 0 && saveRect.bottom < innerHeight);
@@ -322,7 +373,6 @@ if (params.has("check")) {
 
     await click("Add task to Ready");
     check("column creation uses that column's status", field("Status").value === "ready");
-    if (button("Schedule and labels")?.getAttribute("aria-checked") !== "true") await click("Schedule and labels");
     check("new tasks default to normal priority", field("Priority").value === "2");
     await change(field("Title"), "   ");
     check("whitespace titles cannot be saved", button("Save task").disabled);
@@ -396,13 +446,20 @@ if (params.has("check")) {
     await click("New task");
     // The picker owns both halves now, so "which repository is primary" is
     // read off the checked radio rather than a separate select.
-    const primaryName = () => editor().querySelector('.repo-row input[type="radio"]:checked')?.closest(".repo-row")?.querySelector(".repo-name")?.textContent.trim();
-    check("workspace tasks default to a repository in that workspace", primaryName() === "Manvi");
+    // Read off the trigger while closed, and off the rows while open: the two
+    // must agree, which is the whole reason the trigger carries the summary.
+    const primaryName = () => repoPopup()?.querySelector('.repo-row input[type="radio"]:checked')?.closest(".repo-row")?.querySelector(".repo-name")?.textContent.trim();
+    await openRepoPicker();
+    check("workspace tasks default to a repository in that workspace",
+      primaryName() === "Manvi" && repoSummaryText().includes("primary Manvi"));
     check("the picker marks which repositories the home workspace already holds",
-      editor().querySelector(".repo-row.linked .repo-mark")?.textContent.trim() === "In workspace");
+      repoPopup()?.querySelector(".repo-row.linked .repo-mark")?.textContent.trim() === "In workspace");
+    await closeRepoPicker();
     await change(field("Title"), "Workspace draft");
     await click("GitPulse fixture"); await settle(400);
+    await openRepoPicker();
     check("repository tab switches preserve the open draft's repository", field("Title").value === "Workspace draft" && primaryName() === "Manvi");
+    await closeRepoPicker();
     confirmAnswer = true; await click("Close task details");
 
     // A workspace with no member repositories. Every one of these used to
@@ -436,22 +493,28 @@ if (params.has("check")) {
       check("quick add refuses here by naming the marker and the editor, not just failing", false);
     }
     button("New task")?.click(); await settle(400);
-    const repoRow = name => [...(editor()?.querySelectorAll(".repo-row") ?? [])].find(row => row.querySelector(".repo-name").textContent.trim() === name);
-    const summaryText = () => editor()?.querySelector('[data-testid="task-repo-summary"]')?.textContent ?? "";
+    const summaryText = () => repoSummaryText();
     check("New task in an empty workspace opens a sheet at all", Boolean(editor()));
     if (editor()) await change(field("Title"), "First task in a fresh workspace");
     check("the sheet opens with nothing linked and refuses to save until one is",
       summaryText().includes("No repository linked") && button("Save task")?.disabled === true);
+    await openRepoPicker();
     repoRow("GitPulse")?.querySelector('input[type="checkbox"]')?.click(); await settle(150);
     check("linking a repository from the picker is what makes the task saveable",
       button("Save task")?.disabled === false && summaryText().includes("primary GitPulse"));
+    // Linking must update the closed control too, and must not dismiss it —
+    // a picker that shut on every tick could not link two repositories.
+    check("linking updates the trigger without closing the dropdown", Boolean(repoPopup()));
+    await closeRepoPicker();
     check("the sheet says the link is outside the home workspace and offers the join",
       Boolean(editor()?.textContent.includes("not in Fresh space")) && Boolean(editor() && button("Add to workspace", editor())));
     if (editor() && button("Add to workspace", editor())) { await click("Add to workspace"); await settle(250); }
+    await openRepoPicker();
     check("Add to workspace writes the membership and the row stops being an outsider",
       workspaceWrites.some(write => write.id === "workspace-empty" && write.repository_ids.includes("repo-0"))
       && !editor()?.textContent.includes("not in Fresh space")
       && repoRow("GitPulse")?.querySelector(".repo-mark")?.textContent.trim() === "In workspace");
+    await closeRepoPicker();
     if (button("Save task")) { await click("Save task"); await settle(300); }
     check("a task created from an empty workspace saves with that workspace as its home",
       tasks.some(task => task.title === "First task in a fresh workspace" && task.home_workspace_id === "workspace-empty" && task.primary_repository_id === "repo-0"));
@@ -556,7 +619,6 @@ if (params.has("check")) {
     proposals.set(proposal.id,{...proposal,revision:proposal.revision+1,state:"ready",proposed:{title:"A focused task brief",description:"Test suggestion with a verifiable outcome."},rationale:"Make the intended outcome explicit."});
     await wait(()=>Boolean(button("Use both")) || Boolean(button("Accept selected fields")) || Boolean(button("Use this title")));
     const originalTask=structuredClone(tasks.find(task=>task.id==="task-2"));
-    editor().querySelector(".history-drawer > summary")?.click(); await settle();
     const review=editor().querySelector('[aria-label="Enhancement review"]');
     if(review) {
       const descriptionCheck=[...review.querySelectorAll('label')].find(label=>label.textContent.trim()==="Description")?.querySelector('input');
@@ -576,10 +638,64 @@ if (params.has("check")) {
     } else {
       check("inline Manvi acceptance retries once", tasks.find(task=>task.id==="task-2").title==="A focused task brief" && enhancementWrites.filter(w=>w.method==="enhancements.accept").length>=1);
     }
-    editor().querySelector('[data-sheet-tab="organize"]').click(); await settle();
+    // ---- Picking a past suggestion ---------------------------------------
+    // The list used to be buttons reading `state · model` + `Task revision N`
+    // inside a collapsed drawer: two runs of one model against one revision
+    // were the same string twice, and the review the selection drove was
+    // suppressed whenever a ready suggestion was showing beside the fields.
+    const picker = () => editor()?.querySelector('[data-testid="task-assist-history"]');
+    const options = () => [...(picker()?.options ?? [])];
+    const reviewArticle = () => editor()?.querySelector('article[aria-label="Enhancement review"]');
+    const reviewText = () => reviewArticle()?.textContent ?? "";
+    const liveProposal = [...proposals.values()].filter(entry => entry.task_id === "task-2").at(-1);
+    if (liveProposal) {
+      // A second attempt: same task, same revision, same model, and stamped in
+      // the same second as the first. Only the picker's own ordinal can tell
+      // these apart, which is exactly the case the old label could not.
+      const twin = {
+        ...structuredClone(liveProposal),
+        id: "enhancement-twin",
+        revision: 1,
+        state: "ready",
+        proposed: { title: "A second focused brief", description: "A different wording of the same task." },
+        rationale: "An alternative phrasing.",
+      };
+      proposals.set(twin.id, twin);
+      const refresh = button("Refresh", editor());
+      if (refresh) { refresh.click(); await settle(250); }
+      check("every attempt is listed, with enough on each row to tell them apart",
+        Boolean(picker()) && options().length >= 2
+        && new Set(options().map(option => option.textContent.trim())).size === options().length
+        && options().every(option => /^#\d+ · /.test(option.textContent.trim())));
+      check("the picker reports the page it loaded rather than implying it is complete",
+        (editor()?.textContent ?? "").includes("Showing " + options().length + " of "));
+      const before = reviewText();
+      const other = options().find(option => option.value !== picker().value);
+      if (other) {
+        picker().value = other.value;
+        picker().dispatchEvent(new Event("change", { bubbles: true }));
+        await settle(250);
+      }
+      // The point of the whole control: changing it always changes what is on
+      // screen. Against the old code there was no review element at all here.
+      check("changing the selection shows that suggestion, every time",
+        Boolean(other) && Boolean(reviewArticle()) && reviewText() !== before
+        && picker().value === other.value);
+      check("the picker never names a suggestion the review is not rendering",
+        Boolean(reviewArticle()) && Boolean(picker())
+        && options().some(option => option.value === picker().value));
+    } else {
+      check("every attempt is listed, with enough on each row to tell them apart", false);
+      check("the picker reports the page it loaded rather than implying it is complete", false);
+      check("changing the selection shows that suggestion, every time", false);
+      check("the picker never names a suggestion the review is not rendering", false);
+    }
+
     await change(field("Due"),"2026-09-01T09:30"); await click("Save task"); await settle(100);
     check("due dates round-trip through the task editor", field("Due").value==="2026-09-01T09:30");
-    check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="organize"]').getAttribute("aria-selected")==="true");
+    editor().querySelector('[data-sheet-tab="agent"]').click(); await settle();
+    await change(field("Owner"),"ada"); await click("Save task"); await settle(100);
+    check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="agent"]').getAttribute("aria-selected")==="true");
     editor().querySelector('[data-sheet-tab="task"]').click(); await settle();
     await change(field("Description"),"Unsaved context");
     check("unsaved edits stay local until Manvi prepare saves", editor().querySelector("header small").textContent==="Unsaved" && Boolean(enhanceButton()) && !enhanceButton().matches(":disabled"));
@@ -593,14 +709,26 @@ if (params.has("check")) {
     await wait(()=>[...proposals.values()].some(p=>p.source.title==="Fix notification routing" && p.state==="running"));
     const quickProposal=[...proposals.values()].find(p=>p.source.title==="Fix notification routing");
     check("inline drafting refuses duplicate generations while a worker is running", enhanceButton().matches(":disabled"));
-    const stacked = (a, b) => a && b && a.getBoundingClientRect().bottom <= b.getBoundingClientRect().top + 2;
     const assistBox = editor().querySelector('[aria-label="Manvi task assist"]');
-    const typeLabel = [...editor().querySelectorAll("label")].find(label => label.firstChild?.textContent.trim() === "Type");
-    check("Manvi assist sits above task type controls", stacked(assistBox, typeLabel));
+    // The intent has always been "the assist is not buried below every field".
+    // A two-column layout keeps that promise sideways, so the old vertical
+    // `stacked()` test no longer expresses it: assert it is reachable without
+    // scrolling instead.
+    const bodyBox = () => editor().querySelector(".sheet-body").getBoundingClientRect();
+    check("the assist is reachable without scrolling past the task",
+      Boolean(assistBox) && assistBox.getClientRects().length > 0
+      && assistBox.getBoundingClientRect().top < bodyBox().bottom);
     check("one click saves the rough idea and starts Manvi with both fields", quickProposal.fields.length===2 && quickProposal.source.description.includes("explain recovery steps") && quickProposal.source.repository_ids[0]==="repo-0");
     check("Draft with Manvi consumes notes after extract", idea.value.trim() === "");
     check("drafted sheet keeps a single Manvi assist section", Boolean(editor().querySelector('[aria-label="Manvi task assist"]')) && !editor().querySelector('[aria-label="Manvi task enhancements"]'));
-    check("inline suggestions hide history field checkboxes until opened", [...editor().querySelectorAll('.history-drawer article input[type="checkbox"]')].length === 0 || editor().querySelector(".history-drawer")?.open === true);
+    check("inline suggestions own acceptance, and the review still shows the diff",
+      (() => {
+        const article = editor().querySelector('article[aria-label="Enhancement review"]');
+        if (!article) return false;
+        const inline = Boolean(button("Use both") || button("Use this title") || button("Use this description"));
+        if (!inline) return true;
+        return !button("Accept selected fields", article) && article.querySelectorAll('input[type="checkbox"]').length === 0;
+      })());
     proposals.set(quickProposal.id,{...quickProposal,revision:quickProposal.revision+1,state:"ready",proposed:{title:"Reliable task notifications",description:"Preserve saved evidence, route notifications to the correct task, and verify recovery."}});
     await wait(()=>button("Use both"));
     await change(field("Description"),"Unsaved evidence that must survive");
@@ -671,13 +799,97 @@ if (params.has("check")) {
     check("shift-enter hands the parsed line to the editor instead of saving",
       field("Title").value === "Investigate the flake" && tasks.length === beforeQuick + 1
       && !editor().querySelector(".sheet-tabs"));
+    // A draft used to fold these behind a "Schedule and labels" switch. Two
+    // columns give it room, so what the line filled in is simply on screen.
     check("an expanded quick add shows the fields it already filled in",
-      button("Schedule and labels").getAttribute("aria-checked") === "true");
+      field("Priority")?.value === "2"
+      && Boolean(field("Labels")) && field("Labels").getClientRects().length > 0
+      && editor().textContent.includes("ci"));
     confirmAnswer = true; await click("Close task details"); await settle();
     root.querySelector('[data-task-column="inbox"]')?.focus();
     document.dispatchEvent(new KeyboardEvent("keydown", {key:"a", bubbles:true}));
     await settle();
     check("the a shortcut puts the cursor in quick add", document.activeElement === quickAdd());
+    await change(quickAdd(), "");
+
+    // ---- Quick add, with the model ---------------------------------------
+    // Drafting saves exactly what the manual mode saves, then asks for a title
+    // and description to review. It never invents a task, and it never writes
+    // before it has asked whatever it needs to ask.
+    const modeGroup = () => root.querySelector('[aria-label="What Return does with this line"]');
+    const modeButton = label => [...(modeGroup()?.querySelectorAll("button") ?? [])].find(el => el.textContent.trim() === label);
+    const planLine = () => root.querySelector('[data-testid="task-quick-add-plan"]');
+    const enhanceSheet = () => document.querySelector('[aria-labelledby="quick-enhance-title"]');
+    check("quick add offers a drafting mode, off until it is chosen",
+      Boolean(modeGroup()) && Boolean(modeButton("Manual")) && Boolean(modeButton("Draft"))
+      && modeButton("Manual")?.getAttribute("aria-pressed") === "true"
+      && modeButton("Draft")?.getAttribute("aria-pressed") === "false"
+      && !planLine());
+    quickAdd().focus();
+    await change(quickAdd(), "Ship the second release notes !high #docs @ada ~feature");
+    const manualChips = chips().join("|");
+    modeButton("Draft")?.click(); await settle(80);
+    quickAdd().focus(); await change(quickAdd(), "Ship the second release notes !high #docs @ada ~feature");
+    check("the drafting mode changes nothing about what the line means",
+      chips().join("|") === manualChips && modeButton("Draft")?.getAttribute("aria-pressed") === "true");
+    const beforeDraftTasks = tasks.length;
+    const beforeDraftWrites = enhancementWrites.length;
+    check("the drafting mode says what it will write, before it writes anything",
+      Boolean(planLine()) && planLine().textContent.includes("Saves this line now")
+      && tasks.length === beforeDraftTasks && enhancementWrites.length === beforeDraftWrites);
+    enter(quickAdd()); await settle(400);
+    const draftedTask = tasks.find(task => task.title === "Ship the second release notes");
+    check("a drafted quick add saves the typed line first, exactly as the manual mode would",
+      Boolean(draftedTask) && draftedTask.priority === 1 && draftedTask.kind === "feature" && draftedTask.owner === "ada"
+      && [...draftedTask.labels].join(",") === "docs");
+    // The card on the board carries the reader's own words. There is no window
+    // in which a placeholder title exists, because a line with no title is
+    // refused in this mode exactly as it is in the other.
+    check("the drafted card carries the typed title, never a placeholder",
+      Boolean(card(draftedTask?.id)) && card(draftedTask.id).textContent.includes("Ship the second release notes"));
+    await wait(() => Boolean(enhanceSheet()));
+    check("a drafted quick add opens the review surface and starts the model there",
+      Boolean(enhanceSheet())
+      && enhancementWrites.some(write => write.method === "enhancements.create" && write.task_id === draftedTask?.id));
+    // `EnhancementField` is title|description, so the marker fields are out of
+    // scope by type rather than by a rule applied afterwards.
+    const draftCreate = enhancementWrites.filter(write => write.method === "enhancements.create" && write.task_id === draftedTask?.id).at(-1);
+    check("the model is never asked for a field the markers own",
+      Boolean(draftCreate) && [...(draftCreate.fields ?? [])].sort().join(",") === "description,title");
+    const closeEnhance = () => [...(enhanceSheet()?.querySelectorAll("button") ?? [])].find(el => el.getAttribute("aria-label") === "Close Quick Enhance");
+    closeEnhance()?.click(); await settle(200);
+    check("closing the review leaves the drafted task on the board", Boolean(card(draftedTask?.id)) && !enhanceSheet());
+
+    // Opening the sheet to read a task is not a request for one. The drafting
+    // counter only rises, and every fresh sheet starts from zero, so a value
+    // left standing from the run above would auto-start on whatever is opened
+    // next — spending a model request nobody asked for. A task made a moment
+    // ago is the honest subject here: no earlier attempt and no field lock can
+    // make the refusal happen for some other reason.
+    modeButton("Manual")?.click(); await settle(60);
+    quickAdd().focus(); await change(quickAdd(), "Read this one without drafting");
+    enter(quickAdd()); await settle(300);
+    const readOnly = tasks.find(task => task.title === "Read this one without drafting");
+    const beforeReadWrites = enhancementWrites.length;
+    confirmAnswer = true;
+    if (readOnly) { await openMenu(readOnly.id); button("Quick Enhance", menu())?.click(); await wait(() => Boolean(enhanceSheet())); await settle(400); }
+    check("opening Quick Enhance to read a task never starts a run of its own",
+      Boolean(readOnly) && Boolean(enhanceSheet()) && enhancementWrites.length === beforeReadWrites);
+
+    // A different task is a different sheet. It loads its task once, on mount,
+    // so swapping the id under a live instance would leave the reader reading
+    // the previous task while the drafting request is aimed at the new one.
+    modeButton("Draft")?.click(); await settle(60);
+    quickAdd().focus(); await change(quickAdd(), "Rotate the signing key");
+    enter(quickAdd()); await settle(500);
+    const swapped = tasks.find(task => task.title === "Rotate the signing key");
+    await wait(() => Boolean(enhanceSheet()?.textContent.includes("Rotate the signing key"))).catch(() => {});
+    check("drafting while a review is open moves the review onto the new task",
+      Boolean(swapped) && Boolean(enhanceSheet()?.textContent.includes("Rotate the signing key"))
+      && !enhanceSheet()?.textContent.includes("Read this one without drafting")
+      && enhancementWrites.some(write => write.method === "enhancements.create" && write.task_id === swapped?.id));
+    closeEnhance()?.click(); await settle(200);
+    modeButton("Manual")?.click(); await settle(60);
     await change(quickAdd(), "");
 
     // ---- Board customization, and what it costs --------------------------

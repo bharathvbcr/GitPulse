@@ -6,14 +6,14 @@
   import TaskAgentPanel from "./TaskAgentPanel.svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import TaskManviAssist from "./TaskManviAssist.svelte";
-  import SettingToggle from "./SettingToggle.svelte";
+  import TaskRepositoryPicker from "./TaskRepositoryPicker.svelte";
   import LabelInput from "./LabelInput.svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { askConfirm } from "../stores/modalStore";
   import { deleteTask, explainError, getTask, getTaskBrief, getWorkspace, newID, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, WorkbenchError, type EnhancementField, type Repository, type Task, type TaskDraft, type TaskStatus, type WorkspaceCard } from "../workbench/client";
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
   import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
-  import { linkSummary, outsiderLine, repositoryRows, shouldOfferFilter, summaryLine } from "../workbench/taskRepositories";
+  import { linkSummary, repositoryRows, shouldOfferFilter } from "../workbench/taskRepositories";
   import { dueInputValue, parseDueInput } from "../workbench/taskOrganize";
   import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
@@ -78,7 +78,6 @@
   let homeMembers = $state<string[] | null>(null);
   let homeError = $state("");
   let homeToken = 0;
-  let showOrganize = $state(untrack(() => Boolean(initial.seed)));
   let notes = $state("");
   let copied = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -91,9 +90,10 @@
   /**
    * The pane on screen.
    *
-   * A draft has one pane and no strip; saving grows the strip to four and
+   * A draft has one pane and no strip; saving grows the strip to two and
    * leaves the reader on Task. `resolveEditorTab` is what makes that safe —
-   * it refuses a pane this sheet does not offer instead of rendering nothing.
+   * it refuses a pane this sheet does not offer instead of rendering nothing,
+   * and sends a merged-away pane to the one that absorbed it.
    */
   let requestedTab = $state<TaskEditorTab>("task");
   let suggestion = $state<{ title: string; description: string; showTitle: boolean; showDescription: boolean; blocked: string; flash: EnhancementField[] }>({
@@ -101,7 +101,6 @@
   });
   let assist = $state<{ acceptFields: (fields: EnhancementField[]) => void; hideSuggestion: () => void }>();
   let runCount = $state(0);
-  let suggestionCount = $state(0);
   /** Display name of the engine the assist section would use; it owns the picker. */
   let assistName = $state(assistEngineName(DEFAULT_ASSIST_ENGINE));
   const tabs = $derived(editorTabs(Boolean(current)));
@@ -139,7 +138,7 @@
   const summary = $derived(linkSummary(known, draft.repository_ids, draft.primary_repository_id, homeMembers));
   const offerFilter = $derived(shouldOfferFilter(known.length));
   // Membership follows the draft's home workspace, not the board's scope: the
-  // Organize pane can move a task to another workspace while the sheet is open.
+  // Home workspace control can move a task while the sheet is open.
   $effect(() => {
     const workspaceId = draft.home_workspace_id;
     const ticket = ++homeToken;
@@ -346,8 +345,18 @@
   }
 </script>
 
+<!--
+  The repository popover is portaled to the body to escape `.sheet-body`'s
+  scroller, so it is NOT inside `sheet` — and a guard that only asked
+  `sheet.contains` would leave Cmd+S and Cmd+Shift+C dead for a reader whose
+  focus is in the picker. `owns()` is the sheet's real boundary: its own
+  subtree, plus the overlays it opened.
+-->
 <svelte:window onkeydown={(e) => {
-    if (!active || !(e.target instanceof Node) || !sheet?.contains(e.target)) return;
+    const owns = (node: Node) =>
+      Boolean(sheet?.contains(node)) ||
+      (node instanceof Element && Boolean(node.closest("[data-task-repo-popup]")));
+    if (!active || !(e.target instanceof Node) || !owns(e.target)) return;
     if (e.key === "Escape") {
       e.preventDefault();
       if (enhancementBusy) { shortcutBlocked = `Wait for ${assistName} to finish before closing.`; return; }
@@ -390,7 +399,7 @@
     >
       {#each tabs as entry, index (entry.id)}
         {@const props = tabProps(group, entry.id, tab === entry.id)}
-        {@const badge = editorTabBadge(entry.id, { runs: runCount, suggestions: suggestionCount })}
+        {@const badge = editorTabBadge(entry.id, { runs: runCount })}
         <button
           type="button"
           class="gp-seg-btn text-[11px]! py-1!"
@@ -414,7 +423,9 @@
           {/if}
           <span>{entry.label}</span>
           {#if badge}<span class="tab-badge tabular-nums">{badge}</span>{/if}
-          {#if entry.id === "ai" && reviewable}<span class="tab-dot" aria-label="Suggestion ready"></span>{/if}
+          <!-- A suggestion waiting to be reviewed lives on Task. The dot is
+               how the reader knows that while they are on Agent. -->
+          {#if entry.id === "task" && reviewable}<span class="tab-dot" aria-label="Suggestion ready"></span>{/if}
         </button>
       {/each}
     </div>
@@ -427,188 +438,132 @@
     onchange={() => { dirty = true; }}
   >
     <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
-      <fieldset disabled={enhancementBusy}>
       <div class="pane" hidden={Boolean(current) && tab !== "task"} id={panelId(group, "task")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "task") : undefined}>
-        <!-- Repositories lead the sheet. A task cannot be saved without one,
-             and this used to be the last control on the pane: the only
-             mandatory field was the one you had to scroll to find. -->
-        <fieldset class="repositories">
-          <legend>Repositories</legend>
-          <p class="repo-summary" class:needs={summary.linked === 0} data-testid="task-repo-summary">{summaryLine(summary)}</p>
-          {#if offerFilter}
-            <input
-              class="gp-field repo-filter"
-              type="search"
-              bind:value={repoFilter}
-              aria-label="Filter repositories"
-              placeholder="Filter repositories"
-              maxlength="200"
-              oninput={(e) => e.stopPropagation()}
-            />
-          {/if}
-          <div class="repo-list">
-            {#each rows as row (row.id)}
-              <div class="repo-row" class:linked={row.linked}>
-                <label class="check">
-                  <input type="checkbox" checked={row.linked} onchange={(e) => membership(row.id, e.currentTarget.checked)} />
-                  <span class="repo-name">{row.name}</span>
-                  {#if row.member}<span class="repo-mark">In workspace</span>{/if}
-                  {#if row.keptByLink}<span class="repo-mark">Linked</span>{/if}
-                </label>
-                {#if row.linked}
-                  <label class="primary-pick">
-                    <input
-                      type="radio"
-                      name="task-primary-{id}"
-                      checked={row.primary}
-                      onchange={() => setPrimary(row.id)}
-                      aria-label="Make {row.name} the primary repository"
-                    />
-                    Primary
-                  </label>
-                {/if}
-              </div>
-            {/each}
-            {#if known.length === 0}
-              <p class="repo-empty">No repositories are registered yet. Open one in GitPulse, then link it here.</p>
-            {:else if rows.length === 0}
-              <p class="repo-empty">No repository matches this filter.</p>
-            {/if}
-          </div>
-          {#if addable.length}
-            <small>Open in GitPulse</small>
-            {#each addable as openTab (openTab.path)}
-              <label class="check" title={openTab.path}>
-                <input type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([openTab.path]); }} />
-                {openTab.label}<span class="open-mark">Open</span>
-              </label>
-            {/each}
-            {#if addable.length > 1}<button type="button" disabled={adding} onclick={() => void addOpenPaths(addable.map((item) => item.path))}>Add all open</button>{/if}
-          {/if}
-          {#each summary.unknown as missing (missing)}<small>Linked repository {missing} (load more repositories to edit)</small>{/each}
-          {#if draft.home_workspace_id}
-            {#if homeError}
-              <p class="repo-note" role="status">Could not read {homeWorkspaceName}'s repositories: {homeError}</p>
-            {:else if summary.outsiders.length}
-              <p class="repo-note">
-                {outsiderLine(summary.outsiders, homeWorkspaceName)}
-                <button type="button" class="gp-btn" disabled={attaching || adding || saving} onclick={() => void attachOutsiders()}>{attaching ? "Adding…" : "Add to workspace"}</button>
-              </p>
-            {/if}
-          {/if}
-        </fieldset>
-        <label class:flash={suggestion.flash.includes("title")}>Title
-          <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
-        </label>
-        {#if suggestion.showTitle}
-          <div class="inline-suggestion">
-            <p class="meta">Suggested title</p>
-            <p class="suggestion-body suggested">{suggestion.title}</p>
-            <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title"])}>Use this title</button>
-          </div>
-        {/if}
-        <label class:flash={suggestion.flash.includes("description")}>Description
-          <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
-        </label>
-        {#if suggestion.showDescription}
-          <div class="inline-suggestion">
-            <p class="meta">Suggested description</p>
-            <pre class="suggestion-body suggested">{suggestion.description}</pre>
-            <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["description"])}>Use this description</button>
-          </div>
-        {/if}
-        {#if reviewable}
-          <div class="review-actions">
-            {#if suggestion.showTitle && suggestion.showDescription}
-              <button type="button" class="gp-btn-primary" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title", "description"])}>Use both</button>
-            {/if}
-            <button type="button" class="gp-btn" disabled={enhancementBusy} onclick={() => assist?.hideSuggestion()}>Not now</button>
-            {#if suggestion.blocked}<p class="warn">{suggestion.blocked}</p>{/if}
-          </div>
-        {/if}
-        <div class="pair">
-          <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
-          <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
-          <label>Type
-            {#if customKind || kindIsCustom}
-              <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
-              <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
-            {:else}
-              <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
-                {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
-                <option value="__custom__">Custom…</option>
-              </select>
-            {/if}
-          </label>
-        </div>
-        <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
-      </div>
+        <!-- Two columns, not two panes. Writing a task, scheduling it and
+             asking the model to improve the wording are one sitting; the
+             suggestion cards below Title and Description are the reason —
+             they are drawn beside the field each one would replace, so the
+             controls that produce them cannot live behind another tab.
 
-      {#if current}
-        <div class="pane" hidden={tab !== "organize"} id={panelId(group, "organize")} role="tabpanel" aria-labelledby={tabId(group, "organize")}>
-          <div class="pair">
-            <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
-            <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
-          </div>
-          <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
-          <label>Labels
-            <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
-          </label>
-          <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
-          <div class="notifications-row">
-            <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
-            <NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />
+             The columns are a container query, not a media query: the sheet
+             is a dock whose width the window only partly decides. -->
+        <div class="pane-grid">
+          <!-- `enhancementBusy` disables the fields a running suggestion may
+               rewrite. It wraps the columns' *fields* and never the assist,
+               which owns the cancel button for that same run. -->
+          <fieldset class="col" disabled={enhancementBusy}>
+            <TaskRepositoryPicker
+              {rows}
+              {summary}
+              {offerFilter}
+              bind:filter={repoFilter}
+              knownCount={known.length}
+              name={id}
+              {addable}
+              {adding}
+              {attaching}
+              workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}
+              disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
+              onToggle={membership}
+              onPrimary={setPrimary}
+              onAddPaths={(paths) => void addOpenPaths(paths)}
+              onAttachOutsiders={() => void attachOutsiders()}
+            />
+            <label class:flash={suggestion.flash.includes("title")}>Title
+              <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
+            </label>
+            {#if suggestion.showTitle}
+              <div class="inline-suggestion">
+                <p class="meta">Suggested title</p>
+                <p class="suggestion-body suggested">{suggestion.title}</p>
+                <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title"])}>Use this title</button>
+              </div>
+            {/if}
+            <label class:flash={suggestion.flash.includes("description")}>Description
+              <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+            </label>
+            {#if suggestion.showDescription}
+              <div class="inline-suggestion">
+                <p class="meta">Suggested description</p>
+                <pre class="suggestion-body suggested">{suggestion.description}</pre>
+                <button type="button" class="gp-btn" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["description"])}>Use this description</button>
+              </div>
+            {/if}
+            {#if reviewable}
+              <div class="review-actions">
+                {#if suggestion.showTitle && suggestion.showDescription}
+                  <button type="button" class="gp-btn-primary" disabled={Boolean(suggestion.blocked) || enhancementBusy} onclick={() => assist?.acceptFields(["title", "description"])}>Use both</button>
+                {/if}
+                <button type="button" class="gp-btn" disabled={enhancementBusy} onclick={() => assist?.hideSuggestion()}>Not now</button>
+                {#if suggestion.blocked}<p class="warn">{suggestion.blocked}</p>{/if}
+              </div>
+            {/if}
+            <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
+          </fieldset>
+
+          <div class="col">
+            <!-- A draft used to fold these away behind a disclosure because
+                 one column had no room for them. Two columns do, and a draft
+                 that hides fields a saved task shows is an asymmetry the
+                 reader has to learn for no reason. -->
+            <fieldset disabled={enhancementBusy}>
+              <div class="pair">
+                <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
+                <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
+              </div>
+              <div class="pair">
+                <label>Type
+                  {#if customKind || kindIsCustom}
+                    <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
+                    <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
+                  {:else}
+                    <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
+                      {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
+                      <option value="__custom__">Custom…</option>
+                    </select>
+                  {/if}
+                </label>
+                <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
+              </div>
+              <div class="pair">
+                <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
+                <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
+              </div>
+              <label>Labels
+                <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
+              </label>
+              <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
+              {#if current}
+                <div class="notifications-row">
+                  <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
+                  <NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />
+                </div>
+              {/if}
+            </fieldset>
+            <!-- The assist owns the enhancement lifecycle (polling, history,
+                 accept/undo). It sits outside the enhancement-busy fieldset so
+                 a running suggestion cannot disable its own cancel. -->
+            <TaskManviAssist
+              bind:this={assist}
+              task={current}
+              {notes}
+              {dirty}
+              {active}
+              onNotes={(value) => { notes = value; dirty = true; }}
+              bind:title={draft.title}
+              bind:description={draft.description}
+              bind:lockedFields={draft.locked_fields!}
+              repositoryIds={draft.repository_ids}
+              repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
+              prepareTask={prepareForManvi}
+              onApplied={applied}
+              onBusy={(busy) => { enhancementBusy = busy; }}
+              onSuggestion={(state) => { suggestion = state; }}
+              onEngine={(name) => { assistName = name; }}
+              disabled={saving || reloading || pending !== null || pendingDelete !== null}
+            />
           </div>
         </div>
-      {:else}
-        <!-- A draft carries the same scheduling fields; it just has nowhere to
-             hide them, so they sit under one disclosure instead of a pane. -->
-        <SettingToggle
-          label="Schedule and labels"
-          description="Priority, due date, owner, labels, and home workspace."
-          checked={showOrganize}
-          onchange={(next) => { showOrganize = next; }}
-        />
-        {#if showOrganize}
-          <div class="pair">
-            <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
-            <label>Due<input class="gp-field" type="datetime-local" value={dueInputValue(draft.due_at)} oninput={(e) => { draft.due_at = parseDueInput(e.currentTarget.value); }} /></label>
-          </div>
-          <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" /></label>
-          <label>Labels
-            <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
-          </label>
-          <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
-        {/if}
-      {/if}
-      </fieldset>
-      <!-- The assist owns the enhancement lifecycle (polling, history,
-           accept/undo) and must stay mounted whichever pane is on screen.
-           Only its own controls move to the AI pane; the suggestions it
-           produces are drawn beside the fields they would change. It sits
-           after the task fields, and outside the enhancement-busy fieldset,
-           so a running suggestion cannot disable its own cancel. -->
-      <div class="pane" hidden={Boolean(current) && tab !== "ai"} id={panelId(group, "ai")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "ai") : undefined}>
-        <TaskManviAssist
-          bind:this={assist}
-          task={current}
-          {notes}
-          {dirty}
-          {active}
-          onNotes={(value) => { notes = value; dirty = true; }}
-          bind:title={draft.title}
-          bind:description={draft.description}
-          bind:lockedFields={draft.locked_fields!}
-          repositoryIds={draft.repository_ids}
-          repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
-          prepareTask={prepareForManvi}
-          onApplied={applied}
-          onBusy={(busy) => { enhancementBusy = busy; }}
-          onSuggestion={(state) => { suggestion = state; }}
-          onCount={(count) => { suggestionCount = count; }}
-          onEngine={(name) => { assistName = name; }}
-          disabled={saving || reloading || pending !== null || pendingDelete !== null}
-        />
       </div>
     </fieldset>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
@@ -658,22 +613,20 @@
   .flash :is(input,textarea){animation:gp-task-flash 1.1s ease-out}
   @keyframes gp-task-flash{from{border-color:rgb(var(--c-accent));box-shadow:0 0 0 3px rgb(var(--c-accent) / 0.18)}to{border-color:rgb(var(--c-border));box-shadow:none}}
   @media (prefers-reduced-motion: reduce){.flash :is(input,textarea){animation:none}}
-  .task-editor{width:min(430px,48vw);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
-  .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,legend,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}.check{flex-direction:row;align-items:center;margin:5px 0}.check input{width:auto}.repositories{margin:0 0 13px}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
-  /* Only the rows scroll. The summary and the filter above them are how the
-     picker stays readable at any catalog size, so they must not scroll away. */
-  .repo-list{max-height:168px;overflow:auto;margin:2px 0 4px}
-  .repo-summary{margin:4px 0 6px;font-size:11px;color:rgb(var(--c-text-muted))}
-  .repo-summary.needs{color:rgb(var(--c-text))}
-  .repo-filter{margin-bottom:4px}
-  .repo-row{display:flex;align-items:center;gap:8px;justify-content:space-between}
-  .repo-row .check{flex:1;min-width:0;gap:7px}
-  .repo-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .repo-mark{flex-shrink:0;color:rgb(var(--c-text-muted));font-size:10px}
-  .primary-pick{flex-direction:row;align-items:center;gap:4px;flex:0 0 auto;margin:0;font-size:10px;color:rgb(var(--c-text-muted))}
-  .primary-pick input{width:auto}
-  .repo-row.linked .primary-pick{color:rgb(var(--c-text))}
-  .repo-empty{margin:6px 0;color:rgb(var(--c-text-muted))}
-  .repo-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0;color:rgb(var(--c-text-muted))}.error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
+  /* `--gp-task-sheet-w` (app.css) is the one owner of this width: the strip
+     of open-task tabs above the sheet reads the same token, and these used to
+     be two literals that could drift apart. */
+  .task-editor{width:var(--gp-task-sheet-w);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
+  /* The columns respond to the sheet, not the window: this is a dock whose
+     width the reader's window only partly decides. `container-type` also
+     makes this a containing block for fixed descendants, which is why the
+     repository popover is portaled to the body. */
+  .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px;container-type:inline-size}
+  .pane-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:0 18px;align-items:start}
+  .pane-grid > .col{min-width:0}
+  @container (min-width: 520px){
+    .pane-grid{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)}
+  }
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
+  .error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
 </style>

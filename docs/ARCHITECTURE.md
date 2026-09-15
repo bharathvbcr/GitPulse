@@ -559,7 +559,7 @@ act on.
 store exactly as Manvi does, runs the model on this thread instead of routing
 `enhancements.generate` to the sidecar, then publishes the result with
 `enhancements.complete`. The proposal keeps its id, revision, source revision
-and history, so acceptance, undo, dismissal, the history drawer and field locks
+and history, so acceptance, undo, dismissal, the suggestion picker and field locks
 never learn which engine wrote the text. A generation that fails is written
 back as a failed proposal before the error is rethrown: a `pending` record
 holds the store's one-live-attempt lock for its whole 180-second lease. Nothing

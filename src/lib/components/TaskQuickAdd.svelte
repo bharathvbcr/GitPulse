@@ -11,10 +11,13 @@
    * shown as a warning *before* Enter, and an unresolved `^repo` stays in the
    * title rather than disappearing into a repository nobody chose.
    */
-  import { CornerDownLeft, Plus, TriangleAlert, X } from "@lucide/svelte";
+  import { CornerDownLeft, Plus, Sparkles, TriangleAlert, X } from "@lucide/svelte";
+  import SettingSegment from "./SettingSegment.svelte";
   import {
     QUICK_ADD_HINT,
     parseQuickAdd,
+    quickAddAssistPlan,
+    type QuickAddMode,
     type QuickAddRepository,
     type QuickAddResult,
     type QuickAddTokenKind,
@@ -26,6 +29,8 @@
     disabled = false,
     busy = false,
     compact = false,
+    mode = "manual",
+    onMode,
     onSubmit,
     onExpand,
   }: {
@@ -34,8 +39,11 @@
     disabled?: boolean;
     busy?: boolean;
     compact?: boolean;
+    /** What Return does: save the line, or save it and ask for a draft. */
+    mode?: QuickAddMode;
+    onMode?: (next: QuickAddMode) => void;
     /** Resolves true when the task was created, so the field can clear. */
-    onSubmit: (parsed: QuickAddResult) => Promise<boolean>;
+    onSubmit: (parsed: QuickAddResult, mode: QuickAddMode) => Promise<boolean>;
     /** Hand the typed line to the full editor instead of saving it. */
     onExpand?: (parsed: QuickAddResult) => void;
   } = $props();
@@ -45,6 +53,17 @@
   let input: HTMLInputElement | undefined = $state();
   const parsed = $derived(parseQuickAdd(text, { repositories }));
   const showPreview = $derived(focused && text.trim().length > 0);
+  // Computed from the same parse the preview and the save use, so the sentence
+  // promising what Return will do cannot describe a different write.
+  const plan = $derived(quickAddAssistPlan(parsed));
+
+  const MODES: readonly { value: QuickAddMode; label: string; title: string }[] = [
+    // Deliberately not "Add": the submit button beside this one carries that
+    // word, and two controls reading "Add" in one row is a coin flip for a
+    // reader and for anything looking one up by name.
+    { value: "manual", label: "Manual", title: "Create this task from what you typed" },
+    { value: "assist", label: "Draft", title: "Create this task, then ask for a title and description to review" },
+  ];
 
   export function focus() {
     input?.focus();
@@ -52,7 +71,7 @@
 
   async function submit() {
     if (disabled || busy || !parsed.usable) return;
-    if (await onSubmit(parsed)) text = "";
+    if (await onSubmit(parsed, mode)) text = "";
   }
 
   function onKey(event: KeyboardEvent) {
@@ -113,14 +132,25 @@
         <X size={11} />
       </button>
     {/if}
+    {#if onMode}
+      <SettingSegment
+        ariaLabel="What Return does with this line"
+        options={MODES}
+        value={mode}
+        onselect={(next) => onMode?.(next)}
+      />
+    {/if}
     <button
       type="button"
       class="gp-btn"
       disabled={disabled || busy || !parsed.usable}
-      title={parsed.usable ? "Create this task" : "Type a title first"}
+      title={parsed.usable
+        ? mode === "assist" ? "Create this task, then ask for a title and description to review" : "Create this task"
+        : "Type a title first"}
       onclick={() => void submit()}
     >
-      {busy ? "Adding…" : "Add"}<CornerDownLeft size={11} />
+      {#if mode === "assist"}<Sparkles size={11} />{/if}
+      {busy ? "Adding…" : mode === "assist" ? "Add & draft" : "Add"}<CornerDownLeft size={11} />
     </button>
   </div>
 
@@ -143,6 +173,12 @@
           <span class="muted">Type a title. Markers alone do not make a task.</span>
         {/if}
       </p>
+      {#if mode === "assist"}
+        <!-- Said before anything is written, and never a guess at what the
+             model will return: the markers above are exactly what gets saved,
+             and this names what is asked for afterwards. -->
+        <p class="plan" data-testid="task-quick-add-plan"><Sparkles size={11} class="shrink-0" />{plan.sentence}</p>
+      {/if}
       {#each parsed.warnings as warning (warning.code + warning.message)}
         <p class="warn"><TriangleAlert size={11} class="shrink-0" />{warning.message}</p>
       {/each}
@@ -164,6 +200,7 @@
   .chip{font-size:10px;padding:1px 6px;border-radius:5px;background:rgb(var(--c-surface-hover) / 0.7);max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .chip-title{font-weight:600;color:rgb(var(--c-text))}
   .muted,.hint{font-size:10px;color:rgb(var(--c-text-muted));margin:0}
+  .plan{display:flex;align-items:flex-start;gap:5px;margin:0;font-size:10px;line-height:1.45;color:rgb(var(--c-text-muted))}
   .warn{display:flex;align-items:flex-start;gap:5px;margin:0;font-size:10px;color:rgb(180 83 9);line-height:1.45}
   :global(.dark) .warn{color:rgb(252 211 77)}
   /* One hue per token kind, reused by the highlighted line and its chip so a

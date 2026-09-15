@@ -111,14 +111,14 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     await wait(() => !!document.querySelector(".task-editor"));
     material(`${mode} task details`, ".task-editor,.task-editor .gp-field:not(.draft),.task-editor select");
     floating(`${mode} task header`, ".task-editor > header");
-    // A saved task is four panes, and only the open one is drawn. Every probe
-    // below therefore has to open its pane first: `material` measures client
-    // rects, so a hidden pane would report "no surfaces" rather than a colour.
-    check(`${mode}: a saved task offers its four panes`,
-      [...document.querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,organize,agent,ai");
+    // A saved task is two panes, and only the open one is drawn. The Agent
+    // probe below therefore has to open its pane first: `material` measures
+    // client rects, so a hidden pane would report "no surfaces" rather than a
+    // colour. The assist is on the Task pane now, so it needs no click.
+    check(`${mode}: a saved task offers its two panes`,
+      [...document.querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,agent");
     check(`${mode}: only the selected pane is drawn`,
       [...document.querySelectorAll(".task-editor .pane")].filter(pane => pane.getClientRects().length > 0).length === 1);
-    click('[data-sheet-tab="ai"]');
     await wait(() => (document.querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
     check(`${mode}: merged Manvi section has Change link and no Model input`,
       Boolean(document.querySelector(".manvi-assist .change-link"))

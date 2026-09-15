@@ -20,7 +20,8 @@
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, assistEngineName, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, EnhancementAction, liveEnhancement, type AssistEngine } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, assistEngineName, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, liveEnhancement, type AssistEngine } from "../workbench/taskEnhance";
+  import { timestampFormat } from "../ui/timestampFormat";
   import {
     appleBadge,
     appleContext,
@@ -60,7 +61,6 @@
     quick = false,
     startRequest = 0,
     onSuggestion = (_state: AssistSuggestion) => {},
-    onCount = (_total: number) => {},
     onEngine = (_name: string) => {},
   }: {
     task: Task | null;
@@ -96,8 +96,6 @@
      * affordances beside the fields they would change.
      */
     onSuggestion?: (state: AssistSuggestion) => void;
-    /** How many proposals this task has, for the sheet's tab badge. */
-    onCount?: (total: number) => void;
     /**
      * Which engine the ask button would actually use, by display name.
      *
@@ -134,14 +132,23 @@
     note = "Suggestion hidden. It stays in Manvi history.";
   }
 
-  const labels: Record<Enhancement["state"], string> = {
-    pending: "Waiting to start", running: "Generating", cancel_requested: "Cancellation requested",
-    ready: "Ready for review", failed: "Generation failed", cancelled: "Cancelled",
-    interrupted: "Outcome uncertain", dismissed: "Dismissed", accepted: "Accepted", undone: "Undone",
-  };
+  const labels = ENHANCEMENT_STATE_LABELS;
+  /** Two of these mount at once (the sheet and Quick Enhance), so ids collide. */
+  const uid = $props.id();
 
-  let historyOpen = $state(false);
-  $effect(() => { if (quick) historyOpen = true; });
+  /**
+   * The id the picker is displaying.
+   *
+   * Kept apart from `proposal.id` on purpose. A `<select>` shows whatever the
+   * reader just chose the instant they choose it, while loading that proposal
+   * is a round trip that can fail or be superseded. Without its own state the
+   * control would sit there naming a revision the review below is not
+   * rendering — the same shape of lie as a drawer that hid the review
+   * entirely. On failure it snaps back to whatever is actually on screen.
+   */
+  let selectedId = $state("");
+  /** True only between a reader's pick and the proposal landing. */
+  let selectPending = $state(false);
   let configuration = $state<EnhancementConfiguration | null>(null);
   let configurationError = $state<string | null>(null);
   let proposal = $state<Enhancement | null>(null);
@@ -166,6 +173,8 @@
   let selecting = 0;
   let needsReconcile = $state(false);
   let configPending = $state(false);
+  /** The configuration read currently in flight, shared by every caller. */
+  let configLoad: Promise<void> | null = null;
   let flash = $state<EnhancementField[]>([]);
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   let visible = $state(true);
@@ -190,6 +199,32 @@
   const action = new EnhancementAction(undefined, () => liveSelection);
   const acting = $derived(busy || needsReconcile || preparing);
   const controlsLocked = $derived(acting || editing);
+  /**
+   * Keep the picker pointing at whatever the review is rendering.
+   *
+   * `proposal` is replaced by five other paths besides the picker — accepting,
+   * undoing, dismissing, editing, polling and the expiry reset. Syncing at
+   * each of those is five chances to forget one and leave the control naming a
+   * revision that is no longer on screen; this is the one place that answers
+   * it. `choose` sets `selectPending` so an in-flight pick is not overwritten
+   * by the proposal it is replacing.
+   */
+  $effect(() => {
+    const id = proposal?.id ?? "";
+    if (!selectPending) selectedId = id;
+  });
+  /** Newest first, so the ordinal counts up from the task's first attempt. */
+  const historyOptions = $derived(
+    entries.map((entry, index) => ({
+      id: entry.id,
+      label: enhancementOptionLabel(entry, {
+        ordinal: Math.max(1, total - index),
+        when: $timestampFormat.text(entry.created_at),
+      }),
+    })),
+  );
+  /** Why the selected proposal cannot be applied here, or "" when it can. */
+  const applyBlock = $derived(enhancementApplyBlock(proposal, task));
   const liveAttempt = $derived(liveEnhancement(proposal) || entries.some((entry) => liveEnhancement(entry)));
   const stale = $derived(Boolean(proposal && task && proposal.source_revision !== task.revision));
   const acceptDisabled = $derived(acting || disabled || dirty || stale);
@@ -198,6 +233,16 @@
   const descriptionSuggestion = $derived(ready && proposal ? proposal.proposed.description ?? "" : "");
   const showTitleSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("title") && suggestionDiffers(title, titleSuggestion)));
   const showDescriptionSuggestion = $derived(Boolean(!quick && ready && proposal?.fields.includes("description") && suggestionDiffers(description, descriptionSuggestion)));
+  /**
+   * Whether the review draws the accept controls, or only the diff.
+   *
+   * When the sheet is already drawing its own accept button beside the field a
+   * suggestion would replace, this section offering one too would be two
+   * controls writing the same thing. The review still renders — the reader
+   * needs to see *what* changed for the revision they picked — it just does
+   * not offer the write.
+   */
+  const reviewOffersAccept = $derived(quick || !(showTitleSuggestion || showDescriptionSuggestion));
   const gate = $derived(canAskManvi({ title, description, repository_ids: repositoryIds }, notes));
   const manviGate = $derived(canQuickEnhance({ locked_fields: lockedFields }, configuration, configurationError));
   const available = $derived(requested.filter((field) => !lockedFields.includes(field)));
@@ -277,7 +322,6 @@
   });
 
   $effect(() => { onBusy(controlsLocked); });
-  $effect(() => { onCount(total); });
   $effect(() => { onEngine(engineName); });
   $effect(() => {
     onSuggestion({
@@ -300,7 +344,14 @@
     if (quick && active) untrack(() => { if (!startRequest) { void loadConfig(); void history(); } });
   });
   $effect(() => {
-    if (active && startRequest > lastStart) {
+    // `disabled` is part of the condition, not just of `startEnhancement`'s own
+    // guard: that guard returns silently, so a run that cannot act would still
+    // consume the request and the draft would never start. Reading it here
+    // leaves the request pending until the surface can honour it. No caller
+    // reaches this disabled today — the one sheet that passes `startRequest`
+    // only renders this component once its task has loaded — so this is the
+    // seam being closed, not a bug being patched.
+    if (active && !disabled && startRequest > lastStart) {
       lastStart = startRequest;
       untrack(() => { void startEnhancement(); });
     }
@@ -315,24 +366,50 @@
     const timer = window.setInterval(() => { void poll(id); }, 1000);
     return () => window.clearInterval(timer);
   });
-  async function loadConfig() {
-    if (configPending || acting || disabled) return;
+  /**
+   * Read the model configuration, sharing one request between callers.
+   *
+   * Two things ask for this at once whenever a surface opens to start work
+   * straight away: the selection effect on mount, and `startEnhancement`.
+   * The old guard simply *returned* for the second caller, which is the wrong
+   * answer to "is it loaded?" — it reported done while the request was still
+   * in flight, so an auto-start read `configuration` as null and silently did
+   * nothing. Awaiting the same promise keeps the single request and gives
+   * every caller the real answer.
+   */
+  function loadConfig(): Promise<void> {
+    // `busy || needsReconcile`, not `acting`. `acting` also covers
+    // `preparing`, which `startEnhancement` sets *around its own call to this
+    // function* — so the guard refused the one caller that most needs an
+    // answer, and the auto-start could never read a configuration. What the
+    // guard is actually for is not re-reading while a mutation is in flight or
+    // unreconciled, and those are the two flags that say so.
+    if (busy || needsReconcile || disabled) return Promise.resolve();
+    configLoad ??= (async () => {
+      // Coalesce rapid selection changes into one follow-up request rather
+      // than one per keystroke, and bound it: a selection that somehow never
+      // settles must not spin this forever.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const key = await readConfig();
+        if (disposed || key === JSON.stringify(liveSelection)) return;
+      }
+    })().finally(() => { configLoad = null; });
+    return configLoad;
+  }
+  async function readConfig(): Promise<string> {
     const selectionKey = JSON.stringify(liveSelection);
     configPending = true;
     try {
       const config = await bounded(enhancementConfiguration(liveSelection));
-      if (disposed || selectionKey !== JSON.stringify(liveSelection)) return;
+      if (disposed || selectionKey !== JSON.stringify(liveSelection)) return selectionKey;
       configuration = config;
       configurationError = null;
     } catch (cause) {
       if (!disposed && selectionKey === JSON.stringify(liveSelection)) configurationError = explainError(cause);
     } finally {
-      if (!disposed) {
-        configPending = false;
-        // Coalesce rapid selection changes into one follow-up request.
-        if (selectionKey !== JSON.stringify(liveSelection)) void loadConfig();
-      }
+      if (!disposed) configPending = false;
     }
+    return selectionKey;
   }
 
   async function history(append = false) {
@@ -350,15 +427,28 @@
   }
 
   async function choose(id: string) {
-    if (editing || acting) return;
+    // The picker is disabled while locked, so this guard is now only reached
+    // from `history()`'s auto-select. It stays because a swap mid-mutation
+    // would strand the receipt the action is holding.
+    if (editing || acting) { selectedId = proposal?.id ?? ""; return; }
     const ticket = ++selecting;
+    selectedId = id;
+    selectPending = true;
     try {
       const next = await bounded(getEnhancement(id));
       if (disposed || ticket !== selecting) return;
       proposal = next;
       selected = next.fields.filter((field) => !lockedFields.includes(field));
       error = "";
-    } catch (cause) { if (!disposed && ticket === selecting) error = explainError(cause); }
+    } catch (cause) {
+      if (disposed || ticket !== selecting) return;
+      error = explainError(cause);
+    } finally {
+      // Snap back to the revision actually on screen. A picker still naming an
+      // entry it failed to load is the same lie as a review that never
+      // changed: the control would say one thing and the diff below another.
+      if (!disposed && ticket === selecting) { selectPending = false; selectedId = proposal?.id ?? ""; }
+    }
   }
 
   async function poll(id: string) {
@@ -651,36 +741,76 @@
   {#if proposal?.rationale && ready}<p class="meta">{proposal.rationale}</p>{/if}
 
   {#if task}
-    <details class="history-drawer" bind:open={historyOpen}>
-      <summary>Manvi history{#if entries.length} · {entries.length}{/if}</summary>
-      <div class="history-heading">
-        <strong>Suggestions</strong>
-        <button type="button" class="gp-btn" disabled={historyLoading || controlsLocked} onclick={() => history()}>Refresh</button>
-      </div>
-      {#if historyLoading && !entries.length}<p role="status" class="meta">Loading suggestions…</p>
-      {:else if !entries.length}<p class="meta">No suggestions for this task yet.</p>{/if}
-      <div class="history">
-        {#each entries as entry (entry.id)}
-          <button type="button" class:selected={proposal?.id === entry.id} disabled={controlsLocked} onclick={() => choose(entry.id)}>
-            {labels[entry.state]} · {entry.model}
-            <small>Task revision {entry.source_revision}{entry.automatic ? " · Automatic" : ""}{entry.edited_fields.length ? " · Edited" : ""}</small>
-          </button>
-        {/each}
-      </div>
-      {#if cursor}<button type="button" class="gp-btn" disabled={historyLoading || controlsLocked} onclick={() => history(true)}>Load more ({entries.length} of {total})</button>{/if}
+    <!--
+      A dropdown, not a disclosure. The list used to live inside a collapsed
+      `<details>`, above a 150px scroller, above a review that was suppressed
+      whenever a ready suggestion was already showing beside the fields — so
+      the one control that could change which revision was on screen could be
+      operated with no visible effect at all.
 
-      {#if proposal && (quick || historyOpen || proposal.state !== "ready" || (!showTitleSuggestion && !showDescriptionSuggestion))}
+      Native `<select>` for the same reason `gp-select` keeps one everywhere
+      else (app.css): this is a single choice over text, and the platform
+      widget already brings type-ahead, Home/End and a popup that scrolls.
+    -->
+    <div class="history-row">
+      <label class="history-label">
+        <span class="sr-only">Suggestion</span>
+        <select
+          class="gp-select"
+          data-testid="task-assist-history"
+          value={selectedId}
+          disabled={controlsLocked || (!entries.length && !selectedId)}
+          title={controlsLocked
+            ? "Finish the current action before changing suggestions."
+            : proposal
+              ? $timestampFormat.title(proposal.created_at)
+              : ""}
+          aria-describedby="assist-history-count-{uid}"
+          onchange={(event) => void choose(event.currentTarget.value)}
+        >
+          {#if historyLoading && !entries.length}
+            <option value="">Loading suggestions…</option>
+          {:else if !entries.length}
+            <option value="">No suggestions yet</option>
+          {/if}
+          {#each historyOptions as option (option.id)}
+            <option value={option.id}>{option.label}</option>
+          {/each}
+        </select>
+      </label>
+      <button type="button" class="gp-btn" disabled={historyLoading || controlsLocked} onclick={() => history()}>Refresh</button>
+      <!-- An `<option>` cannot be a button, so paging is a sibling. The count
+           beside it is the store's total, not the page: a picker that looks
+           finite must not imply it is complete. -->
+      {#if cursor}<button type="button" class="gp-btn" disabled={historyLoading || controlsLocked} onclick={() => history(true)}>Load more</button>{/if}
+    </div>
+    <p id="assist-history-count-{uid}" class="meta">
+      {#if selectPending}Loading suggestion…
+      {:else if !entries.length}{historyLoading ? "Loading suggestions…" : "No suggestions for this task yet."}
+      {:else}Showing {entries.length} of {total}{/if}
+    </p>
+
+    <!-- Always rendered for whatever is selected. The old condition hid this
+         whenever a ready suggestion was showing beside the fields, which meant
+         changing the picker could produce no visible change at all. The real
+         problem it was solving — two places offering acceptance — is solved by
+         `reviewOffersAccept` instead, so the diff is always readable and only
+         the buttons move. -->
+    {#if proposal}
         <article aria-label="Enhancement review">
           <h3>{labels[proposal.state]}</h3>
           <small>{proposal.provider} / {proposal.model} · source revision {proposal.source_revision}</small>
+          {#if applyBlock}<p class="warn" role="status">{applyBlock}</p>{/if}
           {#if proposal.state === "ready" || proposal.state === "accepted" || proposal.state === "undone"}
             {#each proposal.fields as field}
               <div class="field-review">
-                <label class="check" class:advanced-hidden={quick && !chooseFields}>
-                  <input class="gp-field" type="checkbox" checked={proposal.state === "ready" ? selected.includes(field) : proposal.accepted_fields.includes(field)} disabled={disabled || controlsLocked || proposal.state !== "ready" || lockedFields.includes(field)} onchange={(event) => toggleSelected(field, event.currentTarget.checked)} />
-                  {field === "title" ? "Title" : "Description"}
-                </label>
-                {#if quick && !chooseFields}<h4>{field === "title" ? "Title" : "Description"}</h4>{/if}
+                {#if reviewOffersAccept}
+                  <label class="check" class:advanced-hidden={quick && !chooseFields}>
+                    <input class="gp-field" type="checkbox" checked={proposal.state === "ready" ? selected.includes(field) : proposal.accepted_fields.includes(field)} disabled={disabled || controlsLocked || proposal.state !== "ready" || lockedFields.includes(field)} onchange={(event) => toggleSelected(field, event.currentTarget.checked)} />
+                    {field === "title" ? "Title" : "Description"}
+                  </label>
+                {/if}
+                {#if !reviewOffersAccept || (quick && !chooseFields)}<h4>{field === "title" ? "Title" : "Description"}</h4>{/if}
                 <details open={!quick}><summary>Original task</summary><pre>{proposal.source[field]}</pre></details>
                 {#if proposal.edited_fields.includes(field)}<small>Original suggestion</small><pre>{proposal.original_proposed?.[field]}</pre>{/if}
                 <small>{proposal.edited_fields.includes(field) ? "Edited suggestion" : "Suggestion"}</small>
@@ -695,8 +825,14 @@
               <button type="button" class="gp-btn" disabled={acting} onclick={() => { editing = false; revisionDraft = {}; }}>Discard suggestion edits</button>
             {/if}
             {#if proposal.state === "ready"}
-              <button class="gp-btn-primary" type="button" disabled={disabled || controlsLocked || !selected.length} onclick={() => act("enhancements.accept")}>{quick ? "Apply enhancement" : "Accept selected fields"}</button>
-              {#if quick}<button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={() => { chooseFields = !chooseFields; }}>{chooseFields ? "Hide field choices" : "Choose fields"}</button>{/if}
+              <!-- Acceptance has one owner per surface. The sheet draws its
+                   own accept affordance beside the field the suggestion would
+                   replace, so offering one again here would be two buttons
+                   writing the same thing. -->
+              {#if reviewOffersAccept}
+                <button class="gp-btn-primary" type="button" disabled={disabled || controlsLocked || !selected.length} onclick={() => act("enhancements.accept")}>{quick ? "Apply enhancement" : "Accept selected fields"}</button>
+                {#if quick}<button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={() => { chooseFields = !chooseFields; }}>{chooseFields ? "Hide field choices" : "Choose fields"}</button>{/if}
+              {/if}
               <button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={editSuggestion}>Edit suggestion</button>
             {/if}
             {#if proposal.state === "accepted"}<button type="button" class="gp-btn" disabled={disabled || acting} onclick={() => act("enhancements.undo")}>Undo accepted fields</button>{/if}
@@ -709,8 +845,7 @@
             {/if}
           </div>
         </article>
-      {/if}
-    </details>
+    {/if}
   {/if}
 </section>
 
@@ -729,19 +864,17 @@
   .ask{margin-top:8px}
   label{display:flex;flex-direction:column;gap:6px;margin:12px 0 8px;font-size:12px}
   input,textarea{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
-  .actions,.history-heading,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .actions,.history-row,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
   .model-row{justify-content:space-between;margin:4px 0 8px}
   .change-link{background:none;border:0;color:rgb(var(--c-accent));font-size:11px;padding:0;cursor:pointer;text-decoration:underline}
   .locks{margin:4px 0 8px}
   .error{color:#dc6565}
   .warn{color:#d4a017;font-size:11px;margin:4px 0}
-  .history-drawer{margin-top:12px;border-top:1px solid rgb(var(--c-border) / 0.55);padding-top:8px}
-  .history-drawer summary{cursor:pointer;font-size:11px;color:rgb(var(--c-text-muted));padding:4px 0}
-  .history-heading{justify-content:space-between;margin:8px 0}
-  .history{max-height:150px;overflow:auto;display:flex;flex-direction:column;gap:5px}
-  .history button{text-align:left;padding:6px 9px;border:1px solid rgb(var(--c-border));border-radius:6px;background:transparent;color:inherit}
-  .history small{display:block;color:rgb(var(--c-text-muted));font-size:11px}
-  .history .selected{border-color:rgb(var(--c-accent))}
+  .history-row{margin-top:12px;border-top:1px solid rgb(var(--c-border) / 0.55);padding-top:10px}
+  /* The picker takes the row's slack so a long label ellipsises rather than
+     pushing Refresh and Load more onto their own line. */
+  .history-label{flex:1;min-width:8rem;margin:0}
+  .history-label select{width:100%}
   .field-review{margin:12px 0}
   .check{flex-direction:row;align-items:center;gap:7px}
   .check input{width:auto}

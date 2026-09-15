@@ -618,6 +618,14 @@
      default renders exactly what it rendered before the setting existed;
      lib/ui/codeDisplay.ts overwrites this when the reader picks 2 or 4. */
     --gp-tab-size: 8;
+    /* How wide the Tasks editor dock is. Two rules need this number — the
+     sheet itself and the strip of open-task tabs directly above it — and
+     they were two separate literals, so changing one silently left the
+     strip a different width from the sheet under it.
+
+     `clamp` rather than a bare `min`: the window floor is 900px, where a
+     fixed wide sheet would leave the board narrower than one 196px column. */
+    --gp-task-sheet-w: clamp(380px, 46vw, 620px);
     /* Derived plain colors — the canvas graph reads these. */
     --bg-main: rgb(var(--c-bg));
     --bg-surface: rgb(var(--c-surface));
