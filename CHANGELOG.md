@@ -344,49 +344,58 @@ being read: extending is a decision you take, through the same dialog.
 
 ### Verification
 
-Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at the tip of
-this section's work.
+Built and installed on macOS (Darwin 27.0.0, aarch64) from `main` at `5fa7615`,
+the tip of this section's work, after the prompting-fidelity, two-line worktree
+row and trust-banner branches were merged.
 
+- `npm test` → exit 0, **7056 passed, 0 failed** across 502 test files. This is
+  the whole suite as the repository runs it, from the repository root. The
+  previous build of this section could not make that claim and said so; it can
+  be made now, and the subset caveat that stood here is withdrawn rather than
+  left to look satisfied.
+- `npm run check` → exit 0. `svelte-check` over **5081 files: 0 errors, 0
+  warnings**, then `tsc --noEmit` clean. This is what proves the two branches
+  that both edited `WorktreesPanel.svelte` merged semantically and not merely
+  textually — the trust-extension side deleted the banner, its state and its
+  loader, while the row side rewrote the markup below them, and a leftover
+  reference to either would surface here.
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast` →
+  exit 0, **2548 passed, 0 failed, 19 ignored** across 80 test binaries, summed
+  from the individual `test result:` lines rather than read off a tail.
 - `npm run tauri build` → exit 0. `GitPulse.app` and
   `GitPulse_1.2.0_aarch64.dmg`, every nested helper (`gitpulsed`,
   `gitpulse-mcp`, `gitpulse-hook`) ad-hoc signed before the outer bundle.
   `codesign --verify --deep --strict` on the installed copy: *valid on disk*,
   *satisfies its Designated Requirement*. Not notarized — no Apple credentials
   in the environment, as usual for a local build.
+
+  The first attempt exited 1 in `bundle_dmg.sh` with no reason of its own. The
+  cause was outside the tree: a previous run had left its read-write image
+  attached at `/Volumes/dmg.fyYBMH`, and `hdiutil` will not stage a second one
+  over it. Ejecting the volume and deleting the orphaned `rw.*.dmg` made the
+  same command exit 0. Recorded because the error text named a script rather
+  than a mounted volume, and the next person to hit it will search for the
+  script.
 - `npm run check:release` → `OK: all version sources agree on 1.2.0` across all
-  ten, the new `.cursor-plugin/plugin.json` among them.
+  ten manifests.
 - `npm run mcp:install` → `gitpulse-mcp` and `gitpulse-hook` replaced at 1.2.0.
-  `npm run mcp:doctor` → OK on all three of its claims: the version matches,
-  the hook serves every subcommand `hooks.json` declares, and both binaries were
-  built from the source this tree holds (digest `fbd633f1b157bf91…`, 674 files).
-- The five contract tests bearing on this section — `cursor-plugin-contract`,
-  `repository-trust-control-contract`, `platform-vocabulary-contract`,
-  `plugin-contract` and `advisory-lockfile-contract` — **53 passed, 0 failed**.
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast`
-  against the re-vendored crates → exit 0, **2548 passed, 0 failed, 19 ignored**
-  across 80 test binaries, summed from the individual `test result:` lines.
+  `npm run mcp:doctor` → OK on all three of its claims: the version matches, the
+  hook serves every subcommand `hooks.json` declares, and both binaries were
+  built from the source this tree holds (digest `d733533a741f5104…`, 674 files).
 
-  Two earlier runs of that suite were red and both are worth recording. The
-  first found the `EXTEND_TRUST_CONTROL` gap above — a real defect, fixed. The
-  second failed on `a_two_hundred_step_rebase_reports_coherent_progress` with
-  `git commit` reporting `fatal: could not parse HEAD` while a `cargo install`
-  release build was saturating the same disk. That one is the fixture losing a
-  race under load, not a regression: it passed in the run before it and three
-  times out of three unloaded, and the clean run above is the one being
-  reported. Both are named here because a suite that went green on the third
-  attempt should say so.
+  The doctor earned its third claim here. Before the reinstall it reported the
+  version and the store schema as matching — 1.2.0 and 22 on both sides — and
+  still failed, because the recorded source digest was `329c17f746065005…`
+  against this tree's `d733533a741f5104…`. Version alone could not see that the
+  binaries on `PATH` were built from different source.
 
-**What is not verified here.** `npm test` could not be run as the repository
-runs it. The harness this was built under cannot change directories, and vitest
-driven from outside the repository root leaves `vite-plugin-svelte` unable to
-find `svelte.config.js`, so 43 component files fail to load with `Unknown file
-extension ".svelte"` and three `scripts/` tests that spawn Vite or read `git
-HEAD` fail on the cwd. Those failures are the harness, not the code, and that
-claim was measured rather than assumed: the identical command against the
-pre-merge commit reports the **same 46 files and the same 3 named tests**
-failing — 6218 passing there against 6255 here, so this work adds 37 passing
-tests and no new failure. A green subset is still a subset: run `npm test` from
-the repository root for the real number.
+**What is not verified here.** The browser harnesses (`npm run test:browser`,
+`--webkit`) were not run for this build, so the sidebar row geometry is covered
+by `harness/branches.html`'s assertions only as far as unit tests reach them —
+the measured 264px and 360px claims in the changelog entry come from the
+authoring session, not from a run recorded here. Notarization is absent, as
+above. `npm run ci:local` was not run end to end; the gates it chains were run
+individually and are listed above.
 
 ### Changed — vendored crates
 
