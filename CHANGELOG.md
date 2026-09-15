@@ -29,8 +29,42 @@ as a scope rather than a yes/no, and the worktrees panel offers to extend an
 approval that predates worktree coverage. Approvals are still never widened by
 being read: extending is a decision you take, through the same dialog.
 
+### Added
+
+- The board's quick-add line can draft. Return still saves the typed line
+  exactly as before, and then asks the configured model for a title and a
+  description to review. Two rules keep it honest, and neither is a tiebreak
+  applied afterwards: the task is written from the typed markers first and the
+  model proposes against the saved result, so markers always win structurally;
+  and the model can only ever touch title and description, because that is what
+  the enhancement field type admits — priority, labels, owner, type, repository
+  and due date are out of reach by type rather than by policy. The sentence
+  shown before you press Return and the request made after it are derived from
+  one value, so the promise on screen cannot name a field the request does not
+  carry. Off by default, and remembered: it changes what a keystroke does, so
+  it is chosen once rather than every time, and a stored value this build
+  cannot read falls back to manual — the mode that spends a model call must not
+  be the one a failed decode selects.
+
 ### Changed
 
+- Writing a task and asking the model to help with it are one pane again.
+  Splitting the sheet into four panes fixed a sheet where nothing read as
+  important and introduced a worse problem: the AI pane's *output* was drawn on
+  the Task pane, beside the fields each suggestion would replace, so a reader
+  pressed a button on one pane and the result appeared on another. Writing a
+  task, scheduling it and improving its wording are one sitting, so they are now
+  one pane in two columns. Only Agent still earns a tab — handing a saved
+  revision to something that will act on it is a different decision, with its
+  own risk and its own run history. A draft is still never tabbed.
+- The suggestion picker can tell two attempts apart. Its rows read
+  `state · model` plus `Task revision N`, which was the same string for two
+  attempts by the same model at the same revision. A timestamp separates
+  attempts made minutes apart and an ordinal separates attempts made in the
+  same second; the ordinal is a reading aid derived from the page total, never
+  an identity — the row's value is still the proposal id. State wording now
+  comes from one table read by both the picker row and the heading it selects,
+  which were previously the same literal list written twice.
 - `extended_child_path` leaves a `PATH` already at the `execve` argument-size
   ceiling alone instead of appending to it. Growing a near-limit environment
   turns a working spawn into `E2BIG`, surfacing as "Failed to spawn git:
