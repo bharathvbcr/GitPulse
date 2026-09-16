@@ -142,6 +142,21 @@ tauri-plugin-autostart = "2.5.1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# One GitPulse per machine, everywhere except macOS.
+#
+# `bundle.fileAssociations` registers `.git`, so "Open with GitPulse" and every
+# desktop shortcut is a launch. macOS routes those to the running instance as
+# `RunEvent::Opened`, which `handle_run_event` already answers — but that arm is
+# macOS-only, and on Windows and Linux nothing was listening. Each launch
+# started another whole process: another window, another set of file watchers,
+# another devmap build, all on the same repositories. Repeat it and the copies
+# stack until the machine gives out.
+#
+# Deliberately absent on macOS, where LaunchServices already guarantees one
+# instance of a bundled app and the plugin's own guidance is not to add it.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
 # Native activity notifications. Keep platform bindings macOS-only and enable
 # only the APIs needed for delivery, settings, actions and delegate activation.
 # Request construction needs UNNotificationTrigger even for immediate delivery.

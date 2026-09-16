@@ -6,7 +6,16 @@ import type { ThemePreference } from "../stores/themeStore";
 import type { RepoOperation } from "../repos/operation";
 import { MAX_OPEN_TABS } from "../repos/tabModel";
 import { buildMenuState, canDispatchMenuEvent } from "./menuState";
-import { MENU_LIMITS, menuStateProblem, menuStateWireProblem } from "./menuContract";
+import {
+  MENU_LIMITS,
+  byteLength,
+  clampText,
+  fallbackMenuState,
+  menuStateProblem,
+  menuStateWireProblem,
+  sendableMenuState,
+} from "./menuContract";
+import type { MenuState } from "./menuState";
 
 /**
  * `cmd_set_menu_state` validates before it applies, and a refusal applies
@@ -584,5 +593,144 @@ describe("a Windows workspace, on whatever host runs this", () => {
         }
       }
     }
+  });
+});
+
+/**
+ * The backstop, which only matters on the day the builder stops being total.
+ *
+ * `cmd_set_menu_state` applies nothing when it refuses, and refuses
+ * deterministically, so a payload it will not take does not cost one stale
+ * frame — it costs the menu bar, the tray and the popover until the workspace
+ * happens to change shape. `sendableMenuState` is what turns that into a
+ * missing repository list instead. It is held to repairing every refusal the
+ * validator can raise, because a repair that only covers the faults we thought
+ * of is the same freeze with more steps.
+ */
+describe("an unsendable payload is repaired rather than dropped", () => {
+  const valid = (): MenuState =>
+    buildMenuState(
+      { ...base(), currentPath: "/r/a", currentBranch: "main", openTabs: [tab({ isActive: true })] },
+      prefs(),
+      "system",
+      {},
+      false,
+    );
+
+  it("passes a sendable payload through untouched", () => {
+    const state = valid();
+    const result = sendableMenuState(state);
+    expect(result.problem).toBeNull();
+    expect(result.state).toBe(state);
+  });
+
+  /**
+   * The first switcher row, restored if an earlier breakage removed it.
+   *
+   * The combination case below applies these in any subset, so a breakage that
+   * assumed the row it wanted was still there would fail on the test's own
+   * bookkeeping rather than on the repair it exists to exercise.
+   */
+  const row = (draft: MenuState) => {
+    draft.repositories[0] ??= { path: "/r/a", label: "a", active: false, changed: 0, conflicts: 0, busy: false };
+    return draft.repositories[0];
+  };
+
+  const breakages: [string, (draft: MenuState) => void][] = [
+    ["a switcher row that disagrees with the pointer", (d) => { row(d).active = false; }],
+    ["a pointer at no listed repository", (d) => { d.activePath = "/r/missing"; d.repositories = []; }],
+    ["a duplicate switcher row", (d) => d.repositories.push({ ...row(d), active: false })],
+    ["an empty switcher path", (d) => { d.repositories = [{ ...row(d), path: "", active: false }]; d.activePath = null; }],
+    ["a count past the ceiling", (d) => { row(d).changed = MENU_LIMITS.count + 1; }],
+    ["a count serde would refuse", (d) => { d.status.changed = -1; }],
+    ["a fractional count", (d) => { d.status.stashes = 2.5; }],
+    ["an unknown enabled action", (d) => d.enabled.push("not-an-action")],
+    ["an uncheckable checked action", (d) => d.checked.push("fetch")],
+    ["a tray summary pointing somewhere else", (d) => { d.traySummary.id = "quick-commit"; }],
+    ["a duplicate label", (d) => d.labels.push({ id: "fetch", text: "a" }, { id: "fetch", text: "b" })],
+    ["an unknown label", (d) => d.labels.push({ id: "nope", text: "a" })],
+    ["a tone nobody defined", (d) => { d.status.tone = "excited"; }],
+    ["a watch status nobody defined", (d) => { d.status.watchStatus = "wedged"; }],
+    ["an oversized headline", (d) => { d.status.headline = "\u{1f600}".repeat(MENU_LIMITS.text); }],
+    ["an oversized branch", (d) => { d.status.branch = "b".repeat(MENU_LIMITS.text + 1); }],
+    ["an oversized tray detail", (d) => d.trayDetails.push("x".repeat(MENU_LIMITS.text + 1))],
+    ["too many tray details", (d) => { d.trayDetails = Array(MENU_LIMITS.trayDetails + 4).fill("row"); }],
+    ["an oversized tray title", (d) => { d.trayTitle = "9".repeat(MENU_LIMITS.trayTitleChars + 9); }],
+    ["an oversized tray summary", (d) => { d.traySummary.text = "t".repeat(MENU_LIMITS.text + 1); }],
+    ["an oversized switcher label", (d) => { row(d).label = "l".repeat(MENU_LIMITS.text + 1); }],
+    ["too many rows to send", (d) => {
+      const seed = row(d);
+      d.repositories = Array.from({ length: MENU_LIMITS.repositories + 5 }, (_, i) => ({
+        ...seed, path: `/r/${i}`, active: false,
+      }));
+      d.activePath = null;
+    }],
+    ["a fetch time outside i64", (d) => { d.status.fetchedAt = Number.MAX_VALUE; }],
+  ];
+
+  for (const [name, breach] of breakages) {
+    it(`repairs ${name}`, () => {
+      const broken = structuredClone(valid());
+      breach(broken);
+      const before = menuStateWireProblem(broken) ?? menuStateProblem(broken);
+      expect(before, `${name} did not actually break the payload`).not.toBeNull();
+
+      const { state, problem } = sendableMenuState(broken);
+      expect(problem).toBe(before);
+      expect(menuStateWireProblem(state) ?? menuStateProblem(state)).toBeNull();
+      // Repaired, not replaced. One bad field costs the switcher and whatever
+      // else could not be clamped; it must not cost the whole projection, or
+      // the backstop is just the freeze again with a different shape. No
+      // breakage here touches the repository name, so it survives all of them
+      // — and it is what the startup fallback would have overwritten.
+      expect(state.status.repository).toBe(broken.status.repository);
+      expect(state.status.repository).not.toBe(fallbackMenuState(broken).status.repository);
+      // The preferences that decide where the app lives survive any repair: a
+      // reader who asked for menu-bar-only GitPulse must not get their Dock
+      // icon back because a status card was malformed.
+      expect(state.showStatusIcon).toBe(broken.showStatusIcon);
+      expect(state.hideDockWhenClosed).toBe(broken.hideDockWhenClosed);
+    });
+  }
+
+  it("repairs anything the generator can break, and keeps the menu usable", () => {
+    // Combinations, not one fault at a time: a repair that only holds for
+    // single breakages is not a backstop.
+    for (let seed = 1; seed <= 600; seed += 1) {
+      let value = seed >>> 0;
+      const next = () => {
+        value ^= value << 13; value ^= value >>> 17; value ^= value << 5;
+        value >>>= 0;
+        return value / 0x1_0000_0000;
+      };
+      const broken = structuredClone(valid());
+      const applied: string[] = [];
+      for (const [name, breach] of breakages) {
+        if (next() < 0.3) { breach(broken); applied.push(name); }
+      }
+      const { state } = sendableMenuState(broken);
+      const found = menuStateWireProblem(state) ?? menuStateProblem(state);
+      expect(found, `seed ${seed} [${applied.join(", ")}]: ${found}`).toBeNull();
+      // A repaired payload is still a working menu, not an empty one.
+      expect(state.enabled).toContain("open");
+      expect(state.traySummary.id).toBeTruthy();
+    }
+  });
+
+  it("falls back to a payload the native side accepts at startup", () => {
+    const state = fallbackMenuState({ ...valid(), showStatusIcon: true, hideDockWhenClosed: false });
+    expect(menuStateWireProblem(state) ?? menuStateProblem(state)).toBeNull();
+    expect(state.showStatusIcon).toBe(true);
+    expect(state.hideDockWhenClosed).toBe(false);
+    expect(state.repositories).toEqual([]);
+    expect(state.activePath).toBeNull();
+  });
+
+  it("never splits a character when it shortens text", () => {
+    expect(clampText("\u{1f600}\u{1f600}", 4)).toBe("\u{1f600}");
+    expect(clampText("\u{1f600}\u{1f600}", 7)).toBe("\u{1f600}");
+    expect(clampText("\u{1f600}", 3)).toBe("");
+    expect(clampText("abc", 10)).toBe("abc");
+    expect(byteLength(clampText("é".repeat(5000), MENU_LIMITS.text))).toBeLessThanOrEqual(MENU_LIMITS.text);
   });
 });

@@ -1,4 +1,4 @@
-import type { MenuState } from "./menuState";
+import type { MenuLabel, MenuState } from "./menuState";
 import { REGISTERED_VIEWS } from "../views/viewRegistry";
 
 /**
@@ -15,10 +15,11 @@ import { REGISTERED_VIEWS } from "../views/viewRegistry";
  *
  * Nothing on this side enforced the rules. `buildMenuState` is now total: it
  * clamps, dedupes and drops so that every payload it returns satisfies the
- * validator by construction, which is what makes a runtime re-check here
- * unnecessary. `menuStateProblem` exists so the test suite can prove that
- * claim against hostile inputs instead of trusting it, and returns the same
- * message Rust would so a failure names the branch that tripped.
+ * validator by construction. `menuStateProblem` returns the message Rust would,
+ * so the suites can prove that against hostile input instead of trusting it,
+ * and `sendableMenuState` applies the same check once more at the IPC boundary
+ * — because "total" is a property of today's code, and the cost of it lapsing
+ * is a permanently inert menu rather than one wrong row.
  *
  * `scripts/menu-state-contract.test.ts` reads state.rs and actions.rs and
  * asserts this mirror agrees with them on every limit, every enum and the full
@@ -225,4 +226,168 @@ export function menuStateWireProblem(state: MenuState): string | null {
     return `status.fetchedAt is not an i64: ${fetched}`;
   }
   return null;
+}
+
+const DECODER = new TextDecoder();
+
+/**
+ * Shortens `text` to at most `max` UTF-8 bytes, never splitting a character.
+ *
+ * Cuts the encoded bytes and then walks back off any partial sequence, rather
+ * than dropping code points and re-measuring: the strings that reach here are
+ * the oversized ones by definition, and re-measuring each candidate is
+ * quadratic in exactly the case this exists to handle.
+ */
+export function clampText(text: string, max: number): string {
+  const bytes = ENCODER.encode(text);
+  if (bytes.length <= max) return text;
+  let end = max;
+  // A UTF-8 continuation byte is 0b10xxxxxx; walk back to the sequence's lead.
+  while (end > 0 && (bytes[end - 1] & 0b1100_0000) === 0b1000_0000) end -= 1;
+  if (end > 0) {
+    const lead = bytes[end - 1];
+    const width = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+    // Keep that character only when all of it fits inside the budget.
+    end = end - 1 + width <= max ? end - 1 + width : end - 1;
+  }
+  return DECODER.decode(bytes.subarray(0, end));
+}
+
+/** A count serde will take as `u32` and `validate` will accept, or null. */
+function clampCount(value: number | null, max = MENU_LIMITS.count): number | null {
+  if (value === null || !Number.isFinite(value)) return null;
+  return Math.min(Math.max(Math.trunc(value), 0), max);
+}
+
+/**
+ * A payload the native side will accept, repaired if it would not have been.
+ *
+ * `buildMenuState` is total, and the suites hold it to that — but "total" is a
+ * property of today's code, and the cost of it lapsing is out of all proportion
+ * to the mistake. A refusal from `cmd_set_menu_state` applies nothing, so the
+ * menu bar, the tray and the status popover stop tracking the workspace
+ * entirely and stay stopped: every later payload is refused for the same
+ * reason. That is how one wrong field became an inert application.
+ *
+ * So the last thing between the builder and the IPC boundary is a check, and a
+ * repair rather than a refusal of our own. The switcher is dropped whole rather
+ * than patched row by row, because its rule is an agreement between two fields
+ * and a half-corrected switcher is how the original defect looked. Everything
+ * else is clamped to something sendable. A reader loses the repository list;
+ * they do not lose the menu.
+ *
+ * The problem is returned rather than swallowed: a repair that nobody hears
+ * about is a bug that never gets fixed.
+ *
+ * The final fall back to `fallbackMenuState` is unreachable while the clamps
+ * above cover every field — and that is the point of it. The way this fails
+ * again is a new field on `MenuState` that nobody thought to clamp here, which
+ * is precisely the case the clamps cannot anticipate and a known-good payload
+ * can. Its own test pins that payload as sendable.
+ */
+export function sendableMenuState(state: MenuState): { state: MenuState; problem: string | null } {
+  const problem = menuStateWireProblem(state) ?? menuStateProblem(state);
+  if (problem === null) return { state, problem: null };
+
+  const labels: MenuLabel[] = [];
+  const seen = new Set<string>();
+  for (const label of state.labels) {
+    if (!isKnownAction(label.id) || seen.has(label.id)) continue;
+    if (labels.length >= MENU_LIMITS.labels) break;
+    seen.add(label.id);
+    labels.push({ id: label.id, text: clampText(label.text, MENU_LIMITS.text) });
+  }
+  const card = state.status;
+  const repaired: MenuState = {
+    ...state,
+    enabled: state.enabled.filter(isKnownAction).slice(0, MENU_LIMITS.enabled),
+    checked: state.checked
+      .filter((id) => isKnownAction(id) && isCheckable(id))
+      .slice(0, MENU_LIMITS.checked),
+    labels,
+    repositories: [],
+    activePath: null,
+    trayDetails: state.trayDetails
+      .slice(0, MENU_LIMITS.trayDetails)
+      .map((row) => clampText(row, MENU_LIMITS.text)),
+    traySummary: {
+      id: (TRAY_SUMMARY_IDS as readonly string[]).includes(state.traySummary.id)
+        ? state.traySummary.id
+        : "open",
+      text: clampText(state.traySummary.text, MENU_LIMITS.text),
+    },
+    trayDetail: clampText(state.trayDetail, MENU_LIMITS.text),
+    trayTitle:
+      state.trayTitle === null
+        ? null
+        : Array.from(state.trayTitle).slice(0, MENU_LIMITS.trayTitleChars).join(""),
+    status: {
+      ...card,
+      repository: clampText(card.repository, MENU_LIMITS.text),
+      branch: clampText(card.branch, MENU_LIMITS.text),
+      headline: clampText(card.headline, MENU_LIMITS.text),
+      primaryLabel: clampText(card.primaryLabel, MENU_LIMITS.text),
+      upstream: card.upstream === null ? null : clampText(card.upstream, MENU_LIMITS.text),
+      operation: card.operation === null ? null : clampText(card.operation, MENU_LIMITS.text),
+      activity: card.activity === null ? null : clampText(card.activity, MENU_LIMITS.text),
+      tone: (MENU_TONES as readonly string[]).includes(card.tone) ? card.tone : "neutral",
+      watchStatus: (MENU_WATCH_STATUSES as readonly string[]).includes(card.watchStatus)
+        ? card.watchStatus
+        : "unknown",
+      changed: clampCount(card.changed),
+      staged: clampCount(card.staged),
+      conflicts: clampCount(card.conflicts),
+      ahead: clampCount(card.ahead),
+      behind: clampCount(card.behind),
+      stashes: clampCount(card.stashes),
+      elsewhere: clampCount(card.elsewhere) ?? 0,
+      fetchedAt: Number.isSafeInteger(card.fetchedAt) ? card.fetchedAt : null,
+    },
+  };
+  const remaining = menuStateWireProblem(repaired) ?? menuStateProblem(repaired);
+  return { state: remaining === null ? repaired : fallbackMenuState(state), problem };
+}
+
+/**
+ * The payload of last resort: what the native side already starts up with.
+ *
+ * Mirrors `MenuState::default()`, which `validate` accepts by construction, and
+ * carries across only the two preferences that decide where the app lives — a
+ * reader who asked for a menu-bar-only GitPulse must not get their Dock icon
+ * back because a status card was malformed.
+ */
+export function fallbackMenuState(state: MenuState): MenuState {
+  return {
+    enabled: [...MENU_ACTION_IDS],
+    checked: [],
+    labels: [],
+    repositories: [],
+    activePath: null,
+    showStatusIcon: state.showStatusIcon,
+    hideDockWhenClosed: state.hideDockWhenClosed,
+    trayTitle: null,
+    trayDetails: [],
+    traySummary: { id: "open", text: "Open a repository…" },
+    trayDetail: "GitPulse",
+    status: {
+      repository: "GitPulse",
+      branch: "",
+      changed: null,
+      staged: null,
+      conflicts: null,
+      ahead: null,
+      behind: null,
+      upstream: null,
+      headline: "Your work, at a glance",
+      tone: "neutral",
+      primaryLabel: "Open repository",
+      watchStatus: "unknown",
+      reduceMotion: state.status.reduceMotion,
+      stashes: null,
+      operation: null,
+      activity: null,
+      elsewhere: 0,
+      fetchedAt: null,
+    },
+  };
 }

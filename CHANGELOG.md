@@ -32,6 +32,22 @@ before that tag is pushed.
   cannot disagree.
 - A repository tab activated before its session finished loading produced the
   same refusal on every platform, for the moment that window lasted.
+- Opening a repository from Explorer, a desktop shortcut, or "Open with
+  GitPulse" started another copy of GitPulse on Windows and Linux instead of
+  handing the request to the one already running — and then ignored the
+  repository it was started for, because only macOS was reading it. Each launch
+  brought its own window, its own file watchers and its own code-intelligence
+  build over the same repositories, so repeating it stacked copies until the
+  machine ran out. A launch now reaches the running GitPulse, which opens the
+  repository and comes to the front; a login-item launch still stays out of the
+  way rather than raising a window nobody asked to see.
+- A native menu payload the backend cannot accept no longer costs the menus. It
+  is repaired down to something sendable — losing the repository switcher at
+  worst — instead of leaving the menu bar, the tray and the popover frozen on
+  whatever they last accepted, and the reason is reported once rather than on
+  every refresh.
+- Two status-icon clicks landing together could leave the popover reporting an
+  error instead of opening.
 
 ## [1.2.0] - 2026-09-15
 
