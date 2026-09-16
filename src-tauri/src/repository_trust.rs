@@ -1494,9 +1494,12 @@ mod tests {
             fs::create_dir(&entry).unwrap();
             fs::write(entry.join("gitdir"), target.as_bytes()).unwrap();
         }
-        let looped = registry.join("looped");
-        fs::create_dir(&looped).unwrap();
-        std::os::unix::fs::symlink(&looped, looped.join("gitdir")).unwrap();
+        #[cfg(unix)]
+        {
+            let looped = registry.join("looped");
+            fs::create_dir(&looped).unwrap();
+            std::os::unix::fs::symlink(&looped, looped.join("gitdir")).unwrap();
+        }
 
         let started = std::time::Instant::now();
         let counted = worktree_count(&current);
@@ -1504,8 +1507,9 @@ mod tests {
             started.elapsed() < crate::hooks::BUDGET,
             "counting must not hang"
         );
-        // `looped`'s gitdir is a symlink to a directory, so it is not a file
-        // and does not count; the other two do.
+        // On Unix, `looped`'s gitdir is a symlink to a directory, so it is not a file
+        // and does not count; the other two do. On Windows, symlink creation is skipped
+        // and the two real pointers still count.
         assert_eq!(counted, 3, "main checkout plus the two real pointers");
     }
 
