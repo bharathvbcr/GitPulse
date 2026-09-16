@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.2.1] - 2026-09-16
+
+A release about one wrong comparison, and the two spellings a repository path
+carries. On macOS and Linux those spellings are the same string, so `===` held
+and nothing showed; on Windows they never are, and the whole native surface of
+the app went with it — the menu bar, the menu-bar status icon and the status
+popover stopped tracking the workspace, every repository-scoped menu item and
+its shortcut went dead, and opening a repository from Explorer started another
+copy of GitPulse rather than reaching the one already running. None of it
+reproduced on the machines the checks run on, which is what let it ship.
+
+The fixes are at the comparison rather than at each symptom, and the checks that
+would have caught it now run where the defect actually lived: the frontend holds
+itself to the payload contract the backend enforces, and the Windows path
+spellings are exercised on whatever host the suite runs on.
+
 ### Fixed
 
 - The native menu, the menu-bar status icon and the status popover stopped
@@ -2235,7 +2253,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0

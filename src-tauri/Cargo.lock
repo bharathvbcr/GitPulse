@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "gitpulse"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-channel",
  "base64 0.23.1",
