@@ -576,6 +576,18 @@ than passed where the file is absent.
   prevent. The unit test beside the constant already referenced it; this one was
   missed, and the suite rather than the diff is what found it.
 
+### Hardened — release automation
+
+- Remote release verification (`release-state.mjs`) is hardened against three
+  failure points before deployment:
+  - Line endings: notes round-trip comparison during `finalize` normalizes CRLF
+    (`\r\n`) to LF (`\n`), preventing spurious refusals when GitHub's Releases
+    API converts markdown newlines.
+  - Asset digests: SHA-256 digest inspection accepts uppercase hexadecimal and
+    normalizes to lowercase before snapshot comparison.
+  - HTTP 404 handling: the API helper allows missing endpoints unconditionally
+    when `allowMissing` is true, regardless of child process exit status.
+
 ## [1.1.0] - 2026-09-14
 
 A feature release that began as a patch. What was staged as 1.0.1 — the

@@ -23,6 +23,7 @@ function fixture(change: {
   apiStatus?: number;
   uncertainPost?: boolean;
   downloadDuringFinalize?: boolean;
+  crlfNotes?: boolean;
   list?: unknown[];
 } = {}) {
   let release = change.release === undefined ? draft() : change.release;
@@ -56,6 +57,7 @@ function fixture(change: {
       patches.push(input ?? "");
       release = {...release, ...JSON.parse(input ?? "{}")};
       if (change.corruptNotes && release) release.body = "damaged";
+      if (change.crlfNotes && release && typeof release.body === "string") release.body = release.body.replace(/\n/g, "\r\n");
       if (change.publishAfterPatch && release) release.draft = false;
       return respond(release);
     }
@@ -300,6 +302,29 @@ describe("remote release lifecycle", () => {
       return fixture({release: null}).run(program, args, input);
     };
     expect(runReleaseStage(options, custom404Run).release_id).toBe("42");
+  });
+  it("treats 404 with exit code 0 as absent when allowMissing is true", () => {
+    const custom404ZeroRun: Runner = (program, args, input) => {
+      if (program === "gh" && String(args[4] ?? "").includes("releases/tags/")) {
+        return {status: 0, failed: false, stdout: "HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"message\":\"Not Found\"}"};
+      }
+      return fixture({release: null}).run(program, args, input);
+    };
+    expect(runReleaseStage(options, custom404ZeroRun).release_id).toBe("42");
+  });
+  it("accepts CRLF line endings returned by GitHub in confirmed notes", () => {
+    expect(runReleaseStage(finalize, fixture({crlfNotes: true}).run).stage).toBe("finalize");
+  });
+  it("accepts uppercase hex in asset SHA-256 digest", () => {
+    const uppercaseDraft = {
+      ...draft(),
+      assets: draft().assets.map(asset => ({
+        ...asset,
+        digest: `sha256:${"B".repeat(64)}`,
+      })),
+    };
+    const { run } = fixture({ release: uppercaseDraft, list: [uppercaseDraft] });
+    expect(runReleaseStage(finalize, run).stage).toBe("finalize");
   });
   // Driven through an injected runner rather than the real `git`. The point is
   // which identifier each source wins from, and spawning to learn that measured

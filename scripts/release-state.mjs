@@ -55,7 +55,7 @@ export function runReleaseStage(options, run = runCommand) {
     }
     const match = /^HTTP\/[\d.]+ (\d{3})[^\n]*\r?\n[\s\S]*?\r?\n\r?\n([\s\S]*)$/.exec(result.stdout ?? "");
     if (!match) throw new Error(`GitHub ${method} ${endpoint}: incomplete response`);
-    if (status === 404 && allowMissing && result.status !== 0) return null;
+    if (status === 404 && allowMissing) return null;
     if (result.status !== 0 || status < 200 || status >= 300) throw new Error(`GitHub ${method} ${endpoint}: HTTP ${status}`);
     return JSON.parse(match[2]);
   }
@@ -149,8 +149,8 @@ export function runReleaseStage(options, run = runCommand) {
     const assets = release.assets.map(asset => {
       const metadata = record(asset);
       if (typeof metadata.id !== "number" || !Number.isSafeInteger(metadata.id) || metadata.id <= 0 ||
-          typeof metadata.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(metadata.digest)) throw new Error("Release asset ID or SHA-256 metadata is missing or invalid");
-      return {id: metadata.id, name: String(metadata.name), size: metadata.size, state: metadata.state, digest: metadata.digest};
+          typeof metadata.digest !== "string" || !/^sha256:[a-f0-9]{64}$/i.test(metadata.digest)) throw new Error("Release asset ID or SHA-256 metadata is missing or invalid");
+      return {id: metadata.id, name: String(metadata.name), size: metadata.size, state: metadata.state, digest: metadata.digest.toLowerCase()};
     }).sort((a, b) => a.name.localeCompare(b.name));
     if (new Set(assets.map(asset => asset.id)).size !== assets.length) throw new Error("Duplicate release asset IDs");
     return JSON.stringify(assets);
@@ -238,7 +238,11 @@ export function runReleaseStage(options, run = runCommand) {
     checkDraft(record(api(`releases/${releaseId}`)));
     checkDraft(record(api(`releases/${releaseId}`, "PATCH", { tag_name: tag, body: notes })));
     const confirmed = checkDraft(record(api(`releases/${releaseId}`)));
-    if (confirmed.body !== notes) throw new Error("Release notes round trip differs from changelog");
+    /** @param {unknown} [text] */
+    const normalizeNotes = (text) => (typeof text === "string" ? text : "").replace(/\r\n/g, "\n").trim();
+    if (confirmed.body !== notes && normalizeNotes(confirmed.body) !== normalizeNotes(notes)) {
+      throw new Error("Release notes round trip differs from changelog");
+    }
     if (assetSnapshot(confirmed) !== assets) throw new Error("Release assets changed during finalization");
     checkTag();
   }
