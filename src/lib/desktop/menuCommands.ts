@@ -16,6 +16,10 @@ import { formatError } from "../ui/formatError";
 import { promptQuickCommit } from "../commit/quickCommit";
 import { buildMenuState } from "./menuState";
 import { themeStore } from "../stores/themeStore";
+import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
+
+/** Repository identity folds case on Windows and macOS, not on Linux. */
+const pathOptions = (): PathIdentityOptions => ({ caseInsensitive: isCaseInsensitiveFs() });
 
 type MenuRepo = Pick<typeof repoStore, "fetch" | "pull" | "push" | "stashSave" | "stashPop" | "stageAll" |
   "unstageAll" | "createBranch" | "renameBranch" | "operationAction" | "listRemotes" | "clearRecents" | "activateTab">;
@@ -148,7 +152,10 @@ export function createMenuCommands(deps: MenuCommandDeps = defaultMenuCommandDep
     }),
     clearRecents: () => deps.repo.clearRecents(),
     activateRepo: async (path: string) => {
-      const tab = deps.state().openTabs.find((tab) => tab.path === path);
+      // The menu id carries the switcher's normalised path; a tab holds the
+      // same spelling today, but matching by identity is what makes that a
+      // property of the lookup rather than of how the payload was built.
+      const tab = deps.state().openTabs.find((tab) => sameRepo(tab.path, path, pathOptions()));
       try { if (tab) await deps.repo.activateTab(tab.id); }
       catch (error) { deps.error(formatError(error)); }
     },

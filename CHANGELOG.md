@@ -11,7 +11,27 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- The native menu, the menu-bar status icon and the status popover stopped
+  tracking the workspace on Windows. Every presentation payload was refused by
+  `MenuState::validate`, and a refusal applies nothing, so all three surfaces
+  froze on the startup state while `desktop:menu-state` repeated in
+  diagnostics. Because the backend kept that startup state, it also judged every
+  repository-scoped menu item disabled: File, Repository and Go entries, and the
+  shortcuts bound to them, silently did nothing. macOS and Linux were unaffected,
+  which is what kept it hidden — a tab stores its path normalised to forward
+  slashes while the session keeps the OS-native spelling, and on those platforms
+  the two strings are identical. On Windows they never are, so the switcher row
+  marked active disagreed with the active-repository pointer, the repository
+  switcher never showed work in progress, the status card fell back to a bare
+  folder name instead of the tab's label, and the guard that keeps a stale menu
+  click off the wrong repository rejected every click. Both spellings are now
+  resolved through the same repository identity the rest of the app uses, and
+  the switcher rows and the active pointer are derived from one source so they
+  cannot disagree.
+- A repository tab activated before its session finished loading produced the
+  same refusal on every platform, for the moment that window lasted.
 
 ## [1.2.0] - 2026-09-15
 
