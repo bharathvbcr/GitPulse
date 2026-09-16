@@ -16,6 +16,7 @@
 //! Its own executable because the library suite runs hundreds of tests
 //! concurrently against the same admission gate, and a contention measurement
 //! sharing that gate measures the suite instead.
+#![cfg(unix)]
 
 use gitpulse_lib::engine::git_cli::capture_command;
 use std::time::Duration;

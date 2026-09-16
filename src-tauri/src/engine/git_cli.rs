@@ -3476,6 +3476,7 @@ mod tests {
     /// child resolves — the same wrong-binary class the installation-health
     /// report exists to catch, introduced by the code that reports it.
     #[test]
+    #[cfg(unix)]
     fn extending_never_removes_an_inherited_entry() {
         let home = tempfile::TempDir::new().unwrap();
         for case in [
@@ -3626,6 +3627,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn extended_child_path_appends_missing_fallback_dirs_only() {
         let home = tempfile::TempDir::new().unwrap();
         let extended = extended_child_path(

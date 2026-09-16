@@ -293,7 +293,7 @@ fn rename_storm(path: PathBuf, other: PathBuf, stop: Arc<AtomicBool>) -> Arc<Ato
                 }
                 let _ = std::fs::rename(&stash, &path);
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_micros(100));
         }
         let _ = std::fs::rename(&stash, &path);
     });
