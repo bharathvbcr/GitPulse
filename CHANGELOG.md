@@ -13,6 +13,32 @@ before that tag is pushed.
 
 Nothing yet.
 
+## [1.3.0] - 2026-09-17
+
+A release introducing live delivery observability and CI timeline visualization,
+joining GitHub Actions workflow runs and Firebase App Hosting rollouts directly to
+repository commits with real-time lifecycle monitoring.
+
+### Added
+
+- **Live GitHub Actions Run Polling**: Automated, bounded polling for in-flight
+  workflow runs that refreshes only while runs are queued or executing, backing
+  off on failures, pausing while the window is hidden, and announcing newly
+  failed runs via dismissible notices.
+- **Delivery Timelines**: Visual duration and outcome timeline for workflow runs
+  and Firebase App Hosting rollouts, scaled to sample bounds with pass rates,
+  median execution times, and clean handling of queue time vs execution time.
+- **Firebase App Hosting Rollout Monitoring**: On-demand live refresh for
+  authorized project and backend pairs, providing live rollout status alongside
+  commit history.
+- **Action Dispatch & Rerun Controls**: Enhanced GitHub Actions panel with rerun
+  actions, branch filtering, and granular status reporting.
+
+### Hardened
+
+- Native menu main-thread safety and command gate stress test coverage.
+- Serde/TypeScript type sync expanded to 1188 data fields across 169 structs and 225 IPC handlers.
+
 ## [1.2.1] - 2026-09-16
 
 A release about one wrong comparison, and the two spellings a repository path
@@ -2259,7 +2285,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
