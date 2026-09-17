@@ -34,6 +34,18 @@ describe("command catalog and context", () => {
       }
     }
   });
+  it("reveals the repository surface when opening any view or view section from the palette", async () => {
+    const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+    const commands = buildCommands(ready(), () => {});
+    const workCommand = commands.find(c => c.id === "work");
+    await workCommand?.action();
+    expect(surface).toHaveBeenCalledWith("repository");
+
+    surface.mockClear();
+    const sectionCommand = commands.find(c => c.id === "work:overview");
+    await sectionCommand?.action();
+    expect(surface).toHaveBeenCalledWith("repository");
+  });
   it("opens global task boards without an active repository", async () => {
     const navigate = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
     const command = buildCommands(snapshot({ currentPath: null }), () => {}).find(item => item.id === "tasks");

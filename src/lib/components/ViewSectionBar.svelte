@@ -7,6 +7,7 @@
   import { crossfade } from "svelte/transition";
   import { isMacOS } from "../platform";
   import { liquidSelection } from "../ui/transitions";
+  import ScrollCue from "./ScrollCue.svelte";
 
   const macos = isMacOS();
   const [sendSelection, receiveSelection] = crossfade(liquidSelection());
@@ -45,6 +46,7 @@
   const groupLabel = $derived(VIEW_REGISTRY[view].label);
 
   let list: HTMLDivElement | undefined = $state();
+  let scroller: HTMLDivElement | undefined = $state();
 
   function onKeydown(event: KeyboardEvent) {
     const move = handleTablistKeydown(event.key, activeIndex, sections.length);
@@ -57,11 +59,19 @@
     // tabindex changes which tab is tabbable, not where focus sits.
     focusTabAt(list, move.index);
   }
+
+  $effect(() => {
+    active;
+    const el = list?.querySelector("[data-active='true']");
+    if (el instanceof HTMLElement) {
+      el.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+  });
 </script>
 
 {#if sections.length > 1}
   <div
-    class="h-9 shrink-0 px-3 flex items-center gap-3 border-b border-border/60 gp-section-edge bg-surface/40 select-none"
+    class="h-9 shrink-0 px-3 flex items-center gap-3 border-b border-border/60 gp-section-edge bg-surface/40 select-none min-w-0"
   >
     <div class="sr-only">
       {#each sections as section (section.id)}
@@ -71,45 +81,53 @@
         {/if}
       {/each}
     </div>
-    <div
-      bind:this={list}
-      class="gp-segmented"
-      class:gp-liquid-tabs={macos}
-      role="tablist"
-      aria-label="{groupLabel} sections"
-      tabindex="-1"
-      onkeydown={onKeydown}
-    >
-      {#each sections as section (section.id)}
-        {@const isActive = active === section.id}
-        {@const props = tabProps(view, section.id, isActive)}
-        {@const guideKey = tipGuideKey(view, section.id)}
-        {@const guide = destinationGuide(guideKey)}
-        <button
-          type="button"
-          role={props.role}
-          id={props.id}
-          aria-selected={props["aria-selected"]}
-          aria-controls={props["aria-controls"]}
-          aria-describedby={guide ? tipGuideDescId(guideKey) : undefined}
-          tabindex={props.tabindex}
-          data-active={isActive ? "true" : "false"}
-          data-section={section.id}
-          data-tip-guide={guideKey}
-          onclick={() => repoStore.setViewSection(view, section.id)}
-          class="gp-seg-btn text-[11px]! py-1!"
+    <div class="relative min-w-0 shrink self-stretch flex items-center">
+      <div
+        bind:this={scroller}
+        class="gp-header-scroll h-full flex items-center min-w-0"
+      >
+        <div
+          bind:this={list}
+          class="gp-segmented"
+          class:gp-liquid-tabs={macos}
+          role="tablist"
+          aria-label="{groupLabel} sections"
+          tabindex="-1"
+          onkeydown={onKeydown}
         >
-          {#if macos && isActive}
-            <span
-              class="gp-liquid-selection gp-gpu"
-              aria-hidden="true"
-              in:receiveSelection={{ key: `active-section-${view}` }}
-              out:sendSelection={{ key: `active-section-${view}` }}
-            ></span>
-          {/if}
-          <span>{section.label}</span>
-        </button>
-      {/each}
+          {#each sections as section (section.id)}
+            {@const isActive = active === section.id}
+            {@const props = tabProps(view, section.id, isActive)}
+            {@const guideKey = tipGuideKey(view, section.id)}
+            {@const guide = destinationGuide(guideKey)}
+            <button
+              type="button"
+              role={props.role}
+              id={props.id}
+              aria-selected={props["aria-selected"]}
+              aria-controls={props["aria-controls"]}
+              aria-describedby={guide ? tipGuideDescId(guideKey) : undefined}
+              tabindex={props.tabindex}
+              data-active={isActive ? "true" : "false"}
+              data-section={section.id}
+              data-tip-guide={guideKey}
+              onclick={() => repoStore.setViewSection(view, section.id)}
+              class="gp-seg-btn text-[11px]! py-1!"
+            >
+              {#if macos && isActive}
+                <span
+                  class="gp-liquid-selection gp-gpu"
+                  aria-hidden="true"
+                  in:receiveSelection={{ key: `active-section-${view}` }}
+                  out:sendSelection={{ key: `active-section-${view}` }}
+                ></span>
+              {/if}
+              <span>{section.label}</span>
+            </button>
+          {/each}
+        </div>
+      </div>
+      <ScrollCue target={scroller} axis="x" />
     </div>
     {@render children?.()}
   </div>

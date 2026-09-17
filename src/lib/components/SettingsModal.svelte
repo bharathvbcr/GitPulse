@@ -804,6 +804,15 @@
                         onchange={(next) => interfaceStore.setShowLanguageBar(next)}
                       />
                     </div>
+                    <div data-setting="walkthrough-button" hidden={!shown("walkthrough-button")}>
+                      <SettingToggle
+                        label="Walkthrough button"
+                        description="Show the guided-tour button in the title bar. Turn this back on here to replay the tour."
+                        ariaLabel="Show the Walkthrough button in the header"
+                        checked={$interfaceStore.showWalkthroughButton}
+                        onchange={(next) => interfaceStore.setShowWalkthroughButton(next)}
+                      />
+                    </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
                       <SettingToggle
                         label="MANVI status badges"

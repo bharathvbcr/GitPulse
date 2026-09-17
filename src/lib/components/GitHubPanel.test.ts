@@ -168,17 +168,21 @@ describe("GitHubPanel narrowing contracts", () => {
     expect(source).toContain("{#each visiblePrs as pr (pr.number)}");
     expect(source).toContain("{#each visibleIssues as issue (issue.number)}");
     expect(source).toContain("{#each visibleRuns as run (run.id)}");
+    expect(source).toContain("{#each visibleReleases as release");
   });
 
   it("never dresses a filter that matches nothing as an empty repository", () => {
     expect(source).toContain("prsNarrowedToNothing");
     expect(source).toContain("issuesNarrowedToNothing");
+    expect(source).toContain("releasesNarrowedToNothing");
     expect(source).toContain("No pull request matches this filter");
     expect(source).toContain("No issue matches this filter");
     expect(source).toContain("No run on this branch");
+    expect(source).toContain("No latest release found");
     // The reader can always get back to the full list from the empty state.
     expect(source).toContain("Clear filter");
     expect(source).toContain("Show all runs");
+    expect(source).toContain("Show all releases");
   });
 
   it("drops the previous repository's narrowing on a switch", () => {

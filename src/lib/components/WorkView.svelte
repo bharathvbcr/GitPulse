@@ -1,12 +1,20 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
   import type { WorkProjection } from "../work/projection";
+  import type { ViewLoader } from "./LazyView.svelte";
 
   // Survives the per-tab remount so revisiting Work renders the last join
   // instantly; the fetch below then refreshes it in place.
   import { createWorkRefresh } from "../work/refresh";
   const refreshWork = createWorkRefresh();
   const workCache = createRepoPanelCache<{ projection: WorkProjection; loadedAt: number }>();
+
+  /**
+   * Stable module-scope loader for the branch-chains card (LazyView keys its
+   * cache on loader identity; an inline arrow would remount the view on every
+   * parent update).
+   */
+  const loadStack: ViewLoader = () => import("./CodeStackViewer.svelte");
 </script>
 
 <script lang="ts">
@@ -36,6 +44,7 @@
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import RepoPanel from "./RepoPanel.svelte";
+  import LazyView from "./LazyView.svelte";
   import {
     degradedSummary,
     dirtyCount,
@@ -289,6 +298,7 @@
    * in flight, so they start collapsed and never push the rows down.
    */
   let showRepoDetail = $state(false);
+  let showStackDetail = $state(false);
 </script>
 
 <!-- A scroller that is a column: every band below is `mx-auto w-full max-w-6xl`,
@@ -946,6 +956,26 @@
       {#if showRepoDetail}
         <div class="mt-2">
           <RepoPanel embedded />
+        </div>
+      {/if}
+    </div>
+
+    <div class="mt-4 mx-auto w-full max-w-6xl">
+      <button
+        type="button"
+        class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"
+        onclick={() => (showStackDetail = !showStackDetail)}
+        aria-expanded={showStackDetail}
+      >
+        <ChevronRight
+          size={13}
+          class="shrink-0 transition-transform {showStackDetail ? 'rotate-90' : ''}"
+        />
+        Branch chains and stacked diffs
+      </button>
+      {#if showStackDetail}
+        <div class="mt-2">
+          <LazyView load={loadStack} name="branch chains" />
         </div>
       {/if}
     </div>

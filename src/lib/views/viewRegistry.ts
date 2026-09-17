@@ -67,13 +67,16 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "work",
     label: "Work",
     summary:
-      "Everything in flight: worktrees, pull requests, CI runs and MANVI verdicts. Blocked items sort first.",
+      "Everything in flight: worktrees, pull requests, CI runs and MANVI verdicts. Branch chains and blocked items sort first.",
     paletteCommand: "Open Work — tasks, worktrees, PRs, runs and verdicts",
     // Everything in flight, and the surfaces that act on it. GitHub and MANVI
     // were separate views rendering halves of the same answer Work already
     // joins — both issued `cmd_github_context`, four `gh` round trips each,
     // to draw overlapping lists. Resolve was never a destination: it is what
     // a blocked row opens into, and Work already sorts blocked rows first.
+    // Stack joined Overview as a collapsible card: branch chains are another
+    // reading of "this repository's branches", the subject the Overview's
+    // standing row already opens.
     sections: [
       {
         id: "overview",
@@ -94,13 +97,6 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         summary:
           "Pull requests, issues, Actions runs and releases from GitHub for this repository.",
         paletteCommand: "Open GitHub — pull requests, issues, runs and releases",
-      },
-      {
-        id: "stack",
-        label: "Stack",
-        summary:
-          "Branch chains: which branch sits on which, and restack after the base moved.",
-        paletteCommand: "Open Stack — branch chains and restacking",
       },
       {
         id: "policy",

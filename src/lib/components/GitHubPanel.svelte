@@ -67,6 +67,7 @@
   import {
     filterIssues,
     filterPullRequests,
+    filterReleases,
     PR_FACET_LABELS,
     PR_FACETS,
     prFacetCounts,
@@ -135,6 +136,8 @@
   let prFacet = $state<PrFacet>("all");
   let prQuery = $state("");
   let issueQuery = $state("");
+  let latestReleaseOnly = $state(false);
+  const visibleReleases = $derived(filterReleases(ctx?.releases ?? [], latestReleaseOnly));
   /** Narrows the run list to the checked-out branch. */
   let runsThisBranch = $state(false);
   /** Collapses the CI:local report without discarding it. */
@@ -152,6 +155,9 @@
   );
   const issuesNarrowedToNothing = $derived(
     (ctx?.issues.length ?? 0) > 0 && visibleIssues.length === 0,
+  );
+  const releasesNarrowedToNothing = $derived(
+    (ctx?.releases.length ?? 0) > 0 && visibleReleases.length === 0,
   );
   const prFilterOn = $derived(prFacet !== "all" || prQuery.trim() !== "");
 
@@ -309,6 +315,7 @@
     clearPrFilter();
     issueQuery = "";
     runsThisBranch = false;
+    latestReleaseOnly = false;
     ciReportOpen = true;
     checkingOut.clear();
     ciReport = null;
@@ -1086,10 +1093,23 @@
         </section>
 
         <section>
-          <div class="flex items-center justify-between mb-2">
-            <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Releases</h3>
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <div class="flex items-center gap-2">
+              <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Releases</h3>
+              {#if (ctx.releases?.length ?? 0) > 0}
+                <span class="gp-pill">{ctx.releases.length}</span>
+              {/if}
+            </div>
             {#if (ctx.releases?.length ?? 0) > 0}
-              <span class="gp-pill">{ctx.releases.length}</span>
+              <button
+                type="button"
+                class="gp-pill hover:text-accent {latestReleaseOnly ? 'border-accent/50! bg-accent/10! text-accent!' : ''}"
+                aria-pressed={latestReleaseOnly}
+                onclick={() => (latestReleaseOnly = !latestReleaseOnly)}
+                title="Only releases marked latest"
+              >
+                latest only
+              </button>
             {/if}
           </div>
           {#if ctx.releases_error}
@@ -1098,9 +1118,17 @@
             </div>
           {:else if !ctx.releases || ctx.releases.length === 0}
             <EmptyState icon={Tag} title="No releases found" compact />
+          {:else if releasesNarrowedToNothing}
+            <EmptyState
+              icon={Tag}
+              title="No latest release found"
+              hint="{ctx.releases.length} releases are loaded, none of them marked latest."
+              compact
+              action={{ label: "Show all releases", onClick: () => (latestReleaseOnly = false) }}
+            />
           {:else}
             <div class="space-y-2">
-              {#each ctx.releases as release, i (`${release.tag_name || release.name || "release"}#${i}`)}
+              {#each visibleReleases as release, i (`${release.tag_name || release.name || "release"}#${i}`)}
                 <div class="p-3 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
                   <div class="min-w-0 flex-1">
                     <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">

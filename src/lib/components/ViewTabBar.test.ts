@@ -117,4 +117,9 @@ describe("ViewTabBar view visibility", () => {
     expect(source).not.toContain("title={accelerator");
     expect(source).not.toContain("title={item.label");
   });
+
+  it("reveals the repository surface when selecting a tab so Fleet or Tasks are not stranded", () => {
+    expect(source).toContain('interfaceStore.setGlobalSurface("repository")');
+  });
 });
+

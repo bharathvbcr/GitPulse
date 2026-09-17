@@ -11,7 +11,7 @@
  * can never disagree: both call the same predicate.
  */
 
-import type { IssueInfo } from "../ops/model";
+import type { IssueInfo, ReleaseInfo } from "../ops/model";
 import type { PullRequestInfo, WorkflowRunInfo } from "./types";
 import { isAwaitingFirstReview } from "./prVelocity";
 
@@ -97,6 +97,10 @@ export function filterIssues(issues: readonly IssueInfo[], query: string): Issue
   const needle = query.trim().toLowerCase();
   if (needle === "") return [...issues];
   return issues.filter((issue) => issueSearchText(issue).includes(needle));
+}
+
+export function filterReleases(releases: readonly ReleaseInfo[], latestOnly: boolean): ReleaseInfo[] {
+  return releases.filter((release) => !latestOnly || release.is_latest);
 }
 
 /**

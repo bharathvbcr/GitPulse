@@ -134,7 +134,7 @@ export const RETIRED_VIEWS: Readonly<Record<string, RetiredView>> = {
   // row opens into, and Work already sorts blocked rows first.
   github: { tab: "work", section: "remote" },
   manvi: { tab: "work", section: "policy" },
-  stack: { tab: "work", section: "stack" },
+  stack: { tab: "work" },
   conflict: { tab: "work", section: "resolve" },
   // Files and Blame are two readings of one file. Both keyed off
   // `selectedFilePath`, and Blame had grown its own explorer rail and its own

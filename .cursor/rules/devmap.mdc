@@ -1,15 +1,19 @@
 ---
-description: DevMap navigation and repository hygiene
+description: DevMap navigation, GitPulse Insights and repository hygiene
 alwaysApply: true
 ---
 
-# DevMap
+# DevMap and GitPulse Insights
+
+Before you change anything, ask GitPulse Insights what else is live in this repository. `gitpulse_insights` names the other worktrees, the running agent sessions, uncommitted work, contended files and index health in one call. Then `gitpulse_collision_risk` before touching a file another worktree may hold, `gitpulse_active_changes` for what is in flight, `gitpulse_change_context` / `gitpulse_provenance` for what changed and why, and `gitpulse_ledger_events` for the recorded history. Its facets fail independently — check each `ok`, because a facet that could not scan is not a facet that came back clean.
 
 Use `.devcouncil/repo_map.json` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.
 
 Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one MCP process across workspace tabs. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.
 
 Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.
+
+This binds every agent working here, not only the one reading this file. When you delegate — a subagent, a worktree lane, a handoff plan — name DevMap and GitPulse Insights in the prompt with the same precedence, rather than leaving that agent to grep its way in. When either tool cannot answer (truncated, `walk_incomplete`, empty on a built index, or a capability it does not have), record the gap and say so; do not silently fall back to grep and report the result as if the graph had confirmed it.
 
 ## Repository hygiene
 

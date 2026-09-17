@@ -341,13 +341,13 @@ describe("App chrome preferences", () => {
     expect(window).toContain("<StatusBar");
   });
 
-  it("hides the repository tab strip only while a single repository is open", () => {
-    // Hiding it with several tabs open would strand the other repositories.
+  it("keeps the repository bar mounted so chrome and shortcuts stay reachable", () => {
+    // Unmounting the entire bar when hiding the tab strip would drop Fleet,
+    // Tasks, Open, Recents and the app-wide keydown listener.
     const idx = source.indexOf("<RepoTabBar");
     expect(idx).toBeGreaterThan(-1);
-    expect(source.slice(Math.max(0, idx - 160), idx)).toContain(
-      "{#if !$interfaceStore.autoHideRepoTabs || $repoStore.openTabs.length > 1}",
-    );
+    expect(source).toContain("<RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />");
+    expect(source.slice(Math.max(0, idx - 160), idx)).not.toContain("autoHideRepoTabs");
   });
 
   it("gates the diagnostics button on the shared rule, not an inline error count", () => {

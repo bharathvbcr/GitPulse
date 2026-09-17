@@ -47,11 +47,17 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     }
   };
   const views: PaletteItem[] = Object.values(VIEW_REGISTRY).flatMap(view => [
-    { id: view.id, label: view.paletteCommand ?? `Open ${view.label}`, description: view.summary, category: "Views", icon: icons[view.id], disabledReason: unavailable, action: () => repoStore.setActiveTab(view.id) },
+    { id: view.id, label: view.paletteCommand ?? `Open ${view.label}`, description: view.summary, category: "Views", icon: icons[view.id], disabledReason: unavailable, action: () => {
+      interfaceStore.setGlobalSurface("repository");
+      repoStore.setActiveTab(view.id);
+    } },
     ...(view.sections ?? []).map(section => ({
       id: `${view.id}:${section.id}`, label: section.paletteCommand ?? `Open ${view.label} ${section.label}`,
       description: `${view.label} → ${section.label} · ${section.summary}`, keywords: `${view.label} ${section.label}`, category: "Views", icon: icons[view.id], disabledReason: unavailable,
-      action: () => repoStore.setActiveTab(view.id, section.id),
+      action: () => {
+        interfaceStore.setGlobalSurface("repository");
+        repoStore.setActiveTab(view.id, section.id);
+      },
     })),
   ]);
   return [

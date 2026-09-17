@@ -40,6 +40,7 @@
   );
 
   function selectTab(tab: ViewTab) {
+    interfaceStore.setGlobalSurface("repository");
     repoStore.setActiveTab(tab);
   }
 

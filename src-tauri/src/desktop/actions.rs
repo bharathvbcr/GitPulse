@@ -77,7 +77,6 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
             ("section:work:overview", "Overview"),
             ("section:work:resolve", "Resolve"),
             ("section:work:remote", "Remote"),
-            ("section:work:stack", "Stack"),
             ("section:work:policy", "Policy"),
             ("section:work:tasks", "Tasks"),
         ],

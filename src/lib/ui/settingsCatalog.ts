@@ -139,6 +139,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "manvi harness local model chips toolbar agents",
   },
   {
+    id: "walkthrough-button",
+    section: "layout",
+    label: "Walkthrough button",
+    keywords: "tour guided replay onboarding walkthrough header title bar hide show",
+  },
+  {
     id: "view-visibility",
     section: "views",
     label: "Views in the header",

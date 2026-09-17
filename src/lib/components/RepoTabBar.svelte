@@ -48,6 +48,9 @@
   let scroller: HTMLDivElement | undefined = $state();
   let moveAnnouncement = $state("");
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
+  const hideTabStrip = $derived(
+    $interfaceStore.autoHideRepoTabs && $repoStore.openTabs.length <= 1,
+  );
 
   let unusedRecents = $derived(
     $repoStore.recentRepos.filter(
@@ -470,107 +473,109 @@
         </button>
       {/if}
     </div>
-    <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
-    <div class="relative min-w-0 max-w-full shrink self-stretch">
-    <div
-      bind:this={scroller}
-      class="h-full flex items-center gap-1 overflow-x-auto min-w-0 py-1"
-      role="tablist"
-      tabindex="-1"
-      aria-label="Open repositories"
-      onkeydown={onTablistKeydown}
-      ondragover={onScrollerDragOver}
-      ondrop={onScrollerDrop}
-    >
-      {#each $repoStore.openTabs as tab, index (tab.id)}
-        <div
-          role="presentation"
-          data-tab-id={tab.id}
-          data-tab-shell-index={index}
-          title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}`}
-          draggable="true"
-          onauxclick={(e) => {
-            if (e.button === 1) {
-              e.preventDefault();
-              void repoStore.closeTab(tab.id);
-            }
-          }}
-          oncontextmenu={(e) => onContext(e, tab.id)}
-          ondragstart={(e) => onTabDragStart(e, tab.id)}
-          ondragend={endDrag}
-          class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFromId === tab.id
-            ? 'opacity-60'
-            : ''} {dropTarget?.index === index ? 'border-accent/50' : ''} {repoTabChrome(tab)}"
-        >
-          {#if dropTarget?.index === index}
-            <span
-              aria-hidden="true"
-              class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
-                ? 'left-[-3px]'
-                : 'right-[-3px]'}"
-            ></span>
-          {/if}
-          <button
-            type="button"
-            role="tab"
-            tabindex={tab.isActive ? 0 : -1}
-            aria-selected={tab.isActive}
-            aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"
-            data-active-repo={tab.isActive ? "true" : "false"}
-            data-tab-index={index}
+    {#if !hideTabStrip}
+      <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
+      <div class="relative min-w-0 max-w-full shrink self-stretch">
+      <div
+        bind:this={scroller}
+        class="h-full flex items-center gap-1 overflow-x-auto min-w-0 py-1"
+        role="tablist"
+        tabindex="-1"
+        aria-label="Open repositories"
+        onkeydown={onTablistKeydown}
+        ondragover={onScrollerDragOver}
+        ondrop={onScrollerDrop}
+      >
+        {#each $repoStore.openTabs as tab, index (tab.id)}
+          <div
+            role="presentation"
             data-tab-id={tab.id}
-            onclick={() => selectRepoTab(tab.id)}
-            onkeydown={(e) => {
-              if (e.key === "p" || e.key === "P") {
+            data-tab-shell-index={index}
+            title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}`}
+            draggable="true"
+            onauxclick={(e) => {
+              if (e.button === 1) {
                 e.preventDefault();
-                repoStore.pinTab(tab.id, !tab.pinned);
-              } else if (e.key === "Delete") {
-                e.preventDefault();
-                void closeTabFromKeyboard(tab.id, index);
+                void repoStore.closeTab(tab.id);
               }
             }}
-            ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
-            class="h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+            oncontextmenu={(e) => onContext(e, tab.id)}
+            ondragstart={(e) => onTabDragStart(e, tab.id)}
+            ondragend={endDrag}
+            class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFromId === tab.id
+              ? 'opacity-60'
+              : ''} {dropTarget?.index === index ? 'border-accent/50' : ''} {repoTabChrome(tab)}"
           >
-            {#if tab.pinned}
-              <Pin size={10} class="text-accent shrink-0" />
-            {:else}
-              <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
+            {#if dropTarget?.index === index}
+              <span
+                aria-hidden="true"
+                class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
+                  ? 'left-[-3px]'
+                  : 'right-[-3px]'}"
+              ></span>
             {/if}
-            <span class="whitespace-nowrap font-medium">{tab.label}</span>
-            {#if tab.currentBranch}
-              <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
-            {/if}
-            {#if tab.conflictedCount > 0}
-              <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
-            {/if}
-          </button>
-          {#if tab.isDirty}
-            <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
-              title="Preview uncommitted changes in {tab.label}" aria-label="Preview uncommitted changes in {tab.label}"
-              onclick={() => void repoStore.previewUncommitted(tab.path)}>
-              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
-            </button>
-          {/if}
-          <button
+            <button
             type="button"
-            tabindex="-1"
-            data-tab-close
-            title="Close"
-            aria-label={`Close ${tab.label}`}
-            onclick={(e) => {
-              e.stopPropagation();
-              void repoStore.closeTab(tab.id);
-            }}
-            class="ml-auto p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background hover:text-rose-400 {tab.isActive ? 'opacity-100' : ''}"
-          >
-            <X size={11} />
-          </button>
-        </div>
-      {/each}
-    </div>
-    <ScrollCue target={scroller} axis="x" />
-    </div>
+            role="tab"
+              tabindex={tab.isActive ? 0 : -1}
+              aria-selected={tab.isActive}
+              aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"
+              data-active-repo={tab.isActive ? "true" : "false"}
+              data-tab-index={index}
+              data-tab-id={tab.id}
+              onclick={() => selectRepoTab(tab.id)}
+              onkeydown={(e) => {
+                if (e.key === "p" || e.key === "P") {
+                  e.preventDefault();
+                  repoStore.pinTab(tab.id, !tab.pinned);
+                } else if (e.key === "Delete") {
+                  e.preventDefault();
+                  void closeTabFromKeyboard(tab.id, index);
+                }
+              }}
+              ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
+              class="h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+            >
+              {#if tab.pinned}
+                <Pin size={10} class="text-accent shrink-0" />
+              {:else}
+                <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
+              {/if}
+              <span class="whitespace-nowrap font-medium">{tab.label}</span>
+              {#if tab.currentBranch}
+                <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
+              {/if}
+              {#if tab.conflictedCount > 0}
+                <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
+              {/if}
+            </button>
+            {#if tab.isDirty}
+              <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
+                title="Preview uncommitted changes in {tab.label}" aria-label="Preview uncommitted changes in {tab.label}"
+                onclick={() => void repoStore.previewUncommitted(tab.path)}>
+                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
+              </button>
+            {/if}
+            <button
+              type="button"
+              tabindex="-1"
+              data-tab-close
+              title="Close"
+              aria-label={`Close ${tab.label}`}
+              onclick={(e) => {
+                e.stopPropagation();
+                void repoStore.closeTab(tab.id);
+              }}
+              class="ml-auto p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background hover:text-rose-400 {tab.isActive ? 'opacity-100' : ''}"
+            >
+              <X size={11} />
+            </button>
+          </div>
+        {/each}
+      </div>
+      <ScrollCue target={scroller} axis="x" />
+      </div>
+    {/if}
 
     <button
       type="button"

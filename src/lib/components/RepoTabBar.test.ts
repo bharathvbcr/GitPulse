@@ -5,6 +5,7 @@ import { compile } from "svelte/compiler";
 import RepoTabBar from "./RepoTabBar.svelte";
 
 import { repoStore } from "../stores/repoStore";
+import { interfaceStore } from "../stores/interfaceStore";
 
 const source = readFileSync(new URL("./RepoTabBar.svelte", import.meta.url), "utf8");
 
@@ -25,6 +26,28 @@ describe("RepoTabBar", () => {
     expect(body).toContain('title="Open repository"');
     expect(body).toContain('title="Recent repositories"');
 
+    await repoStore.closeActiveTab();
+  });
+
+  it("hides the repository tab strip while a single repository is open without unmounting chrome", () => {
+    expect(source).toContain("hideTabStrip");
+    expect(source).toContain("$interfaceStore.autoHideRepoTabs && $repoStore.openTabs.length <= 1");
+    expect(source).toContain("{#if !hideTabStrip}");
+  });
+
+  it("keeps Fleet, Tasks, Open, and Recents visible when autoHideRepoTabs hides the lone repository tab", async () => {
+    interfaceStore.setAutoHideRepoTabs(true);
+    await repoStore.openRepo("/repo/alone-project", { allowBroken: true, activate: true });
+
+    const { body } = render(RepoTabBar);
+    expect(body).toContain('data-testid="tasks-tab-chip"');
+    expect(body).toContain('data-testid="fleet-tab-chip"');
+    expect(body).toContain('data-testid="open-repo-tab"');
+    expect(body).toContain('title="Recent repositories"');
+    expect(body).not.toContain('role="tablist"');
+    expect(body).not.toContain("alone-project");
+
+    interfaceStore.setAutoHideRepoTabs(false);
     await repoStore.closeActiveTab();
   });
 

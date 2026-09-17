@@ -4,6 +4,7 @@ import type { PullRequestInfo, WorkflowRunInfo } from "./types";
 import {
   filterIssues,
   filterPullRequests,
+  filterReleases,
   issueSearchText,
   PR_FACETS,
   prFacetCounts,
@@ -153,6 +154,33 @@ describe("runsOnBranch", () => {
     // list rather than turning the filter off.
     expect(runsOnBranch(runs, "")).toHaveLength(2);
     expect(runsOnBranch(runs, "   ")).toHaveLength(2);
+  });
+});
+
+describe("filterReleases", () => {
+  const releases = [
+    { tag_name: "v2.0.0", name: "Newer", is_latest: false, is_draft: false, is_prerelease: false, published_at: "", created_at: "", url: "" },
+    { tag_name: "v1.0.0", name: "Latest", is_latest: true, is_draft: false, is_prerelease: false, published_at: "", created_at: "", url: "" },
+  ];
+
+  it("hides releases not marked latest when Latest only is enabled", () => {
+    expect(filterReleases(releases, true)).toEqual([releases[1]]);
+  });
+
+  it("preserves all releases and their order when disabled", () => {
+    expect(filterReleases(releases, false)).toEqual(releases);
+  });
+
+  it("returns an empty list when no release is marked latest", () => {
+    expect(filterReleases([releases[0]], true)).toEqual([]);
+    expect(filterReleases([], true)).toEqual([]);
+    expect(filterReleases([], false)).toEqual([]);
+  });
+
+  it("preserves multiple latest flags without mutating the input", () => {
+    const rows = Object.freeze([releases[1], releases[0], releases[1]]);
+    expect(filterReleases(rows, true)).toEqual([releases[1], releases[1]]);
+    expect(rows).toEqual([releases[1], releases[0], releases[1]]);
   });
 });
 

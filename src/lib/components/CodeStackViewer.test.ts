@@ -5,7 +5,6 @@ import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 
 import CodeStackViewer from "./CodeStackViewer.svelte";
-import { VIEW_REGISTRY } from "../views/viewRegistry";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "CodeStackViewer.svelte"),
@@ -127,10 +126,8 @@ describe("CodeStackViewer accessibility", () => {
     expect(body).toContain("Stack");
   });
 
-  it("titles the pane the way the section that opens it is labelled", () => {
-    const section = VIEW_REGISTRY.work.sections?.find((s) => s.id === "stack");
-    expect(section?.label).toBe("Stack");
-    expect(source).toContain(`\n        ${section?.label}\n`);
+  it("titles the pane Stack", () => {
+    expect(source).toContain("\n        Stack\n");
   });
 });
 
