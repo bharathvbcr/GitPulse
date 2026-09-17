@@ -29,6 +29,12 @@ would have caught it now run where the defect actually lived: the frontend holds
 itself to the payload contract the backend enforces, and the Windows path
 spellings are exercised on whatever host the suite runs on.
 
+### Added
+
+- Embedded branch chains and stacked diffs card directly into the Work view overview with a collapsible toggle.
+- Walkthrough replay button visibility preference in Layout settings to allow showing or hiding the tour button in the window title bar.
+- Horizontal scroll indicators with smooth cue transitions on repository tabs and view section bars.
+
 ### Fixed
 
 - The native menu, the menu-bar status icon and the status popover stopped
