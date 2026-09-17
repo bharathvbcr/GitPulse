@@ -259,6 +259,86 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
     }
 }
 
+/// The repository a launch was asked to open, if its arguments name one.
+///
+/// `bundle.fileAssociations` claims `.git`, so a launch from Explorer, from a
+/// desktop shortcut, or from "Open with GitPulse" arrives as a path in `argv`.
+/// Only macOS was reading it — it gets the same request as `RunEvent::Opened`
+/// instead, through LaunchServices — so on Windows and Linux opening a
+/// repository from the file manager started an instance that ignored the
+/// repository it was started for.
+///
+/// Pure, and separated from the launch it serves, so the argument shapes a real
+/// launch produces can be pinned in a test rather than only on a desktop.
+///
+/// `argv[0]` is the program itself. Flags are skipped rather than stopping the
+/// scan: `--background` is passed by the login item and may precede a path.
+/// Everything after `--` is taken literally, so a repository whose name begins
+/// with a dash is still openable.
+pub fn repository_arg(argv: &[String]) -> Option<&str> {
+    let mut rest = argv.iter().skip(1);
+    let mut literal = false;
+    for arg in rest.by_ref() {
+        if literal {
+            return (!arg.is_empty()).then_some(arg.as_str());
+        }
+        if arg == "--" {
+            literal = true;
+            continue;
+        }
+        if arg.starts_with('-') || arg.is_empty() {
+            continue;
+        }
+        return Some(arg.as_str());
+    }
+    None
+}
+
+/// A launch that found this app already running: adopt its request and go away.
+///
+/// The second process exits as soon as this returns; everything it was started
+/// to do has to happen here, against the instance that stays. Revealing the
+/// window is not optional — without it a user who opened a repository from the
+/// file manager sees nothing happen at all, because the window that answered is
+/// behind whatever they were looking at.
+pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, argv: &[String]) {
+    match second_launch(argv) {
+        // Reveals the window itself, after queuing the repository.
+        SecondLaunch::Open(path) => queue_and_emit_open(app, Path::new(path)),
+        SecondLaunch::Reveal => {
+            if let Err(error) = reveal_main(app) {
+                log::warn!(target: "desktop", "Could not reveal GitPulse for a second launch: {error}");
+            }
+        }
+        SecondLaunch::Ignore => {}
+    }
+}
+
+/// What a launch that found this app already running is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondLaunch<'a> {
+    /// Open this repository, revealing the window on the way.
+    Open(&'a str),
+    /// Come to the front: someone launched the app that is already running.
+    Reveal,
+    /// Neither. Answering would take over a screen nobody asked about.
+    Ignore,
+}
+
+/// Pure so the matrix is pinned in a test rather than on a desktop.
+pub fn second_launch(argv: &[String]) -> SecondLaunch<'_> {
+    if let Some(path) = repository_arg(argv) {
+        return SecondLaunch::Open(path);
+    }
+    // `--background` is the login item's launch, and it means the opposite of
+    // "look at me". The running instance must not raise its window because the
+    // session started a second one that was never meant to be seen.
+    if argv.iter().any(|arg| arg == "--background") {
+        return SecondLaunch::Ignore;
+    }
+    SecondLaunch::Reveal
+}
+
 pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
     match find_git_root(path) {
         Some(root) => {
@@ -550,6 +630,73 @@ mod tests {
             *confirmations.lock().unwrap(),
             1,
             "main-window quit protection must remain active"
+        );
+    }
+
+    #[test]
+    fn a_launch_names_the_repository_it_was_started_for() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            std::iter::once("gitpulse.exe")
+                .chain(args.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        // The shape Explorer and a desktop shortcut produce.
+        assert_eq!(
+            repository_arg(&argv(&["C:\\Users\\me\\Code\\app"])),
+            Some("C:\\Users\\me\\Code\\app")
+        );
+        assert_eq!(
+            repository_arg(&argv(&["/home/me/code/app"])),
+            Some("/home/me/code/app")
+        );
+        // The login item passes --background, and may pass it before a path.
+        assert_eq!(repository_arg(&argv(&["--background"])), None);
+        assert_eq!(
+            repository_arg(&argv(&["--background", "/r/a"])),
+            Some("/r/a")
+        );
+        // A repository whose name starts with a dash is still openable.
+        assert_eq!(
+            repository_arg(&argv(&["--", "-weird-name"])),
+            Some("-weird-name")
+        );
+        // Nothing to open: the program name alone, or only flags, or blanks.
+        assert_eq!(repository_arg(&argv(&[])), None);
+        assert_eq!(repository_arg(&[]), None);
+        assert_eq!(repository_arg(&argv(&["", "-x", ""])), None);
+        assert_eq!(repository_arg(&argv(&["--"])), None);
+        // argv[0] is never the request, however much it looks like a path.
+        assert_eq!(repository_arg(&["/opt/gitpulse".into()]), None);
+    }
+
+    #[test]
+    fn a_second_launch_reveals_the_app_unless_it_was_meant_to_stay_hidden() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            std::iter::once("gitpulse.exe")
+                .chain(args.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(
+            second_launch(&argv(&["/r/a"])),
+            SecondLaunch::Open("/r/a"),
+            "a repository launch opens it"
+        );
+        assert_eq!(
+            second_launch(&argv(&[])),
+            SecondLaunch::Reveal,
+            "launching the app again asks to see it"
+        );
+        assert_eq!(
+            second_launch(&argv(&["--background"])),
+            SecondLaunch::Ignore,
+            "the login item must not raise a window nobody asked for"
+        );
+        assert_eq!(
+            second_launch(&argv(&["--background", "/r/a"])),
+            SecondLaunch::Open("/r/a"),
+            "a repository still wins: it is an explicit request"
         );
     }
 

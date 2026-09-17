@@ -130,16 +130,26 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                     .build(),
             )
         };
-        let window = builder.build().map_err(|e| e.to_string())?;
-        let handle = app.clone();
-        window.on_window_event(move |event| {
-            if matches!(event, WindowEvent::Focused(false)) {
-                if let Err(error) = hide(&handle) {
-                    log::warn!(target: "desktop", "Status popover dismissal failed: {error}");
-                }
+        // A second toggle arriving between the lookup above and this build
+        // would fail on the duplicate label, and the toggle it belongs to would
+        // report an error instead of showing the panel the reader asked for.
+        // The window that won the race is the one to use.
+        match builder.build() {
+            Ok(window) => {
+                let handle = app.clone();
+                window.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Focused(false)) {
+                        if let Err(error) = hide(&handle) {
+                            log::warn!(target: "desktop", "Status popover dismissal failed: {error}");
+                        }
+                    }
+                });
+                window
             }
-        });
-        window
+            Err(error) => app
+                .get_webview_window(LABEL)
+                .ok_or_else(|| error.to_string())?,
+        }
     };
     let height = window
         .inner_size()

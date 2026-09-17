@@ -87,7 +87,15 @@ pub fn run() {
     } else {
         log::warn!(target: "setup", "{}", signals.describe());
     }
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Registered before every other plugin, as this one requires: it decides
+    // whether this process is the app or a message to the app, and nothing
+    // should have started initialising by the time it answers that.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        desktop::handle_second_instance(app, &argv);
+    }));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -124,6 +132,16 @@ pub fn run() {
                     let _ = app
                         .handle()
                         .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
+            }
+            // The cold-start half of the same request the single-instance hook
+            // answers for a warm one. macOS delivers it as `RunEvent::Opened`
+            // instead, so reading argv there would open the repository twice.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let argv: Vec<String> = std::env::args().collect();
+                if let Some(path) = desktop::repository_arg(&argv) {
+                    desktop::queue_and_emit_open(app.handle(), std::path::Path::new(path));
                 }
             }
             Ok(())

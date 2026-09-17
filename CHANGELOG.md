@@ -13,6 +13,60 @@ before that tag is pushed.
 
 Nothing yet.
 
+## [1.2.1] - 2026-09-16
+
+A release about one wrong comparison, and the two spellings a repository path
+carries. On macOS and Linux those spellings are the same string, so `===` held
+and nothing showed; on Windows they never are, and the whole native surface of
+the app went with it — the menu bar, the menu-bar status icon and the status
+popover stopped tracking the workspace, every repository-scoped menu item and
+its shortcut went dead, and opening a repository from Explorer started another
+copy of GitPulse rather than reaching the one already running. None of it
+reproduced on the machines the checks run on, which is what let it ship.
+
+The fixes are at the comparison rather than at each symptom, and the checks that
+would have caught it now run where the defect actually lived: the frontend holds
+itself to the payload contract the backend enforces, and the Windows path
+spellings are exercised on whatever host the suite runs on.
+
+### Fixed
+
+- The native menu, the menu-bar status icon and the status popover stopped
+  tracking the workspace on Windows. Every presentation payload was refused by
+  `MenuState::validate`, and a refusal applies nothing, so all three surfaces
+  froze on the startup state while `desktop:menu-state` repeated in
+  diagnostics. Because the backend kept that startup state, it also judged every
+  repository-scoped menu item disabled: File, Repository and Go entries, and the
+  shortcuts bound to them, silently did nothing. macOS and Linux were unaffected,
+  which is what kept it hidden — a tab stores its path normalised to forward
+  slashes while the session keeps the OS-native spelling, and on those platforms
+  the two strings are identical. On Windows they never are, so the switcher row
+  marked active disagreed with the active-repository pointer, the repository
+  switcher never showed work in progress, the status card fell back to a bare
+  folder name instead of the tab's label, and the guard that keeps a stale menu
+  click off the wrong repository rejected every click. Both spellings are now
+  resolved through the same repository identity the rest of the app uses, and
+  the switcher rows and the active pointer are derived from one source so they
+  cannot disagree.
+- A repository tab activated before its session finished loading produced the
+  same refusal on every platform, for the moment that window lasted.
+- Opening a repository from Explorer, a desktop shortcut, or "Open with
+  GitPulse" started another copy of GitPulse on Windows and Linux instead of
+  handing the request to the one already running — and then ignored the
+  repository it was started for, because only macOS was reading it. Each launch
+  brought its own window, its own file watchers and its own code-intelligence
+  build over the same repositories, so repeating it stacked copies until the
+  machine ran out. A launch now reaches the running GitPulse, which opens the
+  repository and comes to the front; a login-item launch still stays out of the
+  way rather than raising a window nobody asked to see.
+- A native menu payload the backend cannot accept no longer costs the menus. It
+  is repaired down to something sendable — losing the repository switcher at
+  worst — instead of leaving the menu bar, the tray and the popover frozen on
+  whatever they last accepted, and the reason is reported once rather than on
+  every refresh.
+- Two status-icon clicks landing together could leave the popover reporting an
+  error instead of opening.
+
 ## [1.2.0] - 2026-09-15
 
 A release about checks that were not telling the truth. Every fix here is a
@@ -2199,7 +2253,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
