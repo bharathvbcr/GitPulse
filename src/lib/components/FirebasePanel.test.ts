@@ -227,3 +227,54 @@ describe("FirebasePanel", () => {
     expect(source).toContain("backends && backends.checked ? backends.backends : []");
   });
 });
+
+describe("FirebasePanel live deploy polling stays inside the click-only rule", () => {
+  it("never polls a target no listing has answered for", () => {
+    // The whole justification: listing rollouts can enable the App Hosting API
+    // on a project where it is off, which is a change to a Cloud project. The
+    // enabling happens only when the API is off, so a listing that already
+    // answered proves it is on — and that success, nothing else, is what
+    // authorises a refresh. `pollableTarget` starts null, so mounting the
+    // panel can never start a poll.
+    expect(source).toContain("let pollableTarget = $state<string | null>(null);");
+    expect(source).toContain("if (result.output.checked) {");
+    expect(source).toContain("pollableTarget = `${selectedProjectId}/${selectedBackend}`;");
+  });
+
+  it("keys the authorisation on project AND backend together", () => {
+    // A backend id is not unique across projects, so a project-only key would
+    // let one project's success authorise another project's poll.
+    expect(source).toMatch(/currentTarget = \$derived\(\s*\n?\s*selectedProjectId && selectedBackend/);
+    expect(source).toContain("`${selectedProjectId}/${selectedBackend}`");
+  });
+
+  it("withdraws the authorisation whenever the target moves or fails", () => {
+    // Both directions matter: a changed backend must not inherit the previous
+    // one's authorisation, and a failed listing proves nothing about the API.
+    const resets = source.match(/pollableTarget = null;/g) ?? [];
+    expect(resets.length, "reset on target change and on listing failure").toBeGreaterThanOrEqual(2);
+  });
+
+  it("requires both authorisation and work in flight before any timer starts", () => {
+    expect(source).toContain("const authorised = pollableTarget !== null && pollableTarget === currentTarget;");
+    expect(source).toContain("livePoll?.sync(authorised && anyInFlight(rolloutRows))");
+  });
+
+  it("re-checks the target after the CLI returns, not only before", () => {
+    // The selection can move while the CLI runs; applying that answer would
+    // show one backend's rollouts under another backend's name.
+    const fn = source.slice(source.indexOf("async function pollRolloutsOnce"));
+    const body = fn.slice(0, fn.indexOf("\n  }"));
+    expect(body.match(/pollableTarget !== target/g) ?? []).toHaveLength(2);
+  });
+
+  it("drops a poll whose listing could not run", () => {
+    // `checked: false` must not overwrite real rows with an empty list, and
+    // must count as a failure so the scheduler backs off.
+    expect(source).toContain("if (!result.output.checked) return false;");
+  });
+
+  it("tears the driver down per target", () => {
+    expect(source).toContain("driver.dispose()");
+  });
+});

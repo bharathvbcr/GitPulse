@@ -26,10 +26,11 @@ export function needLabel(need: ComponentNeed): string {
 /**
  * One line describing a component's version.
  *
- * `dcstore`, `dcverify` and `dcgrep` reject `--version`, so their reading is
- * `not_exposed`. Rendering that as an empty string would read as "unknown, so
- * probably old"; it means the opposite — the binary ran, and there is simply
- * nothing to ask.
+ * Modern DevCouncil components report universal version and component identity
+ * on `--version` as a JSON payload (`reported`). Older legacy binaries reject
+ * `--version` and fallback to read-only handshakes, reporting `not_exposed`.
+ * Rendering that as an empty string would read as "unknown, so probably old";
+ * it means the opposite — the binary ran, and there is simply nothing to ask.
  */
 export function versionText(version: VersionReading): string {
   switch (version.kind) {

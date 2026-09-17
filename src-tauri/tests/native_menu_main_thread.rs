@@ -18,6 +18,7 @@
 //! Failures are reported by exiting non-zero after printing, because there is
 //! no harness to catch a panic and attribute it.
 
+use gitpulse_lib::desktop::actions::SECTION_MENUS;
 use gitpulse_lib::desktop::{
     install_menu, menu_state, recent_menu_entries, set_menu_state, set_recent_menu, DesktopState,
     MenuState, RECENT_MENU_LIMIT,
@@ -75,7 +76,15 @@ fn check_additions(app: &tauri::App<tauri::test::MockRuntime>, failures: &mut Ve
         })
         .collect();
     let ids = collect_items(submenus);
-    let expected = [
+    // The Help and zoom entries are listed, because they exist only here.
+    // The section entries are DERIVED from the catalog rather than repeated:
+    // this list was hand-written, and when `section:work:stack` was removed in
+    // "merge branch-chains into work view" the frontend registry, the Rust
+    // catalog and the TypeScript parity contract were all updated while this
+    // copy was not — leaving main red on a section that was deliberately
+    // deleted. A derived list cannot go stale that way; what it still proves
+    // is that every catalogued section reaches the built menu exactly once.
+    let mut expected: Vec<String> = [
         "shortcuts",
         "diagnostics",
         "documentation",
@@ -85,29 +94,30 @@ fn check_additions(app: &tauri::App<tauri::test::MockRuntime>, failures: &mut Ve
         "zoom-in",
         "zoom-out",
         "reset-zoom",
-        "section:work:overview",
-        "section:work:resolve",
-        "section:work:remote",
-        "section:work:stack",
-        "section:work:policy",
-        "section:work:tasks",
-        "section:code:explorer",
-        "section:code:blame",
-        "section:code:map",
-        "section:history:graph",
-        "section:history:diff",
-        "section:history:reflog",
-        "section:insights:pulse",
-        "section:insights:coverage",
-        "section:insights:health",
-        "section:insights:storage",
-    ];
+    ]
+    .iter()
+    .map(|id| (*id).to_string())
+    .collect();
+    expected.extend(
+        SECTION_MENUS
+            .iter()
+            .flat_map(|group| group.entries)
+            .map(|(id, _)| (*id).to_string()),
+    );
+    // A catalog that lost every section would make the check below vacuous.
+    assert!(
+        expected.len() > 9,
+        "the section catalog contributed nothing; this check would prove nothing"
+    );
     let missing: Vec<_> = expected
         .iter()
-        .filter(|id| ids.iter().filter(|found| found == id).count() != 1)
+        .filter(|id| ids.iter().filter(|found| *found == *id).count() != 1)
         .collect();
     check(
-        "all 25 additions exist once with accurate startup availability",
+        &format!(
+            "all {} additions exist once with accurate startup availability",
+            expected.len()
+        ),
         missing.is_empty(),
         &format!("missing or duplicated: {missing:?}"),
         failures,

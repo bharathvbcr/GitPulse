@@ -41,6 +41,10 @@ function fakeHost(startHidden = false) {
       hidden = value;
       for (const listener of [...listeners]) listener();
     },
+    /** Snapshot of the registered listeners, for post-disposal replay. */
+    capturedListeners() {
+      return [...listeners];
+    },
   };
 }
 
@@ -101,6 +105,49 @@ describe("createVisibleInterval", () => {
     expect(env.listenerCount).toBe(0);
   });
 
+  it("creates no timer when a tick disposes the interval from inside itself", () => {
+    // The rejoin path runs `tick()` and then `start()`. A tick that disposes
+    // its own interval — a poll loop deciding it is finished does exactly
+    // that — used to get a fresh timer created immediately afterwards,
+    // holding a handle the disposer had already forgotten. Nothing could stop
+    // it after that, so it fired until the page went away.
+    const env = fakeHost();
+    const box: { dispose: (() => void) | null } = { dispose: null };
+    let ticks = 0;
+    box.dispose = createVisibleInterval(
+      () => {
+        ticks += 1;
+        box.dispose?.();
+      },
+      1000,
+      env.host,
+    );
+    expect(env.live).toBe(1);
+
+    // Hide and rejoin: the rejoin ticks, the tick disposes.
+    env.setHidden(true);
+    env.setHidden(false);
+    expect(ticks).toBe(1);
+    expect(env.live, "a disposed interval must not be resurrected by its own tick").toBe(0);
+    expect(env.listenerCount).toBe(0);
+
+    // And nothing may bring it back afterwards.
+    env.setHidden(false);
+    expect(env.live).toBe(0);
+  });
+
+  it("ignores a visibility event that arrives after disposal", () => {
+    // A listener removal that races a dispatched event is ordinary in a real
+    // DOM; the callback must not restart a timer the owner has released.
+    const env = fakeHost();
+    const dispose = createVisibleInterval(() => {}, 1000, env.host);
+    const listeners = env.capturedListeners();
+    dispose();
+    expect(env.live).toBe(0);
+    for (const listener of listeners) listener();
+    expect(env.live, "a post-disposal event must not start a timer").toBe(0);
+  });
+
   it("is a no-op with no host rather than throwing", () => {
     // Components call this unconditionally; a DOM-free context must not crash.
     expect(() => createVisibleInterval(() => {}, 1000, null)()).not.toThrow();
@@ -115,6 +162,9 @@ describe("every recurring UI timer is visibility-aware", () => {
     ["components/files/LivePulseDashboard.svelte"],
     ["components/ManviOpsPanel.svelte"],
     ["components/ManviHarnessPane.svelte"],
+    // The delivery poll's timeline ticker fires every second while a run is in
+    // flight, and its `live` state outlives the window being hidden.
+    ["components/GitHubPanel.svelte"],
   ])("%s schedules through createVisibleInterval", (path) => {
     const source = read(path);
     expect(source).toContain("createVisibleInterval");

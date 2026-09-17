@@ -89,6 +89,47 @@ repository's shared task board.
 - **The Queue's Counts Are The Way Into It**: `All / Awaiting review / Failing / Drafts` chips carry their own counts and filter the list, plus a search across number, title and both refs. Chip and list share one predicate. "Failing" means a red verdict only — a run still going and a repository whose checks never start are neither passing nor failing, and neither is folded into the other.
 - **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list, each carrying when it was last updated, and searchable by number, title, author or label.
 - **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
+- **Runs Update While You Watch Them**: While any run is queued or executing,
+  the run list refreshes itself; once everything has settled it stops, so a
+  repository nobody is deploying runs no timer at all. The poll asks only for
+  the run listing — one `gh` call, not the four the full context costs — skips
+  a tick while the previous call is still out, backs off on failure, and is
+  bounded by both a wall-clock ceiling and a poll count so a run waiting on a
+  runner that never arrives cannot keep a subprocess loop alive. It pauses
+  while the window is hidden. **A poll that gives up says so on screen**, with
+  the reason: live updates having silently stopped while stale rows keep
+  rendering as current is the one outcome worse than not being live at all.
+  Refresh revives a paused session; nothing else does.
+- **A Run That Goes Red Is Announced**: A run observed executing and then
+  observed failed raises a dismissible notice. Only that transition — a run
+  already finished when the panel opened is history, not news, so opening the
+  panel never replays the window's failures as though they had just happened,
+  and a run dropping off the display cap is never reported as an outcome.
+- **Run Duration And Outcome, Drawn**: A timeline of every run the branch
+  filter admitted, whether or not the collapsed list below draws its card, and
+  nothing at all when the filter admitted none — so a filter matching no run
+  gets the filter's own empty state, never a timeline reporting that the
+  repository has recorded none. One bar per run, scaled to the slowest in the
+  sample, coloured by verdict, with
+  the pass rate stated as a fraction (`60% (3/5)`), the median duration with
+  its sample size, and the count of rows that carry no verdict. Measured from
+  when a run *started*, never from when it was created, so queue time is not
+  reported as execution time. An unknown duration is a dash and no bar, never
+  `0s`; an end before its start is clock skew and measures nothing rather than
+  zero; a completed run whose conclusion `gh` did not report is "no conclusion
+  reported", never a pass. The same component draws App Hosting rollouts, so a
+  deploy and the run that produced it are read the same way.
+- **Deploys Refresh Too, But Only Once You Have Asked**: A rollout listing can
+  enable the App Hosting API on a project where it is off, which is why it is
+  click-only. The enabling happens when the API is *off*, though — so a
+  listing that has already answered is proof it is on, and refreshing that
+  exact target enables nothing. The first listing for a project and backend is
+  therefore still a click, and only an already-answered target refreshes
+  itself while a rollout is still rolling out. The authorisation is keyed to
+  project *and* backend together, because a backend id is not unique across
+  projects; it is withdrawn when either changes, and a listing that could not
+  run never grants it. Same bounded budget, backoff and visible pause as the
+  run poll.
 - **Fetched, Not Merely Present**: The header stamps how long ago the context on screen was fetched, and a listing hydrated from cache on a repository switch loses the stamp rather than inheriting a fetch that never happened.
 - **Firebase Deploys, Joined To Commits**: For a repository carrying `.firebaserc`
   or `firebase.json`, the CI rail lists the project's App Hosting backends and,

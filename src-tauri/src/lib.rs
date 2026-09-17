@@ -243,6 +243,7 @@ pub fn run() {
             cmd_submodule_change,
             cmd_discard_changes,
             cmd_github_context,
+            cmd_github_runs,
             cmd_github_dependabot_alerts,
             cmd_github_code_scanning_alerts,
             cmd_github_create_issue,

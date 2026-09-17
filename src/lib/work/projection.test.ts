@@ -108,6 +108,10 @@ function run(id: number, head_branch: string): WorkflowRunInfo {
     head_branch,
     url: `https://example.test/run/${id}`,
     created_at: "",
+    started_at: "",
+    updated_at: "",
+    head_sha: "",
+    event: "",
   };
 }
 

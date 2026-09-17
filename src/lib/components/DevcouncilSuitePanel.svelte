@@ -11,9 +11,9 @@
    *
    * Two things it must not blur:
    *
-   * * **Installed is not the same as versioned.** Three of these components
-   *   reject `--version`, so they render as present with the version line
-   *   explicitly marked unavailable rather than blank.
+   * * **Installed is not the same as versioned.** Modern components report
+   *   their universal version number and component ID via JSON on `--version`,
+   *   while legacy copies fallback to read-only handshakes without a version flag.
    * * **Unchecked is not the same as healthy.** `devmap doctor` needs a
    *   trusted repository to run in; without one the warnings section says so
    *   instead of showing an empty, reassuring list.

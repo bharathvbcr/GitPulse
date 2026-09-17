@@ -57,6 +57,21 @@ pub struct WorkflowRunInfo {
     pub head_branch: String,
     pub url: String,
     pub created_at: String,
+    /// When the run actually began, which is not when it was created: a run
+    /// can sit queued for minutes. Empty while it has not started, and that
+    /// emptiness is the only thing separating "queued" from "started at the
+    /// epoch" — a duration must never be computed from `created_at`.
+    pub started_at: String,
+    /// Last time the run changed. For a completed run this is when it
+    /// settled, so `updated_at - started_at` is its duration; for a running
+    /// one it is merely the last heartbeat and bounds nothing.
+    pub updated_at: String,
+    /// Commit the run was dispatched against, empty when gh did not report
+    /// one. The join key to the local graph, same role as a rollout's commit.
+    pub head_sha: String,
+    /// What triggered the run (`push`, `pull_request`, `workflow_dispatch`,
+    /// …). Empty when unreported; never defaulted to a guess.
+    pub event: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +135,87 @@ pub struct GitHubContext {
     /// shape change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// Just the workflow-run listing, for the live poll.
+///
+/// [`GitHubContext`] answers the same question, but it costs four `gh` round
+/// trips (issues, releases, pull requests, runs) at up to 45s each. A poll
+/// that runs every few seconds while a run is in flight must not pay for the
+/// three sections it is not watching, so this is the narrow read — one `gh`
+/// call, reusing [`list_workflow_runs`] rather than reimplementing it.
+///
+/// `checked` is the load-bearing field, for the same reason it is on
+/// `FirebaseRolloutsReport`: without it, a poll that could not run is
+/// indistinguishable from a repository with no runs, and the panel would
+/// quietly replace real rows with a clean-looking empty state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubRunsReport {
+    pub available: bool,
+    /// True only when the listing actually ran and parsed. False means every
+    /// other field is unknown rather than empty.
+    pub checked: bool,
+    pub cli_present: bool,
+    pub owner: String,
+    pub repo: String,
+    pub runs: Vec<WorkflowRunInfo>,
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
+impl GitHubRunsReport {
+    /// A report that answers nothing, and says so.
+    fn unavailable(cli_present: bool, remote: Option<&GitHubRepoRef>, error: String) -> Self {
+        GitHubRunsReport {
+            available: false,
+            checked: false,
+            cli_present,
+            owner: remote.map(|r| r.owner.clone()).unwrap_or_default(),
+            repo: remote.map(|r| r.name.clone()).unwrap_or_default(),
+            runs: Vec::new(),
+            truncated: false,
+            error: Some(error),
+        }
+    }
+}
+
+/// The workflow-run listing on its own, for the live poll.
+///
+/// Every failure path returns `checked: false` with a reason. A poll that
+/// cannot reach `gh` must never look like a poll that found nothing.
+pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
+    let cli_present = gh_cli_present();
+    let remote = match discover_github_remote(repo_path) {
+        Ok(Some(remote)) => remote,
+        Ok(None) => {
+            return GitHubRunsReport::unavailable(
+                cli_present,
+                None,
+                "No GitHub remote configured".to_string(),
+            );
+        }
+        Err(error) => return GitHubRunsReport::unavailable(cli_present, None, error),
+    };
+    if !cli_present {
+        return GitHubRunsReport::unavailable(
+            false,
+            Some(&remote),
+            "GitHub CLI (`gh`) is not installed or not on PATH".to_string(),
+        );
+    }
+    match list_workflow_runs(&remote) {
+        Ok((runs, truncated)) => GitHubRunsReport {
+            available: true,
+            checked: true,
+            cli_present: true,
+            owner: remote.owner.clone(),
+            repo: remote.name.clone(),
+            runs,
+            truncated,
+            error: None,
+        },
+        Err(error) => GitHubRunsReport::unavailable(true, Some(&remote), error),
+    }
 }
 
 /// One open Dependabot alert, shaped for the Health view.
@@ -702,6 +798,14 @@ struct GhWorkflowRun {
     created_at: Option<String>,
     #[serde(rename = "displayTitle")]
     display_title: Option<String>,
+    #[serde(rename = "startedAt")]
+    started_at: Option<String>,
+    #[serde(rename = "updatedAt")]
+    updated_at: Option<String>,
+    #[serde(rename = "headSha")]
+    head_sha: Option<String>,
+    #[serde(default)]
+    event: Option<String>,
 }
 
 /// Display cap for the recent workflow-run list; one extra row is fetched so
@@ -718,7 +822,7 @@ fn list_workflow_runs(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowRunInfo>, b
             "--limit",
             &fetch_limit,
             "--json",
-            "databaseId,name,status,conclusion,headBranch,url,createdAt,displayTitle",
+            "databaseId,name,status,conclusion,headBranch,url,createdAt,displayTitle,startedAt,updatedAt,headSha,event",
         ],
         Duration::from_secs(45),
         None,
@@ -773,6 +877,10 @@ fn parse_workflow_runs(
             head_branch: run.head_branch.unwrap_or_default(),
             url: run.url,
             created_at: run.created_at.unwrap_or_default(),
+            started_at: run.started_at.unwrap_or_default(),
+            updated_at: run.updated_at.unwrap_or_default(),
+            head_sha: run.head_sha.unwrap_or_default(),
+            event: run.event.unwrap_or_default(),
         })
         .collect();
     Ok((runs, truncated))
@@ -1852,6 +1960,113 @@ mod tests {
         let (runs, truncated) = parse_workflow_runs(&text, 2).unwrap();
         assert!(truncated);
         assert_eq!(runs.len(), 2);
+    }
+
+    /// The four fields the delivery timeline is built on. Asking gh for them
+    /// and forgetting to carry them through is the silent half of the wire
+    /// contract: nothing errors, the struct fields just stay empty and every
+    /// duration renders as unknown.
+    #[test]
+    fn run_parsing_carries_the_timing_and_commit_fields() {
+        let (runs, _) = parse_workflow_runs(
+            br#"[{"databaseId":42,"name":"ci","status":"completed",
+                  "conclusion":"success","headBranch":"main","url":"https://x/42",
+                  "createdAt":"2026-09-17T07:50:00Z","displayTitle":"build",
+                  "startedAt":"2026-09-17T08:00:00Z",
+                  "updatedAt":"2026-09-17T08:05:00Z",
+                  "headSha":"0123456789abcdef0123456789abcdef01234567",
+                  "event":"push"}]"#,
+            RUN_DISPLAY_LIMIT,
+        )
+        .unwrap();
+        let run = runs.first().expect("one run");
+        assert_eq!(run.started_at, "2026-09-17T08:00:00Z");
+        assert_eq!(run.updated_at, "2026-09-17T08:05:00Z");
+        assert_eq!(run.head_sha, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(run.event, "push");
+        // `created_at` must stay separate: a run that waited ten minutes for a
+        // runner would otherwise report its queue time as execution time.
+        assert_eq!(run.created_at, "2026-09-17T07:50:00Z");
+        assert_ne!(run.started_at, run.created_at);
+    }
+
+    /// A queued run reports no start time at all. The empty string has to
+    /// survive to the frontend, which reads it as "unknown duration" — a zero
+    /// would render as an instant success.
+    #[test]
+    fn run_parsing_leaves_a_missing_start_empty_rather_than_inventing_one() {
+        let (runs, _) = parse_workflow_runs(
+            br#"[{"databaseId":7,"status":"queued","conclusion":null,
+                  "startedAt":null,"updatedAt":null,"headSha":null,"event":null}]"#,
+            RUN_DISPLAY_LIMIT,
+        )
+        .unwrap();
+        let run = runs.first().expect("one run");
+        assert_eq!(run.started_at, "");
+        assert_eq!(run.updated_at, "");
+        assert_eq!(run.head_sha, "");
+        assert_eq!(run.event, "");
+        assert_eq!(run.conclusion, "");
+        assert_eq!(run.status, "queued");
+    }
+
+    /// Every failure path of the poll's narrow read must be `checked: false`.
+    ///
+    /// `checked` is the whole reason this report exists as its own type: an
+    /// empty `runs` on a failed poll would replace the rows already on screen
+    /// with a confident "no runs", which is a claim the poll cannot make.
+    #[test]
+    fn a_runs_report_that_could_not_run_is_never_reported_as_checked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        // Not a repository at all, so the remote discovery fails.
+        let report = load_workflow_runs_report(path);
+        assert!(
+            !report.checked,
+            "an unreadable repository is not a checked poll"
+        );
+        assert!(!report.available);
+        assert!(report.runs.is_empty());
+        assert!(
+            report.error.is_some(),
+            "a report that answers nothing must say why"
+        );
+        assert!(!report.truncated);
+    }
+
+    /// The poll inherits the repository-trust gate, and reports the refusal.
+    ///
+    /// This is the property worth pinning about a *new* IPC surface: it runs
+    /// `gh` against a path the caller supplies, so it must be subject to the
+    /// same trust decision as every other repository read. It is, because it
+    /// resolves its remote through [`discover_github_remote`] rather than
+    /// shelling out on its own — and a refusal arrives as `checked: false`
+    /// with the reason, never as a repository that happens to have no runs.
+    #[test]
+    fn a_runs_report_for_an_untrusted_repository_is_refused_with_its_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !ok {
+            // No usable git on this machine: skip rather than assert a
+            // conclusion this run did not actually reach.
+            return;
+        }
+        let report = load_workflow_runs_report(dir.path().to_str().unwrap());
+        assert!(!report.checked, "a refused poll is not a checked one");
+        assert!(!report.available);
+        assert!(report.runs.is_empty());
+        let reason = report.error.expect("a refusal must carry its reason");
+        assert!(
+            reason.contains("REPOSITORY_TRUST_REQUIRED"),
+            "an untrusted repository must be refused by the trust gate, not \
+             reported as having no runs; got: {reason}"
+        );
     }
 
     #[test]

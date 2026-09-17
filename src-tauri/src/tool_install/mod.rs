@@ -555,6 +555,14 @@ fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
 /// Internal whitespace is collapsed: these blocks are column-aligned, and the
 /// padding is meaningless once the line is out of its block.
 pub(crate) fn version_line(text: &str, needle: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
+            let trimmed = version.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.chars().take(120).collect());
+            }
+        }
+    }
     let name = needle.to_ascii_lowercase();
     let collapse = |line: &str| -> String { line.split_whitespace().collect::<Vec<_>>().join(" ") };
     let chosen = text

@@ -3,6 +3,8 @@
  * mapping from Firebase's states to what a reader sees — which decides whether
  * a commit is shown as live — is unit-testable.
  */
+import type { MonitorPhase } from "../delivery/phase";
+import { displayText, type TimelineRow } from "../delivery/timeline";
 import type { RolloutInfo, RolloutState } from "./types";
 
 /**
@@ -125,4 +127,54 @@ export function commitShaProblem(value: string): string | null {
     return `A full 40-character SHA is required; this is ${trimmed.length}. An abbreviation is an ambiguous target for something that reaches production.`;
   }
   return null;
+}
+
+/**
+ * This rollout's phase in the shared delivery vocabulary.
+ *
+ * Derived from the predicates above rather than from a second set of state
+ * lists, so there is exactly one place that decides what `succeeded` means. A
+ * parallel mapping here would be free to drift from `isLive`, and the drift
+ * would show up as a deploy that the timeline calls green and the badge beside
+ * it calls unknown.
+ */
+export function rolloutPhase(state: RolloutState): MonitorPhase {
+  if (isLive(state)) return "settled_ok";
+  if (isFailed(state)) return "settled_bad";
+  if (isInFlight(state)) return "in_flight";
+  // `unspecified`, `skipped` and `unrecognised`: settled, with no verdict.
+  return "unknown";
+}
+
+/**
+ * A rollout as a timeline row.
+ *
+ * `create_time` is the start. Unlike a workflow run, App Hosting reports no
+ * separate execution start, so queue time is inside the measured span — noted
+ * here because the two sources' bars are drawn on the same scale, and a
+ * rollout's bar therefore includes a wait that a run's bar excludes.
+ */
+export function rolloutTimelineRow(rollout: RolloutInfo): TimelineRow {
+  return {
+    id: rollout.id,
+    label: displayText(rollout.id),
+    // Subject only, then bounded. The subject is the meaningful line; joining
+    // a whole commit body into one row would bury it.
+    sublabel: displayText((rollout.commit?.message ?? "").split("\n")[0]),
+    phase: rolloutPhase(rollout.state),
+    stateLabel: rolloutStateLabel(rollout.state),
+    startedAt: rollout.create_time ?? "",
+    endedAt: rollout.update_time ?? "",
+    commitSha: rollout.commit?.hash ?? "",
+    branch: rollout.commit?.branch ?? "",
+    // App Hosting does not report a trigger; an empty string is the honest
+    // answer and renders as no chip rather than as a guessed one.
+    trigger: "",
+    url: "",
+  };
+}
+
+/** Every rollout as a timeline row, newest first as the API returns them. */
+export function rolloutTimelineRows(rollouts: readonly RolloutInfo[]): TimelineRow[] {
+  return rollouts.map(rolloutTimelineRow);
 }

@@ -448,6 +448,60 @@
       check("a single alias is preselected, because it is not a choice",
         () => selects()[0].value === "only");
 
+
+      // --- the live deploy poll stays inside the click-only rule ----------
+      // The rule this must not break: listing rollouts can ENABLE the App
+      // Hosting API on a project where it is off. So the first listing for a
+      // target has to be a click, and only a target that already answered may
+      // be refreshed. These checks are here rather than in a unit test because
+      // what matters is the *call count against the mocked CLI*, which only a
+      // mounted component produces.
+      const rolloutCalls = () => invoked.filter(c => c.cmd === "cmd_firebase_rollouts").length;
+
+      statusReply = status();
+      rolloutsReply = { policy: null, output: listing() };
+      await remount();
+      // `invoked` accumulates across every scenario above, so every assertion
+      // here is a DELTA from this baseline rather than an absolute count.
+      const baseline = rolloutCalls();
+      await selectProject("default");
+      await runBackends();
+      await setSelect(selects()[1], "web");
+      const afterSelect = rolloutCalls();
+      // Selecting a project and backend is not a listing. Nothing may have run.
+      check("selecting a target does not list rollouts by itself",
+        () => afterSelect === baseline);
+
+      // Even with a rollout in flight, an unlisted target must stay untouched:
+      // the poll is authorised by a successful listing, not by the selection.
+      rolloutsReply = { policy: null, output: listing({ rollouts: [rollout("progressing")] }) };
+      await settle();
+      await settle();
+      check("an in-flight deploy cannot authorise a listing nobody asked for",
+        () => rolloutCalls() === afterSelect);
+
+      // Now the user clicks. That listing answers, which proves the API is on.
+      await runListing();
+      const afterClick = rolloutCalls();
+      check("the click itself lists exactly once", () => afterClick === afterSelect + 1);
+      check("and the in-flight deploy is on screen as in flight",
+        () => flat().includes("Rolling out"));
+
+      // A listing that could NOT run proves nothing, so it must not authorise.
+      rolloutsReply = { policy: null, output: listing({ checked: false, available: false, rollouts: [], error: "CLI refused" }) };
+      await remount();
+      await selectProject("default");
+      await runBackends();
+      await setSelect(selects()[1], "web");
+      await runListing();
+      const afterUnchecked = rolloutCalls();
+      await settle();
+      await settle();
+      check("an unchecked listing does not authorise a refresh",
+        () => rolloutCalls() === afterUnchecked);
+      check("and it says it could not read rather than showing an empty deploy history",
+        () => !flat().includes("has never deployed"));
+
       check("no unconfigured command was invoked", () => unexpected.length === 0);
       check("no runtime errors", () => errors.length === 0);
       document.getElementById("result").textContent = `${results.length}/${results.length} passed`;

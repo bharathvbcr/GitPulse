@@ -1,0 +1,234 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>GitPulse delivery timeline checks</title></head>
+<body><div id="app"></div><pre id="result"></pre>
+<script type="module">
+  /**
+   * The delivery timeline, rendered.
+   *
+   * Unit tests already pin the arithmetic and the vocabulary. What only a real
+   * page can show is that each of the distinct facts behind an empty-looking
+   * timeline reaches a reader as a different sentence:
+   *
+   *   - a listing that could not run  -> a failure, with its reason
+   *   - a listing that ran and found nothing -> a measured absence
+   *   - a sample that is the newest slice of a longer history -> labelled
+   *   - a rate with nothing judgeable in it -> not "0%"
+   *   - a live poll that gave up -> "paused", with why
+   *
+   * These are exactly the states a component test cannot distinguish, because
+   * all five render a card with no bars in it.
+   */
+  import "../src/app.css";
+  import { mount, unmount, tick } from "svelte";
+  import DeliveryTimeline from "../src/lib/components/DeliveryTimeline.svelte";
+  import { runTimelineRows } from "../src/lib/github/runLifecycle.ts";
+  import { createChecks } from "./checks.ts";
+  const params = new URLSearchParams(location.search);
+  const { results, check, stopped } = createChecks();
+  const errors = [];
+  addEventListener("error", e => errors.push(e.message));
+  addEventListener("unhandledrejection", e => errors.push(String(e.reason)));
+
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const T0 = Date.parse("2026-09-17T08:00:00Z");
+  const iso = ms => new Date(ms).toISOString();
+
+  const run = (over = {}) => ({
+    id: 1, name: "CI", title: "Fix the thing",
+    status: "completed", conclusion: "success",
+    head_branch: "main", url: "https://example.invalid/run/1",
+    created_at: iso(T0 - 600_000),
+    started_at: iso(T0), updated_at: iso(T0 + 60_000),
+    head_sha: SHA, event: "push", ...over,
+  });
+
+  // No Tauri seam is needed: this component takes rows as props. The only
+  // reason to stub it at all is the external-link click path.
+  const opened = [];
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => { opened.push({ cmd, args }); return null; },
+    transformCallback: cb => cb,
+  };
+
+  let app;
+  const target = () => document.getElementById("app");
+  const settle = async () => { await tick(); await new Promise(r => setTimeout(r, 30)); await tick(); };
+  const text = () => target().textContent ?? "";
+  /** Whitespace collapsed: prose wraps across source lines. */
+  const flat = () => text().replace(/\s+/g, " ");
+  const remount = async (props) => {
+    if (app) { await unmount(app); app = null; }
+    target().innerHTML = "";
+    app = mount(DeliveryTimeline, {
+      target: target(),
+      props: { title: "Run duration and outcome", now: T0 + 120_000, sampleNoun: "runs", ...props },
+    });
+    await settle();
+  };
+  /**
+   * Every drawn DURATION bar.
+   *
+   * Selected by data attribute, not by `[style*="width:"]` — the outcome strip
+   * above the rows sets `min-width`, which contains that substring, so a style
+   * selector silently counts the strip and makes "no bar" unprovable.
+   */
+  const bars = () => [...target().querySelectorAll("[data-delivery-bar]")];
+  /** Each row's state cell, so a verdict is read from the row, not the card. */
+  const stateCells = () => [...target().querySelectorAll("[data-delivery-state]")];
+  const rowStates = () => stateCells().map(cell => cell.textContent.trim());
+  const rowPhases = () => stateCells().map(cell => cell.dataset.deliveryState);
+
+  main();
+  async function main() {
+    try {
+      // --- a listing that could not run is a failure, not an absence -------
+      await remount({ rows: [], checked: false, error: "gh: could not resolve host" });
+      check("an unchecked listing says it could not read, not that there is nothing",
+        () => flat().includes("Could not read runs — this is not an absence of runs"));
+      check("and it carries the reason it failed",
+        () => text().includes("could not resolve host"));
+      check("an unchecked listing draws no bars",
+        () => bars().length === 0);
+
+      // --- a listing that ran and found nothing is a measured absence ------
+      await remount({ rows: [], checked: true });
+      check("a checked empty listing reads as a real absence",
+        () => flat().includes("No runs recorded for this repository"));
+      check("and does not claim a failure",
+        () => !flat().includes("Could not read"));
+
+      // --- a rate needs its denominator ------------------------------------
+      // Distinct durations, so the figure proves a real median rather than
+      // just the presence of a number: 10s, 20s, 30s -> 20s.
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, conclusion: "success", updated_at: iso(T0 + 10_000) }),
+        run({ id: 2, conclusion: "success", updated_at: iso(T0 + 30_000) }),
+        run({ id: 3, conclusion: "failure", updated_at: iso(T0 + 20_000) }),
+      ]), checked: true });
+      check("a pass rate is shown with the sample behind it",
+        () => flat().includes("66.7%") && flat().includes("(2/3)"));
+      check("and the median is the real middle value, with its sample size",
+        () => flat().includes("Median: 20.0s (n=3)"));
+      check("a failed run's duration counts toward the median too",
+        () => flat().includes("20.0s"));
+
+      // --- nothing judgeable must not read as 0% ---------------------------
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, status: "in_progress", conclusion: "", updated_at: "" }),
+        run({ id: 2, status: "completed", conclusion: "" }),
+      ]), checked: true });
+      check("a sample with no verdict in it says so rather than showing 0%",
+        () => flat().includes("no judged runs") && !flat().includes("0%"));
+      check("and the unjudged rows are counted out loud",
+        () => flat().includes("Unjudged: 2"));
+      // Read the row's own verdict rather than the card text: the rate label
+      // above it is the word "Passed", so a whole-card match always hits.
+      check("a completed run with no conclusion is not called a pass",
+        () => rowStates().includes("Completed (no conclusion reported)"));
+      check("and carries no verdict phase at all",
+        () => rowPhases().includes("unknown") && !rowPhases().includes("settled_ok"));
+
+      // --- a capped sample is labelled --------------------------------------
+      await remount({ rows: runTimelineRows([run()]), checked: true, truncated: true });
+      check("a capped sample says more exist",
+        () => flat().includes("capped — more exist"));
+      await remount({ rows: runTimelineRows([run()]), checked: true, truncated: false });
+      check("and an uncapped one does not",
+        () => !flat().includes("capped"));
+
+      // --- an unknown duration is a dash and no bar -------------------------
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, started_at: "", status: "queued", conclusion: "", updated_at: "" }),
+      ]), checked: true });
+      check("a run that never started shows a dash, not a zero",
+        () => text().includes("—") && !flat().includes("0ms"));
+      check("and draws no bar, which a zero-width one would be mistaken for",
+        () => bars().length === 0);
+
+      // --- clock skew must not publish a number -----------------------------
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, started_at: iso(T0), updated_at: iso(T0 - 60_000) }),
+      ]), checked: true });
+      check("an end before its start measures nothing rather than 0s",
+        () => text().includes("—") && !flat().includes("0.0s"));
+
+      // --- a live poll that gave up must say so -----------------------------
+      await remount({
+        rows: runTimelineRows([run({ id: 1, status: "in_progress", conclusion: "", updated_at: "" })]),
+        checked: true,
+        live: { kind: "paused", reason: "stopped after 5 consecutive failures" },
+      });
+      check("a paused poll is visible on screen, not silent",
+        () => flat().includes("Live updates paused"));
+      check("and names why it stopped",
+        () => flat().includes("stopped after 5 consecutive failures"));
+      // The rows came from a listing that DID run; only the refresh stopped.
+      // Hiding them behind "could not read" would be the opposite dishonesty
+      // from the one `checked` exists to prevent.
+      check("a paused poll still shows the rows it already has",
+        () => rowStates().length === 1 && !flat().includes("Could not read"));
+      check("and still states the sample it is showing",
+        () => flat().includes("Sample: last 1"));
+
+      await remount({
+        rows: runTimelineRows([run({ id: 1, status: "in_progress", conclusion: "", updated_at: "" })]),
+        checked: true,
+        live: { kind: "live", reason: "watching work in flight" },
+      });
+      check("a live poll is marked live", () => flat().includes("Live"));
+      check("and a running row is not given a verdict",
+        () => flat().includes("Running"));
+
+      // --- an in-flight bar is drawn against the clock ----------------------
+      check("a running row has a bar, because its elapsed time is known",
+        () => bars().length > 0);
+
+      // --- bars stay inside their track -------------------------------------
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, updated_at: iso(T0 + 1_000) }),
+        run({ id: 2, updated_at: iso(T0 + 3_600_000) }),
+      ]), checked: true });
+      check("no bar exceeds its track", () => bars().every(bar => {
+        const pct = Number.parseFloat(bar.style.width);
+        return Number.isFinite(pct) && pct >= 0 && pct <= 100;
+      }));
+      check("and a short run still draws something visible", () => bars().some(bar => {
+        const pct = Number.parseFloat(bar.style.width);
+        return pct > 0 && pct < 50;
+      }));
+
+      // --- a hostile label must not break the row -------------------------
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, title: "line one\nline two", name: "CI" }),
+        run({ id: 2, title: "x".repeat(5_000), name: "CI" }),
+      ]), checked: true });
+      check("a multi-line title is flattened before it reaches a row",
+        () => !text().includes("line one\nline two"));
+      check("and an enormous title is bounded",
+        () => !text().includes("x".repeat(400)));
+      check("the card still lays out in one row per run",
+        () => target().scrollWidth <= target().clientWidth + 2);
+
+      // --- a duplicated id must not take the pane down ---------------------
+      // Svelte 5 throws `each_key_duplicate` on a repeated explicit key, and
+      // an exception here blanks the whole card rather than one row. Ids from
+      // both sources are unique, so this is defence against the wild, which is
+      // exactly what `keyedList` exists for.
+      await remount({ rows: runTimelineRows([
+        run({ id: 1, title: "first" }),
+        run({ id: 1, title: "same id again" }),
+      ]), checked: true });
+      check("a duplicated id renders both rows instead of throwing",
+        () => rowStates().length === 2);
+      check("and the card is still on screen",
+        () => target().querySelector('[data-panel=\"delivery\"]') !== null);
+
+      check("no runtime errors", () => errors.length === 0);
+      document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
+    } catch (error) {
+      document.getElementById("result").textContent = stopped(error);
+    }
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+    if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+  }
+</script></body></html>

@@ -81,3 +81,78 @@ export function ciStepClass(status: string): string {
       return "text-textMuted";
   }
 }
+
+/* --- CI rail previews ------------------------------------------------------
+   The rail is one column, and the deploy section is the last thing in it. Every
+   workflow, run and release row pushes Firebase App Hosting further down, and
+   on a repository with a normal amount of CI history it ended up below a fold
+   nobody scrolls to — a section that loads fine, unreachable in practice.
+
+   So the long listings render a preview and expand on request. The counts are
+   per list because the rows are not the same size, but the mechanics are
+   shared: a copy per section is how two lists end up disagreeing about what
+   "show all" means. */
+
+/** Workflow rows rendered before the reader asks for the rest. */
+export const WORKFLOW_PREVIEW_COUNT = 5;
+
+/**
+ * Run rows rendered before the reader asks for the rest.
+ *
+ * The runs list is the longest thing in the rail — the backend fetches twenty
+ * and the section now carries a timeline and a failure banner above them.
+ */
+export const RUN_PREVIEW_COUNT = 5;
+
+/**
+ * Rendered-row count at which rows tighten.
+ *
+ * Measured against the rows actually on screen, not the fetched total: a
+ * collapsed preview is short enough to stay comfortable, and it is the
+ * expanded list — the one the reader deliberately opened — that has to stay
+ * navigable.
+ */
+export const COMPACT_ROW_THRESHOLD = 8;
+
+/**
+ * The rows to render for `expanded`.
+ *
+ * Never empty for a non-empty list, whatever the preview count: a default
+ * collapse that renders zero rows reads as "this repository has none of
+ * these", which is the one thing a collapsed section must never say.
+ *
+ * This slices what is already on screen. It is not a filter and must never be
+ * fed to anything that decides scope — the live poll watches every fetched
+ * run, and the timeline measures everything the branch filter admitted,
+ * whether or not a card was drawn for it.
+ */
+export function previewSlice<T>(
+  all: readonly T[],
+  expanded: boolean,
+  previewCount: number,
+): T[] {
+  if (expanded) return [...all];
+  return all.slice(0, Math.max(1, previewCount));
+}
+
+/** Whether the list is long enough to be worth collapsing at all. */
+export function overflowsPreview(total: number, previewCount: number): boolean {
+  return total > previewCount;
+}
+
+/**
+ * Label for the control that expands or collapses a previewed list.
+ *
+ * The expand label carries the count that was *fetched*, which is not
+ * necessarily everything the repository has: when the backend capped the
+ * listing, the section's own truncation notice says so separately. This
+ * control never speaks for the rows the backend withheld.
+ */
+export function expandLabel(total: number, expanded: boolean, noun: string): string {
+  return expanded ? "Show fewer" : `Show all ${total.toLocaleString()} ${noun}`;
+}
+
+/** Whether `shown` rows are enough to warrant the tighter row. */
+export function useCompactRows(shown: number): boolean {
+  return shown >= COMPACT_ROW_THRESHOLD;
+}

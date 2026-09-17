@@ -53,6 +53,18 @@ export function createVisibleInterval(
   if (!host) return () => {};
 
   let handle: unknown = null;
+  /**
+   * Set by the disposer, and checked by everything that could start a timer.
+   *
+   * The rejoin path below runs `tick()` and then `start()`. A tick is free to
+   * dispose this interval — a poll loop that decides it is finished does
+   * exactly that — and without this flag `start()` would then create a fresh
+   * timer *after* teardown, holding a handle the disposer has already
+   * forgotten. Nothing can stop it after that, so it fires until the page
+   * goes away: a leak that only appears when a tick disposes from inside
+   * itself, which is why it survived the original implementation.
+   */
+  let disposed = false;
 
   const stop = () => {
     if (handle === null) return;
@@ -61,11 +73,12 @@ export function createVisibleInterval(
   };
 
   const start = () => {
-    if (handle !== null) return;
+    if (disposed || handle !== null) return;
     handle = host.setInterval(tick, ms);
   };
 
   const onVisibilityChange = () => {
+    if (disposed) return;
     if (host.isHidden()) {
       stop();
       return;
@@ -80,6 +93,7 @@ export function createVisibleInterval(
   host.addEventListener("visibilitychange", onVisibilityChange);
 
   return () => {
+    disposed = true;
     stop();
     host.removeEventListener("visibilitychange", onVisibilityChange);
   };

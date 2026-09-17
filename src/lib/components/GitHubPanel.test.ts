@@ -102,12 +102,94 @@ describe("GitHubPanel guarded-action contracts", () => {
   });
 
   it("surfaces backend degradation instead of clean-looking empty states", () => {
-    expect(source).toContain("{#if ctx.runs_error}");
-    expect(source).toContain("{#if ctx.runs_truncated}");
+    // Runs now come from either the full context or the live poll, so the
+    // error and truncation states are surfaced through the derivations that
+    // cover both rather than off `ctx` directly — see the live-poll contracts
+    // below for what those derivations must consider.
+    expect(source).toContain("ctx.runs_error");
+    expect(source).toContain("{#if runsTruncated}");
     expect(source).toContain("{#if ctx.prs_truncated}");
     expect(source).toContain("{#if ctx.issues_error}");
     expect(source).toContain("{#if ctx.issues_truncated}");
     expect(source).toContain("{#if (ctx.warnings?.length ?? 0) > 0}");
+  });
+
+  describe("live run polling", () => {
+    it("polls the narrow runs command, not the four-call context", () => {
+      // `cmd_github_context` is four `gh` round trips at up to 45s each. On a
+      // repeating timer that is the difference between a live view and a
+      // subprocess storm against the user's rate limit.
+      expect(source).toContain("cmd_github_runs");
+      expect(source).toMatch(/poll:\s*\(\)\s*=>\s*pollRunsOnce\(repo\)/);
+    });
+
+    it("only lets a poll that actually ran supersede the context's runs", () => {
+      // `checked: false` means the poll could not run. Letting it through
+      // would replace real rows with a confident empty list.
+      expect(source).toContain("liveRuns?.checked === true");
+      expect(source).toContain("runsFromPoll ? (liveRuns?.runs ?? []) : (ctx?.workflow_runs ?? [])");
+    });
+
+    it("reports the listing the rows came from, not the last poll attempt", () => {
+      // A failed poll while the context's rows are still on screen is a stale
+      // live view, not an absent listing. Wiring the timeline's `checked` to
+      // the poll would hide rows that were genuinely fetched behind "could not
+      // read runs" — the opposite dishonesty from the one the flag prevents.
+      expect(source).toContain("const runsChecked = $derived(runsFromPoll ? true : !ctx?.runs_error)");
+      expect(source).toContain("checked={runsChecked}");
+      expect(source).toContain("error={runsError}");
+      // And the poll's own trouble stays visible through the badge instead.
+      expect(source).toContain("live={liveState}");
+    });
+
+    it("drives one decision, so the four run figures cannot disagree", () => {
+      // Rows, truncation, checked and error must all come from the same
+      // source. Four independent ternaries is how a panel ends up showing one
+      // source's rows beside another's truncation note.
+      for (const derived of ["const runs = ", "const runsTruncated = ", "const runsChecked = ", "const runsError = "]) {
+        const at = source.indexOf(derived);
+        expect(at, derived).toBeGreaterThan(0);
+        expect(source.slice(at, at + 220)).toContain("runsFromPoll");
+      }
+    });
+
+    it("drops a poll whose repository is no longer the open one", () => {
+      expect(source).toContain("if ($repoStore.currentPath !== repo) return false;");
+    });
+
+    it("clears the poll's snapshot when a newer full context arrives", () => {
+      // Otherwise Refresh shows fresh pull requests beside runs from whenever
+      // the poll last managed a call: one panel, two ages.
+      expect(source).toContain("liveRuns = null;");
+      expect(source).toContain("livePoll?.reset();");
+    });
+
+    it("gates the poll on every run, not on the branch-filtered view", () => {
+      // The branch filter is a view. Gating on it would stop watching a
+      // running job the moment someone filtered it off screen.
+      expect(source).toContain("anyInFlight(runTimelineRows(runs))");
+    });
+
+    it("creates the driver before the effect that feeds it", () => {
+      // Svelte runs effects in declaration order. If the sync effect ran
+      // first, its one call would hit a null driver and no-op — and on a
+      // repository whose runs arrive already in flight from the panel cache,
+      // `runs` never changes again, so nothing would ever start the poll.
+      const driverAt = source.indexOf("createLivePoll({");
+      const syncAt = source.indexOf("livePoll?.sync(moving)");
+      expect(driverAt).toBeGreaterThan(0);
+      expect(syncAt).toBeGreaterThan(0);
+      expect(driverAt, "the driver effect must be declared first").toBeLessThan(syncAt);
+    });
+
+    it("tears the driver down per repository", () => {
+      expect(source).toContain("driver.dispose()");
+    });
+
+    it("reports a run that went red while it was watching", () => {
+      expect(source).toContain("failuresSince(");
+      expect(source).toContain("Failed while watching:");
+    });
   });
 
   it("renders the issues the context already fetched", () => {
@@ -167,7 +249,12 @@ describe("GitHubPanel narrowing contracts", () => {
     expect(source).toContain("filterPullRequests(ctx?.pull_requests ?? [], prFacet, prQuery)");
     expect(source).toContain("{#each visiblePrs as pr (pr.number)}");
     expect(source).toContain("{#each visibleIssues as issue (issue.number)}");
-    expect(source).toContain("{#each visibleRuns as run (run.id)}");
+    // Runs render through a preview slice, which is itself derived from the
+    // narrowed list: the filter still decides scope, the preview only decides
+    // how many cards get drawn. Both links are pinned so the preview can never
+    // be re-pointed at the unfiltered runs.
+    expect(source).toContain("{#each previewedRuns as run (run.id)}");
+    expect(source).toContain("previewSlice(visibleRuns, runsExpanded, RUN_PREVIEW_COUNT)");
     expect(source).toContain("{#each visibleReleases as release");
   });
 
@@ -185,11 +272,34 @@ describe("GitHubPanel narrowing contracts", () => {
     expect(source).toContain("Show all releases");
   });
 
+  it("keeps the run timeline's gate and its measured list the same list", () => {
+    // The contract above, one layer up. `DeliveryTimeline` documents an empty
+    // `rows` with `checked: true` as a real, measured absence and says so:
+    // "No runs recorded for this repository." Gating it on the unfiltered
+    // `runs` while measuring the narrowed list made it claim nothing was
+    // recorded whenever the branch filter matched none of them — directly
+    // above the "No run on this branch" that counts the ones it had.
+    //
+    // Resolved through the declaration rather than matched as text, so the
+    // contract still binds if either name changes.
+    const measured = /const runRows = \$derived\(runTimelineRows\((\w+)\)\)/.exec(source)?.[1];
+    expect(
+      measured,
+      "runRows is no longer a plain runTimelineRows(<list>) — re-point this contract",
+    ).toBeTruthy();
+    const gate = /\{#if ([^}]*)\}\s*<div class="mb-2">\s*<DeliveryTimeline/.exec(source)?.[1];
+    expect(gate, "could not find the {#if} wrapping the run timeline").toBeTruthy();
+    expect(gate).toContain(`${measured}.length`);
+  });
+
   it("drops the previous repository's narrowing on a switch", () => {
     const effect = source.slice(source.indexOf("ctx = ctxCache.get("));
     expect(effect).toContain("clearPrFilter();");
     expect(effect).toContain('issueQuery = "";');
     expect(effect).toContain("runsThisBranch = false;");
+    // An expanded workflow list is narrowing in reverse: carried across a
+    // switch, it reopens fifty rows for a repository nobody asked to expand.
+    expect(effect).toContain("workflowsExpanded = false;");
   });
 
   it("stamps when the context was fetched, and clears the stamp on hydration", () => {
@@ -226,5 +336,111 @@ describe("GitHubPanel materials", () => {
     expect(source).toContain('role="tablist" aria-label="Pull request filter"');
     expect(source).toContain("class:gp-liquid-tabs={macos}");
     expect(source).toContain("gp-liquid-selection");
+  });
+});
+
+describe("GitHubPanel deploy-section reachability", () => {
+  it("puts the deploy section above the rail's two long listings", () => {
+    // The whole point: Firebase App Hosting used to sit last, under twenty
+    // run rows and ten release rows, so a section that loads fine was
+    // unreachable without scrolling past everything that does not need
+    // reading. Ordering is the fix that does not depend on list lengths.
+    const firebase = source.indexOf("<FirebasePanel repoPath=");
+    const workflows = source.indexOf(">Workflows</h3>");
+    const runs = source.indexOf(">Workflow runs</h3>");
+    const releases = source.indexOf(">Releases</h3>");
+    for (const [name, idx] of Object.entries({ firebase, workflows, runs, releases })) {
+      expect(idx, `${name} present`).toBeGreaterThan(-1);
+    }
+    expect(firebase).toBeGreaterThan(workflows);
+    expect(firebase).toBeLessThan(runs);
+    expect(firebase).toBeLessThan(releases);
+  });
+
+  it("mounts the deploy section exactly once", () => {
+    // Moving a block is how it ends up rendered in both places.
+    expect(source.match(/<FirebasePanel\b/g)).toHaveLength(1);
+  });
+
+  it("renders collapsed slices, not the whole fetched lists", () => {
+    expect(source).toContain("{#each visibleWfs as wf (wf.id)}");
+    expect(source).toContain("{#each previewedRuns as run (run.id)}");
+    expect(source).not.toContain("{#each workflows.workflows as wf (wf.id)}");
+    expect(source).not.toContain("{#each visibleRuns as run (run.id)}");
+    expect(source).toContain(
+      "previewSlice(workflows?.workflows ?? [], workflowsExpanded, WORKFLOW_PREVIEW_COUNT)",
+    );
+    expect(source).toContain(
+      "previewSlice(visibleRuns, runsExpanded, RUN_PREVIEW_COUNT)",
+    );
+  });
+
+  it("defaults releases to the latest one", () => {
+    expect(source).toContain("let latestReleaseOnly = $state(true);");
+    expect(source).not.toContain("let latestReleaseOnly = $state(false);");
+  });
+
+  it("offers two-way expanders whose state is exposed to assistive tech", () => {
+    expect(source).toContain(
+      "overflowsPreview(workflows.workflows.length, WORKFLOW_PREVIEW_COUNT)",
+    );
+    expect(source).toContain("overflowsPreview(visibleRuns.length, RUN_PREVIEW_COUNT)");
+    expect(source).toContain("aria-expanded={workflowsExpanded}");
+    expect(source).toContain("aria-expanded={runsExpanded}");
+    expect(source).toContain("workflowsExpanded = !workflowsExpanded");
+    expect(source).toContain("runsExpanded = !runsExpanded");
+    expect(source).toContain(
+      'expandLabel(workflows.workflows.length, workflowsExpanded, "workflows")',
+    );
+    expect(source).toContain('expandLabel(visibleRuns.length, runsExpanded, "runs")');
+  });
+
+  it("never lets a preview decide scope", () => {
+    // A preview slices what is drawn. Feeding it to the poll gate would stop
+    // watching a running job because its card was collapsed away, and feeding
+    // it to the timeline would make the visualization disagree with the
+    // branch filter it is supposed to be measuring.
+    expect(source).toContain("anyInFlight(runTimelineRows(runs))");
+    expect(source).toContain("runTimelineRows(visibleRuns)");
+    expect(source).not.toContain("runTimelineRows(previewedRuns)");
+    expect(source).not.toContain("anyInFlight(runTimelineRows(previewedRuns))");
+  });
+
+  it("keeps the backend truncation notices counting what was fetched", () => {
+    // Two different facts: rows a control hides, and rows the backend never
+    // sent. Sourcing a notice from the visible slice would let a collapsed
+    // list read as complete coverage of the full listing.
+    expect(source).toContain(
+      "Showing {workflows.workflows.length} workflows; more exist.",
+    );
+    expect(source).toContain("Showing the {runs.length} most recent runs");
+    expect(source).not.toContain("Showing {visibleWfs.length} workflows");
+    expect(source).not.toContain("Showing the {previewedRuns.length} most recent runs");
+  });
+
+  it("derives row density from the rows on screen", () => {
+    expect(source).toContain("useCompactRows(visibleWfs.length)");
+    expect(source).toContain("useCompactRows(previewedRuns.length)");
+    expect(source).toContain('compactWfRows ? "space-y-1" : "space-y-2"');
+    expect(source).toContain('compactRunRows ? "space-y-1" : "space-y-2"');
+  });
+
+  it("keeps the dispatch selector visible at both densities", () => {
+    // `path` is what tells two workflows sharing a `name:` apart and is the
+    // selector the dispatch call sends; compact tightens spacing, it does not
+    // drop the line.
+    const rowBlock = source.slice(
+      source.indexOf("{#each visibleWfs as wf (wf.id)}"),
+      source.indexOf("{#if overflowsPreview(workflows.workflows.length"),
+    );
+    expect(rowBlock).toContain("{wf.path}");
+    expect(rowBlock).not.toContain("{#if !compactWfRows}");
+  });
+
+  it("drops both expansions on a repository switch", () => {
+    const effect = source.slice(source.indexOf("ctx = ctxCache.get("));
+    expect(effect).toContain("workflowsExpanded = false;");
+    expect(effect).toContain("runsExpanded = false;");
+    expect(effect).toContain("latestReleaseOnly = true;");
   });
 });

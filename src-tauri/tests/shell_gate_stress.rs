@@ -22,8 +22,9 @@
 use gitpulse_lib::desktop::shell::resolve_worktree_path;
 use gitpulse_lib::engine::GitReader;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
@@ -56,6 +57,155 @@ fn scale() -> u64 {
         .unwrap_or(1)
 }
 
+/// Everything worth knowing about a fixture repository whose git command has
+/// just failed.
+///
+/// A commit loop that dies reporting only `fatal: could not parse HEAD` is a
+/// failure nobody can act on: it does not say whether the object store is
+/// genuinely corrupt, whether HEAD names a ref that is missing, or how far
+/// the loop had got. Read-only, and built only on the failure path.
+fn repo_state(dir: &Path) -> String {
+    let read = |args: &[&str]| -> String {
+        match Command::new("git").args(args).current_dir(dir).output() {
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !out.status.success() {
+                    text.push_str(&format!(
+                        "<failed: {}>",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                text
+            }
+            Err(err) => format!("<could not run: {err}>"),
+        }
+    };
+    let file = |path: &str| -> String {
+        fs::read_to_string(dir.join(path))
+            .map(|text| text.trim().to_string())
+            .unwrap_or_else(|err| format!("<unreadable: {err}>"))
+    };
+    let count = |path: &str| -> usize {
+        fs::read_dir(dir.join(path))
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    };
+    format!(
+        "\n    loop marker (f.txt) = {}\
+         \n    .git/HEAD           = {}\
+         \n    rev-parse HEAD      = {}\
+         \n    cat-file -t HEAD    = {}\
+         \n    fsck                = {}\
+         \n    object fanouts      = {}, pack dir entries = {}\
+         \n    index.lock held     = {}\
+         \n    .git/gc.log         = {}",
+        file("f.txt"),
+        file(".git/HEAD"),
+        read(&["rev-parse", "HEAD"]),
+        read(&["cat-file", "-t", "HEAD"]),
+        read(&["fsck", "--no-progress"]),
+        count(".git/objects"),
+        count(".git/objects/pack"),
+        dir.join(".git/index.lock").exists(),
+        file(".git/gc.log"),
+    )
+}
+
+/// Writes one commit per message in a single `git fast-import` stream and
+/// returns their object ids, oldest first.
+///
+/// The obvious way to build a fixture with a few hundred commits is a loop
+/// around `git commit`, which is what these tests used to do — and what made
+/// them flaky. Several hundred rapid commit processes against one repository
+/// drive git's own auto-maintenance hard enough that the loop intermittently
+/// ended up with `refs/heads/main` pointing at a commit object that no longer
+/// existed (`git fsck`: `invalid sha1 pointer`), failing roughly one run in
+/// four with `fatal: could not parse HEAD`. One import process writes the same
+/// history with no index churn, no ref hammering and nothing to repack.
+///
+/// Messages are stored byte for byte. `git commit -m` applies its default
+/// cleanup and strips trailing blank lines, which is precisely what a test
+/// about exact byte offsets inside a message does not want.
+fn import_commits(repo: &Path, messages: &[String]) -> Vec<String> {
+    let marks_path = repo.join(".git").join("import-marks");
+    let mut child = Command::new("git")
+        .args(["fast-import", "--quiet", "--date-format=raw"])
+        .arg(format!("--export-marks={}", marks_path.display()))
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("git fast-import must run");
+
+    // Recent and strictly increasing, so a reader that only looks at a window
+    // of recent history still sees every commit this fixture wrote.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(1_700_000_000);
+    let base = now.saturating_sub(messages.len() as u64);
+
+    let mut stdin = child.stdin.take().expect("fast-import stdin");
+    for (index, message) in messages.iter().enumerate() {
+        // Git stores a message with a trailing newline; keep that, so these
+        // commits are byte-identical to what `git commit` would have written.
+        let body = format!("{message}\n");
+        let content = format!("{index}\n");
+        let header = format!(
+            "commit refs/heads/main\nmark :{mark}\ncommitter GitPulse <gitpulse@example.com> {when} +0000\ndata {length}\n",
+            mark = index + 1,
+            when = base + index as u64,
+            length = body.len(),
+        );
+        let file_header = format!("M 100644 inline f.txt\ndata {}\n", content.len());
+        for part in [
+            header.as_bytes(),
+            body.as_bytes(),
+            file_header.as_bytes(),
+            content.as_bytes(),
+            b"\n",
+        ] {
+            stdin
+                .write_all(part)
+                .expect("fast-import stream must accept");
+        }
+    }
+    stdin
+        .write_all(b"done\n")
+        .expect("fast-import must accept done");
+    drop(stdin);
+
+    let status = child.wait().expect("fast-import must finish");
+    assert!(
+        status.success(),
+        "git fast-import failed: {status}{}",
+        repo_state(repo)
+    );
+
+    // `:mark <oid>` per line, in no guaranteed order, so index by the mark
+    // rather than trusting the file's sequence.
+    let exported = fs::read_to_string(&marks_path).expect("fast-import must export marks");
+    let mut ids = vec![String::new(); messages.len()];
+    for line in exported.lines() {
+        let (mark, oid) = line.split_once(' ').expect("a mark line is `:n <oid>`");
+        let position: usize = mark
+            .trim_start_matches(':')
+            .parse()
+            .expect("a mark is numbered");
+        ids[position - 1] = oid.trim().to_string();
+    }
+    assert!(
+        ids.iter().all(|id| !id.is_empty()),
+        "every imported commit must come back with an id, or this fixture is \
+         proving less than it looks like it is"
+    );
+
+    // Leave a normal checkout behind: the import touches neither index nor
+    // worktree, and a reader handed a repository whose HEAD disagrees with
+    // both is being asked a different question than the one under test.
+    git_in(repo, &["reset", "--hard", "main"]);
+    ids
+}
+
 fn git_in(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args([
@@ -72,8 +222,9 @@ fn git_in(dir: &Path, args: &[&str]) {
         .expect("git must run");
     assert!(
         out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "git {args:?} failed: {}{}",
+        String::from_utf8_lossy(&out.stderr).trim(),
+        repo_state(dir)
     );
     if args.first() == Some(&"init") {
         common::trust_repo(dir);
@@ -345,8 +496,6 @@ fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking(
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = dir.path();
     git_in(repo, &["init", "-q", "-b", "main"]);
-    fs::write(repo.join("f.txt"), b"seed").expect("write");
-    git_in(repo, &["add", "."]);
 
     // Multi-byte characters of every UTF-8 width, so a split at a fixed byte
     // index can land on any continuation byte.
@@ -368,21 +517,10 @@ fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking(
         }
     }
 
-    let mut ids = Vec::new();
-    for (i, message) in messages.iter().enumerate() {
-        fs::write(repo.join("f.txt"), format!("{i}")).expect("write");
-        git_in(repo, &["add", "."]);
-        git_in(repo, &["commit", "-q", "--allow-empty", "-m", message]);
-        let out = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo)
-            .output()
-            .expect("rev-parse");
-        ids.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    }
+    let ids = import_commits(repo, &messages);
 
     let repo_arg = repo.to_string_lossy().into_owned();
-    for id in &ids {
+    for (message, id) in messages.iter().zip(&ids) {
         // The assertion is that this returns at all: before the fix the same
         // call aborted the blocking thread with a char-boundary panic.
         let details = GitReader::get_commit_details(&repo_arg, id)
@@ -390,6 +528,22 @@ fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking(
         assert_eq!(
             &details.id, id,
             "the reader must return the commit asked for"
+        );
+        // And that it read *these* bytes. The fixture streams messages through
+        // `fast-import`, where a mis-counted `data <n>` would silently truncate
+        // a body — leaving the sweep reading offsets that are no longer there
+        // and passing because nothing was left to panic on.
+        let (subject, body) = message
+            .split_once("\n\n")
+            .expect("every swept message has a subject and a body");
+        assert_eq!(
+            details.summary, subject,
+            "the commit must carry the subject the sweep built"
+        );
+        assert_eq!(
+            details.body.trim_end(),
+            body.trim_end(),
+            "the commit must carry the body the sweep built, to its last byte"
         );
     }
 
@@ -413,9 +567,6 @@ fn randomized_multibyte_commit_bodies_never_panic() {
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = dir.path();
     git_in(repo, &["init", "-q", "-b", "main"]);
-    fs::write(repo.join("f.txt"), b"seed").expect("write");
-    git_in(repo, &["add", "."]);
-    git_in(repo, &["commit", "-q", "-m", "seed"]);
 
     let pieces = [
         "Co-authored-by:",
@@ -439,7 +590,8 @@ fn randomized_multibyte_commit_bodies_never_panic() {
     let repo_arg = repo.to_string_lossy().into_owned();
     let rounds = 120 * scale();
 
-    for round in 0..rounds {
+    let mut bodies = Vec::new();
+    for _ in 0..rounds {
         let mut body = String::from("subject\n\n");
         for _ in 0..(1 + rng.below(12)) {
             for _ in 0..(1 + rng.below(6)) {
@@ -447,16 +599,20 @@ fn randomized_multibyte_commit_bodies_never_panic() {
             }
             body.push('\n');
         }
-        git_in(repo, &["commit", "-q", "--allow-empty", "-m", &body]);
-        let out = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo)
-            .output()
-            .expect("rev-parse");
-        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        GitReader::get_commit_details(&repo_arg, &id).unwrap_or_else(|e| {
+        bodies.push(body);
+    }
+
+    let ids = import_commits(repo, &bodies);
+    for (round, (id, body)) in ids.iter().zip(&bodies).enumerate() {
+        let details = GitReader::get_commit_details(&repo_arg, id).unwrap_or_else(|e| {
             panic!("round {round} (seed {seed:#x}) body {body:?} must be readable, got {e}")
         });
+        // Every generated body opens with this subject, so a fixture that
+        // imported nothing readable cannot look like a passing sweep.
+        assert_eq!(
+            details.summary, "subject",
+            "round {round} (seed {seed:#x}) must carry the message it was given"
+        );
     }
     eprintln!("randomized bodies: {rounds} rounds from seed {seed:#x}");
 }

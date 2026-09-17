@@ -611,8 +611,9 @@ export type ComponentNeed = "required" | "host_resolved" | "optional";
 
 /**
  * How a component's version was established — or why it could not be.
- * `dcstore`, `dcverify` and `dcgrep` expose no version flag, so "installed"
- * and "version known" are separate facts and must render differently.
+ * Modern DevCouncil components report universal version and component identity
+ * via JSON on `--version`. For legacy binaries lacking a version flag,
+ * "installed" and "version known" remain separate facts and render differently.
  */
 export type VersionReading =
   | { kind: "reported"; version: string }

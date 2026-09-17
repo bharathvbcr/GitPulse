@@ -54,10 +54,16 @@ describe("versionText", () => {
     expect(versionText({ kind: "reported", version: "devmap 0.2.1" })).toBe("devmap 0.2.1");
   });
 
+  it("shows clean universal version numbers for analysis components", () => {
+    // DevCouncil v0.2.3+ emits {"ok":true,"id":"dcstore","component":"dc-store","version":"0.2.3"}
+    // Parsed and reported as clean universal version strings
+    expect(versionText({ kind: "reported", version: "0.2.3" })).toBe("0.2.3");
+  });
+
   it("says a component exposes no version rather than showing nothing", () => {
-    // `dcstore`, `dcverify` and `dcgrep` reject `--version`. Rendering an empty
-    // string here reads as "unknown, probably stale"; it means the opposite —
-    // the binary ran and there is nothing to ask it.
+    // When older binaries reject `--version`, the probe falls back to read-only
+    // handshakes and produces `not_exposed`. Rendering an empty string here reads
+    // as "unknown, probably stale"; it means the binary ran and has no version flag.
     const text = versionText({
       kind: "not_exposed",
       detail: "this component exposes no version flag",

@@ -54,8 +54,13 @@
     currentRollout,
     rolloutStateClass,
     rolloutStateLabel,
+    rolloutTimelineRows,
     shortSha,
   } from "../firebase/rolloutState";
+  import DeliveryTimeline from "./DeliveryTimeline.svelte";
+  import { anyInFlight } from "../delivery/transitions";
+  import { createLivePoll, type LiveState } from "../delivery/livePoll";
+  import { createVisibleInterval } from "../dom/visibleInterval";
   import { reportPanelError } from "../diagnostics/report";
   import { formatError } from "../ui/formatError";
   import EmptyState from "./EmptyState.svelte";
@@ -124,6 +129,31 @@
     status?.projects.find((p) => p.alias === selectedAlias)?.project_id ?? "",
   );
   const live = $derived(rollouts ? currentRollout(rollouts.rollouts) : null);
+  /** The listed rollouts as timeline rows, for the shared visualization. */
+  const rolloutRows = $derived(rolloutTimelineRows(rollouts?.rollouts ?? []));
+
+  /**
+   * The project and backend a rollout listing has already SUCCEEDED for.
+   *
+   * This is what makes a live refresh legitimate here. Listing rollouts is
+   * click-only because the Firebase CLI enables the App Hosting API on a
+   * project where it is off, and that is a change to a Cloud project rather
+   * than a read. But the enabling happens when the API is off — and a listing
+   * that already returned is proof it is on. So the *first* call for a target
+   * stays a click, exactly as documented, and only a target that has already
+   * answered may be refreshed.
+   *
+   * Keyed on both ids together because a backend id is not unique across
+   * projects: reusing one project's success to authorise another's poll would
+   * defeat the whole point.
+   */
+  let pollableTarget = $state<string | null>(null);
+  let liveState = $state<LiveState>({ kind: "idle", reason: "" });
+  /** Advances in-flight bars; only while the poll is actually live. */
+  let timelineNow = $state(Date.now());
+  const currentTarget = $derived(
+    selectedProjectId && selectedBackend ? `${selectedProjectId}/${selectedBackend}` : null,
+  );
 
   /**
    * Backends this project is known to have, or empty when none were listed.
@@ -230,6 +260,8 @@
     rollouts = null;
     rolloutsError = null;
     fetchedAt = null;
+    // The previous backend's listing authorised the previous backend only.
+    pollableTarget = null;
     disarmDeploy();
     persist();
   }
@@ -317,16 +349,89 @@
       rollouts = result.output;
       rolloutsError = null;
       fetchedAt = Date.now();
+      // A listing that answered is proof the App Hosting API is on for this
+      // target, which is what authorises refreshing it without another click.
+      // Only `checked` counts: a report that could not run proves nothing.
+      if (result.output.checked) {
+        pollableTarget = `${selectedProjectId}/${selectedBackend}`;
+        livePoll?.reset();
+      }
       persist();
     } catch (err) {
       if (!guard.isLive()) return;
       rollouts = null;
       rolloutsError = formatError(err);
+      // A failed listing withdraws the authorisation it never earned: the next
+      // call may be the one that has to enable the API, so it is a click again.
+      pollableTarget = null;
       reportPanelError("firebase", err);
     } finally {
       if (guard.isLive()) rolloutsLoading = false;
     }
   }
+
+  /**
+   * One poll of an already-listed backend.
+   *
+   * Refuses unless the exact target still matches the one a listing succeeded
+   * for — a project or backend change between the tick and this call must not
+   * inherit the previous target authorisation.
+   */
+  async function pollRolloutsOnce(): Promise<boolean> {
+    if (!repoPath || !selectedProjectId || !selectedBackend) return false;
+    const target = `${selectedProjectId}/${selectedBackend}`;
+    if (pollableTarget !== target) return false;
+    try {
+      const result = await listFirebaseRollouts(repoPath, selectedProjectId, selectedBackend);
+      // The selection can move while the CLI runs; applying the answer then
+      // would show one backend's rollouts under another's name.
+      if (pollableTarget !== target) return false;
+      if (`${selectedProjectId}/${selectedBackend}` !== target) return false;
+      harnessStore.recordVerdict(result?.policy ?? null, repoPath);
+      if (!result.output.checked) return false;
+      rollouts = result.output;
+      rolloutsError = null;
+      fetchedAt = Date.now();
+      persist();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The live poll for deploys, rebuilt per target.
+   *
+   * Never started by mounting: `pollableTarget` is null until a listing the
+   * user asked for has succeeded, and `sync` is what starts a timer.
+   */
+  let livePoll: ReturnType<typeof createLivePoll> | null = null;
+  $effect(() => {
+    const target = currentTarget;
+    liveState = { kind: "idle", reason: "" };
+    if (!target) return;
+    const driver = createLivePoll({
+      poll: pollRolloutsOnce,
+      onState: (next) => (liveState = next),
+    });
+    livePoll = driver;
+    return () => {
+      driver.dispose();
+      if (livePoll === driver) livePoll = null;
+    };
+  });
+
+  $effect(() => {
+    // Two conditions, both required: a rollout is still moving, AND this
+    // target has already answered a listing at least once.
+    const authorised = pollableTarget !== null && pollableTarget === currentTarget;
+    livePoll?.sync(authorised && anyInFlight(rolloutRows));
+  });
+
+  $effect(() => {
+    if (liveState.kind !== "live") return;
+    return createVisibleInterval(() => (timelineNow = Date.now()), 1_000);
+  });
 
   /**
    * Creates a rollout. Reachable only from the armed confirm button.
@@ -651,6 +756,33 @@
         {:else if rollouts.rollouts.length === 0}
           <EmptyState icon={Flame} title="This backend has never deployed" compact />
         {:else}
+          <!-- Deploy duration and outcome, drawn by the same component the
+               Actions runs use, so a deploy and the run that produced it are
+               read the same way.
+
+               The live poll here is narrower than the run timeline's. Listing
+               rollouts is click-only because the Firebase CLI enables the App
+               Hosting API on a project where it is off, and that is a change
+               to a Cloud project rather than a read. The enabling happens when
+               the API is OFF, though — so a listing that has already answered
+               is proof it is on, and refreshing that exact target enables
+               nothing. The first call for a project and backend therefore
+               stays a click (`pollableTarget` is null until one succeeds), and
+               only an already-answered target is refreshed while a rollout is
+               still moving. `now` ticks only while the poll is live; otherwise
+               it is the fetch instant, because nothing grows between renders. -->
+          <div class="mb-2">
+            <DeliveryTimeline
+              title="Deploy duration and outcome"
+              rows={rolloutRows}
+              now={liveState.kind === "live" ? timelineNow : (fetchedAt ?? 0)}
+              checked={rollouts.checked}
+              truncated={rollouts.truncated || rollouts.walk_incomplete !== null}
+              error={rollouts.error}
+              sampleNoun="rollouts"
+              live={liveState}
+            />
+          </div>
           <div class="space-y-1">
             {#each keyedList(rollouts.rollouts, (r) => r.id) as { key, item } (key)}
               <div class="flex items-baseline gap-2 text-xs py-1 border-b border-border/40 last:border-0">

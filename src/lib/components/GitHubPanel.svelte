@@ -60,6 +60,12 @@
     ciLocalVerdict,
     ciStepClass,
     isWorkflowDispatchable,
+    RUN_PREVIEW_COUNT,
+    WORKFLOW_PREVIEW_COUNT,
+    expandLabel,
+    overflowsPreview,
+    previewSlice,
+    useCompactRows,
     workflowStateLabel,
   } from "../github/runActions";
   import { formatReleaseDate } from "../ops/model";
@@ -79,14 +85,36 @@
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
+  import DeliveryTimeline from "./DeliveryTimeline.svelte";
   import { crossfade } from "svelte/transition";
   import { isMacOS } from "../platform";
   import { liquidSelection } from "../ui/transitions";
+  import { runTimelineRows } from "../github/runLifecycle";
+  import { anyInFlight, failuresSince } from "../delivery/transitions";
+  import { createLivePoll, type LiveState } from "../delivery/livePoll";
+  import { createVisibleInterval } from "../dom/visibleInterval";
+  import type { GitHubRunsReport } from "../github/types";
 
   const macos = isMacOS();
   const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   let ctx = $state<GitHubContext | null>(null);
+
+  /**
+   * Runs from the live poll, superseding the ones the full context carried.
+   *
+   * Null until the first poll returns, so the panel shows the context's runs
+   * immediately rather than an empty list waiting for a `gh` call. One derived
+   * `runs` below is the single read every consumer uses — two lists of runs on
+   * screen at once is a drift waiting to be noticed by a user rather than by
+   * a test.
+   */
+  let liveRuns = $state<GitHubRunsReport | null>(null);
+  let liveState = $state<LiveState>({ kind: "idle", reason: "" });
+  /** Runs that went red while the panel was watching. */
+  let failureNotice = $state<string | null>(null);
+  /** Ticks the in-flight duration bars without refetching anything. */
+  let timelineNow = $state(Date.now());
 
   // Read once per render pass: a fresh Date.now() per row would make two PRs
   // opened in the same second disagree about their age.
@@ -136,19 +164,80 @@
   let prFacet = $state<PrFacet>("all");
   let prQuery = $state("");
   let issueQuery = $state("");
-  let latestReleaseOnly = $state(false);
+  /**
+   * Latest release only, by default. The backend fetches up to fifty and the
+   * rail rendered every one of them above the deploy section; what a reader
+   * opens this rail for is what shipped last, and the pill beside the heading
+   * still gets them the full history.
+   */
+  let latestReleaseOnly = $state(true);
   const visibleReleases = $derived(filterReleases(ctx?.releases ?? [], latestReleaseOnly));
   /** Narrows the run list to the checked-out branch. */
   let runsThisBranch = $state(false);
+  /**
+   * Reveal the whole workflow and run listings. Collapsed by default because
+   * this rail is a single column: every row above the deploy section pushes
+   * Firebase App Hosting further out of reach of anyone who does not already
+   * know to keep scrolling.
+   */
+  let workflowsExpanded = $state(false);
+  let runsExpanded = $state(false);
   /** Collapses the CI:local report without discarding it. */
   let ciReportOpen = $state(true);
 
   const prCounts = $derived(prFacetCounts(ctx?.pull_requests ?? []));
   const visiblePrs = $derived(filterPullRequests(ctx?.pull_requests ?? [], prFacet, prQuery));
   const visibleIssues = $derived(filterIssues(ctx?.issues ?? [], issueQuery));
-  const visibleRuns = $derived(
-    runsOnBranch(ctx?.workflow_runs ?? [], runsThisBranch ? ($repoStore.currentBranch ?? "") : ""),
+  /**
+   * The canonical run list for everything on screen.
+   *
+   * A live poll that came back `checked` supersedes the context's snapshot; a
+   * poll that failed is ignored here and reported by the badge instead, so a
+   * transport error never replaces real rows with an empty list.
+   */
+  const runsFromPoll = $derived(liveRuns?.checked === true);
+  const runs = $derived(runsFromPoll ? (liveRuns?.runs ?? []) : (ctx?.workflow_runs ?? []));
+  const runsTruncated = $derived(
+    runsFromPoll ? (liveRuns?.truncated ?? false) : (ctx?.runs_truncated ?? false),
   );
+  /**
+   * Whether the source the rows on screen actually came from ran.
+   *
+   * Deliberately NOT the last poll's `checked`. A failed poll while the
+   * context's rows are still on screen is a stale live view, not an absent
+   * listing — reporting it as "could not read runs" would hide rows that were
+   * genuinely fetched. The poll's own trouble is the badge's job: it reads
+   * "retrying", and "paused" once the session gives up.
+   */
+  const runsChecked = $derived(runsFromPoll ? true : !ctx?.runs_error);
+  const runsError = $derived(runsFromPoll ? null : (ctx?.runs_error ?? null));
+  const visibleRuns = $derived(
+    runsOnBranch(runs, runsThisBranch ? ($repoStore.currentBranch ?? "") : ""),
+  );
+  /**
+   * Timeline rows for the runs actually on screen, so the branch filter and
+   * the visualization cannot disagree about what is being measured.
+   */
+  const runRows = $derived(runTimelineRows(visibleRuns));
+  /**
+   * The run cards actually drawn.
+   *
+   * Sliced from `visibleRuns`, below the branch filter and above nothing else:
+   * the preview decides how many cards are drawn, never what is in scope. The
+   * timeline above still measures every run the filter admitted, and the poll
+   * still watches every run that was fetched — a collapsed section is not a
+   * quieter one.
+   */
+  const previewedRuns = $derived(previewSlice(visibleRuns, runsExpanded, RUN_PREVIEW_COUNT));
+  const visibleWfs = $derived(
+    previewSlice(workflows?.workflows ?? [], workflowsExpanded, WORKFLOW_PREVIEW_COUNT),
+  );
+  /**
+   * Density follows what is on screen, not what was fetched: the preview stays
+   * comfortable and only the list the reader deliberately opened tightens.
+   */
+  const compactWfRows = $derived(useCompactRows(visibleWfs.length));
+  const compactRunRows = $derived(useCompactRows(previewedRuns.length));
   /** True when a filter is on and has hidden every row that was fetched. */
   const prsNarrowedToNothing = $derived(
     (ctx?.pull_requests.length ?? 0) > 0 && visiblePrs.length === 0,
@@ -165,14 +254,104 @@
   let fetchedAt = $state<number | null>(null);
   /** Ticks the relative stamp without refetching anything. */
   let clockTick = $state(Date.now());
-  $effect(() => {
-    if (typeof setInterval === "undefined") return;
-    const timer = setInterval(() => (clockTick = Date.now()), 30_000);
-    return () => clearInterval(timer);
-  });
+  // Visibility-aware: a ticker whose only job is to re-render a relative
+  // stamp must not wake the renderer behind other windows.
+  $effect(() => createVisibleInterval(() => (clockTick = Date.now()), 30_000));
   const fetchedAgo = $derived(
     fetchedAt === null ? "" : relativeAge(new Date(fetchedAt).toISOString(), clockTick),
   );
+
+  /**
+   * One poll of just the run listing.
+   *
+   * `cmd_github_runs` rather than `cmd_github_context`: one `gh` call instead
+   * of four, because this is on a repeating timer. Returns whether the poll
+   * succeeded, which is what the scheduler backs off on.
+   *
+   * A repository switch mid-poll is handled by discarding the answer: the
+   * component is keyed on `currentPath`, but a resolve can still land after
+   * the path moved, and applying it would show one repository's runs under
+   * another's name.
+   */
+  async function pollRunsOnce(repo: string): Promise<boolean> {
+    try {
+      const report = await invoke<GitHubRunsReport>("cmd_github_runs", { repoPath: repo });
+      if ($repoStore.currentPath !== repo) return false;
+      const previous = runTimelineRows(runs);
+      liveRuns = report;
+      if (report.checked) {
+        // Newly-red runs, diffed against what was on screen a moment ago.
+        // `failuresSince` announces nothing on a first observation, so
+        // mounting the panel cannot replay historical failures as news.
+        const wentRed = failuresSince(previous, runTimelineRows(report.runs));
+        if (wentRed.length > 0) {
+          failureNotice =
+            wentRed.length === 1
+              ? `${wentRed[0].row.label} — ${wentRed[0].row.stateLabel}`
+              : `${wentRed.length} runs failed`;
+        }
+      }
+      // `checked: false` is a failed poll even though the call resolved: the
+      // report carries its own error rather than rejecting.
+      return report.checked;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The live poll, torn down and rebuilt per repository.
+   *
+   * Depends only on `currentPath` — `runs` is fed in through `sync` below
+   * instead, because a driver rebuilt on every change to the run list would
+   * lose the session budget every time a run's timestamp ticked over.
+   */
+  let livePoll: ReturnType<typeof createLivePoll> | null = null;
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    liveRuns = null;
+    failureNotice = null;
+    liveState = { kind: "idle", reason: "" };
+    if (!repo) return;
+    const driver = createLivePoll({
+      poll: () => pollRunsOnce(repo),
+      onState: (next) => (liveState = next),
+    });
+    livePoll = driver;
+    return () => {
+      driver.dispose();
+      if (livePoll === driver) livePoll = null;
+    };
+  });
+
+  /**
+   * Tell the driver whether anything is still moving.
+   *
+   * Reads `runs` — the unfiltered canonical list — deliberately. Gating the
+   * poll on `visibleRuns` would stop watching a running job the moment someone
+   * filtered it off screen, and the branch filter is a view, not a decision
+   * about what to monitor.
+   */
+  $effect(() => {
+    const moving = anyInFlight(runTimelineRows(runs));
+    livePoll?.sync(moving);
+  });
+
+  /**
+   * Advances the in-flight duration bars.
+   *
+   * Only while something is actually in flight: a settled row's bar is fixed,
+   * so a ticking clock would invalidate the whole timeline every second to
+   * redraw identical numbers.
+   */
+  $effect(() => {
+    if (liveState.kind !== "live") return;
+    // Also visibility-aware, and for a sharper reason than the stamp above:
+    // this one fires every second, and `liveState` stays "live" while the
+    // window is hidden — the poll's own timer stops, but this ticker would
+    // not have.
+    return createVisibleInterval(() => (timelineNow = Date.now()), 1_000);
+  });
 
   function clearPrFilter() {
     prFacet = "all";
@@ -212,6 +391,14 @@
       const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
       if (!guard.isLive()) return;
       ctx = next;
+      // The full context is the newer read, so the poll's older snapshot must
+      // stop superseding it. Without this, a Refresh after a paused poll shows
+      // fresh pull requests beside runs from whenever the poll last managed a
+      // call — one panel, two ages, no way to tell.
+      liveRuns = null;
+      // An explicit fetch is the human action that revives a session which
+      // gave up. Nothing else may.
+      livePoll?.reset();
       fetchedAt = Date.now();
       // One clock per fetch, so two pull requests opened in the same second
       // cannot disagree about their age.
@@ -315,7 +502,9 @@
     clearPrFilter();
     issueQuery = "";
     runsThisBranch = false;
-    latestReleaseOnly = false;
+    latestReleaseOnly = true;
+    workflowsExpanded = false;
+    runsExpanded = false;
     ciReportOpen = true;
     checkingOut.clear();
     ciReport = null;
@@ -964,18 +1153,22 @@
                 aria-label="Dispatch ref"
               />
             </div>
-            <div class="space-y-2">
-              {#each workflows.workflows as wf (wf.id)}
-                <div class="p-3 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+            <div class={compactWfRows ? "space-y-1" : "space-y-2"}>
+              {#each visibleWfs as wf (wf.id)}
+                <!-- The compact row tightens padding and leading only. The
+                     path stays on screen at every density because it is the
+                     dispatch selector and the only thing that tells two
+                     workflows with the same `name:` apart. -->
+                <div class="{compactWfRows ? 'px-2.5 py-1.5 rounded-xl' : 'p-3 rounded-2xl'} bg-surface border border-border/70 shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
                   <div class="min-w-0">
-                    <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
+                    <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap {compactWfRows ? 'text-[13px] leading-tight' : ''}">
                       <Workflow size={14} class="text-accent shrink-0" />
                       <span class="truncate">{wf.name}</span>
                       <span class="gp-pill {isWorkflowDispatchable(wf.state) ? 'border-emerald-500/30! bg-emerald-500/10! text-emerald-600! dark:text-emerald-400!' : ''}">
                         {workflowStateLabel(wf.state)}
                       </span>
                     </div>
-                    <div class="mt-1 text-[11px] text-textMuted font-mono truncate">{wf.path}</div>
+                    <div class="{compactWfRows ? 'mt-0 leading-tight' : 'mt-1'} text-[11px] text-textMuted font-mono truncate">{wf.path}</div>
                   </div>
                   <button
                     type="button"
@@ -994,16 +1187,44 @@
                 </div>
               {/each}
             </div>
+            {#if overflowsPreview(workflows.workflows.length, WORKFLOW_PREVIEW_COUNT)}
+              <!-- Reports the fetched count, which is what this control can
+                   actually reveal. Whether the backend capped the listing is a
+                   separate fact, and the notice below still states it. -->
+              <button
+                type="button"
+                class="mt-2 w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+                aria-expanded={workflowsExpanded}
+                onclick={() => (workflowsExpanded = !workflowsExpanded)}
+              >
+                {expandLabel(workflows.workflows.length, workflowsExpanded, "workflows")}
+              </button>
+            {/if}
             {#if workflows.truncated}
               <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {workflows.workflows.length} workflows; more exist.</div>
             {/if}
           {/if}
         </section>
 
+        <!-- Deploys sit in the CI rail beside the workflows and releases that
+             produce them, rather than in a section of their own: a Firebase
+             section would be empty for every repository that does not deploy
+             to Firebase, which is the shape the Insights registry already
+             records as a mistake.
+
+             Above the runs and releases, not below them, because those two are
+             the rail's long listings and this is the only one that is a
+             destination. It used to sit last, which on a repository with
+             twenty runs and ten releases meant a section that loads fine was
+             unreachable without scrolling past everything that does not need
+             reading. Both listings now preview, and this sits above them
+             anyway: a reader who expands one should not lose their deploys. -->
+        <FirebasePanel repoPath={$repoStore.currentPath} />
+
         <section>
           <div class="flex items-center justify-between gap-2 mb-2">
             <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Workflow runs</h3>
-            {#if $repoStore.currentBranch && ctx.workflow_runs.length > 0}
+            {#if $repoStore.currentBranch && runs.length > 0}
               <button
                 type="button"
                 class="gp-pill hover:text-accent {runsThisBranch ? 'border-accent/50! bg-accent/10! text-accent!' : ''}"
@@ -1015,30 +1236,76 @@
               </button>
             {/if}
           </div>
-          {#if ctx.runs_error}
+          {#if failureNotice}
+            <!-- Something went red while we were watching. Dismissible, and
+                 never auto-cleared: a notice that disappears on the next poll
+                 is one nobody standing up from their desk will ever see. -->
+            <div
+              class="mb-2 p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-xs flex items-start justify-between gap-2"
+              role="status"
+            >
+              <span class="text-rose-700 dark:text-rose-300 min-w-0 wrap-break-word">
+                Failed while watching: {failureNotice}
+              </span>
+              <button
+                type="button"
+                class="gp-pill shrink-0"
+                onclick={() => (failureNotice = null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          {/if}
+          <!--
+            Gated on the same list it measures, not on `runs`.
+
+            `DeliveryTimeline` documents an empty `rows` with `checked: true`
+            as a real, measured absence, and says so on screen: "No runs
+            recorded for this repository." Gating on the unfiltered `runs`
+            while measuring `visibleRuns` hands it a filter artifact instead —
+            with runs fetched but none on this branch it would claim none were
+            recorded, directly above the truthful "No run on this branch" that
+            counts them. The filter case already has its own empty state, with
+            an action to clear the filter, so let that one speak alone.
+          -->
+          {#if visibleRuns.length > 0}
+            <div class="mb-2">
+              <DeliveryTimeline
+                title="Run duration and outcome"
+                rows={runRows}
+                now={timelineNow}
+                checked={runsChecked}
+                truncated={runsTruncated}
+                error={runsError}
+                sampleNoun="runs"
+                live={liveState}
+              />
+            </div>
+          {/if}
+          {#if ctx.runs_error && runs.length === 0}
             <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
               Run listing unavailable: {ctx.runs_error}
             </div>
-          {:else if ctx.workflow_runs.length === 0}
+          {:else if runs.length === 0}
             <EmptyState icon={Play} title="No recent Actions runs" compact />
           {:else if visibleRuns.length === 0}
             <EmptyState
               icon={Play}
               title="No run on this branch"
-              hint="{ctx.workflow_runs.length} recent runs are loaded, none of them for {$repoStore.currentBranch}."
+              hint="{runs.length} recent runs are loaded, none of them for {$repoStore.currentBranch}."
               compact
               action={{ label: "Show all runs", onClick: () => (runsThisBranch = false) }}
             />
           {:else}
-            <div class="space-y-2">
-              {#each visibleRuns as run (run.id)}
-                <div class="p-3 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+            <div class={compactRunRows ? "space-y-1" : "space-y-2"}>
+              {#each previewedRuns as run (run.id)}
+                <div class="{compactRunRows ? 'px-2.5 py-1.5 rounded-xl' : 'p-3 rounded-2xl'} bg-surface border border-border/70 shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
                   <div class="min-w-0">
-                    <div class="flex items-center gap-2 text-textPrimary font-medium">
+                    <div class="flex items-center gap-2 text-textPrimary font-medium {compactRunRows ? 'text-[13px] leading-tight' : ''}">
                       <Play size={14} class="text-accent shrink-0" />
                       <span class="truncate">{run.title || run.name}</span>
                     </div>
-                    <div class="mt-1 text-[11px] text-textMuted font-mono">
+                    <div class="{compactRunRows ? 'mt-0 leading-tight' : 'mt-1'} text-[11px] text-textMuted font-mono">
                       {run.name}
                       {#if run.head_branch}
                         · {run.head_branch}
@@ -1086,9 +1353,23 @@
                 </div>
               {/each}
             </div>
+            {#if overflowsPreview(visibleRuns.length, RUN_PREVIEW_COUNT)}
+              <!-- Counts what this control can actually reveal: the runs left
+                   after the branch filter, not everything fetched. Whether the
+                   backend withheld older runs is a separate fact, and the
+                   notice below still states it. -->
+              <button
+                type="button"
+                class="mt-2 w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+                aria-expanded={runsExpanded}
+                onclick={() => (runsExpanded = !runsExpanded)}
+              >
+                {expandLabel(visibleRuns.length, runsExpanded, "runs")}
+              </button>
+            {/if}
           {/if}
-          {#if ctx.runs_truncated}
-            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing the {ctx.workflow_runs.length} most recent runs; older runs exist.</div>
+          {#if runsTruncated}
+            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing the {runs.length} most recent runs; older runs exist.</div>
           {/if}
         </section>
 
@@ -1174,12 +1455,6 @@
             {/if}
           {/if}
         </section>
-        <!-- Deploys sit in the CI rail beside the workflows and releases that
-             produce them, rather than in a section of their own: a Firebase
-             section would be empty for every repository that does not deploy
-             to Firebase, which is the shape the Insights registry already
-             records as a mistake. -->
-        <FirebasePanel repoPath={$repoStore.currentPath} />
       </div>
     </div>
   {/if}

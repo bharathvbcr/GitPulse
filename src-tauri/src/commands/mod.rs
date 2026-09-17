@@ -25,8 +25,9 @@ use crate::engine::{
 };
 use crate::github::{
     checkout_pull_request, create_issue, discover_github_remote, issue_create_argv,
-    load_code_scanning_alerts, load_dependabot_alerts, load_github_context, pr_checkout_argv,
-    validate_issue_payload, CodeScanningReport, DependabotReport, GitHubContext,
+    load_code_scanning_alerts, load_dependabot_alerts, load_github_context,
+    load_workflow_runs_report, pr_checkout_argv, validate_issue_payload, CodeScanningReport,
+    DependabotReport, GitHubContext,
 };
 use crate::graph::{
     mainline_chain_ids, simplify_history, BezierGeometryCalculator, CubicBezierCurve, LaneSolver,
@@ -1748,6 +1749,28 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
             releases_error: None,
             releases_truncated: false,
             warnings: Vec::new(),
+        })
+}
+
+/// The workflow-run listing alone, for the live delivery poll.
+///
+/// One `gh` call where [`cmd_github_context`] makes four, because this one is
+/// on a repeating timer while a run is in flight. Like every other report
+/// here it carries its own failure rather than rejecting, and `checked:
+/// false` is what stops a failed poll from rendering as "no runs".
+#[tauri::command(async)]
+pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsReport {
+    off_thread(move || Ok::<_, String>(load_workflow_runs_report(&repo_path)))
+        .await
+        .unwrap_or_else(|e| crate::github::GitHubRunsReport {
+            available: false,
+            checked: false,
+            cli_present: false,
+            owner: String::new(),
+            repo: String::new(),
+            runs: Vec::new(),
+            truncated: false,
+            error: Some(e),
         })
 }
 

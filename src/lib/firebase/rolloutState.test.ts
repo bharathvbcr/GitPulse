@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { isSettled, isVerdict } from "../delivery/phase";
 import {
   commitShaProblem,
   currentRollout,
   isFailed,
   isInFlight,
   isLive,
+  rolloutPhase,
   rolloutStateClass,
   rolloutStateLabel,
+  rolloutTimelineRow,
   shortSha,
 } from "./rolloutState";
 import type { RolloutInfo, RolloutState } from "./types";
@@ -121,5 +124,103 @@ describe("rollout state vocabulary", () => {
     const problem = commitShaProblem("0123456")!;
     expect(problem).toContain("40");
     expect(problem.toLowerCase()).toContain("ambiguous");
+  });
+});
+
+const ALL_STATE_KINDS = [
+  "unspecified",
+  "queued",
+  "pending_build",
+  "progressing",
+  "paused",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "skipped",
+] as const;
+
+describe("rollout phase in the shared delivery vocabulary", () => {
+  it("agrees with the predicates it is derived from, for every state", () => {
+    // The point of deriving rather than re-listing: a parallel mapping would
+    // be free to drift from isLive, and the drift would show up as a deploy
+    // the timeline calls green and the badge beside it calls unknown.
+    for (const kind of ALL_STATE_KINDS) {
+      const state: RolloutState = { kind };
+      const phase = rolloutPhase(state);
+      expect(phase === "settled_ok", kind).toBe(isLive(state));
+      expect(phase === "settled_bad", kind).toBe(isFailed(state));
+      expect(phase === "in_flight", kind).toBe(isInFlight(state));
+    }
+  });
+
+  it("gives an unrecognised state no verdict and keeps it out of the poll", () => {
+    const unknown: RolloutState = { kind: "unrecognised", raw: "TELEPORTED" };
+    expect(rolloutPhase(unknown)).toBe("unknown");
+    expect(isSettled(rolloutPhase(unknown)), "must not poll forever").toBe(true);
+    expect(isVerdict(rolloutPhase(unknown)), "must not enter a rate").toBe(false);
+  });
+
+  it("maps every known state to a phase without falling through by accident", () => {
+    expect(rolloutPhase({ kind: "succeeded" })).toBe("settled_ok");
+    expect(rolloutPhase({ kind: "failed" })).toBe("settled_bad");
+    expect(rolloutPhase({ kind: "cancelled" })).toBe("settled_bad");
+    expect(rolloutPhase({ kind: "progressing" })).toBe("in_flight");
+    expect(rolloutPhase({ kind: "pending_build" })).toBe("in_flight");
+    expect(rolloutPhase({ kind: "queued" })).toBe("in_flight");
+    expect(rolloutPhase({ kind: "paused" })).toBe("in_flight");
+    expect(rolloutPhase({ kind: "skipped" })).toBe("unknown");
+    expect(rolloutPhase({ kind: "unspecified" })).toBe("unknown");
+  });
+});
+
+describe("rollout as a timeline row", () => {
+  const full = "0123456789abcdef0123456789abcdef01234567";
+  const withCommit = (overrides: Partial<RolloutInfo> = {}): RolloutInfo => ({
+    id: "r1",
+    state: { kind: "succeeded" },
+    create_time: "2026-09-17T08:00:00Z",
+    update_time: "2026-09-17T08:04:00Z",
+    error: null,
+    commit: {
+      hash: full,
+      branch: "main",
+      message: "Ship it\nlong body",
+      author: "a",
+      commit_time: null,
+      present_locally: true,
+    },
+    ...overrides,
+  });
+
+  it("spans create to update time", () => {
+    const row = rolloutTimelineRow(withCommit());
+    expect(row.startedAt).toBe("2026-09-17T08:00:00Z");
+    expect(row.endedAt).toBe("2026-09-17T08:04:00Z");
+  });
+
+  it("takes only the commit subject, never a multi-line body", () => {
+    // A newline inside a single-line row pushes every later row down.
+    expect(rolloutTimelineRow(withCommit()).sublabel).toBe("Ship it");
+  });
+
+  it("degrades every absent field to empty rather than undefined", () => {
+    const bare = rolloutTimelineRow({
+      id: "r2",
+      state: { kind: "queued" },
+      create_time: null,
+      update_time: null,
+      error: null,
+      commit: null,
+    });
+    for (const key of ["sublabel", "startedAt", "endedAt", "commitSha", "branch", "trigger"] as const) {
+      expect(bare[key], key).toBe("");
+    }
+    expect(bare.label).toBe("r2");
+  });
+
+  it("reports no trigger rather than guessing one", () => {
+    // App Hosting does not publish what started a rollout; an invented
+    // "push" chip would be a fact this app made up.
+    expect(rolloutTimelineRow(withCommit()).trigger).toBe("");
   });
 });

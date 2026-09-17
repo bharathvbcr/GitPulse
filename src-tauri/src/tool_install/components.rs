@@ -16,13 +16,15 @@
 //!
 //! ## Presence, and only the version that exists
 //!
-//! `devmap`, `manvi` and the Go host answer a version flag. `dcstore`,
-//! `dcverify` and `dcgrep` do not — they reject `--version` as an unknown
-//! flag. This module therefore reports presence and version as *separate*
-//! facts, and a component whose version cannot be read says so rather than
-//! showing a blank that reads like "unknown/old". Presence is established by
-//! running the binary, not by stat-ing a path: a file named `dcstore` that
-//! cannot execute is not an installed component.
+//! DevCouncil components (`devmap`, `manvi`, `dcstore`, `dcverify`, `dcgrep`,
+//! and the Go host) answer version requests. The analysis plane binaries
+//! (`dcstore`, `dcverify`, `dcgrep`) report component identity and universal
+//! product version as structured JSON over `--version`. GitPulse validates the
+//! reported component identity against impostor binaries and wires the
+//! version number into the suite inventory. For legacy builds that do not yet
+//! expose `--version`, presence is verified via read-only handshakes and reported
+//! as `NotExposed`. Presence is established by running the binary, not by stat-ing
+//! a path: a file named `dcstore` that cannot execute is not an installed component.
 //!
 //! Every probe runs in a scratch directory, never in a user repository, and is
 //! chosen to have no side effects.
@@ -105,9 +107,19 @@ pub struct SuiteStatus {
 enum Probe {
     /// Run with `--version` and read the first line naming a version.
     VersionFlag,
+    /// Run with `--version` first. If that fails (e.g. an older release that
+    /// rejected `--version`), fall back to the given arguments.
+    VersionWithFallback(&'static [&'static str]),
     /// Run the given arguments and require a JSON object on stdout. Used for
     /// the components with no version flag; the arguments are chosen to be
     /// read-only and to need no repository.
+    ///
+    /// No catalogue entry constructs this yet — `evaluate_json_response` and
+    /// the tests around it are reachable, but the library build alone sees the
+    /// variant as dead. `expect` rather than `allow` deliberately: the moment
+    /// a spec does construct it, the expectation goes unfulfilled and this
+    /// attribute asks to be deleted, instead of quietly outliving its reason.
+    #[cfg_attr(not(test), expect(dead_code))]
     JsonHandshake(&'static [&'static str]),
 }
 
@@ -150,9 +162,7 @@ fn catalogue() -> Vec<Spec<'static>> {
             label: "dcstore",
             need: ComponentNeed::HostResolved,
             purpose: "Manvi opens the profile workbench through it; without it managed runs and enhancements fail.",
-            // No arguments: answers `{"ok":false,"error":"--db is required"}`
-            // without opening a database or reading the working directory.
-            probe: Probe::JsonHandshake(&[]),
+            probe: Probe::VersionWithFallback(&[]),
             presets: &["analysis", "all"],
             managed: None,
         },
@@ -161,9 +171,7 @@ fn catalogue() -> Vec<Spec<'static>> {
             label: "dcverify",
             need: ComponentNeed::HostResolved,
             purpose: "Manvi's verification gate. GitPulse links the same library, so its own reads work without the binary.",
-            // No arguments: verifies an empty scope. Read-only, and run in a
-            // scratch directory so it never scans a user repository.
-            probe: Probe::JsonHandshake(&[]),
+            probe: Probe::VersionWithFallback(&[]),
             presets: &["analysis", "all"],
             managed: None,
         },
@@ -172,7 +180,7 @@ fn catalogue() -> Vec<Spec<'static>> {
             label: "dcgrep",
             need: ComponentNeed::HostResolved,
             purpose: "Manvi's repository search. GitPulse does not spawn it directly.",
-            probe: Probe::JsonHandshake(&["health"]),
+            probe: Probe::VersionWithFallback(&["health"]),
             presets: &["analysis", "all"],
             managed: None,
         },
@@ -226,6 +234,70 @@ fn probe(spec: &Spec<'_>) -> ComponentStatus {
     probe_located(spec, located)
 }
 
+/// Matches the identity reported in a component's JSON response against the expected tool id.
+fn matches_component_identity(reported: &str, expected_id: &str) -> bool {
+    let rep = reported.trim().to_ascii_lowercase();
+    let exp = expected_id.trim().to_ascii_lowercase();
+    if rep == exp {
+        return true;
+    }
+    if rep.replace(['-', '_'], "") == exp.replace(['-', '_'], "") {
+        return true;
+    }
+    match exp.as_str() {
+        "devcouncil" => rep == "host" || rep == "go-host",
+        "devmap" => rep == "devmap-cli",
+        _ => false,
+    }
+}
+
+enum JsonProbeOutcome {
+    Reported { version: String },
+    NotExposed { detail: String },
+    IdentityMismatch { reported: String },
+    Malformed { detail: String },
+}
+
+fn evaluate_json_response(value: &serde_json::Value, spec_id: &str) -> JsonProbeOutcome {
+    let Some(obj) = value.as_object() else {
+        return JsonProbeOutcome::Malformed {
+            detail: "response was not a JSON object".into(),
+        };
+    };
+
+    let identity_keys = ["id", "component", "store", "verifier", "searcher"];
+    let mut found_identities = Vec::new();
+    for key in identity_keys {
+        if let Some(val) = obj.get(key).and_then(serde_json::Value::as_str) {
+            found_identities.push(val);
+        }
+    }
+
+    if !found_identities.is_empty() {
+        let any_match = found_identities
+            .iter()
+            .any(|id| matches_component_identity(id, spec_id));
+        if !any_match {
+            return JsonProbeOutcome::IdentityMismatch {
+                reported: found_identities[0].to_string(),
+            };
+        }
+    }
+
+    if let Some(version) = obj.get("version").and_then(serde_json::Value::as_str) {
+        let trimmed = version.trim();
+        if !trimmed.is_empty() {
+            return JsonProbeOutcome::Reported {
+                version: trimmed.to_string(),
+            };
+        }
+    }
+
+    JsonProbeOutcome::NotExposed {
+        detail: "this component exposes no version flag".into(),
+    }
+}
+
 /// The probe itself, with lookup already done.
 ///
 /// Split out so a test can drive a real executable at a known path: passing a
@@ -260,53 +332,248 @@ fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
     };
 
     match spec.probe {
-        Probe::VersionFlag => match run_probe(&path, spec.id, &["--version"]) {
-            Ok((true, text)) => {
-                let reading = match super::version_line(&text, spec.id) {
-                    Some(version) => VersionReading::Reported { version },
-                    None => VersionReading::NotExposed {
-                        detail: "`--version` printed nothing this reader recognized".into(),
-                    },
-                };
-                base(true, Some(path), reading, None)
+        Probe::VersionFlag | Probe::VersionWithFallback(_) => {
+            let fallback_args = match spec.probe {
+                Probe::VersionWithFallback(args) => Some(args),
+                _ => None,
+            };
+
+            match run_probe(&path, spec.id, &["--version"]) {
+                Ok((true, text)) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                        match evaluate_json_response(&value, spec.id) {
+                            JsonProbeOutcome::Reported { version } => {
+                                base(true, Some(path), VersionReading::Reported { version }, None)
+                            }
+                            JsonProbeOutcome::NotExposed { detail } => {
+                                base(true, Some(path), VersionReading::NotExposed { detail }, None)
+                            }
+                            JsonProbeOutcome::IdentityMismatch { reported } => base(
+                                false,
+                                Some(path),
+                                VersionReading::Unavailable {
+                                    detail: format!("reported unexpected component identity {reported:?}"),
+                                },
+                                Some(format!(
+                                    "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
+                                    spec.id
+                                )),
+                            ),
+                            JsonProbeOutcome::Malformed { detail } => base(
+                                false,
+                                Some(path),
+                                VersionReading::Unavailable {
+                                    detail: detail.clone(),
+                                },
+                                Some(format!(
+                                    "`{}` did not answer like a DevCouncil component: {detail}",
+                                    spec.id
+                                )),
+                            ),
+                        }
+                    } else {
+                        let reading = match super::version_line(&text, spec.id) {
+                            Some(version) => VersionReading::Reported { version },
+                            None => VersionReading::NotExposed {
+                                detail: "`--version` printed nothing this reader recognized".into(),
+                            },
+                        };
+                        base(true, Some(path), reading, None)
+                    }
+                }
+                Ok((false, text)) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                        if value.is_object() {
+                            match evaluate_json_response(&value, spec.id) {
+                                JsonProbeOutcome::Reported { version } => {
+                                    return base(
+                                        true,
+                                        Some(path),
+                                        VersionReading::Reported { version },
+                                        None,
+                                    );
+                                }
+                                JsonProbeOutcome::NotExposed { detail } => {
+                                    return base(
+                                        true,
+                                        Some(path),
+                                        VersionReading::NotExposed { detail },
+                                        None,
+                                    );
+                                }
+                                JsonProbeOutcome::IdentityMismatch { reported } => {
+                                    return base(
+                                        false,
+                                        Some(path),
+                                        VersionReading::Unavailable {
+                                            detail: format!("reported unexpected component identity {reported:?}"),
+                                        },
+                                        Some(format!(
+                                            "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
+                                            spec.id
+                                        )),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if let Some(args) = fallback_args {
+                        if let Ok((_, fallback_text)) = run_probe(&path, spec.id, args) {
+                            if let Ok(value) =
+                                serde_json::from_str::<serde_json::Value>(fallback_text.trim())
+                            {
+                                if value.is_object() {
+                                    return match evaluate_json_response(&value, spec.id) {
+                                        JsonProbeOutcome::Reported { version } => {
+                                            base(true, Some(path), VersionReading::Reported { version }, None)
+                                        }
+                                        JsonProbeOutcome::NotExposed { detail } => {
+                                            base(true, Some(path), VersionReading::NotExposed { detail }, None)
+                                        }
+                                        JsonProbeOutcome::IdentityMismatch { reported } => base(
+                                            false,
+                                            Some(path),
+                                            VersionReading::Unavailable {
+                                                detail: format!("reported unexpected component identity {reported:?}"),
+                                            },
+                                            Some(format!(
+                                                "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
+                                                spec.id
+                                            )),
+                                        ),
+                                        JsonProbeOutcome::Malformed { detail } => base(
+                                            false,
+                                            Some(path),
+                                            VersionReading::Unavailable {
+                                                detail: detail.clone(),
+                                            },
+                                            Some(format!(
+                                                "`{}` did not answer like a DevCouncil component: {detail}",
+                                                spec.id
+                                            )),
+                                        ),
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    let detail = text.trim().chars().take(200).collect::<String>();
+                    base(
+                        false,
+                        Some(path),
+                        VersionReading::Unavailable {
+                            detail: detail.clone(),
+                        },
+                        Some(format!("`{} --version` failed: {detail}", spec.id)),
+                    )
+                }
+                Err(detail) => {
+                    if let Some(args) = fallback_args {
+                        if let Ok((_, fallback_text)) = run_probe(&path, spec.id, args) {
+                            if let Ok(value) =
+                                serde_json::from_str::<serde_json::Value>(fallback_text.trim())
+                            {
+                                if value.is_object() {
+                                    return match evaluate_json_response(&value, spec.id) {
+                                        JsonProbeOutcome::Reported { version } => {
+                                            base(true, Some(path), VersionReading::Reported { version }, None)
+                                        }
+                                        JsonProbeOutcome::NotExposed { detail } => {
+                                            base(true, Some(path), VersionReading::NotExposed { detail }, None)
+                                        }
+                                        JsonProbeOutcome::IdentityMismatch { reported } => base(
+                                            false,
+                                            Some(path),
+                                            VersionReading::Unavailable {
+                                                detail: format!("reported unexpected component identity {reported:?}"),
+                                            },
+                                            Some(format!(
+                                                "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
+                                                spec.id
+                                            )),
+                                        ),
+                                        JsonProbeOutcome::Malformed { detail } => base(
+                                            false,
+                                            Some(path),
+                                            VersionReading::Unavailable {
+                                                detail: detail.clone(),
+                                            },
+                                            Some(format!(
+                                                "`{}` did not answer like a DevCouncil component: {detail}",
+                                                spec.id
+                                            )),
+                                        ),
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    base(
+                        false,
+                        Some(path),
+                        VersionReading::Unavailable {
+                            detail: detail.clone(),
+                        },
+                        Some(format!("could not run `{}`: {detail}", spec.id)),
+                    )
+                }
             }
-            Ok((false, text)) => {
-                let detail = text.trim().chars().take(200).collect::<String>();
-                base(
-                    false,
-                    Some(path),
-                    VersionReading::Unavailable {
-                        detail: detail.clone(),
-                    },
-                    Some(format!("`{} --version` failed: {detail}", spec.id)),
-                )
-            }
-            Err(detail) => base(
-                false,
-                Some(path),
-                VersionReading::Unavailable {
-                    detail: detail.clone(),
-                },
-                Some(format!("could not run `{}`: {detail}", spec.id)),
-            ),
-        },
+        }
         // These exit 0 with a JSON object whether or not the request itself
         // succeeded, so the object — not the exit status — is the evidence
         // that the binary is the component it is named after.
         Probe::JsonHandshake(args) => match run_probe(&path, spec.id, args) {
             Ok((_, text)) => {
-                let responded = serde_json::from_str::<serde_json::Value>(text.trim())
-                    .ok()
-                    .is_some_and(|value| value.is_object());
-                if responded {
-                    base(
-                        true,
-                        Some(path),
-                        VersionReading::NotExposed {
-                            detail: "this component exposes no version flag".into(),
-                        },
-                        None,
-                    )
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                    if value.is_object() {
+                        match evaluate_json_response(&value, spec.id) {
+                            JsonProbeOutcome::Reported { version } => {
+                                base(true, Some(path), VersionReading::Reported { version }, None)
+                            }
+                            JsonProbeOutcome::NotExposed { detail } => {
+                                base(true, Some(path), VersionReading::NotExposed { detail }, None)
+                            }
+                            JsonProbeOutcome::IdentityMismatch { reported } => base(
+                                false,
+                                Some(path),
+                                VersionReading::Unavailable {
+                                    detail: format!("reported unexpected component identity {reported:?}"),
+                                },
+                                Some(format!(
+                                    "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
+                                    spec.id
+                                )),
+                            ),
+                            JsonProbeOutcome::Malformed { detail } => base(
+                                false,
+                                Some(path),
+                                VersionReading::Unavailable {
+                                    detail: detail.clone(),
+                                },
+                                Some(format!(
+                                    "`{}` did not answer like a DevCouncil component: {detail}",
+                                    spec.id
+                                )),
+                            ),
+                        }
+                    } else {
+                        let detail = text.trim().chars().take(200).collect::<String>();
+                        base(
+                            false,
+                            Some(path),
+                            VersionReading::Unavailable {
+                                detail: detail.clone(),
+                            },
+                            Some(format!(
+                                "`{}` did not answer like a DevCouncil component: {detail}",
+                                spec.id
+                            )),
+                        )
+                    }
                 } else {
                     let detail = text.trim().chars().take(200).collect::<String>();
                     base(
@@ -584,6 +851,138 @@ mod tests {
         assert!(status.reason.is_some());
     }
 
+    /// When a component returns the universal JSON payload with matching identity
+    /// and version, its version is reported directly as the clean version number.
+    #[test]
+    #[cfg(unix)]
+    fn universal_version_and_id_are_reported_for_analysis_components() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        let cases = [
+            ("dcstore", "{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.2.3\"}\n"),
+            ("dcverify", "{\"ok\":true,\"id\":\"dcverify\",\"component\":\"dc-verify\",\"version\":\"0.2.3\"}\n"),
+            ("dcgrep", "{\"ok\":true,\"id\":\"dcgrep\",\"component\":\"dc-grep\",\"version\":\"0.2.3\"}\n"),
+        ];
+
+        for (id, payload) in cases {
+            let bin = dir.path().join(id);
+            std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' '{payload}'\n")).expect("write");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+            let spec = Spec {
+                id,
+                label: id,
+                need: ComponentNeed::HostResolved,
+                purpose: "test",
+                probe: Probe::VersionWithFallback(&[]),
+                presets: &["analysis"],
+                managed: None,
+            };
+
+            let status = probe_located(&spec, Some(bin.to_string_lossy().into_owned()));
+            assert!(
+                status.installed,
+                "expected {id} to be installed: {status:?}"
+            );
+            assert_eq!(
+                status.version,
+                VersionReading::Reported {
+                    version: "0.2.3".into()
+                },
+                "expected clean universal version number for {id}"
+            );
+            assert!(status.reason.is_none());
+        }
+    }
+
+    /// An impostor binary returning JSON with an unexpected id is rejected.
+    #[test]
+    #[cfg(unix)]
+    fn an_impostor_with_wrong_id_is_rejected_as_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = dir.path().join("fake-dcstore-impostor");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"id\":\"rogue_tool\",\"component\":\"rogue\",\"version\":\"1.0.0\"}'\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let status = probe_located(
+            &Spec {
+                id: "dcstore",
+                label: "dcstore",
+                need: ComponentNeed::HostResolved,
+                purpose: "test",
+                probe: Probe::VersionWithFallback(&[]),
+                presets: &["analysis"],
+                managed: None,
+            },
+            Some(bin.to_string_lossy().into_owned()),
+        );
+
+        assert!(
+            !status.installed,
+            "impostor must not be reported as installed: {status:?}"
+        );
+        assert!(
+            matches!(status.version, VersionReading::Unavailable { .. }),
+            "expected unavailable version reading: {:?}",
+            status.version
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("reported identity"),
+            "expected reason to mention reported identity mismatch: {:?}",
+            status.reason
+        );
+    }
+
+    /// When `--version` fails on an older binary, fallback handshake executes and
+    /// reports `NotExposed` instead of failing if the handshake succeeds.
+    #[test]
+    #[cfg(unix)]
+    fn legacy_binary_falling_back_to_handshake_reports_not_exposed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bin = dir.path().join("legacy-dcstore");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'unknown flag --version' >&2; exit 2; fi\nprintf '%s\\n' '{\"ok\":false,\"error\":\"--db is required\"}'\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let status = probe_located(
+            &Spec {
+                id: "dcstore",
+                label: "dcstore",
+                need: ComponentNeed::HostResolved,
+                purpose: "test",
+                probe: Probe::VersionWithFallback(&[]),
+                presets: &["analysis"],
+                managed: None,
+            },
+            Some(bin.to_string_lossy().into_owned()),
+        );
+
+        assert!(
+            status.installed,
+            "legacy binary must still be detected as installed: {status:?}"
+        );
+        assert!(
+            matches!(status.version, VersionReading::NotExposed { .. }),
+            "expected NotExposed version reading for legacy binary: {:?}",
+            status.version
+        );
+        assert!(status.reason.is_none());
+    }
+
     /// A probe that did not run must never look like a probe that found
     /// nothing. Without a repository, doctor is absent *and* says why, and the
     /// flattened warning list stays empty rather than reading as "all clear".
@@ -632,6 +1031,34 @@ mod tests {
             .any(|c| !c.installed && !matches!(c.need, ComponentNeed::Optional));
         if optional_missing && !needed_missing {
             assert!(status.complete, "optional absence must not read as broken");
+        }
+    }
+
+    /// If dcstore, dcverify, or dcgrep are installed on the host, verify that
+    /// they report clean universal version numbers and validate component identity.
+    #[test]
+    fn host_installed_components_report_universal_version_when_present() {
+        let status = suite_status();
+        for id in &["dcstore", "dcverify", "dcgrep"] {
+            if let Some(comp) = status.components.iter().find(|c| c.id == *id) {
+                if comp.installed {
+                    match &comp.version {
+                        VersionReading::Reported { version } => {
+                            assert!(!version.is_empty(), "version must not be empty for {id}");
+                            assert!(
+                                !version.contains('{'),
+                                "version for {id} must be clean, not raw JSON: {version}"
+                            );
+                        }
+                        VersionReading::NotExposed { .. } => {
+                            // Valid fallback for older binaries
+                        }
+                        VersionReading::Unavailable { detail } => {
+                            panic!("Installed component {id} should not be Unavailable: {detail}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

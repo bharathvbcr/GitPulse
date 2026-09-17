@@ -322,7 +322,13 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        assert_eq!(entries.len(), 16);
+        // 15 is owned by `scripts/view-menu-contract.test.ts`, which compares
+        // this catalog against the frontend view registry entry by entry and
+        // label by label. This assertion is the cheap smoke check beside it —
+        // it went stale at 16 when the section count dropped, and the parity
+        // contract is what proves 15 is the right number rather than just the
+        // current one.
+        assert_eq!(entries.len(), 15);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {

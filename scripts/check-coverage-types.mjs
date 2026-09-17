@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 67 contracts over
- * 167 structs, spanning both wire surfaces: command returns and event payloads.
+ * 169 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -164,7 +164,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repository trust", rustPath: rust("repository_trust.rs"), tsPath: ts("repos", "repositoryTrust.ts"), structs: ["TrustPreview"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
-  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo"] },
+  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo", "WorkflowRunInfo", "GitHubRunsReport"] },
   // Firebase deployment state. `RolloutCommit.hash` is the join key to local
   // history, so a rename there would silently stop every commit matching and
   // render as "nothing is deployed" rather than as an error.

@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  COMPACT_ROW_THRESHOLD,
+  RUN_PREVIEW_COUNT,
+  WORKFLOW_PREVIEW_COUNT,
   canCancelRun,
   canRerunRun,
   ciLocalVerdict,
   ciStepClass,
+  expandLabel,
   isWorkflowDispatchable,
+  overflowsPreview,
+  previewSlice,
+  useCompactRows,
   workflowStateLabel,
 } from "./runActions";
 
@@ -116,5 +123,105 @@ describe("ciStepClass", () => {
     expect(ciStepClass("passed")).not.toBe("text-green-400");
     expect(ciStepClass("skipped")).toContain("textMuted");
     expect(ciStepClass("whatever")).toContain("textMuted");
+  });
+});
+
+describe("previewSlice", () => {
+  const list = (n: number) => Array.from({ length: n }, (_, i) => `row-${i}`);
+
+  it("caps the collapsed list at the preview count and expands to all", () => {
+    expect(previewSlice(list(50), false, WORKFLOW_PREVIEW_COUNT)).toHaveLength(
+      WORKFLOW_PREVIEW_COUNT,
+    );
+    expect(previewSlice(list(50), true, WORKFLOW_PREVIEW_COUNT)).toHaveLength(50);
+    expect(previewSlice(list(20), false, RUN_PREVIEW_COUNT)).toHaveLength(
+      RUN_PREVIEW_COUNT,
+    );
+  });
+
+  it("keeps the first rows, so expanding only ever appends", () => {
+    // A collapsed preview that showed a different slice than the head of the
+    // expanded list would make the button look like it reordered the section.
+    const all = list(12);
+    const collapsed = previewSlice(all, false, WORKFLOW_PREVIEW_COUNT);
+    expect(collapsed).toEqual(all.slice(0, collapsed.length));
+    expect(previewSlice(all, true, WORKFLOW_PREVIEW_COUNT).slice(0, collapsed.length)).toEqual(
+      collapsed,
+    );
+  });
+
+  it("never renders an empty list for a repository that has rows", () => {
+    // The class of bug this guards: a default collapse that renders zero rows
+    // is indistinguishable from "no Actions workflows", so the section lies
+    // about the repository rather than merely hiding part of it.
+    for (const n of [1, 2, 3, 4, 5, 6, 20, 50]) {
+      for (const count of [WORKFLOW_PREVIEW_COUNT, RUN_PREVIEW_COUNT, 0, -1]) {
+        expect(previewSlice(list(n), false, count).length).toBeGreaterThan(0);
+        expect(previewSlice(list(n), true, count).length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("shows every row, collapsed or not, when there are few", () => {
+    const all = list(WORKFLOW_PREVIEW_COUNT);
+    expect(previewSlice(all, false, WORKFLOW_PREVIEW_COUNT)).toEqual(all);
+  });
+
+  it("leaves an empty list empty rather than inventing a row", () => {
+    expect(previewSlice([], false, WORKFLOW_PREVIEW_COUNT)).toEqual([]);
+    expect(previewSlice([], true, WORKFLOW_PREVIEW_COUNT)).toEqual([]);
+  });
+
+  it("does not alias the caller's array", () => {
+    const all = list(3);
+    const expanded = previewSlice(all, true, WORKFLOW_PREVIEW_COUNT);
+    expanded.push("mutated");
+    expect(all).toHaveLength(3);
+  });
+});
+
+describe("overflowsPreview", () => {
+  it("offers the expander only when rows are actually hidden", () => {
+    // Off-by-one here renders a "Show all 5 workflows" button that changes
+    // nothing when clicked.
+    expect(overflowsPreview(WORKFLOW_PREVIEW_COUNT, WORKFLOW_PREVIEW_COUNT)).toBe(false);
+    expect(overflowsPreview(WORKFLOW_PREVIEW_COUNT + 1, WORKFLOW_PREVIEW_COUNT)).toBe(true);
+    expect(overflowsPreview(0, WORKFLOW_PREVIEW_COUNT)).toBe(false);
+  });
+
+  it("agrees with previewSlice about whether anything is hidden", () => {
+    for (const count of [WORKFLOW_PREVIEW_COUNT, RUN_PREVIEW_COUNT]) {
+      for (let n = 0; n <= 25; n += 1) {
+        const hidden = n - previewSlice(Array.from({ length: n }), false, count).length;
+        expect(overflowsPreview(n, count)).toBe(hidden > 0);
+      }
+    }
+  });
+});
+
+describe("expandLabel", () => {
+  it("names the count to reveal, and offers the way back once expanded", () => {
+    expect(expandLabel(23, false, "workflows")).toBe("Show all 23 workflows");
+    expect(expandLabel(20, false, "runs")).toBe("Show all 20 runs");
+    expect(expandLabel(23, true, "workflows")).toBe("Show fewer");
+  });
+
+  it("groups large counts the way the rest of the panel does", () => {
+    expect(expandLabel(1234, false, "workflows")).toBe("Show all 1,234 workflows");
+  });
+});
+
+describe("useCompactRows", () => {
+  it("tightens rows only once enough of them are on screen", () => {
+    expect(useCompactRows(COMPACT_ROW_THRESHOLD - 1)).toBe(false);
+    expect(useCompactRows(COMPACT_ROW_THRESHOLD)).toBe(true);
+    expect(useCompactRows(0)).toBe(false);
+  });
+
+  it("leaves every collapsed preview comfortable", () => {
+    // The previews are short by construction, so neither should ever trip the
+    // compact threshold — otherwise every repository gets the dense row.
+    expect(useCompactRows(WORKFLOW_PREVIEW_COUNT)).toBe(false);
+    expect(useCompactRows(RUN_PREVIEW_COUNT)).toBe(false);
   });
 });

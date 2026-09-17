@@ -16,6 +16,37 @@ export interface WorkflowRunInfo {
   head_branch: string;
   url: string;
   created_at: string;
+  /**
+   * When the run began executing, which is not when it was created — a run can
+   * sit queued for minutes. Empty while it has not started, and that emptiness
+   * is what separates "queued" from "started at the epoch", so a duration must
+   * never fall back to `created_at`.
+   */
+  started_at: string;
+  /** Last change; for a completed run this is when it settled. */
+  updated_at: string;
+  /** Commit the run was dispatched against, empty when unreported. */
+  head_sha: string;
+  /** `push` | `pull_request` | `workflow_dispatch` | …, empty when unreported. */
+  event: string;
+}
+
+/**
+ * Wire shape of `cmd_github_runs` — the narrow listing behind the live poll.
+ *
+ * `checked` is load-bearing: false means the poll could not run, so `runs`
+ * being empty says nothing about the repository. Rendering an unchecked report
+ * as an empty list is how stale rows get replaced by a confident "no runs".
+ */
+export interface GitHubRunsReport {
+  available: boolean;
+  checked: boolean;
+  cli_present: boolean;
+  owner: string;
+  repo: string;
+  runs: WorkflowRunInfo[];
+  truncated: boolean;
+  error: string | null;
 }
 
 /** One Actions workflow from `gh workflow list`. */

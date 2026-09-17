@@ -58,6 +58,10 @@ function run(id: number, extra: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo 
     head_branch: "main",
     url: `https://example.test/runs/${id}`,
     created_at: "2026-09-04T11:00:00Z",
+    started_at: "2026-09-04T11:00:05Z",
+    updated_at: "2026-09-04T11:02:05Z",
+    head_sha: "0123456789abcdef0123456789abcdef01234567",
+    event: "push",
     ...extra,
   };
 }
