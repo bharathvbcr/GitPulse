@@ -3,15 +3,27 @@ node_modules/
 /src-tauri/.vendor-lock/
 /src-tauri/.vendor-stage-*/
 dist/
+dist-ssr/
+/target/
 src-tauri/target/
 src-tauri/gen/
 .DS_Store
 *.log
 /coverage/
+.coverage
+.coverage.*
+coverage.xml
+coverage-summary.json
+htmlcov/
+.nyc_output/
 lcov.info
+*.profraw
+*.profdata
 .env
 .env.*
 !.env.example
+!.env.sample
+!.env.template
 .vite/
 *.local
 .claude/
@@ -134,6 +146,13 @@ CHANGELOG_DRAFT.md
 .antigravity/
 .warp/
 .grok/
+.gitnexus/
+.continue/
+.windsurf/
+.copilot/
+.cline/
+.roo/
+.chatgpt/
 
 # Secrets and local databases
 *.sqlite
@@ -160,17 +179,73 @@ dump/
 *_results.txt
 *_log.txt
 *_output.txt
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.out
+*.err
+*.exit
+*.log.*
+*.orig
+!**/Cargo.toml.orig
+*.rej
+*.swo
+*.swn
+*.swm
+*.un~
+Session.vim
+.netrwhist
+*~
+\#*\#
+.#*
 
 # Environment, dependency, and cache directories
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
 .venv/
 venv/
 .env.local
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Build, package manager, and linter caches
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+.turbo/
+.parcel-cache/
+.pnpm-store/
+.npm/
+cargo-timing.html
+**/*.rs.bk
+
+# Operating system files
+._*
+.DS_Store?
+.Spotlight-V100
+.Trashes
 Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.fuse_hidden*
+.directory
+.Trash-*
+
+# IDEs and editors
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+*.sublime-workspace
 
 # Legacy local agent state
 .conducor/
