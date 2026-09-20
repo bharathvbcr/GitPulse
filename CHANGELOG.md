@@ -13,17 +13,42 @@ before that tag is pushed.
 
 Nothing yet.
 
-## [1.3.0] - 2026-09-19
+## [1.3.0] - 2026-09-20
 
 A consolidation release. It joins live delivery observability — GitHub Actions
 workflow runs and Firebase App Hosting rollouts tied directly to repository
-commits — with four bodies of work that were in flight beside it: code-age
-history in Blame, a terminal dock that belongs to a repository rather than the
-workspace, terminal output whose links are safe to click and land where they
-point, and walkthrough replay moved out of the title bar.
+commits — with the bodies of work that were in flight beside it: code-age history
+in Blame, a terminal dock that belongs to a repository rather than the workspace,
+terminal output whose links are safe to click and land where they point, and
+walkthrough replay moved out of the title bar.
+
+Re-cut on 2026-09-20 over a wider tree, adding regression suspects — which commits
+could have caused this symptom, answered from the code graph rather than from
+blame recency — a Health view that reaches a verdict, repository tab groups, and
+the coverage and impact surfaces reduced to what they can actually claim. Two
+process-lifecycle defects are fixed behind them: an ordinary policy-harness
+shutdown that leaked whatever the harness had forked, and a test suite whose
+verdict depended on how busy the machine was.
 
 ### Added
 
+- **Regression suspects — which commits could have caused this?** Blame joined to
+  the code graph, and the order of operations is the whole argument: a
+  blame-first tool reads a file's gutter and ranks by recency, this reads the
+  graph first, so candidates are ranked by what actually reaches the symptom.
+  Ships as two vendored crates (`dc-regress`, `dc-regress-store`) so every host
+  asks the same question of the same graph, plus a Regression Suspects panel.
+- **The Health view gives a verdict**, rather than a wall of readings for you to
+  add up, and every repeated decision behind it now has one owner instead of a
+  copy per caller.
+- **Repository tab groups.** Open repositories can be grouped and named, so a
+  workspace with a dozen checkouts is navigable rather than merely complete.
+- **Markup and stylesheet extraction.** A template file's HTML and CSS halves go
+  through a real grammar, closing the gap left when only its `<script>` blocks
+  did.
+- **A substance gate for verification.** Every other gate answers "is something
+  wrong with this change"; this one answers "is there anything *in* it", which
+  nothing did before.
 - **Live GitHub Actions Run Polling**: Automated, bounded polling for in-flight
   workflow runs that refreshes only while runs are queued or executing, backing
   off on failures, pausing while the window is hidden, and announcing newly
@@ -103,6 +128,16 @@ point, and walkthrough replay moved out of the title bar.
 
 ### Changed
 
+- **Coverage headers collapsed from five bands to three**, and the measurement now
+  names what qualifies it instead of presenting a number as unconditional.
+- **The impact question is answered in one line** instead of reprinting the
+  engine's prose, and that prose is bounded where it enters rather than where it
+  is rendered — a cap at the render site leaves the oversized string already in
+  memory and in the payload.
+- **One owner for collapse-and-expand in long rail listings.** Workflows, run
+  cards and the delivery timeline all previewed then expanded, each with its own
+  copy of the logic.
+- **The Task pane has one owner for what it shows and in what order.**
 - **The terminal dock belongs to a repository tab, not the workspace.** Opening a
   shell in one repository no longer opens the dock over every other repository you
   switch to. Because hosting a terminal panel starts a shell, it also no longer
@@ -129,6 +164,14 @@ point, and walkthrough replay moved out of the title bar.
 
 ### Fixed
 
+- **An ordinary policy-harness shutdown no longer leaks process groups.** Closing
+  the sidecar escalated with a kill aimed at the direct child only, so anything
+  `manvi serve` had forked survived — observed outliving the process that started
+  it, reparented to init. The whole group is now signalled, and signalled in the
+  one order that is safe: while nothing has waited on the pid, because the pid is
+  the group id and a reaped pid may be recycled. A graceful wait that polls
+  `try_wait` reaps as it watches, and so had nothing left to signal by the time
+  it knew the child was gone.
 - **Blame rows now honour the density setting.** Rows carried a fixed 24 px
   height while `VirtualList` positioned them from `rowHeight("blame", …)`, so at
   Compact density every row overhung its 20 px slot and drew over its neighbour.
@@ -138,6 +181,15 @@ point, and walkthrough replay moved out of the title bar.
 
 ### Hardened
 
+- **The Rust suite is a gate again.** Nineteen tests decided their outcome by
+  whether a child process answered inside a deadline, so a busy machine failed
+  them and a quiet one passed; they now assert the property directly, at the seam.
+  The rest of the cascade was not flakiness at all: one test installed a
+  process-global stub-binary override and cleared it on its last line, so a
+  timeout there left every later test in the run pointing at a deleted temporary
+  directory — one slow test presenting as nineteen failures across seven
+  unrelated modules, each of which passed when run alone. The override is now an
+  RAII binding that cannot outlive the test that took it.
 - Native menu main-thread safety and command gate stress test coverage.
 - Serde/TypeScript type sync expanded to 1188 data fields across 169 structs and 225 IPC handlers.
 - Closing a repository tab that holds live shells now asks first, and says how many
