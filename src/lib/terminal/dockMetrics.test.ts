@@ -58,4 +58,11 @@ describe("fitTerminalDockHeight", () => {
     expect(fitTerminalDockHeight(300, 0)).toBe(300);
     expect(fitTerminalDockHeight(10_000, 0)).toBe(TERMINAL_DOCK_MAX_HEIGHT);
   });
+
+  it("lets Expand fill a window taller than the old 900px cap", () => {
+    expect(TERMINAL_DOCK_MAX_HEIGHT).toBeGreaterThan(900);
+    expect(fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, 1400, 0)).toBe(1400);
+    expect(fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, 2000, 0)).toBe(2000);
+    expect(fitTerminalDockHeight(10_000, 3000, 0)).toBe(TERMINAL_DOCK_MAX_HEIGHT);
+  });
 });

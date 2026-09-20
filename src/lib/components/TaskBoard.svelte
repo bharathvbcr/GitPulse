@@ -11,8 +11,9 @@
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import { copyText } from "../desktop/clipboard";
+  import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover } from "../ui/popover";
+  import { popover, restoreFocusTo } from "../ui/popover";
   import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository,
@@ -97,16 +98,7 @@
   let archiveToken = $state(0);
   let unread = $state(0);
   let addMenu = $state(false);
-  /**
-   * Dismissal only, from the shared popover owner: the add-repository menu is
-   * placed by CSS under its own heading, so it has no anchor to clamp.
-   * `onAddMenuKey` takes Escape first whenever the menu has focus; this is the
-   * fallback for focus that has left it.
-   */
-  const addMenuDismissal = {
-    dismiss: { inside: "[data-add-repo]", escape: "bubble" as const },
-    onDismiss: () => { addMenu = false; },
-  };
+  let addRepoTriggerEl: HTMLButtonElement | undefined = $state();
   let adding = $state(false);
   let addMenuEl: HTMLDivElement | undefined = $state();
   let workspaceMemberIds = $state<string[] | null>(null);
@@ -155,6 +147,36 @@
       : repositories.find((r) => r.id === target.id)?.name ?? "Repository";
   });
   const addRepoLabel = $derived(scope.kind === "workspace" ? `Add repository to ${title}` : "Add repository");
+  /**
+   * Portaled and clamped, from the shared popover owner.
+   *
+   * A CSS `absolute` panel under this heading used to live inside the 188px
+   * `.navigator` scroller. `right: 0` plus a 260px width grew the sidebar
+   * sideways and clipped the rows — the menu was a header dropdown, not a
+   * left-rail control. Portal + an element anchor is how every other overlay
+   * on this page escapes a clipping ancestor.
+   *
+   * `onAddMenuKey` takes Escape first whenever the menu has focus; bubble
+   * Escape here is the fallback for focus that has left it.
+   */
+  function closeAddMenu(options?: { restoreFocus?: boolean }) {
+    const opener = addRepoTriggerEl;
+    addMenu = false;
+    if (options?.restoreFocus) restoreFocusTo(opener);
+  }
+  const addMenuDismissal = $derived({
+    anchor: { kind: "element" as const, element: addRepoTriggerEl, gap: 6 },
+    estimate: { width: 280, height: 240 },
+    revision: menuTabs.length + attachable.length,
+    inset: 8,
+    dismiss: {
+      inside: "[data-add-repo], [data-add-repo-popup]",
+      scroll: true,
+      resize: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
+  });
   const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
@@ -323,7 +345,14 @@
     }).catch((cause) => { if (!disposed) catalogError = explainError(cause); });
   });
   $effect(() => {
-    if (addMenu && addMenuEl) addMenuEl.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    if (!addMenu || !addMenuEl) return;
+    // Deferred so the portal has moved the node and the popover has measured
+    // it before we steal focus. A sync focus on a node still in the heading
+    // was fine; a sync focus on a node mid-reparent is not.
+    const id = window.setTimeout(() => {
+      addMenuEl?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    }, 0);
+    return () => clearTimeout(id);
   });
   /** Join these repositories to the workspace scope, if that is where we are. */
   async function attachToScope(ids: string[]) {
@@ -392,6 +421,12 @@
     addMenu = !addMenu;
   }
   function onAddMenuKey(event: KeyboardEvent) {
+    event.stopPropagation();
+    if (event.key === "Tab" || event.key === "Escape") {
+      event.preventDefault();
+      closeAddMenu({ restoreFocus: true });
+      return;
+    }
     const items = [...(event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('[role="menuitem"]')];
     if (items.length === 0) return;
     const index = Math.max(0, items.indexOf(event.target as HTMLElement));
@@ -399,7 +434,6 @@
     else if (event.key === "ArrowUp") { event.preventDefault(); items[(index - 1 + items.length) % items.length]?.focus(); }
     else if (event.key === "Home") { event.preventDefault(); items[0]?.focus(); }
     else if (event.key === "End") { event.preventDefault(); items[items.length - 1]?.focus(); }
-    else if (event.key === "Escape") { event.preventDefault(); addMenu = false; }
   }
   async function moreRepositories() {
     if (!repositoryCursor) return;
@@ -1062,30 +1096,42 @@
       <!-- In a workspace scope this control has a second effect: whatever it
            adds also joins the workspace. It says so rather than leaving the
            membership write to be discovered. -->
-      <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
-        {#if addMenu}
-          <div bind:this={addMenuEl} use:popover={addMenuDismissal} id="task-add-repo-menu" class="add-menu gp-menu" role="menu" aria-label={addRepoLabel} tabindex="-1" style="z-index: {LAYERS.MENU}" onkeydown={onAddMenuKey}>
-            {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
-            {#each menuTabs as tab (tab.path)}
-              <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
-                <span class="add-name">{tab.label}</span>
-                <span class="add-path">{tab.path}</span>
+      <div class="nav-heading" data-add-repo>Repositories<button bind:this={addRepoTriggerEl} type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button></div>
+      {#if addMenu}
+        <div
+          bind:this={addMenuEl}
+          use:portal={"body"}
+          use:popover={addMenuDismissal}
+          id="task-add-repo-menu"
+          data-add-repo-popup
+          data-testid="task-add-repo-menu"
+          class="add-menu gp-menu gp-pop fixed"
+          role="menu"
+          aria-label={addRepoLabel}
+          tabindex="-1"
+          style="z-index: {LAYERS.MENU}"
+          onkeydown={onAddMenuKey}
+        >
+          {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
+          {#each menuTabs as tab (tab.path)}
+            <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
+              <span class="add-name">{tab.label}</span>
+              <span class="add-path">{tab.path}</span>
+            </button>
+          {/each}
+          {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
+          {#if attachable.length}
+            <div class="add-menu-label">Registered</div>
+            {#each attachable as repo (repo.id)}
+              <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
+                <span class="add-name">{repo.name}</span>
               </button>
             {/each}
-            {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
-            {#if attachable.length}
-              <div class="add-menu-label">Registered</div>
-              {#each attachable as repo (repo.id)}
-                <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
-                  <span class="add-name">{repo.name}</span>
-                </button>
-              {/each}
-              {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
-            {/if}
-            <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
-          </div>
-        {/if}
-      </div>
+            {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
+          {/if}
+          <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
+        </div>
+      {/if}
       {#each repositories as repo (repo.id)}<button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>
         {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}</span>
       </button>{/each}
@@ -1489,11 +1535,15 @@
   .navigator .gp-seg-btn > span:not(:global(.gp-liquid-selection)){display:block;overflow:hidden;text-overflow:ellipsis}
   .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;color:rgb(var(--c-text-muted));font-size:10px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
   .nav-heading > button,.icon,.nav-row>button:last-child{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
-  .add-menu{position:absolute;right:0;top:calc(100% + 4px);width:min(260px,70vw);max-height:min(16rem,50vh);overflow:auto}
+  /* Portaled: `fixed` + the popover owner set left/top. Width and height are
+     viewport-capped so a long path or a long registered list cannot grow the
+     panel off the window the way the old 260px-in-188px absolute menu did.
+     `gp-menu`'s overflow:hidden is overridden so the list can scroll. */
+  .add-menu{width:min(20rem,calc(100vw - 16px));max-width:calc(100vw - 16px);max-height:min(20rem,calc(100vh - 16px));overflow:hidden auto;box-sizing:border-box}
   .add-menu-label{padding:4px 8px;font-size:10px;color:rgb(var(--c-text-muted))}
-  .navigator .add-menu button{width:100%;height:auto;padding:6px 8px;white-space:normal;overflow:visible}
-  .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px}
-  .add-name,.add-path{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .add-menu button{width:100%;height:auto;min-width:0;padding:6px 8px;white-space:normal;overflow:visible;text-align:left}
+  .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0}
+  .add-name,.add-path{display:block;min-width:0;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
   .add-path{font-size:10px;color:rgb(var(--c-text-muted))}
   .hint-action{border:0;background:transparent;padding:0;color:rgb(var(--c-accent));font-size:11px}
   .nav-row{display:flex}

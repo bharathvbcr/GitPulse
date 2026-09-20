@@ -6,7 +6,7 @@
  * DevCouncil (`src-tauri/vendored/VENDOR.json` — change it there and
  * re-vendor, never here), its `items.list` accepts exactly `limit`, `cursor`,
  * `workspace_id`, `repository_id`, `status` and `query`, its `items.put`
- * accepts exactly eighteen named fields, and both reject any other field. So
+ * accepts exactly nineteen named fields, and both reject any other field. So
  * "archived" is the `done` status and nothing else, and this module is the
  * one place that says so: the dock, the board's note, the card menu's Archive
  * row and the restore menu all derive from `ARCHIVE_STATUS` rather than

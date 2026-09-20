@@ -40,7 +40,8 @@ const TERMINAL_ARG_BYTES_CAP: usize = 16 * 1024;
 const TERMINAL_ARGV_BYTES_CAP: usize = 128 * 1024;
 /// Interactive terminal resource bounds. The PTY is user-owned, but its IPC
 /// surface must not permit unbounded processes, allocations, or resize work.
-const MAX_PTY_SESSIONS: usize = 16;
+/// Public so frontend contract tests and native stress tests share one number.
+pub const MAX_PTY_SESSIONS: usize = 32;
 const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PTY_ROWS: u16 = 1_000;
 const MAX_PTY_COLS: u16 = 1_000;
@@ -893,6 +894,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let actor_kind = if shell.contains("claude")
         || shell.contains("manvi")
         || shell.contains("codex")
+        || shell.contains("grok")
         || shell.contains("agy")
     {
         crate::ledger::ActorKind::Agent

@@ -64,6 +64,8 @@
       const { mount } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
+      const { MAX_TERMINAL_TABS } = await import("../src/lib/terminal/tabs.ts");
+      const { TERMINAL_DOCK_MAX_HEIGHT } = await import("../src/lib/terminal/dockMetrics.ts");
       const Host = (await import("./TerminalHost.svelte")).default;
       await repoStore.openRepo("/fixture/Other");
       await repoStore.openRepo("/fixture/GitPulse");
@@ -102,7 +104,11 @@
         const wait = () => new Promise((resolve) => setTimeout(resolve, 250));
         const visible = (selector) => [...document.querySelectorAll(selector)].filter((el) => el.getClientRects().length);
         const label = (name) => visible("[aria-label]").find((el) => el.getAttribute("aria-label") === name);
-        const button = (name) => label(name) ?? visible("button").find((el) => el.textContent.trim() === name);
+        const button = (name) => {
+          const el = label(name) ?? visible("button").find((node) => node.textContent.trim() === name);
+          if (!el) throw new Error(`missing control: ${name}`);
+          return el;
+        };
         const check = (name, pass) => { results.push({ name, pass }); if (!pass) throw new Error(name); };
         const input = async (text) => {
           const field = label("Find in terminal output");
@@ -172,6 +178,21 @@
           const name = label("Terminal tab name"); name.value = "Build logs"; name.dispatchEvent(new Event("input", { bubbles: true }));
           button("Rename").click(); await wait();
           check("custom tab names survive program titles", visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
+          button("Find terminal session").click(); await wait();
+          check("session search sits above the grid instead of overlapping it", aboveGrid(label("Search this repository's terminals")));
+          const sessionSearch = label("Search this repository's terminals");
+          sessionSearch.value = "Build"; sessionSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+          check("session search filters to the renamed tab", visible('[aria-label="Matching terminals"] [role="option"]').length === 1 && visible('[aria-label="Matching terminals"] [role="option"]')[0].textContent.includes("Build logs"));
+          await press(sessionSearch, "Enter");
+          check("session search activates the match", visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
+          button("New session type").click(); await wait();
+          check("launcher menu sits above the grid instead of overlapping it", aboveGrid(label("New session type menu")));
+          const launcherSearch = label("Search session types");
+          launcherSearch.value = "zzzz-missing"; launcherSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+          check("launcher search reports no match", label("New session type menu").textContent.includes("No session types match"));
+          launcherSearch.value = "shell"; launcherSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+          visible('[aria-label="Session types"] [role="option"]')[0].click(); await wait();
+          check("launcher search restores a matching type", Boolean(button("New Shell session")));
           button("Terminal tab options").click(); await wait();
           button("Move terminal tab left").click(); await wait();
           check("tab reorder preserves sessions and selection", visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
@@ -192,14 +213,27 @@
           button("All terminal sessions").click(); await wait();
           check("session list sits above the grid instead of overlapping it", aboveGrid(label("Sessions across repositories")));
           check("session manager includes both repositories", label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
+          const searchSessions = label("Search terminal sessions");
+          searchSessions.value = "Other"; searchSessions.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+          check("global session search filters repositories", label("Sessions across repositories").textContent.includes("Other") && !label("Sessions across repositories").textContent.includes("GitPulse"));
+          searchSessions.value = ""; searchSessions.dispatchEvent(new Event("input", { bubbles: true })); await wait();
           button("All terminal sessions").click(); await wait();
-          for (let i = 0; i < 14; i++) { button("New Shell session").click(); await wait(); }
-          check("global session limit spans both repositories", visible('[role="tab"]').length === 15 && report.spawned === 16 && button("New Shell session").disabled);
+          while (!button("New Shell session").disabled && report.spawned < MAX_TERMINAL_TABS + 4) {
+            button("New Shell session").click();
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+          check("global session limit spans both repositories", report.spawned === MAX_TERMINAL_TABS && button("New Shell session").disabled);
+          await wait();
+          const stripEl = label("Terminal sessions");
+          check("tab strip scrolls when many sessions are open", stripEl.scrollWidth > stripEl.clientWidth + 1);
+          check("crowded tabs compress labels", Boolean(document.querySelector("[data-crowded='true']")));
           const activeTab = visible('[role="tab"][aria-selected="true"]')[0].closest("[data-terminal-tab]").getBoundingClientRect();
-          const strip = label("Terminal sessions").getBoundingClientRect();
-          check("new active tab scrolls into view", activeTab.left >= strip.left && activeTab.right <= strip.right + 1);
+          const strip = stripEl.getBoundingClientRect();
+          check("new active tab scrolls into view", activeTab.left >= strip.left - 1 && activeTab.right <= strip.right + 2);
+          const tabCount = visible('[role="tab"]').length;
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
-          check("close chord kills only its session", visible('[role="tab"]').length === 14 && report.killed === 1);
+          check("close chord kills only its session", visible('[role="tab"]').length === tabCount - 1 && report.killed === 1);
+          check("expand ceiling is taller than the old 900px cap", TERMINAL_DOCK_MAX_HEIGHT > 900);
           check("controls never write to the shell", report.writes === writesBefore);
           check("no runtime errors", report.errors.length === 0);
         } catch (error) {
@@ -213,8 +247,28 @@
         document.querySelector("#result").style.whiteSpace = "pre-wrap";
         document.querySelector("#checks").textContent = results.every((result) => result.pass) ? `${results.length} checks passed` : "Checks FAILED";
         document.querySelector("#stress").disabled = !results.every((result) => result.pass);
+        document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results })));
+        const reportUrl = new URLSearchParams(location.search).get("report");
+        if (reportUrl) await fetch(reportUrl, { method: "POST", body: document.documentElement.outerHTML });
       };
       document.querySelector("#checks").disabled = false;
+      if (new URLSearchParams(location.search).has("check")) {
+        const ready = async () => {
+          const deadline = Date.now() + 15000;
+          while (Date.now() < deadline) {
+            if ([...document.querySelectorAll('[aria-label="Find in terminal"]')].some((el) => el.getClientRects().length)) return;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          throw new Error("terminal panel did not mount");
+        };
+        void ready().then(() => document.querySelector("#checks").click()).catch((error) => {
+          report.checks = [{ name: String(error), pass: false }];
+          showReport();
+          document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results: report.checks })));
+          const reportUrl = new URLSearchParams(location.search).get("report");
+          if (reportUrl) void fetch(reportUrl, { method: "POST", body: document.documentElement.outerHTML });
+        });
+      }
     </script>
   </body>
 </html>

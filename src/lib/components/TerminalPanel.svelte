@@ -34,6 +34,7 @@
     Settings2,
     ChevronLeft,
     ChevronRight,
+    ChevronsUpDown,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -61,6 +62,18 @@
     type LauncherKind,
     type TabState,
   } from "../terminal/tabs";
+  import {
+    crowdedTabStrip,
+    filterLaunchers,
+    filterSessionRecords,
+    filterTerminalTabs,
+    stepSearchIndex,
+  } from "../terminal/tabSearch";
+  import {
+    applyHorizontalScrollDelta,
+    scrollChildIntoHorizontalView,
+    verticalWheelToHorizontalDelta,
+  } from "../dom/overflowHint";
 
   /** The shared wire shape; aliased for this panel's existing call sites. */
   type TerminalRunResponse = TerminalRunResult;
@@ -144,6 +157,15 @@
   let splitIds = $state<[string, string] | null>(null);
   let tabOptions = $state(false);
   let sessionListOpen = $state(false);
+  let sessionSearchOpen = $state(false);
+  let launcherMenuOpen = $state(false);
+  let sessionQuery = $state("");
+  let sessionListQuery = $state("");
+  let launcherQuery = $state("");
+  let sessionHighlight = $state(0);
+  let launcherHighlight = $state(0);
+  let sessionSearchInput = $state<HTMLInputElement | null>(null);
+  let launcherSearchInput = $state<HTMLInputElement | null>(null);
   let renameValue = $state("");
   let tabStatuses = $state<Record<string, string>>({});
   let unread = $state(new Set<string>());
@@ -151,6 +173,110 @@
   const capacityTitle = $derived(canCreate ? "New terminal session" : `All ${MAX_TERMINAL_TABS} terminal sessions are open — close one in Sessions`);
   let shortcutsOpen = $state(false);
   let focusTabStrip = false;
+  const tabExtras = $derived.by(() => {
+    const extras: Record<string, { status?: string; unread?: boolean }> = {};
+    for (const tab of tabState.tabs) {
+      extras[tab.id] = { status: tabStatuses[tab.id], unread: unread.has(tab.id) };
+    }
+    return extras;
+  });
+  const filteredTabs = $derived(filterTerminalTabs(tabState.tabs, sessionQuery, tabExtras));
+  const filteredSessions = $derived(filterSessionRecords($terminalSessions, sessionListQuery));
+  const filteredLaunchers = $derived(filterLaunchers(LAUNCHERS, launcherQuery));
+
+  function closeChrome() {
+    tabOptions = false;
+    sessionListOpen = false;
+    shortcutsOpen = false;
+    sessionSearchOpen = false;
+    launcherMenuOpen = false;
+  }
+
+  function openSessionSearch() {
+    sessionQuery = "";
+    const activeIndex = tabState.tabs.findIndex((tab) => tab.id === activeId);
+    sessionHighlight = activeIndex >= 0 ? activeIndex : 0;
+    closeChrome();
+    sessionSearchOpen = true;
+    void tick().then(() => sessionSearchInput?.focus());
+  }
+
+  function openLauncherMenu() {
+    launcherQuery = "";
+    launcherHighlight = Math.max(0, LAUNCHERS.findIndex((launcher) => launcher.kind === nextLauncher));
+    closeChrome();
+    launcherMenuOpen = true;
+    void tick().then(() => launcherSearchInput?.focus());
+  }
+
+  function chooseLauncher(kind: LauncherKind) {
+    nextLauncher = kind;
+    interfaceStore.setTerminalLauncher(kind);
+    launcherMenuOpen = false;
+  }
+
+  function chooseSearchedTab(id: string) {
+    sessionSearchOpen = false;
+    selectTab(id);
+  }
+
+  function handleSessionSearchKey(event: KeyboardEvent) {
+    if (isImeComposition(event)) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      sessionHighlight = stepSearchIndex(filteredTabs.length, sessionHighlight, event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const tab = filteredTabs[sessionHighlight] ?? filteredTabs[0];
+      if (tab) chooseSearchedTab(tab.id);
+    }
+  }
+
+  function handleLauncherSearchKey(event: KeyboardEvent) {
+    if (isImeComposition(event)) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      launcherHighlight = stepSearchIndex(filteredLaunchers.length, launcherHighlight, event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const launcher = filteredLaunchers[launcherHighlight] ?? filteredLaunchers[0];
+      if (launcher) chooseLauncher(launcher.kind);
+    }
+  }
+
+  $effect(() => {
+    const length = filteredTabs.length;
+    untrack(() => {
+      if (length <= 0) sessionHighlight = 0;
+      else if (sessionHighlight >= length) sessionHighlight = length - 1;
+    });
+  });
+
+  $effect(() => {
+    const length = filteredLaunchers.length;
+    untrack(() => {
+      if (length <= 0) launcherHighlight = 0;
+      else if (launcherHighlight >= length) launcherHighlight = length - 1;
+    });
+  });
+
+  $effect(() => {
+    const scroller = tabScroller;
+    if (!scroller) return;
+    const onWheel = (event: WheelEvent) => {
+      const delta = verticalWheelToHorizontalDelta(event);
+      if (delta === null) return;
+      if (scroller.scrollWidth <= scroller.clientWidth + 0.5) return;
+      event.preventDefault();
+      scroller.scrollLeft = applyHorizontalScrollDelta(scroller, delta);
+    };
+    scroller.addEventListener("wheel", onWheel, { passive: false });
+    return () => scroller.removeEventListener("wheel", onWheel);
+  });
 
   $effect(() => {
     const request = $taskTerminalRequests.find((request) => request.repoPath === repoPath);
@@ -249,8 +375,8 @@
 
   function handlePanelKey(event: KeyboardEvent) {
     if (!visible || event.defaultPrevented) return;
-    if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || shortcutsOpen)) {
-      tabOptions = false; sessionListOpen = false; shortcutsOpen = false;
+    if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || shortcutsOpen || sessionSearchOpen || launcherMenuOpen)) {
+      closeChrome();
       event.preventDefault(); event.stopPropagation();
       if (activeId) sessions[activeId]?.reveal();
       return;
@@ -299,7 +425,15 @@
     const scroller = tabScroller;
     void tick().then(() => {
       if (!visible || mode !== "shell" || activeId !== id) return;
-      scroller?.querySelector(`[data-terminal-tab="${id}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      const node = scroller?.querySelector(`[data-terminal-tab="${id}"]`);
+      if (scroller && node instanceof HTMLElement) {
+        const strip = scroller.getBoundingClientRect();
+        const tab = node.getBoundingClientRect();
+        scroller.scrollLeft = scrollChildIntoHorizontalView(scroller, {
+          offsetLeft: tab.left - strip.left + scroller.scrollLeft,
+          offsetWidth: tab.width,
+        });
+      }
     });
   });
 
@@ -314,8 +448,9 @@
 
   function showTabOptions() {
     renameValue = tabState.tabs.find((tab) => tab.id === activeId)?.name ?? "";
-    tabOptions = !tabOptions;
-    sessionListOpen = false; shortcutsOpen = false;
+    const next = !tabOptions;
+    closeChrome();
+    tabOptions = next;
   }
 
   function saveTabName(event: SubmitEvent) {
@@ -543,8 +678,8 @@
           <span>Clear</span>
         </button>
       {/if}
-      <button type="button" class="gp-icon-btn text-[10px]!" aria-label="All terminal sessions" aria-expanded={sessionListOpen} title="Sessions across repositories" onclick={() => { sessionListOpen = !sessionListOpen; tabOptions = false; shortcutsOpen = false; }}>{$terminalSessions.length}/{MAX_TERMINAL_TABS}</button>
-      <button type="button" class="gp-icon-btn" aria-label="Terminal shortcuts" aria-expanded={shortcutsOpen} title="Terminal shortcuts" onclick={() => { shortcutsOpen = !shortcutsOpen; tabOptions = false; sessionListOpen = false; }}><Keyboard size={13} /></button>
+      <button type="button" class="gp-icon-btn text-[10px]!" aria-label="All terminal sessions" aria-expanded={sessionListOpen} title="Sessions across repositories" onclick={() => { const next = !sessionListOpen; closeChrome(); sessionListOpen = next; }}>{$terminalSessions.length}/{MAX_TERMINAL_TABS}</button>
+      <button type="button" class="gp-icon-btn" aria-label="Terminal shortcuts" aria-expanded={shortcutsOpen} title="Terminal shortcuts" onclick={() => { const next = !shortcutsOpen; closeChrome(); shortcutsOpen = next; }}><Keyboard size={13} /></button>
       {#if onToggleExpanded}
         <button type="button" class="gp-icon-btn" aria-label={expanded ? "Restore terminal size" : "Expand terminal"} title={expanded ? "Restore terminal size" : "Expand terminal"} onclick={onToggleExpanded}>
           {#if expanded}<Minimize2 size={13} />{:else}<Maximize2 size={13} />{/if}
@@ -558,13 +693,22 @@
 
   {#if sessionListOpen}
     <div class="terminal-popover px-3 py-2 overflow-auto border-b border-border/60 gp-section-edge bg-surface text-[11px]" aria-label="Sessions across repositories">
-      {#each $terminalSessions as session (session.key)}
+      <input
+        type="search"
+        aria-label="Search terminal sessions"
+        placeholder="Search sessions"
+        bind:value={sessionListQuery}
+        maxlength="128"
+        class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
+      />
+      {#each filteredSessions as session (session.key)}
         <div class="flex gap-2 items-center py-0.5">
           <span class="flex-1 min-w-0 truncate" title={session.repoPath}>{session.repoPath.split(/[\\/]/).pop()} · {session.label} · {session.status}</span>
           <button type="button" class="gp-btn py-0!" onclick={() => session.close().catch((error: unknown) => (validationError = formatError(error)))}>Close session</button>
         </div>
+      {:else}
+        <span>{$terminalSessions.length ? "No sessions match." : "No active processes."}</span>
       {/each}
-      {#if !$terminalSessions.length}<span>No active processes.</span>{/if}
     </div>
   {/if}
   {#if shortcutsOpen}
@@ -577,6 +721,7 @@
       <span><kbd>Esc</kbd> Close find</span>
       <span><kbd>{platformChord("⌘ + / − / 0", "Ctrl+Shift+ + / − / 0", $hostPlatform.os)}</kbd> Text size</span>
       <span><kbd>← / → / Home / End</kbd> Navigate focused tabs</span>
+      <span>Find session searches this repository's tabs. All terminal sessions searches across repositories.</span>
       <span>Shell commands run outside the MANVI gate. Console git commands are MANVI-gated.</span>
     </div>
   {/if}
@@ -585,8 +730,9 @@
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-9 border-b border-border/60 gp-section-edge bg-surface/40"
+      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0 border-b border-border/60 gp-section-edge bg-surface/40"
       class:hidden={mode !== "shell"}
+      data-crowded={crowdedTabStrip(tabState.tabs.length) ? "true" : "false"}
     >
       <!-- Only the tabs scroll. The launcher group sat inside the scroller
            behind an `ml-auto`, so past a handful of tabs the way to open one
@@ -594,7 +740,8 @@
       <div class="relative flex-1 min-w-0 self-stretch">
       <div
         bind:this={tabScroller}
-        class="h-full flex items-stretch gap-1 overflow-x-auto"
+        data-terminal-tab-scroller
+        class="terminal-tab-scroller h-full flex items-stretch gap-1 overflow-x-auto overflow-y-hidden"
         role="tablist"
         aria-label="Terminal sessions"
       >
@@ -613,7 +760,7 @@
             aria-controls={`terminal-pane-${tab.id}`}
             aria-selected={tab.id === tabState.activeId}
             tabindex={tab.id === tabState.activeId ? 0 : -1}
-            class="max-w-56 truncate"
+            class="terminal-tab-label truncate"
             onclick={() => selectTab(tab.id)}
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
@@ -636,16 +783,77 @@
       </div>
 
       <div class="flex items-center gap-1 shrink-0 border-l border-border/60 pl-2">
+        <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label={splitIds ? "Close split view" : "Split terminal"} aria-pressed={Boolean(splitIds)} disabled={!activeId || (tabState.tabs.length < 2 && !canCreate)} onclick={toggleSplit}><Columns2 size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
-        <select bind:value={nextLauncher} onchange={() => interfaceStore.setTerminalLauncher(nextLauncher)} aria-label="New session type" class="max-w-24 bg-surface text-textPrimary text-[11px] rounded px-1 py-0.5 border border-border/60">
-          {#each LAUNCHERS as launcher (launcher.kind)}
-            <option value={launcher.kind}>{launcher.label}</option>
-          {/each}
-        </select>
+        <button type="button" class="gp-btn py-0! px-1.5! text-[11px]! max-w-28 truncate" aria-label="New session type" aria-expanded={launcherMenuOpen} title="Choose what the next session runs" onclick={() => launcherMenuOpen ? closeChrome() : openLauncherMenu()}>
+          {launcherLabel(nextLauncher)}
+          <ChevronDown size={11} />
+        </button>
         <button type="button" class="gp-icon-btn" disabled={!repoPath || !canCreate} onclick={() => newTab(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
       </div>
     </div>
+
+    {#if sessionSearchOpen && mode === "shell"}
+      <div class="terminal-popover px-3 py-2 border-b border-border/60 gp-section-edge bg-surface" aria-label="Find terminal session">
+        <input
+          bind:this={sessionSearchInput}
+          type="search"
+          aria-label="Search this repository's terminals"
+          placeholder="Search this repository's terminals"
+          bind:value={sessionQuery}
+          maxlength="128"
+          onkeydown={handleSessionSearchKey}
+          class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
+        />
+        <div class="max-h-40 overflow-auto" role="listbox" aria-label="Matching terminals">
+          {#each filteredTabs as tab, index (tab.id)}
+            <button
+              type="button"
+              role="option"
+              aria-selected={index === sessionHighlight}
+              class="flex w-full items-center gap-2 py-0.5 px-1 rounded text-left {index === sessionHighlight ? 'bg-accent/15 text-textPrimary' : 'text-textMuted hover:bg-surfaceHover'}"
+              onclick={() => chooseSearchedTab(tab.id)}
+            >
+              <span class="flex-1 min-w-0 truncate">{tabLabel(tab)}</span>
+              <span class="shrink-0 text-[10px]">{launcherLabel(tab.launcher)}{#if tabStatuses[tab.id] === "exited"} · Ended{:else if tabStatuses[tab.id] === "error"} · Error{/if}{#if unread.has(tab.id)} · Unread{/if}</span>
+            </button>
+          {:else}
+            <span class="text-textMuted">No terminals match.</span>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    {#if launcherMenuOpen && mode === "shell"}
+      <div class="terminal-popover px-3 py-2 border-b border-border/60 gp-section-edge bg-surface" aria-label="New session type menu">
+        <input
+          bind:this={launcherSearchInput}
+          type="search"
+          aria-label="Search session types"
+          placeholder="Search session types"
+          bind:value={launcherQuery}
+          maxlength="128"
+          onkeydown={handleLauncherSearchKey}
+          class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
+        />
+        <div class="max-h-40 overflow-auto" role="listbox" aria-label="Session types">
+          {#each filteredLaunchers as launcher, index (launcher.kind)}
+            <button
+              type="button"
+              role="option"
+              aria-selected={launcher.kind === nextLauncher}
+              class="flex w-full items-center py-0.5 px-1 rounded text-left {index === launcherHighlight ? 'bg-accent/15 text-textPrimary' : 'text-textMuted hover:bg-surfaceHover'}"
+              onclick={() => chooseLauncher(launcher.kind)}
+            >
+              {launcher.label}
+            </button>
+          {:else}
+            <span class="text-textMuted">No session types match.</span>
+          {/each}
+        </div>
+      </div>
+    {/if}
 
     {#if tabOptions && mode === "shell" && activeId}
       <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 border-b border-border/60 gp-section-edge bg-surface" onsubmit={saveTabName}>
@@ -869,6 +1077,7 @@
           bind:value={commandInput}
           onkeydown={handleKeyDown}
           type="text"
+          aria-label="Console command"
           placeholder="Enter command (e.g. git status, npm test, cargo update)..."
           disabled={running}
           class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden disabled:opacity-50"
@@ -898,6 +1107,12 @@
      the panes made the prompt and these bars share pixels. Find already
      takes a row; shortcuts, sessions, and tab options do the same. */
   .terminal-popover { flex-shrink: 0; max-height: 40%; overflow: auto; }
+  .terminal-tab-scroller {
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+  }
+  .terminal-tab-label { max-width: 14rem; }
+  [data-crowded="true"] .terminal-tab-label { max-width: 7rem; }
   .terminal-panes { container-type: inline-size; overflow: auto; }
   /* Keep a readable grid after Find, warnings, popovers, and the footer
      take their space. Short docks scroll their panes instead of crushing

@@ -36,6 +36,8 @@ describe("CoverageViewer", () => {
     expect(body).toContain("Run in Claude Code");
     expect(body).toContain("Coverage coding agent");
     expect(body).toContain("Codex");
+    expect(body).toContain("Grok");
+    expect(body).toContain("Antigravity");
     expect(body).toContain("Preview prompt");
   });
 });

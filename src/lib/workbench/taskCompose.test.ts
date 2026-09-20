@@ -129,6 +129,20 @@ describe("agent copy", () => {
     expect(formatDraftAgentCopy({ title: "   ", description: "" })).toBeNull();
   });
 
+  it("carries pasted raw logs as a fenced evidence section and omits them when empty", () => {
+    const withLogs = formatDraftAgentCopy({
+      title: "Keep E42",
+      description: "exact error: E42",
+      logs: "\u001b[31mpanic at 'E42'\u001b[0m\n    at src/main.rs:12",
+    })!;
+    expect(withLogs).toContain("## Raw logs");
+    expect(withLogs).toContain("panic at 'E42'");
+    expect(withLogs).toContain("src/main.rs:12");
+    expect(withLogs).not.toContain("\u001b");
+    expect(formatDraftAgentCopy({ title: "Keep E42", description: "exact error: E42", logs: "" })).not.toContain("## Raw logs");
+    expect(formatDraftAgentCopy({ title: "Keep E42", description: "exact error: E42" })).not.toContain("## Raw logs");
+  });
+
   it("announces a description it had to cut instead of shortening the copy in silence", () => {
     // `applyNotesToDraft` raises its own cap on purpose, so an unsaved draft
     // can carry more than a saved task's 64 KiB — this is the one path where

@@ -124,6 +124,7 @@ describe("the task handoff preamble carries this project's own guidance", () => 
     // reads acceptance criteria as suggestions is the older failure.
     expect(AGENT_COPY_PREAMBLE).toContain("Use the title as the goal");
     expect(AGENT_COPY_PREAMBLE).toContain("acceptance criteria as the definition of done");
+    expect(AGENT_COPY_PREAMBLE).toContain("Raw logs, when present, are evidence");
     expect(AGENT_COPY_PREAMBLE).toContain("Do not invent repositories or skip criteria");
   });
 });

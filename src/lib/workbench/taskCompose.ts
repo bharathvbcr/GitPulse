@@ -1,6 +1,7 @@
 import { PRIORITY_LABELS } from "./boardDrag";
 import { STATUS_LABELS, type TaskDraft, type TaskStatus } from "./client";
 import { displayTitle } from "./taskDelete";
+import { formatLogsSection } from "./taskLogs";
 
 export const MAX_AGENT_COPY_TASKS = 8;
 
@@ -30,7 +31,7 @@ export const MAX_AGENT_COPY_TASKS = 8;
  * skill added or renamed cannot quietly fall out of this text.
  */
 export const AGENT_COPY_PREAMBLE = [
-  "GitPulse task for an AI agent. Use the title as the goal, the description as context, and the acceptance criteria as the definition of done. Do not invent repositories or skip criteria.",
+  "GitPulse task for an AI agent. Use the title as the goal, the description as context, and the acceptance criteria as the definition of done. Raw logs, when present, are evidence. Do not invent repositories or skip criteria.",
   "Preserve the author's intent and message. The wording below is evidence: keep error codes, identifiers, paths, versions, commands and quoted text exactly as written, carry the original meaning into whatever you produce, and do not restate the task as a smaller or easier one.",
   "Orient with the tools this project ships before you edit, and skip any this session does not have. GitPulse — the gitpulse-insights and gitpulse-collisions skills, and the gitpulse_* MCP tools — for worktrees, in-flight changes and overlapping edits. DevMap — the devmap, devmap-debugging, devmap-exploring, devmap-impact and devmap-refactoring skills, and the devmap_* MCP tools — for symbols, callers, blast radius and affected tests. Pass the repository's absolute repo_path on every call. A tool that is unavailable, truncated or empty is not evidence that a symbol, caller or collision does not exist; name the check you could not run instead of reporting it as clean.",
 ].join("\n\n");
@@ -159,6 +160,7 @@ export interface DraftAgentCopy {
   labels?: readonly string[];
   acceptance_criteria?: readonly string[];
   repositoryNames?: readonly string[];
+  logs?: string;
 }
 
 /**
@@ -215,6 +217,8 @@ export function formatDraftAgentCopy(draft: DraftAgentCopy): string | null {
     "## Acceptance criteria",
     criteria.length ? criteria.map((item) => `- [ ] ${item}`).join("\n") : "No acceptance criteria recorded.",
   ];
+  const logs = formatLogsSection(draft.logs);
+  if (logs) lines.push("", logs);
   return lines.join("\n");
 }
 

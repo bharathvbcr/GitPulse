@@ -47,8 +47,14 @@ import {
  */
 export const MAX_TICKS = 160;
 
-/** The smallest tick that is still visible on a 400px strip. */
-const MIN_TICK_PCT = 0.9;
+/**
+ * The smallest tick that is still visible on a 400px strip.
+ *
+ * Exported because the blame age rail is the same strip at the same size and
+ * has to floor its marks the same way; two spellings of "visible" would be
+ * corrected on one rail and not the other.
+ */
+export const MIN_TICK_PCT = 0.9;
 
 /**
  * Buckets `tones` into ticks.

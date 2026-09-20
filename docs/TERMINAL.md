@@ -1,18 +1,25 @@
 # Terminal
 
 Open the dock with **Ctrl+`**. It stays below the current view; **Expand terminal**
-gives it more room and **Restore terminal size** returns to its previous height.
-Hiding the dock or switching repositories preserves its shells. Closing a terminal
-tab terminates that session; closing a repository tab closes its terminal sessions.
+gives it as much of the window as will fit (up to 2400px) and **Restore terminal
+size** returns to its previous height. Dragging the splitter can also grow past
+the old 900px cap. Hiding the dock or switching repositories preserves its shells.
+Closing a terminal tab terminates that session; closing a repository tab closes
+its terminal sessions.
 
 A Manvi session is the wrap around DevCouncil components (policy, agent hosting). GitPulse uses it here without requiring the rest of the DevCouncil suite.
 
-Choose Shell, Claude, Manvi, or Codex in **New session type**, then press **+**.
-Each repository keeps its own tabs. The tab strip scrolls to the selected tab.
-The application allows 16 concurrent sessions across repositories, including
-starts and closes still in flight. **All terminal sessions** shows their repository,
-launcher, and status, and lets you close a session to free capacity. A failed close
-stays listed with an explicit retry; it does not silently release a live process.
+Choose a session type in **New session type** (searchable), then press **+**.
+Each repository keeps its own tabs. The tab strip scrolls horizontally — including
+with a vertical wheel — and compresses labels once more than four tabs are open.
+**Find terminal session** searches this repository's tabs. **All terminal sessions**
+searches across repositories, shows launcher and status, and lets you close a
+session to free capacity. A failed close stays listed with an explicit retry; it
+does not silently release a live process.
+
+The application allows 32 concurrent sessions across repositories, including
+starts and closes still in flight. **Expand terminal** can use the window height
+up to 2400px; **Restore terminal size** returns to the previous height.
 
 Use **Terminal tab options** to rename a tab, move it left or right, copy selected
 text, copy retained output, or export retained output through a native save dialog.

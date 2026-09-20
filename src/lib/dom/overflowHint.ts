@@ -109,6 +109,56 @@ export function scrollOverflowBy(
 }
 
 /**
+ * Map a vertical wheel onto a horizontal scroller.
+ *
+ * Trackpads and mice report vertical deltas even when the pointer is over a
+ * row that only scrolls on X. Returning null leaves the event to the browser
+ * (already-horizontal wheels, or a strip that does not overflow).
+ */
+export function verticalWheelToHorizontalDelta(event: {
+  deltaX: number;
+  deltaY: number;
+}): number | null {
+  if (!Number.isFinite(event.deltaX) || !Number.isFinite(event.deltaY)) return null;
+  if (Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return null;
+  if (event.deltaY === 0) return null;
+  return event.deltaY;
+}
+
+export function applyHorizontalScrollDelta(
+  el: { scrollLeft: number; scrollWidth: number; clientWidth: number },
+  delta: number,
+): number {
+  const view = finiteNonNegative(el.clientWidth);
+  const size = finiteNonNegative(el.scrollWidth);
+  const max = Math.max(0, size - view);
+  const pos = Number.isFinite(el.scrollLeft) ? el.scrollLeft : 0;
+  if (!Number.isFinite(delta) || max <= SCROLL_EPS) return pos;
+  return Math.min(max, Math.max(0, pos + delta));
+}
+
+/**
+ * The smallest scrollLeft that keeps `child` fully inside the scroller.
+ * `scrollIntoView` can pan a parent instead of this strip; this cannot.
+ */
+export function scrollChildIntoHorizontalView(
+  scroller: { scrollLeft: number; clientWidth: number; scrollWidth: number },
+  child: { offsetLeft: number; offsetWidth: number },
+): number {
+  const view = finiteNonNegative(scroller.clientWidth);
+  const size = finiteNonNegative(scroller.scrollWidth);
+  const max = Math.max(0, size - view);
+  const left = finiteNonNegative(child.offsetLeft);
+  const width = finiteNonNegative(child.offsetWidth);
+  const right = left + width;
+  const start = Number.isFinite(scroller.scrollLeft) ? scroller.scrollLeft : 0;
+  if (view <= 0) return start;
+  if (left < start) return Math.min(max, left);
+  if (right > start + view) return Math.min(max, Math.max(0, right - view));
+  return Math.min(max, Math.max(0, start));
+}
+
+/**
  * Live overflow for a DOM scroller. Resize of the scroller or its direct
  * children, plus childList mutations (virtual-list spacers), all retrigger
  * the same read. Scroll is coalesced to animation frames so a trackpad

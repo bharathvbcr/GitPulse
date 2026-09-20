@@ -27,11 +27,11 @@
  * is exactly the change a preference must not be able to make on its own.
  */
 
-import { PERMISSION_MODES, type PermissionMode, type RunKind } from "./vocabulary";
+import { asAgentProvider, PERMISSION_MODES, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
 
-export type AgentProvider = "claude" | "codex";
+export type { AgentProvider };
 
 export interface HandoffSettings {
   provider: AgentProvider;
@@ -57,7 +57,7 @@ export function defaultHandoff(): HandoffSettings {
 }
 
 export function isAgentProvider(value: unknown): value is AgentProvider {
-  return value === "claude" || value === "codex";
+  return asAgentProvider(value) !== null;
 }
 
 export function isRunKind(value: unknown): value is RunKind {
@@ -85,7 +85,7 @@ export function sanitizeHandoff(value: unknown): HandoffSettings {
   return { provider, kind, permission };
 }
 
-/** Only Codex has a managed connection today; Claude Code is terminal-only. */
+/** Only Codex has a managed connection today; Claude Code, Grok and Antigravity are terminal-only. */
 export function supportsManaged(provider: AgentProvider): boolean {
   return provider === "codex";
 }
@@ -120,7 +120,12 @@ export function reconcileHandoff(settings: HandoffSettings): HandoffSettings {
 export const PROVIDER_LABELS: Record<AgentProvider, string> = {
   claude: "Claude Code",
   codex: "Codex",
+  grok: "Grok",
+  agy: "Antigravity",
 };
+
+/** Display order on the handoff control. Codex first because it is the default. */
+export const PROVIDER_CHOICES: readonly AgentProvider[] = ["codex", "claude", "grok", "agy"];
 
 export function describeHandoff(settings: HandoffSettings): string {
   const connection = settings.kind === "managed" ? "managed" : "terminal";

@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   EMPTY_OVERFLOW_HINT,
+  applyHorizontalScrollDelta,
   overflowNudge,
   readOverflowHint,
   resolveOverflowHint,
+  scrollChildIntoHorizontalView,
   scrollOverflowBy,
+  verticalWheelToHorizontalDelta,
   type OverflowBox,
   type OverflowScroller,
 } from "./overflowHint";
@@ -124,5 +127,68 @@ describe("overflowNudge / scrollOverflowBy", () => {
       top: -64,
       behavior: "auto",
     });
+  });
+});
+
+describe("verticalWheelToHorizontalDelta", () => {
+  it("maps a dominant vertical wheel onto X and leaves a horizontal one alone", () => {
+    expect(verticalWheelToHorizontalDelta({ deltaX: 0, deltaY: 40 })).toBe(40);
+    expect(verticalWheelToHorizontalDelta({ deltaX: 0, deltaY: -12 })).toBe(-12);
+    expect(verticalWheelToHorizontalDelta({ deltaX: 30, deltaY: 10 })).toBeNull();
+    expect(verticalWheelToHorizontalDelta({ deltaX: 8, deltaY: 8 })).toBeNull();
+    expect(verticalWheelToHorizontalDelta({ deltaX: 0, deltaY: 0 })).toBeNull();
+  });
+
+  it("fails closed on non-finite deltas", () => {
+    expect(verticalWheelToHorizontalDelta({ deltaX: Number.NaN, deltaY: 10 })).toBeNull();
+    expect(verticalWheelToHorizontalDelta({ deltaX: 0, deltaY: Number.POSITIVE_INFINITY })).toBeNull();
+  });
+});
+
+describe("applyHorizontalScrollDelta", () => {
+  const scroller = (partial: Partial<{ scrollLeft: number; scrollWidth: number; clientWidth: number }>) => ({
+    scrollLeft: 0,
+    scrollWidth: 800,
+    clientWidth: 200,
+    ...partial,
+  });
+
+  it("clamps to the scrollable range", () => {
+    expect(applyHorizontalScrollDelta(scroller({}), 50)).toBe(50);
+    expect(applyHorizontalScrollDelta(scroller({ scrollLeft: 580 }), 50)).toBe(600);
+    expect(applyHorizontalScrollDelta(scroller({ scrollLeft: 10 }), -50)).toBe(0);
+  });
+
+  it("does not move a strip that does not overflow", () => {
+    expect(applyHorizontalScrollDelta(scroller({ scrollWidth: 200, clientWidth: 200 }), 80)).toBe(0);
+  });
+
+  it("fails closed on hostile measurements", () => {
+    expect(applyHorizontalScrollDelta(scroller({ scrollLeft: Number.NaN }), 40)).toBe(40);
+    expect(applyHorizontalScrollDelta(scroller({}), Number.NaN)).toBe(0);
+    expect(applyHorizontalScrollDelta(scroller({ scrollWidth: Number.POSITIVE_INFINITY }), 40)).toBe(0);
+  });
+});
+
+describe("scrollChildIntoHorizontalView", () => {
+  it("pans just enough to reveal a child past either edge", () => {
+    const strip = { scrollLeft: 0, clientWidth: 200, scrollWidth: 800 };
+    expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 0, offsetWidth: 80 })).toBe(0);
+    expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 250, offsetWidth: 80 })).toBe(130);
+    expect(scrollChildIntoHorizontalView({ ...strip, scrollLeft: 400 }, { offsetLeft: 0, offsetWidth: 80 })).toBe(0);
+  });
+
+  it("does not overscroll a strip that is already showing the child", () => {
+    const strip = { scrollLeft: 100, clientWidth: 200, scrollWidth: 800 };
+    expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 120, offsetWidth: 40 })).toBe(100);
+  });
+
+  it("fails closed on hostile geometry", () => {
+    expect(
+      scrollChildIntoHorizontalView(
+        { scrollLeft: Number.NaN, clientWidth: 0, scrollWidth: 800 },
+        { offsetLeft: 400, offsetWidth: 80 },
+      ),
+    ).toBe(0);
   });
 });

@@ -5,7 +5,8 @@
   import type { CoverageReport } from "../coverage/types";
   import { copyText } from "../desktop/clipboard";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
+  import { PROMPT_LAUNCHERS, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
+  import { PROVIDER_LABELS } from "../workbench/taskHandoff";
   import { formatError } from "../ui/formatError";
 
   let { repoPath, report, exclusions = [], scanFailed = false, focus, selectedScope = $bindable(false), onRescan, scanning = false }: {
@@ -95,9 +96,9 @@
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <select aria-label="Coverage coding agent" bind:value={launcher} class="rounded border border-border bg-background px-2 py-1 text-[11px] text-textPrimary">
-        <option value="claude">Claude Code</option><option value="codex">Codex</option>
+        {#each PROMPT_LAUNCHERS as kind (kind)}<option value={kind}>{PROVIDER_LABELS[kind]}</option>{/each}
       </select>
-      <button type="button" class="gp-btn-primary py-1! px-2.5! text-[11px]!" aria-label={`Run in ${launcher === "claude" ? "Claude Code" : "Codex"}`} disabled={!repoPath || launching} onclick={() => void runAgent(launcher)}>
+      <button type="button" class="gp-btn-primary py-1! px-2.5! text-[11px]!" aria-label={`Run in ${PROVIDER_LABELS[launcher]}`} disabled={!repoPath || launching} onclick={() => void runAgent(launcher)}>
         {#if launching}<LoaderCircle size={12} class="animate-spin" />{:else}<Terminal size={12} />{/if} {actionLabel}
       </button>
       <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={!repoPath || copying} onclick={() => void copyPrompt()} aria-label={copied ? "Agent prompt copied" : "Copy agent prompt"}>
@@ -114,7 +115,7 @@
   {/if}
   {#if recentSession}
     <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
-      <span class="text-textMuted">{recentSession.launcher === "claude" ? "Claude Code" : "Codex"} session: {recentSession.status}</span>
+      <span class="text-textMuted">{PROVIDER_LABELS[recentSession.launcher]} session: {recentSession.status}</span>
       <button type="button" class="gp-btn py-0.5! px-2!" onclick={() => { interfaceStore.setTerminalDockOpen(true); recentSession?.reveal(); }}>View agent session</button>
       <button type="button" class="gp-btn py-0.5! px-2!" disabled={scanning} onclick={onRescan}><RefreshCw size={11} /> Rescan results</button>
       <span class="text-textMuted">Session status does not verify coverage. Rescan after the report is written.</span>

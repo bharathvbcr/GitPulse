@@ -116,9 +116,19 @@ describe("TerminalPanel tab strip", () => {
     // The old pills called selectLauncher, which killed the running shell to
     // start the chosen CLI in its place — switching cost you your session.
     expect(source).not.toContain("selectLauncher");
-    expect(source).toContain("{#each LAUNCHERS as launcher (launcher.kind)}");
-    expect(source).toContain("<option value={launcher.kind}>{launcher.label}</option>");
+    expect(source).toContain("{#each filteredLaunchers as launcher, index (launcher.kind)}");
     expect(source).toContain("onclick={() => newTab(nextLauncher)}");
+    expect(source).toContain("openLauncherMenu");
+  });
+
+  it("keeps a searchable session switcher and a scrolling tab strip", () => {
+    expect(source).toContain('aria-label="Find terminal session"');
+    expect(source).toContain("filterTerminalTabs");
+    expect(source).toContain("data-terminal-tab-scroller");
+    expect(source).toContain("overflow-x-auto overflow-y-hidden");
+    expect(source).toContain("verticalWheelToHorizontalDelta");
+    expect(source).toContain("scrollChildIntoHorizontalView");
+    expect(source).toContain("crowdedTabStrip");
   });
 
   it("disables opening past the ceiling and says why", () => {
@@ -198,7 +208,7 @@ describe("TerminalPanel chrome popovers", () => {
     const panesIdx = source.indexOf('class="terminal-panes');
     expect(panesIdx).toBeGreaterThan(-1);
     const marks = [...source.matchAll(/class="terminal-popover/g)];
-    expect(marks).toHaveLength(3);
+    expect(marks).toHaveLength(5);
     for (const mark of marks) {
       expect(mark.index).toBeLessThan(panesIdx);
     }
@@ -209,5 +219,7 @@ describe("TerminalPanel chrome popovers", () => {
     expect(harness).toContain('check("shortcuts sit above the grid instead of overlapping it"');
     expect(harness).toContain('check("tab options sit above the grid instead of overlapping it"');
     expect(harness).toContain('check("session list sits above the grid instead of overlapping it"');
+    expect(harness).toContain('check("session search sits above the grid instead of overlapping it"');
+    expect(harness).toContain('check("launcher menu sits above the grid instead of overlapping it"');
   });
 });

@@ -220,7 +220,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "mcp-plugin",
     section: "agents",
     label: "Agent plugin surface",
-    keywords: "mcp codex plugin tools read-only agents claude protocol",
+    keywords: "mcp codex plugin tools read-only agents claude grok antigravity agy protocol",
   },
   // macOS-only: on every other host the framework cannot exist, so the row
   // would be a permanent "unavailable" with nothing the reader could do.

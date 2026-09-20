@@ -5,7 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use gitpulse_lib::terminal::{
     acknowledge_output, kill_session, resize_session, spawn_session, write_to_session,
-    TerminalSessions,
+    TerminalSessions, MAX_PTY_SESSIONS,
 };
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -313,11 +313,11 @@ fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
         )
     };
     let mut sessions = Vec::new();
-    for _ in 0..16 {
+    for _ in 0..MAX_PTY_SESSIONS {
         sessions.push(launch().unwrap());
     }
     assert!(launch().is_err());
-    for index in 0..16 {
+    for index in 0..MAX_PTY_SESSIONS {
         kill_session(&state, &sessions[index].id).unwrap();
         let replacement = launch();
         if replacement.is_err() {

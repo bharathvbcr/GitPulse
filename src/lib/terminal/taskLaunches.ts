@@ -1,6 +1,7 @@
 import { get, writable } from "svelte/store";
+import type { AgentProvider } from "../workbench/vocabulary";
 
-export interface TaskTerminalRequest { runId: string; repoPath: string; provider: "claude" | "codex"; title: string }
+export interface TaskTerminalRequest { runId: string; repoPath: string; provider: AgentProvider; title: string }
 const pending = writable<TaskTerminalRequest[]>([]);
 export const taskTerminalRequests = { subscribe: pending.subscribe };
 

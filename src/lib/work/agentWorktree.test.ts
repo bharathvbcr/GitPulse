@@ -19,8 +19,12 @@ describe("isAgentWorktree", () => {
     // remedy of the one they need.
     expect(isAgentWorktree("/repo/.cursor/worktrees/fix-auth")).toBe(true);
     expect(isAgentWorktree("/repo/.codex/worktrees/session-1")).toBe(true);
+    expect(isAgentWorktree("/repo/.grok/worktrees/feat")).toBe(true);
+    expect(isAgentWorktree("/repo/.agy/worktrees/session-1")).toBe(true);
     expect(agentKind("/repo/.cursor/worktrees/fix-auth")).toBe("cursor");
     expect(agentKind("/repo/.codex/worktrees/session-1")).toBe("codex");
+    expect(agentKind("/repo/.grok/worktrees/feat")).toBe("grok");
+    expect(agentKind("/repo/.agy/worktrees/session-1")).toBe("agy");
   });
 
   it("recognises it on Windows separators too", () => {

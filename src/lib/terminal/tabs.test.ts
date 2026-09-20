@@ -81,6 +81,16 @@ describe("terminal tab model", () => {
     expect(openTab(state, "shell")).toBe(state);
   });
 
+  it("accepts more sessions than the old 16-process ceiling", () => {
+    // The tab strip used to look like a four-tab control and the process
+    // budget used to stop at 16. Opening past both is the point of the new
+    // ceiling; a test that only filled 16 would still pass on the old cap.
+    expect(MAX_TERMINAL_TABS).toBeGreaterThan(16);
+    let state = initialState();
+    for (let i = 0; i < 20; i += 1) state = openTab(state, "shell");
+    expect(state.tabs).toHaveLength(21);
+  });
+
   describe("closing", () => {
     const four = (): TabState => {
       let state = initialState();
@@ -156,6 +166,8 @@ describe("terminal tab model", () => {
       const tab = createTab("manvi");
       expect(tabLabel(tab)).toBe("Manvi");
       expect(launcherLabel("codex")).toBe("Codex");
+      expect(launcherLabel("grok")).toBe("Grok");
+      expect(launcherLabel("agy")).toBe("Antigravity");
     });
 
     it("prefers what the running program calls itself", () => {

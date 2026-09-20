@@ -9,13 +9,15 @@
 import { isImeComposition } from "../keyboard/imeGuard";
 
 /** What a tab runs. `shell` is the user's own login shell; the rest are agent CLIs. */
-export type LauncherKind = "shell" | "claude" | "manvi" | "codex";
+export type LauncherKind = "shell" | "claude" | "manvi" | "codex" | "grok" | "agy";
 
 export const LAUNCHERS: readonly { kind: LauncherKind; label: string }[] = [
   { kind: "shell", label: "Shell" },
   { kind: "claude", label: "Claude" },
   { kind: "manvi", label: "Manvi" },
   { kind: "codex", label: "Codex" },
+  { kind: "grok", label: "Grok" },
+  { kind: "agy", label: "Antigravity" },
 ];
 
 /**
@@ -26,7 +28,7 @@ export const LAUNCHERS: readonly { kind: LauncherKind; label: string }[] = [
  * that ran past it would surface that refusal as an unexplained spawn error.
  * `tabs.contract.test.ts` reads the Rust constant and fails if the two drift.
  */
-export const MAX_TERMINAL_TABS = 16;
+export const MAX_TERMINAL_TABS = 32;
 
 export interface TerminalTab {
   id: string;

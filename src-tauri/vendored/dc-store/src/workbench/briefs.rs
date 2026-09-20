@@ -3,6 +3,7 @@
 //! Repository identities and remotes are deliberately absent from this export.
 
 use super::{Entity, Error, Input, MAX_INTEGER, MAX_PAGE_DOCUMENTS, Result};
+use super::input::MAX_LOGS_BYTES;
 use rusqlite::{OptionalExtension, params};
 
 pub(super) fn get(input: &Input<'_>) -> Result<String> {
@@ -33,7 +34,7 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
         return Err(too_large());
     }
     // This is persisted, validated JSON, not a new request. Enhancements can
-    // grow a saved document beyond the original request's 256 KiB input bound.
+    // grow a saved document beyond the original request's 1 MiB input bound.
     let task = Input {
         conn: input.conn,
         raw: &body,
@@ -115,6 +116,13 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     for criterion in criteria {
         markdown.push_str(&format!("- [ ] {criterion}\n"));
     }
+    if let Some(logs) = task.text("logs", MAX_LOGS_BYTES)? {
+        if !logs.trim().is_empty() {
+            markdown.push_str("\n## Raw logs\nPasted evidence. Keep stack frames, timestamps, error codes and quoted text exactly as written.\n\n");
+            markdown.push_str(&fence_logs(&logs));
+            markdown.push('\n');
+        }
+    }
     let response: String = input.conn.query_row(
         "SELECT json_object('ok',json('true'),'item',json_object('id',?1,'revision',?2,'updated_at',?3,'format_version',1,'task',json(?4),'repositories',json(?5),'workspace',json(?6),'markdown',?7))",
         params![id,revision,updated,body,format!("[{}]",repositories.join(",")),workspace,markdown], |r| r.get(0),
@@ -138,6 +146,21 @@ fn reference(input: &Input<'_>, entity: Entity, id: &str) -> Result<(String, Str
     let revision = value.integer("revision", None, MAX_INTEGER)?;
     value.integer("updated_at", None, MAX_INTEGER)?;
     Ok((snapshot, format!("{name} [{id}] (revision {revision})")))
+}
+
+fn fence_logs(text: &str) -> String {
+    let mut ticks = 3usize;
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch == '`' {
+            run += 1;
+            ticks = ticks.max(run + 1);
+        } else {
+            run = 0;
+        }
+    }
+    let mark = "`".repeat(ticks);
+    format!("{mark}\n{text}\n{mark}")
 }
 
 fn inconsistent() -> Error {

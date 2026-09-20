@@ -1,17 +1,25 @@
 import { writable } from "svelte/store";
 import type { LauncherKind } from "./tabs";
 
-export type PromptLauncher = Extract<LauncherKind, "claude" | "codex">;
+export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
-/** Both interactive CLIs accept a positional prompt. No shell interpolation. */
+export const PROMPT_LAUNCHERS: readonly PromptLauncher[] = ["claude", "codex", "grok", "agy"];
+
+export function isPromptLauncher(value: unknown): value is PromptLauncher {
+  return PROMPT_LAUNCHERS.some((launcher) => launcher === value);
+}
+
+/** Interactive CLIs that accept an initial prompt. No shell interpolation. */
 export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string[] | null {
   if (prompt === undefined) return null;
-  if (launcher !== "claude" && launcher !== "codex") {
-    throw new Error("Initial prompts require Claude Code or Codex");
+  if (!isPromptLauncher(launcher)) {
+    throw new Error("Initial prompts require Claude Code, Codex, Grok, or Antigravity");
   }
   if (!prompt.trim() || prompt.includes("\0") || new TextEncoder().encode(prompt).length > 16000) {
     throw new Error("Agent prompt must be nonempty, contain no NUL, and fit within 16000 bytes");
   }
+  // Antigravity reads prompts only from `--prompt-interactive` / `--print`, never positionally.
+  if (launcher === "agy") return ["--prompt-interactive", prompt];
   return ["--", prompt];
 }
 

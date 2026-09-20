@@ -356,7 +356,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     if !["external_terminal", "managed"].contains(&kind.as_str()) {
         return Err(Error::invalid("unsupported execution adapter"));
     }
-    if !["codex", "claude"].contains(&provider.as_str())
+    if !["codex", "claude", "grok", "agy"].contains(&provider.as_str())
         || ![
             "inspect",
             "ask",

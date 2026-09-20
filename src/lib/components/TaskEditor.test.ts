@@ -136,14 +136,29 @@ describe("TaskEditor", () => {
       ["1", "Repositories"],
       ["2", "Quick add"],
       ["3", "Title and description"],
-      ["4", "Status and scheduling"],
-      ["5", "Owner"],
+      ["4", "Raw logs"],
+      ["5", "Status and scheduling"],
+      ["6", "Owner"],
     ] as const) {
       expect(pane).toContain(`<span class="step-n" aria-hidden="true">${n}</span><h3>${heading}</h3>`);
     }
     // In that order, and with nothing unnumbered between them.
     const order = [...pane.matchAll(/<span class="step-n" aria-hidden="true">(\d)<\/span>/g)].map((m) => m[1]);
-    expect(order).toEqual(["1", "2", "3", "4", "5"]);
+    expect(order).toEqual(["1", "2", "3", "4", "5", "6"]);
+  });
+
+  it("lets the reader paste raw logs on the sheet without feeding them to notes or title extraction", () => {
+    const pane = taskPane();
+    expect(pane).toContain('data-testid="task-logs"');
+    expect(pane).toContain("Copy logs");
+    expect(source).toContain("sanitizeLogs");
+    expect(source).toContain("copyLogs");
+    expect(source).toContain("onLogsPaste");
+    expect(source).toContain("logs: draft.logs");
+    expect(source).not.toMatch(/consumeNotes\([^)]*logs/);
+    expect(source).not.toMatch(/applyNotesToDraft\([^)]*logs/);
+    expect(pane.indexOf('data-testid="task-logs"')).toBeGreaterThan(pane.indexOf('name="task-title"'));
+    expect(pane.indexOf('data-testid="task-logs"')).toBeLessThan(pane.indexOf("<TaskDuePicker"));
   });
 
   it("gives the due date the picker rather than the platform's datetime box", () => {

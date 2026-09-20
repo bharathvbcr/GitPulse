@@ -12,6 +12,8 @@ import { harnessStore } from "../src/lib/stores/harnessStore";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
+const copies = [];
+Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { copies.push(text); } } });
 const preparedRuns = [], appleDrafts = [];
 let appleStatus = { compiled: true, state: "available", reason: null, detail: "The on-device model is ready. Nothing leaves this Mac." };
 let appleFailure = "";
@@ -151,7 +153,22 @@ mockIPC(async (cmd, args) => {
       if (holdSearch && input.query === "older") return new Promise(resolve => heldSearch.push(() => resolve(result)));
       return result;
     }
-    case "items.get": { const result = JSON.stringify({ok: true, item: tasks.find(task => task.id === input.id)}); if (holdGet) return new Promise(resolve => { releaseGet = () => resolve(result); }); return result; }
+    case "items.get": { const found = tasks.find(task => task.id === input.id); const result = JSON.stringify({ok: true, item: found ? { logs: "", ...found } : found}); if (holdGet) return new Promise(resolve => { releaseGet = () => resolve(result); }); return result; }
+    case "items.brief.get": {
+      const task = tasks.find(item => item.id === input.id);
+      if (!task || deleted.has(task.id)) throw {code:"not_found", message:"Fixture has no such task"};
+      if (task.revision !== input.expected_revision) throw {code:"revision_conflict", message:"Reload the task before exporting"};
+      const repositories = task.repository_ids.map(id => {
+        const repo = repos.find(item => item.id === id);
+        return { id, revision: repo?.revision ?? 1, updated_at: repo?.updated_at ?? 1, name: repo?.name ?? id };
+      });
+      const home = task.home_workspace_id ? workspaces.find(space => space.id === task.home_workspace_id) : null;
+      const logs = typeof task.logs === "string" && task.logs.trim()
+        ? `\n## Raw logs\nPasted evidence. Keep stack frames, timestamps, error codes and quoted text exactly as written.\n\n\`\`\`\n${task.logs}\n\`\`\`\n`
+        : "";
+      const markdown = `# Task brief v1\n\n## Title\n${task.title}\n\nTask: ${task.id} (revision ${task.revision})\n\n## Description\n${task.description || ""}\n${logs}`;
+      return JSON.stringify({ok:true, item:{ id: task.id, revision: task.revision, updated_at: task.updated_at, format_version: 1, task: { logs: "", ...task }, repositories, workspace: home ? { id: home.id, revision: home.revision, updated_at: home.updated_at, name: home.name } : null, markdown }});
+    }
     case "items.delete": {
       deleteWrites.push(structuredClone(input));
       if(holdDelete) await new Promise(resolve=>{releaseDelete=resolve;});
@@ -199,7 +216,7 @@ const settle = async (ms = 30) => {
   if (prompt && pendingPrompt.options.title === "Reload saved task?") { button("Reload", prompt)?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
 const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error("Timed out waiting for task UI"); };
-const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete"};
+const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete", "Copy for agent":"Copy task for an AI agent"};
 const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => {
   const names = [text, aliases[text]].filter(Boolean);
   return names.includes(el.textContent.trim()) || names.includes(el.getAttribute("aria-label")) || names.includes(el.querySelector(":scope > span.flex-1")?.textContent.trim());
@@ -223,6 +240,15 @@ const repoToggle = () => editor()?.querySelector("[data-task-repo-picker] .repo-
 // Due is not a labelled input any more, so `field("Due")` cannot reach it.
 const dueTrigger = () => editor()?.querySelector('[data-testid="task-due-trigger"]');
 const repoPopup = () => document.querySelector("[data-task-repo-popup]");
+const addRepoMenu = () => document.querySelector("[data-add-repo-popup]");
+const addRepoTrigger = () => root.querySelector("[data-add-repo] button");
+const workspaceTab = name => [...root.querySelectorAll('nav[aria-label="Task scopes"] button')].find(el => el.textContent.trim().startsWith(name));
+const fitsViewport = (el, pad = 1) => {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0 && r.left >= -pad && r.top >= -pad && r.right <= innerWidth + pad && r.bottom <= innerHeight + pad;
+};
+const uncropped = (el) => Boolean(el) && el.scrollWidth <= el.clientWidth + 1;
 const openRepoPicker = async () => { if (!repoPopup()) repoToggle()?.click(); await settle(80); return repoPopup(); };
 // Dismissed the way a reader dismisses it: a pointerdown outside. The picker
 // listens on the capture phase, so this reaches it from `body`.
@@ -377,6 +403,79 @@ if (params.has("check")) {
     await wait(() => !editor());
     check("closing the last open task removes the editor", !editor() && !root.querySelector('[aria-label="Open tasks"]'));
 
+    // Add-repository lives on the left-rail plus, not the task sheet. The
+    // pre-fix menu was a 260px absolute panel inside the 188px navigator
+    // scroller: opening it grew the sidebar and cropped the rows. These
+    // checks would have failed that geometry. They mutate the catalog, so
+    // they restore it before any later picker assertion sees the extras.
+    {
+      const nav = () => root.querySelector(".navigator");
+      const longName = `very-long-repo-name-${"x".repeat(180)}`;
+      const longPath = `/fixture/${"deep/".repeat(40)}hostile-repo`;
+      const extras = [
+        { id: "repo-stress-long", name: longName, revision: 1, updated_at: 1, identity_key: `local:${longPath}/.git`, remote_url: null },
+        ...Array.from({ length: 47 }, (_, i) => ({
+          id: `repo-stress-${i}`,
+          name: `Stress ${String(i).padStart(2, "0")}`,
+          revision: 1,
+          updated_at: 1,
+          identity_key: `local:/fixture/stress-${i}/.git`,
+          remote_url: null,
+        })),
+      ];
+      const dropExtras = () => {
+        for (let i = repos.length - 1; i >= 0; i--) if (String(repos[i].id).startsWith("repo-stress")) repos.splice(i, 1);
+      };
+      try {
+        await click("Global fixture");
+        await wait(() => Boolean(workspaceTab("Fresh space")) && Boolean(addRepoTrigger()));
+        const fresh = workspaceTab("Fresh space");
+        fresh.click();
+        await wait(() => fresh.getAttribute("aria-pressed") === "true" && (addRepoTrigger()?.getAttribute("aria-label") ?? "").includes("Fresh space"));
+        await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+        repos.push(extras[0]);
+        await click("Refresh");
+        await wait(() => nav()?.textContent.includes("very-long-repo-name-"));
+        const beforeScroll = nav()?.scrollWidth ?? 0;
+        const beforeClient = nav()?.clientWidth ?? 0;
+        for (let i = 0; i < 25 && !addRepoMenu(); i++) { addRepoTrigger()?.click(); await settle(80); }
+        const menu = addRepoMenu();
+        const longRow = [...(menu?.querySelectorAll(".add-name") ?? [])].find(el => el.textContent.includes("very-long-repo-name-"));
+        const line = longRow ? Number.parseFloat(getComputedStyle(longRow).lineHeight) || 16 : 16;
+        check("the add-repository menu escapes the navigator instead of expanding it",
+          Boolean(menu) && Boolean(nav()) && !nav().contains(menu)
+          && nav().scrollWidth <= beforeClient + 1
+          && nav().scrollWidth <= beforeScroll + 1);
+        check("the add-repository menu stays inside the window", fitsViewport(menu));
+        check("a long repository name wraps in the add-repository menu instead of cropping",
+          Boolean(longRow) && uncropped(longRow) && longRow.clientHeight > line * 1.5);
+        const choose = menu ? button("Choose folder…", menu) : null;
+        check("Choose folder remains fully readable in the add-repository menu",
+          Boolean(choose) && uncropped(choose));
+        menu?.querySelector('[role="menuitem"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        await settle(80);
+        check("Escape in the add-repository menu restores focus to the plus",
+          !addRepoMenu() && document.activeElement === addRepoTrigger());
+        repos.push(...extras.slice(1));
+        await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+        await click("Refresh");
+        await wait(() => (nav()?.textContent.match(/Stress \d+/g) ?? []).length >= 20);
+        for (let i = 0; i < 25 && !addRepoMenu(); i++) { addRepoTrigger()?.click(); await settle(80); }
+        const tall = addRepoMenu();
+        check("a long registered list still fits the window and scrolls inside the menu",
+          Boolean(tall) && fitsViewport(tall) && tall.scrollHeight > tall.clientHeight && getComputedStyle(tall).overflowY === "auto");
+        document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+        await settle(80);
+        check("a pointer outside dismisses the add-repository menu", !addRepoMenu());
+      } finally {
+        if (addRepoMenu()) { document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60); }
+        dropExtras();
+        workspaceTab("All")?.click();
+        await click("Refresh");
+        await wait(() => Boolean(card("task-1")));
+      }
+    }
+
     await click("Add task to Ready");
     check("column creation uses that column's status", field("Status").value === "ready");
     check("new tasks default to normal priority", field("Priority").value === "2");
@@ -395,7 +494,28 @@ if (params.has("check")) {
     check("retrying a lost save reuses the same mutation identity", writes.at(-1).request_id === pendingWrite.request_id && tasks.find(task => task.id === pendingWrite.id)?.revision === 1);
     check("acceptance criteria are normalized and retained after saving", field("Acceptance criteria").value === "Result verified\nRecovery checked");
     check("creation persists the selected task status", tasks.find(task => task.id === pendingWrite.id)?.status === "review");
+    const logsField = field("Raw logs");
+    check("the task sheet offers a raw-logs paste surface", Boolean(logsField) && Boolean(editor().querySelector('[data-testid="task-logs"]')));
+    const ansiDump = "\u001b[31merror: E42\u001b[0m\r\n    at src/main.rs:12";
+    const dt = new DataTransfer(); dt.setData("text/plain", ansiDump);
+    logsField.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt }));
+    await settle();
+    if (logsField.value.includes("\u001b") || !logsField.value.includes("E42")) await change(logsField, ansiDump);
+    check("pasted ANSI logs keep the error code and drop the escape codes", logsField.value.includes("error: E42") && logsField.value.includes("src/main.rs:12") && !logsField.value.includes("\u001b"));
+    const copiesBefore = copies.length;
+    await click("Copy logs"); await settle();
+    check("Copy logs puts the sanitized dump on the clipboard", copies.at(-1)?.includes("error: E42") && !copies.at(-1)?.includes("\u001b") && copies.length > copiesBefore);
+    await click("Save task"); await wait(() => tasks.find(task => task.id === pendingWrite.id)?.logs?.includes("E42"));
+    check("saving the sheet persists the raw logs", tasks.find(task => task.id === pendingWrite.id)?.logs?.includes("error: E42") && !tasks.find(task => task.id === pendingWrite.id)?.logs?.includes("\u001b"));
+    await click("Copy for agent"); await settle();
+    check("Copy for agent includes the saved raw logs as evidence", copies.at(-1)?.includes("## Raw logs") && copies.at(-1)?.includes("error: E42"));
     await click("Close task details");
+    card(pendingWrite.id).click(); await wait(editor);
+    check("reopening the sheet restores the saved raw logs", field("Raw logs")?.value.includes("error: E42") && field("Raw logs")?.value.includes("src/main.rs:12"));
+    const huge = `${"x".repeat(256 * 1024 + 50)}the reproduction ends with E999`;
+    await change(field("Raw logs"), huge);
+    check("an oversized paste is cut with a visible notice instead of silently dropping the tail", field("Raw logs").value.includes("[logs truncated:") && editor().textContent.includes("bytes kept") && !field("Raw logs").value.includes("E999"));
+    confirmAnswer = true; await click("Close task details"); await settle();
 
     const taskOne = tasks.find(task => task.id === "task-1"); taskOne.kind = "custom-category";
     card("task-1").click(); await wait(editor);
@@ -476,7 +596,6 @@ if (params.has("check")) {
     // Matched on a prefix, not the whole label, so the rest of this block
     // still runs against a build whose navigator says nothing about members.
     await click("Global fixture"); await settle(400);
-    const workspaceTab = name => [...root.querySelectorAll('nav[aria-label="Task scopes"] button')].find(el => el.textContent.trim().startsWith(name));
     check("the navigator says which workspaces are empty before one is opened",
       workspaceTab("Fresh space").textContent.trim() === "Fresh space · Empty");
     workspaceTab("Fresh space").click(); await settle(400);
@@ -1195,6 +1314,10 @@ if (params.has("check")) {
 
     // ---- Handing a card to an agent --------------------------------------
     await openMenu("task-11"); button("Send to agent…", menu()).click(); await settle();
+    const agentRows = [...menu().querySelectorAll("button")].map(el => el.textContent.trim());
+    check("the agent submenu offers Grok and Antigravity beside Codex and Claude Code",
+      agentRows.some(text => text.startsWith("Grok")) && agentRows.some(text => text.startsWith("Antigravity"))
+      && agentRows.some(text => text.startsWith("Claude")) && agentRows.some(text => text.startsWith("Codex")));
     const target = [...menu().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Codex"));
     target.click(); await settle(250);
     const sheet = () => document.querySelector('[data-testid="task-handoff"]');

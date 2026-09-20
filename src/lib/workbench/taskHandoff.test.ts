@@ -6,6 +6,7 @@ import {
   defaultHandoff,
   describeHandoff,
   handoffGate,
+  isAgentProvider,
   normalizeCheckout,
   preferredCheckout,
   reconcileHandoff,
@@ -48,6 +49,38 @@ describe("sanitizeHandoff", () => {
       .toBe("external_terminal");
     expect(supportsManaged("claude")).toBe(false);
     expect(supportsManaged("codex")).toBe(true);
+  });
+
+  it("treats Grok as a first-class terminal-only provider", () => {
+    expect(isAgentProvider("grok")).toBe(true);
+    expect(supportsManaged("grok")).toBe(false);
+    expect(sanitizeHandoff({ provider: "grok", kind: "managed", permission: "edit" }))
+      .toEqual({ provider: "grok", kind: "external_terminal", permission: "edit" });
+    expect(describeHandoff({ provider: "grok", kind: "external_terminal", permission: "ask" }))
+      .toBe("Grok · terminal");
+    expect(handoffGate({
+      checkout: "/work/GitPulse",
+      settings: { provider: "grok", kind: "managed", permission: "ask" },
+      acknowledgedBypass: false,
+      dirty: false,
+      busy: false,
+    }).reason).toMatch(/Grok supports terminal handoffs only/);
+  });
+
+  it("treats Antigravity as a first-class terminal-only provider", () => {
+    expect(isAgentProvider("agy")).toBe(true);
+    expect(supportsManaged("agy")).toBe(false);
+    expect(sanitizeHandoff({ provider: "agy", kind: "managed", permission: "edit" }))
+      .toEqual({ provider: "agy", kind: "external_terminal", permission: "edit" });
+    expect(describeHandoff({ provider: "agy", kind: "external_terminal", permission: "ask" }))
+      .toBe("Antigravity · terminal");
+    expect(handoffGate({
+      checkout: "/work/GitPulse",
+      settings: { provider: "agy", kind: "managed", permission: "ask" },
+      acknowledgedBypass: false,
+      dirty: false,
+      busy: false,
+    }).reason).toMatch(/Antigravity supports terminal handoffs only/);
   });
 
   it("keeps a settings object coherent when the provider changes under it", () => {

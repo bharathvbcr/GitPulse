@@ -2,6 +2,7 @@ import { PRIORITY_LABELS } from "./boardDrag";
 import { ARCHIVE_STATUS, archiveState } from "./taskArchive";
 import { STATUSES, STATUS_LABELS, type TaskCard, type TaskStatus } from "./client";
 import { displayTitle, isRevision, isTaskId } from "./taskDelete";
+import type { AgentProvider } from "./vocabulary";
 
 export type TaskMenuSubmenu = "move" | "priority" | "copy" | "due" | "owner" | "label" | "agent";
 
@@ -28,8 +29,7 @@ export type TaskDueChoice = "today" | "tomorrow" | "next_week" | "clear";
 
 /** How a handoff starts. Mirrors `RunKind` plus the provider it applies to. */
 export type TaskAgentTarget =
-  | { provider: "claude"; kind: "external_terminal" }
-  | { provider: "codex"; kind: "external_terminal" }
+  | { provider: AgentProvider; kind: "external_terminal" }
   | { provider: "codex"; kind: "managed" };
 
 export type TaskMenuAction =
@@ -105,6 +105,8 @@ const DUE_CHOICES: readonly { choice: TaskDueChoice; label: string }[] = [
 const AGENT_TARGETS: readonly { id: string; label: string; hint: string; target: TaskAgentTarget }[] = [
   { id: "agent-claude", label: "Claude Code", hint: "Terminal", target: { provider: "claude", kind: "external_terminal" } },
   { id: "agent-codex", label: "Codex", hint: "Terminal", target: { provider: "codex", kind: "external_terminal" } },
+  { id: "agent-grok", label: "Grok", hint: "Terminal", target: { provider: "grok", kind: "external_terminal" } },
+  { id: "agent-agy", label: "Antigravity", hint: "Terminal", target: { provider: "agy", kind: "external_terminal" } },
   { id: "agent-codex-managed", label: "Codex", hint: "Managed", target: { provider: "codex", kind: "managed" } },
 ];
 

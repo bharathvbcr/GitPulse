@@ -11,7 +11,54 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Code-age timeline in Blame**: a chronological axis above the gutter showing
+  what percentage of the open file was last changed in each period. Resolution
+  adapts to the file's history (daily through yearly) and is bounded; a history
+  too long for even a yearly axis folds its oldest lines into the leading column
+  and says so. Clicking a column filters the gutter to exactly the lines that
+  column counted — the picture and the filter share one classifier, so a column
+  cannot claim a share it would not select. Quiet periods are drawn as empty
+  columns rather than omitted.
+- **Off-axis lines are named rather than dropped**: worktree-only, clock-skewed
+  and undated lines carry their own labelled, selectable shares beside the axis.
+  Columns plus chips account for 100% of the file.
+- **Commit blocks in the gutter**: consecutive lines from one commit state their
+  hash and author once at the head of the block, keep the hash reachable on
+  hover or focus, and mark the whole commit down the left edge when hovered.
+- **Line age in the gutter**: each line's commit age, following the shared
+  timestamp preference, with the other form on hover. `docs/FEATURES.md` had
+  described this since the page was written; it was never drawn.
+- **Code-age rail in Blame**: a heat strip down the right edge showing *where*
+  in the file each age lives, with a band marking what is on screen and
+  click/drag to navigate. It maps the list actually drawn, so a filter re-maps
+  it; the freshest tone wins each bucket and the mark's intensity says how much
+  of the bucket that tone really is. Geometry is the diff minimap's, reused
+  rather than re-derived.
+- **The legend now carries the distribution and filters on it**: each age band
+  states its share of the file and selects those lines. Period columns,
+  off-axis chips and age bands are one selection model with one matching rule.
+- **Blame browser harness**: `npm run test:browser -- --harness blame` (and
+  `--webkit`) mounts the production pane over fixture IPC, 59 real-DOM checks.
+
+### Fixed
+
+- **Blame rows now honour the density setting.** Rows carried a fixed 24 px
+  height while `VirtualList` positioned them from `rowHeight("blame", …)`, so at
+  Compact density every row overhung its 20 px slot and drew over its neighbour.
+- **A long blame line has somewhere to go.** Lines were clipped at the pane edge
+  with no scrollbar to reach the rest; the pane now shares one horizontal
+  scroller, as the diff does.
+
+### Changed
+
+- The blame age scale (row tint, timeline column fill, legend and rail) now
+  comes from one table and one per-line classifier instead of a colour function
+  beside a hand-listed legend.
+- A blame line with no knowable age — worktree-only, undated, or dated after
+  now by a skewed clock — carries no row tint. It used to tint as the freshest
+  code in the file, which also disagreed with the band filter that excludes it.
 
 ## [1.3.0] - 2026-09-17
 

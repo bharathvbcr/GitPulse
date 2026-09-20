@@ -66,9 +66,9 @@ describe("the premise of the archive-separation plan", () => {
   it("still cannot write one", () => {
     const fields = acceptedFields(store, "put_item");
     expect(fields, "items.put now accepts `archived` — execute the plan").not.toContain("archived");
-    // The plan's exact count, so "eighteen named fields" cannot go stale.
-    expect(fields.length).toBe(18);
-    expect(plan).toContain("eighteen accepted names");
+    // The plan's exact count, so "nineteen named fields" cannot go stale.
+    expect(fields.length).toBe(19);
+    expect(plan).toContain("nineteen accepted names");
   });
 
   it("still cannot filter a list by one", () => {

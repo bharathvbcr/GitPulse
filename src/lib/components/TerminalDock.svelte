@@ -84,6 +84,9 @@
   // The stored height is a request; what renders also respects the room the
   // window actually has, so a dock sized on a large display cannot swallow
   // the view when the same preference is restored on a small one.
+  let heightCeiling = $derived(
+    fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, containerHeight, expanded ? 0 : 160),
+  );
   let height = $derived(
     expanded
       ? fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, containerHeight, 0)
@@ -169,7 +172,7 @@
       aria-label="Resize the terminal dock"
       aria-valuenow={height}
       aria-valuemin={TERMINAL_DOCK_MIN_HEIGHT}
-      aria-valuemax={TERMINAL_DOCK_MAX_HEIGHT}
+      aria-valuemax={heightCeiling}
       title="Drag to resize · ↑/↓ to nudge"
       tabindex="0"
       onpointerdown={startDrag}

@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse blame timeline checks</title></head>
+  <body style="margin:0">
+    <div id="app"></div>
+    <pre id="result" style="position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      /**
+       * Blame, rendered.
+       *
+       * Unit tests pin the bucketing arithmetic and the source-level contracts.
+       * What only a real page can settle is the geometry and the agreement
+       * between the two halves of this pane:
+       *
+       *   - a column that claims 12% of the file must select exactly those
+       *     lines when it is clicked, in the DOM, not in a pure function
+       *   - the rows must be exactly as tall as the windowing math thinks
+       *     they are, at BOTH densities — the old `h-6` overhung its 20px
+       *     compact slot and drew over its neighbour, which no node test can
+       *     see because nothing mounts there
+       *   - a long source line must have somewhere to go
+       *   - the strip must stay inside its own row rather than pushing the
+       *     list off screen
+       *
+       * Nothing here executes git. Every IPC answer is a fixture.
+       */
+      import { mockIPC } from "@tauri-apps/api/mocks";
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      addEventListener("error", event => errors.push(event.message));
+      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+
+      const DAY = 86_400;
+      const nowSec = () => Math.floor(Date.now() / 1000);
+      const oid = letter => letter.repeat(40);
+      const ZERO = "0".repeat(40);
+
+      /** `count` lines of one commit, numbered from `from`. */
+      const block = (from, count, commit_id, author_name, ageDays, content = "const value = 1;") =>
+        Array.from({ length: count }, (_, i) => ({
+          line_no: from + i,
+          commit_id,
+          author_name,
+          author_email: `${author_name.toLowerCase()}@example.invalid`,
+          timestamp: commit_id === ZERO ? 0 : nowSec() - Math.round(ageDays * DAY),
+          content,
+        }));
+
+      // 100 lines with round shares: 40 / 25 / 20 / 5 committed, 10 worktree.
+      // The oldest line is over a year back, so the axis is monthly whatever
+      // day of the month this runs on.
+      const mixed = () => [
+        ...block(1, 40, oid("a"), "Ada", 5),
+        ...block(41, 25, oid("b"), "Grace", 45),
+        ...block(66, 20, oid("c"), "Ada", 400),
+        ...block(86, 5, oid("d"), "Linus", 2),
+        ...block(91, 10, ZERO, "Not Committed Yet", 0),
+      ];
+
+      const FIXTURES = {
+        mixed,
+        fresh: () => block(1, 20, oid("e"), "Ada", 1),
+        uncommitted: () => block(1, 12, ZERO, "Not Committed Yet", 0),
+        skewed: () => [
+          ...block(1, 6, oid("f"), "Ada", 10),
+          // A clock-skewed commit, and one whose author time did not survive.
+          ...block(7, 2, oid("1"), "Ada", -30),
+          ...block(9, 2, oid("2"), "Ada", 0).map(line => ({ ...line, timestamp: 0 })),
+        ],
+        long: () => [
+          ...block(1, 3, oid("9"), "Ada", 3),
+          ...block(4, 1, oid("9"), "Ada", 3, `const wide = "${"x".repeat(4000)}";`),
+        ],
+        empty: () => [],
+        error: () => { throw new Error("Blame unavailable: fixture refused"); },
+      };
+
+      let mode = "mixed";
+
+      mockIPC((cmd, args) => {
+        switch (cmd) {
+          case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
+          case "cmd_get_file_blame": return FIXTURES[mode]();
+          case "cmd_get_file_coverage":
+            return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [{ line_no: 1, hits: 3 }, { line_no: 2, hits: 0 }], totals: { lines_found: 2, lines_hit: 1, percentage: 50 }, truncated: false, lines_truncated: false };
+          case "cmd_list_repo_files": return ["src/mixed.ts", "src/fresh.ts", "src/other.ts"];
+          case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: oid("7"), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
+          case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
+          case "cmd_stash_list": return { entries: [], truncated: false };
+          case "cmd_list_tags": return { tags: [], truncated: false };
+          case "cmd_branch_stats": return {};
+          case "cmd_repo_operation": case "cmd_workspace_sync": return null;
+          default: throw new Error(`Unimplemented fixture: ${cmd}`);
+        }
+      }, { shouldMockEvents: true });
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { densityStore } = await import("../src/lib/stores/densityStore");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
+      const { rowHeight } = await import("../src/lib/ui/density");
+      const { createChecks } = await import("./checks.ts");
+      const Host = (await import("./BlameHost.svelte")).default;
+
+      await repoStore.openRepo("/fixture/GitPulse");
+      let fileSequence = 0;
+      /** A mode change is also a file change: blame reloads on the selection. */
+      const setMode = next => {
+        mode = next;
+        repoStore.selectFilePath(`src/${next}-${++fileSequence}.ts`);
+      };
+      mount(Host, { target: document.querySelector("#app"), props: { setMode } });
+      setMode("mixed");
+
+      const wait = () => new Promise(resolve => setTimeout(resolve, 60));
+      const until = async test => {
+        const end = Date.now() + 8000;
+        while (!test() && Date.now() < end) await wait();
+        if (!test()) throw new Error("Fixture condition timed out");
+      };
+      const text = () => document.body.textContent;
+      const strip = () => document.querySelector('[role="group"][aria-label^="Code age timeline"]');
+      const columns = () => [...(strip()?.querySelectorAll("button") ?? [])];
+      const rows = () => [...document.querySelectorAll("[data-blame-line]")];
+      const rowFor = n => document.querySelector(`[data-blame-line="${n}"]`);
+      const chip = label => [...document.querySelectorAll("button")].find(node => node.textContent.trim().startsWith(label));
+      const rail = () => document.querySelector("[data-blame-rail]");
+      const ticks = () => [...document.querySelectorAll("[data-blame-tick]")];
+      const railBand = () => document.querySelector("[data-blame-rail-band]");
+      const bandButton = label =>
+        [...document.querySelectorAll('[aria-label="Filter by code age"] button')]
+          .find(node => (node.getAttribute("aria-label") ?? "").startsWith(`${label}:`));
+      const scroller = () => document.querySelector("[data-blame-line]").closest(".gp-scroll");
+      const buttonNamed = name => [...document.querySelectorAll("button")].find(node => node.textContent.trim() === name);
+      /** "Mar 2026: 12% of the file, 12 lines from 1 commit" -> 12 */
+      const linesClaimed = column => {
+        const match = /,\s+(\d+) lines? from/.exec(column.getAttribute("aria-label") ?? "");
+        return match ? Number(match[1]) : 0;
+      };
+      const showing = () => {
+        const match = /Showing (\d+) lines? of (\d+)/.exec(text());
+        return match ? { shown: Number(match[1]), total: Number(match[2]) } : null;
+      };
+
+      const { results, check, stopped } = createChecks();
+      const report = () => { document.getElementById("result").textContent = results.map(row => `${row.pass ? "ok  " : "FAIL"} ${row.name}`).join("\n"); };
+
+      await (async () => {
+        try {
+          await until(() => rows().length > 0 && !!strip());
+
+          // --- the strip ---------------------------------------------------
+          check("the timeline draws a bounded monthly axis", () => {
+            const count = columns().length;
+            return count > 10 && count <= 48 && text().includes("monthly");
+          });
+          check("the file total is stated beside it", () => text().includes("100 lines"));
+          check("the axis stays inside its own row", () => {
+            const box = strip().parentElement.parentElement;
+            return box.scrollWidth <= box.clientWidth + 1;
+          });
+          check("every column that holds lines is drawn, and none overflows", () => {
+            const fills = columns().map(column => column.querySelector("span"));
+            return fills.length === columns().length && fills.every(fill => {
+              const height = fill.getBoundingClientRect().height;
+              return height >= 1 && height <= 31;
+            });
+          });
+          check("the columns account for every dated line", () =>
+            columns().reduce((sum, column) => sum + linesClaimed(column), 0) === 90);
+          check("the four age bands are all legended", () =>
+            ["< 7d", "< 30d", "< 90d", "Older"].every(label => text().includes(label)));
+          check("the worktree lines ride beside the axis at their real share", () =>
+            !!chip("Uncommitted") && chip("Uncommitted").textContent.includes("10%"));
+
+          // --- a column selects exactly what it counted ---------------------
+          const filled = columns().filter(column => linesClaimed(column) > 0);
+          check("more than one period holds lines", () => filled.length >= 2);
+          const target = filled[0];
+          const claimed = linesClaimed(target);
+          target.click(); await tick();
+          check("a column selects exactly the lines it claimed", () => {
+            const state = showing();
+            return state && state.shown === claimed && state.total === 100;
+          });
+          check("and marks itself as the pressed filter", () => target.getAttribute("aria-pressed") === "true");
+          target.click(); await tick();
+          check("clicking it again shows the whole file", () => showing() === null);
+          const empty = columns().find(column => linesClaimed(column) === 0);
+          check("an empty period exists on this axis", () => !!empty);
+          empty.click(); await tick();
+          check("an empty period cannot blank the pane", () => showing() === null && rows().length > 0);
+          chip("Uncommitted").click(); await tick();
+          check("the worktree chip filters to the worktree lines", () => {
+            const state = showing();
+            return state && state.shown === 10;
+          });
+          buttonNamed("Clear").click(); await tick();
+          check("Clear returns the whole file", () => showing() === null);
+
+          // --- the legend carries the distribution and selects on it --------
+          check("each band states its share of the file", () => {
+            const labels = ["< 7d", "< 30d", "< 90d", "Older"].map(name =>
+              bandButton(name)?.getAttribute("aria-label"));
+            return labels.every(Boolean) &&
+              labels[0].includes("45%") && labels[2].includes("25%") && labels[3].includes("20%");
+          });
+          check("a band holding nothing is marked unselectable", () =>
+            bandButton("< 30d").getAttribute("aria-disabled") === "true");
+          bandButton("< 30d").click(); await tick();
+          check("and clicking it does not blank the pane", () => showing() === null);
+          bandButton("< 7d").click(); await tick();
+          check("a band selects exactly the lines it claimed", () => {
+            const state = showing();
+            return state && state.shown === 45 && state.total === 100;
+          });
+          check("and the filter names the band it came from", () => text().includes("lines < 7d"));
+          check("selecting a band releases the period selection", () =>
+            columns().every(column => column.getAttribute("aria-pressed") !== "true"));
+          buttonNamed("Clear").click(); await tick();
+
+          // --- the age rail --------------------------------------------------
+          check("the rail marks the whole file", () => ticks().length > 0);
+          check("its marks stay inside it", () => {
+            const box = rail().getBoundingClientRect();
+            return ticks().every(node => {
+              const mark = node.getBoundingClientRect();
+              return mark.top >= box.top - 1 && mark.bottom <= box.bottom + 1.5;
+            });
+          });
+          check("it carries every tone this file has", () => {
+            const tones = new Set(ticks().map(node => node.getAttribute("data-blame-tick")));
+            // 40+5 fresh, 25 settled, 20 old, 10 uncommitted — the worktree
+            // lines outrank the commits in their own bucket.
+            return tones.has("fresh") && tones.has("old") && tones.has("uncommitted");
+          });
+          check("a viewport band says where you are", () => {
+            const band = railBand();
+            if (!band) return false;
+            const height = Number.parseFloat(band.style.height);
+            // A band covering the whole rail would say nothing at all.
+            return height > 0 && height < 100;
+          });
+
+          rail().setPointerCapture = () => {};
+          const clickRail = async ratio => {
+            const before = scroller().scrollTop;
+            const box = rail().getBoundingClientRect();
+            rail().dispatchEvent(new PointerEvent("pointerdown", {
+              bubbles: true, buttons: 1, clientY: box.top + box.height * ratio,
+            }));
+            await until(() => scroller().scrollTop !== before);
+            await wait();
+          };
+          const bandCentre = () =>
+            Number.parseFloat(railBand().style.top) + Number.parseFloat(railBand().style.height) / 2;
+
+          await clickRail(0.95);
+          check("clicking near the foot of the rail scrolls the list there", () => {
+            const max = scroller().scrollHeight - scroller().clientHeight;
+            return scroller().scrollTop > 0 && scroller().scrollTop <= max + 1;
+          });
+          check("and the band follows the list it maps", () => bandCentre() > 60);
+
+          await clickRail(0.2);
+          // The centring rule, measured where it is visible. A top-aligned jump
+          // puts the viewport's TOP at the click and the band's centre half a
+          // viewport below it; both land in the same clamped place at the ends
+          // of the list, which is why this is asked in the middle of it.
+          check("a click lands in the MIDDLE of the viewport, not at its top", () =>
+            Math.abs(bandCentre() - 20) < 4);
+
+          // --- and it re-maps when the list it maps changes -------------------
+          bandButton("Older").click(); await tick(); await wait();
+          check("a filtered rail maps the filtered list, not the file", () => {
+            const tones = new Set(ticks().map(node => node.getAttribute("data-blame-tick")));
+            return tones.size === 1 && tones.has("old");
+          });
+          buttonNamed("Clear").click(); await tick(); await wait();
+          check("and comes back when the filter goes", () =>
+            new Set(ticks().map(node => node.getAttribute("data-blame-tick"))).size > 1);
+
+          // --- row geometry, at both densities ------------------------------
+          for (const density of ["spacious", "compact"]) {
+            densityStore.setDensity(density); await tick(); await wait();
+            const expected = rowHeight("blame", density);
+            check(`a ${density} row is exactly ${expected}px tall`, () =>
+              rows().every(row => Math.abs(row.getBoundingClientRect().height - expected) < 0.5));
+            check(`and ${density} rows do not overlap each other`, () => {
+              const tops = rows().slice(0, 6).map(row => row.getBoundingClientRect().top);
+              return tops.length >= 3 && tops.every((top, i) => i === 0 || Math.abs(top - tops[i - 1] - expected) < 0.5);
+            });
+          }
+          densityStore.setDensity("spacious"); await tick();
+
+          // --- one commit reads as one block --------------------------------
+          check("a commit states its author once, at the head of its block", () =>
+            rowFor(1).textContent.includes("Ada") && !rowFor(1).hasAttribute("data-blame-grouped"));
+          check("and its continuation lines stay quiet", () =>
+            rowFor(2).getAttribute("data-blame-grouped") === "true" && !rowFor(2).textContent.includes("Ada"));
+          check("but keep the hash, so the commit is still one click away", () =>
+            !!rowFor(2).querySelector("button"));
+          rowFor(2).dispatchEvent(new MouseEvent("mouseenter", { bubbles: false })); await tick();
+          check("hovering one line lights the whole commit", () =>
+            document.querySelectorAll('[data-blame-block="true"]').length >= 3 &&
+            rowFor(1).getAttribute("data-blame-block") === "true");
+          rowFor(2).dispatchEvent(new MouseEvent("mouseleave", { bubbles: false })); await tick();
+          check("and releases it", () => document.querySelectorAll('[data-blame-block="true"]').length === 0);
+
+          // --- the age column honours the shared preference ------------------
+          check("a line's age reads as a relative time by default", () =>
+            /\d+(m|h|d|mo) ago/.test(rowFor(1).textContent));
+          interfaceStore.setTimestampStyle("absolute"); await tick();
+          check("and switches with the setting, not with a local dialect", () =>
+            /\d{4}-\d{2}-\d{2}/.test(rowFor(1).textContent));
+          interfaceStore.setTimestampStyle("relative"); await tick();
+
+          // --- a long line has somewhere to go -------------------------------
+          setMode("long"); await until(() => rows().length === 4);
+          check("a long source line scrolls instead of being clipped away", () => {
+            const scroller = rowFor(4).closest(".gp-scroll");
+            return scroller.scrollWidth > scroller.clientWidth + 1;
+          });
+
+          // --- the states an empty-looking pane can be in ---------------------
+          setMode("uncommitted"); await until(() => rows().length === 12);
+          check("a file with nothing committed says so instead of drawing an axis", () =>
+            text().includes("No dated lines to place on a timeline.") && !strip());
+          check("and still accounts for all of its lines", () =>
+            chip("Uncommitted").textContent.includes("100%"));
+          check("its rows are named uncommitted, not linked to a commit", () =>
+            rowFor(1).textContent.includes("uncommitted") && !rowFor(1).querySelector("button"));
+
+          setMode("skewed"); await until(() => rows().length === 10);
+          check("a clock-skewed line is named, not placed in a future period", () =>
+            !!chip("Future-dated") && chip("Future-dated").textContent.includes("20%"));
+          check("an undated line is named too", () =>
+            !!chip("Undated") && chip("Undated").textContent.includes("20%"));
+
+          setMode("empty"); await until(() => text().includes("Empty file"));
+          check("an empty file draws no timeline at all", () => !strip() && rows().length === 0);
+
+          setMode("error"); await until(() => !!buttonNamed("Retry"));
+          check("a failed blame explains itself and offers a way back", () =>
+            text().includes("fixture refused") && !strip());
+          mode = "mixed";
+          buttonNamed("Retry").click(); await until(() => rows().length > 0);
+          check("Retry reloads the same file without a new selection", () => !!strip() && text().includes("100 lines"));
+
+          // --- a selection belongs to its file --------------------------------
+          columns().filter(column => linesClaimed(column) > 0)[0].click(); await tick();
+          check("a period is selected", () => showing() !== null);
+          setMode("fresh"); await until(() => rows().length === 20);
+          check("and does not follow the reader into the next file", () => showing() === null);
+
+          // --- the strip must not push the pane sideways ---------------------
+          // The toolbar summary is the longest string in its row and the axis
+          // fills whatever is left. Both have to give on a narrow window
+          // rather than widening the pane and hiding the gutter off screen.
+          setMode("mixed"); await until(() => rows().length > 0 && !!strip());
+          const pane = () => document.querySelector("main > div:last-child");
+          for (const step of [1, 2]) {
+            buttonNamed("Toggle narrow layout").click(); await tick(); await wait();
+            check(`the pane lays out at narrow step ${step}`, () =>
+              pane().scrollWidth <= pane().clientWidth + 1);
+            check(`and the axis still draws every period at step ${step}`, () =>
+              columns().length > 10 &&
+              columns().every(column => column.getBoundingClientRect().width >= 1));
+            // The summary is the longest string in the toolbar. A rigid one
+            // does not overflow the row — the path beside it simply absorbs
+            // every pixel and truncates to nothing, which is worse, because
+            // the subject of the whole pane is the thing that disappears.
+            check(`and the file path is still legible at step ${step}`, () =>
+              document.querySelector("[data-blame-path]").getBoundingClientRect().width >= 60);
+          }
+          buttonNamed("Toggle narrow layout").click(); await tick();
+
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report();
+        } catch (error) {
+          stopped(error);
+          report();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+      })();
+    </script>
+  </body>
+</html>

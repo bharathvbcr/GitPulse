@@ -40,6 +40,7 @@
   } from "../workbench/client";
   import {
     MAX_CHECKOUT_LENGTH,
+    PROVIDER_CHOICES,
     PROVIDER_LABELS,
     checkoutCandidates,
     defaultHandoff,
@@ -246,8 +247,9 @@
 <div class="handoff-form" data-testid="task-handoff-form">
   <div class="pair">
     <div class="gp-segmented" role="group" aria-label="Coding agent">
-      <button type="button" class="gp-seg-btn" data-active={settings.provider === "codex"} aria-pressed={settings.provider === "codex"} disabled={locked} onclick={() => choose({ provider: "codex" })}>Codex</button>
-      <button type="button" class="gp-seg-btn" data-active={settings.provider === "claude"} aria-pressed={settings.provider === "claude"} disabled={locked} onclick={() => choose({ provider: "claude" })}>Claude Code</button>
+      {#each PROVIDER_CHOICES as provider (provider)}
+        <button type="button" class="gp-seg-btn" data-active={settings.provider === provider} aria-pressed={settings.provider === provider} disabled={locked} onclick={() => choose({ provider })}>{PROVIDER_LABELS[provider]}</button>
+      {/each}
     </div>
     <div class="gp-segmented" role="group" aria-label="Connection">
       <button type="button" class="gp-seg-btn" data-active={settings.kind === "external_terminal"} aria-pressed={settings.kind === "external_terminal"} disabled={locked} onclick={() => choose({ kind: "external_terminal" })}>Terminal</button>

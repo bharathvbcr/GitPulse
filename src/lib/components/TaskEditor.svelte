@@ -16,6 +16,7 @@
   import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
   import { linkSummary, repositoryRows, shouldOfferFilter, triggerChips } from "../workbench/taskRepositories";
   import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { sanitizeLogs } from "../workbench/taskLogs";
   import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
   import { editorTabBadge, editorTabHint, editorTabs, resolveEditorTab, type TaskEditorTab } from "../workbench/taskEditorTabs";
   import { handleTablistKeydown, focusTabAt, panelId, tabId, tabProps } from "../dom/tablist";
@@ -49,9 +50,10 @@
       title: "", description: "", kind: "feature", status: initial.initialStatus, priority: 2, severity: null,
       owner: null, due_at: null, labels: [], acceptance_criteria: [], repository_ids: initial.primary ? [initial.primary] : [],
       primary_repository_id: initial.primary, home_workspace_id: initial.home, position: Date.now(), locked_fields: [] as EnhancementField[],
+      logs: "",
       ...initial.seed,
     };
-    return { ...base, locked_fields: base.locked_fields ?? [] };
+    return { ...base, locked_fields: base.locked_fields ?? [], logs: base.logs ?? "" };
   })());
   let criteria = $state(untrack(() => draft.acceptance_criteria.join("\n")));
   let labelChips = $state<string[]>(untrack(() => [...draft.labels]));
@@ -79,6 +81,7 @@
   let homeError = $state("");
   let homeToken = 0;
   let notes = $state("");
+  let logNotice = $state("");
   let copied = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
   let confirming = $state(false);
@@ -125,7 +128,8 @@
     return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus(); };
   });
   onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
-  const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim()));
+  const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim() || (draft.logs ?? "").trim()));
+  const hasLogs = $derived(Boolean((draft.logs ?? "").trim()));
   const id = initial.value?.id ?? newID();
   const group = `task-sheet-${id}`;
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
@@ -222,6 +226,11 @@
     if (!pending && !applyExtractedNotes()) return null;
     if (!pending && (!draft.title.trim() || !draft.kind.trim())) { error = "Add a title and task type before saving."; return null; }
     if (!pending && new TextEncoder().encode(draft.description).length > 65_536) { error = "Description is too long. Keep it below 64 KB."; return null; }
+    if (!pending) {
+      const logs = sanitizeLogs(draft.logs);
+      draft.logs = logs.text;
+      logNotice = logs.notice;
+    }
     saving = true; error = ""; note = ""; shortcutBlocked = "";
     try {
       if (!pending) {
@@ -232,7 +241,7 @@
       const saved = await bounded(putTask(pending));
       if (saved.id !== id || saved.revision !== Number(pending.expected_revision) + 1) throw new WorkbenchError("protocol_error", "Task update confirmation does not match the request.");
       if (disposed) return null;
-      current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [] }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels]; dirty = false; pending = null;
+      current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [], logs: saved.logs ?? "" }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels]; dirty = false; pending = null;
       note = "Saved"; onSaved(saved);
       return saved;
     } catch (cause) {
@@ -256,6 +265,30 @@
       return saved;
     }
     return current;
+  }
+  function setLogs(value: string) {
+    const result = sanitizeLogs(value);
+    draft.logs = result.text;
+    logNotice = result.notice;
+    dirty = true;
+  }
+  function onLogsPaste(event: ClipboardEvent) {
+    const incoming = event.clipboardData?.getData("text") ?? "";
+    if (!incoming) return;
+    event.preventDefault();
+    const area = event.currentTarget as HTMLTextAreaElement;
+    const start = area.selectionStart ?? area.value.length;
+    const end = area.selectionEnd ?? start;
+    setLogs(`${area.value.slice(0, start)}${incoming}${area.value.slice(end)}`);
+  }
+  async function copyLogs() {
+    if (copying || saving || !hasLogs) return;
+    copying = true; error = ""; note = "";
+    try {
+      const packet = sanitizeLogs(draft.logs).text;
+      if (packet && await copyText(packet)) note = "Copied raw logs";
+      else error = packet ? "Clipboard unavailable" : "Add logs before copying them.";
+    } finally { copying = false; }
   }
   function markCopied(message: string) {
     note = message;
@@ -287,6 +320,7 @@
           labels: [...labelChips],
           acceptance_criteria: criteria.split("\n").map((item) => item.trim()).filter(Boolean),
           repositoryNames: draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? repo),
+          logs: draft.logs,
         });
         if (packet && await copyText(packet)) markCopied("Copied unsaved draft for an agent");
         else error = packet ? "Clipboard unavailable" : "Add a title or description to copy";
@@ -303,7 +337,7 @@
       const latest = await bounded(getTask(id));
       if (disposed) return;
       if (latest.id !== id) throw new WorkbenchError("protocol_error", "Loaded task does not match this editor.");
-      current = latest; draft = { ...taskDraft(latest), locked_fields: latest.locked_fields ?? [] }; criteria = latest.acceptance_criteria.join("\n"); labelChips = [...latest.labels]; notes = ""; pending = null; dirty = false; error = "";
+      current = latest; draft = { ...taskDraft(latest), locked_fields: latest.locked_fields ?? [], logs: latest.logs ?? "" }; criteria = latest.acceptance_criteria.join("\n"); labelChips = [...latest.labels]; notes = ""; logNotice = ""; pending = null; dirty = false; error = "";
     } catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) { confirming = false; reloading = false; } }
   }
@@ -330,7 +364,7 @@
     } finally { if (!disposed) saving = false; }
   }
   function applied(saved: Task) {
-    current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [] }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels];
+    current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [], logs: saved.logs ?? "" }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels];
     dirty = false; pending = null; note = `Saved revision ${saved.revision}`; onSaved(saved);
   }
   function onTabKeydown(event: KeyboardEvent) {
@@ -388,7 +422,7 @@
       <small>{dirty ? "Unsaved" : current ? `Revision ${current.revision}` : "Describe the work, then save."}</small>
     </div>
     <div class="header-actions">
-      <button type="button" class="gp-btn" onclick={() => void copyForAgent()} disabled={!copyable || copying || saving || enhancementBusy || pending !== null} aria-label="Copy task for an AI agent" title={copyable ? "Copy a packet an AI agent can paste" : "Add a title, description, or notes first"}>
+      <button type="button" class="gp-btn" onclick={() => void copyForAgent()} disabled={!copyable || copying || saving || enhancementBusy || pending !== null} aria-label="Copy task for an AI agent" title={copyable ? "Copy a packet an AI agent can paste" : "Add a title, description, notes, or logs first"}>
         <Clipboard size={12} /> {copying ? "Copying…" : copied ? "Copied" : "Copy for agent"}
       </button>
       <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementBusy || saving || adding || reloading || confirming || pending !== null || pendingDelete !== null} aria-label="Close task details">✕</button>
@@ -534,7 +568,19 @@
           </section>
 
           <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">4</span><h3>Status and scheduling</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <div class="step-head"><span class="step-n" aria-hidden="true">4</span><h3>Raw logs</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <div class="logs-head">
+              <p class="meta">Paste a stack trace or terminal dump. It is saved with the task so you can copy it or send it to an agent.</p>
+              <button type="button" class="gp-btn" onclick={() => void copyLogs()} disabled={!hasLogs || copying || saving} aria-label="Copy raw logs">Copy logs</button>
+            </div>
+            <fieldset disabled={enhancementBusy}>
+              <label>Raw logs<textarea class="gp-field logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
+            </fieldset>
+            {#if logNotice}<p class="meta" role="status">{logNotice}</p>{/if}
+          </section>
+
+          <section class="step">
+            <div class="step-head"><span class="step-n" aria-hidden="true">5</span><h3>Status and scheduling</h3><span class="step-rule" aria-hidden="true"></span></div>
             <fieldset disabled={enhancementBusy}>
               <div class="pair">
                 <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
@@ -578,7 +624,7 @@
           </section>
 
           <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">5</span><h3>Owner</h3><span class="step-rule" aria-hidden="true"></span></div>
+            <div class="step-head"><span class="step-n" aria-hidden="true">6</span><h3>Owner</h3><span class="step-rule" aria-hidden="true"></span></div>
             <fieldset disabled={enhancementBusy}>
               <!-- The section heading already says "Owner", so the label is
                    there for a screen reader rather than repeated on screen.
@@ -649,6 +695,9 @@
   .step-head h3{margin:0;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
   .step-n{flex-shrink:0;width:16px;height:16px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.34)}
   .step-rule{flex:1;height:1px;background:linear-gradient(to right,rgb(var(--c-border) / 0.55),transparent)}
+  .logs-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin:0 0 8px}
+  .logs-head p{margin:0;flex:1}
+  .logs-field{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;white-space:pre;overflow:auto}
   /* The last field in a section carries the section's own bottom gap, not a
      second one of its own. */
   .step fieldset > :last-child{margin-bottom:0}

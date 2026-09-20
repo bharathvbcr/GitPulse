@@ -258,6 +258,9 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     let task_id = input.id("task_id")?;
     let source_revision = input.integer("source_revision", None, MAX_INTEGER)?;
     let source = task_body(input, &task_id)?;
+    // Logs are agent evidence, not drafting input. Leaving them on `source`
+    // would send a terminal dump to Manvi whenever a title is rewritten.
+    let source: String = input.conn.query_row("SELECT json_remove(?1,'$.logs')", [&source], |r| r.get(0))?;
     let task = Input {
         conn: input.conn,
         raw: &source,

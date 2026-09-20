@@ -47,6 +47,10 @@ describe("task attempt transport", () => {
     for (const change of [{state:"done"},{provider:"shell"},{permission_mode:"skip"},{source_revision:0},{exit_code:-1},{outcome_uncertain:"false"},{session_id:12},{reason:null}]) expect(()=>taskRun({...run,...change})).toThrow();
     expect(taskRun({...run,state:"unresolved",outcome_uncertain:true})).toMatchObject({state:"unresolved",outcome_uncertain:true});
   });
+  it("accepts Grok and Antigravity terminal runs", () => {
+    expect(taskRun({...run, provider:"grok"})).toMatchObject({provider:"grok"});
+    expect(taskRun({...run, provider:"agy"})).toMatchObject({provider:"agy"});
+  });
   it("checks repository and task-run identity in single-record reads", async () => {
     native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{id:"repo",revision:3,updated_at:1,name:"GitPulse",identity_key:"local",remote_url:null}}));
     await expect(getRepository("other")).rejects.toMatchObject({code:"protocol_error"});

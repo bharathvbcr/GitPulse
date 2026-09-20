@@ -55,6 +55,8 @@ describe("TerminalDock", () => {
 
   it("sizes itself through the clamp rather than trusting the stored height", () => {
     expect(source).toContain("fitTerminalDockHeight($interfaceStore.terminalDockHeight");
+    expect(source).toContain("fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, containerHeight, 0)");
+    expect(source).toContain("aria-valuemax={heightCeiling}");
   });
 });
 

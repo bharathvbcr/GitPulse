@@ -619,6 +619,10 @@ fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     ];
     if let Some(home) = home {
         dirs.push(PathBuf::from(home).join(".local/bin"));
+        // Grok Build installs the real binary under `~/.grok/bin` and may
+        // only symlink `grok` into `~/.local/bin`. A GUI PATH that sees
+        // neither Homebrew nor that symlink still has to find it.
+        dirs.push(PathBuf::from(home).join(".grok/bin"));
     }
     // Fixed system path, so it does not depend on knowing `home` — gating it
     // on that withheld a still-valid directory from launchd/daemon contexts,
@@ -3227,6 +3231,33 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_finds_grok_in_its_install_dir() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".grok/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert!(
+            gui_launch_fallback_dirs(Some(home.path().as_os_str())).contains(&bin),
+            "~/.grok/bin must be a GUI-launch fallback directory"
+        );
+        let probe = "gitpulse-grok-bin-probe";
+        let path = bin.join(probe);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let resolved = resolve_spawn_program_with(
+            probe,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            Some(home.path().as_os_str()),
+        );
+        assert_eq!(
+            Path::new(&resolved),
+            &path,
+            "resolution must reach ~/.grok/bin on a GUI-launch PATH"
+        );
+    }
+
     /// A fallback directory that does not depend on the user's home must not
     /// be gated on knowing it. `/usr/local/go/bin` is a fixed system path, so
     /// dropping it when `home` is unset (a launchd/daemon context, where this
@@ -3642,6 +3673,7 @@ mod tests {
             PathBuf::from("/opt/homebrew/bin"),
             PathBuf::from("/usr/local/bin"),
             home.path().join(".local/bin"),
+            home.path().join(".grok/bin"),
             // Go toolchain locations so govulncheck's own `go` spawn resolves.
             PathBuf::from("/usr/local/go/bin"),
             home.path().join("go/bin"),

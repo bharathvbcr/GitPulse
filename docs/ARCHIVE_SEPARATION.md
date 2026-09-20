@@ -23,7 +23,7 @@ the GitPulse side:
 | What | Where | Why it blocks |
 | --- | --- | --- |
 | No column to store it | `work_items` in `workbench/schema.sql` | The table's stored generated columns are `title`, `description`, `status`, `position`. There is no `archived`. |
-| No field to write it | `put_item` in `workbench/mod.rs` | `input.fields(…)` lists eighteen accepted names and **rejects** every other field, so an `archived` key in the request is an error, not an ignored extra. The body is assembled by `json_object(…)` from those names, so an unknown key could not reach the body even if it were accepted. |
+| No field to write it | `put_item` in `workbench/mod.rs` | `input.fields(…)` lists nineteen accepted names and **rejects** every other field, so an `archived` key in the request is an error, not an ignored extra. The body is assembled by `json_object(…)` from those names, so an unknown key could not reach the body even if it were accepted. |
 | No filter to read it | `list_items` in `workbench/mod.rs` | `input.fields(…)` accepts exactly `limit`, `cursor`, `workspace_id`, `repository_id`, `status`, `query`. There is nowhere to say "archived" in a query. |
 
 `STATUSES` is also a six-element `const` in that crate, so "add a seventh

@@ -36,5 +36,19 @@ export function asTaskStatus(value: unknown): TaskStatus | null {
 export const PERMISSION_MODES = ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
+/**
+ * Interactive CLIs GitPulse can hand a saved task to.
+ *
+ * Managed runs remain Codex-only: that connection is Manvi supervising a
+ * Codex session, not a property of every agent CLI.
+ */
+export const AGENT_PROVIDERS = ["claude", "codex", "grok", "agy"] as const;
+export type AgentProvider = (typeof AGENT_PROVIDERS)[number];
+
+/** A provider from untrusted input (stored preference, wire payload), or null. */
+export function asAgentProvider(value: unknown): AgentProvider | null {
+  return AGENT_PROVIDERS.find((provider) => provider === value) ?? null;
+}
+
 /** A provider terminal GitPulse opens, or a connection GitPulse supervises. */
 export type RunKind = "external_terminal" | "managed";

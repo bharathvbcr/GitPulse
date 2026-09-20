@@ -134,6 +134,43 @@ must not open storage, and Manvi must observe a native task revision change and
 refuse a stale generation before provider resolution. It does not launch the
 installed desktop app or evaluate a live model.
 
+## Blame and its code-age timeline
+
+Run `npm run test:browser -- --harness blame`, or
+`npm run test:webkit -- --harness blame` on macOS. For interactive inspection,
+open `/harness/blame.html` on the development server; the buttons across the
+top swap the blame fixture and toggle density, timestamp style and theme.
+
+It mounts the production `BlameViewer` over simulated IPC and settles the two
+things a node test cannot reach:
+
+- **The strip and the rows are one population.** A column that claims 45% of
+  the file is clicked, and the filtered count under it has to be the 45 lines
+  the column counted. The same run adds up every column's claim and requires
+  it to equal the file's dated lines, so a share can neither be invented nor
+  dropped on the way to the DOM.
+- **The rows are exactly as tall as the windowing math thinks.** Checked at
+  both densities, against neighbouring row positions. The rows used to carry a
+  fixed `h-6` while `VirtualList` placed them from `rowHeight("blame", …)`, so
+  a compact row overhung its 20 px slot — invisible to every node test,
+  because nothing mounts there.
+
+- **The rail maps the list actually drawn.** Under a filter the file and the
+  drawn list are different lists, and a map of the other one points every mark
+  at a row that is not there. The run filters to one band and requires the rail
+  to carry only that tone. It also clicks the rail in the *middle* of the list
+  and requires the click to land in the middle of the viewport: at the ends,
+  centring and top-aligning both clamp to the same place, so that is the one
+  position where the rule is visible at all.
+
+It also covers a long line's horizontal scroll, commit-block grouping and
+hover, the age column following the shared timestamp preference, the legend's
+per-band shares and the filter behind them, and the four states an
+empty-looking pane can be in: nothing committed, an empty file, a failed read
+with its retry, and a clock-skewed or undated line named beside the axis
+rather than placed on it. Unexpected IPC and runtime errors fail the run. No
+git command executes.
+
 ## Code diagnostics
 
 Run `npm run test:browser` for the automated Chrome gate, or

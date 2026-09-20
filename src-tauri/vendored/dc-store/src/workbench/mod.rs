@@ -666,8 +666,10 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         "home_workspace_id",
         "position",
         "locked_fields",
+        "logs",
     ])?;
     enhancements::fields(input, "locked_fields", false)?;
+    input.text("logs", input::MAX_LOGS_BYTES)?;
     let title = input.required_text("title", 1200)?;
     if title.chars().count() > 300 {
         return Err(Error::invalid("title exceeds 300 characters"));
@@ -715,9 +717,10 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
     let body:String=input.conn.query_row(
         "SELECT json_object('id',?1,'revision',?2,'title',?3,'description',?4,'kind',?5,'status',?6,'priority',?7,'severity',?8,'owner',?9,'position',?10,'primary_repository_id',?11,'home_workspace_id',?12,'repository_ids',json(json_extract(?13,'$.repository_ids')),'labels',json(coalesce(json_extract(?13,'$.labels'),'[]')),'acceptance_criteria',json(coalesce(json_extract(?13,'$.acceptance_criteria'),'[]')),'due_at',json_extract(?13,'$.due_at'),'updated_at',?14)",
         params![id,revision,title,description,kind,status,priority,severity,owner,position,primary,home,input.raw,now],|r|r.get(0))?;
-    // Older hosts do not know field locks. Omission must preserve them; only an
-    // explicit empty array unlocks fields. This also keeps ordinary edits safe.
-    let body: String = input.conn.query_row("SELECT json_set(?1,'$.locked_fields',json(coalesce(json_extract(?2,'$.locked_fields'),(SELECT json_extract(body,'$.locked_fields') FROM work_items WHERE id=?3),'[]')))", params![body,input.raw,id], |r|r.get(0))?;
+    // Older hosts do not know field locks or logs. Omission must preserve them;
+    // only an explicit empty array / empty string clears. This also keeps
+    // ordinary edits from wiping evidence a previous revision stored.
+    let body: String = input.conn.query_row("SELECT json_set(?1,'$.locked_fields',json(coalesce(json_extract(?2,'$.locked_fields'),(SELECT json_extract(body,'$.locked_fields') FROM work_items WHERE id=?3),'[]')),'$.logs',coalesce(json_extract(?2,'$.logs'),(SELECT json_extract(body,'$.logs') FROM work_items WHERE id=?3),''))", params![body,input.raw,id], |r|r.get(0))?;
     let deleted: bool = input.conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND deleted=1)",
         [id],
@@ -1087,7 +1090,7 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         "WITH page AS MATERIALIZED (
             SELECT t.rowid AS item_rowid,t.position,t.id {query}
             AND (t.position,t.id)>(?{},?{}) ORDER BY t.position,t.id LIMIT ?{}
-        ) SELECT json_remove(t.body,'$.description','$.acceptance_criteria'),page.position,page.id
+        ) SELECT json_remove(t.body,'$.description','$.acceptance_criteria','$.logs'),page.position,page.id
           FROM page CROSS JOIN work_items t ON t.rowid=page.item_rowid
           ORDER BY page.position,page.id",
         bound + 1,
@@ -1161,6 +1164,8 @@ fn item_query(
 mod enhancement_lifecycle_tests;
 #[cfg(test)]
 mod item_query_tests;
+#[cfg(test)]
+mod logs_tests;
 
 fn list_events(input: &Input<'_>) -> Result<String> {
     input.fields(&["limit", "after"])?;

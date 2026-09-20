@@ -245,7 +245,7 @@ describe("the handoff gate under hostile settings", () => {
     ];
     for (const value of stored) {
       const settings = sanitizeHandoff(value);
-      expect(["codex", "claude"], JSON.stringify(value)).toContain(settings.provider);
+      expect(["codex", "claude", "grok", "agy"], JSON.stringify(value)).toContain(settings.provider);
       expect(["external_terminal", "managed"], JSON.stringify(value)).toContain(settings.kind);
       expect(settings.permission, JSON.stringify(value)).not.toBe("bypass");
       // Reconciling is idempotent, so a round trip cannot drift.

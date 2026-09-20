@@ -7,7 +7,7 @@
  */
 
 export const TERMINAL_DOCK_MIN_HEIGHT = 200;
-export const TERMINAL_DOCK_MAX_HEIGHT = 900;
+export const TERMINAL_DOCK_MAX_HEIGHT = 2400;
 export const TERMINAL_DOCK_DEFAULT_HEIGHT = 280;
 /** Keyboard resize step for the dock separator (ArrowUp/ArrowDown). */
 export const TERMINAL_DOCK_RESIZE_STEP = 24;

@@ -268,6 +268,8 @@ describe("agent handoff entry", () => {
     expect(menuPageItems(items, "agent").map((item) => [item.label, item.hint])).toEqual([
       ["Claude Code", "Terminal"],
       ["Codex", "Terminal"],
+      ["Grok", "Terminal"],
+      ["Antigravity", "Terminal"],
       ["Codex", "Managed"],
     ]);
     expect(items.find((item) => item.id === "agent-codex-managed")?.action).toEqual({

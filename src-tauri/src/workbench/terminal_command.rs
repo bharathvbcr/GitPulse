@@ -69,8 +69,12 @@ fn error(code: &str, message: impl Into<String>) -> WorkbenchError {
     WorkbenchError::new(code, message)
 }
 
+pub(super) fn is_terminal_provider(provider: &str) -> bool {
+    matches!(provider, "codex" | "claude" | "grok" | "agy")
+}
+
 pub(super) fn program(provider: &str) -> Result<String, WorkbenchError> {
-    if !["codex", "claude"].contains(&provider) {
+    if !is_terminal_provider(provider) {
         return Err(error("invalid_input", "Unsupported terminal provider."));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
@@ -109,21 +113,28 @@ pub(super) fn check(
     .map_err(|e| error("capability_error", e))?;
     if !version.success
         || version.stdout.len() > 1024
+        || version.stderr.len() > 1024
         || !help.success
         || help.stdout.len() > 128 * 1024
+        || help.stderr.len() > 128 * 1024
     {
         return Err(error(
             "capability_error",
             "The provider did not return bounded version and help responses.",
         ));
     }
-    let version = std::str::from_utf8(&version.stdout)
+    let version = command_text(&version.stdout, &version.stderr)
         .map_err(|_| error("capability_error", "Invalid provider version response."))?;
-    let help = std::str::from_utf8(&help.stdout)
+    let help = command_text(&help.stdout, &help.stderr)
         .map_err(|_| error("capability_error", "Invalid provider help response."))?;
     let identity = match provider {
         "codex" => version.starts_with("codex-cli "),
         "claude" => version.contains("Claude Code"),
+        "grok" => version.starts_with("grok "),
+        // `agy --version` prints only a semver. Identity is the help banner;
+        // Antigravity writes that banner to stderr, which `command_text` prefers
+        // only when stdout is empty.
+        "agy" => help.contains("Usage of agy:") && help.contains("--prompt-interactive"),
         _ => false,
     };
     let (flags, _) = policy(provider, mode)?;
@@ -138,13 +149,37 @@ pub(super) fn check(
                 .filter(|next| !next.starts_with("--"));
             advertised_option(help, flag, value)
         });
-    if !identity || !supported || (provider == "codex" && !advertised_option(help, "--cd", None)) {
+    let required: &[&str] = match provider {
+        "codex" => &["--cd"],
+        "grok" => &["--cwd"],
+        "agy" => &[
+            "--mode",
+            "--prompt-interactive",
+            "--dangerously-skip-permissions",
+        ],
+        _ => &[],
+    };
+    if !identity
+        || !supported
+        || required
+            .iter()
+            .any(|flag| !advertised_option(help, flag, None))
+    {
         return Err(error(
             "unsupported_capability",
             "This provider build does not advertise the requested launch controls.",
         ));
     }
     Ok(())
+}
+
+/// stdout when the provider printed there, otherwise stderr.
+///
+/// Claude Code, Codex and Grok write `--help` to stdout. Antigravity's `agy`
+/// writes it to stderr (Go `flag`). A check that only read stdout would treat
+/// a real install as having no launch controls.
+fn command_text<'a>(stdout: &'a [u8], stderr: &'a [u8]) -> Result<&'a str, std::str::Utf8Error> {
+    std::str::from_utf8(if stdout.is_empty() { stderr } else { stdout })
 }
 
 /// Verify the exact option and value within its own help block. A similarly
@@ -201,6 +236,20 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
         ("claude", "auto_review") => vec!["--permission-mode", "auto"],
         ("claude", "preapproved") => vec!["--permission-mode", "dontAsk"],
         ("claude", "bypass") => vec!["--permission-mode", "bypassPermissions"],
+        // Grok's modes are Claude-compatible except `ask`: it has `default`
+        // (prompt for permissions) rather than `manual`.
+        ("grok", "inspect") => vec!["--permission-mode", "plan"],
+        ("grok", "ask") => vec!["--permission-mode", "default"],
+        ("grok", "edit") => vec!["--permission-mode", "acceptEdits"],
+        ("grok", "auto_review") => vec!["--permission-mode", "auto"],
+        ("grok", "preapproved") => vec!["--permission-mode", "dontAsk"],
+        ("grok", "bypass") => vec!["--permission-mode", "bypassPermissions"],
+        ("agy", "inspect") => vec!["--mode", "plan"],
+        ("agy", "ask") => vec![],
+        ("agy", "edit") => vec!["--mode", "accept-edits"],
+        ("agy", "auto_review") => vec!["--sandbox"],
+        ("agy", "preapproved") => vec!["--mode", "accept-edits", "--sandbox"],
+        ("agy", "bypass") => vec!["--dangerously-skip-permissions"],
         _ => {
             return Err(error(
                 "unsupported_capability",
@@ -230,8 +279,12 @@ pub(super) fn arguments(
         .ok_or_else(|| error("file_error", "Task brief path is not Unicode."))?;
     let quoted = serde_json::to_string(path).map_err(|e| error("file_error", e.to_string()))?;
     let mut args: Vec<String> = flags.into_iter().map(String::from).collect();
-    if provider == "codex" {
-        args.extend(["--cd".into(), cwd.into()]);
+    match provider {
+        "codex" => args.extend(["--cd".into(), cwd.into()]),
+        "grok" => args.extend(["--cwd".into(), cwd.into()]),
+        // Antigravity ignores positional arguments as prompts.
+        "agy" => args.push("--prompt-interactive".into()),
+        _ => {}
     }
     let scope = if inspect {
         "Inspect and propose a plan; do not modify files."
@@ -252,10 +305,10 @@ pub(super) fn arguments(
 mod tests {
     use super::{arguments, BriefFile};
     #[test]
-    #[ignore = "requires explicitly installed Claude Code and Codex binaries; probes help only"]
+    #[ignore = "requires explicitly installed Claude Code, Codex, Grok and Antigravity binaries; probes help only"]
     fn installed_provider_help_supports_requested_modes() {
         let root = tempfile::tempdir().unwrap();
-        for provider in ["claude", "codex"] {
+        for provider in ["claude", "codex", "grok", "agy"] {
             let program = super::program(provider).unwrap();
             for mode in [
                 "inspect",
@@ -340,7 +393,7 @@ mod tests {
     }
     #[test]
     fn each_provider_mode_is_explicit_and_bypass_is_never_inherited() {
-        for provider in ["codex", "claude"] {
+        for provider in ["codex", "claude", "grok", "agy"] {
             for mode in [
                 "inspect",
                 "ask",
@@ -357,7 +410,14 @@ mod tests {
                     std::path::Path::new("/brief.md"),
                 )
                 .unwrap();
-                assert_eq!(args.iter().any(|a| a.contains("bypass")), mode == "bypass");
+                let names_bypass = args
+                    .iter()
+                    .any(|a| a.contains("bypass") || a.contains("dangerously-skip-permissions"));
+                assert_eq!(
+                    names_bypass,
+                    mode == "bypass",
+                    "{provider}/{mode}: {args:?}"
+                );
                 assert!(arguments(
                     provider,
                     mode,
@@ -376,5 +436,157 @@ mod tests {
             std::path::Path::new("/brief.md")
         )
         .is_err());
+    }
+    #[test]
+    fn grok_is_a_first_class_terminal_provider() {
+        match super::program("grok") {
+            Ok(path) => assert!(
+                path.contains("grok"),
+                "resolved grok path must name grok: {path}"
+            ),
+            Err(error) => assert_eq!(
+                error.code, "not_installed",
+                "an unknown provider is invalid_input; a missing install is not_installed: {} {}",
+                error.code, error.message
+            ),
+        }
+        assert_eq!(super::program("gemini").unwrap_err().code, "invalid_input");
+        let args = arguments(
+            "grok",
+            "inspect",
+            false,
+            "/checkout with spaces",
+            std::path::Path::new("/brief.md"),
+        )
+        .unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "plan"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--cwd", "/checkout with spaces"]),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("bypass")));
+        let ask = arguments(
+            "grok",
+            "ask",
+            false,
+            "/repo",
+            std::path::Path::new("/brief.md"),
+        )
+        .unwrap();
+        assert!(
+            ask.windows(2)
+                .any(|pair| pair == ["--permission-mode", "default"]),
+            "{ask:?}"
+        );
+    }
+    #[test]
+    fn antigravity_is_a_first_class_terminal_provider() {
+        match super::program("agy") {
+            Ok(path) => assert!(
+                path.contains("agy"),
+                "resolved agy path must name agy: {path}"
+            ),
+            Err(error) => assert_eq!(
+                error.code, "not_installed",
+                "an unknown provider is invalid_input; a missing install is not_installed: {} {}",
+                error.code, error.message
+            ),
+        }
+        let inspect = arguments(
+            "agy",
+            "inspect",
+            false,
+            "/checkout with spaces",
+            std::path::Path::new("/brief.md"),
+        )
+        .unwrap();
+        assert!(
+            inspect.windows(2).any(|pair| pair == ["--mode", "plan"]),
+            "{inspect:?}"
+        );
+        assert!(
+            inspect
+                .windows(2)
+                .any(|pair| pair[0] == "--prompt-interactive" && pair[1].contains("brief.md")),
+            "{inspect:?}"
+        );
+        assert!(!inspect.iter().any(|a| a.contains("dangerously-skip")));
+        let ask = arguments(
+            "agy",
+            "ask",
+            false,
+            "/repo",
+            std::path::Path::new("/brief.md"),
+        )
+        .unwrap();
+        assert_eq!(ask[0], "--prompt-interactive", "{ask:?}");
+        let bypass = arguments(
+            "agy",
+            "bypass",
+            true,
+            "/repo",
+            std::path::Path::new("/brief.md"),
+        )
+        .unwrap();
+        assert!(bypass.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn grok_probe_requires_identity_permission_modes_and_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("scripted-grok");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n--version) printf 'grok 1.0.34 (deadbeef) [stable]\\n';;\n--help) printf 'Grok Build TUI\\n      --permission-mode <MODE>\\n          [possible values: default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\\n      --cwd <CWD>\\n          Working directory\\n';;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = path.to_str().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        super::check(program, cwd, "grok", "ask").unwrap();
+        super::check(program, cwd, "grok", "bypass").unwrap();
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n--version) printf 'grok 1.0.34 (deadbeef) [stable]\\n';;\n--help) printf 'Grok Build TUI\\n      --permission-mode <MODE>\\n          [possible values: default, plan]\\n';;\nesac\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::check(program, cwd, "grok", "ask").unwrap_err().code,
+            "unsupported_capability"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_help_on_stderr_is_still_capability_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("scripted-agy");
+        // Help on stderr, version on stdout — the real `agy` layout.
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n--version) printf '1.1.22\\n';;\n--help) printf 'Usage of agy:\\n  --mode                          Set the agent execution mode for this session (accept-edits, plan)\\n  --prompt-interactive            Run an initial prompt interactively\\n  --dangerously-skip-permissions  Auto-approve all tool permission requests\\n  --sandbox                       Run in a sandbox\\n' >&2;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = path.to_str().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        super::check(program, cwd, "agy", "ask").unwrap();
+        super::check(program, cwd, "agy", "inspect").unwrap();
+        super::check(program, cwd, "agy", "bypass").unwrap();
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n--version) printf '1.1.22\\n';;\n--help) printf 'Usage of agy:\\n  --prompt-interactive            prompt\\n' >&2;;\nesac\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::check(program, cwd, "agy", "ask").unwrap_err().code,
+            "unsupported_capability"
+        );
     }
 }

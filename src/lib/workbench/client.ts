@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { selectionWire, type ModelSelection } from "./taskModel";
-import { PERMISSION_MODES, STATUSES, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
+import { PERMISSION_MODES, STATUSES, asAgentProvider, type AgentProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
 
-export { STATUSES, STATUS_LABELS, asTaskStatus, PERMISSION_MODES } from "./vocabulary";
-export type { TaskStatus, PermissionMode, RunKind } from "./vocabulary";
+export { STATUSES, STATUS_LABELS, asTaskStatus, PERMISSION_MODES, AGENT_PROVIDERS, asAgentProvider } from "./vocabulary";
+export type { TaskStatus, PermissionMode, RunKind, AgentProvider } from "./vocabulary";
 export interface RecordVersion { id: string; revision: number; updated_at: number }
 export interface Repository extends RecordVersion { name: string; identity_key: string; remote_url: string | null }
 export interface WorkspaceCard extends RecordVersion { name: string; icon: string; color: string; position: number; pinned: boolean; archived: boolean; repository_count: number }
@@ -31,7 +31,7 @@ export interface AutomationSettings extends RecordVersion { enabled: boolean; pr
 export const AUTOMATIC_STATES = ["not_started", "checking", "idle", "disabled", "waiting", "generating", "stopping", "paused", "stopped"] as const;
 export interface AutomaticStatus { state: typeof AUTOMATIC_STATES[number]; reason: string; task_id: string; proposal_id: string; next_check_at: number }
 export type EnhancementMutation = "enhancements.create" | "enhancements.generate" | "enhancements.accept" | "enhancements.dismiss" | "enhancements.undo" | "enhancements.recover" | "enhancements.revise";
-export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; locked_fields?: EnhancementField[] }
+export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; locked_fields?: EnhancementField[]; logs?: string }
 export interface BriefReference extends RecordVersion { name: string }
 export interface TaskBrief extends RecordVersion { format_version: 1; task: Task; repositories: BriefReference[]; workspace: BriefReference | null; markdown: string }
 export const RUN_STATES = ["prepared", "starting", "running", "exited", "failed", "cancelled", "unresolved"] as const;
@@ -41,7 +41,7 @@ export interface TaskRun extends RecordVersion {
   provider_state?: typeof PROVIDER_STATES[number]; provider_thread_id?: string; provider_turn_id?: string | null;
   effective_configuration?: string; output?: string; output_truncated?: boolean;
   task_id: string; source_revision: number; task_title: string; repository_id: string;
-  provider: "claude" | "codex"; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
+  provider: AgentProvider; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
   cwd: string; created_at: number; expires_at: number; session_id: string | null;
   exit_code: number | null; reason: string; outcome_uncertain: boolean;
 }
@@ -49,7 +49,7 @@ export interface RunPreparation {
   kind?: RunKind;
   id: string; request_id: string; task_id: string; source_revision: number;
   repository_id: string; repository_revision: number; repo_path: string;
-  provider: "claude" | "codex"; permission_mode: PermissionMode; acknowledge_bypass: boolean;
+  provider: AgentProvider; permission_mode: PermissionMode; acknowledge_bypass: boolean;
 }
 export type TaskDraft = Omit<Task, keyof RecordVersion>;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
@@ -295,7 +295,12 @@ function lockFields(value: unknown): EnhancementField[] {
   if (fields.length > 2 || new Set(fields).size !== fields.length) return invalid();
   return fields.map((field) => field === "title" || field === "description" ? field : invalid());
 }
-export function task(value: unknown): Task { const raw = object(value); return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), ...(raw.locked_fields === undefined ? {} : { locked_fields: lockFields(raw.locked_fields) }) }; }
+export function task(value: unknown): Task {
+  const raw = object(value);
+  const logs = raw.logs === undefined ? undefined : text(raw.logs);
+  if (logs !== undefined && (logs.includes("\0") || new TextEncoder().encode(logs).length > 1024 * 1024)) return invalid();
+  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: lockFields(raw.locked_fields) }) };
+}
 export function enhancementSummary(value: unknown): EnhancementSummary {
   const raw = object(value);
   const state = ENHANCEMENT_STATES.find((state) => state === raw.state);
@@ -380,7 +385,8 @@ export function taskRun(value: unknown): TaskRun {
   if (providerState && ["ready", "running", "completed"].includes(providerState) && !thread?.trim()) return invalid();
   if (providerState && ["running", "completed"].includes(providerState) && !turn?.trim()) return invalid();
   if ((thread !== undefined || turn !== undefined) && (!providerState || !thread?.trim())) return invalid();
-  if (!state || !permission || (provider !== "claude" && provider !== "codex")) return invalid();
+  const named = asAgentProvider(provider);
+  if (!state || !permission || !named) return invalid();
   const source = integer(raw.source_revision);
   if (!source) return invalid();
   return { ...version(raw), kind,
@@ -390,7 +396,7 @@ export function taskRun(value: unknown): TaskRun {
     ...(raw.effective_configuration === undefined ? {} : {effective_configuration: text(raw.effective_configuration)}),
     ...(raw.output === undefined ? {} : {output: text(raw.output)}),
     ...(raw.output_truncated === undefined ? {} : {output_truncated: boolean(raw.output_truncated)}),
-    task_id: text(raw.task_id), source_revision: source, task_title: text(raw.task_title), repository_id: text(raw.repository_id), provider, permission_mode: permission, state,
+    task_id: text(raw.task_id), source_revision: source, task_title: text(raw.task_title), repository_id: text(raw.repository_id), provider: named, permission_mode: permission, state,
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
     exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain) };
 }

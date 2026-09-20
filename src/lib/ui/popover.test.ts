@@ -262,6 +262,24 @@ describe("popover placement", () => {
     handle.destroy();
   });
 
+  it("keeps a left-rail menu inside the window instead of growing past the trigger", () => {
+    // The Tasks navigator is 188px on the left edge. A 320px panel opened
+    // flush with a plus at ~160px would paint past a 400px window unless
+    // clamp pulls it back. The old add-repo menu did that growth in CSS
+    // (`right:0` + 260px inside 188px); the owner has to refuse it.
+    fakeWindow({ width: 400, height: 300 });
+    const node = fakeNode({ width: 320, height: 240 });
+    const handle = popover(node, {
+      anchor: { kind: "element", element: anchorElement({ left: 160, bottom: 40, top: 14 }), gap: 6 },
+      inset: 8,
+    });
+    expect(Number.parseFloat(node.style.left)).toBeGreaterThanOrEqual(8);
+    expect(Number.parseFloat(node.style.left) + 320).toBeLessThanOrEqual(400);
+    expect(Number.parseFloat(node.style.top)).toBeGreaterThanOrEqual(8);
+    expect(Number.parseFloat(node.style.top) + 240).toBeLessThanOrEqual(300);
+    handle.destroy();
+  });
+
   it("opens an element anchor below its trigger, across the gap", () => {
     fakeWindow();
     const node = fakeNode();

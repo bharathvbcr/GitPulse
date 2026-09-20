@@ -18,7 +18,7 @@ mod terminal_launch;
 mod terminal_run;
 
 const MAX_IN_FLIGHT: usize = 8;
-const MAX_INPUT: usize = 256 * 1024;
+const MAX_INPUT: usize = 1024 * 1024;
 const MAX_MODEL_BASE_URL: usize = 512;
 const MAX_MODEL_ID: usize = 128;
 
@@ -722,7 +722,7 @@ done
         for (id, name) in [("r1", "Primary repository"), ("r2", "Linked repository")] {
             host.request("repositories.put", &json!({"id":id,"request_id":id,"expected_revision":0,"name":name,"identity_key":format!("clone:{id}"),"remote_url":"https://credential@example.test"}).to_string()).unwrap();
         }
-        host.request("items.put", r#"{"id":"t","request_id":"t","expected_revision":0,"title":"Keep E42","description":"Exact $(touch NEVER_EXECUTE) 🧪","repository_ids":["r2","r1"],"primary_repository_id":"r1"}"#).unwrap();
+        host.request("items.put", r#"{"id":"t","request_id":"t","expected_revision":0,"title":"Keep E42","description":"Exact $(touch NEVER_EXECUTE) 🧪","repository_ids":["r2","r1"],"primary_repository_id":"r1","logs":"error: E42\n    at src/main.rs:12"}"#).unwrap();
         let events = host.request("events.list", "{}").unwrap();
         let brief = host
             .request("items.brief.get", r#"{"id":"t","expected_revision":1}"#)
@@ -739,6 +739,13 @@ done
             brief["item"]["task"]["description"],
             "Exact $(touch NEVER_EXECUTE) 🧪"
         );
+        assert_eq!(
+            brief["item"]["task"]["logs"],
+            "error: E42\n    at src/main.rs:12"
+        );
+        let markdown = brief["item"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("## Raw logs"), "{markdown}");
+        assert!(markdown.contains("error: E42"), "{markdown}");
         assert!(!brief.to_string().contains("credential@"));
         assert_eq!(host.request("events.list", "{}").unwrap(), events);
         assert!(worker_absent(&host));
@@ -996,7 +1003,7 @@ done
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-created.sqlite");
         let error = state(&path)
-            .request("items.list", &" ".repeat(256 * 1024 + 1))
+            .request("items.list", &" ".repeat(1024 * 1024 + 1))
             .unwrap_err();
         assert_eq!(error.code, "invalid_input");
         assert!(!path.exists());

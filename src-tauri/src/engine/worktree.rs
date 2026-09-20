@@ -358,7 +358,7 @@ pub fn agent_layout(path: &str) -> Option<AgentLayout> {
     None
 }
 
-/// The agent that created this worktree (`claude`, `cursor`, `codex`, …).
+/// The agent that created this worktree (`claude`, `cursor`, `codex`, `grok`, `agy`, …).
 ///
 /// `None` when the path is not an agent worktree. See [`agent_layout`].
 pub fn agent_kind(path: &str) -> Option<String> {

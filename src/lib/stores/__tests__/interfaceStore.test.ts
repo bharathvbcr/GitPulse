@@ -848,6 +848,21 @@ describe("remembered agent handoff", () => {
     });
   });
 
+  it("remembers Grok and Antigravity as terminal handoffs", () => {
+    interfaceStore.setTaskHandoff({ provider: "grok", kind: "managed", permission: "inspect" });
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "grok",
+      kind: "external_terminal",
+      permission: "inspect",
+    });
+    interfaceStore.setTaskHandoff({ provider: "agy", kind: "external_terminal", permission: "edit" });
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "agy",
+      kind: "external_terminal",
+      permission: "edit",
+    });
+  });
+
   it("never restores bypass from storage written by another build", async () => {
     const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
     try {

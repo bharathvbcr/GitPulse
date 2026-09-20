@@ -50,7 +50,7 @@ fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
     }) || [request.source_revision, request.repository_revision]
         .iter()
         .any(|r| *r == 0 || *r > 9_007_199_254_740_991)
-        || !["codex", "claude"].contains(&request.provider.as_str())
+        || !super::terminal_command::is_terminal_provider(&request.provider)
         || ![
             "inspect",
             "ask",
@@ -427,6 +427,39 @@ mod tests {
         }
         assert!(!db.parent().unwrap().exists());
         assert!(state.0.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn grok_and_antigravity_prepare_as_terminal_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        for provider in ["grok", "agy"] {
+            let mut input = prepare(&root);
+            input["id"] = json!(format!("run-{provider}"));
+            input["request_id"] = json!(format!("prepare-{provider}"));
+            input["provider"] = json!(provider);
+            let result = state
+                .request("runs.prepare_terminal", &input.to_string())
+                .unwrap_or_else(|e| panic!("{provider}: {} {}", e.code, e.message));
+            assert_eq!(result["item"]["provider"], provider);
+            assert_eq!(result["item"]["kind"], "external_terminal");
+            // One prepared run per checkout: cancel before the next provider.
+            state
+                .request(
+                    "runs.cancel",
+                    &json!({
+                        "id": format!("run-{provider}"),
+                        "request_id": format!("cancel-{provider}"),
+                        "expected_revision": 1
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
     }
 
     #[test]

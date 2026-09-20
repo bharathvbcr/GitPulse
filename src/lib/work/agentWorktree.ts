@@ -123,7 +123,7 @@ export function isAgentWorktree(path: string): boolean {
 }
 
 /**
- * The agent that created this worktree (`claude`, `cursor`, `codex`, …).
+ * The agent that created this worktree (`claude`, `cursor`, `codex`, `grok`, `agy`, …).
  *
  * Empty when the path is not an agent worktree. The hidden-directory name is
  * returned as-is: inventing a prettier label would claim knowledge we do not

@@ -32,4 +32,14 @@ describe("workbench boundary", () => {
       expect(() => task({ ...full, locked_fields })).toThrow("invalid response");
     }
   });
+  it("round-trips pasted logs and treats a missing field as absent rather than invalid", () => {
+    expect(task(full).logs).toBeUndefined();
+    const dumped = "error: E42\n    at src/main.rs:12";
+    const loaded = task({ ...full, logs: dumped });
+    expect(loaded.logs).toBe(dumped);
+    expect(taskWrite(full.id, full.revision, taskDraft(loaded))).toMatchObject({ logs: dumped });
+    expect(taskWrite(full.id, full.revision, taskDraft(task(full)))).not.toHaveProperty("logs");
+    expect(() => task({ ...full, logs: 12 })).toThrow("invalid response");
+    expect(() => task({ ...full, logs: "a\0b" })).toThrow("invalid response");
+  });
 });

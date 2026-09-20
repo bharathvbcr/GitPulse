@@ -2,6 +2,12 @@ use rusqlite::Connection;
 
 use super::{Error, Result};
 
+/// Upper bound for one workbench request, including a terminal-sized raw log
+/// plus the rest of a task. Field-level caps still apply inside this envelope.
+pub(super) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Pasted terminal dumps. Matches the terminal output window.
+pub(super) const MAX_LOGS_BYTES: usize = 256 * 1024;
+
 /// SQLite's bundled JSON parser supplies validation and encoding. Inputs never
 /// become SQL: field paths are program constants and values are bound parameters.
 pub(super) struct Input<'a> {
@@ -11,8 +17,8 @@ pub(super) struct Input<'a> {
 
 impl<'a> Input<'a> {
     pub fn new(conn: &'a Connection, raw: &'a str) -> Result<Self> {
-        if raw.len() > 256 * 1024 {
-            return Err(Error::invalid("request exceeds 256 KiB"));
+        if raw.len() > MAX_REQUEST_BYTES {
+            return Err(Error::invalid("request exceeds 1 MiB"));
         }
         let valid: bool = conn.query_row("SELECT json_valid(?1)", [raw], |r| r.get(0))?;
         if !valid {

@@ -257,16 +257,49 @@ describe("TaskBoard", () => {
     expect(source).toContain("openTabs={openTabRefs}");
     expect(source).toContain('aria-haspopup="menu"');
     expect(source).toContain("data-add-repo");
-    // Dismissal comes from the shared popover owner, which counts the heading
-    // — trigger included — as inside; popover.test.ts holds the phases to
-    // account.
-    expect(source).toContain("use:popover={addMenuDismissal}");
-    expect(source).toContain('inside: "[data-add-repo]"');
     expect(source).toContain("emptyAddLabel");
     expect(source).toContain("pickerSelectionIds");
     expect(source).toContain('aria-controls="task-add-repo-menu"');
     expect(source).toContain("onAddMenuKey");
-    expect(source).toContain("class=\"add-path\"");
+    expect(source).toContain('class="add-path"');
+  });
+
+  it("portals the add-repository menu out of the 188px navigator and clamps it to the viewport", () => {
+    // The pre-fix menu was `position:absolute; right:0` under the heading,
+    // 260px wide, inside `.navigator { width:188px; overflow:auto }`. Opening
+    // it grew the sidebar's scrollWidth and cropped every row that did not
+    // fit the leftover strip. That is a header-dropdown geometry, not a
+    // left-rail one. The sheet's repository picker already escaped its
+    // scroller this way; this menu now does the same.
+    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{addMenuDismissal\}/);
+    expect(source).toContain("element: addRepoTriggerEl");
+    expect(source).toContain('inside: "[data-add-repo], [data-add-repo-popup]"');
+    expect(source).toContain("scroll: true");
+    expect(source).toContain("resize: true");
+    expect(source).toContain("inset: 8");
+    expect(source).toContain('class="add-menu gp-menu gp-pop fixed"');
+    expect(source).toContain("data-add-repo-popup");
+    expect(source).toContain("closeAddMenu({ restoreFocus: true })");
+    expect(source).toContain("restoreFocusTo");
+    // Replaced, not accumulated: no CSS placement beside the owner, and no
+    // nowrap ellipsis that crops a path the panel was supposed to show.
+    expect(source).not.toContain("clampMenuPosition");
+    expect(source).not.toContain("position:absolute;right:0;top:calc(100% + 4px)");
+    expect(source).not.toContain("width:min(260px,70vw)");
+    expect(source).not.toContain(".navigator .add-menu button");
+    const addMenuRule = source.slice(source.indexOf("<style>")).match(/\.add-menu\{([^}]*)\}/)?.[1];
+    expect(source).toContain(".navigator{width:188px");
+    expect(addMenuRule, "missing .add-menu rule").toBeDefined();
+    expect(addMenuRule).toContain("calc(100vw - 16px)");
+    expect(addMenuRule).toContain("calc(100vh - 16px)");
+    expect(addMenuRule).toContain("overflow:hidden auto");
+    expect(addMenuRule).not.toContain("position:absolute");
+    const nameRule = source.slice(source.indexOf("<style>")).match(/\.add-name,\.add-path\{([^}]*)\}/)?.[1];
+    expect(nameRule, "missing .add-name/.add-path rule").toBeDefined();
+    expect(nameRule).toContain("overflow-wrap:anywhere");
+    expect(nameRule).toContain("min-width:0");
+    expect(nameRule).not.toContain("text-overflow:ellipsis");
+    expect(nameRule).not.toContain("white-space:nowrap");
   });
 
   it("reaches registered repositories a workspace has not joined, and names the side effect", () => {

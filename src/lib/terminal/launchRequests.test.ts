@@ -49,9 +49,11 @@ describe("terminal agent launch requests", () => {
     const prompt = "--bad\n$(touch /tmp/nope); `anything` \"quoted\" 世界";
     expect(agentPromptArgs("codex", prompt)).toEqual(["--", prompt]);
     expect(agentPromptArgs("claude", prompt)).toEqual(["--", prompt]);
+    expect(agentPromptArgs("grok", prompt)).toEqual(["--", prompt]);
+    expect(agentPromptArgs("agy", prompt)).toEqual(["--prompt-interactive", prompt]);
     expect(agentPromptArgs("shell")).toBeNull();
-    expect(() => agentPromptArgs("shell", prompt)).toThrow("Claude Code or Codex");
-    expect(() => agentPromptArgs("manvi", prompt)).toThrow("Claude Code or Codex");
+    expect(() => agentPromptArgs("shell", prompt)).toThrow("Claude Code, Codex, Grok, or Antigravity");
+    expect(() => agentPromptArgs("manvi", prompt)).toThrow("Claude Code, Codex, Grok, or Antigravity");
   });
 
   it("refuses empty, NUL and oversized inputs before publishing a request", async () => {

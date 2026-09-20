@@ -15,6 +15,12 @@ describe("the agent handoff has one implementation", () => {
     }
   });
 
+  it("offers Grok and Antigravity from the same provider list as Codex and Claude Code", () => {
+    expect(form).toContain("PROVIDER_CHOICES");
+    expect(form).toContain("PROVIDER_LABELS[provider]");
+    expect(form).not.toContain('choose({ provider: "codex" })');
+  });
+
   it("leaves the launch to the form, so neither host can grow a second one", () => {
     // The board sheet and the editor panel are chrome around one form. If
     // either started calling `prepareTaskRun` itself, the checkout resolution,
