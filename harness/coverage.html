@@ -22,7 +22,14 @@
           { path: "src/full.ts", language: "TypeScript", color_hex: "#3178c6", lines_found: 2, lines_hit: 2, percentage: 100 },
           { path: "src/unknown.ts", language: "TypeScript", color_hex: "#3178c6", lines_found: 0, lines_hit: 0, percentage: 0 },
         ] : [],
-        languages: [], artifacts: measured ? [{ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped: false, totals }] : [],
+        // Two splits whose labels are deliberately different widths: the bar
+        // track used to grow with its label, so these two rendered on scales
+        // that could not be compared to each other.
+        languages: measured ? [
+          { language: "TypeScript", color_hex: "#3178c6", files: 1024, lines_found: 12, lines_hit: 9, percentage: 75 },
+          { language: "Go", color_hex: "#00ADD8", files: 3, lines_found: 4, lines_hit: 1, percentage: 25 },
+        ] : [],
+        artifacts: measured ? [{ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped: false, totals }] : [],
         overall: measured ? overall : { lines_found: 0, lines_hit: 0, percentage: 0 }, truncated: false,
       });
       addEventListener("error", event => errors.push(event.message));
@@ -94,6 +101,11 @@
           check("empty coverage can copy and run", !button("Copy agent prompt").disabled && !button("Run in Claude Code").disabled);
           check("empty coverage is unmeasured", prompt().includes("No coverage data"));
           check("scanner-owned path is included", prompt().includes("coverage/coverage-final.json"));
+          // A qualified measurement has to say what qualifies it. The header
+          // word alone ("Partial coverage" / "Unmeasured") has six possible
+          // causes and used to name none of them anywhere on screen.
+          check("the header names why this scan covers less than the repository",
+            (document.querySelector("[data-coverage-header]")?.textContent ?? "").includes("no report found for javascript"));
           document.querySelector("summary").click(); await tick();
           check("preview is read-only and visible", document.querySelector("textarea").readOnly && document.querySelector("textarea").getBoundingClientRect().height > 0);
           Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { copiedText = text; } } });
@@ -189,6 +201,28 @@
           check("capacity refuses without spawning", spawned.length === beforeCap);
           slots.splice(0).forEach(slot => slot.release());
           mode = "measured"; button("Rescan coverage artifacts").click(); await until(() => prompt().includes("62.5%"));
+          // The bar length IS the percentage, so every bar has to be drawn on
+          // the same track. `min-w-36` let the track grow with its label, and
+          // these two splits (1024 files vs 3) are exactly the case where a
+          // higher percentage could paint the shorter bar.
+          const bars = [...document.querySelectorAll("[data-coverage-bar]")];
+          const trackWidth = bar => Math.round(bar.getBoundingClientRect().width);
+          check("every language bar is drawn on one track",
+            bars.length === 2 && trackWidth(bars[0]) > 0 && trackWidth(bars[0]) === trackWidth(bars[1]));
+          const fillRatio = bar => bar.firstElementChild.getBoundingClientRect().width / bar.getBoundingClientRect().width;
+          check("each fill is its own percentage of that track",
+            bars.length === 2 && Math.abs(fillRatio(bars[0]) - 0.75) < 0.02 && Math.abs(fillRatio(bars[1]) - 0.25) < 0.02);
+          // Nothing is missing here, so the family strip has nothing to report;
+          // a row per family reading "report found" was a whole band restating
+          // the language bars directly beneath it.
+          check("the family strip is silent when every report was found", !document.querySelector("[data-coverage-family-strip]"));
+          // …and speaks again the moment one is missing, carrying its Run button.
+          button("Empty coverage").click(); button("Rescan coverage artifacts").click();
+          await until(() => !!document.querySelector("[data-coverage-family-strip]"));
+          check("the family strip returns for a family that owes a report",
+            (document.querySelector("[data-coverage-family-strip]")?.textContent ?? "").includes("no report"));
+          mode = "measured"; button("Measured coverage").click(); button("Rescan coverage artifacts").click();
+          await until(() => !document.querySelector("[data-coverage-family-strip]"));
           button("Hide the terminal dock").click();
           button("Toggle narrow layout").click(); button("Toggle theme").click(); await wait();
           const section = document.querySelector('section[aria-label="Generate coverage with a coding agent"]');

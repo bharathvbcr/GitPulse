@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanStatus } from "./explorer";
-import type { FileCoverageSummary, CoverageReport } from "./types";
+import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanReasons, coverageScanStatus } from "./explorer";
+import type { CoverageArtifact, CoverageFamilyStatus, FileCoverageSummary, CoverageReport } from "./types";
+
+const artifact = (skipped: boolean): CoverageArtifact =>
+  ({ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped, totals: { lines_found: 0, lines_hit: 0, percentage: 0 } });
+
+const family = (name: string, found: boolean): CoverageFamilyStatus =>
+  ({ family: name, languages: [name], color_hex: "#000", expected_formats: [], expected_paths: [], found, suggested_commands: [], setup_commands: [], tool_ready: true, tool_detail: "", duration_hint: "" });
 
 const file = (path: string, hit: number, found: number, language = "TypeScript"): FileCoverageSummary =>
   ({ path, language, lines_hit: hit, lines_found: found, percentage: found ? hit / found * 100 : 0, color_hex: "#000" });
@@ -37,5 +43,35 @@ describe("coverage exploration", () => {
     expect(coverageScanStatus(report, true, false, false)).toBe("Scanning…");
     expect(coverageScanStatus(report, false, false, true)).toBe("Partial coverage");
     expect(coverageScanStatus({ ...report, overall: { lines_found: 0, lines_hit: 0, percentage: 0 } }, false, false, false)).toBe("Unmeasured");
+  });
+
+  it("names every reason a scan is partial, so the header word has a recoverable cause", () => {
+    const report: CoverageReport = { files: [], families: [], languages: [], artifacts: [], overall: { lines_found: 1, lines_hit: 0, percentage: 0 }, truncated: false };
+    expect(coverageScanReasons(null, false)).toEqual([]);
+    expect(coverageScanReasons(report, false)).toEqual([]);
+    expect(coverageScanReasons({ ...report, truncated: true }, false)).toEqual(["the scan did not read every artifact"]);
+    expect(coverageScanReasons({ ...report, limit_notices: [{ resource: "covered files", kept: 4000, total: 12873 }] }, false))
+      .toEqual(["only 4000 of 12873 covered files were kept"]);
+    expect(coverageScanReasons({ ...report, go_modules_partial: true }, false)).toEqual(["the Go module search was cut short"]);
+    expect(coverageScanReasons({ ...report, artifacts: [artifact(true), artifact(false)] }, false)).toEqual(["1 coverage artifact was skipped"]);
+    expect(coverageScanReasons({ ...report, artifacts: [artifact(true), artifact(true)] }, false)).toEqual(["2 coverage artifacts were skipped"]);
+    expect(coverageScanReasons({ ...report, families: [family("go", false), family("rust", true), family("python", false)] }, false))
+      .toEqual(["no report found for go, python"]);
+    expect(coverageScanReasons(report, true)).toEqual(["a command only passed with files excluded from measurement"]);
+    // Every cause is reported, not just the first one the old predicate chain hit.
+    expect(coverageScanReasons({ ...report, truncated: true, go_modules_partial: true }, true)).toHaveLength(3);
+  });
+
+  it("does not call a scan partial for a limit notice that dropped nothing", () => {
+    // `limit_notices?.length` alone made a cap that kept everything read as
+    // partial, while the detail chip — which filters on total > kept — printed
+    // nothing, leaving a warning with no recoverable cause.
+    const report: CoverageReport = {
+      files: [], families: [], languages: [], artifacts: [], truncated: false,
+      overall: { lines_found: 1, lines_hit: 0, percentage: 0 },
+      limit_notices: [{ resource: "covered files", kept: 12, total: 12 }],
+    };
+    expect(coverageScanReasons(report, false)).toEqual([]);
+    expect(coverageScanStatus(report, false, false, false)).toBe("Measured");
   });
 });
