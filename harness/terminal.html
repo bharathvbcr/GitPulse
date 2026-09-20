@@ -85,7 +85,9 @@
       await repoStore.openRepo("/fixture/GitPulse");
       interfaceStore.setTerminalFontSize(12);
       interfaceStore.setTerminalDockHeight(400);
-      interfaceStore.setTerminalDockOpen(true);
+      // Per repository tab: this opens the dock on /fixture/GitPulse, the tab
+      // that is active, and deliberately NOT on /fixture/Other.
+      repoStore.setTerminalOpen(true);
       mount(Host, { target: document.querySelector("#app") });
       showReport();
 
@@ -237,10 +239,21 @@
           button("Hide the terminal dock").click(); await wait();
           button("Show terminal").click(); await wait();
           check("hide/show preserves both sessions", () => report.spawned === beforeHide && report.killed === 0);
+          // THE DECOUPLING, in a real browser. Visiting another repository
+          // while a shell runs here must not open a dock there, and must not
+          // spawn anything: a panel mounts a session, and this check used to
+          // assert the opposite ("another repository gets its own session").
           button("Repository Other").click(); await wait();
-          check("another repository gets its own session", () => report.spawned === beforeHide + 1);
+          check("switching repositories spawns nothing", () => report.spawned === beforeHide && report.killed === 0);
+          check("the other repository's dock is hidden, so its view is whole",
+            () => visible("[data-terminal-dock]").length === 0);
+          // Opening it THERE is what starts a shell there.
+          button("Show terminal").click(); await wait();
+          check("opening the dock on that repository starts exactly one session", () => report.spawned === beforeHide + 1);
+          check("each repository's strip holds only its own tabs", () => visible('[role="tab"]').length === 1);
           button("Repository GitPulse").click(); await wait();
           check("returning restores both original tabs", () => visible('[role="tab"]').length === 2 && report.killed === 0);
+          check("returning restores this repository's own dock", () => visible("[data-terminal-dock]").length === 1);
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
@@ -311,7 +324,26 @@
           searchSessions.value = "Other"; searchSessions.dispatchEvent(new Event("input", { bubbles: true })); await wait();
           check("global session search filters repositories", () => label("Sessions across repositories").textContent.includes("Other") && !label("Sessions across repositories").textContent.includes("GitPulse"));
           searchSessions.value = ""; searchSessions.dispatchEvent(new Event("input", { bubbles: true })); await wait();
-          button("All terminal sessions").click(); await wait();
+          // Jumping to a shell running in ANOTHER repository: the list could
+          // always name them, but "Close session" was the only thing it could
+          // do with one.
+          {
+            const row = [...label("Sessions across repositories").children]
+              .find((el) => el.textContent.includes("Other"));
+            check("a session in another repository offers a way in", () => !!row?.querySelector("button"));
+            const beforeJump = report.spawned;
+            row.querySelector("button").click(); await wait();
+            check("Go to switches to that repository without spawning anything new",
+              () => report.spawned === beforeJump && report.killed === 0);
+            check("Go to lands on that repository's own single tab", () => visible('[role="tab"]').length === 1);
+            check("Go to leaves its dock showing", () => visible("[data-terminal-dock]").length === 1);
+            button("Repository GitPulse").click(); await wait();
+            check("and back again", () => visible('[role="tab"]').length === 2);
+            // Jumping closes the list itself, so the popover is already shut
+            // here — clicking the toggle again would REOPEN it and leave it
+            // over the tab strip for every check below.
+            check("jumping closes the session list", () => !label("Sessions across repositories"));
+          }
           while (!button("New Shell session").disabled && report.spawned < MAX_TERMINAL_TABS + 4) {
             button("New Shell session").click();
             await wait(40);

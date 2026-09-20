@@ -3,23 +3,42 @@
 Open the dock with **Ctrl+`**. It stays below the current view; **Expand terminal**
 gives it as much of the window as will fit (up to 2400px) and **Restore terminal
 size** returns to its previous height. Dragging the splitter can also grow past
-the old 900px cap. Hiding the dock or switching repositories preserves its shells.
-Closing a terminal tab terminates that session; closing a repository tab closes
-its terminal sessions.
+the old 900px cap.
+
+**The dock belongs to one repository tab.** Opening a terminal in one repository
+does not open it in the others, and switching to a repository whose terminal you
+have not opened shows that repository whole. Because hosting a terminal panel
+starts a shell, this is also what stops a walk through several repositories from
+spawning a shell in each. Each repository remembers whether its dock was showing,
+including across a restart, and its dock reappears when you return to it.
+
+Hiding the dock or switching repositories preserves its shells. Closing a terminal
+tab terminates that session. Closing a repository tab closes its terminal sessions,
+and GitPulse asks first when there are any — **Close Other Tabs** and **Close Tabs
+to the Right** count every repository they would discard.
 
 A Manvi session is the wrap around DevCouncil components (policy, agent hosting). GitPulse uses it here without requiring the rest of the DevCouncil suite.
 
-Choose a session type in **New session type** (searchable), then press **+**.
-Each repository keeps its own tabs. The tab strip scrolls horizontally — including
-with a vertical wheel — and compresses labels once more than four tabs are open.
+Choose a session type in **New session type** (searchable), then press **+**. The
+command palette also names each one directly — *New Terminal Session*, *New Claude
+Session*, and so on — which opens this repository's dock if it is hidden and starts
+the session in one step. Each repository keeps its own tabs. The tab strip scrolls
+horizontally — including with a vertical wheel — and compresses labels once more
+than four tabs are open.
+
 **Find terminal session** searches this repository's tabs. **All terminal sessions**
-searches across repositories, shows launcher and status, and lets you close a
-session to free capacity. A failed close stays listed with an explicit retry; it
-does not silently release a live process.
+searches across repositories and shows each session's repository, launcher, and
+status. **Go to** brings a session on screen wherever it is running, switching
+repository tabs and opening that repository's dock when the session lives in
+another one. **Close session** frees capacity. A failed close stays listed with an
+explicit retry; it does not silently release a live process.
+
+A repository tab carries a terminal glyph while it holds live sessions, with a count
+past the first, so a shell running in a repository you are not looking at is still
+visible — and so the answer to "what is using the 32 slots" is on screen.
 
 The application allows 32 concurrent sessions across repositories, including
-starts and closes still in flight. **Expand terminal** can use the window height
-up to 2400px; **Restore terminal size** returns to the previous height.
+starts and closes still in flight.
 
 Use **Terminal tab options** to rename a tab, move it left or right, copy selected
 text, copy retained output, or export retained output through a native save dialog.

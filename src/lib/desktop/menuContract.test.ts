@@ -261,8 +261,10 @@ describe("the payload budget", () => {
       operation: { operation: operation(), probeFailed: false },
       watch: { status: "degraded", reason: "inotify limit" },
       fetchedAt: Date.now() - 60_000,
+      // Per repository tab, not a workspace preference.
+      terminalOpen: true,
     };
-    return buildMenuState(repo, { ...prefs(), terminalDockOpen: true }, "system", busy, false, busy);
+    return buildMenuState(repo, prefs(), "system", busy, false, busy);
   }
 
   it("spends every tray-detail row and no more", () => {

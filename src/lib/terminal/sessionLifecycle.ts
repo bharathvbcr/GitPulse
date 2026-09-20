@@ -29,6 +29,8 @@ export function createSessionLifecycle(options: {
   hooks: SessionHooks;
   /** Native spawn reconnects this durable attempt; it can never create a successor. */
   singleAttempt?: boolean;
+  /** Panel-owned "bring this tab on screen"; see `TerminalSessionRecord.reveal`. */
+  reveal?: () => void;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -86,7 +88,7 @@ export function createSessionLifecycle(options: {
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let timedOut = false;
     try {
-      slot ??= registry.reserve({ key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close });
+      slot ??= registry.reserve({ key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close, reveal: options.reveal });
       state("starting");
       ready = await bus.prepare();
       if (disposed) { release(); return; }

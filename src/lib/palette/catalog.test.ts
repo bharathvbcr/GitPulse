@@ -9,6 +9,8 @@ import { themeStore } from "../stores/themeStore";
 import { completePrompt, cancelPrompt, promptState } from "../stores/modalStore";
 import { openSetupWizard } from "../tools/onboardingStore";
 import { promptQuickCommit } from "../commit/quickCommit";
+import { LAUNCHERS } from "../terminal/tabs";
+import { terminalLaunchRequests } from "../terminal/launchRequests";
 
 vi.mock("../tools/onboardingStore", () => ({ openSetupWizard: vi.fn() }));
 vi.mock("../commit/quickCommit", () => ({ promptQuickCommit: vi.fn().mockResolvedValue({ ok: true }) }));
@@ -131,7 +133,7 @@ describe("command catalog and context", () => {
     const prev = vi.spyOn(repoStore, "prevTab").mockResolvedValue();
     const reopen = vi.spyOn(repoStore, "reopenLastClosed").mockResolvedValue();
     const fleet = vi.spyOn(interfaceStore, "setFleetOpen").mockImplementation(() => {});
-    const terminal = vi.spyOn(interfaceStore, "toggleTerminalDock").mockImplementation(() => {});
+    const terminal = vi.spyOn(repoStore, "toggleTerminal").mockImplementation(() => false);
     const avatars = vi.spyOn(interfaceStore, "toggleGraphAvatars").mockImplementation(() => {});
     const zoomIn = vi.spyOn(interfaceStore, "zoomIn").mockImplementation(() => {});
     const zoomOut = vi.spyOn(interfaceStore, "zoomOut").mockImplementation(() => {});
@@ -186,6 +188,53 @@ describe("command catalog and context", () => {
     await expect(action).rejects.toThrow("active repository changed");
     expect(create).toHaveBeenCalledOnce();
   });
+  it("offers a command for every launcher, opening the dock on the repository it was run in", async () => {
+    // Starting a session used to require opening the dock and then finding
+    // the launcher dropdown and the + beside it.
+    const current = ready();
+    vi.spyOn(repoStore, "subscribe").mockImplementation((listener) => { listener(current); return () => {}; });
+    const open = vi.spyOn(repoStore, "setTerminalOpen").mockImplementation(() => true);
+    const requested: { path: string; launcher: string; prompt: string | undefined }[] = [];
+    vi.spyOn(terminalLaunchRequests, "request").mockImplementation(async (path, launcher, prompt) => {
+      requested.push({ path, launcher, prompt });
+    });
+
+    const commands = buildCommands(current, () => {});
+    for (const launcher of LAUNCHERS) {
+      const command = commands.find((item) => item.id === `terminal-new-${launcher.kind}`);
+      expect(command?.disabledReason, launcher.kind).toBeUndefined();
+      await command?.action();
+    }
+    expect(requested).toEqual(LAUNCHERS.map((launcher) => ({ path: "/repo", launcher: launcher.kind, prompt: undefined })));
+    // The dock has to be shown too, or the request expires unclaimed against
+    // a panel that never becomes visible.
+    expect(open).toHaveBeenCalledTimes(LAUNCHERS.length);
+    expect(open).toHaveBeenLastCalledWith(true);
+  });
+
+  it("refuses to start a session in a repository the user has since switched away from", async () => {
+    let current = ready();
+    vi.spyOn(repoStore, "subscribe").mockImplementation((listener) => { listener(current); return () => {}; });
+    const open = vi.spyOn(repoStore, "setTerminalOpen").mockImplementation(() => true);
+    const request = vi.spyOn(terminalLaunchRequests, "request").mockResolvedValue(undefined);
+
+    const commands = buildCommands(current, () => {});
+    const command = commands.find((item) => item.id === "terminal-new-shell");
+    current = { ...current, currentPath: "/elsewhere" };
+    await expect(command?.action()).rejects.toThrow("active repository changed");
+    // Nothing may be started, and no dock opened, in the wrong repository.
+    expect(request).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("disables every session command with no repository open", () => {
+    const commands = buildCommands(snapshot({ currentPath: null }), () => {});
+    for (const launcher of LAUNCHERS) {
+      expect(commands.find((item) => item.id === `terminal-new-${launcher.kind}`)?.disabledReason).toBe("Open a repository first.");
+    }
+    expect(commands.find((item) => item.id === "terminal-dock")?.disabledReason).toBe("Open a repository first.");
+  });
+
   it("routes recent/open repositories by path, disambiguates their names, and verifies activation", async () => {
     const tab = (id: string, path: string, isActive: boolean) => ({ id, path, name: "same", label: `${id}/same`, pinned: false, isActive, isBare: false, isDirty: false, isLoading: false, error: null, currentBranch: "main", conflictedCount: 0, changedCount: 0 });
     let current = { ...ready(), activeTabId: "b", currentPath: "/two/same", openTabs: [tab("a", "/one/same", false), tab("b", "/two/same", true), tab("c", "/three/same", false)], recentRepos: ["/one/same", "/four/same"] };

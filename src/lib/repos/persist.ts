@@ -34,6 +34,21 @@ export interface PersistedTab {
    * ignores the field and simply opens each view on its default section.
    */
   viewSections?: Record<string, string>;
+  /**
+   * Whether the terminal dock was showing on this repository tab.
+   *
+   * Per tab, not per workspace. A single workspace-wide flag meant opening a
+   * shell in one repository opened the dock in every other one the user then
+   * visited — and, because a hosted panel spawns a shell, started a process
+   * nobody asked for in each. The dock belongs to the repository you opened
+   * it on.
+   *
+   * Additive on the schema, exactly as `viewSections` above is: an older
+   * build ignores the field and opens every tab with the dock closed, so
+   * this needs no `version` bump and cannot push an old client into legacy
+   * recovery.
+   */
+  terminalOpen?: boolean;
   searchQuery: string;
   selectedBranch: string | null;
 }
@@ -319,6 +334,7 @@ export function workspaceToPersisted(
       viewSections?: Record<string, string>;
       searchQuery?: string;
       selectedBranch?: string | null;
+      terminalOpen?: boolean;
     }
   >,
 ): PersistedWorkspace {
@@ -332,6 +348,7 @@ export function workspaceToPersisted(
         pinned: tab.pinned,
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
+        terminalOpen: session?.terminalOpen === true,
         searchQuery: session?.searchQuery ?? "",
         selectedBranch: session?.selectedBranch ?? null,
       };
@@ -359,6 +376,10 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
       pinned: record.pinned === true,
       viewTab: migrateViewTab(record.viewTab),
       viewSections: sanitizeViewSections(record.viewSections, record.viewTab),
+      // Strict `=== true`: an absent field, and any non-boolean a hand-edited
+      // or older blob might carry, both mean "closed". Opening a dock is what
+      // spawns a shell, so the permissive reading is the costly one.
+      terminalOpen: record.terminalOpen === true,
       searchQuery: typeof record.searchQuery === "string" ? record.searchQuery : "",
       selectedBranch: typeof record.selectedBranch === "string" ? record.selectedBranch : null,
     });

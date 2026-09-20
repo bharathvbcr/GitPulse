@@ -28,7 +28,6 @@
     buildDevcouncilInstallCommand,
   } from "../../tools/devcouncilInstall";
   import { enqueueConsoleLaunch } from "../../terminal/consoleLaunches";
-  import { interfaceStore } from "../../stores/interfaceStore";
   import { repoStore } from "../../stores/repoStore";
   import { copyText } from "../../desktop/clipboard";
 
@@ -87,7 +86,7 @@
         label: installSpec.label,
         timeoutSecs: installSpec.timeoutSecs,
       });
-      interfaceStore.setTerminalDockOpen(true);
+      repoStore.setTerminalOpen(true);
       copyNote = "Running in Terminal → Console.";
     } catch (e) {
       copyNote = String(e);

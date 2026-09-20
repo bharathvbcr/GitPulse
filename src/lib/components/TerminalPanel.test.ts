@@ -66,6 +66,15 @@ describe("TerminalPanel session ownership", () => {
     expect(source).toContain("repoPath = null");
   });
 
+  it("takes cross-repository navigation as a prop rather than reaching for the store", () => {
+    // The Sessions list can jump to a shell running in another repository,
+    // which means switching repository tabs — something this panel must not
+    // do itself, because it cannot see the store that would tell it where it
+    // is. The dock supplies the capability; this only renders the failure.
+    expect(source).toContain("onGoToSession");
+    expect(source).toContain("await onGoToSession(session)");
+  });
+
   it("refits the visible session when its host is shown again", () => {
     const body = source.slice(source.indexOf("$effect(() => {", source.indexOf("function handleChord")));
     expect(body).toContain("if (!visible || mode !== \"shell\") return");

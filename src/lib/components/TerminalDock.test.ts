@@ -46,6 +46,16 @@ describe("TerminalDock", () => {
     expect(source).toContain("visible: open && tab.id === $repoStore.activeTabId");
   });
 
+  it("owns cross-repository session focus, because the panel may not", () => {
+    // TerminalPanel is bound to the single path it was handed and is barred
+    // from importing repoStore at all (TerminalPanel.test.ts holds that).
+    // Switching repository tabs to reveal a shell therefore has to live here,
+    // where the dock already spans every open repository.
+    expect(source).toContain("focusTerminalSession");
+    expect(source).toContain("onGoToSession: goToSession");
+    expect(source).toContain("setTerminalOpen: (open) => repoStore.setTerminalOpen(open)");
+  });
+
   it("offers the WAI-ARIA splitter, keyboard included", () => {
     expect(source).toContain('role="separator"');
     expect(source).toContain('aria-valuenow={height}');
@@ -77,6 +87,15 @@ describe("App hosts the terminal as a dock, not a view", () => {
   it("binds the chord every terminal-hosting editor uses", () => {
     // Control, not Command, on macOS too: ⌘` is the OS window cycler.
     expect(app).toContain('e.key === "`"');
-    expect(app).toContain("interfaceStore.toggleTerminalDock()");
+    expect(app).toContain("repoStore.toggleTerminal()");
+  });
+
+  it("reads the dock's open state from the repository tab, not a workspace preference", () => {
+    // A single workspace-wide flag meant opening a shell in one repository
+    // opened the dock over every other repository the user switched to, and
+    // — because hosting a panel starts a shell — spawned a PTY in each.
+    expect(app).toContain("$derived($repoStore.terminalOpen)");
+    expect(app).not.toContain("interfaceStore.terminalDockOpen");
+    expect(app).not.toContain("interfaceStore.setTerminalDockOpen");
   });
 });

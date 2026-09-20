@@ -25,8 +25,17 @@ export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string
 
 interface LaunchRequest {
   repoPath: string;
-  launcher: PromptLauncher;
-  prompt: string;
+  /**
+   * Any launcher, not only the two that accept a prompt.
+   *
+   * Widened so "start a shell here" uses this one channel rather than a
+   * fourth request store beside it: the panel already knows how to claim a
+   * request, open a tab and report capacity refusals, and `agentPromptArgs`
+   * already returns "no arguments" for a promptless launch of any kind.
+   */
+  launcher: LauncherKind;
+  /** Absent for a plain session; a literal CLI argument when present. */
+  prompt?: string;
   complete(error?: string): void;
 }
 
@@ -58,8 +67,11 @@ export function createTerminalLaunchRequests() {
     forget(id: string) {
       sessions.update(rows => rows.filter(row => row.id !== id));
     },
-    async request(repoPath: string, launcher: PromptLauncher, prompt: string, signal?: AbortSignal): Promise<void> {
-      if (!repoPath.trim()) throw new Error("Open a repository before starting an agent");
+    async request(repoPath: string, launcher: LauncherKind, prompt?: string, signal?: AbortSignal): Promise<void> {
+      if (!repoPath.trim()) throw new Error("Open a repository before starting a terminal session");
+      // Validates here, at the boundary, so a bad prompt is refused before a
+      // panel is asked to open a tab for it. A promptless launch returns null
+      // for every launcher, which is what makes "new shell" fit this channel.
       agentPromptArgs(launcher, prompt);
       if (signal?.aborted) throw new Error("Terminal launch cancelled");
       if (busy) throw new Error("A terminal launch is already pending");

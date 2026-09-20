@@ -11,14 +11,29 @@ describe("nextHostedTerminals", () => {
     expect(nextHostedTerminals(new Set(), ["a", "b"], "a", true)).toEqual(new Set(["a"]));
   });
 
-  it("keeps a hidden tab's panel when the user switches to another repository", () => {
+  it("keeps a hidden tab's panel, and hosts the new one only when ITS dock is open", () => {
+    // The fourth argument is the ACTIVE tab's own dock state. `true` here
+    // means the user has opened the terminal on "b" too, so hosting it is
+    // what they asked for; "a" stays hosted so its scrollback survives.
     const hosted = new Set(["a"]);
     expect(nextHostedTerminals(hosted, ["a", "b"], "b", true)).toEqual(new Set(["a", "b"]));
   });
 
-  it("does not latch a newly visited tab while the dock is hidden", () => {
+  /**
+   * The decoupling, stated as a rule.
+   *
+   * This case used to be unreachable: the dock's open state was one
+   * workspace-wide boolean, so a user with a shell running in "a" arrived at
+   * "b" with `true` and latched a panel — and a spawned shell — in a
+   * repository they were only reading. Now "b" carries its own state, so
+   * visiting it with its dock closed hosts nothing.
+   */
+  it("does not latch a newly visited repository whose own dock is closed", () => {
     const hosted = new Set(["a"]);
     expect(nextHostedTerminals(hosted, ["a", "b"], "b", false)).toEqual(new Set(["a"]));
+    // …and it stays that way however many repositories the user walks past.
+    expect(nextHostedTerminals(hosted, ["a", "b", "c", "d"], "c", false)).toBe(hosted);
+    expect(nextHostedTerminals(hosted, ["a", "b", "c", "d"], "d", false)).toBe(hosted);
   });
 
   it("drops a panel when its repository tab closes", () => {

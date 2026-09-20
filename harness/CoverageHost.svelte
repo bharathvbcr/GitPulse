@@ -2,7 +2,6 @@
   import CoverageViewer from "../src/lib/components/CoverageViewer.svelte";
   import TerminalDock from "../src/lib/components/TerminalDock.svelte";
   import { repoStore } from "../src/lib/stores/repoStore";
-  import { interfaceStore } from "../src/lib/stores/interfaceStore";
   import { themeStore } from "../src/lib/stores/themeStore";
   let { setMode }: { setMode: (mode: string) => void } = $props();
   const load = () => import("../src/lib/components/TerminalPanel.svelte");
@@ -23,6 +22,6 @@
   </div>
   <div class="min-h-0 flex-1 flex flex-col border border-border rounded overflow-hidden">
     {#key $repoStore.currentPath}<CoverageViewer />{/key}
-    <TerminalDock open={$interfaceStore.terminalDockOpen} onClose={() => interfaceStore.setTerminalDockOpen(false)} {load} />
+    <TerminalDock open={$repoStore.terminalOpen} onClose={() => repoStore.setTerminalOpen(false)} {load} />
   </div>
 </main>

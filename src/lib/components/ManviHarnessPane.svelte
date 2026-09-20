@@ -230,7 +230,6 @@
   import { createVisibleInterval } from "../dom/visibleInterval";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
-  import { interfaceStore } from "../stores/interfaceStore";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "@tauri-apps/api/core";
   import type { GrantView } from "../grants/types";
@@ -405,7 +404,7 @@
    */
   function openTerminal() {
     if (!$repoStore.currentPath) return;
-    interfaceStore.setTerminalDockOpen(true);
+    repoStore.setTerminalOpen(true);
   }
 
   function actionTime(ts: number): string {

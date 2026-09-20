@@ -11,7 +11,7 @@ import vitestConfig from "../vitest.config.ts";
 
 const tsconfig = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "tsconfig.json"), "utf8"),
-) as { compilerOptions?: { types?: string[] } };
+) as { compilerOptions?: { types?: string[] }; include?: string[] };
 
 describe("gitpulseManualChunk", () => {
   it("isolates the large runtimes from the application entry", () => {
@@ -81,6 +81,20 @@ describe("TypeScript 6 ambient types", () => {
     // this list, `npm run check` reports 250 missing-name errors that tests
     // never see, because Vitest loads Node types through its own pipeline.
     expect(tsconfig.compilerOptions?.types).toEqual(["node", "vite/client"]);
+  });
+
+  it("typechecks the harness pages, not only src", () => {
+    // The harnesses ARE the real-UI verification layer, and they were outside
+    // `include`, so svelte-check could not see them at all. A harness host
+    // left referencing `$repoStore` with no import typechecked clean and then
+    // failed as a Vite compile error sixty seconds into a browser run — the
+    // only signal being a timeout naming the file.
+    //
+    // Note for anyone editing tsconfig.json: it is read with JSON.parse right
+    // above, so it must stay comment-free. This guard is where the reason
+    // lives.
+    expect(tsconfig.include).toContain("harness/**/*.svelte");
+    expect(tsconfig.include).toContain("harness/**/*.ts");
   });
 });
 

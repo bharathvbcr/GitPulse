@@ -85,7 +85,7 @@ describe("HealthPanel source contracts & interactive remediation", () => {
     // This used to switch to the Terminal *view*, which replaced the pane —
     // the remediation plan the user was about to run left the screen at the
     // moment they needed to read it. The dock opens under this panel instead.
-    expect(source).toContain("interfaceStore.setTerminalDockOpen(true)");
+    expect(source).toContain("repoStore.setTerminalOpen(true)");
     expect(source).not.toContain('setActiveTab("terminal")');
     expect(source).toContain("Rescan Health");
   });

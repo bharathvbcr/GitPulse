@@ -1020,7 +1020,7 @@
                 {/if}
                 <button
                   type="button"
-                  onclick={() => interfaceStore.setTerminalDockOpen(true)}
+                  onclick={() => repoStore.setTerminalOpen(true)}
                   class="gp-btn py-1! text-[11px]!"
                   title="Open the terminal below this panel, so the plan stays on screen while you run it"
                 >

@@ -189,19 +189,16 @@ export interface InterfacePrefs {
    * moved. `sanitizeHandoff` also refuses to restore `bypass`: see its note.
    */
   taskHandoff: HandoffSettings;
-  /**
-   * Whether the terminal dock is showing beneath the active view.
-   *
-   * The terminal was a view until it became clear the shape was wrong: a PTY
-   * has to survive a view switch, so App mounted the pane once and hid it
-   * thereafter — a page that was never really a page. As a dock it is what it
-   * always behaved like, and a Health scan can be read while its command runs.
-   *
-   * Workspace-wide rather than per-repository, like `fleetOpen`: the session
-   * blob holds the tab arrangement, and bumping its schema for a boolean would
-   * make an older build fall back to legacy recovery and lose the user's tabs.
+  /*
+   * Whether the terminal dock is showing is NOT here: it is per repository
+   * tab, on `RepoSession.terminalOpen`. It lived here as one workspace-wide
+   * boolean on the reasoning that per-tab state would need a `version` bump
+   * of the session blob and so push older builds into legacy recovery — but
+   * `PersistedTab.viewSections`, added in the same commit, shows an optional
+   * field needs no bump at all. The workspace-wide flag meant opening a shell
+   * in one repository opened the dock over every other repository visited,
+   * and started a PTY in each.
    */
-  terminalDockOpen: boolean;
   /** Dock height in CSS pixels, clamped on read; the user drags to resize. */
   terminalDockHeight: number;
   terminalFontSize: number;
@@ -285,7 +282,6 @@ const DEFAULTS: InterfacePrefs = {
   taskShowArchivedWorkspaces: true,
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
-  terminalDockOpen: false,
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
   terminalScreenReader: false,
@@ -430,7 +426,6 @@ function readPrefs(): InterfacePrefs {
       // build cannot read must not be the one that spends a model call.
       taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
       taskHandoff: sanitizeHandoff(parsed.taskHandoff),
-      terminalDockOpen: bool(parsed.terminalDockOpen, DEFAULTS.terminalDockOpen),
       terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
       terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
@@ -615,9 +610,6 @@ function createInterfaceStore() {
     setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),
     setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
-    setTerminalDockOpen: (open: boolean) => patch({ terminalDockOpen: open }),
-    toggleTerminalDock: () =>
-      patch((prefs) => ({ terminalDockOpen: !prefs.terminalDockOpen })),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),
     setCheckForUpdates: (enabled: boolean) =>

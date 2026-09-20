@@ -61,7 +61,7 @@ describe("ManviHarnessPane capability truth", () => {
     // pane instead of navigating away — the grant list stays readable while
     // the shell it describes runs. Still a real link, just not a tab switch.
     expect(source).toContain("onclick={openTerminal}");
-    expect(source).toContain("interfaceStore.setTerminalDockOpen(true)");
+    expect(source).toContain("repoStore.setTerminalOpen(true)");
     expect(source).toContain("cargo-llvm-cov");
     expect(source).toContain("several minutes");
   });

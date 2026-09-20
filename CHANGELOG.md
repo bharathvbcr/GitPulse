@@ -41,6 +41,40 @@ before that tag is pushed.
   off-axis chips and age bands are one selection model with one matching rule.
 - **Blame browser harness**: `npm run test:browser -- --harness blame` (and
   `--webkit`) mounts the production pane over fixture IPC, 59 real-DOM checks.
+- **Go to, in the cross-repository Sessions list.** The list could already name
+  every shell across every open repository; now it can bring one on screen —
+  switching repository tabs and opening that repository's dock when the session
+  lives in another one.
+- **Live-session marks on repository tabs.** A repository tab carries a terminal
+  glyph while it holds sessions, with a count past the first, so a shell running
+  where you are not looking is visible — and so "what is using the 32 slots" is
+  answerable at a glance.
+- **Command palette entries for each launcher** — *New Terminal Session*, *New
+  Claude Session*, *New Manvi Session*, *New Codex Session* — which open this
+  repository's dock if it is hidden and start the session in one step. Starting a
+  session previously required opening the dock and then finding the launcher
+  dropdown and the **+** beside it.
+
+### Changed
+
+- **The terminal dock belongs to a repository tab, not the workspace.** Opening a
+  shell in one repository no longer opens the dock over every other repository you
+  switch to. Because hosting a terminal panel starts a shell, it also no longer
+  spawns a PTY — and spends one of the 32 global session slots — in repositories
+  you were only reading. Each repository remembers whether its dock was showing,
+  across a restart, and its dock reappears when you return to it. `Ctrl+\``, the
+  status bar button, the command palette entry and the native Show/Hide Terminal
+  menu item all act on the active repository. Persisted additively on the existing
+  workspace schema, so an older build reads the same session file unchanged.
+
+  After upgrading, every repository starts with its dock closed once; the previous
+  workspace-wide preference is not carried over.
+- The blame age scale (row tint, timeline column fill, legend and rail) now
+  comes from one table and one per-line classifier instead of a colour function
+  beside a hand-listed legend.
+- A blame line with no knowable age — worktree-only, undated, or dated after
+  now by a skewed clock — carries no row tint. It used to tint as the freshest
+  code in the file, which also disagreed with the band filter that excludes it.
 
 ### Fixed
 
@@ -51,14 +85,19 @@ before that tag is pushed.
   with no scrollbar to reach the rest; the pane now shares one horizontal
   scroller, as the diff does.
 
-### Changed
+### Hardened
 
-- The blame age scale (row tint, timeline column fill, legend and rail) now
-  comes from one table and one per-line classifier instead of a colour function
-  beside a hand-listed legend.
-- A blame line with no knowable age — worktree-only, undated, or dated after
-  now by a skewed clock — carries no row tint. It used to tint as the freshest
-  code in the file, which also disagreed with the band filter that excludes it.
+- Closing a repository tab that holds live shells now asks first, and says how many
+  will be ended. **Close Other Tabs** and **Close Tabs to the Right** are covered
+  too, counting every repository they would discard; both bypassed the single-tab
+  close path entirely. The check fails open if the session count is unavailable —
+  an unclosable repository tab is worse than a missing warning.
+- The harness pages are typechecked. They are the real-UI verification layer and
+  sat outside `tsconfig.json`'s `include`, so a harness host referencing a store it
+  no longer imported typechecked clean and surfaced only as a browser-run timeout.
+- Randomized-sequence coverage for the terminal hosting rule, asserting over
+  hundreds of open/close/switch steps that no repository is ever hosted — and so
+  no shell ever started — without the user opening a terminal on it.
 
 ## [1.3.0] - 2026-09-17
 

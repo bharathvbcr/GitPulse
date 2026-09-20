@@ -234,10 +234,10 @@
     {#if $repoStore.currentPath}
       <button
         type="button"
-        onclick={() => interfaceStore.toggleTerminalDock()}
-        aria-pressed={$interfaceStore.terminalDockOpen}
-        class="inline-flex items-center gap-1 transition-colors text-[10px] {$interfaceStore
-          .terminalDockOpen
+        onclick={() => repoStore.toggleTerminal()}
+        aria-pressed={$repoStore.terminalOpen}
+        class="inline-flex items-center gap-1 transition-colors text-[10px] {$repoStore
+          .terminalOpen
           ? 'text-accent'
           : 'text-textMuted hover:text-textPrimary'}"
         title="Toggle the terminal dock ({shortcutTextLabel('⌃`', $hostPlatform.os)})"

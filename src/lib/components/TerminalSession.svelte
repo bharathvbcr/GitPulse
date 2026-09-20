@@ -120,6 +120,7 @@
     onChord,
     onStatus = () => {},
     onActivity = () => {},
+    revealSelf,
   }: {
     repoPath: string;
     tabId: string;
@@ -132,6 +133,13 @@
     onActivity?: () => void;
     /** Returns true when the panel consumed the event; xterm then ignores it. */
     onChord: (event: KeyboardEvent) => boolean;
+    /**
+     * Panel-owned "select my tab and focus me", published on this session's
+     * registry record so the cross-repository Sessions list can jump to it.
+     * The panel owns it because focusing an xterm behind a hidden tab shows
+     * nothing.
+     */
+    revealSelf?: () => void;
   } = $props();
 
   let container = $state<HTMLDivElement | null>(null);
@@ -405,6 +413,7 @@
     return createSessionLifecycle({
       key: tabId, repoPath, label: launcherLabel(launcher), bus: ptyBus, registry: terminalSessions,
       singleAttempt: !!taskRunId,
+      reveal: revealSelf,
       transport: {
         spawn: () => {
           const dims = fitAddon?.proposeDimensions();

@@ -17,7 +17,7 @@ describe("SetupWizard DevCouncil install", () => {
 
   it("runs the documented command through Console, not the Manvi action gate", () => {
     expect(source).toContain("enqueueConsoleLaunch");
-    expect(source).toContain("setTerminalDockOpen(true)");
+    expect(source).toContain("repoStore.setTerminalOpen(true)");
     expect(source).not.toContain("cmd_manvi_run_action");
   });
 });

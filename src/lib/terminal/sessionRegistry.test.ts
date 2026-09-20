@@ -1,6 +1,6 @@
 import { get } from "svelte/store";
 import { describe, expect, it, vi } from "vitest";
-import { createSessionRegistry, type TerminalSessionRecord } from "./sessionRegistry";
+import { createSessionRegistry, sessionsByRepo, type TerminalSessionRecord } from "./sessionRegistry";
 import { MAX_TERMINAL_TABS } from "./tabs";
 
 function record(overrides: Partial<TerminalSessionRecord> = {}): TerminalSessionRecord {
@@ -71,6 +71,18 @@ describe("terminal session registry", () => {
     expect(get(registry)).toHaveLength(MAX_TERMINAL_TABS);
   });
 
+  it("carries a reveal through status updates, so a jump target survives a restart", () => {
+    // `update` rebuilds the record; a spread that dropped `reveal` would make
+    // the Sessions list's "Go to" button silently go dead the first time the
+    // shell changed status.
+    const registry = createSessionRegistry();
+    const reveal = vi.fn();
+    const lease = registry.reserve(record({ key: "a", status: "starting", reveal }));
+    lease.update("running");
+    get(registry)[0].reveal?.();
+    expect(reveal).toHaveBeenCalledOnce();
+  });
+
   it("keeps reserved slots across status transitions while open", () => {
     const registry = createSessionRegistry();
     const lease = registry.reserve(record({ key: "a", status: "ready" }));
@@ -80,5 +92,58 @@ describe("terminal session registry", () => {
 
     expect(get(registry)).toHaveLength(1);
     expect(get(registry)[0].status).toBe("closing");
+  });
+});
+
+describe("sessionsByRepo", () => {
+  it("counts sessions per repository", () => {
+    const counts = sessionsByRepo([
+      { repoPath: "/r/a" },
+      { repoPath: "/r/b" },
+      { repoPath: "/r/a" },
+      { repoPath: "/r/a" },
+    ]);
+    expect(counts.get("/r/a")).toBe(3);
+    expect(counts.get("/r/b")).toBe(1);
+  });
+
+  it("omits a repository with no sessions rather than reporting zero", () => {
+    // The badge renders on truthiness, so a stored 0 would draw an empty
+    // terminal glyph on every repository the user has ever visited.
+    const counts = sessionsByRepo([{ repoPath: "/r/a" }]);
+    expect(counts.has("/r/b")).toBe(false);
+    expect(counts.get("/r/b")).toBeUndefined();
+    expect([...counts.keys()]).toEqual(["/r/a"]);
+  });
+
+  it("is empty for no sessions", () => {
+    expect(sessionsByRepo([]).size).toBe(0);
+  });
+
+  it("skips a blank repoPath instead of counting it as a repository", () => {
+    const counts = sessionsByRepo([{ repoPath: "" }, { repoPath: "/r/a" }]);
+    expect(counts.has("")).toBe(false);
+    expect(counts.get("/r/a")).toBe(1);
+  });
+
+  it("does not fold paths that differ only by case or trailing separator", () => {
+    // Deliberate: every producer hands out the path the repository store
+    // already resolved, so folding here would invent a second identity rule.
+    // Pinned so a future change to that assumption is a failing test, not a
+    // badge that quietly counts the wrong repository.
+    const counts = sessionsByRepo([
+      { repoPath: "/r/A" },
+      { repoPath: "/r/a" },
+      { repoPath: "/r/a/" },
+    ]);
+    expect(counts.size).toBe(3);
+  });
+
+  it("reads a live registry's published array", () => {
+    const registry = createSessionRegistry();
+    registry.reserve(record({ key: "a", repoPath: "/r/one" }));
+    registry.reserve(record({ key: "b", repoPath: "/r/two" }));
+    registry.reserve(record({ key: "c", repoPath: "/r/one" }));
+    expect(sessionsByRepo(get(registry))).toEqual(new Map([["/r/one", 2], ["/r/two", 1]]));
   });
 });
