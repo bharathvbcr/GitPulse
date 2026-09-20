@@ -100,11 +100,56 @@ timeouts, and Manvi gating for Git commands. It retains up to 100 commands and
 100 results / 8 MiB, and discloses removed results. Completion preserves the
 reader's scroll position and does not steal focus from another control.
 
+## Links in output
+
+URLs and repository file references in terminal output are clickable. Hovering
+one names its target in the session footer before you commit to the click, so
+the text on screen is never the only evidence of where it goes.
+
+Two rules bound what a click can do, and both fail closed. A URL opens in your
+browser only when its scheme is `http` or `https`; every other scheme —
+`file:`, `javascript:`, `data:`, or an app handler such as `vscode:` — is not
+underlined, not hoverable and not openable. A file reference opens in the code
+viewer only when it resolves inside the session's repository; an absolute path
+elsewhere on disk, or one that climbs out with `..`, is not a link either.
+Terminal output is untrusted text, so a span GitPulse will not open is never
+decorated as though it would.
+
+`path:line:column` opens the file in the code viewer and lands on that line,
+with the line selected. A reference naming a line past the end of the file
+opens near the end rather than refusing. The request is dropped if nothing
+collects it within 30 seconds, so it cannot fire later when the same file is
+opened for an unrelated reason.
+
+Hyperlinks a program embeds itself (OSC 8) obey the same allowlist, checked
+against the escape sequence's target rather than its display text.
+
+## Screen reader support
+
+**Settings → Appearance → Terminal screen reader support** builds xterm's
+accessible row tree and announces new output. It is off by default because the
+tree is rebuilt as output arrives, which costs time on a session that prints
+continuously; turning it on applies to sessions already running.
+
+It does not make the shell's input line an editable accessible field. The
+focused element in a terminal is xterm's helper textarea, whose value is empty
+by design — what you type goes straight to the PTY and is painted as grid
+cells. Text-expansion utilities that work by reading the focused field and
+rewriting it therefore cannot act inside the terminal, and will report that the
+text they expected to find is not there. They work normally in **Console** and
+in the rest of the application, which use ordinary input fields.
+
 ## Frontend verification
 
-Run `npm run dev`, open `/harness/terminal.html` on the reported local URL, then
-click **Run terminal checks**, then **Run input stress checks**. The harness mounts the real dock, panels, sessions,
-and xterm renderer with Tauri's official mock transport. It checks search,
+`npm run test:browser -- --harness terminal` runs the harness in headless
+Chrome and fails the run on any failed or missing assertion; `--all` derives
+the list from `BROWSER_HARNESSES`, and `--webkit` runs the same page in
+WKWebView. For local work, `npm run dev` and `/harness/terminal.html` still
+offer **Run terminal checks** and **Run input stress checks** as buttons.
+
+The harness mounts the real dock, panels, sessions,
+and xterm renderer with Tauri's official mock transport. It checks link
+detection, hover targets, refused schemes and paths, search,
 keyboard focus, global tab limits, session preservation, split panes, resizing,
 narrow/light layout, and exact large-paste delivery.
 The displayed counters make shell writes, spawns, kills, and runtime errors visible.

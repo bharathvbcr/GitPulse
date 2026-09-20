@@ -205,6 +205,20 @@ export interface InterfacePrefs {
   /** Dock height in CSS pixels, clamped on read; the user drags to resize. */
   terminalDockHeight: number;
   terminalFontSize: number;
+  /**
+   * Builds xterm's accessibility tree — a row list plus a live region that
+   * announces new output — so VoiceOver and other assistive technology can
+   * read the terminal at all. Without it the grid is a canvas of glyphs with
+   * no accessible text behind it.
+   *
+   * Opt-in rather than always on because the tree is rebuilt as output
+   * arrives, which is a real cost on a session that prints continuously, and
+   * the web gives no reliable signal that a screen reader is running. It does
+   * NOT make the shell's current input line an editable accessible field:
+   * xterm's focused textarea stays empty by design, so tools that expand text
+   * by reading and rewriting the focused field still cannot act here.
+   */
+  terminalScreenReader: boolean;
   terminalLauncher: LauncherKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
@@ -274,6 +288,7 @@ const DEFAULTS: InterfacePrefs = {
   terminalDockOpen: false,
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
+  terminalScreenReader: false,
   terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
@@ -417,6 +432,7 @@ function readPrefs(): InterfacePrefs {
       taskHandoff: sanitizeHandoff(parsed.taskHandoff),
       terminalDockOpen: bool(parsed.terminalDockOpen, DEFAULTS.terminalDockOpen),
       terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
+      terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -597,6 +613,7 @@ function createInterfaceStore() {
         taskHandoff: defaultHandoff(),
       }),
     setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),
+    setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockOpen: (open: boolean) => patch({ terminalDockOpen: open }),
     toggleTerminalDock: () =>

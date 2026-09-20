@@ -212,3 +212,63 @@ describe("TerminalSession surface colour", () => {
     expect(source).toContain('cursorAccent: v("--bg-surface"');
   });
 });
+
+describe("TerminalSession linkification", () => {
+  it("registers a link provider and releases it with the session", () => {
+    // A provider outliving its terminal keeps the whole buffer reachable, and
+    // xterm goes on calling it against a disposed emulator.
+    expect(source).toContain("registerLinkProvider(");
+    expect(source).toContain("linkProvider?.dispose()");
+    expect(source).toContain("linkProvider = null");
+  });
+
+  it("routes both link paths through the one policy function", () => {
+    // The detected spans and the OSC 8 hyperlinks are different code paths in
+    // xterm. If either reached an opener without `resolveLinkAction`, the
+    // scheme allowlist and the repository containment check would apply to
+    // one kind of link and not the other.
+    const activations = [...source.matchAll(/activate: \([^)]*\) => \{([^}]*)\}/g)].map(m => m[1]);
+    expect(activations.length).toBeGreaterThanOrEqual(2);
+    for (const body of activations) expect(body).toContain("activateLink(");
+    // `activateLink` is the only caller of the openers, and it asks first.
+    expect(source).toContain("const action = resolveLinkAction(text, repoPath)");
+    expect(source.indexOf("resolveLinkAction(text, repoPath)"))
+      .toBeLessThan(source.indexOf("await openExternal("));
+  });
+
+  it("keeps xterm's own OSC 8 protocol filter switched on", () => {
+    // xterm applies this in its OSC provider only, so it is a second layer
+    // over that path rather than a replacement for the module's allowlist.
+    expect(source).toContain("allowNonHttpProtocols: false");
+  });
+
+  it("will not open a file into a different repository's checkout", () => {
+    // `selectFilePath` acts on whichever repository tab is active, not on the
+    // one this terminal belongs to.
+    expect(source).toContain("activePath !== repoPath");
+  });
+
+  it("records the reveal before the selection that triggers the viewer", () => {
+    // The viewer reads the request as it mounts, so recording it afterwards
+    // is a race the click loses on a fast file read.
+    const body = source.slice(source.indexOf("async function activateLink"));
+    expect(body.indexOf("requestReveal(action.path, action.line, action.column)"))
+      .toBeLessThan(body.indexOf("repoStore.selectFilePath(action.path)"));
+  });
+
+  it("maps buffer columns from cell widths rather than string offsets", () => {
+    // A double-width glyph is one string index and two cells; reading the
+    // offset as the column drags every later link range to the left.
+    expect(source).toContain("cell.getWidth()");
+    expect(source).toContain("if (cellWidth === 0) continue;");
+  });
+});
+
+describe("TerminalSession accessibility", () => {
+  it("takes screen reader mode from the preference and applies it live", () => {
+    expect(source).toContain("screenReaderMode: get(interfaceStore).terminalScreenReader");
+    // Someone enabling it has assistive technology running now; making them
+    // restart every shell to be read is not an answer.
+    expect(source).toContain("term.options.screenReaderMode = on");
+  });
+});

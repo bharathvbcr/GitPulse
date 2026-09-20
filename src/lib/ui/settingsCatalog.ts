@@ -84,6 +84,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "animation animations transition accessibility vestibular reduce motion",
   },
   {
+    id: "terminal-screen-reader",
+    section: "appearance",
+    label: "Terminal screen reader support",
+    keywords: "terminal screen reader voiceover accessibility a11y announce assistive shell console",
+  },
+  {
     id: "timestamps",
     section: "appearance",
     label: "Timestamps",

@@ -645,6 +645,22 @@
                     </p>
                   </div>
 
+                  <div data-setting="terminal-screen-reader" hidden={!shown("terminal-screen-reader")}>
+                    <SettingToggle
+                      label="Terminal screen reader support"
+                      description="Builds an accessible row-by-row tree of the terminal grid and announces new output. Without it the terminal is a picture of text to assistive technology."
+                      ariaLabel="Terminal screen reader support"
+                      checked={$interfaceStore.terminalScreenReader}
+                      onchange={(next) => interfaceStore.setTerminalScreenReader(next)}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug">
+                      Off by default because the tree is rebuilt as output arrives, which
+                      costs time on a session that prints continuously. It does not make
+                      the shell's input line an editable field: text-expansion tools that
+                      rewrite the focused field still cannot act inside a terminal.
+                    </p>
+                  </div>
+
                   <div data-setting="timestamps" hidden={!shown("timestamps")}>
                     <div class="flex items-center justify-between mb-1.5">
                       <span class="text-textMuted text-[10px]">Timestamps</span>
