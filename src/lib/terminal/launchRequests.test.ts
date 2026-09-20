@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs } from "./launchRequests";
+import { createTerminalLaunchRequests, agentPromptArgs, PROMPT_LAUNCHERS } from "./launchRequests";
+import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
 
@@ -36,9 +37,18 @@ describe("terminal agent launch requests", () => {
   it("still refuses a prompt for a launcher that cannot take one", async () => {
     const requests = createTerminalLaunchRequests();
     // Validated at the boundary, before any panel is asked to open a tab.
-    await expect(requests.request("/a", "shell", "do the thing")).rejects.toThrow(
-      "Initial prompts require Claude Code or Codex",
-    );
+    const refused = await requests
+      .request("/a", "shell", "do the thing")
+      .then(() => null, (error: unknown) => error as Error);
+    expect(refused?.message).toContain("Initial prompts require");
+    // Derived, not transcribed. The refusal hand-lists the prompt-capable
+    // launchers beside PROMPT_LAUNCHERS itself, so the two drift apart
+    // silently: adding Grok and Antigravity left this test asserting a
+    // sentence naming only two of the four. Asserting that every launcher in
+    // the list is named makes the next addition fail here instead.
+    for (const launcher of PROMPT_LAUNCHERS) {
+      expect(refused?.message).toContain(PROVIDER_LABELS[launcher]);
+    }
     expect(get(requests)).toBeNull();
     expect(requests.take("/a")).toBeNull();
   });

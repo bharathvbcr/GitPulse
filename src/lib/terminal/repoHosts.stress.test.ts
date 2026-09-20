@@ -120,15 +120,20 @@ describe("terminal hosting under churn", () => {
   });
 
   it("stays within the PTY budget when the user opens a dock in every repository", () => {
-    // MAX_OPEN_TABS (24) exceeds MAX_TERMINAL_TABS (16), so a workspace CAN
-    // ask for more panels than there are session slots. Hosting does not
-    // enforce that ceiling — the registry does, with a visible spawn error —
-    // but the shape of the excess is worth pinning: it is bounded by the
-    // repositories the user actually opened a dock on, never by the number
-    // they visited.
-    expect(MAX_OPEN_TABS).toBeGreaterThan(MAX_TERMINAL_TABS);
+    // Hosting does not enforce the session ceiling — the registry does, with
+    // a visible spawn error — but the shape of the demand is worth pinning:
+    // it is bounded by the repositories the user actually opened a dock on,
+    // never by the number they visited.
+    //
+    // The two ceilings move independently, so this pins the shape rather than
+    // either constant. It used to assert MAX_OPEN_TABS > MAX_TERMINAL_TABS,
+    // true while the caps were 24 and 16; raising the session cap to 32 made
+    // that premise false and the assertion failed on a rule that had not
+    // changed. Guarding on `invited` is what actually keeps the run
+    // non-vacuous: far more repositories are visited than were ever invited.
     const all = Array.from({ length: MAX_OPEN_TABS }, (_, i) => `tab-${i}`);
     const invited = all.slice(0, 5);
+    expect(all.length).toBeGreaterThan(invited.length);
     const world: World = { openTabs: [...all], activeTabId: null, docks: new Set(invited) };
     let hosted: ReadonlySet<string> = new Set<string>();
 
