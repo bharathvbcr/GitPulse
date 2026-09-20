@@ -207,7 +207,10 @@
   // repository tabs (one panel per visited tab). The {#key currentPath}
   // around the git UI remounts Sidebar/views/StatusBar; the dock sits
   // outside that key so a tab switch cannot kill the shell.
-  const terminalDockOpen = $derived($interfaceStore.terminalDockOpen);
+  // Per repository tab, not per workspace: opening a shell in one repository
+  // used to open the dock over every other repository the user switched to,
+  // and — because hosting a panel starts a shell — spawn a process in each.
+  const terminalDockOpen = $derived($repoStore.terminalOpen);
 
   // --- fleet keep-alive -----------------------------------------------------
   // Fleet is workspace-scoped, so it sits BESIDE the repository pane rather
@@ -496,7 +499,7 @@
       // repository pane and has no shell to attach to without one.
       if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === "`" && $repoStore.currentPath) {
         e.preventDefault();
-        interfaceStore.toggleTerminalDock();
+        repoStore.toggleTerminal();
         return;
       }
       if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))) {
@@ -594,7 +597,7 @@
       zoomOut: () => interfaceStore.zoomOut(),
       resetZoom: () => interfaceStore.resetZoom(),
       fleet: () => interfaceStore.setFleetOpen(true),
-      terminalDock: () => interfaceStore.toggleTerminalDock(),
+      terminalDock: () => repoStore.toggleTerminal(),
       rebase: openRebaseDialog,
       palette: () => openCommandPalette(),
       focusFilter: () => void focusCommitSearch(),
@@ -1059,7 +1062,7 @@
             <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("terminal", error)}>
               <TerminalDock
                 open={terminalDockOpen}
-                onClose={() => interfaceStore.setTerminalDockOpen(false)}
+                onClose={() => repoStore.setTerminalOpen(false)}
                 load={loadTerminalPanel}
               />
             </svelte:boundary>

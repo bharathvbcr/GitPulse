@@ -91,7 +91,8 @@
   const {mount}=await import("svelte");
   const {interfaceStore}=await import("../src/lib/stores/interfaceStore");
   const {sanitizeHandoff}=await import("../src/lib/workbench/taskHandoff");
-  interfaceStore.setTerminalDockOpen(false);interfaceStore.setTerminalDockHeight(500);
+  // Per repository tab, and every tab starts closed: nothing to clear here.
+  interfaceStore.setTerminalDockHeight(500);
   const Host=(await import("./TaskAgentHost.svelte")).default;
   mount(Host,{target:document.getElementById("app"),props:{task,repositories:[repository],openTabs:[{path:"/fixture/GitPulse",label:"GitPulse"}]}});
   show();

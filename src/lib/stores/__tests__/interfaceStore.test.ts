@@ -4,15 +4,18 @@ import { interfaceStore } from "../interfaceStore";
 import { memoryStorage } from "../../repos/persist";
 
 describe("interfaceStore", () => {
-  it("selects one global surface and preserves the terminal dock", () => {
-    interfaceStore.setTerminalDockOpen(true);
+  it("selects one global surface and preserves unrelated terminal preferences", () => {
+    // Whether the dock is OPEN is per repository tab and lives on the repo
+    // session, not here; the terminal preferences that remain in this store
+    // must still survive a surface switch.
+    interfaceStore.setTerminalFontSize(18);
     interfaceStore.setGlobalSurface("tasks");
     expect(get(interfaceStore).globalSurface).toBe("tasks");
     interfaceStore.toggleFleet();
     expect(get(interfaceStore).globalSurface).toBe("fleet");
     interfaceStore.setFleetOpen(false);
     expect(get(interfaceStore).globalSurface).toBe("repository");
-    expect(get(interfaceStore).terminalDockOpen).toBe(true);
+    expect(get(interfaceStore).terminalFontSize).toBe(18);
   });
   beforeEach(() => {
     interfaceStore.reset();
@@ -734,7 +737,7 @@ describe("tasks board view preferences", () => {
   });
 
   it("resets only the board view, leaving unrelated preferences alone", () => {
-    interfaceStore.setTerminalDockOpen(true);
+    interfaceStore.setTerminalFontSize(18);
     interfaceStore.setTaskLayout("list");
     interfaceStore.setTaskDensity("compact");
     interfaceStore.toggleTaskColumn("done");
@@ -747,7 +750,7 @@ describe("tasks board view preferences", () => {
       taskHiddenColumns: [],
       taskCardFields: ["repo", "type", "owner", "due", "labels"],
       taskShowArchivedWorkspaces: true,
-      terminalDockOpen: true,
+      terminalFontSize: 18,
     });
   });
 

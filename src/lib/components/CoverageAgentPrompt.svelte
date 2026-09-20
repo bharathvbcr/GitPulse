@@ -4,7 +4,7 @@
   import { formatCoverageAgentPrompt, type CoverageExclusionNotice, type CoverageAgentFocus } from "../coverage/report";
   import type { CoverageReport } from "../coverage/types";
   import { copyText } from "../desktop/clipboard";
-  import { interfaceStore } from "../stores/interfaceStore";
+  import { repoStore } from "../stores/repoStore";
   import { terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
   import { formatError } from "../ui/formatError";
 
@@ -76,7 +76,7 @@
     launchController = new AbortController();
     try {
       const opened = terminalLaunchRequests.request(repoPath, launcher, prompt, launchController.signal);
-      interfaceStore.setTerminalDockOpen(true);
+      repoStore.setTerminalOpen(true);
       await opened;
       if (!destroyed) notice = "Agent session opened in the terminal. Follow progress below, then Rescan coverage.";
     } catch (err: unknown) {
@@ -115,7 +115,7 @@
   {#if recentSession}
     <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
       <span class="text-textMuted">{recentSession.launcher === "claude" ? "Claude Code" : "Codex"} session: {recentSession.status}</span>
-      <button type="button" class="gp-btn py-0.5! px-2!" onclick={() => { interfaceStore.setTerminalDockOpen(true); recentSession?.reveal(); }}>View agent session</button>
+      <button type="button" class="gp-btn py-0.5! px-2!" onclick={() => { repoStore.setTerminalOpen(true); recentSession?.reveal(); }}>View agent session</button>
       <button type="button" class="gp-btn py-0.5! px-2!" disabled={scanning} onclick={onRescan}><RefreshCw size={11} /> Rescan results</button>
       <span class="text-textMuted">Session status does not verify coverage. Rescan after the report is written.</span>
     </div>

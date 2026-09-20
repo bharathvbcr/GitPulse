@@ -412,6 +412,304 @@ describe("repoStore tabs", () => {
     expect(state.selectedDiff).toBe("diff README.md");
   });
 
+  /**
+   * The terminal dock belongs to one repository tab.
+   *
+   * It used to be a single workspace-wide preference, so opening a shell in
+   * one repository opened the dock over every other repository the user
+   * switched to — and because `TerminalDock` hosts a panel for the active tab
+   * whenever the dock is open, and a panel spawns a shell on mount, it also
+   * started a PTY in each. The user's way out was to hide the terminal every
+   * time they wanted to read another repository.
+   */
+  describe("terminal dock scope", () => {
+    it("does not open on a second repository because the first one has it open", async () => {
+      const { store } = makeStore();
+      await store.openRepo("/r/alpha");
+      const alphaId = get(store).activeTabId!;
+      expect(store.setTerminalOpen(true)).toBe(true);
+      expect(get(store).terminalOpen).toBe(true);
+
+      await store.openRepo("/r/beta");
+      // The regression: this read `true`, and the dock hosted — and spawned —
+      // a shell in /r/beta that nobody asked for.
+      expect(get(store).currentPath).toBe("/r/beta");
+      expect(get(store).terminalOpen).toBe(false);
+
+      await store.activateTab(alphaId);
+      expect(get(store).terminalOpen).toBe(true);
+    });
+
+    it("keeps each tab's dock state independent in both directions", async () => {
+      const { store } = makeStore();
+      await store.openRepo("/r/alpha");
+      const alphaId = get(store).activeTabId!;
+      await store.openRepo("/r/beta");
+      const betaId = get(store).activeTabId!;
+
+      store.setTerminalOpen(true);
+      await store.activateTab(alphaId);
+      expect(get(store).terminalOpen).toBe(false);
+      store.setTerminalOpen(true);
+      await store.activateTab(betaId);
+      expect(get(store).terminalOpen).toBe(true);
+
+      // Closing beta's dock must not close alpha's.
+      store.setTerminalOpen(false);
+      expect(get(store).terminalOpen).toBe(false);
+      await store.activateTab(alphaId);
+      expect(get(store).terminalOpen).toBe(true);
+    });
+
+    it("toggles only the active tab and reports whether anything changed", async () => {
+      const { store } = makeStore();
+      await store.openRepo("/r/alpha");
+      expect(store.toggleTerminal()).toBe(true);
+      expect(get(store).terminalOpen).toBe(true);
+      expect(store.toggleTerminal()).toBe(true);
+      expect(get(store).terminalOpen).toBe(false);
+      // A set to the value it already holds is a no-op, which is what lets a
+      // caller that opens the dock to reveal something tell the two apart.
+      expect(store.setTerminalOpen(false)).toBe(false);
+      expect(store.setTerminalOpen(true)).toBe(true);
+    });
+
+    it("refuses to record a dock with no repository open", async () => {
+      const { store } = makeStore();
+      expect(store.setTerminalOpen(true)).toBe(false);
+      expect(store.toggleTerminal()).toBe(false);
+      expect(get(store).terminalOpen).toBe(false);
+    });
+
+    it("persists per tab and restores each tab's own dock state", async () => {
+      const storage = memoryStorage();
+      const graph = makeGraph();
+      const make = () =>
+        createRepoStore({
+          invoke: makeInvoke(),
+          storage,
+          caseInsensitive: true,
+          graph: graph.api,
+          filter: makeFilter(),
+        });
+
+      const first = make();
+      await first.openRepo("/r/alpha");
+      const alphaId = get(first).activeTabId!;
+      first.setTerminalOpen(true);
+      await first.openRepo("/r/beta");
+      expect(get(first).terminalOpen).toBe(false);
+      await first.activateTab(alphaId);
+
+      const blob = JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE)!);
+      expect(blob.tabs.find((tab: { path: string }) => tab.path === "/r/alpha").terminalOpen).toBe(true);
+      expect(blob.tabs.find((tab: { path: string }) => tab.path === "/r/beta").terminalOpen).toBe(false);
+      // Additive on the schema: the blob is still version 1, so an older
+      // build reads these tabs instead of falling into legacy recovery.
+      expect(blob.version).toBe(1);
+
+      const second = make();
+      await second.restoreWorkspace();
+      const restoredAlpha = get(second).openTabs.find((tab) => tab.path === "/r/alpha")!;
+      const restoredBeta = get(second).openTabs.find((tab) => tab.path === "/r/beta")!;
+      await second.activateTab(restoredAlpha.id);
+      expect(get(second).terminalOpen).toBe(true);
+      await second.activateTab(restoredBeta.id);
+      expect(get(second).terminalOpen).toBe(false);
+    });
+
+    it("treats a blob with no terminalOpen field as every dock closed", async () => {
+      const storage = memoryStorage({
+        [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+          version: 1,
+          tabs: [
+            { path: "/r/alpha", pinned: false, viewTab: "work", searchQuery: "", selectedBranch: null },
+          ],
+          activePath: "/r/alpha",
+          recents: [],
+          lastClosed: [],
+        }),
+      });
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage,
+        caseInsensitive: true,
+        graph: makeGraph().api,
+        filter: makeFilter(),
+      });
+      await store.restoreWorkspace();
+      // Opening a dock is what spawns a shell, so an absent field — and any
+      // non-boolean a hand-edited blob might carry — must mean "closed".
+      expect(get(store).terminalOpen).toBe(false);
+    });
+  });
+
+  /**
+   * Closing a repository tab unmounts its terminal panel, which kills every
+   * shell in it. That was silent. It became likely enough to matter once the
+   * dock went per repository: before, only the repository in front could be
+   * holding one, so the shell you killed was the shell you were looking at.
+   */
+  describe("closing a tab that holds live shells", () => {
+    function withTerminals(counts: Record<string, number>) {
+      const graph = makeGraph();
+      const asked: string[] = [];
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage: memoryStorage(),
+        caseInsensitive: true,
+        graph: graph.api,
+        filter: makeFilter(),
+        terminals: {
+          countFor: (path) => {
+            asked.push(path);
+            return counts[path] ?? 0;
+          },
+        },
+      });
+      return { store, asked };
+    }
+
+    it("closes without asking when nothing is running", async () => {
+      const { store } = withTerminals({});
+      await store.openRepo("/r/alpha");
+      await store.closeTab(get(store).activeTabId!);
+      expect(get(promptState)).toBeNull();
+      expect(get(store).openTabs).toEqual([]);
+    });
+
+    it("asks before ending a shell, and keeps the tab when refused", async () => {
+      const { store } = withTerminals({ "/r/alpha": 1 });
+      await store.openRepo("/r/alpha");
+      const id = get(store).activeTabId!;
+
+      const closing = store.closeTab(id);
+      await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End the terminal session?"));
+      cancelPrompt();
+      await closing;
+
+      // Refusing must leave the tab — and its shell — exactly as they were.
+      expect(get(store).openTabs).toHaveLength(1);
+      expect(get(store).activeTabId).toBe(id);
+    });
+
+    it("closes once the user confirms", async () => {
+      const { store } = withTerminals({ "/r/alpha": 2 });
+      await store.openRepo("/r/alpha");
+
+      const closing = store.closeTab(get(store).activeTabId!);
+      await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End 2 terminal sessions?"));
+      completePrompt(true);
+      await closing;
+
+      expect(get(store).openTabs).toEqual([]);
+    });
+
+    it("guards Close Other Tabs, which never routes through closeTab", async () => {
+      const { store } = withTerminals({ "/r/beta": 1 });
+      await store.openRepo("/r/alpha");
+      const alpha = get(store).activeTabId!;
+      await store.openRepo("/r/beta");
+
+      const closing = store.closeOtherTabs(alpha);
+      await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End the terminal session?"));
+      cancelPrompt();
+      await closing;
+      expect(get(store).openTabs).toHaveLength(2);
+    });
+
+    it("guards Close Tabs to the Right and counts every repository it would discard", async () => {
+      const { store } = withTerminals({ "/r/beta": 2, "/r/gamma": 1 });
+      await store.openRepo("/r/alpha");
+      const alpha = get(store).activeTabId!;
+      await store.openRepo("/r/beta");
+      await store.openRepo("/r/gamma");
+
+      const closing = store.closeTabsToTheRight(alpha);
+      // Three shells across two repositories, not one repository's worth.
+      await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End 3 terminal sessions?"));
+      expect(get(promptState)?.options.message).toContain("these 2 repository tabs");
+      cancelPrompt();
+      await closing;
+      expect(get(store).openTabs).toHaveLength(3);
+    });
+
+    it("does not ask about repositories it is not closing", async () => {
+      const { store } = withTerminals({ "/r/alpha": 3 });
+      await store.openRepo("/r/alpha");
+      const alpha = get(store).activeTabId!;
+      await store.openRepo("/r/beta");
+
+      // Closing beta must not warn about alpha's three shells.
+      await store.closeTab(get(store).activeTabId!);
+      expect(get(promptState)).toBeNull();
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/alpha"]);
+      expect(get(store).activeTabId).toBe(alpha);
+    });
+
+    it("closes rather than trapping the tab when the counter throws", async () => {
+      const graph = makeGraph();
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage: memoryStorage(),
+        caseInsensitive: true,
+        graph: graph.api,
+        filter: makeFilter(),
+        terminals: {
+          countFor: () => {
+            throw new Error("registry unavailable");
+          },
+        },
+      });
+      await store.openRepo("/r/alpha");
+      await store.closeTab(get(store).activeTabId!);
+      // Fails OPEN: an unclosable repository tab is worse than a missing
+      // warning, and the count is a courtesy, not a safety interlock.
+      expect(get(promptState)).toBeNull();
+      expect(get(store).openTabs).toEqual([]);
+    });
+
+    it("abandons the first close rather than hanging when a second is asked for", async () => {
+      // Holding ⌘W issues a close per microtask, so a second confirmation can
+      // arrive while the first is still open. `modalStore.begin` retires the
+      // superseded prompt as cancelled, so the first awaiter must resolve —
+      // not close the tab, and not hang forever holding it.
+      const { store } = withTerminals({ "/r/alpha": 1, "/r/beta": 1 });
+      await store.openRepo("/r/alpha");
+      const alpha = get(store).activeTabId!;
+      await store.openRepo("/r/beta");
+      const beta = get(store).activeTabId!;
+
+      const first = store.closeTab(beta);
+      await vi.waitFor(() => expect(get(promptState)).not.toBeNull());
+      const second = store.closeTab(alpha);
+      await vi.waitFor(() => expect(get(promptState)?.options.message).toContain("/r/alpha"));
+
+      await first; // must settle, superseded
+      expect(get(store).openTabs).toHaveLength(2);
+
+      completePrompt(true);
+      await second;
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/beta"]);
+    });
+
+    it("treats a nonsense count as nothing running", async () => {
+      const graph = makeGraph();
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage: memoryStorage(),
+        caseInsensitive: true,
+        graph: graph.api,
+        filter: makeFilter(),
+        terminals: { countFor: () => Number.NaN },
+      });
+      await store.openRepo("/r/alpha");
+      await store.closeTab(get(store).activeTabId!);
+      expect(get(promptState)).toBeNull();
+      expect(get(store).openTabs).toEqual([]);
+    });
+  });
+
   it("drops a stale open when a faster second open of another repo wins the UI", async () => {
     const slow = deferred<{ path: string; name: string; is_bare: boolean }>();
     let resolveCount = 0;

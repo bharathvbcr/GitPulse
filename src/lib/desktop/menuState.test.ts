@@ -78,8 +78,10 @@ describe("native menu projection", () => {
     expect(menuActionEnabled(model(repo, { "/r/b": ["fetch"] }), "fetch")).toBe(true);
   });
   it("shows selection and terminal state, including an explicit theme equal to the system", () => {
-    const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "reflog" } };
-    const state = buildMenuState(repo, { ...prefs(), terminalDockOpen: true }, "light", {}, false);
+    // The dock is per repository tab, so its menu state comes from the repo,
+    // not from a workspace preference.
+    const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "reflog" }, terminalOpen: true };
+    const state = buildMenuState(repo, prefs(), "light", {}, false);
     expect(state.checked).toEqual(expect.arrayContaining(["theme-light", "tab-history", "section:history:reflog", "terminal-dock"]));
     expect(state.checked).not.toContain("theme-system");
     expect(state.labels).toContainEqual({ id: "terminal-dock", text: "Hide Terminal" });

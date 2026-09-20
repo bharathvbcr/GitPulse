@@ -215,9 +215,13 @@ export function buildMenuState(
     const kind = id === "stage-all" ? "stage" : id === "unstage-all" ? "unstage" : id;
     label(id, busy.includes(kind) || busy.includes(id) || (id === "stash-pop" && busy.includes("unstash")) ? active : text);
   }
-  label("terminal-dock", prefs.terminalDockOpen ? "Hide Terminal" : "Show Terminal");
+  // The dock belongs to the active repository tab, so the menu reads the repo
+  // state rather than a workspace preference: switching to a repository whose
+  // terminal is closed must say "Show Terminal", not keep offering to hide a
+  // dock that is not on screen.
+  label("terminal-dock", repo.terminalOpen ? "Hide Terminal" : "Show Terminal");
   label("copy-commit", repo.selectedCommitId ? "Copy Selected Commit SHA" : "Copy HEAD SHA");
-  if (prefs.terminalDockOpen && hasRepo) checked.add("terminal-dock");
+  if (repo.terminalOpen && hasRepo) checked.add("terminal-dock");
   if (prefs.globalSurface === "fleet") checked.add("fleet");
   for (const view of REGISTERED_VIEWS) {
     allow(`tab-${view.id}`, hasRepo);

@@ -1,7 +1,7 @@
 <script lang="ts">
   import TaskAgentPanel from "../src/lib/components/TaskAgentPanel.svelte";
   import TerminalDock from "../src/lib/components/TerminalDock.svelte";
-  import { interfaceStore } from "../src/lib/stores/interfaceStore";
+  import { repoStore } from "../src/lib/stores/repoStore";
   import type { OpenTabRef } from "../src/lib/workbench/openMembership";
   import type { Repository, Task } from "../src/lib/workbench/client";
   let { task, repositories, openTabs = [] }: { task: Task; repositories: Repository[]; openTabs?: OpenTabRef[] } = $props();
@@ -18,6 +18,6 @@
   </aside>
   <div class="flex flex-col flex-1 min-w-0 min-h-0">
     <div class="flex-1 p-4 text-textMuted">The selected task’s terminal opens here.</div>
-    <TerminalDock open={$interfaceStore.terminalDockOpen} onClose={() => interfaceStore.setTerminalDockOpen(false)} {load} />
+    <TerminalDock open={$repoStore.terminalOpen} onClose={() => repoStore.setTerminalOpen(false)} {load} />
   </div>
 </div>

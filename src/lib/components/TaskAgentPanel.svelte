@@ -136,7 +136,7 @@
       enqueueTaskTerminal({ runId: run.id, repoPath: path, provider: run.provider, title: run.task_title });
       queued = true;
       interfaceStore.setGlobalSurface("repository");
-      interfaceStore.setTerminalDockOpen(true);
+      repoStore.setTerminalOpen(true);
     } });
     if (!opened || !queued) throw new Error("The checkout did not finish opening. The attempt remains available below; open it again or cancel its preparation.");
   }

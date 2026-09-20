@@ -6,6 +6,7 @@ import RepoTabBar from "./RepoTabBar.svelte";
 
 import { repoStore } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
+import { terminalSessions } from "../terminal/sessionRegistry";
 
 const source = readFileSync(new URL("./RepoTabBar.svelte", import.meta.url), "utf8");
 
@@ -197,6 +198,56 @@ describe("RepoTabBar", () => {
     expect(source).toContain("function selectRepoTab");
     expect(source).toContain('interfaceStore.setGlobalSurface("repository")');
     expect(source).toContain("onclick={() => selectRepoTab(tab.id)}");
+  });
+
+  describe("live terminal sessions", () => {
+    it("marks a repository holding shells, and counts only past the first", async () => {
+      // The dock is per repository tab now, so a shell can be running where
+      // the user is not looking — and the PTY budget is process-global, so
+      // "which of my repositories hold shells" is also the question to answer
+      // when a new one is refused.
+      await repoStore.openRepo("/repo/shelled", { allowBroken: true, activate: true });
+      const first = terminalSessions.reserve({
+        key: "badge-1", repoPath: "/repo/shelled", label: "Shell", status: "running", close: async () => {},
+      });
+      try {
+        let body = render(RepoTabBar).body;
+        expect(body).toContain("1 terminal session running in");
+        // A single session shows the glyph alone; a bare "1" beside it is noise.
+        expect(body).not.toContain("2 terminal sessions running in");
+
+        const second = terminalSessions.reserve({
+          key: "badge-2", repoPath: "/repo/shelled", label: "Claude", status: "running", close: async () => {},
+        });
+        try {
+          body = render(RepoTabBar).body;
+          expect(body).toContain("2 terminal sessions running in");
+        } finally {
+          second.release();
+        }
+      } finally {
+        first.release();
+      }
+
+      // Released, so the badge goes: an exited shell must not leave a repository
+      // looking busy.
+      expect(render(RepoTabBar).body).not.toContain("terminal session running in");
+      // Nothing is running now, so this close asks nothing and cannot hang.
+      await repoStore.closeActiveTab();
+    });
+
+    it("does not mark a repository whose sessions belong to another one", async () => {
+      await repoStore.openRepo("/repo/quiet", { allowBroken: true, activate: true });
+      const elsewhere = terminalSessions.reserve({
+        key: "badge-3", repoPath: "/repo/somewhere-else", label: "Shell", status: "running", close: async () => {},
+      });
+      try {
+        expect(render(RepoTabBar).body).not.toContain("terminal session running in");
+      } finally {
+        elsewhere.release();
+      }
+      await repoStore.closeActiveTab();
+    });
   });
 
   it("bounds recent repositories dropdown height and enables scrolling to prevent viewport clipping", () => {

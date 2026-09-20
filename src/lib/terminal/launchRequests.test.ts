@@ -18,6 +18,37 @@ describe("terminal agent launch requests", () => {
     expect(get(requests)).toBeNull();
   });
 
+  it("carries a promptless launch for every launcher, so one channel serves 'new shell' too", async () => {
+    // Widened rather than duplicated: adding a fourth request store beside
+    // this one would mean a second copy of claim, capacity refusal and the
+    // lazily-mounted-panel handoff.
+    for (const kind of ["shell", "claude", "manvi", "codex"] as const) {
+      const requests = createTerminalLaunchRequests();
+      const launched = requests.request("/a", kind);
+      const request = requests.take("/a");
+      expect(request?.launcher).toBe(kind);
+      expect(request?.prompt).toBeUndefined();
+      request?.complete();
+      await expect(launched).resolves.toBeUndefined();
+    }
+  });
+
+  it("still refuses a prompt for a launcher that cannot take one", async () => {
+    const requests = createTerminalLaunchRequests();
+    // Validated at the boundary, before any panel is asked to open a tab.
+    await expect(requests.request("/a", "shell", "do the thing")).rejects.toThrow(
+      "Initial prompts require Claude Code or Codex",
+    );
+    expect(get(requests)).toBeNull();
+    expect(requests.take("/a")).toBeNull();
+  });
+
+  it("refuses a launch with no repository", async () => {
+    const requests = createTerminalLaunchRequests();
+    await expect(requests.request("   ", "shell")).rejects.toThrow("Open a repository");
+    expect(get(requests)).toBeNull();
+  });
+
   it("rejects duplicate pending launches and reports capacity refusal", async () => {
     const requests = createTerminalLaunchRequests();
     const launched = requests.request("/a", "claude", "Generate coverage");

@@ -4,7 +4,8 @@
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { terminalSessions } from "../terminal/sessionRegistry";
+  import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
+  import type { FocusOutcome } from "../terminal/sessionFocus";
   import { terminalLaunchRequests } from "../terminal/launchRequests";
   import { taskTerminalRequests, consumeTaskTerminal } from "../terminal/taskLaunches";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
@@ -71,6 +72,7 @@
     onClose,
     expanded = false,
     onToggleExpanded,
+    onGoToSession,
   }: {
     repoPath?: string | null;
     /** False while another repository's panel (or a closed dock) is showing. */
@@ -78,6 +80,14 @@
     onClose?: () => void;
     expanded?: boolean;
     onToggleExpanded?: () => void;
+    /**
+     * Brings a session from the cross-repository Sessions list on screen,
+     * switching repository tabs when it lives in another one.
+     *
+     * Supplied by the dock because it needs the repository store, which this
+     * panel deliberately cannot see — see `goToSession`.
+     */
+    onGoToSession?: (session: TerminalSessionRecord) => Promise<FocusOutcome>;
   } = $props();
 
   interface ExecutionEntry {
@@ -174,6 +184,30 @@
     });
   });
 
+  /**
+   * Jumps to a session in the Sessions list, in this repository or another.
+   *
+   * Switching repositories is the DOCK's job, not this panel's: a panel is
+   * bound to the one path it was handed and must never reach for the live
+   * `currentPath` — a hidden one that did would render and journal against
+   * whichever repository the user switched to while its PTY sat in the
+   * worktree it was spawned in. So the capability arrives as a prop and this
+   * only reports failure where the user is looking.
+   */
+  async function goToSession(session: TerminalSessionRecord) {
+    sessionListOpen = false;
+    if (!onGoToSession) {
+      validationError = "Jumping between sessions is unavailable in this window.";
+      return;
+    }
+    const outcome = await onGoToSession(session);
+    if (!outcome.ok) {
+      validationError = outcome.reason === "unavailable"
+        ? "That session could not be shown. It may have just exited; the Sessions list refreshes when it does."
+        : "That session is no longer running.";
+    }
+  }
+
   function newTab(launcher: LauncherKind, initialPrompt?: string): boolean {
     if (!repoPath || !canCreate) return false;
     focusTabStrip = false;
@@ -191,8 +225,12 @@
       mode = "shell";
       const opened = newTab(claimed.launcher, claimed.prompt);
       const id = tabState.activeId;
-      if (opened && id) terminalLaunchRequests.remember({
-        id, repoPath: claimed.repoPath, launcher: claimed.launcher, status: "starting",
+      // Only a prompt-carrying launch is an AGENT session; a plain shell
+      // started from the palette must not appear in the agent list that
+      // Coverage's "View agent session" reads.
+      const agent = claimed.launcher === "claude" || claimed.launcher === "codex" ? claimed.launcher : null;
+      if (opened && id && agent && claimed.prompt !== undefined) terminalLaunchRequests.remember({
+        id, repoPath: claimed.repoPath, launcher: agent, status: "starting",
         reveal() {
           mode = "shell";
           selectTab(id);
@@ -560,7 +598,22 @@
     <div class="terminal-popover px-3 py-2 overflow-auto border-b border-border/60 gp-section-edge bg-surface text-[11px]" aria-label="Sessions across repositories">
       {#each $terminalSessions as session (session.key)}
         <div class="flex gap-2 items-center py-0.5">
-          <span class="flex-1 min-w-0 truncate" title={session.repoPath}>{session.repoPath.split(/[\\/]/).pop()} · {session.label} · {session.status}</span>
+          <span class="flex-1 min-w-0 truncate" title={session.repoPath}>
+            {session.repoPath.split(/[\\/]/).pop()} · {session.label} · {session.status}
+            {#if session.repoPath !== repoPath}<span class="text-textMuted"> · other repository</span>{/if}
+          </span>
+          <!-- The list has always been able to NAME every shell across every
+               repository; until now the only thing it could do with one was
+               kill it. -->
+          <button
+            type="button"
+            class="gp-btn py-0!"
+            disabled={!session.reveal}
+            title={session.reveal
+              ? (session.repoPath === repoPath ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
+              : "This session's panel is not mounted, so it cannot be shown"}
+            onclick={() => void goToSession(session)}
+          >Go to</button>
           <button type="button" class="gp-btn py-0!" onclick={() => session.close().catch((error: unknown) => (validationError = formatError(error)))}>Close session</button>
         </div>
       {/each}
@@ -695,6 +748,7 @@
               active={visible && tab.id === tabState.activeId && mode === "shell"}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
+              revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => sessions[tab.id]?.reveal()); }}
               onStatus={(status) => { tabStatuses = { ...tabStatuses, [tab.id]: status }; terminalLaunchRequests.update(tab.id, status); }}
               onActivity={() => { if (visible && mode === "shell" && splitIds?.includes(tab.id)) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />

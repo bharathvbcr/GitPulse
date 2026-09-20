@@ -61,7 +61,8 @@
       const { get } = await import("svelte/store");
       const Host = (await import("./CoverageHost.svelte")).default;
       interfaceStore.setAutoRunCoverage(false);
-      interfaceStore.setTerminalDockOpen(false);
+      // The dock is per repository tab now and every tab starts with it
+      // closed, so there is no workspace-wide flag left to clear here.
       interfaceStore.setTerminalDockHeight(260);
       await repoStore.openRepo("/fixture/Other");
       await repoStore.openRepo("/fixture/GitPulse");

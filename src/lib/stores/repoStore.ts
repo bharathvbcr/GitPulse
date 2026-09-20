@@ -4,6 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
+// One-way: the terminal registry knows nothing about repositories, so this
+// cannot form a cycle. `sessionFocus` takes the store by injection for the
+// same reason.
+import { sessionsByRepo, terminalSessions } from "../terminal/sessionRegistry";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
@@ -256,6 +260,19 @@ export interface RepoSession {
    * come back to Reflog. Unset views open on their registered default.
    */
   viewSections: Record<string, string>;
+  /**
+   * Whether the terminal dock is showing on THIS repository tab.
+   *
+   * Per tab because a shell belongs to a working tree. As one workspace-wide
+   * flag, opening a terminal in one repository opened the dock over every
+   * other repository the user switched to — and since hosting a panel starts
+   * a shell, it also spawned a process in each, spending the global
+   * `MAX_PTY_SESSIONS` budget on repositories nobody asked for a shell in.
+   *
+   * Closing the dock only hides it; the shells keep running and their
+   * scrollback survives. Closing the repository TAB is what ends them.
+   */
+  terminalOpen: boolean;
   searchQuery: string;
   selectedBranch: string | null;
   commitDraft: string;
@@ -349,6 +366,8 @@ export interface RepoState {
   activeTab: ViewTab;
   /** Section last open in each sectioned view; see the session field. */
   viewSections: Record<string, string>;
+  /** Whether the ACTIVE tab is showing the terminal dock; see the session field. */
+  terminalOpen: boolean;
   isLoading: boolean;
   error: string | null;
   commitDraft: string;
@@ -401,6 +420,19 @@ export interface RepoStoreDeps {
     setSearch(query: string): void;
     selectBranch(branch: string | null): void;
     clear(): void;
+  };
+  /**
+   * How many live terminal sessions a repository holds.
+   *
+   * Injected rather than imported so the store stays testable without the
+   * terminal module, matching `graph` and `filter`. Closing a repository tab
+   * unmounts its terminal panel, which kills every shell in it — including a
+   * build or an agent still running — and that used to happen silently. It
+   * became likely enough to guard once the dock went per repository: before,
+   * only the repository in front could be holding one.
+   */
+  terminals?: {
+    countFor(repoPath: string): number;
   };
 }
 
@@ -479,6 +511,7 @@ function emptyProjected(): RepoState {
     selectedDiffPending: false,
     activeTab: "work",
     viewSections: {},
+    terminalOpen: false,
     isLoading: false,
     error: null,
     commitDraft: "",
@@ -529,6 +562,7 @@ function createSession(
     selectedDiffPending: extras.selectedDiffPending ?? false,
     activeTab: extras.activeTab ?? "work",
     viewSections: { ...(extras.viewSections ?? {}) },
+    terminalOpen: extras.terminalOpen ?? false,
     searchQuery: extras.searchQuery ?? "",
     selectedBranch: extras.selectedBranch ?? null,
     commitDraft: extras.commitDraft ?? "",
@@ -599,6 +633,7 @@ function project(internal: InternalState): RepoState {
     selectedDiffPending: active?.selectedDiffPending ?? false,
     activeTab: active?.activeTab ?? "work",
     viewSections: active?.viewSections ?? {},
+    terminalOpen: active?.terminalOpen ?? false,
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
     commitDraft: active?.commitDraft ?? "",
@@ -626,6 +661,50 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   };
   const graph = deps.graph ?? graphStore;
   const filters = deps.filter ?? filterStore;
+  const terminals = deps.terminals ?? {
+    countFor: (repoPath: string) => sessionsByRepo(get(terminalSessions)).get(repoPath) ?? 0,
+  };
+
+  /**
+   * True when these tabs may be closed: either nothing is running in any of
+   * them, or the user said to end it anyway.
+   *
+   * Takes a LIST because "Close Other Tabs" and "Close Tabs to the Right"
+   * discard several repositories at once and never route through `closeTab`.
+   * Guarding only the single close would leave the two paths that can lose
+   * the most work unguarded.
+   *
+   * Fails OPEN on a broken counter. A registry that threw would otherwise
+   * make every repository tab unclosable, which is a worse failure than a
+   * missing warning — the count is a courtesy, not a safety interlock.
+   */
+  async function confirmTerminalLoss(paths: readonly string[]): Promise<boolean> {
+    let running = 0;
+    let repos = 0;
+    try {
+      for (const path of paths) {
+        const count = terminals.countFor(path);
+        if (!Number.isFinite(count) || count <= 0) continue;
+        running += count;
+        repos += 1;
+      }
+    } catch {
+      return true;
+    }
+    if (running <= 0) return true;
+    const shells = running === 1 ? "the shell" : `all ${running} shells`;
+    const subject = repos === 1 ? "this repository tab" : `these ${repos} repository tabs`;
+    return askConfirm({
+      title: running === 1 ? "End the terminal session?" : `End ${running} terminal sessions?`,
+      message:
+        `${paths.length === 1 ? `${paths[0]}\n\n` : ""}` +
+        `Closing ${subject} ends ${shells} running in ${repos === 1 ? "it" : "them"}. ` +
+        "A command still running — a build, a test run, an agent — is stopped.\n\n" +
+        "Hiding the terminal instead (⌃`) leaves it running.",
+      confirmLabel: running === 1 ? "Close and End Session" : "Close and End Sessions",
+      destructive: true,
+    });
+  }
 
   let internal: InternalState = {
     workspace: emptyWorkspace(),
@@ -1424,6 +1503,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           viewSections?: Record<string, string>;
           searchQuery?: string;
           selectedBranch?: string | null;
+          terminalOpen?: boolean;
         };
       } = {},
     ) => {
@@ -1558,6 +1638,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               selectedBranch:
                 extras.restore?.selectedBranch ??
                 carriedSession?.selectedBranch,
+              terminalOpen:
+                extras.restore?.terminalOpen ?? carriedSession?.terminalOpen,
               commitDraft: carriedSession?.commitDraft ?? "",
               isAmending: carriedSession?.isAmending ?? false,
               isLoading: Boolean(resolved),
@@ -1651,6 +1733,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     closeTab: async (id: string) => {
       const session = internal.sessions[id];
+      // Closing the tab unmounts its terminal panel, which kills every shell
+      // in it. Ask first, and only when there is something to lose — a
+      // confirmation on every close would train the user to dismiss it, which
+      // is how the one that mattered gets dismissed too.
+      if (session && !(await confirmTerminalLoss([session.path]))) return;
       const result = closeTab(internal.workspace, id);
       if (result.reason === "missing") return;
       replaceWorkspace(result.workspace);
@@ -1682,6 +1769,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const keep = internal.sessions[id];
       if (!keep) return;
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
+      if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
       stopStatusPoll();
@@ -1702,6 +1790,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const index = internal.workspace.tabs.findIndex((tab) => tab.id === id);
       if (index < 0) return;
       const removed = internal.workspace.tabs.slice(index + 1);
+      if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
       replaceWorkspace(closeTabsToTheRight(internal.workspace, id));
       const remaining = new Set(internal.workspace.tabs.map((tab) => tab.id));
       const sessions: Record<string, RepoSession> = {};
@@ -1878,6 +1967,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             viewSections: tab.viewSections,
             searchQuery: tab.searchQuery,
             selectedBranch: tab.selectedBranch,
+            terminalOpen: tab.terminalOpen,
           },
         });
         if (!activated && isActive(tab.path)) {
@@ -2528,6 +2618,32 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         viewSections: { ...session.viewSections, [tab]: resolved },
       });
       flushPersist();
+    },
+    /**
+     * Shows or hides the terminal dock on the ACTIVE repository tab.
+     *
+     * Scoped to one tab on purpose: a shell belongs to a working tree, and a
+     * workspace-wide flag made every repository the user switched to inherit
+     * — and start — a terminal they never opened.
+     *
+     * Hiding does not end the shells. `TerminalDock` keeps a hidden panel
+     * mounted so its scrollback survives; closing the repository tab is what
+     * disposes it. Returns whether anything changed, so a caller that opens
+     * the dock to reveal something can tell a no-op from a real open.
+     */
+    setTerminalOpen: (open: boolean): boolean => {
+      const session = activeSession();
+      if (!session || session.terminalOpen === open) return false;
+      if (!applyToSession(session.id, session.generation, { terminalOpen: open })) return false;
+      flushPersist();
+      return true;
+    },
+    toggleTerminal: (): boolean => {
+      const session = activeSession();
+      if (!session) return false;
+      if (!applyToSession(session.id, session.generation, { terminalOpen: !session.terminalOpen })) return false;
+      flushPersist();
+      return true;
     },
     inspectCommitInHistory: (commitId: string) => {
       openEpoch += 1;

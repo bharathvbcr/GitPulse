@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { ChevronDown, SquareTerminal } from "@lucide/svelte";
@@ -13,7 +13,10 @@
     fitTerminalDockHeight,
   } from "../terminal/dockMetrics";
   import { nextHostedTerminals } from "../terminal/repoHosts";
+  import { focusTerminalSession } from "../terminal/sessionFocus";
+  import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { observeResize } from "../dom/observeResize";
+  import { get } from "svelte/store";
 
   /**
    * The terminal, docked beneath the active view.
@@ -74,6 +77,26 @@
       (tab) => hostedIds.has(tab.id) || (open && tab.id === $repoStore.activeTabId),
     ),
   );
+
+  /**
+   * Bringing a session from another repository on screen.
+   *
+   * The dock owns this, not the panel: a panel is bound to the single path it
+   * was handed and must never consult the live `currentPath`, so it cannot be
+   * the thing that switches repository tabs. The dock already spans them.
+   */
+  function goToSession(session: TerminalSessionRecord) {
+    return focusTerminalSession(session, {
+      snapshot: () => {
+        const state = get(repoStore);
+        return { openTabs: state.openTabs, activeTabId: state.activeTabId };
+      },
+      activateTab: (id) => repoStore.activateTab(id),
+      setTerminalOpen: (open) => repoStore.setTerminalOpen(open),
+      openRepo: (path) => repoStore.openRepo(path),
+      afterRender: () => tick(),
+    });
+  }
 
   let host: HTMLDivElement | undefined = $state();
   let dragging = $state(false);
@@ -214,6 +237,7 @@
               onClose,
               expanded,
               onToggleExpanded: () => (expanded = !expanded),
+              onGoToSession: goToSession,
             }}
           />
         </div>

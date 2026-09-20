@@ -22,7 +22,9 @@
     FolderOpen,
     LayoutGrid,
     ListChecks,
+    SquareTerminal,
   } from "@lucide/svelte";
+  import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import { taskChrome } from "../workbench/taskTabs";
@@ -32,6 +34,17 @@
   }: {
     onOpen?: () => void;
   } = $props();
+
+  /**
+   * Live shells per repository, for the tab badge.
+   *
+   * Now that the dock is per repository tab, a shell can be running somewhere
+   * the user is not looking — which is the point, but it means nothing on
+   * screen said where. The PTY budget is process-global, so "which of my
+   * repositories are holding shells" is also the question to answer when a
+   * new one is refused.
+   */
+  const terminalCounts = $derived(sessionsByRepo($terminalSessions));
 
   let menu = $state<{ x: number; y: number; id: string } | null>(null);
   // Measured menu box feeds the shared clamp so the tab menu can never open
@@ -547,6 +560,24 @@
               {/if}
               {#if tab.conflictedCount > 0}
                 <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
+              {/if}
+              {#if terminalCounts.get(tab.path)}
+                <!-- Not a button: the tab itself is the way in, and a second
+                     click target inside a tab is how a close gets mis-hit. -->
+                <span
+                  class="shrink-0 inline-flex items-center gap-0.5 text-accent"
+                  title={terminalCounts.get(tab.path) === 1
+                    ? `1 terminal session running in ${tab.label}`
+                    : `${terminalCounts.get(tab.path)} terminal sessions running in ${tab.label}`}
+                >
+                  <SquareTerminal size={10} aria-hidden="true" />
+                  {#if (terminalCounts.get(tab.path) ?? 0) > 1}
+                    <span class="text-[9px] font-medium tabular-nums">{terminalCounts.get(tab.path)}</span>
+                  {/if}
+                  <!-- `title` on a non-focusable span is not reliably
+                       announced; the tab's accessible name carries it. -->
+                  <span class="sr-only">{terminalCounts.get(tab.path)} terminal sessions running</span>
+                </span>
               {/if}
             </button>
             {#if tab.isDirty}
