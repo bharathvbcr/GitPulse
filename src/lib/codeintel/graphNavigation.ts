@@ -1,5 +1,6 @@
 import { isGraphTestPath, nodeCommunity, nodeLanguageKey, type CodeGraphModel, type LaidOutNode } from "./graphPayload";
 import type { GraphVizLink, GraphVizNode } from "./types";
+import { nodeFilePath } from "./nodeLabel";
 import type { LanguageIconKey } from "../language/languageLogos";
 
 export type TraceDirection = "outgoing" | "incoming" | "both";
@@ -73,7 +74,14 @@ export interface GraphFilters {
 export function filterGraphNodes(model: CodeGraphModel, index: GraphIndex, filters: GraphFilters): LaidOutNode[] {
   const query = (filters.query ?? "").trim().toLowerCase();
   return model.nodes.filter(node => {
-    const path = (node.path || node.id.split("::")[0]).replace(/\\/g, "/");
+    // The `::` prefix is only a path when it looks like one. Taking it
+    // unconditionally invented a path for every namespaced symbol, and two
+    // filters below judge nodes BY that path: `SpecialCaseSpec::run` was
+    // hidden by "hide tests" (stem matches /Specs?$/) and `Vendor::helper` by
+    // "hide generated" — both production symbols, in no such file. A symbol
+    // whose file is unknown is judged by neither, which is the honest answer;
+    // search is unaffected because the haystack already carries `node.id`.
+    const path = (node.path || nodeFilePath(node.id) || "").replace(/\\/g, "/");
     if (filters.community && nodeCommunity(node) !== filters.community) return false;
     if (filters.language && nodeLanguageKey(node) !== filters.language) return false;
     if (filters.hideTests && isGraphTestPath(path)) return false;
@@ -123,10 +131,8 @@ export function graphNodeOpenPath(node: GraphVizNode): string | null {
   if (node.kind === "subsystem") return null;
   if (node.path?.trim()) return node.path;
   if (node.kind === "file" || node.kind === "doc") return node.id || null;
-  const separator = node.id.indexOf("::");
-  if (separator > 0) {
-    const prefix = node.id.slice(0, separator);
-    if (/[\\/]|\.[a-z0-9]+$/i.test(prefix)) return prefix;
-  }
-  return null;
+  // Same question the blast-radius labels ask of the same ids, so it has one
+  // answer: a second copy of the test would be free to drift from the one
+  // that governs whether a node opens in the editor.
+  return nodeFilePath(node.id);
 }

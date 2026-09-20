@@ -35,6 +35,7 @@
     Check,
     X,
     Bug,
+    TriangleAlert,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError, isMissingFileError } from "../ui/formatError";
@@ -84,7 +85,7 @@
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
   import CoverageAgentPrompt from "./CoverageAgentPrompt.svelte";
-  import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
+  import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanReasons, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
   import { isImeComposition } from "../keyboard/imeGuard";
 
   let report: CoverageReport | null = $state(null);
@@ -393,6 +394,31 @@
     familyViews
       .map((view) => view.pipeline)
       .filter((pipeline): pipeline is MissingCoveragePipeline => pipeline !== null),
+  );
+  /**
+   * The strip renders the families that still owe a report; the rest are
+   * summarised by count. Split here rather than in the template so the two
+   * halves cannot disagree about which family belongs to which.
+   */
+  let unfoundViews = $derived(familyViews.filter((view) => !view.found));
+  let foundViews = $derived(familyViews.filter((view) => view.found));
+  /**
+   * Why this scan is partial, from the same owner that decides *that* it is.
+   * The header shows the first reason and hovers the rest; a warning the
+   * reader cannot resolve to a cause is the shape this panel had before.
+   */
+  let scanReasons = $derived(
+    isScanning || scanError !== null
+      ? []
+      : coverageScanReasons(report as CoverageReport | null, coverageExclusions.length > 0),
+  );
+  let scanStatusPartial = $derived(scanError !== null || scanReasons.length > 0);
+  let scanStatusTitle = $derived(
+    scanError !== null
+      ? scanError
+      : scanReasons.length > 0
+        ? `This scan covers less than the repository:\n· ${scanReasons.join("\n· ")}`
+        : "Every detected language contributed a coverage report and no scan bound fired.",
   );
   /**
    * Exact retained/observed counts for the caps that fired, e.g.
@@ -1403,17 +1429,21 @@
 
 <svelte:window onkeydown={coverageKey} />
 <div role="region" aria-label="Test coverage" bind:this={coverageRoot} class="flex-1 min-h-0 min-w-0 flex flex-col bg-background h-full text-xs overflow-hidden">
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex flex-wrap gap-2 items-center justify-between font-sans shrink-0">
-    <div class="flex items-center gap-3 min-w-0">
+  <!-- One header, not three bands. The measurement, the word that qualifies it
+       and the facts about the scan belong to the same statement, and splitting
+       them across stacked full-width strips cost ~100px above the data while
+       leaving "Partial coverage" sitting alone with no cause beside it. -->
+  <div data-coverage-header class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex flex-wrap gap-x-3 gap-y-1.5 items-center justify-between font-sans shrink-0">
+    <div class="flex items-center gap-x-2.5 gap-y-1 min-w-0 flex-wrap">
       <Percent size={16} class="text-accent shrink-0" />
       {#if report && report.overall.lines_found > 0}
-        <div class="flex items-center gap-2">
+        <div class="flex items-baseline gap-2 shrink-0">
           <span
-            class="font-semibold tabular-nums"
+            class="text-sm font-semibold tabular-nums"
             style="color: {coverageBarColor(report.overall.percentage)}"
           >{formatCoveragePercent(report.overall.percentage)}</span>
-          <span class="text-textMuted">
-            {report.overall.lines_hit}/{report.overall.lines_found} lines
+          <span class="text-textMuted tabular-nums">
+            {report.overall.lines_hit.toLocaleString()} / {report.overall.lines_found.toLocaleString()} lines
           </span>
         </div>
       {:else if report}
@@ -1426,13 +1456,33 @@
       {:else}
         <span class="text-textMuted">Test coverage</span>
       {/if}
+
+      <span class="w-px self-stretch bg-border/60 shrink-0" aria-hidden="true"></span>
+
+      <!-- The status word carries its own reasons. "Partial coverage" has six
+           possible causes and named none of them, so the one question it
+           raises had no answer anywhere on screen. -->
+      <span
+        role="status"
+        class="gp-chip shrink-0 {scanStatusPartial ? 'border-amber-500/40 bg-amber-500/10 text-amber-300' : 'border-border/60 text-textMuted'}"
+        title={scanStatusTitle}
+      >
+        {#if scanStatusPartial}<TriangleAlert size={11} class="shrink-0" />{/if}
+        {coverageScanStatus(report, isScanning, scanError !== null, coverageExclusions.length > 0)}
+      </span>
+      {#if scanReasons.length > 0}
+        <span class="text-[11px] text-amber-300/90 truncate min-w-0" title={scanStatusTitle}>{scanReasons[0]}{scanReasons.length > 1 ? ` · +${scanReasons.length - 1} more` : ""}</span>
+      {/if}
+      <span class="text-[11px] text-textMuted truncate min-w-0">
+        Last scanned: {lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}
+      </span>
+      <span
+        class="text-[11px] text-textMuted/70 shrink-0"
+        title="The scanner does not receive artifact generation timestamps or test outcomes, so it cannot say how old a report on disk is."
+      >Artifact age unknown</span>
+      {#if scanError}<button type="button" class="gp-btn py-0.5! px-2! shrink-0" disabled={isScanning} onclick={rescan}>Retry scan</button>{/if}
     </div>
     <div class="flex flex-wrap items-center gap-2">
-      <div class="flex items-center gap-2 text-[11px] text-textMuted">
-        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500/50"></span> hit</span>
-        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-red-500/50"></span> missed</span>
-        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-gray-500/30"></span> uninstrumented</span>
-      </div>
       <button
         type="button"
         class="gp-icon-btn p-1! hover:text-accent"
@@ -1488,10 +1538,14 @@
           {/if}
         </button>
       {/if}
+      <!-- The caveat that used to run along the status band lives on the
+           control it qualifies. "rescanning does not rerun tests" is only ever
+           read by someone about to press this button. -->
       <button
         type="button"
         class="gp-icon-btn p-1! hover:text-accent"
-        title="Rescan coverage artifacts"
+        aria-label="Rescan coverage artifacts"
+        title="Rescan coverage artifacts — re-reads the reports already on disk; it does not rerun tests"
         onclick={rescan}
         disabled={isScanning}
       >
@@ -1499,19 +1553,6 @@
       </button>
     </div>
   </div>
-
-  <div aria-label="Coverage scan status" class="px-4 py-1.5 border-b border-border/60 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-sans text-textMuted shrink-0">
-    <span class:text-amber-400={!!scanError || report?.truncated} role="status">{coverageScanStatus(report, isScanning, scanError !== null, coverageExclusions.length > 0)}</span>
-    <span>Last scanned: {lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}</span>
-    <span title="The scanner does not receive artifact generation timestamps or test outcomes.">Artifact age unknown · rescanning does not rerun tests</span>
-    {#if scanError}<button type="button" class="gp-btn py-0.5! px-2!" disabled={isScanning} onclick={rescan}>Retry scan</button>{/if}
-  </div>
-
-  {#key $repoStore.currentPath}
-    <CoverageAgentPrompt repoPath={$repoStore.currentPath} {report} exclusions={coverageExclusions} scanFailed={scanError !== null}
-      onRescan={rescan} scanning={isScanning} bind:selectedScope
-      focus={selectedFile ? { file: selectedFile, blocks: missedBlocks, detailAvailable: !isLoadingFile && fileLoaded && !fileError, partial: linesTruncated || scanTruncated || report?.truncated === true } : undefined} />
-  {/key}
 
   {#if report && scanError}
     <div class="px-4 py-1.5 border-b border-border bg-red-500/10 text-red-400 font-sans shrink-0 flex items-center justify-between gap-2">
@@ -1548,10 +1589,16 @@
     </div>
   {/if}
 
-  {#if report && (report.families.length > 0 || report.truncated)}
-    <div class="border-b border-border/40 gp-section-edge bg-surface/40 font-sans shrink-0">
+  <!-- Only the families that still need something. A row per family saying
+       "report found" repeated, at full width, what the language bars below
+       already say with numbers attached; in the everything-found case the
+       whole strip carried no information and cost a band. The count moved
+       into `unfoundViews`'s trailing summary, which keeps the found families
+       and their expected paths one hover away. -->
+  {#if report && (unfoundViews.length > 0 || report.truncated || Object.keys(scriptStatuses).length > 0)}
+    <div data-coverage-family-strip class="border-b border-border/40 gp-section-edge bg-surface/40 font-sans shrink-0">
       <div class="px-4 py-1.5 flex items-center gap-3 overflow-x-auto">
-        {#each familyViews as view (view.family)}
+        {#each unfoundViews as view (view.family)}
           <div class="flex items-center gap-1.5 shrink-0" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
             <span class="w-2 h-2 rounded-full" style="background-color: {view.status.color_hex}"></span>
             <span class="text-textPrimary/80">{view.status.languages.join(", ")}</span>
@@ -1579,6 +1626,12 @@
             {/if}
           </div>
         {/each}
+        {#if foundViews.length > 0}
+          <span
+            class="shrink-0 text-textMuted/70"
+            title={foundViews.map((view) => `${view.status.languages.join(", ")} (${view.family}): ${view.status.expected_paths.join(", ")}`).join("\n")}
+          >{foundViews.length} other {foundViews.length === 1 ? "report" : "reports"} found</span>
+        {/if}
         {#if report.truncated}
           <!-- "scan capped" alone leaves the reader to assume the numbers on
                screen are the repository. Where the scanner published exact
@@ -1666,19 +1719,23 @@
   {/if}
 
   {#if report && report.languages.length > 0}
-    <div class="px-4 py-2 border-b border-border/40 gp-section-edge bg-surface/20 flex items-center gap-4 overflow-x-auto font-sans">
+    <div class="px-4 py-2 border-b border-border/40 gp-section-edge bg-surface/20 flex items-center gap-3 overflow-x-auto gp-edge-fade-end font-sans">
       <span class="text-[10px] uppercase tracking-wider text-textMuted/60 shrink-0">by language</span>
+      <!-- Fixed track width, not `min-w-36`. The bar length encodes the
+           percentage, so a track that grows with the label made 98.2% Rust and
+           80.2% Go paint near-identical fills: the one comparison this row
+           exists to support was the one it could not be read for. -->
       {#each report.languages as lang (lang.language)}
-        <div class="shrink-0 min-w-36">
-          <div class="flex items-center justify-between gap-2 mb-0.5">
+        <div class="shrink-0 w-44" title="{lang.language}: {lang.lines_hit.toLocaleString()} of {lang.lines_found.toLocaleString()} lines across {lang.files} {lang.files === 1 ? 'file' : 'files'}">
+          <div class="flex items-center justify-between gap-2 mb-1">
             <span class="flex items-center gap-1.5 min-w-0">
               <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {lang.color_hex}"></span>
               <span class="truncate text-textPrimary/80">{lang.language}</span>
-              <span class="text-textMuted/50">{lang.files} {lang.files === 1 ? "file" : "files"}</span>
+              <span class="text-[10px] text-textMuted/50 shrink-0">{lang.files}</span>
             </span>
             <span class="tabular-nums shrink-0" style="color: {coverageBarColor(lang.percentage)}">{formatCoveragePercent(lang.percentage)}</span>
           </div>
-          <div class="h-1 rounded-full bg-surfaceHover overflow-hidden">
+          <div data-coverage-bar={lang.language} class="h-1.5 rounded-full bg-surfaceHover overflow-hidden">
             <div
               class="h-full rounded-full"
               style="width: {Math.min(100, Math.max(0, lang.percentage))}%; background-color: {coverageBarColor(lang.percentage)};"
@@ -1689,27 +1746,38 @@
     </div>
   {/if}
 
+  <!-- Moved below the summary: this is the act-on-it bar, and it now sits
+       against the file list it sends the agent into rather than pushing the
+       measurement down the page. -->
+  {#key $repoStore.currentPath}
+    <CoverageAgentPrompt repoPath={$repoStore.currentPath} {report} exclusions={coverageExclusions} scanFailed={scanError !== null}
+      onRescan={rescan} scanning={isScanning} bind:selectedScope
+      focus={selectedFile ? { file: selectedFile, blocks: missedBlocks, detailAvailable: !isLoadingFile && fileLoaded && !fileError, partial: linesTruncated || scanTruncated || report?.truncated === true } : undefined} />
+  {/key}
+
   <div class="flex-1 flex min-h-0 min-w-0">
     <div class="w-72 max-w-[40%] min-w-40 shrink-0 border-r border-border/60 flex flex-col bg-surface/40 p-1.5 min-h-0">
       {#if isScanning && !report}
         <div class="flex-1 flex items-center justify-center text-textMuted font-sans">Scanning coverage…</div>
       {:else if report && report.files.length > 0}
-        <div class="p-1 space-y-2 font-sans shrink-0">
-          <input type="search" aria-label="Search coverage files" placeholder="Search files…" bind:value={fileQuery} class="w-full rounded border border-border bg-background px-2 py-1.5 text-[11px] text-textPrimary" />
-          <div class="flex flex-wrap gap-1">
-            <select aria-label="Filter coverage language" bind:value={languageFilter} class="flex-1 min-w-0 rounded border border-border bg-background p-1 text-[11px] text-textPrimary">
+        <!-- The app's own field and select chrome (`gp-field` / `gp-select`),
+             which ~20 other panels already wear. These four controls were the
+             only square-cornered system widgets in the window, which is most
+             of why this pane read as unfinished next to the rest. -->
+        <div class="p-1 space-y-1.5 font-sans shrink-0">
+          <input type="search" aria-label="Search coverage files" placeholder="Search files…" bind:value={fileQuery} class="gp-field w-full py-1! text-[11px]!" />
+          <div class="flex gap-1">
+            <select aria-label="Filter coverage language" bind:value={languageFilter} class="gp-select flex-1 min-w-0 py-1 text-[11px]">
               <option value="">All languages</option>{#each filterLanguages as language}<option value={language}>{language}</option>{/each}
             </select>
-            <select aria-label="Filter coverage gaps" bind:value={coverageFilter} class="flex-1 min-w-0 rounded border border-border bg-background p-1 text-[11px] text-textPrimary">
+            <select aria-label="Filter coverage gaps" bind:value={coverageFilter} class="gp-select flex-1 min-w-0 py-1 text-[11px]">
               <option value="all">All files</option><option value="missed">With missed lines</option><option value="below80">Below 80%</option>
             </select>
           </div>
-          <label class="flex items-center gap-2 text-[10px] text-textMuted">Sort
-            <select aria-label="Sort coverage files" bind:value={fileSort} class="flex-1 min-w-0 rounded border border-border bg-background p-1 text-[11px] text-textPrimary">
-              <option value="missed">Most missed lines</option><option value="coverage">Lowest coverage</option><option value="path">File path</option>
-            </select>
-          </label>
-          <div class="flex flex-wrap items-center justify-between gap-1 text-[10px] text-textMuted">
+          <select aria-label="Sort coverage files" bind:value={fileSort} class="gp-select w-full py-1 text-[11px]">
+            <option value="missed">Sort: most missed lines</option><option value="coverage">Sort: lowest coverage</option><option value="path">Sort: file path</option>
+          </select>
+          <div class="flex flex-wrap items-center justify-between gap-1 px-1 text-[10px] text-textMuted">
             <span role="status">Showing {visibleFiles.length} of {report.files.length} scanned files{report.truncated ? " · partial scan" : ""}</span>
             {#if fileQuery || languageFilter || coverageFilter !== "all"}<button type="button" class="text-accent hover:underline" onclick={clearFileFilters}>Clear filters</button>{/if}
           </div>
@@ -1845,15 +1913,25 @@
 
     <div class="flex-1 min-h-0 min-w-0 font-mono flex flex-col">
       {#if selectedPath}
-        <div class="px-3 py-2 border-b border-border/60 font-sans flex flex-wrap items-center gap-2 shrink-0">
+        <!-- One row. The path, the controls that walk it and the legend for
+             the gutter beneath all belong to the same pane; the legend in
+             particular used to sit in the app header, a pane away from the
+             only thing it explains. -->
+        <div class="px-3 py-1.5 border-b border-border/60 font-sans flex flex-wrap items-center gap-x-2 gap-y-1 shrink-0">
           <span class="min-w-0 flex-1 truncate text-textPrimary" title={selectedPath}>{selectedPath}</span>
-          {#if selectedFile}<button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" onclick={() => (selectedScope = true)}>Improve this file’s coverage</button>{/if}
-          <div class="flex flex-wrap items-center gap-2 w-full text-[11px] text-textMuted">
-            <button type="button" class="gp-btn py-0.5! px-2!" aria-label="Previous missed block" title="Previous missed block (Alt+Up)" aria-keyshortcuts="Alt+ArrowUp" disabled={!missedBlocks.length} onclick={() => jumpMissed(-1)}>↑ Previous</button>
-            <button type="button" class="gp-btn py-0.5! px-2!" aria-label="Next missed block" title="Next missed block (Alt+Down)" aria-keyshortcuts="Alt+ArrowDown" disabled={!missedBlocks.length} onclick={() => jumpMissed(1)}>↓ Next</button>
-            <span role="status">{isLoadingFile ? "Loading line details…" : !fileLoaded || fileError ? "Line details unavailable" : missedBlocks.length ? `${activeBlockIndex < 0 ? missedBlocks.length : `${activeBlockIndex + 1} of ${missedBlocks.length}`} missed blocks${activeBlock ? ` · lines ${activeBlock.start}–${activeBlock.end}` : ""}` : "No missed lines in available details"}</span>
-            {#if selectedFile && !selectedVisible}<span>Selected file is outside the current filters.</span>{/if}
+          <div class="flex items-center gap-1 shrink-0">
+            <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" aria-label="Previous missed block" title="Previous missed block (Alt+Up)" aria-keyshortcuts="Alt+ArrowUp" disabled={!missedBlocks.length} onclick={() => jumpMissed(-1)}>↑ Prev</button>
+            <button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" aria-label="Next missed block" title="Next missed block (Alt+Down)" aria-keyshortcuts="Alt+ArrowDown" disabled={!missedBlocks.length} onclick={() => jumpMissed(1)}>↓ Next</button>
           </div>
+          <span class="text-[11px] text-textMuted shrink-0 tabular-nums" role="status">{isLoadingFile ? "Loading line details…" : !fileLoaded || fileError ? "Line details unavailable" : missedBlocks.length ? `${activeBlockIndex < 0 ? missedBlocks.length : `${activeBlockIndex + 1} of ${missedBlocks.length}`} missed blocks${activeBlock ? ` · lines ${activeBlock.start}–${activeBlock.end}` : ""}` : "No missed lines in available details"}</span>
+          {#if selectedFile && !selectedVisible}<span class="text-[11px] text-textMuted shrink-0">Selected file is outside the current filters.</span>{/if}
+          <span class="w-px self-stretch bg-border/60 shrink-0" aria-hidden="true"></span>
+          <div class="flex items-center gap-2 text-[10px] text-textMuted/80 shrink-0" aria-label="Gutter legend">
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500/50"></span> hit</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-red-500/50"></span> missed</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-gray-500/30"></span> uninstrumented</span>
+          </div>
+          {#if selectedFile}<button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => (selectedScope = true)}>Improve this file’s coverage</button>{/if}
         </div>
       {/if}
       {#if scanTruncated}

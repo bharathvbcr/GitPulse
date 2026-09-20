@@ -8,6 +8,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { autoInit } from "../codeintel/autoInit";
+import { boundText } from "../codeintel/walkIncomplete";
+
+/**
+ * A failure message has to fit the Map status strip.
+ *
+ * Shorter than the codeintel prose budget on purpose: this one sits on a
+ * single status line rather than in a panel, and its content is raw stderr.
+ */
+const MAP_FAILURE_MAX_CHARS = 240;
 
 export type ExternalTool = "devmap" | "manvi";
 
@@ -274,6 +283,9 @@ export function mapFailureMessage(mode: MapFailureMode, fallback?: string | null
     case "no_json_artifact":
       return "No repo_map.json artifact yet — click Build to generate the navigator map.";
     default:
-      return fallback ?? "Map unavailable";
+      // The fallback is the build's own stderr — a process's output, with no
+      // length anyone controls. Every other branch here is a fixed sentence;
+      // this one could put a whole failed build log into a status strip.
+      return fallback ? boundText(fallback, MAP_FAILURE_MAX_CHARS) : "Map unavailable";
   }
 }

@@ -147,6 +147,7 @@
     type ComposedBlastRadius,
   } from "../codeintel/blastCompose";
   import { capFanout, omittedLayeredImpact } from "../codeintel/fanout";
+  import { hedgedCount } from "../codeintel/blastGlance";
   import { rungParam } from "../codeintel/rungFilter";
   import { boundText, summarizeWalkIncomplete, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
   import type { CodeintelRung, CodeintelRungHistogram } from "../codeintel/types";
@@ -238,13 +239,21 @@
   let changeSetBlast = $state<ComposedBlastRadius | null>(null);
   let changeSetBlastLoading = $state(false);
   let changeSetBlastGuard: AsyncGuard | null = null;
+  /**
+   * Collapsed until asked for, and held open once asked.
+   *
+   * The pane is remounted per view switch, so this is per-visit rather than a
+   * stored preference — the reader who opens it to study one change-set does
+   * not have to reopen it for every file in that change-set.
+   */
+  let blastOpen = $state(false);
   let impactWalkTitle = $derived(tooltipWalkIncomplete([impactWalkIncomplete]));
   let impactUnavailableTitle = $derived(
     tooltipWalkIncomplete([impactReason, impactWalkIncomplete]) ?? "impact unavailable",
   );
   let impactEdgesTitle = $derived(
     boundText(
-      `${impactEdges} downstream callers/dependencies affected by this file in devmap${
+      `${impactEdges} downstream callers/dependencies affected by THIS FILE in devmap — the panel below counts the whole change set${
         impactWalkTitle ? ` · walk incomplete: ${impactWalkTitle}` : ""
       }`,
     ),
@@ -1079,9 +1088,20 @@
 <svelte:window onkeydown={onWindowKeydown} />
 
 <div class="flex h-full flex-1 flex-col overflow-hidden bg-background text-xs">
-  <!-- Identity: what is on screen, taken from the diff itself. -->
+  <!-- Identity: what is on screen, taken from the diff itself.
+
+       `flex-wrap` is the narrow-pane behaviour, not the normal one. Every
+       chip here is `shrink-0`, so below roughly 500px their combined width
+       exceeds the row and the tail — the stage button, the impact chip — ran
+       off the edge with no scrollbar to reach it. Measured in the impact
+       harness at 420px. Wrapping to a second line costs a line only when the
+       row genuinely cannot fit, and beats silently amputating the controls.
+
+       This is not the wrap that was removed: that one was a `<p>` of prose
+       reflowing its own text at EVERY width. Each item here still refuses to
+       wrap internally. -->
   <div
-    class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/60 px-3 py-1.5 font-sans"
+    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/60 gp-section-edge bg-surface/60 px-3 py-1.5 font-sans"
   >
     {#if languagePath}
       <LanguageLogo filePath={languagePath} size={15} class="shrink-0" />
@@ -1133,15 +1153,18 @@
         impact unavailable
       </span>
     {:else if impactEdges > 0}
+      <!-- Scope is stated on the chip because the panel below answers the same
+           question for the whole change set. Two unlabelled impact numbers on
+           one screen read as a contradiction rather than as two scopes.
+           The walk qualification rides in the wording ("at least N") instead
+           of a separate amber word beside it: same disclosure, one chip. -->
       <span
         class="shrink-0 rounded-full border border-accent/30 bg-accent/15 px-2 py-0.5 text-[10px] text-accent"
         title={impactEdgesTitle}
       >
-        {impactEdges} {impactEdges === 1 ? "affected caller" : "affected callers"}
+        {hedgedCount(impactEdges, Boolean(impactWalkIncomplete), "caller")}
+        <span class="opacity-70">· this file</span>
       </span>
-    {/if}
-    {#if impactAvailable && impactWalkIncomplete}
-      <span class="shrink-0 text-[9px] text-amber-500" title={impactWalkTitle}>walk incomplete</span>
     {/if}
     {#if impactAvailable}
       <RungFilterControl bind:minRung histogram={impactRungs} layeredImpactActive={false} />
@@ -1416,10 +1439,17 @@
 
   {#if rail.entries.length > 0}
     <div class="mx-3 mt-2 shrink-0">
+      <!-- Named by its scope, because the header chip answers the same
+           question for the open file alone. The count is the whole changed
+           set; seeds the fan-out cap skipped come back as unavailable seeds,
+           so the summary reports them rather than quietly shrinking. -->
       <BlastRadiusPanel
         blast={changeSetBlast}
         loading={changeSetBlastLoading}
-        title="Change-set blast radius"
+        title={rail.entries.length === 1
+          ? "Blast radius · 1 changed file"
+          : `Blast radius · all ${rail.entries.length} changed files`}
+        bind:open={blastOpen}
       />
     </div>
   {/if}

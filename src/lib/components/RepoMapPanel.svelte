@@ -17,6 +17,7 @@
     refreshDevmap,
   } from "../codeintel/client";
   import { linkCandidatesHonesty } from "../codeintel/linkCandidates";
+  import { boundText } from "../codeintel/walkIncomplete";
   import {
     coverageGapSummary,
     formatCap,
@@ -83,6 +84,18 @@
 
   const CODE_GRAPH_VIEWS = new Set<MapView>(["files", "symbols", "subsystems", "docgraph"]);
   const BROKEN_LINKS_DISPLAY_CAP = 200;
+
+  /**
+   * Clip a process's own output to what a status strip can hold.
+   *
+   * `devmap`'s stderr is the source of most reasons on this pane, and stderr
+   * has no length anyone here controls — a failed build's is a log. The
+   * ellipsis `boundText` appends is what tells the reader a tail was cut; the
+   * full text stays in the logs the Copy-logs button collects.
+   */
+  const STRIP_MAX_CHARS = 240;
+  const boundStrip = (text: string | null | undefined): string | null =>
+    text == null ? null : boundText(text, STRIP_MAX_CHARS);
 
   let load = $state<RepoMapLoad | null>(null);
   let cliStatus = $state<DevmapCliStatus | null>(null);
@@ -152,14 +165,15 @@
           : "Indexing this repository… a large repository takes a few minutes.";
       case "failed":
         // The reason is the build's own stderr; it is the only thing that
-        // explains why pressing Build again would not help either.
+        // explains why pressing Build again would not help either. Bounded
+        // for exactly that reason — a failed build's stderr can be a log.
         return snapshot.reason
-          ? `The automatic index failed: ${snapshot.reason}`
+          ? `The automatic index failed: ${boundStrip(snapshot.reason)}`
           : "The automatic index failed.";
       case "skipped":
         // A skip the user needs to know about is one a rebuild cannot fix.
         return snapshot.decision === "skip_schema_outdated" && snapshot.reason
-          ? snapshot.reason
+          ? boundStrip(snapshot.reason)
           : null;
       default:
         return null;
@@ -531,10 +545,12 @@
           gaps: {coverageGapSummary(statusPayload)}
         </span>
       {/if}
+    <!-- `mapFailureMessage` bounds what it returns, but these fallbacks reach
+         the strip without passing through it, and both are process output. -->
     {:else if cliStatus && !cliStatus.available}
-      <span class="text-amber-600 dark:text-amber-300">{mapFailureText ?? cliStatus.reason ?? "devmap CLI missing"}</span>
+      <span class="text-amber-600 dark:text-amber-300">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "devmap CLI missing"}</span>
     {:else if load && !load.available}
-      <span class="text-amber-600 dark:text-amber-300">{mapFailureText ?? load.reason ?? "map unavailable"}</span>
+      <span class="text-amber-600 dark:text-amber-300">{mapFailureText ?? boundStrip(load.reason) ?? "map unavailable"}</span>
     {:else}
       <span>Status unknown</span>
     {/if}

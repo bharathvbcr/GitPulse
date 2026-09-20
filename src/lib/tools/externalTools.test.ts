@@ -189,6 +189,26 @@ describe("classifyMapFailure", () => {
     expect(mapFailureMessage("other", "custom")).toBe("custom");
     expect(mapFailureMessage("other")).toBe("Map unavailable");
   });
+
+  it("bounds the stderr fallback, which is a process's output", () => {
+    // Every other branch is a fixed sentence; this one is whatever `devmap`
+    // printed, and a failed build's stderr is a log, not a sentence.
+    const log = "error: could not compile\n".repeat(2_000);
+    const message = mapFailureMessage("other", log);
+    expect(message.length).toBeLessThanOrEqual(240);
+    // The clip must announce itself; a silently shortened reason reads as the
+    // whole reason.
+    expect(message.endsWith("…")).toBe(true);
+    // The head is kept, so the first line still says what went wrong.
+    expect(message.startsWith("error: could not compile")).toBe(true);
+  });
+
+  it("leaves a short reason exactly as the tool wrote it", () => {
+    for (const short of ["custom", "devmap: no such subcommand", ""]) {
+      const out = mapFailureMessage("other", short);
+      expect(out).toBe(short === "" ? "Map unavailable" : short);
+    }
+  });
 });
 
 describe("IPC wrappers", () => {

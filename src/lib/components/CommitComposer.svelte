@@ -22,6 +22,11 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
   import { tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
+  // The rail already derives its per-file verdict from these; the composer
+  // used to re-render the raw report beside it, which is how the two came to
+  // describe the same preview differently.
+  import { fileGlance, markerForHonesty } from "../codeintel/previewSummary";
+  import { formatPathParts } from "../files/formatPath";
   import { capFanout, omittedLayeredImpact } from "../codeintel/fanout";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
@@ -216,44 +221,100 @@
         {#if $previewSummary.outcomeReason}
           <p class="text-[10px] text-textMuted">{$previewSummary.outcomeReason}</p>
         {/if}
-        <ul class="flex max-h-28 flex-col gap-1 overflow-y-auto gp-scroll">
+        <!-- One row per file: the filename, and the first thing the preview
+             actually found. The per-field telemetry that used to fill six
+             monospace lines per file is still reachable — it is the row's
+             tooltip and the disclosure below — but it no longer outweighs the
+             finding it was supposed to support. -->
+        <ul class="flex max-h-32 flex-col gap-px overflow-y-auto gp-scroll">
           {#each $previewSummary.files as file (file.file_path)}
-            <li class="rounded border border-border/40 px-1.5 py-1 font-mono text-[9px] leading-relaxed text-textMuted">
-              <div class="truncate text-textSecondary" title={file.file_path}>{file.file_path}</div>
-              <div>
-                parse={file.parse_status}
-                · against={file.compared_against}
-                · indexed={file.file_is_indexed ? "yes" : "no"}
-                · delta={file.delta_available ? "yes" : "no"}
-              </div>
-              {#if file.degraded_reason}
-                <div class="text-amber-500">degraded: {file.degraded_reason}</div>
-              {/if}
-              <div>
-                bodies_not_compared={file.bodies_not_compared}
-                · ambiguous_callers={file.ambiguous_callers}
-                · broken={file.broken_shown}/{file.broken_total}{file.broken_truncated
-                  ? " (truncated)"
-                  : ""}
-              </div>
-              {#if file.walk_incomplete}
-                {@const walk = tooltipWalkIncomplete([file.walk_incomplete])}
-                <div class="line-clamp-2 text-amber-500" title={walk}>
-                  walk incomplete: {walk}
-                </div>
-              {/if}
-              {#if !file.available}
-                <div class="text-amber-500">unavailable: {file.reason}</div>
-              {:else if file.unreliable}
-                <div class="text-amber-500">unreliable preview — not "nothing breaks"</div>
-              {/if}
+            {@const marker = markerForHonesty(file)}
+            <li
+              class="flex items-baseline gap-1.5 rounded px-1 py-0.5 text-[10px] leading-snug hover:bg-surfaceHover/50"
+              title={marker.title}
+            >
+              <span
+                class="mt-px size-1.5 shrink-0 rounded-full {marker.kind === 'breaks'
+                  ? 'bg-rose-500'
+                  : marker.kind === 'clean'
+                    ? 'bg-emerald-500'
+                    : 'bg-amber-500'}"
+                aria-hidden="true"
+              ></span>
+              <span class="min-w-0 shrink truncate font-mono text-textSecondary">
+                {formatPathParts(file.file_path).name}
+              </span>
+              <span
+                class="min-w-0 flex-1 truncate text-right {marker.kind === 'clean'
+                  ? 'text-textMuted'
+                  : marker.kind === 'breaks'
+                    ? 'text-rose-500'
+                    : 'text-amber-600 dark:text-amber-400'}"
+              >
+                {fileGlance(file)}
+              </span>
             </li>
           {/each}
         </ul>
+
+        <!-- The raw report, for the reader who needs the exact fields. Kept
+             verbatim: compressing the summary is not licence to lose the
+             evidence behind it. -->
+        {#if $previewSummary.files.length > 0}
+          <details class="mt-1">
+            <summary class="cursor-pointer text-[10px] text-textMuted hover:text-textPrimary">
+              Preview details
+            </summary>
+            <ul class="mt-1 flex max-h-40 flex-col gap-1 overflow-y-auto gp-scroll">
+              {#each $previewSummary.files as file (file.file_path)}
+                <li
+                  class="rounded border border-border/40 px-1.5 py-1 font-mono text-[9px] leading-relaxed text-textMuted"
+                >
+                  <div class="truncate text-textSecondary" title={file.file_path}>
+                    {file.file_path}
+                  </div>
+                  <div>
+                    parse={file.parse_status}
+                    · against={file.compared_against}
+                    · indexed={file.file_is_indexed ? "yes" : "no"}
+                    · delta={file.delta_available ? "yes" : "no"}
+                  </div>
+                  {#if file.degraded_reason}
+                    <div class="text-amber-500">degraded: {file.degraded_reason}</div>
+                  {/if}
+                  <div>
+                    bodies_not_compared={file.bodies_not_compared}
+                    · ambiguous_callers={file.ambiguous_callers}
+                    · broken={file.broken_shown}/{file.broken_total}{file.broken_truncated
+                      ? " (truncated)"
+                      : ""}
+                  </div>
+                  {#if file.walk_incomplete}
+                    {@const walk = tooltipWalkIncomplete([file.walk_incomplete])}
+                    <div class="line-clamp-2 text-amber-500" title={walk}>
+                      walk incomplete: {walk}
+                    </div>
+                  {/if}
+                  {#if !file.available}
+                    <div class="text-amber-500">unavailable: {file.reason}</div>
+                  {:else if file.unreliable}
+                    <div class="text-amber-500">unreliable preview — not "nothing breaks"</div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          </details>
+        {/if}
       {/if}
     </div>
 
-    <BlastRadiusPanel {blast} loading={blastLoading} title="Staged blast radius" />
+    <BlastRadiusPanel
+      {blast}
+      loading={blastLoading}
+      title={stagedFiles.length === 1
+        ? "Blast radius · 1 staged file"
+        : `Blast radius · all ${stagedFiles.length} staged files`}
+    />
   {/if}
 
   <textarea
@@ -317,9 +378,15 @@
     </div>
   {/if}
 
-  <div class="flex items-center justify-between gap-2">
-    <div class="flex items-center gap-3 min-w-0">
-      <label class="flex items-center gap-1.5 text-[11px] text-textMuted cursor-pointer">
+  <!-- The two toggles keep their own text on one line and the ROW wraps when
+       the sidebar is too narrow for all three controls. Without this, "Include
+       unstaged" broke across two lines inside its own label and dragged the
+       commit button's row height with it. -->
+  <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
+    <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
+      <label
+        class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-textMuted cursor-pointer"
+      >
         <input
           type="checkbox"
           checked={isAmending}
@@ -329,7 +396,7 @@
         <span>Amend</span>
       </label>
       <label
-        class="flex items-center gap-1.5 text-[11px] text-textMuted cursor-pointer {isAmending
+        class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-textMuted cursor-pointer {isAmending
           ? 'opacity-40 cursor-not-allowed'
           : ''}"
         title="Stage remaining files and commit them together (quick commit)"
@@ -351,7 +418,7 @@
       title={quickCommit
         ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
         : "Commit staged files (Cmd/Ctrl+Enter)"}
-      class="gp-btn-primary"
+      class="gp-btn-primary shrink-0 whitespace-nowrap"
     >
       <Send size={12} />
       <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>

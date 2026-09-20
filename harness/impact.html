@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse impact surface checks</title></head>
+  <body style="margin:0">
+    <div id="app"></div>
+    <pre id="result" style="position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      /**
+       * The impact surfaces, in a real browser.
+       *
+       * What only a real page can settle:
+       *
+       *   - the diff header is ONE line. The rung control used to render an
+       *     unbounded `<p>` of histogram prose inside that flex row, which
+       *     wrapped to two lines and stretched every sibling with it. No node
+       *     test can see a wrap; SSR has no layout at all.
+       *   - the blast panel is collapsed on arrival, and the kernel's essay is
+       *     genuinely absent from the page rather than merely clipped by CSS —
+       *     `line-clamp` hides text that is still in the DOM and still tall.
+       *   - the qualification survives the collapse. Compressing detail is the
+       *     point; compressing a caveat is the failure.
+       *   - a lower bound is NOT amber. It is the ordinary case on any real
+       *     repository, and colouring the ordinary case as a warning is what
+       *     teaches people to stop reading warnings.
+       *
+       * Nothing here executes git or devmap. Every value is a fixture.
+       */
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      addEventListener("error", event => errors.push(event.message));
+      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+
+      const KERNEL_ESSAY =
+        "the walk did not complete: stopped at depth 10; the result is a lower bound, not the " +
+        "full blast radius; 16977 of 54269 unresolved attribution site(s) have no indexed " +
+        "target after excluding 37292 site(s) classified as builtin, runtime-global, " +
+        "external-import, no-namesake, or module-path; classification does not prove complete " +
+        "source coverage";
+
+      const layers = [
+        { depth: 1, nodes: [
+            "Sources/ExpanderEngine/AI/SelectionReader.swift::SelectionReader.readSelectionImpl",
+            "Tests/ExpanderEngineTests/EraseRangeEvidenceTests.swift::Field.gitPulseComboBoxRefuse",
+          ], node_count: 4, nodes_omitted: 0, lowest_confidence: 1 },
+        { depth: 2, nodes: ["Sources/ExpanderEngine/AI/SelectionReader.swift::SelectionReader.readSelection"],
+          node_count: 2, nodes_omitted: 0, lowest_confidence: 1 },
+        { depth: 3, nodes: ["Sources/DevTypeAppCore/AITransformFlow.swift::AITransformFlow.presentFromHotkey"],
+          node_count: 6, nodes_omitted: 31, lowest_confidence: 1 },
+      ];
+
+      const base = {
+        available: true, reason: null, seeds: ["a.swift"], unmatched_targets: [],
+        total_impacted: 4740, overlap_possible: false, layers, layers_truncated: false,
+        walk_incomplete: null, unavailable_seeds: [], cancelled_seeds: 0,
+      };
+
+      const FIXTURES = {
+        floor: { ...base, walk_incomplete: KERNEL_ESSAY, layers_truncated: true },
+        exact: { ...base },
+        unavailable: { ...base, available: false, reason: "no indexed traversal start", total_impacted: 0, layers: [] },
+        interrupted: { ...base, cancelled_seeds: 2,
+          unavailable_seeds: [{ seed: "a", reason: "query cancelled" }, { seed: "b", reason: "query cancelled" }] },
+      };
+
+      const histogram = { deterministic: 2576, high: 20, speculative: 40, filtered_out: 0 };
+
+      const report = over => ({
+        file_path: "src/a.ts", parse_status: "Full", delta_available: true, file_is_indexed: true,
+        compared_against: "HEAD", degraded_reason: null, symbols: [], bodies_not_compared: 0,
+        ambiguous_callers: 0,
+        broken_callers: { source_freshness: { fresh: true }, available: true, reason: null,
+          items: [], total: 0, shown: 0, truncated: false },
+        ...over,
+      });
+
+      const { mount, tick } = await import("svelte");
+      const { createChecks } = await import("./checks.ts");
+      const { fileHonesty } = await import("../src/lib/codeintel/previewSummary");
+      const Host = (await import("./ImpactHost.svelte")).default;
+
+      const previewFiles = [
+        fileHonesty({ file_path: "src/clean.ts", available: true, reason: null, report: report({ file_path: "src/clean.ts" }) }),
+        fileHonesty({ file_path: "src/broken.ts", available: true, reason: null, report: report({
+          file_path: "src/broken.ts",
+          broken_callers: { source_freshness: { fresh: true }, available: true, reason: null, items: [], total: 12, shown: 12, truncated: false } }) }),
+        fileHonesty({ file_path: "package-lock.json", available: false,
+          reason: "path is not indexable source", report: null }),
+        fileHonesty({ file_path: "src/deeply/nested/directory/with/a/very/long/name/module.ts",
+          available: true, reason: null, report: report({
+            file_path: "src/deeply/nested/directory/with/a/very/long/name/module.ts",
+            degraded_reason: "index older than the file; rebuild to compare bodies" }) }),
+      ];
+
+      let mode = "floor";
+      let narrow = false;
+      const target = document.querySelector("#app");
+
+      /**
+       * Remount rather than mutate props.
+       *
+       * The panel's `open` is component-local state by design — the reader's
+       * choice, not the host's — so a fixture switch must start from a fresh
+       * mount or the next assertion inherits the previous case's disclosure.
+       */
+      function rerenderHost() {
+        target.innerHTML = "";
+        mount(Host, {
+          target,
+          props: { blast: FIXTURES[mode], histogram, previewFiles, width: narrow ? 420 : 1280, setMode },
+        });
+      }
+
+      function setMode(next) {
+        if (next === "narrow") narrow = !narrow;
+        else mode = next;
+        rerenderHost();
+      }
+
+      rerenderHost();
+
+      const wait = (ms = 40) => new Promise(resolve => setTimeout(resolve, ms));
+      const { results, check, stopped } = createChecks();
+      const el = selector => document.querySelector(selector);
+      const text = () => document.body.textContent;
+
+      /**
+       * Amber, as this build actually computes it.
+       *
+       * Hardcoding "rgb(245, 158, 11)" reads as a passing check and tests
+       * nothing: Tailwind v4 emits oklch(), so a `!includes("245, 158, 11")`
+       * assertion is true of every colour on the page including amber itself.
+       * The reference swatch is rendered with the same class the components
+       * use, so the comparison is exact and format-agnostic.
+       */
+      const swatch = document.createElement("div");
+      swatch.className = "bg-amber-500";
+      swatch.style.position = "fixed";
+      swatch.style.pointerEvents = "none";
+      swatch.style.opacity = "0";
+      document.body.appendChild(swatch);
+      const AMBER = getComputedStyle(swatch).backgroundColor;
+      const dotColour = () =>
+        getComputedStyle(
+          el("[data-impact-panel] button[aria-expanded] span[aria-hidden]"),
+        ).backgroundColor;
+      /** One text line at this font size; two lines exceed it. */
+      const ONE_LINE = 30;
+
+      const report_ = () => {
+        document.querySelector("#result").textContent = results
+          .map(row => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
+      };
+
+      (async () => {
+        try {
+          await tick(); await wait();
+
+          // ---- the diff header is one line -------------------------------
+          const header = () => el("[data-impact-header]");
+          check("the diff header renders", () => !!header());
+          check("the diff header is a single line", () =>
+            header().getBoundingClientRect().height <= 40);
+          check("the rung control sits on that one line", () => {
+            const rung = el("[data-impact-rung]").getBoundingClientRect();
+            return rung.height <= ONE_LINE;
+          });
+          check("the rung control does not wrap its own content", () => {
+            const node = el("[data-impact-rung] label");
+            return node.scrollHeight <= node.clientHeight + 2;
+          });
+          check("the header does not overflow horizontally", () =>
+            header().scrollWidth <= header().clientWidth + 1);
+          check("the impact chip states its scope", () =>
+            el("[data-impact-chip]").textContent.includes("this file"));
+          check("the impact chip hedges a bounded count", () =>
+            el("[data-impact-chip]").textContent.includes("at least"));
+          check("the histogram prose is not printed into the row", () =>
+            !header().textContent.includes("What you did not necessarily see"));
+          check("the histogram prose is still reachable as a tooltip", () =>
+            (el("[data-impact-rung] label").getAttribute("title") ?? "")
+              .includes("What you did not necessarily see"));
+
+          // ---- the blast panel arrives collapsed --------------------------
+          const panel = () => el("[data-impact-panel]");
+          const summary = () => el("[data-impact-panel] button[aria-expanded]");
+          check("the blast panel renders", () => !!summary());
+          check("it arrives collapsed", () =>
+            summary().getAttribute("aria-expanded") === "false");
+          check("collapsed, it is one row tall", () =>
+            panel().getBoundingClientRect().height <= 40);
+          check("collapsed, the kernel essay is absent from the DOM", () =>
+            !text().includes("unresolved attribution site"));
+          check("collapsed, it still states the bound", () =>
+            summary().textContent.includes("at least"));
+          check("collapsed, it names a magnitude", () =>
+            summary().textContent.includes("4,740"));
+          check("collapsed, it does not overflow its column", () =>
+            summary().scrollWidth <= summary().clientWidth + 1);
+          check("the amber reference swatch resolved at all", () =>
+            AMBER.length > 0 && AMBER !== "rgba(0, 0, 0, 0)");
+          check("a lower bound is not coloured as a warning", () =>
+            dotColour() !== AMBER);
+
+          // ---- expanding reveals the evidence ----------------------------
+          summary().click(); await tick(); await wait();
+          check("clicking expands it", () =>
+            summary().getAttribute("aria-expanded") === "true");
+          check("expanded, the engine's own account is offered", () =>
+            text().includes("What the engine reported"));
+          check("expanded, the hop bands are listed", () => text().includes("hop 1"));
+          check("expanded, node_count is shown, not just the sample", () =>
+            text().includes("31 not sampled"));
+          check("expanded, the symbol precedes its file in the DOM", () => {
+            const html = panel().innerHTML;
+            return html.indexOf("SelectionReader.readSelectionImpl") <
+              html.indexOf("SelectionReader.swift<");
+          });
+          check("expanded, it still does not overflow horizontally", () =>
+            panel().scrollWidth <= panel().clientWidth + 1);
+          // A closed <details> keeps its content in the DOM and in
+          // textContent — it is hidden by rendering, not by removal. So the
+          // claim worth checking is that it occupies no space, which is what
+          // keeps the panel one-row-tall; asking textContent here would have
+          // quietly asserted nothing.
+          const details = el("[data-impact-panel] details");
+          check("expanded, the disclosure starts closed", () => !details.open);
+          const closedHeight = panel().getBoundingClientRect().height;
+          details.open = true; await tick(); await wait();
+          check("opening the disclosure costs height it did not cost before", () =>
+            panel().getBoundingClientRect().height > closedHeight + 10);
+          check("opening the disclosure reveals the verbatim account", () =>
+            text().includes("unresolved attribution site"));
+
+          // ---- degraded states earn amber, ordinary bounds do not ---------
+          setMode("unavailable"); await tick(); await wait();
+          check("an unavailable radius refuses to read as zero", () =>
+            text().includes("not the same as no impact"));
+          check("an unavailable radius IS coloured as a warning", () =>
+            dotColour() === AMBER);
+
+          setMode("interrupted"); await tick(); await wait();
+          check("an interrupted walk says so before its number", () => {
+            const line = summary().textContent.trim();
+            return line.startsWith("Interrupted after");
+          });
+
+          setMode("exact"); await tick(); await wait();
+          check("a complete answer carries no hedge", () =>
+            !summary().textContent.includes("at least"));
+          check("a complete answer shows no confidence chip", () =>
+            summary().textContent.replace(/\s+/g, " ").trim() ===
+              "Reaches 4,740 symbols within 3 hops.");
+
+          // ---- the commit sidebar rows ------------------------------------
+          setMode("floor"); await tick(); await wait();
+          const rows = () => [...document.querySelectorAll("[data-impact-preview-row]")];
+          check("every staged file gets a row", () => rows().length === 4);
+          check("each preview row is a single line", () =>
+            rows().every(row => row.getBoundingClientRect().height <= 22));
+          check("no preview row overflows the sidebar width", () =>
+            rows().every(row => row.scrollWidth <= row.clientWidth + 1));
+          check("a clean file says so in words", () =>
+            rows()[0].textContent.includes("no callers break"));
+          check("a clean file is marked clean", () =>
+            !!rows()[0].querySelector('[data-impact-preview-dot="clean"]'));
+          check("a breaking file names the count", () =>
+            rows()[1].textContent.includes("12 callers would break"));
+          check("a breaking file is marked as breaking", () =>
+            !!rows()[1].querySelector('[data-impact-preview-dot="breaks"]'));
+          check("an unpreviewable file never reads as clean", () =>
+            rows()[2].textContent.includes("not previewed") &&
+            !rows()[2].querySelector('[data-impact-preview-dot="clean"]'));
+          check("no row prints the raw report fields", () =>
+            rows().every(row => !row.textContent.includes("bodies_not_compared")));
+
+          // The commit footer: each toggle keeps its own label on one line.
+          const toggles = () => [...document.querySelectorAll("[data-impact-toggle]")];
+          check("both commit toggles render", () => toggles().length === 2);
+          check("no commit toggle wraps its own label", () =>
+            toggles().every(t => t.getBoundingClientRect().height <= 22));
+          check("the commit footer does not overflow the sidebar", () => {
+            const footer = el("[data-impact-commit-footer]");
+            return footer.scrollWidth <= footer.clientWidth + 1;
+          });
+
+          // ---- narrow ------------------------------------------------------
+          setMode("narrow"); await tick(); await wait();
+          // Below ~500px the shrink-0 chips cannot all fit. The claim is not
+          // that the row stays one line — it is that the overflow becomes a
+          // second LINE rather than content running off the edge where no
+          // scrollbar can reach it.
+          check("the header does not run off the edge at narrow width", () =>
+            header().scrollWidth <= header().clientWidth + 1);
+          check("the header wraps instead, gaining height", () =>
+            header().getBoundingClientRect().height > 40);
+          check("every header chip is still reachable inside the pane", () => {
+            const box = header().getBoundingClientRect();
+            return [...header().children].every(child => {
+              const rect = child.getBoundingClientRect();
+              return rect.left >= box.left - 1 && rect.right <= box.right + 1;
+            });
+          });
+          check("the collapsed panel survives a narrow pane", () =>
+            el("[data-impact-panel]").getBoundingClientRect().height <= 40);
+          check("nothing overflows at narrow width", () =>
+            el("[data-impact-stage]").scrollWidth <=
+              el("[data-impact-stage]").clientWidth + 1);
+
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report_();
+        } catch (error) {
+          stopped(error);
+          report_();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      })();
+    </script>
+  </body>
+</html>
