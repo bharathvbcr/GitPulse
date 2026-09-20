@@ -15,7 +15,7 @@ says so.
 
 `dc-store` is vendored from DevCouncil
 ([`src-tauri/vendored/VENDOR.json`](../src-tauri/vendored/VENDOR.json), crate
-`dc-store` at commit `0944ef5`). The vendor manifest is explicit: change these
+`dc-store` at commit `539fd40`). The vendor manifest is explicit: change these
 crates upstream and re-vendor, never in this repository. Three separate parts
 of that crate would have to change, and none of them can be worked around from
 the GitPulse side:

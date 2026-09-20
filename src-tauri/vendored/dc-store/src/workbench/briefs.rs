@@ -2,8 +2,8 @@
 //! transaction binds the task and its repository/workspace revision vector.
 //! Repository identities and remotes are deliberately absent from this export.
 
-use super::{Entity, Error, Input, MAX_INTEGER, MAX_PAGE_DOCUMENTS, Result};
 use super::input::MAX_LOGS_BYTES;
+use super::{Entity, Error, Input, MAX_INTEGER, MAX_PAGE_DOCUMENTS, Result};
 use rusqlite::{OptionalExtension, params};
 
 pub(super) fn get(input: &Input<'_>) -> Result<String> {
@@ -116,12 +116,12 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     for criterion in criteria {
         markdown.push_str(&format!("- [ ] {criterion}\n"));
     }
-    if let Some(logs) = task.text("logs", MAX_LOGS_BYTES)? {
-        if !logs.trim().is_empty() {
-            markdown.push_str("\n## Raw logs\nPasted evidence. Keep stack frames, timestamps, error codes and quoted text exactly as written.\n\n");
-            markdown.push_str(&fence_logs(&logs));
-            markdown.push('\n');
-        }
+    if let Some(logs) = task.text("logs", MAX_LOGS_BYTES)?
+        && !logs.trim().is_empty()
+    {
+        markdown.push_str("\n## Raw logs\nPasted evidence. Keep stack frames, timestamps, error codes and quoted text exactly as written.\n\n");
+        markdown.push_str(&fence_logs(&logs));
+        markdown.push('\n');
     }
     let response: String = input.conn.query_row(
         "SELECT json_object('ok',json('true'),'item',json_object('id',?1,'revision',?2,'updated_at',?3,'format_version',1,'task',json(?4),'repositories',json(?5),'workspace',json(?6),'markdown',?7))",

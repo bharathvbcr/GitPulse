@@ -905,6 +905,14 @@ impl Store {
         records::evidence_list(&self.conn, task_id)
     }
 
+    /// Lists gap history. See [`records::gap_history_list`].
+    pub fn gap_history_list(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<(Vec<records::GapHistoryRow>, bool)> {
+        records::gap_history_list(&self.conn, task_id)
+    }
+
     /// Lists gaps. See [`records::gaps_list`].
     pub fn gaps_list(&self, task_id: Option<&str>) -> Result<(Vec<records::GapRow>, bool)> {
         records::gaps_list(&self.conn, task_id)

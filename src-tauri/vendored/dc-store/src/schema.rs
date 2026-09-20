@@ -123,6 +123,44 @@ CREATE TABLE IF NOT EXISTS gaps (
     PRIMARY KEY (id)
 );
 
+-- How many times a task's gaps have been replaced.
+--
+-- `gaps` is current-state by design: `gaps_replace` deletes the task's rows and
+-- writes the new set, so a reconnecting agent sees the latest run rather than a
+-- union of historical findings. That is the right answer to "what blocks me
+-- now" and it is the reason the one fact worth keeping across runs cannot be
+-- recovered from it — a gap that was raised, reported fixed, and raised again
+-- is indistinguishable there from one nobody ever addressed.
+--
+-- The counter is its own table rather than derived from gap_history because a
+-- run that reports NO gaps still has to advance it. Deriving the run number
+-- from the history's own maximum would skip those runs, and a gap that
+-- disappeared for exactly one clean run and came back would then look like it
+-- had never gone away.
+CREATE TABLE IF NOT EXISTS gap_runs (
+    task_id VARCHAR NOT NULL,
+    run INTEGER NOT NULL,
+    PRIMARY KEY (task_id)
+);
+
+-- One row per (task, gap id) ever seen, kept when `gaps` is cleared.
+--
+-- This is the negative memory: `resurfaces` counts how many times a gap went
+-- away and came back, which is the highest-signal event in a task and the one
+-- the current-state table cannot hold. It is a record of what was reported, not
+-- of what was true — a gap can also "resurface" because a run could not measure
+-- it, which is why the run numbers are kept rather than only the count.
+CREATE TABLE IF NOT EXISTS gap_history (
+    task_id VARCHAR NOT NULL,
+    gap_id VARCHAR NOT NULL,
+    gap_type VARCHAR NOT NULL,
+    first_seen_run INTEGER NOT NULL,
+    last_seen_run INTEGER NOT NULL,
+    occurrences INTEGER NOT NULL,
+    resurfaces INTEGER NOT NULL,
+    PRIMARY KEY (task_id, gap_id)
+);
+
 CREATE TABLE IF NOT EXISTS critique_findings (
     id VARCHAR NOT NULL,
     source_agent VARCHAR NOT NULL,
