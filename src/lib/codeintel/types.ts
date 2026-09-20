@@ -2,6 +2,13 @@
  * In-process code intelligence types matching `src-tauri/src/codeintel/mod.rs`.
  */
 
+// walkIncomplete.ts imports nothing, so this cannot cycle back through here.
+import {
+  boundText,
+  summarizeWalkIncomplete,
+  WALK_INCOMPLETE_MAX_CHARS,
+} from "./walkIncomplete";
+
 export interface CodeintelSymbolHit {
   symbol_name: string;
   file_path: string;
@@ -144,6 +151,50 @@ export function parseSourceFreshness(value: unknown, command = "codeintel"): Sou
 }
 
 /**
+ * Fold an engine qualification once, at the boundary it arrives through.
+ *
+ * `walk_incomplete` is unbounded prose written by the devmap kernel: a ~60-word
+ * essay per walk, and N per-seed walks concatenate. Folding it here rather than
+ * at each render site means a surface cannot forget — the failure mode was
+ * exactly that, with four panels reading the same field and three of them
+ * printing it verbatim into the UI.
+ *
+ * Folding is idempotent by design (see summarizeWalkIncomplete), so the callers
+ * that already fold keep working unchanged.
+ *
+ * The one rule: a non-empty qualification may never fold into silence. If the
+ * folder finds no clause it can use — prose with no letters or digits at all —
+ * the bounded original is kept, because "this answer is qualified" must survive
+ * even when "why" cannot be parsed. Only genuinely empty input yields nothing,
+ * which is the absence of a qualification rather than the loss of one.
+ */
+function foldWalkIncomplete(raw: string): string | undefined {
+  const folded = summarizeWalkIncomplete([raw]);
+  if (folded) return folded;
+  const trimmed = raw.trim();
+  return trimmed ? boundText(trimmed, WALK_INCOMPLETE_MAX_CHARS) : undefined;
+}
+
+/** Clip an engine reason to the same budget a folded qualification gets. */
+function boundReason(reason: string | null | undefined): string | null {
+  if (reason == null) return null;
+  return boundText(reason, WALK_INCOMPLETE_MAX_CHARS);
+}
+
+/**
+ * Same clip, but `undefined` must survive as `undefined`.
+ *
+ * `freshness_reason` distinguishes "the backend said nothing" from "the
+ * backend said null", and collapsing the two would make an unasked question
+ * look like an answered one.
+ */
+function boundStatusReason(reason: string | null | undefined): string | null | undefined {
+  if (reason === undefined) return undefined;
+  if (reason === null) return null;
+  return boundText(reason, WALK_INCOMPLETE_MAX_CHARS);
+}
+
+/**
  * Unwraps a `CodeintelResponse`. Null, a non-object, or an `available: true`
  * payload without `items` is a failed read — Health used to dereference
  * `.available` / `.length` off that and crash the pane, which tore its
@@ -202,15 +253,21 @@ export function parseCodeintelResponse<T>(
   if (walk !== undefined && typeof walk !== "string") {
     throw new Error(`${command} returned a corrupt walk_incomplete`);
   }
+  const foldedWalk = typeof walk === "string" ? foldWalkIncomplete(walk) : undefined;
   return {
     source_freshness: parseSourceFreshness(value.source_freshness, command),
     available: value.available,
-    reason: optionalString(value.reason) ?? null,
+    // Bounded, not folded. `reason` is engine prose like `walk_incomplete` and
+    // is just as unbounded, but it is frequently a short exact phrase that
+    // callers compare and display verbatim, so clipping keeps it intact up to
+    // the budget while refusing to hand a panel an essay. The ellipsis
+    // `boundText` appends is what says the tail exists.
+    reason: boundReason(optionalString(value.reason)),
     items,
     total,
     shown,
     truncated: value.truncated === true,
-    ...(typeof walk === "string" ? { walk_incomplete: walk } : {}),
+    ...(foldedWalk !== undefined ? { walk_incomplete: foldedWalk } : {}),
     ...(histogram ? { rungs: histogram } : {}),
   };
 }
@@ -235,7 +292,11 @@ export function parseCodeintelStatus(
   return {
     available: value.available,
     is_fresh: optionalBoolean(value.is_fresh),
-    freshness_reason: optionalString(value.freshness_reason),
+    // Prose, and long in practice — the analyzer-freshness reason runs to a
+    // couple of hundred characters explaining which grammar could not be
+    // checked. Bounded here for the same reason `reason` is, so no panel has
+    // to remember.
+    freshness_reason: boundStatusReason(optionalString(value.freshness_reason)),
     source_freshness: optionalBoolean(value.source_freshness),
     analyzer_freshness: optionalBoolean(value.analyzer_freshness),
     pending_count: optionalFiniteNumber(value.pending_count),
@@ -244,7 +305,7 @@ export function parseCodeintelStatus(
     total_files: optionalFiniteNumber(value.total_files),
     total_symbols: optionalFiniteNumber(value.total_symbols),
     total_edges: optionalFiniteNumber(value.total_edges),
-    reason: optionalString(value.reason) ?? null,
+    reason: boundReason(optionalString(value.reason)),
   };
 }
 

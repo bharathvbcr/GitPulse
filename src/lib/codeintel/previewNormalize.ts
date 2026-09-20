@@ -15,7 +15,24 @@ import {
   type DevmapPreviewFileResult,
   type DevmapPreviewReport,
 } from "./types";
-import { summarizeWalkIncomplete } from "./walkIncomplete";
+import {
+  boundText,
+  summarizeWalkIncomplete,
+  WALK_INCOMPLETE_MAX_CHARS,
+} from "./walkIncomplete";
+
+/**
+ * Engine prose reaching a panel is bounded here, beside the walk fold.
+ *
+ * `reason` and `degraded_reason` come from the same driver as
+ * `walk_incomplete` and carry no documented length limit, so a panel that
+ * renders one verbatim has exactly the unbounded-essay problem the fold next
+ * to it exists to prevent. Clipping rather than folding keeps a short exact
+ * phrase exact; the ellipsis is what says a tail was cut.
+ */
+function boundEngineText(value: unknown): string | null {
+  return typeof value === "string" ? boundText(value, WALK_INCOMPLETE_MAX_CHARS) : null;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -53,16 +70,17 @@ function normalizeBrokenCallers(
 
   const resolution = rec.resolution;
   let available = asBool(rec.available, true);
-  let reason: string | null =
-    typeof rec.reason === "string" ? rec.reason : null;
+  let reason: string | null = boundEngineText(rec.reason);
   if (resolution && typeof resolution === "object" && !Array.isArray(resolution)) {
     const res = resolution as Record<string, unknown>;
     if ("Unavailable" in res) {
       available = false;
       const detail = res.Unavailable;
-      if (typeof detail === "string") reason = detail;
+      if (typeof detail === "string") reason = boundEngineText(detail);
       else if (detail && typeof detail === "object" && "reason" in detail) {
-        reason = asString((detail as { reason?: unknown }).reason, reason ?? "");
+        reason = boundEngineText(
+          asString((detail as { reason?: unknown }).reason, reason ?? ""),
+        );
       }
     }
   }
@@ -98,12 +116,18 @@ export function normalizePreviewReport(
   if (!rec) return null;
   return {
     file_path: asString(rec.file_path, fallbackPath),
-    parse_status: asString(rec.parse_status, "Unknown"),
+    // `parse_status_name` emits one of five short tokens — clean | partial |
+    // fallback | failed | skipped — so this clip never fires on real data.
+    // It is still an unconstrained String on the wire, and the commit
+    // composer's details view prints it verbatim. Bounding is safe precisely
+    // because reliability is not decided by this field alone: the engine also
+    // sets degraded_reason / delta_available, which is what honestyFromReport
+    // actually reads.
+    parse_status: boundText(asString(rec.parse_status, "Unknown"), WALK_INCOMPLETE_MAX_CHARS),
     delta_available: asBool(rec.delta_available, false),
     file_is_indexed: asBool(rec.file_is_indexed, false),
     compared_against: asString(rec.compared_against, "unknown"),
-    degraded_reason:
-      typeof rec.degraded_reason === "string" ? rec.degraded_reason : null,
+    degraded_reason: boundEngineText(rec.degraded_reason),
     symbols: Array.isArray(rec.symbols) ? rec.symbols : [],
     bodies_not_compared: asNumber(rec.bodies_not_compared, 0),
     ambiguous_callers: asNumber(rec.ambiguous_callers, 0),

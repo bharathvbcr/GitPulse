@@ -74,7 +74,14 @@ export interface GraphFilters {
 export function filterGraphNodes(model: CodeGraphModel, index: GraphIndex, filters: GraphFilters): LaidOutNode[] {
   const query = (filters.query ?? "").trim().toLowerCase();
   return model.nodes.filter(node => {
-    const path = (node.path || node.id.split("::")[0]).replace(/\\/g, "/");
+    // The `::` prefix is only a path when it looks like one. Taking it
+    // unconditionally invented a path for every namespaced symbol, and two
+    // filters below judge nodes BY that path: `SpecialCaseSpec::run` was
+    // hidden by "hide tests" (stem matches /Specs?$/) and `Vendor::helper` by
+    // "hide generated" — both production symbols, in no such file. A symbol
+    // whose file is unknown is judged by neither, which is the honest answer;
+    // search is unaffected because the haystack already carries `node.id`.
+    const path = (node.path || nodeFilePath(node.id) || "").replace(/\\/g, "/");
     if (filters.community && nodeCommunity(node) !== filters.community) return false;
     if (filters.language && nodeLanguageKey(node) !== filters.language) return false;
     if (filters.hideTests && isGraphTestPath(path)) return false;

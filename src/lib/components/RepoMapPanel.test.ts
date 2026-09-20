@@ -90,6 +90,36 @@ describe("RepoMapPanel", () => {
   });
 });
 
+describe("RepoMapPanel bounds process output before the status strip", () => {
+  /**
+   * Derived: find every place the panel renders a `reason`, and require each
+   * one to pass through the clip. A hand-listed set would miss the next one.
+   */
+  it("routes every rendered reason through boundStrip", () => {
+    expect(source).toContain("boundStrip");
+    // Only the TEMPLATE renders; the script block builds diagnostic payloads
+    // that legitimately carry a raw reason, and `reason:` marks those — a
+    // property being written, not a value being shown.
+    const template = source.slice(source.lastIndexOf("</script>"));
+    expect(template.length).toBeGreaterThan(0);
+    const unbounded = [
+      ...template.matchAll(/\{[^{}]*?\b(?:cliStatus|load|snapshot)\??\.reason\b[^{}]*?\}/g),
+    ]
+      .map((m) => m[0])
+      .filter((expr) => !expr.includes("boundStrip") && !/\breason:/.test(expr));
+    expect(
+      unbounded,
+      `these render a reason without clipping it: ${unbounded.join(" | ")}`,
+    ).toEqual([]);
+  });
+
+  it("interpolates the failed-build reason through the clip too", () => {
+    // devmap's stderr on a failed build is a log, not a sentence.
+    expect(source).toContain("The automatic index failed: ${boundStrip(snapshot.reason)}");
+    expect(source).not.toContain("The automatic index failed: ${snapshot.reason}");
+  });
+});
+
 describe("CodeView map section", () => {
   it("lazy-loads the Map panel beside Explorer and Blame", () => {
     expect(codeView).toContain('section === "map"');

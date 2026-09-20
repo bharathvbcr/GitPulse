@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fileGlance, fileHonesty, markerForHonesty } from "./previewSummary";
+import { normalizePreviewReport } from "./previewNormalize";
 import type { DevmapPreviewFileResult, DevmapPreviewReport } from "./types";
 
 function report(over: Partial<DevmapPreviewReport> = {}): DevmapPreviewReport {
@@ -109,6 +110,161 @@ describe("fileGlance says what was found, not what the struct holds", () => {
     expect(glanceOf({ bodies_not_compared: 3 })).toBe("3 bodies not compared");
     expect(glanceOf({ bodies_not_compared: 1 })).toBe("1 body not compared");
     expect(glanceOf({ ambiguous_callers: 2 })).toBe("2 ambiguous callers");
+  });
+});
+
+describe("the five parse outcomes devmap actually emits", () => {
+  /**
+   * The authoritative list, from `parse_status_name` in
+   * `devmap-query/src/engine.rs`: clean | partial | fallback | failed |
+   * skipped. Fixtures across this repo use "Full", which the engine never
+   * sends — so the reliable-parse path was only ever exercised with a
+   * fictional value. Pinning the real ones here means a future change to the
+   * classifier is judged against production data.
+   *
+   * Note what carries the signal: only `fallback` matches the parse-status
+   * denylist. The other three degraded outcomes are caught because the engine
+   * also sets `degraded_reason` (partial, fallback) or `delta_available:
+   * false` plus a reason (failed, skipped). That redundancy is why the
+   * denylist's "unreadable"/"error" entries — which match no real value —
+   * have never mattered.
+   */
+  const OUTCOMES: Array<{ status: string; degraded: string | null; delta: boolean }> = [
+    { status: "clean", degraded: null, delta: true },
+    { status: "partial", degraded: "the buffer parsed with errors", delta: true },
+    { status: "fallback", degraded: "the buffer's language has no linked grammar", delta: true },
+    { status: "failed", degraded: "the buffer was not parsed", delta: false },
+    { status: "skipped", degraded: "the buffer was not parsed", delta: false },
+  ];
+
+  it("treats clean as trustworthy and every other outcome as not", () => {
+    for (const { status, degraded, delta } of OUTCOMES) {
+      const h = fileHonesty(
+        file({ parse_status: status, degraded_reason: degraded, delta_available: delta }),
+      );
+      const shouldTrust = status === "clean";
+      expect(h.unreliable, `${status}: wrong reliability`).toBe(!shouldTrust);
+      expect(h.claim_clean, `${status}: wrong claim_clean`).toBe(shouldTrust);
+      expect(
+        fileGlance(h) === "no callers break",
+        `${status}: glance disagrees with reliability`,
+      ).toBe(shouldTrust);
+    }
+  });
+
+  it("names a cause for every outcome that is not clean", () => {
+    for (const { status, degraded, delta } of OUTCOMES.filter((o) => o.status !== "clean")) {
+      const g = fileGlance(
+        fileHonesty(
+          file({ parse_status: status, degraded_reason: degraded, delta_available: delta }),
+        ),
+      );
+      expect(g.length, `${status}: empty glance`).toBeGreaterThan(0);
+      expect(g, `${status}: read as clean`).not.toBe("no callers break");
+    }
+  });
+});
+
+describe("no engine string reaches a panel unbounded", () => {
+  const HUGE = "x".repeat(50_000);
+
+  /**
+   * Derived, not hand-listed: every string-valued field the normalizer emits
+   * is checked, so a new engine field added without a bound fails here rather
+   * than in a sidebar.
+   */
+  it("bounds every string the preview normalizer emits", () => {
+    const report = normalizePreviewReport(
+      {
+        file_path: HUGE,
+        parse_status: HUGE,
+        delta_available: true,
+        file_is_indexed: true,
+        compared_against: HUGE,
+        degraded_reason: HUGE,
+        symbols: [],
+        bodies_not_compared: 0,
+        ambiguous_callers: 0,
+        broken_callers: {
+          source_freshness: { fresh: true },
+          available: false,
+          reason: HUGE,
+          walk_incomplete: HUGE,
+          items: [],
+          total: 0,
+          shown: 0,
+          truncated: false,
+        },
+      },
+      "fallback.ts",
+    )!;
+    expect(report).toBeTruthy();
+
+    const offenders: string[] = [];
+    const walk = (value: unknown, path: string) => {
+      if (typeof value === "string") {
+        // file_path and compared_against are caller-supplied identifiers, not
+        // engine prose; they are bounded by the paths git itself produces.
+        if (path.endsWith("file_path") || path.endsWith("compared_against")) return;
+        if (value.length > 720) offenders.push(`${path} (${value.length} chars)`);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((v, i) => walk(v, `${path}[${i}]`));
+        return;
+      }
+      if (value && typeof value === "object") {
+        for (const [k, v] of Object.entries(value)) walk(v, `${path}.${k}`);
+      }
+    };
+    walk(report, "report");
+    expect(offenders, `unbounded engine strings: ${offenders.join(", ")}`).toEqual([]);
+  });
+
+  it("bounds degraded_reason and the broken-caller reason specifically", () => {
+    const report = normalizePreviewReport(
+      {
+        file_path: "src/a.ts",
+        parse_status: "Full",
+        degraded_reason: HUGE,
+        broken_callers: {
+          source_freshness: { fresh: true },
+          available: false,
+          reason: HUGE,
+          items: [],
+          total: 0,
+          shown: 0,
+          truncated: false,
+        },
+      },
+      "src/a.ts",
+    )!;
+    expect(report.degraded_reason!.length).toBeLessThanOrEqual(720);
+    expect(report.degraded_reason!.endsWith("…")).toBe(true);
+    expect(report.broken_callers.reason!.length).toBeLessThanOrEqual(720);
+  });
+
+  it("leaves a short reason exactly as the engine wrote it", () => {
+    const exact = "path is not indexable source";
+    const report = normalizePreviewReport(
+      {
+        file_path: "src/a.ts",
+        parse_status: "Full",
+        degraded_reason: exact,
+        broken_callers: {
+          source_freshness: { fresh: true },
+          available: false,
+          reason: exact,
+          items: [],
+          total: 0,
+          shown: 0,
+          truncated: false,
+        },
+      },
+      "src/a.ts",
+    )!;
+    expect(report.degraded_reason).toBe(exact);
+    expect(report.broken_callers.reason).toBe(exact);
   });
 });
 

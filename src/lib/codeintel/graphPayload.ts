@@ -8,10 +8,18 @@
 import type { GraphVizCounts, GraphVizLink, GraphVizNode } from "./types";
 import { DOC_GRAPH_EXTENT } from "../docs/docGraphPayload";
 import { getLanguageDisplayName, resolveLanguageIconKey, type LanguageIconKey } from "../language/languageLogos";
+import { nodeFilePath } from "./nodeLabel";
 
-/** Metadata wins; older payloads can still identify a language by source path. */
+/**
+ * Metadata wins; older payloads can still identify a language by source path.
+ *
+ * The `::` prefix is consulted only when it actually names a file. Taking it
+ * unconditionally handed bare namespaces to the language resolver, so a symbol
+ * like `Rust::new` or `Swift::make` was labelled by its namespace rather than
+ * by its file.
+ */
 export function nodeLanguageKey(node: GraphVizNode): LanguageIconKey {
-  for (const candidate of [node.language, node.lang, node.path, node.id.split("::")[0], node.kind === "file" ? node.name : ""]) {
+  for (const candidate of [node.language, node.lang, node.path, nodeFilePath(node.id), node.kind === "file" ? node.name : ""]) {
     const key = resolveLanguageIconKey(candidate ?? "");
     if (key !== "file") return key;
   }
