@@ -30,7 +30,7 @@ health from a native Rust / Tauri 2 app with a Svelte 5 frontend.
    helpers, and project tools to run with your account permissions.
 3. Use **Work** for changes in flight, **History** to review a commit, and
    **Code** to explore files. Open the command palette with `⌘K` / `Ctrl+K`.
-4. Use **Walkthrough** in the title bar whenever you want a guided tour.
+4. Replay the guided tour any time from **Settings → Appearance → Guided walkthrough**.
 
 GitHub CLI, DevMap, Manvi, and local model servers are optional; install the
 ones needed for the features you use. The [first repository guide](docs/GETTING_STARTED.md)

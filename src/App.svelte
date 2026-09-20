@@ -61,7 +61,6 @@
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
   import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
-  import { productTour } from "./lib/tools/productTour";
   import SetupWizard from "./lib/components/onboarding/SetupWizard.svelte";
   import {
     dismissFirstRun,
@@ -916,9 +915,6 @@
 
     <!-- Right Actions -->
     <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
-      {#if $interfaceStore.showWalkthroughButton}
-      <button class="gp-btn" data-tour="replay" title="Resume or replay the walkthrough" onclick={() => productTour.open()}>Walkthrough</button>
-      {/if}
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
       {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}

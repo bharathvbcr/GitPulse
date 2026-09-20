@@ -396,7 +396,6 @@ describe("interfaceStore chrome preferences", () => {
     expect(prefs.showHeaderActionLabels).toBe(true);
     expect(prefs.autoHideRepoTabs).toBe(false);
     expect(prefs.diagnosticsButton).toBe("always");
-    expect(prefs.showWalkthroughButton).toBe(true);
   });
 
   it("sets each chrome preference without disturbing the others", () => {
@@ -404,13 +403,11 @@ describe("interfaceStore chrome preferences", () => {
     interfaceStore.setShowHeaderActionLabels(false);
     interfaceStore.setAutoHideRepoTabs(true);
     interfaceStore.setDiagnosticsButton("issues");
-    interfaceStore.setShowWalkthroughButton(false);
     const prefs = get(interfaceStore);
     expect(prefs.statusBarMode).toBe("hidden");
     expect(prefs.showHeaderActionLabels).toBe(false);
     expect(prefs.autoHideRepoTabs).toBe(true);
     expect(prefs.diagnosticsButton).toBe("issues");
-    expect(prefs.showWalkthroughButton).toBe(false);
     // Untouched neighbours from other sections stay put.
     expect(prefs.showLanguageBar).toBe(true);
     expect(prefs.uiFontScale).toBe(1.0);
@@ -468,7 +465,7 @@ describe("interfaceStore chrome preferences", () => {
         hiddenViews: ["code", "blame", "not-a-view", 7, null],
         showHeaderActionLabels: "no",
         autoHideRepoTabs: 1,
-        showWalkthroughButton: "gone",
+        showWalkthroughButton: true,
       });
       expect(bad.statusBarMode).toBe("full");
       expect(bad.diagnosticsButton).toBe("always");
@@ -478,7 +475,10 @@ describe("interfaceStore chrome preferences", () => {
       expect(bad.hiddenViews).toEqual(["code"]);
       expect(bad.showHeaderActionLabels).toBe(true);
       expect(bad.autoHideRepoTabs).toBe(false);
-      expect(bad.showWalkthroughButton).toBe(true);
+      // showWalkthroughButton is retired along with the header's Walkthrough
+      // pill. Every upgraded profile still carries it, so the reader must drop
+      // it rather than carry a preference no control can change back.
+      expect(bad).not.toHaveProperty("showWalkthroughButton");
 
       // The control: valid values do survive, so the cases above are not
       // passing because the reader ignores these fields.
@@ -488,14 +488,12 @@ describe("interfaceStore chrome preferences", () => {
         hiddenViews: ["insights"],
         showHeaderActionLabels: false,
         autoHideRepoTabs: true,
-        showWalkthroughButton: false,
       });
       expect(good.statusBarMode).toBe("minimal");
       expect(good.diagnosticsButton).toBe("issues");
       expect(good.hiddenViews).toEqual(["insights"]);
       expect(good.showHeaderActionLabels).toBe(false);
       expect(good.autoHideRepoTabs).toBe(true);
-      expect(good.showWalkthroughButton).toBe(false);
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else delete (globalThis as { window?: unknown }).window;

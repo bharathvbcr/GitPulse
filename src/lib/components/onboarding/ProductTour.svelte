@@ -112,7 +112,7 @@
         </h1>
         {#if step === "welcome"}
           <p>Take a hands-on tour of GitPulse. Open a repository, try the workspace views, and find Tasks and Settings.</p>
-          <p>The guide will move beside the controls as you explore. Every step is optional; use Walkthrough in the title bar to resume later.</p>
+          <p>The guide will move beside the controls as you explore. Every step is optional; resume later from Settings → Appearance → Guided walkthrough.</p>
         {:else if step === "repository"}
           <p>{target ? "Try the highlighted Open menu to choose or clone a repository. You can also use the button below." : "Use the button below to choose a repository. The Open menu is not currently visible."} Review repository trust when asked.</p>
           <button class="gp-btn" disabled={busy} onclick={() => openRepository()}><FolderOpen size={15} /> {busy ? "Opening…" : "Choose a repository"}</button>
@@ -147,7 +147,7 @@
           {#if settingsVisited}<p role="status" class="tour-success"><Check size={15} /> Settings opened. No permission grant is required to finish.</p>
           {:else}<p class="text-xs">Explore Settings, then close it to return to this step. The tour does not change permissions or credentials.</p>{/if}
         {:else}
-          <p>You’ve reached the end of the walkthrough. Keep exploring, or return here any time from the title bar.</p>
+          <p>You’ve reached the end of the walkthrough. Keep exploring, or replay it any time from Settings → Appearance → Guided walkthrough.</p>
           <p class="text-xs">Skipped steps stay optional. Finishing records the tour as complete; it does not grant access or confirm a repository operation.</p>
           <button class="gp-btn" onclick={() => openRepository(true)}><FolderOpen size={15} /> Finish and open a repository</button>
         {/if}

@@ -328,8 +328,11 @@ describe("SettingsModal is wired to the search catalog", () => {
   it("makes the hidden attribute actually hide, whatever utilities a row carries", () => {
     // The UA sheet's `[hidden] { display: none }` loses to any author rule
     // that sets `display`, so a row with `flex` on it stayed on screen while
-    // marked hidden. Two rows here carry `flex`; the filter is only as honest
-    // as this rule.
+    // marked hidden. The action rows here carry `flex`; the filter is only as
+    // honest as this rule, so assert the rule rather than counting the rows.
+    const flexRows = [...source.matchAll(/<div\b([^>]*data-setting="([^"]+)"[^>]*)>/g)]
+      .filter(([, attrs]) => /class="[^"]*\bflex\b/.test(attrs));
+    expect(flexRows.length).toBeGreaterThan(0);
     expect(appCss.replace(/\s+/g, " ")).toContain("[hidden] { display: none !important; }");
   });
 

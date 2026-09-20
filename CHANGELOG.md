@@ -11,7 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **Walkthrough moved out of the title bar**: the persistent **Walkthrough**
+  pill no longer sits in the header. Replay now lives in **Settings →
+  Appearance → Guided walkthrough**, beside **First-run coach marks**, and
+  Settings closes as the tour opens so the guide is not drawn underneath it.
+  The first-run tour itself is unchanged.
+
+### Removed
+
+- The `showWalkthroughButton` preference and its **Layout** toggle, which
+  existed only to hide the pill. Stored copies in existing profiles are
+  ignored on read.
 
 ## [1.3.0] - 2026-09-17
 

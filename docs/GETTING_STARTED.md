@@ -15,8 +15,9 @@ permissions are separate decisions. The repository tab's **Revoke repository
 trust** action closes access when you no longer want to trust it; the full scope
 is documented in [Security](SECURITY.md).
 
-**Walkthrough** in the title bar can guide you through the controls. You can defer
-it and resume later, or replay it after completion.
+The guided walkthrough can take you through the controls. It opens by itself on a
+first run; **Settings → Appearance → Guided walkthrough → Replay Tour** resumes a
+deferred tour or replays a finished one.
 
 ## 2. Find the right view
 
