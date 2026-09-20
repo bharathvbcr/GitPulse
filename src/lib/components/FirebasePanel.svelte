@@ -771,7 +771,7 @@
                only an already-answered target is refreshed while a rollout is
                still moving. `now` ticks only while the poll is live; otherwise
                it is the fetch instant, because nothing grows between renders. -->
-          <div class="mb-2">
+          <div class="mb-2 min-w-0">
             <DeliveryTimeline
               title="Deploy duration and outcome"
               rows={rolloutRows}

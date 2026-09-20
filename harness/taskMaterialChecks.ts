@@ -114,11 +114,19 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     // A saved task is two panes, and only the open one is drawn. The Agent
     // probe below therefore has to open its pane first: `material` measures
     // client rects, so a hidden pane would report "no surfaces" rather than a
-    // colour. The assist is on the Task pane now, so it needs no click.
+    // colour. The assist is on the Task pane, but folded until the reader asks
+    // — measuring its glass has to expand it the way a reader would.
     check(`${mode}: a saved task offers its two panes`,
       [...document.querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,agent");
     check(`${mode}: only the selected pane is drawn`,
       [...document.querySelectorAll(".task-editor .pane")].filter(pane => pane.getClientRects().length > 0).length === 1);
+    await wait(() => !!document.querySelector('[data-testid="task-assist-toggle"]'));
+    check(`${mode}: a saved task folds the model assist`,
+      (document.querySelector('[data-testid="task-assist-body"]') as HTMLElement | null)?.hidden === true
+      && document.querySelector('[data-testid="task-assist-toggle"]')?.getAttribute("aria-expanded") === "false");
+    check(`${mode}: a saved task draws its title without the compose surface`,
+      (document.querySelector('input[name="task-title"]')?.getClientRects().length ?? 0) > 0);
+    (document.querySelector('[data-testid="task-assist-toggle"]') as HTMLElement).click();
     await wait(() => (document.querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
     check(`${mode}: merged Manvi section has Change link and no Model input`,
       Boolean(document.querySelector(".manvi-assist .change-link"))

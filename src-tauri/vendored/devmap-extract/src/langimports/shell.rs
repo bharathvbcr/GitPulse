@@ -36,9 +36,24 @@ pub(crate) fn extract_source(node: Node, source: &str, imports: &mut Vec<Extract
     if specifier.is_empty() || specifier.contains('$') {
         return;
     }
-    imports.push(file_import(
+    // `alias = "."` is the resolver's glob marker, and `source` is a glob: it
+    // runs the file in the current shell, so every function and variable it
+    // defines is in scope afterwards under its own name. There is no local
+    // binding name to record — nothing is renamed and nothing is namespaced.
+    //
+    // Emitted as a plain `file_import` at first, which resolved the file but
+    // bound none of its names. The functions it defines were then left to the
+    // global tier, which matches on the name alone: in this repository
+    // `verify.sh`'s calls to `peak_rss_bytes` landed on **six archived copies**
+    // of `peak_rss.sh` under `benchmarks/results/competition/` and never on
+    // `rust/tools/peak_rss.sh`, the file it sources. Reusing the existing glob
+    // marker rather than adding a shell arm beside it keeps one owner for
+    // "this import brings in everything".
+    let mut import = file_import(
         &get_node_text(node, source),
         specifier.to_string(),
         node_span(node),
-    ));
+    );
+    import.alias = Some(".".to_string());
+    imports.push(import);
 }

@@ -23,6 +23,25 @@ pub enum SymbolKind {
     Route,
     Endpoint,
     EventSubscriber,
+    /// An identity declared in markup that a stylesheet, a script selector or
+    /// another element can target: an `id`, or a `data-*` attribute used as a
+    /// hook. Named in CSS-selector form — `#repo-heading`, `[data-add-repo]` —
+    /// because that is the form every consumer of the identity writes, so it is
+    /// the form a search for it uses.
+    ///
+    /// Produced by [`crate::markup`]. Not a code declaration: nothing *calls*
+    /// it, so liveness exempts the kind rather than reporting every DOM hook as
+    /// dead — see the exemption in `devmap-analyze`.
+    MarkupAnchor,
+    /// A name declared in a stylesheet region: one selector of a rule's
+    /// selector list (`.nav-heading`, `#repo-heading`, `[data-add-repo]`), a
+    /// `@keyframes` name, or a custom property (`--gap-x`).
+    ///
+    /// Produced by [`crate::markup`] by pattern, because no CSS grammar is
+    /// linked in this workspace. Exempt from liveness for the same reason as
+    /// [`Self::MarkupAnchor`], and additionally because a class can be applied
+    /// by a runtime string this extractor cannot follow.
+    StyleRule,
     Dependency,
     Subsystem,
     Community,
@@ -53,6 +72,8 @@ impl SymbolKind {
             SymbolKind::Route => "Route",
             SymbolKind::Endpoint => "Endpoint",
             SymbolKind::EventSubscriber => "EventSubscriber",
+            SymbolKind::MarkupAnchor => "MarkupAnchor",
+            SymbolKind::StyleRule => "StyleRule",
             SymbolKind::Dependency => "Dependency",
             SymbolKind::Subsystem => "Subsystem",
             SymbolKind::Community => "Community",
@@ -75,6 +96,8 @@ impl SymbolKind {
         SymbolKind::Route,
         SymbolKind::Endpoint,
         SymbolKind::EventSubscriber,
+        SymbolKind::MarkupAnchor,
+        SymbolKind::StyleRule,
         SymbolKind::Dependency,
         SymbolKind::Subsystem,
         SymbolKind::Community,
@@ -889,6 +912,19 @@ pub enum ReferenceKind {
     JsxTag,
     /// Identifier in expression/value position (JSX prop, object shorthand, …).
     Name,
+    /// A DOM or stylesheet identity named as a *target*: a class listed in a
+    /// `class` attribute, an id named by an IDREF attribute (`for`,
+    /// `aria-controls`, …), a `var(--x)` use, or a selector string in a script.
+    ///
+    /// Deliberately **outside** the code resolution ladder. The names in this
+    /// kind live in a different namespace from identifiers — a class called
+    /// `menu` is not the function `menu` — so letting the ladder's
+    /// unique-global rung answer it would fabricate an edge between two
+    /// unrelated things. `devmap-resolve` answers it from markup and stylesheet
+    /// symbols only, and a name it cannot find is not recorded as an
+    /// unresolved *code* reference: the declaration may legitimately live in a
+    /// global stylesheet, a framework, or a CDN this index never saw.
+    Selector,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

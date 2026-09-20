@@ -22,6 +22,7 @@
   import { mount, unmount, tick } from "svelte";
   import DeliveryTimeline from "../src/lib/components/DeliveryTimeline.svelte";
   import { runTimelineRows } from "../src/lib/github/runLifecycle.ts";
+  import { TIMELINE_PREVIEW_COUNT } from "../src/lib/delivery/timeline.ts";
   import { createChecks } from "./checks.ts";
   const params = new URLSearchParams(location.search);
   const { results, check, stopped } = createChecks();
@@ -56,15 +57,35 @@
   const text = () => target().textContent ?? "";
   /** Whitespace collapsed: prose wraps across source lines. */
   const flat = () => text().replace(/\s+/g, " ");
-  const remount = async (props) => {
+  const remount = async (props, widthPx) => {
     if (app) { await unmount(app); app = null; }
     target().innerHTML = "";
+    target().style.width = widthPx ? `${widthPx}px` : "";
+    target().style.maxWidth = widthPx ? `${widthPx}px` : "";
     app = mount(DeliveryTimeline, {
       target: target(),
       props: { title: "Run duration and outcome", now: T0 + 120_000, sampleNoun: "runs", ...props },
     });
     await settle();
   };
+  const card = () => target().querySelector("[data-panel=delivery]");
+  const detailRows = () => [...target().querySelectorAll("[data-delivery-row]")];
+  const stripSegs = () => [...target().querySelectorAll("[data-delivery-strip-seg]")];
+  const expandBtn = () => target().querySelector("[data-delivery-expand]");
+  const fitsRail = () => {
+    const el = card();
+    return !!el && el.scrollWidth <= el.clientWidth + 1;
+  };
+  const twentyRuns = (over = {}) => Array.from({ length: 20 }, (_, i) => run({
+    id: i + 1,
+    title: over.title ?? `run ${i + 1}`,
+    conclusion: over.conclusion ?? (i < 6 ? "failure" : "success"),
+    updated_at: over.updated_at ?? iso(T0 + (i + 1) * 10_000),
+    head_branch: over.head_branch ?? "main",
+    event: over.event ?? "push",
+    ...over,
+    id: i + 1,
+  }));
   /**
    * Every drawn DURATION bar.
    *
@@ -124,7 +145,9 @@
       // Read the row's own verdict rather than the card text: the rate label
       // above it is the word "Passed", so a whole-card match always hits.
       check("a completed run with no conclusion is not called a pass",
-        () => rowStates().includes("Completed (no conclusion reported)"));
+        () => rowPhases().includes("unknown") && !rowStates().includes("Pass"));
+      check("and keeps the searchable wording on the tooltip, not the tile",
+        () => detailRows().some(el => (el.getAttribute("title") ?? "").includes("Completed (no conclusion reported)")));
       check("and carries no verdict phase at all",
         () => rowPhases().includes("unknown") && !rowPhases().includes("settled_ok"));
 
@@ -177,7 +200,7 @@
       });
       check("a live poll is marked live", () => flat().includes("Live"));
       check("and a running row is not given a verdict",
-        () => flat().includes("Running"));
+        () => rowPhases().includes("in_flight") && !rowStates().includes("Pass") && !rowStates().includes("Fail"));
 
       // --- an in-flight bar is drawn against the clock ----------------------
       check("a running row has a bar, because its elapsed time is known",
@@ -206,8 +229,91 @@
         () => !text().includes("line one\nline two"));
       check("and an enormous title is bounded",
         () => !text().includes("x".repeat(400)));
-      check("the card still lays out in one row per run",
-        () => target().scrollWidth <= target().clientWidth + 2);
+      check("the card stays inside its container",
+        () => fitsRail());
+
+      // --- a long listing previews, then expands ---------------------------
+      // The bug this pins: twenty duration rows in a single flex line blew
+      // out of the CI rail, and collapsing the *cards* below did nothing
+      // because the timeline always drew the whole sample.
+      await remount({ rows: runTimelineRows(twentyRuns({
+        head_branch: "feature/a-very-long-branch-name-that-used-to-blow-the-row",
+        event: "workflow_dispatch",
+      })), checked: true, truncated: true }, 280);
+      check("a twenty-run sample draws only the preview rows",
+        () => detailRows().length === TIMELINE_PREVIEW_COUNT);
+      check("and still measures the full sample",
+        () => flat().includes("70%") && flat().includes("(14/20)") && flat().includes("last 20"));
+      check("and still draws every verdict on the strip",
+        () => stripSegs().length === 20);
+      check("and names the expander after the fetched count",
+        () => expandBtn()
+          && expandBtn().getAttribute("aria-expanded") === "false"
+          && flat().includes("Show all 20 runs"));
+      check("and says the sample is capped",
+        () => flat().includes("capped — more exist"));
+      check("a 280px rail does not overflow while collapsed",
+        () => fitsRail());
+      check("the three preview runs sit on one glance row", () => {
+        const boxes = detailRows().map(el => el.getBoundingClientRect());
+        if (boxes.length !== TIMELINE_PREVIEW_COUNT) return false;
+        const top = Math.round(boxes[0].top);
+        return boxes.every(box => Math.round(box.top) === top);
+      });
+      check("glance tiles do not print the commit subject",
+        () => !flat().includes("a-very-long-branch-name") && !flat().includes("workflow_dispatch"));
+
+      expandBtn().click();
+      await settle();
+      check("expanding reveals every fetched row",
+        () => detailRows().length === 20 && expandBtn().getAttribute("aria-expanded") === "true");
+      check("expanding does not change the sample figures",
+        () => flat().includes("70%") && flat().includes("(14/20)") && flat().includes("last 20"));
+      check("an expanded 280px listing still fits",
+        () => fitsRail());
+      check("the expander offers the way back",
+        () => flat().includes("Show fewer"));
+
+      expandBtn().click();
+      await settle();
+      check("collapsing returns to the preview",
+        () => detailRows().length === TIMELINE_PREVIEW_COUNT
+          && expandBtn().getAttribute("aria-expanded") === "false");
+
+      await remount({
+        rows: runTimelineRows(twentyRuns().slice(0, TIMELINE_PREVIEW_COUNT)),
+        checked: true,
+      }, 280);
+      check("a short listing has no expander",
+        () => !expandBtn() && detailRows().length === TIMELINE_PREVIEW_COUNT);
+
+      await remount({ rows: runTimelineRows(twentyRuns()), checked: true, sampleNoun: "rollouts" }, 280);
+      check("the expander uses the listing's own noun",
+        () => flat().includes("Show all 20 rollouts"));
+
+      // Three 1s runs, then seventeen hour-long ones. If the bar scale used
+      // only the preview, the three shorts would all be 100%. Against the
+      // full sample they floor at a sliver.
+      await remount({ rows: runTimelineRows([
+        ...[1, 2, 3].map((id) => run({ id, updated_at: iso(T0 + 1_000) })),
+        ...Array.from({ length: 17 }, (_, i) => run({ id: i + 4, updated_at: iso(T0 + 3_600_000) })),
+      ]), checked: true }, 280);
+      check("collapsed bars still scale against the full sample", () => {
+        const widths = bars().map((bar) => Number.parseFloat(bar.style.width));
+        return widths.length === TIMELINE_PREVIEW_COUNT
+          && widths.every((w) => Number.isFinite(w) && w > 0 && w < 10);
+      });
+
+      await remount({ rows: runTimelineRows(twentyRuns({
+        title: "x".repeat(5_000),
+        name: "CI",
+        head_branch: `feature/${"y".repeat(200)}`,
+        event: "workflow_dispatch_from_a_very_long_name",
+      })), checked: true }, 240);
+      check("hostile labels in a 240px rail do not overflow",
+        () => fitsRail() && detailRows().length === TIMELINE_PREVIEW_COUNT);
+      check("and an enormous title is still bounded at the narrow width",
+        () => !text().includes("x".repeat(400)));
 
       // --- a duplicated id must not take the pane down ---------------------
       // Svelte 5 throws `each_key_duplicate` on a repeated explicit key, and

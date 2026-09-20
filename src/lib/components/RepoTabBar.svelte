@@ -15,15 +15,23 @@
   import { enumerateFocusables } from "../ui/focusTrap";
   import {
     ChevronDown,
+    ChevronRight,
     Pin,
     Plus,
     X,
+    Folder,
     FolderGit2,
     FolderOpen,
     LayoutGrid,
     ListChecks,
     SquareTerminal,
   } from "@lucide/svelte";
+  import { askConfirm, askText } from "../stores/modalStore";
+  import {
+    computeTabLayout,
+    normalizeGroupName,
+    type GroupHeaderItem,
+  } from "../repos/tabGroups";
   import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
@@ -51,10 +59,18 @@
   // off-screen (the old innerWidth-200 guess overflowed on short windows).
   let menuEl: HTMLDivElement | undefined = $state();
   let menuOpener: HTMLElement | null = null;
+  let groupMenu = $state<{ x: number; y: number; group: string } | null>(null);
+  let groupMenuEl: HTMLDivElement | undefined = $state();
+  let groupMenuOpener: HTMLElement | null = null;
+  let stripMenu = $state<{ x: number; y: number } | null>(null);
+  let stripMenuEl: HTMLDivElement | undefined = $state();
+  let stripMenuOpener: HTMLElement | null = null;
   let recentsOpen = $state(false);
   let recentsTriggerEl: HTMLButtonElement | undefined = $state();
   let recentsEl: HTMLDivElement | undefined = $state();
   let dragFromId = $state<string | null>(null);
+  let dragHoverGroup = $state<string | null>(null);
+  let dragHoverGroupTimer: ReturnType<typeof setTimeout> | null = null;
   // Where a dragged tab would land. `before` picks the left/right half of the
   // hovered tab; null means "no useful insertion point" and hides the bar.
   let dropTarget = $state<{ index: number; before: boolean } | null>(null);
@@ -65,6 +81,58 @@
     $interfaceStore.autoHideRepoTabs && $repoStore.openTabs.length <= 1,
   );
 
+  const tabLayout = $derived(
+    computeTabLayout($repoStore.openTabs, $repoStore.collapsedGroups, terminalCounts),
+  );
+
+  const groupHeadersByName = $derived(
+    new Map(tabLayout.groups.map((g) => [g.group, g])),
+  );
+
+  const collapsedGroupSet = $derived(
+    new Set($repoStore.collapsedGroups),
+  );
+
+  const distinctGroupNames = $derived(
+    Array.from(
+      new Set(
+        $repoStore.openTabs
+          .map((t) => normalizeGroupName(t.group))
+          .filter((g): g is string => g !== null),
+      ),
+    ),
+  );
+
+  const ungroupedTabs = $derived(
+    $repoStore.openTabs.filter((t) => !normalizeGroupName(t.group)),
+  );
+
+  function isFirstInGroup(tab: { group?: string | null }, index: number): boolean {
+    const group = normalizeGroupName(tab.group);
+    if (!group) return false;
+    const firstIndex = $repoStore.openTabs.findIndex(
+      (t) => normalizeGroupName(t.group) === group,
+    );
+    return index === firstIndex;
+  }
+
+  function isTabInCollapsedGroup(tab: { group?: string | null }): boolean {
+    const group = normalizeGroupName(tab.group);
+    return group !== null && collapsedGroupSet.has(group);
+  }
+
+  function getGroupInfo(rawGroup: string | null | undefined): GroupHeaderItem | undefined {
+    const group = normalizeGroupName(rawGroup);
+    return group ? groupHeadersByName.get(group) : undefined;
+  }
+
+  function groupChrome(info: { hasActiveTab: boolean }): string {
+    if (info.hasActiveTab) {
+      return "border-accent/50 bg-accent/10 text-accent font-medium";
+    }
+    return "border-border/70 bg-surface/70 text-textSecondary hover:border-accent/30 hover:bg-surfaceHover hover:text-textPrimary";
+  }
+
   let unusedRecents = $derived(
     $repoStore.recentRepos.filter(
       (path) => !isPathAmong(path, $repoStore.openTabs.map((tab) => tab.path), pathOpts),
@@ -72,13 +140,116 @@
   );
   const tasksOpen = $derived($interfaceStore.globalSurface === "tasks");
 
-  function closeMenu(options?: { restoreFocus?: boolean }) {
-    const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl : null;
-    menu = null;
-    recentsOpen = false;
-    menuOpener = null;
+  function closeStripMenu(options?: { restoreFocus?: boolean }) {
+    const opener = stripMenuOpener;
+    stripMenu = null;
+    stripMenuOpener = null;
     if (options?.restoreFocus && opener?.isConnected) {
       window.setTimeout(() => opener.focus(), 0);
+    }
+  }
+
+  function closeGroupMenu(options?: { restoreFocus?: boolean }) {
+    const opener = groupMenuOpener;
+    groupMenu = null;
+    groupMenuOpener = null;
+    if (options?.restoreFocus && opener?.isConnected) {
+      window.setTimeout(() => opener.focus(), 0);
+    }
+  }
+
+  function closeMenu(options?: { restoreFocus?: boolean }) {
+    const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl : groupMenu ? groupMenuOpener : stripMenu ? stripMenuOpener : null;
+    menu = null;
+    recentsOpen = false;
+    groupMenu = null;
+    stripMenu = null;
+    menuOpener = null;
+    groupMenuOpener = null;
+    stripMenuOpener = null;
+    if (options?.restoreFocus && opener?.isConnected) {
+      window.setTimeout(() => opener.focus(), 0);
+    }
+  }
+
+  async function promptSetGroup(tabId: string, currentGroup?: string | null) {
+    closeMenu();
+    const next = await askText({
+      title: currentGroup ? "Change group" : "Add to group",
+      message: "Enter group name for this repository tab (leave blank to ungroup):",
+      placeholder: "e.g. backend, frontend, tools",
+      initialValue: currentGroup ?? "",
+      confirmLabel: currentGroup ? "Update group" : "Set group",
+    });
+    if (next !== null) {
+      repoStore.setTabGroup(tabId, next);
+    }
+  }
+
+  async function promptRenameGroup(group: string) {
+    closeGroupMenu();
+    const next = await askText({
+      title: `Rename group "${group}"`,
+      message: "Enter a new name for this tab group:",
+      placeholder: group,
+      initialValue: group,
+      confirmLabel: "Rename",
+    });
+    if (next !== null) {
+      repoStore.renameGroup(group, next);
+    }
+  }
+
+  async function confirmCloseGroup(group: string, count: number) {
+    closeGroupMenu();
+    const confirmed = await askConfirm({
+      title: `Close group "${group}"`,
+      message: `Close all ${count} repository ${count === 1 ? "tab" : "tabs"} in "${group}"?`,
+      confirmLabel: "Close group tabs",
+      destructive: true,
+    });
+    if (confirmed) {
+      repoStore.closeGroup(group);
+    }
+  }
+
+  async function confirmCloseOtherGroups(keepGroup: string) {
+    closeGroupMenu();
+    const otherTabs = $repoStore.openTabs.filter(
+      (t) => {
+        const g = normalizeGroupName(t.group);
+        return g !== null && g !== keepGroup;
+      },
+    );
+    if (otherTabs.length === 0) return;
+    const confirmed = await askConfirm({
+      title: "Close other groups",
+      message: `Close all ${otherTabs.length} repository ${otherTabs.length === 1 ? "tab" : "tabs"} in other groups?`,
+      confirmLabel: "Close other groups",
+      destructive: true,
+    });
+    if (confirmed) {
+      for (const tab of otherTabs) {
+        await repoStore.closeTab(tab.id);
+      }
+    }
+  }
+
+  async function confirmCloseAllTabs() {
+    closeStripMenu();
+    const count = $repoStore.openTabs.length;
+    if (count === 0) return;
+    const confirmed = await askConfirm({
+      title: "Close all repositories",
+      message: `Close all ${count} open repository ${count === 1 ? "tab" : "tabs"}?`,
+      confirmLabel: "Close all",
+      destructive: true,
+    });
+    if (confirmed) {
+      const ids = $repoStore.openTabs.map((t) => t.id);
+      for (const id of ids) {
+        await repoStore.closeTab(id);
+      }
     }
   }
 
@@ -97,6 +268,12 @@
     }
   });
 
+  $effect(() => {
+    if (groupMenu && !groupHeadersByName.has(groupMenu.group)) {
+      untrack(() => { groupMenu = null; });
+    }
+  });
+
   function onContext(e: MouseEvent, id: string) {
     e.preventDefault();
     menuOpener = e.currentTarget instanceof HTMLElement
@@ -104,23 +281,60 @@
       : null;
     menu = { x: e.clientX, y: e.clientY, id };
     recentsOpen = false;
+    groupMenu = null;
+    stripMenu = null;
+  }
+
+  function onGroupContext(e: MouseEvent, group: string) {
+    e.preventDefault();
+    groupMenuOpener = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
+    groupMenu = { x: e.clientX, y: e.clientY, group };
+    menu = null;
+    stripMenu = null;
+    recentsOpen = false;
+  }
+
+  function onStripContext(e: MouseEvent) {
+    if (
+      e.target instanceof Element &&
+      (e.target.closest("[data-tab-id]") || e.target.closest("[data-group-header]") || e.target.closest("button"))
+    ) {
+      return;
+    }
+    e.preventDefault();
+    stripMenuOpener = scroller ?? null;
+    stripMenu = { x: e.clientX, y: e.clientY };
+    menu = null;
+    groupMenu = null;
+    recentsOpen = false;
   }
 
   /**
-   * The tab menu and the recents dropdown are two popovers, and they get two
-   * instances of the shared owner rather than one hand-written listener block
-   * that has to ask which of them is open before deciding anything.
-   *
-   * Only the tab menu has an anchor: recents is placed by CSS, `absolute`
-   * under its own trigger. Both leave Escape to `handlePopupKeydown`, which
-   * owns the popup keyboard and hands focus back to the opener.
+   * The tab menu, group menu, strip menu, and recents dropdown are popovers with shared
+   * dismissal behavior.
    */
+  const groupMenuDismissal = $derived({
+    anchor: { kind: "point" as const, x: groupMenu?.x ?? 0, y: groupMenu?.y ?? 0 },
+    estimate: { width: 176, height: 160 },
+    revision: groupMenu?.group,
+    dismiss: { inside: "[data-group-menu]", resize: true, escape: "none" as const },
+    onDismiss: () => closeGroupMenu(),
+  });
+
   const menuDismissal = $derived({
     anchor: { kind: "point" as const, x: menu?.x ?? 0, y: menu?.y ?? 0 },
     estimate: { width: 176, height: 150 },
     revision: menu?.id,
     dismiss: { inside: "[data-repo-menu]", resize: true, escape: "none" as const },
     onDismiss: () => closeMenu(),
+  });
+
+  const stripMenuDismissal = $derived({
+    anchor: { kind: "point" as const, x: stripMenu?.x ?? 0, y: stripMenu?.y ?? 0 },
+    estimate: { width: 176, height: 160 },
+    revision: stripMenu ? `${stripMenu.x},${stripMenu.y}` : undefined,
+    dismiss: { inside: "[data-strip-menu]", resize: true, escape: "none" as const },
+    onDismiss: () => closeStripMenu(),
   });
 
   const recentsDismissal = {
@@ -172,12 +386,20 @@
     if (recentsOpen && recentsEl) focusPopup(recentsEl);
   });
 
+  $effect(() => {
+    if (groupMenu && groupMenuEl) focusPopup(groupMenuEl);
+  });
+
+  $effect(() => {
+    if (stripMenu && stripMenuEl) focusPopup(stripMenuEl);
+  });
+
   function handlePopupKeydown(e: KeyboardEvent) {
     if (e.key === "Tab") {
       e.preventDefault();
       const popup = e.currentTarget;
       if (popup instanceof HTMLElement) {
-        const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl ?? null : null;
+        const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl ?? null : groupMenu ? groupMenuOpener : stripMenu ? stripMenuOpener : null;
         focusAdjacentToMenuOpener(popup, opener, e.shiftKey);
       }
       closeMenu();
@@ -214,7 +436,7 @@
     if (isImeComposition(e)) return;
     // Escape closes any open tab menu, regardless of where focus sits —
     // same window-listener pattern as ViewTabBar.
-    if (e.key === "Escape" && (menu || recentsOpen)) {
+    if (e.key === "Escape" && (menu || recentsOpen || groupMenu || stripMenu)) {
       e.preventDefault();
       closeMenu({ restoreFocus: true });
       return;
@@ -259,8 +481,73 @@
   });
 
   function endDrag() {
+    if (dragHoverGroupTimer) {
+      clearTimeout(dragHoverGroupTimer);
+      dragHoverGroupTimer = null;
+    }
+    dragHoverGroup = null;
     dragFromId = null;
     dropTarget = null;
+  }
+
+  function onGroupDragOver(e: DragEvent, group: string, isCollapsed: boolean) {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    if (dragFromId === null) return;
+    if (isCollapsed) {
+      if (dragHoverGroup !== group) {
+        if (dragHoverGroupTimer) clearTimeout(dragHoverGroupTimer);
+        dragHoverGroup = group;
+        dragHoverGroupTimer = setTimeout(() => {
+          repoStore.setGroupCollapsed(group, false);
+          dragHoverGroup = null;
+          dragHoverGroupTimer = null;
+        }, 400);
+      }
+    }
+  }
+
+  function onGroupDragLeave(_e: DragEvent, group: string) {
+    if (dragHoverGroup === group) {
+      if (dragHoverGroupTimer) clearTimeout(dragHoverGroupTimer);
+      dragHoverGroup = null;
+      dragHoverGroupTimer = null;
+    }
+  }
+
+  function onGroupDrop(e: DragEvent, group: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (dragFromId !== null) {
+      const id = dragFromId;
+      repoStore.setTabGroup(id, group);
+      repoStore.setGroupCollapsed(group, false);
+      announceMove(id);
+    }
+    endDrag();
+  }
+
+  function onGroupKeydown(e: KeyboardEvent, info: GroupHeaderItem) {
+    if (e.key === "ArrowRight" && info.isCollapsed) {
+      e.preventDefault();
+      repoStore.setGroupCollapsed(info.group, false);
+      return;
+    }
+    if (e.key === "ArrowLeft" && !info.isCollapsed) {
+      e.preventDefault();
+      repoStore.setGroupCollapsed(info.group, true);
+      return;
+    }
+    if (e.key === "F2") {
+      e.preventDefault();
+      void promptRenameGroup(info.group);
+      return;
+    }
+    if (e.key === "Delete") {
+      e.preventDefault();
+      void confirmCloseGroup(info.group, info.tabCount);
+      return;
+    }
   }
 
   function focusTabById(id: string) {
@@ -322,7 +609,7 @@
     if (e.ctrlKey || e.altKey || e.metaKey) return;
     const key = e.key as RovingKey;
     if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Home" && key !== "End") return;
-    const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index]") ?? [];
+    const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index], [data-group-head]") ?? [];
     if (tabs.length === 0) return;
     const current = Array.from(tabs).findIndex((el) => el === document.activeElement);
     const next = nextRovingIndex(current, tabs.length, key);
@@ -444,6 +731,64 @@
   });
 </script>
 
+{#snippet groupHead(info?: GroupHeaderItem)}
+  {#if info}
+    <div
+      role="presentation"
+      class="group relative flex items-center shrink-0"
+      data-group-header={info.group}
+      ondragover={(e) => onGroupDragOver(e, info.group, info.isCollapsed)}
+      ondragleave={(e) => onGroupDragLeave(e, info.group)}
+      ondrop={(e) => onGroupDrop(e, info.group)}
+    >
+      <button
+        type="button"
+        class="h-7 px-2 flex items-center gap-1.5 rounded-lg border text-xs font-medium cursor-pointer transition-[color,background-color,border-color,box-shadow] duration-150 {groupChrome(info)} {dragHoverGroup === info.group ? 'ring-2 ring-accent border-accent' : ''}"
+        aria-expanded={!info.isCollapsed}
+        aria-label={`Group ${info.label}, ${info.tabCount} ${info.tabCount === 1 ? 'repository' : 'repositories'}${info.isCollapsed ? ', collapsed' : ''}`}
+        title={`Group: ${info.label} (${info.tabCount} ${info.tabCount === 1 ? 'repository' : 'repositories'})\nClick to ${info.isCollapsed ? 'expand' : 'collapse'} · Right-click for options · F2 to rename · Delete to close`}
+        data-group-head={info.group}
+        tabindex={info.isCollapsed && info.hasActiveTab ? 0 : -1}
+        onclick={() => repoStore.toggleGroupCollapsed(info.group)}
+        oncontextmenu={(e) => onGroupContext(e, info.group)}
+        onkeydown={(e) => onGroupKeydown(e, info)}
+        onauxclick={(e) => {
+          if (e.button === 1) {
+            e.preventDefault();
+            void confirmCloseGroup(info.group, info.tabCount);
+          }
+        }}
+      >
+        {#if info.isCollapsed}
+          <ChevronRight size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary transition-transform" />
+        {:else}
+          <ChevronDown size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary transition-transform" />
+        {/if}
+        <Folder size={12} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
+        <span class="whitespace-nowrap font-medium text-[11px]">{info.label}</span>
+        <span class="text-[10px] tabular-nums font-mono opacity-70">({info.tabCount})</span>
+        {#if info.isDirty}
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)] shrink-0" title="{info.label} has uncommitted changes"></span>
+        {/if}
+        {#if info.conflictedCount > 0}
+          <span class="text-amber-400 text-[10px] font-mono shrink-0" title="{info.conflictedCount} conflicted files in {info.label}">{info.conflictedCount}</span>
+        {/if}
+        {#if info.terminalCount > 0}
+          <span
+            class="shrink-0 inline-flex items-center gap-0.5 text-accent"
+            title={`${info.terminalCount} terminal session${info.terminalCount === 1 ? '' : 's'} running in ${info.label}`}
+          >
+            <SquareTerminal size={10} aria-hidden="true" />
+            {#if info.terminalCount > 1}
+              <span class="text-[9px] font-medium tabular-nums">{info.terminalCount}</span>
+            {/if}
+          </span>
+        {/if}
+      </button>
+    </div>
+  {/if}
+{/snippet}
+
   <div class="gp-glass gp-repo-tabs relative z-20 h-11 bg-surface border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
@@ -498,8 +843,13 @@
         onkeydown={onTablistKeydown}
         ondragover={onScrollerDragOver}
         ondrop={onScrollerDrop}
+        oncontextmenu={onStripContext}
       >
         {#each $repoStore.openTabs as tab, index (tab.id)}
+          {#if isFirstInGroup(tab, index)}
+            {@render groupHead(getGroupInfo(tab.group))}
+          {/if}
+          {#if !isTabInCollapsedGroup(tab)}
           <div
             role="presentation"
             data-tab-id={tab.id}
@@ -602,6 +952,7 @@
               <X size={11} />
             </button>
           </div>
+          {/if}
         {/each}
       </div>
       <ScrollCue target={scroller} axis="x" />
@@ -778,6 +1129,97 @@
       }}>
         Revoke repository trust…
       </button>
+      <span class="gp-menu-sep" aria-hidden="true"></span>
+      {#if tab.group}
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          const id = tab.id;
+          const grp = tab.group;
+          closeMenu();
+          void promptSetGroup(id, grp);
+        }}>
+          Change group… ({tab.group})
+        </button>
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          repoStore.setTabGroup(tab.id, null);
+          closeMenu();
+        }}>
+          Remove from group
+        </button>
+        {#if isTabInCollapsedGroup(tab)}
+          <button role="menuitem" class="gp-menu-item" onclick={() => {
+            repoStore.setGroupCollapsed(tab.group!, false);
+            closeMenu();
+          }}>
+            Expand group "{tab.group}"
+          </button>
+        {:else}
+          <button role="menuitem" class="gp-menu-item" onclick={() => {
+            repoStore.setGroupCollapsed(tab.group!, true);
+            closeMenu();
+          }}>
+            Collapse group "{tab.group}"
+          </button>
+        {/if}
+      {:else}
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          const id = tab.id;
+          closeMenu();
+          void promptSetGroup(id);
+        }}>
+          Add to group…
+        </button>
+      {/if}
+      {#if distinctGroupNames.length > 0}
+        {#each distinctGroupNames as grp}
+          {#if grp !== tab.group}
+            <button role="menuitem" class="gp-menu-item" onclick={() => {
+              repoStore.setTabGroup(tab.id, grp);
+              closeMenu();
+            }}>
+              Move to group "{grp}"
+            </button>
+          {/if}
+        {/each}
+      {/if}
+      <button role="menuitem" class="gp-menu-item" onclick={() => {
+        repoStore.groupByParentFolder();
+        closeMenu();
+      }}>
+        Group all by parent folder
+      </button>
+      {#if $repoStore.openTabs.some((t) => t.group)}
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          repoStore.ungroupTabs();
+          closeMenu();
+        }}>
+          Ungroup all repositories
+        </button>
+      {/if}
+      {#if distinctGroupNames.length > 0}
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          repoStore.collapseAllGroups();
+          closeMenu();
+        }}>
+          Collapse all groups
+        </button>
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          repoStore.expandAllGroups();
+          closeMenu();
+        }}>
+          Expand all groups
+        </button>
+      {/if}
+      {#if tab.group}
+        <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => {
+          const g = tab.group!;
+          const count = groupHeadersByName.get(g)?.tabCount ?? 1;
+          closeMenu();
+          void confirmCloseGroup(g, count);
+        }}>
+          Close group "{tab.group}"…
+        </button>
+      {/if}
+      <span class="gp-menu-sep" aria-hidden="true"></span>
       <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeTab(tab.id); closeMenu(); }}>
         Close
       </button>
@@ -792,4 +1234,158 @@
       </button>
     </div>
   {/if}
+{/if}
+
+{#if groupMenu}
+  {@const groupHeader = groupHeadersByName.get(groupMenu.group)}
+  {#if groupHeader}
+    <div
+      bind:this={groupMenuEl}
+      use:portal={"body"}
+      use:popover={groupMenuDismissal}
+      data-group-menu
+      role="menu"
+      aria-label={`Group actions for ${groupHeader.label}`}
+      tabindex="-1"
+      onkeydown={handlePopupKeydown}
+      class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
+      style="z-index: {LAYERS.MENU}"
+    >
+      <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0 font-medium">
+        Group: {groupHeader.label} ({groupHeader.tabCount})
+      </div>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          repoStore.toggleGroupCollapsed(groupHeader.group);
+          closeGroupMenu();
+        }}
+      >
+        {groupHeader.isCollapsed ? "Expand group" : "Collapse group"}
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          repoStore.expandAllGroups();
+          closeGroupMenu();
+        }}
+      >
+        Expand all groups
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          repoStore.collapseAllGroups();
+          closeGroupMenu();
+        }}
+      >
+        Collapse all groups
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          const g = groupHeader.group;
+          closeGroupMenu();
+          void promptRenameGroup(g);
+        }}
+      >
+        Rename group…
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          repoStore.ungroupTabs(groupHeader.group);
+          closeGroupMenu();
+        }}
+      >
+        Ungroup repositories
+      </button>
+      {#if ungroupedTabs.length > 0}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            for (const t of ungroupedTabs) {
+              repoStore.setTabGroup(t.id, groupHeader.group);
+            }
+            closeGroupMenu();
+          }}
+        >
+          Add open ungrouped repositories ({ungroupedTabs.length})
+        </button>
+      {/if}
+      <span class="gp-menu-sep" aria-hidden="true"></span>
+      {#if tabLayout.groups.length > 1}
+        <button
+          role="menuitem"
+          class="gp-menu-item text-rose-400 hover:text-rose-300"
+          onclick={() => void confirmCloseOtherGroups(groupHeader.group)}
+        >
+          Close other groups…
+        </button>
+      {/if}
+      <button
+        role="menuitem"
+        class="gp-menu-item text-rose-400 hover:text-rose-300"
+        onclick={() => {
+          const g = groupHeader.group;
+          const count = groupHeader.tabCount;
+          closeGroupMenu();
+          void confirmCloseGroup(g, count);
+        }}
+      >
+        Close group repositories…
+      </button>
+    </div>
+  {/if}
+{/if}
+
+{#if stripMenu}
+  <div
+    bind:this={stripMenuEl}
+    use:portal={"body"}
+    use:popover={stripMenuDismissal}
+    data-strip-menu
+    role="menu"
+    aria-label="Repository tab strip actions"
+    tabindex="-1"
+    onkeydown={handlePopupKeydown}
+    class="fixed min-w-48 gp-menu gp-pop text-[11px] text-textPrimary"
+    style="z-index: {LAYERS.MENU}"
+  >
+    <button role="menuitem" class="gp-menu-item" onclick={() => { onOpen?.(); closeStripMenu(); }}>
+      <FolderOpen size={11} /> Open repository…
+    </button>
+    {#if $repoStore.lastClosed.length > 0}
+      <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.reopenLastClosed(); closeStripMenu(); }}>
+        Reopen closed repository ({displayName($repoStore.lastClosed[0])})
+      </button>
+    {/if}
+    <span class="gp-menu-sep" aria-hidden="true"></span>
+    <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.groupByParentFolder(); closeStripMenu(); }}>
+      Group all by parent folder
+    </button>
+    {#if distinctGroupNames.length > 0}
+      <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.expandAllGroups(); closeStripMenu(); }}>
+        Expand all groups
+      </button>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.collapseAllGroups(); closeStripMenu(); }}>
+        Collapse all groups
+      </button>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.ungroupTabs(); closeStripMenu(); }}>
+        Ungroup all repositories
+      </button>
+    {/if}
+    {#if $repoStore.openTabs.length > 0}
+      <span class="gp-menu-sep" aria-hidden="true"></span>
+      <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => void confirmCloseAllTabs()}>
+        Close all repositories…
+      </button>
+    {/if}
+  </div>
 {/if}

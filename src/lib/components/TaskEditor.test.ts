@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { compile } from "svelte/compiler";
+import { EDITOR_SECTION_IDS } from "../workbench/taskEditorLayout";
 
 const source = readFileSync(new URL("./TaskEditor.svelte", import.meta.url), "utf8");
 
@@ -124,27 +125,30 @@ describe("TaskEditor", () => {
     expect(source).not.toContain("Schedule and labels");
   });
 
-  it("numbers the sections instead of splitting them into columns", () => {
+  it("numbers the sections from editorSections instead of splitting them into columns", () => {
     // The two-column grid only applied past 520px and the dock's floor is
     // 380px, so which layout a reader got depended on how far they had dragged
-    // the splitter. Five numbered sections read the same at every width.
+    // the splitter. Numbered sections read the same at every width; which
+    // section is 2 is owned by `editorSections`, not by six literals here —
+    // a saved task must not keep calling the model "Quick add".
     const pane = taskPane();
     expect(source).not.toContain("pane-grid");
     expect(source).not.toContain("@container");
     expect(pane).toContain('<div class="steps">');
-    for (const [n, heading] of [
-      ["1", "Repositories"],
-      ["2", "Quick add"],
-      ["3", "Title and description"],
-      ["4", "Raw logs"],
-      ["5", "Status and scheduling"],
-      ["6", "Owner"],
-    ] as const) {
-      expect(pane).toContain(`<span class="step-n" aria-hidden="true">${n}</span><h3>${heading}</h3>`);
+    expect(source).toContain("const sections = $derived(editorSections(saved))");
+    expect(pane).toContain("{#each sections as section (section.id)}");
+    expect(pane).toContain("data-editor-section={section.id}");
+    expect(pane).toContain("{section.n}");
+    expect(pane).toContain("{section.heading}");
+    expect(pane).not.toContain("<h3>Quick add</h3>");
+    for (const id of EDITOR_SECTION_IDS) {
+      expect(pane, id).toContain(`section.id === "${id}"`);
     }
-    // In that order, and with nothing unnumbered between them.
-    const order = [...pane.matchAll(/<span class="step-n" aria-hidden="true">(\d)<\/span>/g)].map((m) => m[1]);
-    expect(order).toEqual(["1", "2", "3", "4", "5", "6"]);
+    expect(pane).toContain('data-testid="task-assist-toggle"');
+    expect(pane).toContain('data-testid="task-assist-body"');
+    expect(pane).toContain("hidden={!assistChrome.open}");
+    // Folded, not unmounted: a running suggestion has to keep its Cancel.
+    expect(pane).not.toMatch(/\{#if assistChrome\.open\}[\s\S]*?<TaskManviAssist/);
   });
 
   it("lets the reader paste raw logs on the sheet without feeding them to notes or title extraction", () => {
@@ -267,10 +271,24 @@ describe("TaskEditor", () => {
     expect(source).toContain('class:flash={flash.includes("title")}');
     expect(source).toContain('class:flash={flash.includes("description")}');
 
-    // The dictation and the fields it fills are in reading order: the capture
-    // surface first, then Title and Description under it. Pressing a button on
-    // one pane and reading the result on another is what the merge removed.
-    expect(pane.indexOf("<TaskManviAssist")).toBeLessThan(pane.indexOf('name="task-title"'));
+    // Visual order is `editorSections`' job: a draft still dictates first, a
+    // saved task leads with the title. Source order of the two tags is not
+    // that order — the sheet iterates the table — so the promise lives there.
+    expect(source).toContain("editorSections(saved)");
+    expect(source).toContain("assistDisclosure({ saved, opened: assistOpened })");
+    expect(source).toContain("riseAssistOpen");
+    expect(source).not.toContain("if (work && !prevAssistWork) assistOpened = true");
+    expect(source).toMatch(/assistAttention\(\{[\s\S]*?state:[\s\S]*?uncertain:[\s\S]*?\}\)/);
+    expect(source).toContain("compose={!current}");
+    expect(source).not.toContain("on a saved task it is last and folded");
+    expect(pane).toContain("<TaskManviAssist");
+    expect(pane).toContain('name="task-title"');
+    expect(pane).toContain('data-testid="task-assist-status"');
+    expect(source).toContain("assistFoldStatus({");
+    expect(source).toContain("logsDisclosure({");
+    expect(pane).toContain('data-testid="task-logs-toggle"');
+    expect(pane).toContain('data-testid="task-logs-body"');
+    expect(pane).toContain("hidden={!logsChrome.open}");
   });
 
   it("keeps the assist outside the fieldset a running suggestion disables", () => {
@@ -293,4 +311,18 @@ describe("TaskEditor", () => {
     expect(source).toContain("Retry delete");
     expect(source).not.toContain("window.confirm");
   });
+
+  it("supports adding subtasks and extracting checklists into criteria", () => {
+    const pane = taskPane();
+    expect(pane).toContain('data-testid="task-extract-subtasks"');
+    expect(pane).toContain('data-testid="task-subtask-add-row"');
+    expect(pane).toContain('data-testid="task-subtask-add-input"');
+    expect(pane).toContain('data-testid="task-subtask-add-button"');
+    expect(pane).toContain('data-testid="task-criteria"');
+    expect(source).toContain("extractDraftSubtasks(");
+    expect(source).toContain("addSubtaskItem()");
+    expect(source).toContain("removeSubtaskItem(");
+    expect(source).toContain("criteriaList = $derived(");
+  });
 });
+

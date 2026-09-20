@@ -34,10 +34,18 @@ export interface TaskEditorTabDescriptor {
   hint: string;
 }
 
-const ALL: readonly TaskEditorTabDescriptor[] = [
-  { id: "task", label: "Task", hint: "What the work is, how it is scheduled, and the model's help with it." },
-  { id: "agent", label: "Agent", hint: "Hand this saved revision to a coding agent." },
-];
+export const TASK_TAB_HINT_DRAFT = "What the work is, how it is scheduled, and the model's help with it.";
+export const TASK_TAB_HINT_SAVED = "What the work is and how it is scheduled.";
+export const AGENT_TAB_HINT = "Hand this saved revision to a coding agent.";
+
+const ALL_SAVED: readonly TaskEditorTabDescriptor[] = Object.freeze([
+  { id: "task", label: "Task", hint: TASK_TAB_HINT_SAVED },
+  { id: "agent", label: "Agent", hint: AGENT_TAB_HINT },
+]);
+
+const DRAFT_TAB: readonly TaskEditorTabDescriptor[] = Object.freeze([
+  { id: "task", label: "Task", hint: TASK_TAB_HINT_DRAFT },
+]);
 
 /**
  * Panes that were folded into Task, and still answer to their old names.
@@ -66,11 +74,11 @@ const MERGED_INTO: Record<string, TaskEditorTab> = Object.assign(Object.create(n
  * disappears as fields are filled in is worse than one that is simply empty.
  */
 export function editorTabs(saved: boolean): TaskEditorTabDescriptor[] {
-  return saved ? [...ALL] : [ALL[0]];
+  return saved ? [...ALL_SAVED] : [...DRAFT_TAB];
 }
 
 export function isTaskEditorTab(value: unknown): value is TaskEditorTab {
-  return ALL.some((tab) => tab.id === value);
+  return ALL_SAVED.some((tab) => tab.id === value);
 }
 
 /**
@@ -91,8 +99,10 @@ export function resolveEditorTab(current: unknown, saved: boolean): TaskEditorTa
   return "task";
 }
 
-export function editorTabHint(tab: TaskEditorTab): string {
-  return ALL.find((entry) => entry.id === tab)?.hint ?? "";
+export function editorTabHint(tab: TaskEditorTab, saved: boolean = true): string {
+  if (tab === "task") return saved ? TASK_TAB_HINT_SAVED : TASK_TAB_HINT_DRAFT;
+  if (tab === "agent") return AGENT_TAB_HINT;
+  return "";
 }
 
 /**

@@ -33,6 +33,7 @@ export type PanelSource =
   | "remotes"
   | "submodules"
   | "conflict"
+  | "suspects"
   | "fleet";
 
 export interface ReporterOptions {

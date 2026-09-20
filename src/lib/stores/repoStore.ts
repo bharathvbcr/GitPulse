@@ -37,6 +37,16 @@ import {
   removeRecent as removeWorkspaceRecent,
   moveTabBy as moveWorkspaceTabBy,
   moveTabTo as moveWorkspaceTabTo,
+  setTabGroup as setWorkspaceTabGroup,
+  setGroupCollapsed as setWorkspaceGroupCollapsed,
+  toggleGroupCollapsed as toggleWorkspaceGroupCollapsed,
+  isGroupCollapsed as isWorkspaceGroupCollapsed,
+  renameGroup as renameWorkspaceGroup,
+  ungroupTabs as ungroupWorkspaceTabs,
+  closeGroup as closeWorkspaceGroup,
+  groupByParentFolder as groupWorkspaceByParentFolder,
+  collapseAllGroups as collapseWorkspaceAllGroups,
+  expandAllGroups as expandWorkspaceAllGroups,
   type WorkspaceTabs,
 } from "../repos/tabModel";
 import {
@@ -174,6 +184,7 @@ export interface OpenRepoTab {
   name: string;
   label: string;
   pinned: boolean;
+  group?: string | null;
   isActive: boolean;
   isBare: boolean;
   isDirty: boolean;
@@ -326,6 +337,7 @@ export interface RepoState {
   activeTabId: string | null;
   recentRepos: string[];
   lastClosed: string[];
+  collapsedGroups: string[];
   currentPath: string | null;
   branches: BranchInfo[];
   tags: TagInfo[];
@@ -495,6 +507,7 @@ function emptyProjected(): RepoState {
     activeTabId: null,
     recentRepos: [],
     lastClosed: [],
+    collapsedGroups: [],
     currentPath: null,
     branches: [],
     tags: [],
@@ -597,6 +610,7 @@ function project(internal: InternalState): RepoState {
       name: session?.name ?? displayName(tab.path),
       label: labels.get(tab.path) ?? displayName(tab.path),
       pinned: tab.pinned,
+      group: tab.group ?? null,
       isActive: tab.id === internal.workspace.activeId,
       isBare: session?.isBare ?? false,
       isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
@@ -617,6 +631,7 @@ function project(internal: InternalState): RepoState {
     activeTabId: internal.workspace.activeId,
     recentRepos: internal.workspace.recents,
     lastClosed: internal.workspace.lastClosed,
+    collapsedGroups: internal.workspace.collapsedGroups ?? [],
     currentPath: active?.path ?? null,
     branches: active?.branches ?? [],
     tags: active?.tags ?? [],
@@ -1855,6 +1870,76 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = internal.sessions[id];
       if (session) putSession({ ...session, pinned });
       publish();
+    },
+    setTabGroup: (id: string, group: string | null) => {
+      replaceWorkspace(setWorkspaceTabGroup(internal.workspace, id, group));
+      publish();
+      flushPersist();
+    },
+    groupByParentFolder: () => {
+      replaceWorkspace(groupWorkspaceByParentFolder(internal.workspace));
+      publish();
+      flushPersist();
+    },
+    ungroupTabs: (groupName?: string) => {
+      replaceWorkspace(ungroupWorkspaceTabs(internal.workspace, groupName));
+      publish();
+      flushPersist();
+    },
+    closeGroup: async (groupName: string) => {
+      const groupTabs = internal.workspace.tabs.filter((t) => t.group === groupName);
+      if (groupTabs.length === 0) return;
+      if (!(await confirmTerminalLoss(groupTabs.map((t) => t.path)))) return;
+      const { workspace, closedPaths } = closeWorkspaceGroup(internal.workspace, groupName);
+      replaceWorkspace(workspace);
+      const remaining = new Set(internal.workspace.tabs.map((tab) => tab.id));
+      const sessions: Record<string, RepoSession> = {};
+      for (const [key, session] of Object.entries(internal.sessions)) {
+        if (remaining.has(key)) sessions[key] = session;
+      }
+      internal = { ...internal, sessions };
+      stopStatusPoll();
+      for (const path of closedPaths) {
+        graph.evict(path);
+        await unwatch(path);
+      }
+      const revealed = activeSession();
+      if (revealed) {
+        putSession(bumped(revealed));
+        ensureStatusPoll();
+      }
+      syncFilterFromSession(activeSession());
+      publish();
+      revealGraph(activeSession());
+      flushPersist();
+    },
+    renameGroup: (oldName: string, newName: string) => {
+      replaceWorkspace(renameWorkspaceGroup(internal.workspace, oldName, newName));
+      publish();
+      flushPersist();
+    },
+    toggleGroupCollapsed: (groupName: string) => {
+      replaceWorkspace(toggleWorkspaceGroupCollapsed(internal.workspace, groupName));
+      publish();
+      flushPersist();
+    },
+    setGroupCollapsed: (groupName: string, collapsed: boolean) => {
+      replaceWorkspace(setWorkspaceGroupCollapsed(internal.workspace, groupName, collapsed));
+      publish();
+      flushPersist();
+    },
+    isGroupCollapsed: (groupName: string) => {
+      return isWorkspaceGroupCollapsed(internal.workspace, groupName);
+    },
+    collapseAllGroups: () => {
+      replaceWorkspace(collapseWorkspaceAllGroups(internal.workspace));
+      publish();
+      flushPersist();
+    },
+    expandAllGroups: () => {
+      replaceWorkspace(expandWorkspaceAllGroups(internal.workspace));
+      publish();
+      flushPersist();
     },
     reopenLastClosed: async () => {
       const path = internal.workspace.lastClosed[0];

@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Default token budget for in-process query operations.
+pub mod suspects;
+pub use suspects::{
+    suspects, CodeintelSuspect, CodeintelSuspectScope, CodeintelSuspectsPayload,
+    CodeintelTouchedSymbol,
+};
+
 pub const DEFAULT_CODEINTEL_BUDGET: u32 = 2000;
 
 /// Schema version this GitPulse build can read. Pinned to the linked
@@ -265,7 +271,7 @@ fn open_indexed_store(repo: &Path) -> Result<Store, String> {
 
 /// Validates the repository and opens its built map — the whole preamble every
 /// query surface shares.
-fn open_repo_map(repo_path: &str) -> Result<Store, String> {
+pub(crate) fn open_repo_map(repo_path: &str) -> Result<Store, String> {
     open_indexed_store(&resolve_repo(repo_path)?)
 }
 

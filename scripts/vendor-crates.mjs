@@ -96,6 +96,16 @@ export function sources(env = process.env, from = REPO) {
         // took it as a hard dependency upstream after that, so a re-vendor
         // without it fails to resolve rather than building a stale tree.
         "dc-proc",
+        // Which commits could have caused a symptom: git blame joined to the
+        // code graph. `dc-regress` is the analysis and knows nothing about
+        // storage; `dc-regress-store` is the adapter that presents a persisted
+        // devmap generation through its `CodeGraph` trait. Both are vendored
+        // because the adapter is the part GitPulse would otherwise have had to
+        // write itself, and a second adapter would have to agree — silently —
+        // with the one `devmap suspects` uses about cone direction, walk budget
+        // and how a symptom name resolves.
+        "dc-regress",
+        "dc-regress-store",
         "dc-store",
         "dc-verify",
         "devmap-analyze",
@@ -510,6 +520,38 @@ function gitCommit(root) {
 }
 
 /**
+ * Whether the crate's own subtree upstream has uncommitted changes.
+ *
+ * `commit` alone is a claim that the vendored bytes are recoverable by checking
+ * that commit out, and vendoring from a dirty tree makes that false without
+ * saying so. It is the normal case, not an exotic one: a crate is vendored
+ * right after it is changed and before the change is committed, which is
+ * exactly when the two disagree. A later `--check` then reports drift against
+ * the recorded commit that nobody can explain, or an operator checks the commit
+ * out and does not find the code.
+ *
+ * Scoped to the crate's directory rather than the whole repository, because a
+ * dirty README upstream says nothing about whether *this* crate is reproducible
+ * from that commit.
+ *
+ * @param {string} root
+ * @param {string} relDir
+ */
+function gitSubtreeDirty(root, relDir) {
+  try {
+    const out = execFileSync("git", ["-C", root, "status", "--porcelain", "--", relDir], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim() !== "";
+  } catch {
+    // Not a git checkout, or git is unavailable. `commit` is already "" in that
+    // case, so there is no commit claim to qualify.
+    return false;
+  }
+}
+
+/**
  * Build the exact standalone snapshot used by both refresh and drift checks.
  * Comparing this output with the recorded manifest catches source deletions,
  * Cargo inheritance changes, and changes to standalone rewrites through one
@@ -554,6 +596,11 @@ function prepareCrate(source, name, to, workspace, commit) {
       root_env: `GITPULSE_${source.id.toUpperCase()}_ROOT`,
       path: source.crateDir(name),
       commit,
+      // Present and true only when it applies, so an entry without it reads as
+      // "reproducible from `commit`" rather than as "nobody looked".
+      ...(gitSubtreeDirty(source.root, source.crateDir(name))
+        ? { commit_is_not_the_source: true }
+        : {}),
     },
     omitted: ["tests/", "[dev-dependencies]"],
     rewrites,
@@ -713,6 +760,15 @@ export function check(env = process.env) {
         result.upstream = result.drifted.length === 0 ? "matches" : "drifted";
         if (current && current !== crate.origin.commit) {
           result.reason = `upstream has moved to ${current.slice(0, 8)} since vendoring at ${String(crate.origin.commit).slice(0, 8)}`;
+        }
+        // Said last so it is the note a reader ends on: it changes what every
+        // other verdict here means. "matches" against a commit the bytes never
+        // came from is a comparison against the wrong thing, and a `drifted`
+        // list may be nothing but the uncommitted work itself.
+        if (crate.origin.commit_is_not_the_source) {
+          result.reason =
+            `vendored from an uncommitted tree — ${String(crate.origin.commit).slice(0, 8)} does not contain these bytes` +
+            (result.reason ? `; ${result.reason}` : "");
         }
       }
       crates.push(result);

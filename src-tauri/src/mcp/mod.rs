@@ -509,6 +509,29 @@ fn build_tools() -> Vec<Value> {
             codeintel_output(),
         ),
         tool(
+            "gitpulse_codeintel_suspects",
+            "Regression suspects",
+            "Which commits since `since` could have caused a symptom. Blames only the lines belonging to symbols the symptom depends on, so the answer is the dependency cone rather than the file's recent history. The window ends at the commit the index was built at, never HEAD. An empty list with available=true means nothing in the window touched the cone; refusals are reported in walk_incomplete and make the list a lower bound.",
+            json!({
+                "repo_path": repo_prop(),
+                "symptom": path_prop("Symbol that is misbehaving — a qualified node id, or a bare name"),
+                "since": path_prop("Revision the window opens at (a commit, tag or branch)"),
+                // Bounded, like every other numeric argument here. The cone
+                // grows with depth and each file it reaches costs a `git blame`
+                // subprocess, so an unbounded depth is an unbounded amount of
+                // work asked for by one integer. Ten is already far past the
+                // point where a dependency chain explains a regression.
+                "depth": {
+                    "type": "integer",
+                    "description": "How many call edges out from the symptom to follow (default 3)",
+                    "minimum": 1,
+                    "maximum": 10
+                }
+            }),
+            &["repo_path", "symptom", "since"],
+            codeintel_output(),
+        ),
+        tool(
             "gitpulse_provenance",
             "Commit provenance",
             "Read Git-native verification notes and confidence decay for a commit",
@@ -741,6 +764,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
             let budget = arguments["budget"].as_u64().map(|b| b as u32);
             Ok(json!(crate::codeintel::dead_symbols(repo, budget)))
+        }
+        "gitpulse_codeintel_suspects" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let symptom = arguments["symptom"].as_str().ok_or("missing symptom")?;
+            let since = arguments["since"].as_str().ok_or("missing since")?;
+            let depth = arguments["depth"].as_u64().map(|d| d as u32);
+            Ok(json!(crate::codeintel::suspects(
+                repo, symptom, since, depth
+            )))
         }
         "gitpulse_provenance" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;

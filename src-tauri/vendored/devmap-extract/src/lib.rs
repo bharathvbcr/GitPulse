@@ -24,6 +24,12 @@ pub mod langfields;
 #[cfg(feature = "parse")]
 pub mod langimports;
 pub mod languages;
+/// The markup and stylesheet halves of a template, HTML or CSS file.
+///
+/// Ungated: its stylesheet and text scanners are pure string readers that the
+/// `--no-default-features` query build can use, and only the one function that
+/// walks a parse tree is behind `parse`.
+pub mod markup;
 pub mod model;
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.

@@ -5,6 +5,8 @@ import {
   parseInitReport,
   parseIntegrationPlan,
   parseSuiteReport,
+  parseSuspectsPayload,
+  type CodeintelSuspectsPayload,
   type CodeintelAffectedTests,
   type CodeintelClones,
   type CodeintelDeadSymbol,
@@ -95,6 +97,40 @@ export async function getDeadSymbols(
     repoPath,
     tokenBudget,
   }).then(asResponse("cmd_codeintel_dead_symbols"));
+}
+
+/**
+ * Deepest call-graph cone the backend will walk for a suspects query.
+ *
+ * A mirror of `MAX_CONE_DEPTH` in `src-tauri/src/codeintel/suspects.rs`, which
+ * is itself held against the `maximum` the MCP schema advertises. Mirrored
+ * rather than fetched because the input has to be bounded before the first
+ * call, and held by a test (`suspects.test.ts`) so the two cannot drift: a UI
+ * that offers a depth the backend refuses is a control that fails on use.
+ */
+export const MAX_SUSPECT_CONE_DEPTH = 10;
+
+/**
+ * Which commits since `since` could have caused `symptom`.
+ *
+ * The window's upper bound is chosen by the index, not by this call: it ends at
+ * the commit the map was built at, so the graph's byte offsets and the blamed
+ * lines describe the same content. Read `scope.indexed_head` to show the user
+ * what was actually examined — it is not `HEAD` and saying so avoids the
+ * obvious misreading.
+ */
+export async function getSuspects(
+  repoPath: string,
+  symptom: string,
+  since: string,
+  depth?: number,
+): Promise<CodeintelSuspectsPayload> {
+  return invoke("cmd_codeintel_suspects", {
+    repoPath,
+    symptom,
+    since,
+    depth,
+  }).then((raw) => parseSuspectsPayload(raw, "cmd_codeintel_suspects"));
 }
 
 export async function getDependencies(

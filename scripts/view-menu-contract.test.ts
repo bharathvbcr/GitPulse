@@ -39,7 +39,11 @@ describe("native section menus match the frontend registry", () => {
     const expected = REGISTERED_VIEWS.flatMap((view) =>
       (view.sections ?? []).map((section) => [`section:${view.id}:${section.id}`, section.label]),
     );
-    expect(expected).toHaveLength(15);
+    // Written out so the registry side cannot collapse to nothing and let the
+    // comparison below pass against an equally empty Rust side. Bump it when a
+    // section is added — the edit is the review. 16 = 5 Work + 3 Code +
+    // 4 History + 4 Insights.
+    expect(expected).toHaveLength(16);
     expect(entries.sort()).toEqual(expected.sort());
     expect(menu).toContain("actions::SECTION_MENUS");
   });

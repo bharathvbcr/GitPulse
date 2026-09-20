@@ -287,7 +287,7 @@ describe("GitHubPanel narrowing contracts", () => {
       measured,
       "runRows is no longer a plain runTimelineRows(<list>) — re-point this contract",
     ).toBeTruthy();
-    const gate = /\{#if ([^}]*)\}\s*<div class="mb-2">\s*<DeliveryTimeline/.exec(source)?.[1];
+    const gate = /\{#if ([^}]*)\}\s*<div class="mb-2 min-w-0">\s*<DeliveryTimeline/.exec(source)?.[1];
     expect(gate, "could not find the {#if} wrapping the run timeline").toBeTruthy();
     expect(gate).toContain(`${measured}.length`);
   });
@@ -404,6 +404,8 @@ describe("GitHubPanel deploy-section reachability", () => {
     expect(source).toContain("runTimelineRows(visibleRuns)");
     expect(source).not.toContain("runTimelineRows(previewedRuns)");
     expect(source).not.toContain("anyInFlight(runTimelineRows(previewedRuns))");
+    expect(source).toContain("rows={runRows}");
+    expect(source).not.toContain("rows={previewedRuns}");
   });
 
   it("keeps the backend truncation notices counting what was fetched", () => {

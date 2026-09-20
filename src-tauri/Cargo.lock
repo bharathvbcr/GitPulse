@@ -733,6 +733,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-regress"
+version = "0.2.3"
+dependencies = [
+ "dc-proc",
+ "devmap-extract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dc-regress-store"
+version = "0.2.3"
+dependencies = [
+ "anyhow",
+ "dc-regress",
+ "devmap-query",
+ "devmap-store",
+]
+
+[[package]]
 name = "dc-store"
 version = "0.2.3"
 dependencies = [
@@ -1524,6 +1544,8 @@ dependencies = [
  "async-channel",
  "base64 0.23.1",
  "block2",
+ "dc-regress",
+ "dc-regress-store",
  "dc-store",
  "dc-verify",
  "devmap-extract",

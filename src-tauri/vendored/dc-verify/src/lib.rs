@@ -19,6 +19,7 @@
 pub mod coverage;
 pub mod json_stdout;
 pub mod rigor;
+pub mod substance;
 
 use std::fmt;
 
@@ -42,8 +43,19 @@ pub struct FileDiff {
     pub status: ChangeStatus,
     /// Added lines as (line number in the new file, content without the '+').
     pub added_lines: Vec<(u32, String)>,
-    /// Count of removed lines.
-    pub removed_count: u32,
+    /// Removed lines, content without the '-'.
+    ///
+    /// This was a bare count until the substance gate needed the text. The
+    /// count could say a diff removed forty lines; only the content can say
+    /// whether the forty lines it *added* are those same forty lines moved,
+    /// which is the difference between a rewrite and a relocation and is the
+    /// single largest class of change that passes every other gate here while
+    /// containing no new work.
+    ///
+    /// No line numbers: the old file's numbering is not a question any gate
+    /// asks, and carrying it would mean maintaining a second numbering that
+    /// nothing checks.
+    pub removed_lines: Vec<String>,
 }
 
 impl FileDiff {
@@ -51,6 +63,18 @@ impl FileDiff {
     /// needs.
     pub fn added_line_numbers(&self) -> Vec<u32> {
         self.added_lines.iter().map(|(n, _)| *n).collect()
+    }
+
+    /// How many lines the change removed.
+    ///
+    /// Derived rather than stored beside the content: a count and the list it
+    /// counts are two representations of one fact, and the pair drifts the
+    /// first time a caller appends to one of them.
+    pub fn removed_count(&self) -> u32 {
+        // A diff with more than u32::MAX removed lines is not reachable — the
+        // parser would have to be handed four billion lines — but saturating
+        // is still the right answer over a silent wrap to a small number.
+        u32::try_from(self.removed_lines.len()).unwrap_or(u32::MAX)
     }
 }
 
@@ -133,7 +157,7 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
                 old_path: None,
                 status: ChangeStatus::Modified,
                 added_lines: Vec::new(),
-                removed_count: 0,
+                removed_lines: Vec::new(),
             });
             continue;
         }
@@ -226,7 +250,7 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
                         reason: "body line beyond the count the hunk header declared",
                     });
                 }
-                file.removed_count += 1;
+                file.removed_lines.push(raw[1..].to_string());
                 old_remaining -= 1;
             }
             Some(' ') => {
@@ -494,7 +518,12 @@ deleted file mode 100644
         let files = parse_unified(diff).expect("parse");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].status, ChangeStatus::Deleted);
-        assert_eq!(files[0].removed_count, 2);
+        assert_eq!(files[0].removed_count(), 2);
+        // The content, not only the count: the substance gate compares added
+        // text against removed text, so a parser that counted correctly while
+        // storing the wrong strings would satisfy a count assertion and make
+        // every relocation look like new work.
+        assert_eq!(files[0].removed_lines, vec!["one", "two"]);
         assert!(files[0].added_lines.is_empty());
     }
 
@@ -524,7 +553,8 @@ diff --git a/x.txt b/x.txt
 ";
         let files = parse_unified(diff).expect("parse");
         assert_eq!(files[0].added_line_numbers(), vec![3]);
-        assert_eq!(files[0].removed_count, 1);
+        assert_eq!(files[0].removed_count(), 1);
+        assert_eq!(files[0].removed_lines, vec!["old"]);
     }
 
     /// The rule the module exists to hold: a diff that cannot be parsed is an

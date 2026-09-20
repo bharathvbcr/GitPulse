@@ -239,6 +239,10 @@ const card = id => root.querySelector(`[data-task-card][data-card-id="${id}"]`);
 const repoToggle = () => editor()?.querySelector("[data-task-repo-picker] .repo-trigger");
 // Due is not a labelled input any more, so `field("Due")` cannot reach it.
 const dueTrigger = () => editor()?.querySelector('[data-testid="task-due-trigger"]');
+const editorSection = (id) => editor()?.querySelector(`[data-editor-section="${id}"]`);
+const assistBody = () => editor()?.querySelector('[data-testid="task-assist-body"]');
+const assistToggle = () => editor()?.querySelector('[data-testid="task-assist-toggle"]');
+const onScreen = el => Boolean(el) && el.getClientRects().length > 0;
 const repoPopup = () => document.querySelector("[data-task-repo-popup]");
 const addRepoMenu = () => document.querySelector("[data-add-repo-popup]");
 const addRepoTrigger = () => root.querySelector("[data-add-repo] button");
@@ -322,6 +326,32 @@ if (params.has("check")) {
       && repoSummaryText().includes("primary GitPulse"));
     check("the repository control comes before the title on the pane",
       Boolean(repoToggle()) && (repoToggle().compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING));
+    // A saved task used to open on the compose surface labelled "Quick add":
+    // notes, engine picker, and an accepted suggestion filled the viewport
+    // while title sat below the fold. Title first, model last and folded.
+    check("a saved task leads with the title, not a compose surface",
+      onScreen(field("Title")) && fitsViewport(field("Title"))
+      && Boolean(editorSection("title")) && Boolean(editorSection("assist"))
+      && (editorSection("title").compareDocumentPosition(editorSection("assist")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+      && Boolean(assistBody()?.hidden)
+      && !onScreen(editor().querySelector(".notes-label textarea"))
+      && !(editor().querySelector("h3") && [...editor().querySelectorAll("h3")].some(h => /quick add/i.test(h.textContent))));
+    check("a saved task folds the model until the reader asks",
+      Boolean(assistToggle())
+      && assistToggle().getAttribute("aria-expanded") === "false"
+      && assistToggle().textContent.trim() === "Show");
+    const titleTop = field("Title").getBoundingClientRect().top;
+    assistToggle().click(); await settle();
+    check("showing the assist on a saved task does not move the title below it",
+      onScreen(field("Title"))
+      && Math.abs(field("Title").getBoundingClientRect().top - titleTop) <= 1
+      && !assistBody()?.hidden
+      && assistToggle().getAttribute("aria-expanded") === "true"
+      && onScreen(editor().querySelector(".notes-label textarea"))
+      && (editorSection("title").compareDocumentPosition(editorSection("assist")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
+    assistToggle().click(); await settle();
+    check("hiding the assist again leaves the title on screen",
+      Boolean(assistBody()?.hidden) && onScreen(field("Title")) && assistToggle().getAttribute("aria-expanded") === "false");
     await openRepoPicker();
     const primaryRadio = () => [...(repoPopup()?.querySelectorAll('input[type="radio"]') ?? [])].find(el => el.checked);
     check("linking and the primary choice are one control, not two that can disagree",
@@ -352,7 +382,6 @@ if (params.has("check")) {
     check("scrolling the sheet dismisses the repository dropdown instead of leaving it floating",
       Boolean(editor()) && !repoPopup() && repoToggle()?.getAttribute("aria-expanded") === "false");
     const paneTab = id => editor()?.querySelector(`[data-sheet-tab="${id}"]`);
-    const onScreen = el => Boolean(el) && el.getClientRects().length > 0;
     check("a saved task opens on Task and draws exactly one pane",
       [...editor().querySelectorAll("[data-sheet-tab]")].map(tab => tab.getAttribute("data-sheet-tab")).join(",") === "task,agent"
       && paneTab("task").getAttribute("aria-selected") === "true"
@@ -363,7 +392,8 @@ if (params.has("check")) {
     // Both halves are asserted, because "on screen" alone would pass for a
     // layout that had simply stopped hiding everything.
     check("the assist writes where the reader is, and only the agent panel is a separate pane",
-      onScreen(editor().querySelector('[aria-label="Manvi task assist"]'))
+      Boolean(editor().querySelector('[aria-label="Manvi task assist"]'))
+      && Boolean(editorSection("assist"))
       && !onScreen(editor().querySelector('[aria-label="Task agent runs"]')));
     // Schedule and labels are on this pane too, beside the description rather
     // than behind a second tab.
@@ -382,7 +412,7 @@ if (params.has("check")) {
     // beside the fields — so changing the selection could do nothing visible.
     const historyPicker = () => editor().querySelector('[data-testid="task-assist-history"]');
     check("the suggestion picker is on screen the moment the assist is, and is a real picker",
-      onScreen(editor().querySelector(".manvi-assist")) && Boolean(historyPicker())
+      Boolean(editor().querySelector(".manvi-assist")) && Boolean(historyPicker())
       && historyPicker() instanceof HTMLSelectElement && !editor().querySelector(".history-drawer"));
     check("merged Manvi section has no model input", Boolean(editor().querySelector(".manvi-assist .change-link")) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
     editor().querySelector(".sheet-body").scrollTop = 900; await settle();
@@ -862,6 +892,9 @@ if (params.has("check")) {
     // verb and the request's kind that `draftingKind`/`draftingVerb` were
     // extracted to end, so it was asserting the bug rather than the fix.
     check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Draft with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    check("a new task does not fold its notes",
+      !assistToggle() && assistBody() && !assistBody().hidden
+      && (idea.compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
     await change(idea,"Fix notification routing\nKeep saved task evidence and explain recovery steps.");
     await wait(() => button("Draft with Manvi") && !button("Draft with Manvi").disabled);
     await click("Draft with Manvi");

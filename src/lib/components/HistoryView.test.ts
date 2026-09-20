@@ -29,6 +29,20 @@ describe("HistoryView", () => {
     expect(history).not.toContain('import ReflogViewer');
   });
 
+  it("hosts the suspects lens on the same lazy contract", () => {
+    // It pulls the code-graph client, which no other History section needs, so
+    // eager-importing it would put that chunk in every session that opens a
+    // repository. Same stable-loader rule as the reflog.
+    expect(history).toContain("loadSuspects: ViewLoader");
+    expect(history).toContain('{:else if section === "suspects"}');
+    expect(history).not.toContain("import RegressionSuspectsPanel");
+    expect(app).toContain("const loadRegressionSuspectsPanel = () =>");
+    expect(app).toContain("loadSuspects={loadRegressionSuspectsPanel}");
+    // Inline arrows are the failure this contract exists for: a new function
+    // each render misses LazyView's cache and remounts the pane.
+    expect(app).not.toContain("loadSuspects={() =>");
+  });
+
   it("swaps sections with {#if}, never {#key}", () => {
     // Keying would rebuild the pane on every switch, replay the entrance fade
     // and make CommitTable re-hydrate its virtual window from scratch.

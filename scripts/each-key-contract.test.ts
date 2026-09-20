@@ -45,7 +45,7 @@ describe("repeatable provider rows keep unique Svelte identities", () => {
     { file: "files/MarkDevViewer.svelte", iterable: "backlinks", scope: { backlinks: [{ path: "A.md", line: 1, offset: 0 }, { path: "A.md", line: 1, offset: 20 }] }, count: 2 },
     { file: "OperationBanner.svelte", iterable: "operation.warnings", scope: { operation: { warnings: ["busy", "busy", "busy#1"] } }, count: 3 },
     { file: "GitHubPanel.svelte", iterable: "ciReport.steps", scope: { ciReport: { steps: [{ name: "check" }, { name: "check" }] } }, count: 2 },
-    { file: "DeliveryTimeline.svelte", iterable: "keyedList(rows", scope: { rows: [{ id: "1", phase: "settled_ok" }, { id: "1", phase: "settled_bad" }] }, count: 2 },
+    { file: "DeliveryTimeline.svelte", iterable: "keyedList(shown", scope: { shown: [{ id: "1", phase: "settled_ok" }, { id: "1", phase: "settled_bad" }] }, count: 2 },
     { file: "StoragePanel.svelte", iterable: "report.reclaim", scope: { report: { reclaim: [{ category: "ab", label: "c" }, { category: "a", label: "bc" }, { category: "ab", label: "c" }] } }, count: 3 },
   ];
   for (const { file, iterable, scope, count } of cases) {

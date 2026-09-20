@@ -150,6 +150,16 @@ fn node_kind_label(kind: SymbolKind) -> &'static str {
         SymbolKind::Dependency => "package",
         SymbolKind::Subsystem => "namespace",
         SymbolKind::Community => "namespace",
+        // A compatibility projection, not a claim. `PYTHON_NODE_KINDS` is a
+        // frozen set — a value outside it makes `CodeGraph.model_validate`
+        // raise and every consumer of this artifact lose the whole graph — so a
+        // kind added after it was frozen has to land on an existing member.
+        // `property` is the closest: a named member a file declares, which is
+        // what a DOM hook and a stylesheet rule both are. The exact kind is not
+        // lost, because this mapping feeds only the exported `code_graph.json`;
+        // the store's own `kind` column carries `MarkupAnchor`/`StyleRule`
+        // verbatim and every `devmap` query reads that.
+        SymbolKind::MarkupAnchor | SymbolKind::StyleRule => "property",
     }
 }
 

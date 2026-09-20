@@ -94,6 +94,8 @@
   const loadGitHubPanel = () => import("./lib/components/GitHubPanel.svelte");
   const loadManviOpsPanel = () => import("./lib/components/ManviOpsPanel.svelte");
   const loadReflogViewer = () => import("./lib/components/ReflogViewer.svelte");
+  const loadRegressionSuspectsPanel = () =>
+    import("./lib/components/RegressionSuspectsPanel.svelte");
   const loadBlameViewer = () => import("./lib/components/BlameViewer.svelte");
   const loadRepoMapPanel = () => import("./lib/components/RepoMapPanel.svelte");
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
@@ -1039,7 +1041,10 @@
               {:else if $repoStore.activeTab === "code"}
                 <CodeView loadBlame={loadBlameViewer} loadMap={loadRepoMapPanel} />
               {:else if $repoStore.activeTab === "history"}
-                <HistoryView loadReflog={loadReflogViewer} />
+                <HistoryView
+                  loadReflog={loadReflogViewer}
+                  loadSuspects={loadRegressionSuspectsPanel}
+                />
               {:else if $repoStore.activeTab === "insights"}
                 <InsightsView
                   loadPulse={loadPulseView}

@@ -3674,6 +3674,32 @@ pub async fn cmd_codeintel_impact(
     .await
 }
 
+/// Which commits between `since` and the indexed head could have caused a
+/// symptom.
+///
+/// Returns the scope beside the ranked list, and it is not optional detail: an
+/// empty list means "nothing in the window touched the dependency cone", which
+/// is a finding, and the scope is what lets the caller tell that from an answer
+/// that was cut short. `walk_incomplete` carries the refusals when the list is
+/// a lower bound.
+///
+/// Runs off-thread: it shells out to `git blame` once per file in the cone, so
+/// it is bounded but not instant.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_suspects(
+    repo_path: String,
+    symptom: String,
+    since: String,
+    depth: Option<u32>,
+) -> Result<crate::codeintel::CodeintelSuspectsPayload, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::suspects(
+            &repo_path, &symptom, &since, depth,
+        ))
+    })
+    .await
+}
+
 /// Dead code analysis across the repository.
 #[tauri::command(async)]
 pub async fn cmd_codeintel_dead_symbols(

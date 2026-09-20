@@ -1210,12 +1210,16 @@
       </div>
     {/if}
     {#if creation.allowed}
-      <div class="quick-add-row">
+      <div
+        class="quick-add-row"
+        class:dimmed={taskTabs.tabs.length > 0}
+        data-testid="task-quick-add-row"
+      >
         <TaskQuickAdd
           bind:this={quickAddEl}
           repositories={quickAddRepositories}
           busy={quickAdding}
-          disabled={busy}
+          disabled={busy || taskTabs.tabs.length > 0}
           compact={compact}
           placeholder="Add a task — try: Fix retry loop !1 #ci @ada due:friday"
           mode={$interfaceStore.taskQuickAddAssist ? "assist" : "manual"}
@@ -1610,6 +1614,7 @@
   .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;font-size:12px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pad{padding:16px}
   .quick-add-row{padding:8px 14px 0}
+  .quick-add-row.dimmed{opacity:.45;pointer-events:none;transition:opacity .15s ease}
   .hidden-note{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0;padding:6px 14px;font-size:11px;color:rgb(var(--c-text-muted))}
   .link{border:0;background:transparent;padding:0;font-size:11px;color:rgb(var(--c-accent))}
   .link:hover{text-decoration:underline}

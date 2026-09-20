@@ -65,6 +65,9 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   await wait(() => !button("Save task", editor()).disabled);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "1");
+  const assistToggle = editor().querySelector('[data-testid="task-assist-toggle"]');
+  if (assistToggle instanceof HTMLElement && assistToggle.getAttribute("aria-expanded") === "false") assistToggle.click();
+  await wait(() => (editor().querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
   assert(Boolean(editor().querySelector(".manvi-assist .change-link")), "Merged Manvi section is missing the Change link");
   assert(![...editor().querySelectorAll(".manvi-assist label")].some((label) => label.firstChild?.textContent?.trim() === "Model"), "Merged Manvi section must not expose a Model input");
   await wait(() => !enhance().matches(":disabled"));

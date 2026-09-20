@@ -5936,14 +5936,23 @@ impl Store {
         .optional()
     }
 
+    /// Same question as [`Self::latest_generation_head_sha`], under the older
+    /// name, and now the same query.
+    ///
+    /// These were two independent implementations of one read —
+    /// `ORDER BY id DESC LIMIT 1` here, `WHERE id = (SELECT max(id) …)` there —
+    /// and they had already drifted in the way two copies do: one was gated
+    /// `#[cfg(feature = "parse")]` and the other was not, so an embedder
+    /// linking the store without the grammars could reach the head through one
+    /// name and not the other. The gate was debris — the read is pure SQL and
+    /// has nothing to do with parsing — but it stood because nothing pointed
+    /// out that the same answer was already available beside it.
+    ///
+    /// Delegating rather than deleting: both names have callers across four
+    /// crates, and which one survives is a rename worth deciding on its own.
+    /// One implementation is the part that has to be true today.
     pub fn latest_generation_head(&self) -> Result<Option<String>> {
-        let conn = lock_conn(&self.conn)?;
-        conn.query_row(
-            "SELECT head_sha FROM generations ORDER BY id DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
+        self.latest_generation_head_sha()
     }
 
     /// Absolute root the newest generation was built from, when recorded.
@@ -5980,23 +5989,6 @@ impl Store {
         Ok(count as usize)
     }
 
-    /// Whether every row in the latest generation was produced by the extractor
-    /// and grammars this build is running.
-    ///
-    /// A build asks this *before* deciding to go differential. The extraction
-    /// cache re-extracts a file whose analyzer or grammar version moved, but a
-    /// generation used to carry its stored rows forward on content hash alone,
-    /// so an upgraded kernel kept committing generations made of old payloads
-    /// until a changed file finally made the stored edges disagree with the
-    /// fresh analysis — at which point every incremental build failed and the
-    /// only way out was deleting the database. Answering false here turns that
-    /// into one full build.
-    ///
-    /// True when there is no generation yet: a cold build carries nothing.
-    /// Whether the stored payload was produced by the current grammars.
-    /// A build-path question: it compares against grammar identities only
-    /// the parsing frontend can supply.
-    #[cfg(feature = "parse")]
     /// The git HEAD the latest generation was built from, if any.
     ///
     /// Exists for B5: a commit, branch switch, rebase or stash changes what the

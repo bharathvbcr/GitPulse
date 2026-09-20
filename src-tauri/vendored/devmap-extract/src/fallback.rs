@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::model::{ExtractedSymbol, Span, SymbolKind};
+use crate::model::{ExtractedReference, ExtractedSymbol, Span, SymbolKind};
 
 /// Most declarations this can find in one file.
 ///
@@ -173,8 +173,17 @@ fn is_plausible_name(name: &str) -> bool {
 /// An allowlist would be the wrong shape here. The tier exists precisely to
 /// serve languages nobody enumerated, so its default must be "scan"; only the
 /// formats known to have no declarations are named.
-const NON_DECLARATIVE_LANGUAGES: [&str; 9] = [
-    "markdown", "html", "css", "json", "yaml", "toml", "config", "text",
+/// Languages this tier recovers nothing from.
+///
+/// `html` and `css` were here and are not any more. They were listed because
+/// *this file's line scanner* cannot read them, and that was mistaken for the
+/// claim that they declare nothing: a stylesheet declares rules, keyframes and
+/// custom properties, and a page declares every identity its markup carries.
+/// [`crate::markup`] reads both, and [`scan_declarations_in`] dispatches to it,
+/// so the list below is once again what its name says — formats with no
+/// declarations for any reader to find.
+const NON_DECLARATIVE_LANGUAGES: [&str; 7] = [
+    "markdown", "json", "yaml", "toml", "config", "text",
     // A notebook's raw form is JSON. Its code lives in escaped string arrays,
     // so a line scan over the raw bytes matches JSON structure and cell
     // metadata, not declarations — the K3 error with a different file
@@ -191,6 +200,11 @@ pub fn applies_to(language: &str) -> bool {
 /// The outcome of a fallback scan.
 pub struct FallbackScan {
     pub symbols: Vec<ExtractedSymbol>,
+    /// Uses this tier could read. Empty for the line scanner, which recovers
+    /// declarations only; non-empty for the markup and stylesheet readers, where
+    /// a use — a `class` attribute, a `var(--x)` — is as plainly on the page as
+    /// the declaration next to it.
+    pub references: Vec<ExtractedReference>,
     /// Declarations found beyond [`MAX_FALLBACK_SYMBOLS`] and therefore
     /// dropped. Non-zero means the file's symbol list is a prefix, not a set.
     pub truncated: usize,
@@ -203,6 +217,13 @@ pub struct FallbackScan {
     /// there. Generated `.proto` and `.ps1` routinely carry lines past this
     /// limit, so this is the ordinary case, not the exotic one.
     pub skipped_long_lines: usize,
+    /// Bytes a reader stopped short of, so the total above is a lower bound.
+    ///
+    /// The markup and stylesheet readers are bounded by bytes as well as by
+    /// count — a vendored stylesheet is megabytes of generated rules — and a
+    /// byte cap that did not say so would turn "read 2,000 rules of 40,000"
+    /// into an answer that looks complete.
+    pub unread_bytes: usize,
 }
 
 /// Recover top-level declarations from `source` by line pattern.
@@ -213,6 +234,60 @@ pub struct FallbackScan {
 /// scanner does not know where a body ends, and guessing would produce spans
 /// that overlap the next declaration.
 pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
+    scan_declarations_in("generic", file_path, source)
+}
+
+/// [`scan_declarations`], told which language it is reading.
+///
+/// Two of the languages this tier serves are not read by a line scanner at all.
+/// A stylesheet's declarations are rules, and a page's are the identities its
+/// markup carries; both are structure a line pattern cannot see, which is why
+/// `css` and `html` sat in [`NON_DECLARATIVE_LANGUAGES`] claiming to declare
+/// nothing. They are read by [`crate::markup`] instead, and dispatched here so
+/// that "tier-2 recovery" stays one entry point with two readers behind it
+/// rather than a second recovery path bolted on beside the first.
+/// Whether this tier reads `language` with a dedicated reader rather than the
+/// line scanner.
+///
+/// The one owner of that list, consulted twice: [`scan_declarations_in`]
+/// dispatches on it, and `unavailable_extraction` asks it to decide what the
+/// *absence* of declarations means. Those two must agree. When a dedicated
+/// reader ran and found nothing, the file genuinely declares nothing — an
+/// `.html` page with no ids, a stylesheet with no rules — and that is a complete
+/// answer, not a missing grammar. Reporting it as a missing grammar is the K5
+/// defect (`devmap-store/tests/kernel_defects.rs`): 294 of 1,310 files counted as
+/// parse failures, every one of them prose or data, hiding the 16 real ones.
+pub fn has_dedicated_reader(language: &str) -> bool {
+    matches!(language, "css" | "html")
+}
+
+pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> FallbackScan {
+    match language {
+        "css" => {
+            return from_markup(
+                crate::markup::scan_stylesheet(file_path, source),
+                file_path,
+                source,
+            )
+        }
+        "html" => {
+            let scan = crate::markup::scan_markup_text(file_path, source);
+            // A page's inline `<script>` is not parsed here — no grammar is
+            // reachable from this tier — but a selector string in it is plain
+            // text, and joining it to an anchor the same page declares needs no
+            // parser. The gap that remains is the script's *code*, and it is
+            // named in that module's documentation rather than left implied.
+            let declared = scan.declared_names();
+            let budget = crate::markup::MAX_MARKUP_REFERENCES.saturating_sub(scan.references.len());
+            let (script_uses, truncated) =
+                crate::markup::selector_references(source, &scan.script_regions, &declared, budget);
+            let mut scan = scan;
+            scan.references.extend(script_uses);
+            scan.truncated_references += truncated;
+            return from_markup(scan, file_path, source);
+        }
+        _ => {}
+    }
     let mut symbols: Vec<ExtractedSymbol> = Vec::new();
     let mut truncated = 0usize;
     let mut skipped_long_lines = 0usize;
@@ -283,8 +358,41 @@ pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
 
     FallbackScan {
         symbols,
+        references: Vec::new(),
         truncated,
         skipped_long_lines,
+        unread_bytes: 0,
+    }
+}
+
+/// Carry a [`crate::markup::MarkupScan`] out through this tier's own result type.
+///
+/// The two shapes report the same three facts under different names, and this is
+/// the one place they are translated, so the caller that builds the `Extraction`
+/// needs to know about only one of them.
+fn from_markup(scan: crate::markup::MarkupScan, file_path: &str, source: &str) -> FallbackScan {
+    let unread_bytes = scan
+        .unread
+        .iter()
+        .map(|range| range.end_byte.saturating_sub(range.start_byte))
+        .sum::<usize>()
+        .min(source.len());
+    let mut references = scan.references;
+    // Through the same owner the template path uses. Here every use belongs to
+    // the file: a stylesheet's declarations are rules, which are never an edge
+    // source, and a page's inline script has no parsed function to belong to
+    // because no grammar is reachable from this tier.
+    crate::markup::attribute_uses(&mut references, &scan.symbols, file_path);
+    FallbackScan {
+        symbols: scan.symbols,
+        references,
+        truncated: scan.truncated_symbols,
+        // A line was never the unit here: a stylesheet reader stops at a byte
+        // cap, not at a long line, and reporting zero skipped lines for a file
+        // it read half of would be true and misleading. `unread_bytes` is the
+        // fact, and the reason string says so.
+        skipped_long_lines: 0,
+        unread_bytes,
     }
 }
 
@@ -430,12 +538,64 @@ mod applicability_tests {
     /// graph that do not exist anywhere.
     #[test]
     fn prose_and_data_formats_are_not_scanned() {
-        for language in ["markdown", "html", "css", "json", "yaml", "toml", "config"] {
+        for language in [
+            "markdown", "json", "yaml", "toml", "config", "text", "notebook",
+        ] {
             assert!(
                 !applies_to(language),
                 "{language} declares nothing; scanning it can only invent symbols"
             );
         }
+    }
+
+    /// `html` and `css` are served by this tier, and **not** by its line scanner.
+    ///
+    /// They used to be in the list above, which read as "these declare nothing".
+    /// That was never true of them — a stylesheet declares rules, keyframes and
+    /// custom properties, and a page declares every identity its markup carries —
+    /// it was true of *the line scanner*, which cannot see any of that. They are
+    /// dispatched to [`crate::markup`] before the line scanner runs.
+    ///
+    /// The second half of this test is the one that has to keep holding. The
+    /// reason those two sat with the prose formats is that the line scanner is
+    /// actively wrong on them: a page or a stylesheet containing the word
+    /// `function` or `class` at the start of a line would have declarations
+    /// attributed to it that do not exist, which is the `ReasoningBank` failure
+    /// above with a different extension. So the dispatch is asserted to *replace*
+    /// the line scan, not to precede it.
+    #[test]
+    fn markup_and_stylesheets_are_read_by_their_own_reader_not_the_line_scanner() {
+        for language in ["html", "css"] {
+            assert!(
+                applies_to(language),
+                "{language} has declarations, and a reader for them"
+            );
+        }
+
+        // Text that the line scanner matches and neither real reader should.
+        let trap = "<p>\nfunction ghostFunction() {}\nclass GhostClass {}\n</p>\n";
+        let names: Vec<String> = scan_declarations_in("html", "page.html", trap)
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"ghostFunction".to_string())
+                && !names.contains(&"GhostClass".to_string()),
+            "the line scanner ran over a page and invented declarations: {names:?}"
+        );
+
+        let css_trap = "/* function ghostFunction() {} */\n.real { color: red; }\n";
+        let names: Vec<String> = scan_declarations_in("css", "app.css", css_trap)
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![".real".to_string()],
+            "a stylesheet yields its rules and nothing the line scanner would have matched"
+        );
     }
 
     /// The default is to scan, because the tier exists for languages nobody

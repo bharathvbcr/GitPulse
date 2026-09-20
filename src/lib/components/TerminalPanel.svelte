@@ -75,6 +75,9 @@
     scrollChildIntoHorizontalView,
     verticalWheelToHorizontalDelta,
   } from "../dom/overflowHint";
+  import { portal } from "../dom/portal";
+  import { LAYERS } from "../ui/layers";
+  import { popover, restoreFocusTo } from "../ui/popover";
 
   /** The shared wire shape; aliased for this panel's existing call sites. */
   type TerminalRunResponse = TerminalRunResult;
@@ -176,6 +179,7 @@
   let launcherHighlight = $state(0);
   let sessionSearchInput = $state<HTMLInputElement | null>(null);
   let launcherSearchInput = $state<HTMLInputElement | null>(null);
+  let launcherTriggerEl = $state<HTMLButtonElement | null>(null);
   let renameValue = $state("");
   let tabStatuses = $state<Record<string, string>>({});
   let unread = $state(new Set<string>());
@@ -193,6 +197,27 @@
   const filteredTabs = $derived(filterTerminalTabs(tabState.tabs, sessionQuery, tabExtras));
   const filteredSessions = $derived(filterSessionRecords($terminalSessions, sessionListQuery));
   const filteredLaunchers = $derived(filterLaunchers(LAUNCHERS, launcherQuery));
+  /**
+   * Compact overlay, not an in-flow chrome row. A full-width `terminal-popover`
+   * shoved the PTY down by the height of the type list. The other chrome
+   * bars stay in the column because they are short toolbars; this one is a
+   * picker, so it uses the same portaled menu as HeaderRepoMenu.
+   */
+  const launcherMenuDismissal = $derived({
+    anchor: { kind: "element" as const, element: launcherTriggerEl, gap: 6 },
+    estimate: { width: 208, height: 220 },
+    inset: 8,
+    revision: `${launcherQuery}:${filteredLaunchers.length}`,
+    dismiss: {
+      inside: "[data-terminal-launcher], [data-terminal-launcher-popup]",
+      resize: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => {
+      launcherMenuOpen = false;
+      if (reason === "escape") restoreFocusTo(launcherTriggerEl);
+    },
+  });
 
   function closeChrome() {
     tabOptions = false;
@@ -246,6 +271,13 @@
 
   function handleLauncherSearchKey(event: KeyboardEvent) {
     if (isImeComposition(event)) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      launcherMenuOpen = false;
+      restoreFocusTo(launcherTriggerEl);
+      return;
+    }
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       launcherHighlight = stepSearchIndex(filteredLaunchers.length, launcherHighlight, event.key === "ArrowDown" ? 1 : -1);
@@ -839,10 +871,22 @@
         <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label={splitIds ? "Close split view" : "Split terminal"} aria-pressed={Boolean(splitIds)} disabled={!activeId || (tabState.tabs.length < 2 && !canCreate)} onclick={toggleSplit}><Columns2 size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
-        <button type="button" class="gp-btn py-0! px-1.5! text-[11px]! max-w-28 truncate" aria-label="New session type" aria-expanded={launcherMenuOpen} title="Choose what the next session runs" onclick={() => launcherMenuOpen ? closeChrome() : openLauncherMenu()}>
-          {launcherLabel(nextLauncher)}
-          <ChevronDown size={11} />
-        </button>
+        <div class="relative shrink-0" data-terminal-launcher>
+          <button
+            bind:this={launcherTriggerEl}
+            type="button"
+            class="gp-btn py-0! px-1.5! text-[11px]! max-w-28 truncate"
+            aria-label="New session type"
+            aria-haspopup="listbox"
+            aria-expanded={launcherMenuOpen}
+            aria-controls="terminal-launcher-menu"
+            title="Choose what the next session runs"
+            onclick={() => launcherMenuOpen ? closeChrome() : openLauncherMenu()}
+          >
+            {launcherLabel(nextLauncher)}
+            <ChevronDown size={11} />
+          </button>
+        </div>
         <button type="button" class="gp-icon-btn" disabled={!repoPath || !canCreate} onclick={() => newTab(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
       </div>
     </div>
@@ -879,7 +923,18 @@
     {/if}
 
     {#if launcherMenuOpen && mode === "shell"}
-      <div class="terminal-popover px-3 py-2 border-b border-border/60 gp-section-edge bg-surface" aria-label="New session type menu">
+      <div
+        id="terminal-launcher-menu"
+        use:portal={"body"}
+        use:popover={launcherMenuDismissal}
+        data-terminal-launcher-popup
+        class="fixed w-52 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1.5 text-[11px] text-textPrimary"
+        style="z-index: {LAYERS.MENU}"
+        role="dialog"
+        aria-label="New session type menu"
+        tabindex="-1"
+        onkeydown={handleLauncherSearchKey}
+      >
         <input
           bind:this={launcherSearchInput}
           type="search"
@@ -887,22 +942,21 @@
           placeholder="Search session types"
           bind:value={launcherQuery}
           maxlength="128"
-          onkeydown={handleLauncherSearchKey}
-          class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
+          class="w-full mb-1 bg-background border border-border rounded-lg px-2 py-1 text-[11px]"
         />
-        <div class="max-h-40 overflow-auto" role="listbox" aria-label="Session types">
+        <div class="max-h-48 overflow-auto" role="listbox" aria-label="Session types">
           {#each filteredLaunchers as launcher, index (launcher.kind)}
             <button
               type="button"
               role="option"
               aria-selected={launcher.kind === nextLauncher}
-              class="flex w-full items-center py-0.5 px-1 rounded text-left {index === launcherHighlight ? 'bg-accent/15 text-textPrimary' : 'text-textMuted hover:bg-surfaceHover'}"
+              class="gp-menu-item {index === launcherHighlight ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
               onclick={() => chooseLauncher(launcher.kind)}
             >
               {launcher.label}
             </button>
           {:else}
-            <span class="text-textMuted">No session types match.</span>
+            <span class="block px-2.5 py-1.5 text-textMuted">No session types match.</span>
           {/each}
         </div>
       </div>
@@ -1159,10 +1213,12 @@
 </div>
 
 <style>
-  /* Chrome in the column, never an overlay. On macOS `bg-surface` is
-     translucent and xterm paints an opaque grid, so a guessed `inset` over
+  /* Chrome in the column, never a translucent overlay. On macOS `bg-surface`
+     is translucent and xterm paints an opaque grid, so a guessed `inset` over
      the panes made the prompt and these bars share pixels. Find already
-     takes a row; shortcuts, sessions, and tab options do the same. */
+     takes a row; shortcuts, sessions, find, and tab options do the same.
+     The session-type picker is the exception: a compact `gp-menu` overlay
+     (with the float blur) so opening it cannot shove the PTY down. */
   .terminal-popover { flex-shrink: 0; max-height: 40%; overflow: auto; }
   .terminal-tab-scroller {
     overscroll-behavior-x: contain;

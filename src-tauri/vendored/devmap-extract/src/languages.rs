@@ -815,8 +815,24 @@ pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities, LivenessUnit)] = &[
     ("json", Capabilities::NONE, LivenessUnit::Data),
     ("yaml", Capabilities::NONE, LivenessUnit::Data),
     ("toml", Capabilities::NONE, LivenessUnit::Data),
-    ("html", Capabilities::NONE, LivenessUnit::Data),
-    ("css", Capabilities::NONE, LivenessUnit::Data),
+    // Not prose, and no longer `NONE`. `crate::markup` reads a page's markup and
+    // a stylesheet's rules, and it reads *uses* as well as declarations — a
+    // `class` attribute, an IDREF, a `var(--x)` — so `REFERENCES` is a capability
+    // these two now genuinely have. It is declared here, and
+    // `testdata/capabilities/probe.{html,css}` were extended to exercise it,
+    // because a bit set for a language whose vector stays empty is the same
+    // rotting comment `CALL_EXTRACTION_LANGUAGES` was.
+    //
+    // `LivenessUnit::Data` deliberately does **not** change with it. That unit is
+    // what keeps a file out of `unwired_candidates`, and it is a claim about the
+    // format, not about which engine ran: a stylesheet nothing imports is linked
+    // by a bundler config, a `<link>` tag, or a framework convention this index
+    // does not read, so "delete this" is exactly the wrong suggestion. Moving it
+    // to `Module` would re-create the historical bug in which every `.md`,
+    // `.json` and `.yaml` in every repository was a delete-this candidate, for
+    // the file type most likely to be referenced from outside the graph.
+    ("html", Capabilities::new(REFERENCES), LivenessUnit::Data),
+    ("css", Capabilities::new(REFERENCES), LivenessUnit::Data),
     ("config", Capabilities::NONE, LivenessUnit::Data),
     ("generic", Capabilities::NONE, LivenessUnit::Data),
     // A notebook is re-parsed with its kernel's grammar, so its capabilities

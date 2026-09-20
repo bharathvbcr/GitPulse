@@ -31,6 +31,19 @@ describe("editorTabs", () => {
     }
     expect(editorTabHint("nonsense" as never)).toBe("");
   });
+
+  it("does not speak compose copy on a saved task", () => {
+    const savedTabs = editorTabs(true);
+    const taskSaved = savedTabs.find((t) => t.id === "task")!;
+    expect(taskSaved.hint).toBe("What the work is and how it is scheduled.");
+    expect(taskSaved.hint).not.toContain("model");
+    expect(editorTabHint("task", true)).toBe("What the work is and how it is scheduled.");
+
+    const draftTabs = editorTabs(false);
+    const taskDraft = draftTabs.find((t) => t.id === "task")!;
+    expect(taskDraft.hint).toContain("model's help with it");
+    expect(editorTabHint("task", false)).toContain("model's help with it");
+  });
 });
 
 describe("resolveEditorTab", () => {

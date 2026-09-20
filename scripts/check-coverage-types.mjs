@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 67 contracts over
- * 169 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 68 contracts over
+ * 173 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -208,6 +208,12 @@ export const CONTRACTS = Object.freeze([
   { label: "native-menu-state", rustPath: rust("desktop", "state.rs"), tsPath: ts("desktop", "menuState.ts"), structs: ["MenuState", "MenuLabel", "MenuRepository", "StatusCard"] },
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },
+  // Regression suspects. A named row rather than an entry on the unchecked
+  // list: every field here is one the UI reads to tell a refusal apart from a
+  // finding — `scope` going missing, `body_changed` narrowing from three
+  // states to a bool, or `refusals` being renamed would each turn "could not
+  // examine" into "found nothing" with nothing to catch it.
+  { label: "codeintel-suspects", rustPath: rust("codeintel", "suspects.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelTouchedSymbol", "CodeintelSuspect", "CodeintelSuspectScope", "CodeintelSuspectsPayload"] },
   // The query envelope's freshness object lives in the vendored query model
   // and is serialized as-is. Listing it here is what stops a field rename
   // from looking like a verified bool on the TypeScript side.

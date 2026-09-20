@@ -1,0 +1,30 @@
+[package]
+name = "dc-regress"
+version = "0.2.3"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
+description = "Which commits could have caused this symptom: git blame joined to the code graph, with the blob identity that makes the join honest"
+
+[dependencies]
+dc-proc = { path = "../dc-proc" }
+# `default-features = false` drops the parsing frontend and keeps only
+# `devmap_extract::model`, which is not feature-gated. What this crate wants
+# from it is `LineIndex` — the workspace's one owner of byte-offset-to-line
+# arithmetic, already hardened against the multi-byte panic that aborted
+# `devmap manifest`. Re-deriving that here is precisely the "two copies of one
+# computation existed and only one was safe" shape its own comment records.
+devmap-extract = { path = "../devmap-extract", default-features = false }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0" }
+
+# No parsing frontend, deliberately. This crate answers from a graph it is
+# *given* and from git; it never builds one. That keeps it out of the `parse`
+# feature ladder entirely — there is no configuration of this crate that
+# compiles differently — and it is why `CodeGraph` is a trait rather than a
+# dependency on `devmap-store`.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

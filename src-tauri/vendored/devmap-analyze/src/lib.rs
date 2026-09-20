@@ -31,8 +31,8 @@ pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, exempt_symbol_names, extraction_coverage,
     extraction_gaps, language_can_reference, DiscoveryCoverage, ExtractionCoverage, ExtractionGap,
     ExtractionGapEntry, LivenessOutcome, CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP,
-    COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON, HIGHEST_DEGRADED_CONFIDENCE,
-    UNRESOLVED_NAMESAKE_REASON,
+    COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON, GO_VALUE_MENTION_REASON,
+    HIGHEST_DEGRADED_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
 };
 pub use model::*;
 pub use pdg::*;

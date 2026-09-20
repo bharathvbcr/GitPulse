@@ -462,4 +462,12 @@ describe("the board can archive a task", () => {
     expect(source).toContain("Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}");
     expect(source).not.toContain("Archive — completed tasks in this scope");
   });
+
+  it("dims and disables the board's quick-add row while the task editor sheet is open", () => {
+    expect(source).toContain('data-testid="task-quick-add-row"');
+    expect(source).toContain("class:dimmed={taskTabs.tabs.length > 0}");
+    expect(source).toContain("disabled={busy || taskTabs.tabs.length > 0}");
+    expect(source).toMatch(/\.quick-add-row\.dimmed\{opacity:\.45;pointer-events:none;/);
+  });
 });
+

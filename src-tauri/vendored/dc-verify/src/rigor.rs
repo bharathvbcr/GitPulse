@@ -23,11 +23,57 @@ pub enum Severity {
     Advisory,
 }
 
+/// How a gate knows what it reported.
+///
+/// [`Severity`] says how much a finding matters. This says how much it can be
+/// trusted, which is a different axis and was not on the wire at all until
+/// now: `secret_scan`'s prefix-and-length match and a coverage gap read out of
+/// an executed profile arrived at a consumer as the same kind of claim, so
+/// nothing downstream could tell a measurement from a guess. The verifier
+/// already refuses to let a check that *could not run* look like one that ran;
+/// this is the same rule one step further in — a guess must not look like a
+/// measurement.
+///
+/// The ladder is deliberately short, and each rung is defined by what would
+/// have to be wrong for a finding at that rung to be wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strength {
+    /// Follows from the parsed structure of the input. Wrong only if the diff
+    /// parser is wrong, which is the one thing every other gate here already
+    /// depends on.
+    Proven,
+    /// Read from an execution artifact the caller supplied. Wrong only if that
+    /// artifact does not describe this revision — which the verifier cannot
+    /// check and does not claim to.
+    Observed,
+    /// A textual pattern that correlates with the thing being looked for.
+    /// Wrong whenever the pattern matches something else, which is an ordinary
+    /// event rather than a defect: these gates are tuned to be conservative,
+    /// not to be certain.
+    Derived,
+}
+
+impl Strength {
+    /// The wire spelling. Matched exactly by the Go client, which refuses an
+    /// unknown value rather than decoding it as a default — an unrecognised
+    /// strength silently read as `proven` would be the precise inversion of
+    /// what this type is for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Strength::Proven => "proven",
+            Strength::Observed => "observed",
+            Strength::Derived => "derived",
+        }
+    }
+}
+
 /// One thing a gate found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub gate: &'static str,
     pub severity: Severity,
+    /// How the gate knows. See [`Strength`].
+    pub strength: Strength,
     pub path: String,
     pub line: u32,
     /// What triggered it. Truncated, and never the full line for a secret
@@ -76,6 +122,16 @@ pub fn detect_stubs(files: &[FileDiff]) -> Vec<Finding> {
                 findings.push(Finding {
                     gate: "stub_detection",
                     severity: Severity::Blocking,
+                    // Blocking and yet only `Derived`, which is exactly the
+                    // pair this axis exists to express. `todo!()` is
+                    // unambiguous as a language construct, but this is a
+                    // substring test over one line of text: the same bytes
+                    // inside a string literal, a doc example or a macro that
+                    // quotes its input match identically. Shipping it is
+                    // clearly wrong when the match is real, so it blocks — and
+                    // a consumer weighing an appeal deserves to know the
+                    // verifier pattern-matched rather than parsed.
+                    strength: Strength::Derived,
                     path: file.path.clone(),
                     line: *line_no,
                     evidence: safe_evidence(content),
@@ -96,6 +152,12 @@ pub fn detect_stubs(files: &[FileDiff]) -> Vec<Finding> {
                 findings.push(Finding {
                     gate: "stub_detection",
                     severity: Severity::Advisory,
+                    // The weakest thing this file reports: a word, in a
+                    // comment, that often but not always means unfinished
+                    // work. Advisory and derived agree here, which is the
+                    // uninteresting case — the axis earns its keep on the
+                    // blocking findings above and below.
+                    strength: Strength::Derived,
                     path: file.path.clone(),
                     line: *line_no,
                     evidence: safe_evidence(content),
@@ -413,6 +475,16 @@ pub fn scan_secrets(files: &[FileDiff]) -> Vec<Finding> {
                 findings.push(Finding {
                     gate: "secret_scan",
                     severity: Severity::Blocking,
+                    // A vendor prefix, a length floor and a character-class
+                    // test. That identifies the *shape* of a credential; it is
+                    // not a proof that the token authenticates anything, and a
+                    // fixture key, a rotated key and a live key are
+                    // indistinguishable here. It blocks anyway — the cost of
+                    // being wrong is one redaction, and the cost of being
+                    // right and silent is a key in the history forever — but
+                    // the report says which of the two kinds of certainty this
+                    // is.
+                    strength: Strength::Derived,
                     path: file.path.clone(),
                     line: *line_no,
                     // The finding names the shape and shows only the prefix.

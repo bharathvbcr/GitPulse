@@ -123,6 +123,21 @@ devmap-resolve = { path = "vendored/devmap-resolve", default-features = false }
 # Keep `default-features = false` — this must not pull tree-sitter grammars.
 devmap-extract = { path = "vendored/devmap-extract", default-features = false }
 
+# "Which commits could have caused this symptom": git blame joined to the code
+# graph, so only the lines belonging to symbols the symptom actually depends on
+# are ever blamed.
+#
+# `dc-regress` is the analysis and takes its graph through a trait, so it knows
+# nothing about SQLite; `dc-regress-store` is the adapter that presents the
+# persisted generation through that trait. The adapter is vendored rather than
+# rewritten here because `devmap suspects` uses the same one — a second copy
+# would have to agree with it, silently, about which direction the dependency
+# cone runs, and that direction was already wrong once.
+#
+# Neither needs a grammar: both read a map and shell out to git.
+dc-regress = { path = "vendored/dc-regress" }
+dc-regress-store = { path = "vendored/dc-regress-store" }
+
 # MarkDev's Markdown parse + tree-sitter highlight core. Default features off
 # so cbindgen / the C ABI stay out of this build; `highlight` pulls the six
 # grammars DiffViewer and CodeViewer dispatch to for rust/js/ts/python/json/shell.

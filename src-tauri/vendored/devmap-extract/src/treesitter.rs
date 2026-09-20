@@ -716,6 +716,15 @@ fn extract_treesitter_before_deadline(
                 // deduplicated against its own calls too, and once for the
                 // whole file rather than per language arm.
                 drop_duplicate_callee_names(&mut extraction.references);
+                // The other half of a template file: its markup, and its
+                // `<style>` block. After the script merge because a selector
+                // string is attributed to the function it sits inside, and that
+                // function only exists in `symbols` once the merge above has
+                // run; after the dedup because a `ReferenceKind::Selector` is
+                // not in the callee-name namespace that pass is about. Returns
+                // after one registry lookup for every language whose entry
+                // permits neither `css` nor `html` inside it.
+                crate::markup::merge_markup(&mut extraction, root, source, lang);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1123,6 +1132,67 @@ fn go_composite_literal_type<'tree>(
     }
 }
 
+/// Whether `node` is the **field-name key** of a Go struct composite literal.
+///
+/// `&Command{run: nil}` parses the key as an ordinary `identifier`, so it
+/// reached `maybe_push_name_reference` as a bare `ReferenceKind::Name` and was
+/// indistinguishable from naming a package-level `func run`. That cost nothing
+/// while the reference ladder declined every bare `Name`; once the Go
+/// package-scope rung began answering them, the same spelling produced a
+/// `SamePackage` edge at DETERMINISTIC — a fabricated caller for a function
+/// nothing calls, which is exactly the defect the receiver gates elsewhere in
+/// this ladder exist to prevent.
+///
+/// A struct key is not a reference to anything the graph holds: it names a
+/// field of the literal's own type. A **map** key is the opposite — `m[k]` and
+/// `map[string]int{k: 1}` both name a real value — so the two are separated by
+/// the literal's declared type rather than by position alone.
+///
+/// The type is read from the nearest enclosing `composite_literal`, and when
+/// that one is implicit (`[]Command{{run: nil}}`, `map[string]Command{"a":
+/// {run: nil}}` — the inner literal carries no type at all) from the one above
+/// it, whose element/value type is what the inner literal constructs.
+/// [`go_composite_literal_type`] already performs that unwrapping, so this
+/// asks it rather than repeating the rules.
+fn go_struct_literal_field_key(node: Node, source: &str) -> bool {
+    // Key position: `keyed_element` holds `literal_element : literal_element`,
+    // and only the first is the key.
+    let Some(element) = node.parent().filter(|p| p.kind() == "literal_element") else {
+        return false;
+    };
+    let Some(keyed) = element.parent().filter(|p| p.kind() == "keyed_element") else {
+        return false;
+    };
+    if keyed.named_child(0).map(|first| first.id()) != Some(element.id()) {
+        return false;
+    }
+
+    // The literal this key belongs to, then outwards while the type is implicit.
+    let mut literal = keyed.parent().and_then(|value| value.parent());
+    for _ in 0..16 {
+        let Some(current) = literal.filter(|c| c.kind() == "composite_literal") else {
+            return false;
+        };
+        match current.child_by_field_name("type") {
+            // A map literal's key is an expression, not a field name. Checked
+            // before unwrapping, because `go_composite_literal_type` reduces
+            // `map[K]V` to `V` and the distinction would be gone.
+            Some(declared) if declared.kind() == "map_type" => return false,
+            Some(declared) => {
+                return go_composite_literal_type(declared, source, 0).is_some();
+            }
+            // Implicit type: this literal is an element of the one outside it.
+            None => {
+                literal = current
+                    .parent()
+                    .and_then(|value| value.parent())
+                    .filter(|outer| outer.kind() == "composite_literal");
+            }
+        }
+    }
+    false
+}
+
 /// Go's predeclared type names, from the language specification.
 ///
 /// None of these can be a node in the graph — they are declared by the language,
@@ -1230,6 +1300,40 @@ fn python_all_exports(source: &str) -> std::collections::BTreeSet<String> {
     exported
 }
 
+/// Whether `node` is a **pure dotted name** — `Other`, `widgets.Widget`,
+/// `pkg.mod.Thing` — and not an expression that merely ends in one.
+///
+/// The distinction is the whole of the alias rule. An alias is a second *name*
+/// for something another module can already import, which is why dropping one
+/// would delete a name other modules use. A computed value is not that, however
+/// dotted it looks.
+///
+/// Asking only whether the outermost node was an `identifier` or an `attribute`
+/// admitted every computed value whose last step happened to be an attribute
+/// access. `OUT = Path(__file__).resolve().parent` is an `attribute` whose
+/// object is a `call`: it passed, survived the `__all__` filter as an "alias",
+/// and became a symbol nothing can reference — because nothing can import it —
+/// and was therefore reported dead at 0.9. Measured on this repository that was
+/// 54 of 54 Python `Variable` symbols and six of the eight findings in the
+/// confident tier.
+///
+/// Iterative rather than recursive, for the reason every walk in this file is:
+/// `a.b.c.…` nested adversarially deep must not overflow the stack. The loop
+/// strictly descends the `object` chain, so it terminates.
+fn is_python_dotted_name(node: Node) -> bool {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => return true,
+            "attribute" => match current.child_by_field_name("object") {
+                Some(object) => current = object,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
 /// Module-level names a Python file declares as another name for something
 /// already referenceable — `TestEvidence = VerificationEvidence`.
 ///
@@ -1268,7 +1372,7 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
         ) else {
             continue;
         };
-        if left.kind() != "identifier" || !matches!(right.kind(), "identifier" | "attribute") {
+        if left.kind() != "identifier" || !is_python_dotted_name(right) {
             continue;
         }
         let name = get_node_text(left, source);
@@ -1408,18 +1512,36 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
     // parse failures, all prose and data, hiding the 16 real ones.
     let declarative = crate::fallback::applies_to(lang);
     let scan = if declarative {
-        crate::fallback::scan_declarations(path, source)
+        // The language, not just the path: two of the languages this tier serves
+        // — `css` and `html` — are read by `crate::markup` rather than by the
+        // line scanner, and the dispatch belongs to the tier, not here.
+        crate::fallback::scan_declarations_in(lang, path, source)
     } else {
         // Prose and data formats declare nothing; see
         // `fallback::NON_DECLARATIVE_LANGUAGES` for what scanning them produced.
         crate::fallback::FallbackScan {
             symbols: Vec::new(),
+            references: Vec::new(),
             truncated: 0,
             skipped_long_lines: 0,
+            unread_bytes: 0,
         }
     };
     let recovered_count = scan.symbols.len();
-    let recovered = recovered_count > 0;
+    // A reader ran over this file and produced an answer — either because it
+    // found declarations, or because the language has a reader of its own and
+    // that reader found none.
+    //
+    // The second half is load-bearing and was not here at first. `html` and `css`
+    // moved out of `NON_DECLARATIVE_LANGUAGES` when `crate::markup` gave them a
+    // reader, and a page with no ids then landed in the `(false, true)` arm —
+    // "a grammar was wanted for this language and was not there" — so every
+    // `.html` and `.css` file without an anchor or a rule counted as a parse
+    // failure. That is the K5 defect exactly, and the store's
+    // `k5_prose_formats_are_not_parse_failures_but_broken_files_still_are`
+    // caught it. Finding nothing in a file that declares nothing is a completed
+    // read, and it must not report what a failed one reports.
+    let recovered = recovered_count > 0 || crate::fallback::has_dedicated_reader(lang);
 
     // The `File` node, which this path used to omit entirely.
     //
@@ -1519,6 +1641,18 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
                             crate::fallback::MAX_LINE_BYTES
                         ));
                     }
+                    // A third way to lose a declaration, and the only one the
+                    // markup and stylesheet readers can hit: a byte cap stopped
+                    // the reader partway through the file. Like a skipped line
+                    // and unlike the scan cap, what those bytes held was never
+                    // counted, so the total is a lower bound.
+                    if scan.unread_bytes > 0 {
+                        caveats.push(format!(
+                            "{} byte(s) never read at a reader's byte cap, so the total is a \
+                             lower bound",
+                            scan.unread_bytes
+                        ));
+                    }
                     // The "X of Y" form is used only when Y is genuinely
                     // known — that is, when every declaration was counted and
                     // some were dropped afterwards. If a line was never
@@ -1558,7 +1692,11 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         imports: Vec::new(),
         calls: Vec::new(),
         exports: Vec::new(),
-        references: Vec::new(),
+        // Empty for the line scanner, which recovers declarations only. The
+        // markup and stylesheet readers behind this same tier do read uses — a
+        // `class` attribute, a `var(--x)` — and dropping them here would index
+        // one half of a contract that only means anything as a pair.
+        references: scan.references,
         diagnostics,
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
@@ -2955,6 +3093,17 @@ fn extract_node(
                                 target_symbol: qualified_name.clone(),
                                 details: reason.to_string(),
                             });
+                        } else if let Some(callee) = js_object_literal_argument_callee(node, source)
+                        {
+                            // The structural rule the two name lists above
+                            // cannot express. Second, not first: where a name
+                            // already identifies the framework, that reason is
+                            // the more specific one and stays.
+                            wiring.push(WiringAnnotation {
+                                kind: WiringKind::RuntimeEntryPoint,
+                                target_symbol: qualified_name.clone(),
+                                details: crate::wiring::js_object_literal_argument_reason(&callee),
+                            });
                         }
                     }
                     symbols.push(ExtractedSymbol {
@@ -3392,6 +3541,17 @@ fn extract_node(
             "macro_invocation" => {
                 let caller = enclosing_callable_qualified(node, source, file_symbol_name);
                 for (callee_name, receiver_expr) in rust_macro_calls(node, source, file_symbol_name)
+                    .into_iter()
+                    .map(|(callee_name, receiver_expr)| {
+                        // A call written inside a macro argument — which is
+                        // where `assert_eq!(super::helper(1), 2)` puts most of
+                        // a test module's calls — reaches here instead of the
+                        // `call_expression` arm, and needs the same absorption.
+                        // The nesting is read from the macro invocation, whose
+                        // ancestors are the real tree; the re-parsed token tree
+                        // inside it has none.
+                        (callee_name, rust_absorb_inline_super(node, receiver_expr))
+                    })
                 {
                     references.push(extracted_reference(
                         node,
@@ -3510,7 +3670,7 @@ fn extract_node(
             // Emitting them here as well produced the same method twice.
             "impl_item" => {}
             "use_declaration" => {
-                rust_use_imports(node, source, span, imports);
+                rust_use_imports(node, source, span, imports, exports);
             }
             "attribute_item" => {
                 rust_attribute_callback_refs(node, source, file_symbol_name, references);
@@ -3529,6 +3689,7 @@ fn extract_node(
                     // to name, and falling back turned its whole body into one —
                     // the shape SC26 removed from the Go arm and left live here.
                     if let Some((callee, receiver_expr)) = split_call_target(f, source) {
+                        let receiver_expr = rust_absorb_inline_super(node, receiver_expr);
                         references.push(extracted_reference(
                             f,
                             source,
@@ -5695,6 +5856,36 @@ fn collect_rust_use_leaves(
 /// at file level names the parent directory's module. This repository contains
 /// 87 of the first spelling and none of the resolver's rungs could tell them
 /// apart.
+/// A Rust call receiver of exactly `super`, resolved against the inline-module
+/// nesting the call is written inside.
+///
+/// `mod tests { super::helper() }` spends its `super` on the inline module and
+/// therefore names **this file**; the identical text at file level names the
+/// parent directory's module. Both reach the resolver as the receiver string
+/// `"super"` and nothing downstream can tell them apart — the nesting is only
+/// knowable here, while the syntax tree still exists. This is the call half of
+/// the fact [`rust_use_imports`] already resolves for `use`, and it reaches the
+/// same answer by the same rule: once the nesting absorbs the `super`, the
+/// target is this file's own module, spelled `self`.
+///
+/// Deliberately restricted to a receiver that is *exactly* `super`. A receiver
+/// with segments left over (`super::Thing`) names something this function
+/// cannot place without the file's own inline-module table, so it is returned
+/// unchanged — losing an edge rather than inventing one.
+///
+/// Depth beyond one is treated the same way because the extractor flattens
+/// inline modules: a `fn` inside `mod a { mod b { … } }` is extracted with the
+/// file-level qualified name, so every `super` that stays inside the file lands
+/// in the one namespace the file has.
+fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<String> {
+    match receiver {
+        Some(receiver) if receiver == "super" && rust_inline_module_depth(node) > 0 => {
+            Some("self".to_string())
+        }
+        other => other,
+    }
+}
+
 fn rust_inline_module_depth(node: Node) -> usize {
     let mut depth = 0usize;
     let mut current = bounded_parent(node);
@@ -5752,11 +5943,28 @@ fn rust_use_specifier(module: &[String], inline_depth: usize) -> String {
 /// A glob is emitted as the `.` alias rather than as a name. That spelling
 /// already exists for Go's dot-import and means exactly this — bind everything
 /// this module exports — so the resolver needs no second rung for it.
+///
+/// A `pub use` is additionally an **export**, and emitting nothing for it was a
+/// hole the size of the standard Rust library layout. `lib.rs` republishes the
+/// crate surface and every consumer imports through the crate root, so the
+/// import binding pointed at `lib.rs`, `lib.rs` declares none of those names,
+/// and the ladder fell through to the bare-name global lookup — the exact
+/// failure `compute_reexport_chains` was built to stop, with no Rust input to
+/// feed it. Measured on this repository: `devmap-store/src/lib.rs` carries
+/// `pub use schema::*;`, and `CURRENT_SCHEMA_VERSION` had six callers, all in
+/// the one file naming `crate::schema::` directly. The migration-ladder test
+/// that guards it had no edge to the schema at all.
+///
+/// Only a bare `pub` republishes across the crate boundary. A private `use`
+/// binds the name for this file, and `pub(crate)` / `pub(super)` / `pub(in …)`
+/// stop short of the surface a consumer can import, so recording a chain
+/// through any of them would name a route the language does not have.
 fn rust_use_imports(
     node: Node,
     source: &str,
     span: Span,
     imports: &mut Vec<ExtractedImport>,
+    exports: &mut Vec<ExtractedExport>,
 ) -> Option<()> {
     let raw = get_node_text(node, source);
     let argument = node.child_by_field_name("argument")?;
@@ -5802,6 +6010,38 @@ fn rust_use_imports(
         }
     }
 
+    // A `pub use` republishes what it names, so it is an export as well as an
+    // import. Derived from the same two maps rather than from a second pass
+    // over the leaves, so the two records cannot disagree about what the
+    // statement said.
+    if rust_use_is_public(node, source) {
+        for (specifier, (imported_names, local_names)) in &named {
+            for (imported, local) in imported_names.iter().zip(local_names.iter()) {
+                // `pub use m::a as b;` publishes `b` and asks `m` for `a`,
+                // which is the `exported_name` / `local_name` split the chain
+                // builder already reads for `export { a as b } from './m'`.
+                exports.push(ExtractedExport {
+                    exported_name: local.clone(),
+                    local_name: Some(imported.clone()),
+                    module_specifier: Some(specifier.clone()),
+                    span: span.clone(),
+                });
+            }
+        }
+        for (specifier, alias) in &whole_module {
+            // Only the glob. `pub use m;` republishes the module itself, which
+            // names no symbol for a chain to terminate on.
+            if alias.as_deref() == Some(".") {
+                exports.push(ExtractedExport {
+                    exported_name: "*".to_string(),
+                    local_name: None,
+                    module_specifier: Some(specifier.clone()),
+                    span: span.clone(),
+                });
+            }
+        }
+    }
+
     for (specifier, (imported_names, local_names)) in named {
         imports.push(ExtractedImport {
             raw_import: raw.clone(),
@@ -5823,6 +6063,74 @@ fn rust_use_imports(
         });
     }
     Some(())
+}
+
+/// The callee an object-literal method is handed to, when the syntax hands it
+/// to one.
+///
+/// `created.registerLinkProvider({ provideLinks() {…} })` gives the terminal
+/// library an object and lets it call the member; there is no call site in this
+/// corpus and there never will be, so `provideLinks` was reported dead at the
+/// confident tier. Every callback interface has this shape — a comparator, a
+/// visitor, an event map, a plugin — and the name lists that covered a handful
+/// of them could not generalise.
+///
+/// **Where the walk stops is the whole of the precision.** Only an `object`,
+/// an `array`, a `pair`, or a value-preserving TypeScript wrapper may sit
+/// between the method and the argument list, because those carry the value
+/// outward unchanged. Anything else — a function body, a statement, an
+/// assignment — means the method is *not* part of what the call receives:
+///
+/// - `f({ m() {} })` and `f({ outer: { m() {} } })` hand `m` over.
+/// - `const o = { m() {} }` does not: `o` is a local, and if nothing calls
+///   `o.m()` then `m` really is dead. Reporting it is the correct answer and
+///   this must not take it away.
+/// - `f({ cb() { const o = { helper() {} }; } })` does not hand `helper` over
+///   either, and the walk hits `cb`'s body and refuses before reaching the
+///   argument list.
+///
+/// That asymmetry is deliberate: `liveness.rs` states throughout that an
+/// over-inclusive exemption costs correctness while an omission costs only
+/// noise, so the walk refuses on anything it does not positively recognise.
+fn js_object_literal_argument_callee(node: Node, source: &str) -> Option<String> {
+    let mut current = bounded_parent(node)?;
+    loop {
+        match current.kind() {
+            // Literal structure: the value travels outward unchanged.
+            "object" | "array" | "pair" => {}
+            // TypeScript wrappers that change the type and not the value.
+            "as_expression" | "satisfies_expression" | "parenthesized_expression" => {}
+            // The argument list: this call receives the object.
+            "arguments" => {
+                let call = bounded_parent(current)?;
+                if !matches!(call.kind(), "call_expression" | "new_expression") {
+                    return None;
+                }
+                let callee = call
+                    .child_by_field_name("function")
+                    .or_else(|| call.child_by_field_name("constructor"))?;
+                let text = get_node_text(callee, source);
+                return (!text.trim().is_empty()).then_some(text);
+            }
+            _ => return None,
+        }
+        current = bounded_parent(current)?;
+    }
+}
+
+/// Whether a `use_declaration` republishes beyond the crate that wrote it.
+///
+/// Exactly a bare `pub`. `pub(crate)`, `pub(super)` and `pub(in path)` are all
+/// `visibility_modifier` nodes too, and all of them stop short of the surface
+/// an outside consumer can import — so matching on the node kind alone would
+/// publish names that cannot be reached, which is the same overreach as
+/// publishing a private `use` one scope wider.
+fn rust_use_is_public(node: Node, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let public = node.children(&mut cursor).any(|child| {
+        child.kind() == "visibility_modifier" && get_node_text(child, source).trim() == "pub"
+    });
+    public
 }
 
 /// Parameter name → declared type, for languages whose parameters carry one.
@@ -6285,6 +6593,14 @@ fn maybe_push_name_reference(
         return;
     }
     if ref_kind == ReferenceKind::Name && name_is_shadowed_by_local(node, source, &name) {
+        return;
+    }
+    // A Go struct literal's key names a field of that struct, not a symbol.
+    // Gated here beside the other "this spelling is not a reference" rules
+    // rather than in the resolver: the resolver sees a bare identifier with no
+    // receiver and has nothing left to distinguish it with.
+    if ref_kind == ReferenceKind::Name && lang == "go" && go_struct_literal_field_key(node, source)
+    {
         return;
     }
     references.push(ExtractedReference {
@@ -8881,7 +9197,12 @@ mod tests {
                     ("crate::thing", vec!["One", "Two"], vec!["One", "Three"], None),
                     ("inner", vec!["Exported"], vec!["Exported"], None),
                 ],
-                vec!["f.rs"],
+                // `pub use inner::Exported;` was in this fixture from the start
+                // and the export set recorded only the file node, which is the
+                // defect stated as a pin: a Rust re-export produced no export at
+                // all, so `compute_reexport_chains` had no Rust input and a
+                // crate root's republished surface was invisible to it.
+                vec!["Exported", "f.rs"],
             ),
         ];
 
@@ -9321,6 +9642,151 @@ mod tests {
 
     /// The ordinary declaration forms are unchanged.
     ///
+    /// Every object-literal method in one file, with the exemption each got.
+    fn object_literal_exemptions(source: &str) -> Vec<(String, bool)> {
+        let extraction = extract_treesitter("src/t.ts", "typescript", source);
+        let exempt: std::collections::BTreeSet<&str> = extraction
+            .wiring
+            .iter()
+            .filter(|annotation| annotation.kind == WiringKind::RuntimeEntryPoint)
+            .map(|annotation| annotation.target_symbol.as_str())
+            .collect();
+        extraction
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::Method)
+            .map(|symbol| {
+                (
+                    symbol.name.clone(),
+                    exempt.contains(symbol.qualified_name.as_str()),
+                )
+            })
+            .collect()
+    }
+
+    /// A callback interface handed to a library has no call site in this corpus
+    /// and never will, and the name lists could only cover libraries somebody
+    /// had thought of.
+    ///
+    /// Measured on GitPulse: `registerLinkProvider({ provideLinks() {…} })` is
+    /// xterm's `ILinkProvider`, and `provideLinks` was reported dead at the
+    /// *confident* tier — 0.9, the tier whose contract is "safe to act on",
+    /// with `lcov.info` recording it executed.
+    #[test]
+    fn a_method_handed_to_a_callee_in_an_object_literal_is_exempt() {
+        assert_eq!(
+            object_literal_exemptions(
+                "export function ensureTerm(created) {\n  \
+                 return created.registerLinkProvider({\n    \
+                 provideLinks(line, callback) { callback(undefined); },\n  });\n}\n"
+            ),
+            vec![("provideLinks".to_string(), true)]
+        );
+    }
+
+    /// The case the rule must NOT take away, and the reason it is a walk rather
+    /// than "is this method inside an object literal".
+    ///
+    /// `const o = { m() {} }` hands `m` to nobody. If nothing calls `o.m()`
+    /// then it really is dead, and reporting it is the correct answer.
+    #[test]
+    fn a_method_on_a_plain_local_object_is_still_reported() {
+        assert_eq!(
+            object_literal_exemptions(
+                "export function f() {\n  const o = { standalone() { return 2; } };\n  \
+                 return o;\n}\n"
+            ),
+            vec![("standalone".to_string(), false)]
+        );
+    }
+
+    /// A method nested deeper inside the argument is still handed over: the
+    /// callee receives the whole structure and can reach it.
+    #[test]
+    fn a_method_nested_inside_the_argument_is_still_handed_over() {
+        assert_eq!(
+            object_literal_exemptions(
+                "export function f() {\n  return wrap({ outer: { inner() { return 1; } } });\n}\n"
+            ),
+            vec![("inner".to_string(), true)]
+        );
+    }
+
+    /// The walk stops at a function boundary, which is what keeps it from
+    /// exempting everything textually inside a call.
+    ///
+    /// `f({ cb() { const o = { helper() {} }; } })` hands `cb` to `f` and keeps
+    /// `helper` to itself — `helper` is a local of `cb`'s body, which the call
+    /// never sees.
+    #[test]
+    fn a_method_declared_inside_a_handed_over_function_body_is_not_itself_handed_over() {
+        let exemptions = object_literal_exemptions(
+            "export function f() {\n  return reg({ cb() { const o = { helper() { return 1; } }; \
+             return o; } });\n}\n",
+        );
+        assert_eq!(
+            exemptions,
+            vec![("cb".to_string(), true), ("helper".to_string(), false)],
+            "the argument's own member is handed over; a local built inside its body is not"
+        );
+    }
+
+    /// An array of handlers is a literal structure like any other.
+    #[test]
+    fn a_method_in_an_array_argument_is_handed_over() {
+        assert_eq!(
+            object_literal_exemptions(
+                "export function f() {\n  return use([{ setup() { return 1; } }]);\n}\n"
+            ),
+            vec![("setup".to_string(), true)]
+        );
+    }
+
+    /// `new Thing({ m() {} })` hands the object over exactly as a call does.
+    #[test]
+    fn a_method_handed_to_a_constructor_is_exempt() {
+        assert_eq!(
+            object_literal_exemptions(
+                "export function f() {\n  return new Observer({ handleEvent(e) { return e; } });\n}\n"
+            ),
+            vec![("handleEvent".to_string(), true)]
+        );
+    }
+
+    /// A TypeScript `satisfies` or `as` changes the type and not the value, so
+    /// the object still reaches the callee.
+    #[test]
+    fn a_type_assertion_between_the_literal_and_the_call_does_not_break_the_walk() {
+        assert_eq!(
+            object_literal_exemptions(
+                "export function f() {\n  return reg({ provide() { return 1; } } as Provider);\n}\n"
+            ),
+            vec![("provide".to_string(), true)]
+        );
+    }
+
+    /// A method on an object that is *returned* rather than passed is not
+    /// handed to a callee by this rule. It may still be spared by the
+    /// factory-return rule that owns that case; what matters here is that this
+    /// walk does not claim it, because `return` is not an argument list.
+    #[test]
+    fn a_method_on_a_returned_object_is_not_claimed_by_this_rule() {
+        let extraction = extract_treesitter(
+            "src/t.ts",
+            "typescript",
+            "function build() {\n  return { run() { return 1; } };\n}\n",
+        );
+        assert!(
+            !extraction.wiring.iter().any(|annotation| {
+                annotation
+                    .details
+                    .contains("declared in an object literal passed to")
+            }),
+            "a returned object was not passed to anything: {:?}",
+            extraction.wiring
+        );
+    }
+
     /// The walk that follows escapes replaced a hand-rolled per-kind match, and
     /// these are the cases that match had to keep getting right.
     #[test]

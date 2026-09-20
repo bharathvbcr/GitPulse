@@ -319,6 +319,24 @@ pub enum Resolution {
         target_symbol: String,
         target_file: String,
     },
+    /// Exactly one file in the repository declares this markup or stylesheet
+    /// identity, and it is not the file that names it: a global stylesheet's
+    /// `.btn`, reached from a component that writes `class="btn"`.
+    ///
+    /// The same rung as [`Self::UniqueGlobal`] and rated identically — one
+    /// declaration of that name, so there is nothing to choose between — but a
+    /// separate variant because `UniqueGlobal` carries a [`LangFamily`] and this
+    /// rung has none to carry. A `.btn` in `app.css` is named by a Svelte
+    /// component, a Vue one and a plain `.html` page alike; the namespace
+    /// searched is the markup one, which spans every language. Filling that
+    /// field in would have meant either naming a family the rung never consulted
+    /// or writing `Generic`, which
+    /// [`LangFamily::admits`](crate::model::LangFamily::admits) defines as inert
+    /// — an edge whose own evidence says cross-file resolution was refused.
+    UniqueSelector {
+        target_symbol: String,
+        target_file: String,
+    },
 }
 
 impl Resolution {
@@ -336,6 +354,10 @@ impl Resolution {
             Resolution::AmbiguousGlobal { .. } => ResolutionKind::AmbiguousGlobal,
             Resolution::Unresolved { .. } => ResolutionKind::Unresolved,
             Resolution::Structural { .. } => ResolutionKind::Structural,
+            // The same rung as UniqueGlobal: one declaration of the name in the
+            // repository. Persisted under the same label, so no stored
+            // generation and no schema check changes meaning.
+            Resolution::UniqueSelector { .. } => ResolutionKind::UniqueGlobal,
         }
     }
 
@@ -381,6 +403,10 @@ impl Resolution {
                 ..
             }
             | Resolution::Structural {
+                target_symbol,
+                target_file,
+            }
+            | Resolution::UniqueSelector {
                 target_symbol,
                 target_file,
             } => Some((target_file.as_str(), target_symbol.as_str())),

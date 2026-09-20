@@ -336,4 +336,31 @@ describe("retired views", () => {
     expect(loaded.tabs[0].path).toBe("/r/one");
     expect(loaded.tabs[0].viewTab).toBe("work");
   });
+
+  it("round-trips tab groups and collapsed group states through persistence", () => {
+    const ws = {
+      tabs: [
+        { id: "/r/one", path: "/r/one", pinned: false, group: "devtools" },
+        { id: "/r/two", path: "/r/two", pinned: false, group: "devtools" },
+        { id: "/r/three", path: "/r/three", pinned: false, group: null },
+      ],
+      activeId: "/r/one",
+      recents: ["/r/one"],
+      lastClosed: [],
+      collapsedGroups: ["devtools"],
+    };
+    const persisted = workspaceToPersisted(ws, {});
+    expect(persisted.tabs[0].group).toBe("devtools");
+    expect(persisted.tabs[1].group).toBe("devtools");
+    expect(persisted.tabs[2].group).toBeUndefined();
+    expect(persisted.collapsedGroups).toEqual(["devtools"]);
+
+    const storage = memoryStorage();
+    savePersistedWorkspace(storage, persisted);
+    const loaded = loadPersistedWorkspace(storage, opts);
+    expect(loaded.tabs[0].group).toBe("devtools");
+    expect(loaded.tabs[1].group).toBe("devtools");
+    expect(loaded.tabs[2].group).toBeUndefined();
+    expect(loaded.collapsedGroups).toEqual(["devtools"]);
+  });
 });

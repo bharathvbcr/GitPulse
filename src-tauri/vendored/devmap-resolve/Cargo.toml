@@ -36,6 +36,10 @@ name = "adversarial_resolve"
 required-features = ["parse"]
 
 [[test]]
+name = "rust_qualified_super_calls"
+required-features = ["parse"]
+
+[[test]]
 name = "audit_regressions"
 required-features = ["parse"]
 
@@ -45,6 +49,10 @@ required-features = ["parse"]
 
 [[test]]
 name = "embedded_script_families"
+required-features = ["parse"]
+
+[[test]]
+name = "markup_selectors_resolve"
 required-features = ["parse"]
 
 [[test]]
@@ -139,4 +147,12 @@ required-features = ["parse"]
 
 [[test]]
 name = "a_field_types_its_receiver"
+required-features = ["parse"]
+
+[[test]]
+name = "reexported_module_surfaces"
+required-features = ["parse"]
+
+[[test]]
+name = "shell_source_resolves"
 required-features = ["parse"]

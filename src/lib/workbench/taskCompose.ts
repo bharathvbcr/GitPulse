@@ -4,6 +4,169 @@ import { displayTitle } from "./taskDelete";
 import { formatLogsSection } from "./taskLogs";
 
 export const MAX_AGENT_COPY_TASKS = 8;
+export const MAX_SUBTASKS = 128;
+export const SUBTASK_CAP = 4096;
+
+const CHECKLIST_HEADING = /^(?:#{1,6}\s+)?(?:task\s+)?(?:sub[- ]?tasks?|checklist|acceptance\s+criteria|tasks|to-?dos?)(?:\s*:)?\s*$/i;
+const CHECKLIST_COLON_LINE = /^(?:task\s+)?(?:sub[- ]?tasks?|checklist|acceptance\s+criteria|tasks|to-?dos?):\s*$/i;
+const CHECKBOX_LINE = /^\s*[-*+]?\s*\[([ xX])\]\s*(.+)$/;
+const BULLET_OR_NUMBER_LINE = /^\s*(?:[-*+]|\d+[\.)])\s+(.+)$/;
+const PLACEHOLDER_CRITERIA = /^(?:no\s+acceptance\s+criteria\s+recorded|none|n\/a)\.?$/i;
+
+function cleanSubtaskItem(raw: string): string {
+  let text = raw.trim();
+  text = text.replace(/^\[[ xX]\]\s*/, "");
+  text = text.replace(/^[-*+]\s+/, "");
+  text = text.replace(/^\d+[\.)]\s+/, "");
+  text = text.trim();
+  if (PLACEHOLDER_CRITERIA.test(text)) return "";
+  const chars = [...text];
+  return chars.length > SUBTASK_CAP ? chars.slice(0, SUBTASK_CAP).join("") : text;
+}
+
+export function mergeSubtasks(
+  existing: readonly string[],
+  incoming: readonly string[],
+  cap = MAX_SUBTASKS,
+): string[] {
+  const limit = Number.isSafeInteger(cap) && cap > 0 ? Math.min(cap, MAX_SUBTASKS) : MAX_SUBTASKS;
+  const result: string[] = [];
+  const seen = new Set<string>();
+
+  for (const item of existing ?? []) {
+    const cleaned = cleanSubtaskItem(typeof item === "string" ? item : "");
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(cleaned);
+    }
+  }
+
+  for (const item of incoming ?? []) {
+    if (result.length >= limit) break;
+    const cleaned = cleanSubtaskItem(typeof item === "string" ? item : "");
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(cleaned);
+    }
+  }
+
+  return result.slice(0, limit);
+}
+
+export function extractSubtasksFromContent(content: unknown): {
+  subtasks: string[];
+  remainingText: string;
+} {
+  if (typeof content !== "string" || !content.trim()) {
+    return { subtasks: [], remainingText: typeof content === "string" ? content : "" };
+  }
+
+  const lines = content.split(/\r?\n/);
+  const subtasks: string[] = [];
+  const keptLines: string[] = [];
+  let inChecklistSection = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    const isHeading = /^#{1,6}\s+/.test(trimmed);
+
+    if (isHeading || CHECKLIST_COLON_LINE.test(trimmed)) {
+      if (CHECKLIST_HEADING.test(trimmed) || CHECKLIST_COLON_LINE.test(trimmed)) {
+        inChecklistSection = true;
+        continue;
+      } else {
+        inChecklistSection = false;
+      }
+    }
+
+    if (inChecklistSection) {
+      if (!trimmed) {
+        const nextNonEmpty = lines.slice(i + 1).find((l) => l.trim().length > 0);
+        if (
+          nextNonEmpty &&
+          (CHECKBOX_LINE.test(nextNonEmpty.trim()) ||
+            BULLET_OR_NUMBER_LINE.test(nextNonEmpty.trim()))
+        ) {
+          continue;
+        } else {
+          inChecklistSection = false;
+          keptLines.push(line);
+          continue;
+        }
+      }
+
+      const checkboxMatch = trimmed.match(CHECKBOX_LINE);
+      const bulletMatch = trimmed.match(BULLET_OR_NUMBER_LINE);
+      if (checkboxMatch) {
+        const item = cleanSubtaskItem(checkboxMatch[2]);
+        if (item) subtasks.push(item);
+        continue;
+      } else if (bulletMatch) {
+        const item = cleanSubtaskItem(bulletMatch[1]);
+        if (item) subtasks.push(item);
+        continue;
+      } else {
+        inChecklistSection = false;
+        keptLines.push(line);
+        continue;
+      }
+    }
+
+    const standaloneMatch = trimmed.match(CHECKBOX_LINE);
+    if (standaloneMatch) {
+      const item = cleanSubtaskItem(standaloneMatch[2]);
+      if (item) subtasks.push(item);
+      continue;
+    }
+
+    keptLines.push(line);
+  }
+
+  let remainingText = keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (content.endsWith("\n") && remainingText) {
+    remainingText += "\n";
+  }
+
+  const uniqueSubtasks = mergeSubtasks([], subtasks);
+  return { subtasks: uniqueSubtasks, remainingText };
+}
+
+export function extractSubtasks(text: unknown): string[] {
+  return extractSubtasksFromContent(text).subtasks;
+}
+
+export function extractDraftSubtasks(
+  draft: { description?: string; acceptance_criteria?: readonly string[] },
+  notes?: string,
+): { description: string; subtasks: string[]; extracted: boolean; count: number } {
+  const fromDesc = extractSubtasksFromContent(draft.description ?? "");
+  const fromNotes = extractSubtasks(notes ?? "");
+  const allIncoming = [...fromDesc.subtasks, ...fromNotes];
+  if (!allIncoming.length) {
+    return {
+      description: typeof draft.description === "string" ? draft.description : "",
+      subtasks: (draft.acceptance_criteria ?? []).map((s) => s.trim()).filter(Boolean),
+      extracted: false,
+      count: 0,
+    };
+  }
+  const existing = (draft.acceptance_criteria ?? []).map((s) => s.trim()).filter(Boolean);
+  const existingSet = new Set(existing.map((s) => s.toLowerCase()));
+  const newItems = allIncoming.filter((item) => !existingSet.has(item.toLowerCase()));
+  const merged = mergeSubtasks(existing, allIncoming);
+  return {
+    description: fromDesc.remainingText,
+    subtasks: merged,
+    extracted: true,
+    count: newItems.length,
+  };
+}
+
 
 /**
  * The instruction every copied task carries into an agent.

@@ -91,6 +91,15 @@ describe("FirebasePanel", () => {
     expect(source).toContain("Policy on {lastVerdictAction}");
   });
 
+  it("hands the timeline every rollout, not a collapsed slice", () => {
+    // Collapse lives inside DeliveryTimeline so Actions runs and App Hosting
+    // rollouts cannot disagree about what "show all" means. Slicing here
+    // would also shrink the sample the card measures.
+    expect(source).toContain("rows={rolloutRows}");
+    expect(source).not.toContain("previewSlice(rolloutRows");
+    expect(source).not.toContain("previewSlice(rollout");
+  });
+
   it("names the target a rollout listing belongs to", () => {
     // The rows come from the report; so must the heading above them. A listing
     // labelled by the selectors instead would, after a remount, show one

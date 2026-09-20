@@ -123,9 +123,59 @@ impl<'a> UsePosition<'a> {
     }
 }
 
+/// Whether a file's stylesheet applies to the whole document.
+///
+/// True for a standalone stylesheet and for a plain page; false for every
+/// template language, because Svelte, Vue and Astro each scope a component's
+/// `<style>` to that component's own elements. Keyed on the language rather than
+/// the extension so the one place that decides it is the same place
+/// `detect_language` already answered.
+///
+/// `:global(.x)` in a component is deliberately **not** detected. It is the one
+/// way a component legitimately declares a document-wide class, and honouring it
+/// would need the extractor to mark the declaration — a field on the payload. So
+/// a `:global` class answers its own file and nothing else: a missing edge, which
+/// a reader can see, rather than a wrong one, which they cannot.
+fn is_global_stylesheet(language: &str) -> bool {
+    matches!(language, "css" | "html")
+}
+
+/// One file's declaration of a markup or stylesheet identity.
+///
+/// The flag is what makes cross-file resolution decidable. A component's
+/// `<style>` is **scoped**: Svelte, Vue and Astro each compile it to rules that
+/// match only that component's own elements, so a `.selected` declared in
+/// `TaskBoard.svelte` cannot style `BranchList.svelte`'s markup, and an edge
+/// saying otherwise is false however unique the name is. A standalone
+/// stylesheet, and a `<style>` in a plain page, are global and can.
+///
+/// Measured on GitPulse before this flag existed: 672 cross-file selector edges,
+/// 668 of them into the global `src/app.css` and correct, and three of the
+/// remaining four into another component's scoped stylesheet and wrong.
+#[derive(Debug, Clone)]
+struct SelectorDeclaration {
+    file: String,
+    /// Whether the declaring file's stylesheet is document-wide: a `.css`,
+    /// `.scss` or `.less` file, or an `.html` page.
+    in_global_sheet: bool,
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
+    /// Markup and stylesheet declarations, by their selector-form name:
+    /// `[data-add-repo]`, `.nav-heading`, `#repo-heading`, `--gap-x` -> the
+    /// files that declare them, deduplicated and sorted.
+    ///
+    /// **A second namespace, on purpose.** These names do not live in the same
+    /// space as identifiers, and `symbol_index` is keyed by qualified name for
+    /// rungs that reason about imports, receivers and packages — none of which a
+    /// CSS class has. Putting them in one index would let the code ladder's
+    /// unique-global rung answer a class with a function: a class called `menu`
+    /// is not `fn menu`, and an edge between them is a fabrication, not a
+    /// coarser answer. Kept apart, the only thing that can answer a selector is
+    /// a markup or stylesheet declaration.
+    selector_symbols: BTreeMap<String, Vec<SelectorDeclaration>>,
     /// Every indexed file, grouped by its parent directory, each group sorted.
     ///
     /// Three call sites answered "which files sit directly in this directory"
@@ -146,6 +196,24 @@ pub struct Resolver {
     /// `file_symbols` takes an entry per extraction unconditionally, including
     /// files that declare no symbol.
     files_by_dir: BTreeMap<String, Vec<String>>,
+    /// Rust crate name, spelled as a `use` spells it, -> that crate's `src`
+    /// root. `None` where two indexed crates claim the same name.
+    ///
+    /// `use devmap_store::CURRENT_SCHEMA_VERSION;` is how one crate names
+    /// another, and nothing mapped that name to a file. The crate-relative rung
+    /// derives its root from the *importer's* path — the innermost `src` above
+    /// it — which is right for `crate::` and answers nothing here: an
+    /// integration test lives in `tests/`, has no `src` ancestor at all, and
+    /// fell back to a literal `src` that matches no workspace member.
+    ///
+    /// Built from indexed roots rather than from manifests, so the entry exists
+    /// only where the crate's own `lib.rs` is in the corpus. Cargo's name
+    /// normalisation is the one assumption: a directory `devmap-store` is the
+    /// crate `devmap_store`, which is the convention every crate in this
+    /// workspace follows and the only bridge between the two spellings.
+    /// Ambiguity abstains rather than picking, the same rule
+    /// [`Self::unique_basename`] follows.
+    rust_crate_roots: BTreeMap<String, Option<String>>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -343,7 +411,9 @@ impl Resolver {
         Self {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
+            selector_symbols: BTreeMap::new(),
             files_by_dir: BTreeMap::new(),
+            rust_crate_roots: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -1263,7 +1333,9 @@ impl Resolver {
         // for a rebuild.
         self.symbol_index.clear();
         self.file_symbols.clear();
+        self.selector_symbols.clear();
         self.files_by_dir.clear();
+        self.rust_crate_roots.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -1377,6 +1449,16 @@ impl Resolver {
                             .clone()
                             .unwrap_or_else(|| ext.file_path.clone())
                     });
+                // The markup/stylesheet namespace, kept out of the rungs above.
+                if matches!(sym.kind, SymbolKind::MarkupAnchor | SymbolKind::StyleRule) {
+                    let declaring = self.selector_symbols.entry(sym.name.clone()).or_default();
+                    if !declaring.iter().any(|known| known.file == ext.file_path) {
+                        declaring.push(SelectorDeclaration {
+                            file: ext.file_path.clone(),
+                            in_global_sheet: is_global_stylesheet(&ext.language),
+                        });
+                    }
+                }
                 file_syms.push(sym.name.clone());
             }
             self.file_symbols.insert(ext.file_path.clone(), file_syms);
@@ -1458,6 +1540,43 @@ impl Resolver {
             files.sort();
         }
         self.files_by_dir = files_by_dir;
+
+        // Which crate each indexed `src/lib.rs` or `src/main.rs` is the root
+        // of, keyed by the name a `use` would spell. Built here for the same
+        // reason `files_by_dir` is: `file_symbols` is complete and pass two is
+        // about to start asking.
+        let mut rust_crate_roots: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for path in self.file_symbols.keys() {
+            let Some(src_root) = path
+                .strip_suffix("/lib.rs")
+                .or_else(|| path.strip_suffix("/main.rs"))
+            else {
+                continue;
+            };
+            if src_root != "src" && !src_root.ends_with("/src") {
+                continue;
+            }
+            let crate_dir = Self::parent_dir(src_root);
+            let Some(name) = crate_dir.rsplit('/').next().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let name = name.replace('-', "_");
+            let root = src_root.to_string();
+            match rust_crate_roots.entry(name) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(Some(root));
+                }
+                std::collections::btree_map::Entry::Occupied(mut held) => {
+                    // A crate with both a `lib.rs` and a `main.rs` is one crate
+                    // with one root, not two claimants. Two *directories* of
+                    // the same name are the ambiguity this abstains on.
+                    if held.get().as_deref() != Some(root.as_str()) {
+                        held.insert(None);
+                    }
+                }
+            }
+        }
+        self.rust_crate_roots = rust_crate_roots;
 
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
@@ -1876,6 +1995,121 @@ impl Resolver {
     /// it terminates.
     const REEXPORT_CHAIN_MAX_DEPTH: usize = 8;
 
+    /// Most hops the whole glob expansion may hold.
+    ///
+    /// One glob over a file declaring N symbols adds N hops, and a crate root
+    /// globbing a dozen modules multiplies that — so the work is a product of
+    /// two corpus dimensions rather than a walk over one, and a generated tree
+    /// is exactly where it gets large. Past this the expansion stops and the
+    /// chains it would have built are simply absent, which is the answer the
+    /// map gave before globs were expanded at all: a lost chain costs
+    /// precision, never a wrong edge.
+    const REEXPORT_GLOB_MAX_HOPS: usize = 200_000;
+
+    /// Turn each glob re-export into one hop per name the target publishes.
+    ///
+    /// What a target publishes is what it *declares* plus what it already
+    /// re-exports, and the second is why this runs to a fixpoint: a crate root
+    /// globbing a module that itself globs only learns the inner names once the
+    /// inner hops exist. The round count is [`REEXPORT_CHAIN_MAX_DEPTH`], the
+    /// same bound the chain walk uses and for the same reason.
+    ///
+    /// **Two names it refuses to invent.** An explicit re-export already states
+    /// where a name comes from and is never overwritten — which is also the
+    /// language's own rule, since a named `pub use` shadows a glob covering it.
+    /// And a name that *two* globs bring in from two different files has no
+    /// single true source — Rust rejects such a program outright — so it is
+    /// recorded from neither, on the same rule the cycle follows: picking one
+    /// endpoint would manufacture the certainty the map exists to supply.
+    fn expand_glob_hops(
+        hops: &mut BTreeMap<String, (String, String)>,
+        file_symbols: &BTreeMap<String, Vec<String>>,
+    ) {
+        // `(globbing file, target file)` for every `export * from` / `pub use m::*`.
+        let globs: Vec<(String, String)> = hops
+            .iter()
+            .filter(|(_, (_, name))| name == "*")
+            .filter_map(|(key, (target, _))| {
+                key.rsplit_once("::")
+                    .map(|(file, _)| (file.to_string(), target.clone()))
+            })
+            .collect();
+        if globs.is_empty() {
+            return;
+        }
+
+        let mut poisoned: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::REEXPORT_CHAIN_MAX_DEPTH {
+            let additions = {
+                // What each file publishes as of this round.
+                let mut published: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+                for (file, names) in file_symbols {
+                    published
+                        .entry(file.as_str())
+                        .or_default()
+                        .extend(names.iter().map(String::as_str));
+                }
+                for key in hops.keys() {
+                    if let Some((file, name)) = key.rsplit_once("::") {
+                        if name != "*" {
+                            published.entry(file).or_default().insert(name);
+                        }
+                    }
+                }
+
+                let mut proposals: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+                for (from, target) in &globs {
+                    let Some(names) = published.get(target.as_str()) else {
+                        continue;
+                    };
+                    // Every file carries a `SymbolKind::File` container symbol
+                    // named after its own basename, and it is marked exported
+                    // like any other. A glob republishes the module's *names*,
+                    // not the file object, so sweeping it in produced the
+                    // nonsense chain `a.rs::b.rs` -> `b.rs::b.rs`. Identified by
+                    // the basename because that is exactly how the extractor
+                    // names it, and no language whose files carry an extension
+                    // can declare a real symbol with a dot in it.
+                    let container = target.rsplit('/').next().unwrap_or(target.as_str());
+                    for name in names.iter().filter(|name| **name != container) {
+                        let key = format!("{from}::{name}");
+                        if hops.contains_key(&key) || poisoned.contains(&key) {
+                            continue;
+                        }
+                        proposals.entry(key).or_default().insert(target.as_str());
+                    }
+                }
+
+                let mut additions: Vec<(String, (String, String))> = Vec::new();
+                for (key, targets) in proposals {
+                    let Some(name) = key.rsplit_once("::").map(|(_, name)| name.to_string()) else {
+                        continue;
+                    };
+                    let mut targets = targets.into_iter();
+                    let Some(first) = targets.next() else {
+                        continue;
+                    };
+                    if targets.next().is_some() {
+                        poisoned.insert(key);
+                        continue;
+                    }
+                    additions.push((key, (first.to_string(), name)));
+                }
+                additions
+            };
+
+            if additions.is_empty() {
+                break;
+            }
+            for (key, hop) in additions {
+                if hops.len() >= Self::REEXPORT_GLOB_MAX_HOPS {
+                    return;
+                }
+                hops.insert(key, hop);
+            }
+        }
+    }
+
     /// `<file>::<exported name>` for every `export { x } from './m'`, followed
     /// to the file that actually declares the name.
     ///
@@ -1933,6 +2167,17 @@ impl Resolver {
                 );
             }
         }
+
+        // A glob names a *module*, not a symbol, so the hop it states —
+        // `index.js::*` pointing at `("impl.js", "*")` — can never terminate:
+        // no file declares a symbol called `*`. Every `export * from` chain was
+        // dropped in silence for exactly that reason, and Rust's `pub use m::*`
+        // arrives with the same shape.
+        //
+        // The expansion cannot happen in the extractor, which sees one file at
+        // a time while a glob names whatever *another* file declares. Here the
+        // whole-corpus symbol table is in hand.
+        Self::expand_glob_hops(&mut hops, &self.file_symbols);
 
         let mut chains = BTreeMap::new();
         for key in hops.keys() {
@@ -2374,6 +2619,36 @@ impl Resolver {
                             resolution = Some(Arc::new(Resolution::SameFile {
                                 target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
                             }));
+                        } else if family == LangFamily::Rust
+                            && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function) {
+                            // Rust reaches a **free function** through a `self`
+                            // receiver, which no other family here does.
+                            //
+                            // `self::helper()` is a module path, and so is the
+                            // `super::helper()` that `rust_absorb_inline_super`
+                            // rewrote to it — both name this file's own
+                            // `helper`. The method-only arm above cannot serve
+                            // them: the extractor records a Rust free function
+                            // as `Function`, reserving `Method` for one owned by
+                            // a type, so every path-qualified call to a
+                            // file-level function fell through to the
+                            // superclass guard below and was recorded as having
+                            // no target. That is what reported
+                            // `procguard::run_tree_killer` dead at the confident
+                            // tier while two call sites and a coverage hit
+                            // proved otherwise.
+                            //
+                            // Safe precisely because the two spellings cannot
+                            // collide in this language: `self.helper()` on a
+                            // free function is not valid Rust, so a `self`
+                            // receiver landing on a `Function` can only have
+                            // come from `self::`/absorbed `super::`. The
+                            // `Method` arm keeps every dotted call, and the
+                            // other families keep the bare-name restriction the
+                            // comment above earned.
+                            resolution = Some(Arc::new(Resolution::SameFile {
+                                target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
+                            }));
                         }
                     }
 
@@ -2489,7 +2764,23 @@ impl Resolver {
                     // A superclass receiver excludes the overriding declaration.
                     // Without a proven base target, bare-name widening fabricates
                     // a self-call. Preserve the unresolved site instead.
-                    if resolution.is_none() && call.receiver_expr.as_deref().is_some_and(|r| matches!(r, "super" | "super()" | "base")) {
+                    //
+                    // Not in Rust, where `super` is not superclass dispatch at
+                    // all — the language has no inheritance and `super::f()` is
+                    // a *module path* naming the parent module. Claiming
+                    // "superclass dispatch requires a proven base declaration"
+                    // for it stated a reason that cannot apply, and did so on
+                    // every file-level `super::` call in the corpus. Letting
+                    // Rust fall through leaves the site to `classify_unresolved`,
+                    // which has a tier for exactly this shape — `ModulePath`,
+                    // whose own documentation names `super::` — so the row still
+                    // records that nothing was bound, under a reason that is
+                    // true. The inline-module spelling never arrives here: the
+                    // extractor has already rewritten it to `self`, and rung 2c
+                    // above binds it.
+                    if resolution.is_none()
+                        && family != LangFamily::Rust
+                        && call.receiver_expr.as_deref().is_some_and(|r| matches!(r, "super" | "super()" | "base")) {
                         resolution = Some(Arc::new(Resolution::Unresolved {
                             reason: "superclass dispatch requires a proven base declaration".to_string(),
                         }));
@@ -2624,6 +2915,22 @@ impl Resolver {
                         reference.kind,
                         ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                     ) {
+                        continue;
+                    }
+                    // A DOM or stylesheet identity, answered by its own two-rung
+                    // ladder and by nothing else. It never reaches the code
+                    // rungs below, and a name they cannot find is not recorded
+                    // as an unresolved *code* reference: a class this index never
+                    // saw declared is the ordinary case — it lives in a global
+                    // stylesheet outside the tree, in a framework, or behind a
+                    // CDN — and filing 40,000 of those as failed attributions
+                    // would bury the tier whose whole purpose is to name
+                    // defects. The limit is stated in `markup`'s documentation
+                    // instead of implied by an empty ledger.
+                    if reference.kind == ReferenceKind::Selector {
+                        if let Some(edge) = self.resolve_selector_reference(ext, reference) {
+                            edges.push(edge);
+                        }
                         continue;
                     }
                     if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
@@ -4264,14 +4571,6 @@ impl Resolver {
             }
         }
 
-        // Name identifiers unique-global to a unique function in another file.
-        // That binds `except Exception as e` / `print(e)` / `for _, segment`
-        // to a unique `def e` / `func segment` across the language family.
-        // Same-file and import-scoped remain; Calls still unique-global.
-        if matches!(reference.kind, ReferenceKind::Name) {
-            return None;
-        }
-
         // X45. The package block, for the reference half of the ladder.
         //
         // `func score(paper Paper)` in `search/rank.go` names the `Paper` its
@@ -4326,6 +4625,37 @@ impl Resolver {
                     },
                 ));
             }
+        }
+
+        // Name identifiers unique-global to a unique function in another file.
+        // That binds `except Exception as e` / `print(e)` / `for _, segment`
+        // to a unique `def e` / `func segment` across the language family.
+        // Same-file and import-scoped remain; Calls still unique-global.
+        //
+        // This guards the **global** tier below, and it used to sit above the
+        // two scope rungs as well — which caught them by position rather than
+        // by the argument. The argument is about matching a bare name *across
+        // the family*, where two packages can each declare `Version` and the
+        // name alone cannot say which was meant. Inside one package that is not
+        // an inference at all: Go's spec puts every package-level identifier in
+        // the package block, and `same_package_target` abstains outright when
+        // the package declares the name twice
+        // (`a_name_the_package_declares_twice_is_an_abstention_not_a_choice`).
+        // The same-file and import-scoped rungs have already run by here, so a
+        // local variable or an imported name has bound above and cannot reach
+        // the package block by mistake.
+        //
+        // What the refusal cost while it stood above them: a package-level
+        // *constant* read as a bare name produced no edge at all, so
+        // `cmd/devcouncil/version.go` — whose `Version` `main.go` prints on
+        // three lines — was reported by `unwired_candidates` as a file nothing
+        // depends on. Types and calls were unaffected, which is why it survived:
+        // they do not arrive as `ReferenceKind::Name`.
+        //
+        // `a_bare_name_still_does_not_reach_another_package` holds the other
+        // half, so moving this cannot quietly become deleting it.
+        if matches!(reference.kind, ReferenceKind::Name) {
+            return None;
         }
 
         if let Some(hits) = self.symbol_index.get(name) {
@@ -4393,6 +4723,103 @@ impl Resolver {
             let first = *file_hits.first()?;
             file_hits.iter().all(|kind| *kind == first).then_some(first)
         })
+    }
+
+    /// Resolve one [`ReferenceKind::Selector`] against markup and stylesheet
+    /// declarations only.
+    ///
+    /// Two rungs, and deliberately no third:
+    ///
+    /// 1. **This file.** A component's `<style>` is scoped to it by every
+    ///    framework that has one, and a `data-*` hook is queried by the script
+    ///    beside it, so a declaration in the same file is the answer whenever
+    ///    there is one — deterministic, exactly as `SameFile` is for code.
+    /// 2. **Exactly one file in the repository.** A global stylesheet declares
+    ///    `.btn` once and every component that writes `class="btn"` means that
+    ///    one. Rated `UniqueGlobal`, the same rung and the same confidence the
+    ///    code ladder gives a name with one declaration.
+    ///
+    /// Several files and no same-file match is **no edge**. Two components that
+    /// each scope a `.card` are two different `.card`s, and picking one would
+    /// assert a relationship between unrelated components; the honest answer is
+    /// that this index cannot say which, and `AmbiguousGlobal` would still put a
+    /// speculative edge in the graph.
+    fn resolve_selector_reference(
+        &self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+    ) -> Option<ResolvedEdge> {
+        let declaring = self.selector_symbols.get(&reference.name)?;
+        let (target_file, resolution) = if declaring
+            .iter()
+            .any(|declaration| declaration.file == ext.file_path)
+        {
+            (
+                ext.file_path.clone(),
+                Resolution::SameFile {
+                    target_symbol: reference.name.clone(),
+                    target_file: ext.file_path.clone(),
+                },
+            )
+        } else if declaring.len() == 1 && self.may_cross_files(reference, &declaring[0]) {
+            let target = declaring[0].file.clone();
+            (
+                target.clone(),
+                Resolution::UniqueSelector {
+                    target_symbol: reference.name.clone(),
+                    target_file: target,
+                },
+            )
+        } else {
+            return None;
+        };
+        Some(self.reference_edge(ext, &target_file, &reference.name, reference, resolution))
+    }
+
+    /// Whether a selector may reach a declaration in *another* file at all.
+    ///
+    /// Uniqueness is not sufficient here, which is what separates this rung from
+    /// the code ladder's. A name declared exactly once is still unreachable when
+    /// the two ends are scoped to different components, and an edge between them
+    /// is false rather than uncertain. Two ways for it to be reachable, and
+    /// nothing else:
+    ///
+    /// 1. **The declaration is global.** A `.css`/`.scss`/`.less` file, or a
+    ///    `<style>` in a plain `.html` page, applies to the whole document, so
+    ///    every component that names one of its classes means that one.
+    /// 2. **The name is an `id`.** An id is unique *per document*, not per
+    ///    component, so one component's `aria-controls="task-archive-dock"`
+    ///    naming another's `id` is the ordinary correct case — it is how an ARIA
+    ///    relationship is written across a page.
+    ///
+    /// Everything else abstains. Measured on GitPulse, this is the difference
+    /// between 672 cross-file edges with three wrong ones and 669 with none: the
+    /// three were `.selected`, `.sheet-body` and `.status`, each declared in one
+    /// component's scoped `<style>` and named by a different component's markup,
+    /// where the real declaration is either global CSS this index never saw or
+    /// absent altogether.
+    ///
+    /// **A third clause was considered and removed**, which is worth recording
+    /// because it reads as obviously right: *the reference is global*, on the
+    /// grounds that a rule in a global stylesheet selects across the whole
+    /// document. It has no correct producer. A stylesheet's selectors are read as
+    /// *declarations*, not uses, so a global sheet emits almost no references to
+    /// admit — and the one shape the clause did admit was wrong: a plain page's
+    /// `class="x"` reaching a `.x` that only a component scopes, which that
+    /// component's compiled CSS cannot match.
+    ///
+    /// The residual, stated rather than implied: clause 2 assumes the two
+    /// components render into the same document, which is true of a single-page
+    /// application and is not something this index proves. Two separately-mounted
+    /// pages could each carry an element with that id and the edge would join the
+    /// wrong pair. That is why an id crossing files is rated `HIGH` and never
+    /// `DETERMINISTIC`.
+    fn may_cross_files(
+        &self,
+        reference: &ExtractedReference,
+        declaration: &SelectorDeclaration,
+    ) -> bool {
+        declaration.in_global_sheet || reference.name.starts_with('#')
     }
 
     fn reference_edge(
@@ -4500,6 +4927,51 @@ impl Resolver {
             for cand in candidates {
                 if self.file_symbols.contains_key(&cand) {
                     return Some(cand);
+                }
+            }
+        }
+
+        // Shell `source` / `.` names a **path**, not a module, and it is the one
+        // import form whose base directory is the runtime working directory
+        // rather than anything written down.
+        //
+        // There was no arm here at all, so every specifier
+        // `langimports::shell` extracted resolved to nothing. `shell` still
+        // declares `Capability::Imports`, which is what makes that silent: SQL
+        // declines the capability and is charged `import_blind`, so a `.sql`
+        // file nothing imports is excluded from the finding with a reason,
+        // while a `.sh` file nothing *could* import was reported as unwired on
+        // the strength of a lookup that never had an arm to run.
+        //
+        // Measured on this repository: `rust/verify.sh` and
+        // `rust/tools/memory_model_probe.sh` both `. tools/peak_rss.sh`, and
+        // the sourced file was an unwired candidate. Worse than the missing
+        // edge, the `peak_rss_bytes` calls it defines fanned out through the
+        // global tier onto **six archived copies** under
+        // `benchmarks/results/competition/*/peak_rss.sh` — the stale artifacts
+        // absorbed the edges the live file should have had.
+        //
+        // The specifier is tried against each ancestor directory of the
+        // sourcing script, nearest first. A script that sources a relative path
+        // has almost always `cd`-ed somewhere inside its own tree first
+        // (`verify.sh` opens with `cd "$(dirname "$0")"`), and the ancestor walk
+        // is the bounded way to say that without guessing at a cwd: it cannot
+        // reach outside the repository, it cannot invent a file — the indexed
+        // universe decides — and nearest-first makes the most specific match
+        // win. An absolute or `$`-bearing specifier never arrives: the
+        // extractor refuses those rather than emitting a path the author did
+        // not write.
+        if lang == "shell" {
+            let mut probe = dir.clone();
+            loop {
+                if let Some(candidate) = Self::normalize_rel(&probe, clean_spec) {
+                    if self.file_symbols.contains_key(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+                match probe.rsplit_once('/') {
+                    Some((parent, _)) if !parent.is_empty() => probe = parent.to_string(),
+                    _ => break,
                 }
             }
         }
@@ -4613,7 +5085,27 @@ impl Resolver {
             }
         }
 
-        if lang == "rust" && (clean_spec.starts_with("self::") || clean_spec.starts_with("super::"))
+        // Rust 2018 *uniform paths*: `use schema::stamp;` written beside
+        // `pub mod schema;` names this file's own child module, with no `self::`
+        // on it. That is how every crate root in this workspace is written —
+        // `pub use model::*;`, `pub use resolver::Resolver;` — and there was no
+        // arm for it. A bare specifier fell through to the language table,
+        // which carries no Rust rule at all, so it resolved to nothing and the
+        // crate surface was invisible to the re-export chain built above.
+        //
+        // Read as `self::`-relative and accepted only when the candidate is an
+        // indexed file, so an external crate name binds to nothing rather than
+        // to a coincidence: the corpus decides, not the guess. `use serde::…`
+        // probes a sibling `serde.rs`, finds none, and stays unresolved exactly
+        // as before.
+        let rust_uniform_path = lang == "rust"
+            && !clean_spec.is_empty()
+            && !clean_spec.starts_with("crate::")
+            && !matches!(clean_spec, "self" | "super" | "crate");
+        if lang == "rust"
+            && (clean_spec.starts_with("self::")
+                || clean_spec.starts_with("super::")
+                || rust_uniform_path)
         {
             let mut tail = clean_spec;
             let mut hops = 0usize;
@@ -4660,6 +5152,44 @@ impl Resolver {
                     }
                 }
                 parts.pop();
+            }
+        }
+
+        // One Rust crate naming another. Last of the Rust rungs on purpose: a
+        // path that resolves inside this crate is what the author wrote, and
+        // only a specifier no local module answers can be a sibling crate.
+        //
+        // `use devmap_store::schema::CURRENT_SCHEMA_VERSION;` walks the tail
+        // the same way `crate::` does, so a deep path lands on the module that
+        // declares the name; a bare `use devmap_store::X;` lands on the root and
+        // the re-export chain takes it the rest of the way.
+        if lang == "rust" {
+            let (head, tail) = clean_spec.split_once("::").unwrap_or((clean_spec, ""));
+            if let Some(Some(root)) = self.rust_crate_roots.get(head) {
+                let root = root.clone();
+                let mut parts: Vec<&str> = if tail.is_empty() {
+                    Vec::new()
+                } else {
+                    tail.split("::").collect()
+                };
+                self.trim_to_indexed_depth(&mut parts);
+                while !parts.is_empty() {
+                    let module_path = parts.join("/");
+                    for candidate in [
+                        format!("{root}/{module_path}.rs"),
+                        format!("{root}/{module_path}/mod.rs"),
+                    ] {
+                        if self.file_symbols.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
+                    }
+                    parts.pop();
+                }
+                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
+                    if self.file_symbols.contains_key(&candidate) {
+                        return Some(candidate);
+                    }
+                }
             }
         }
 

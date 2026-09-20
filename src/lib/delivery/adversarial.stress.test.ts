@@ -18,12 +18,17 @@ import {
   durationMs,
   formatDuration,
   longestDurationMs,
+  GLANCE_NAME_CHARS,
+  glanceName,
+  glanceState,
   MAX_LABEL_CHARS,
   medianSettledDurationMs,
   parseInstant,
+  TIMELINE_PREVIEW_COUNT,
   type TimelineRow,
 } from "./timeline";
 import { anyInFlight, failuresSince, settledSince, verdictRate } from "./transitions";
+import { overflowsPreview, previewSlice } from "../ui/previewList";
 
 /**
  * Seeded so a failure is reproducible.
@@ -160,6 +165,10 @@ describe("the run vocabulary under fuzz", () => {
       expect(row.label.length, "a row must always have a label").toBeGreaterThan(0);
       expect([...row.label].length).toBeLessThanOrEqual(MAX_LABEL_CHARS + 1);
       expect([...row.sublabel].length).toBeLessThanOrEqual(MAX_LABEL_CHARS + 1);
+      const name = glanceName(row);
+      expect(/[\n\r\u2028\u2029]/.test(name)).toBe(false);
+      expect([...name].length).toBeLessThanOrEqual(GLANCE_NAME_CHARS + 1);
+      expect(["Pass", "Fail", "Live", "—"]).toContain(glanceState(row.phase));
     }
   });
 });
@@ -520,5 +529,41 @@ describe("state machine exhaustiveness", () => {
     // activity must never show "live updates paused".
     const spent: PollState = { startedAt: 0, polls: 1e9, failures: 1e9 };
     expect(decidePoll({ anyInFlight: false, state: spent, now: 1e12 }).kind).toBe("idle");
+  });
+});
+
+describe("preview collapse under fuzz", () => {
+  it("never hides a non-empty listing, and agrees with the expander", () => {
+    const random = rng(0x51ce);
+    const counts = [
+      TIMELINE_PREVIEW_COUNT,
+      0,
+      -1,
+      1,
+      3,
+      5,
+      8,
+      20,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      1.9,
+      1e12,
+    ];
+    let sawHidden = false;
+    for (let i = 0; i < 5_000; i += 1) {
+      const n = Math.floor(random() * 40);
+      const count = pick(random, counts);
+      const expanded = random() > 0.5;
+      const shown = previewSlice(Array.from({ length: n }), expanded, count);
+      if (n > 0) expect(shown.length).toBeGreaterThan(0);
+      if (n === 0) expect(shown).toEqual([]);
+      if (expanded) expect(shown).toHaveLength(n);
+      else expect(shown.length).toBeLessThanOrEqual(Math.max(n, 0));
+      const hidden = n - previewSlice(Array.from({ length: n }), false, count).length;
+      expect(overflowsPreview(n, count)).toBe(hidden > 0);
+      if (hidden > 0) sawHidden = true;
+    }
+    expect(sawHidden, "non-vacuity: the fuzz must have hidden rows").toBe(true);
   });
 });

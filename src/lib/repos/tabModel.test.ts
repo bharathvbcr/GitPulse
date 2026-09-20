@@ -19,6 +19,16 @@ import {
   dropReorderIndex,
   moveTabBy,
   moveTabTo,
+  setTabGroup,
+  setGroupCollapsed,
+  toggleGroupCollapsed,
+  isGroupCollapsed,
+  renameGroup,
+  ungroupTabs,
+  closeGroup,
+  groupByParentFolder,
+  collapseAllGroups,
+  expandAllGroups,
   type WorkspaceTabs,
 } from "./tabModel";
 
@@ -188,14 +198,117 @@ describe("pin close-others and recents", () => {
   });
 });
 
+describe("tab grouping and folder heads", () => {
+  it("sets, updates, and clears tab groups", () => {
+    let ws = emptyWorkspace();
+    const t1 = mustOpen(ws, "/code/devtools/repo1");
+    const t2 = mustOpen(t1.workspace, "/code/devtools/repo2");
+    ws = setTabGroup(t2.workspace, t1.id, "devtools");
+    expect(ws.tabs.find((t) => t.id === t1.id)?.group).toBe("devtools");
+    expect(ws.tabs.find((t) => t.id === t2.id)?.group).toBeNull();
+
+    ws = setTabGroup(ws, t1.id, "   ");
+    expect(ws.tabs.find((t) => t.id === t1.id)?.group).toBeNull();
+  });
+
+  it("automatically groups tabs by parent folder", () => {
+    let ws = emptyWorkspace();
+    ws = mustOpen(ws, "/Users/dev/code/devtools/GitPulse").workspace;
+    ws = mustOpen(ws, "/Users/dev/code/web/frontend").workspace;
+    ws = mustOpen(ws, "/Users/dev/code/devtools/cli").workspace;
+    ws = mustOpen(ws, "/Users/dev/code/web/backend").workspace;
+
+    ws = groupByParentFolder(ws);
+    const groups = ws.tabs.map((t) => t.group);
+    expect(groups).toEqual(["devtools", "devtools", "web", "web"]);
+    assertWorkspaceInvariants(ws, opts);
+  });
+
+  it("collapses and toggles group collapse state, expanding when active tab is activated", () => {
+    let ws = emptyWorkspace();
+    const t1 = mustOpen(ws, "/code/devtools/r1");
+    const t2 = mustOpen(t1.workspace, "/code/devtools/r2");
+    ws = setTabGroup(t2.workspace, t1.id, "devtools");
+    ws = setTabGroup(ws, t2.id, "devtools");
+
+    ws = setGroupCollapsed(ws, "devtools", true);
+    expect(isGroupCollapsed(ws, "devtools")).toBe(true);
+
+    ws = toggleGroupCollapsed(ws, "devtools");
+    expect(isGroupCollapsed(ws, "devtools")).toBe(false);
+
+    ws = setGroupCollapsed(ws, "devtools", true);
+    expect(isGroupCollapsed(ws, "devtools")).toBe(true);
+
+    // Activating t1 should auto-expand "devtools"
+    ws = activateTab(ws, t1.id);
+    expect(isGroupCollapsed(ws, "devtools")).toBe(false);
+  });
+
+  it("renames group and closes group", () => {
+    let ws = emptyWorkspace();
+    const t1 = mustOpen(ws, "/code/devtools/r1");
+    const t2 = mustOpen(t1.workspace, "/code/devtools/r2");
+    const t3 = mustOpen(t2.workspace, "/code/web/r3");
+    ws = setTabGroup(t3.workspace, t1.id, "devtools");
+    ws = setTabGroup(ws, t2.id, "devtools");
+    ws = setTabGroup(ws, t3.id, "web");
+
+    ws = renameGroup(ws, "devtools", "core-tools");
+    expect(ws.tabs.find((t) => t.id === t1.id)?.group).toBe("core-tools");
+    expect(ws.tabs.find((t) => t.id === t2.id)?.group).toBe("core-tools");
+
+    const closed = closeGroup(ws, "core-tools");
+    expect(closed.closedPaths).toHaveLength(2);
+    expect(closed.workspace.tabs).toHaveLength(1);
+    expect(closed.workspace.tabs[0].id).toBe(t3.id);
+    assertWorkspaceInvariants(closed.workspace, opts);
+  });
+
+  it("ungroups tabs", () => {
+    let ws = emptyWorkspace();
+    const t1 = mustOpen(ws, "/code/devtools/r1");
+    const t2 = mustOpen(t1.workspace, "/code/web/r2");
+    ws = setTabGroup(t2.workspace, t1.id, "devtools");
+    ws = setTabGroup(ws, t2.id, "web");
+
+    ws = ungroupTabs(ws, "devtools");
+    expect(ws.tabs.find((t) => t.id === t1.id)?.group).toBeNull();
+    expect(ws.tabs.find((t) => t.id === t2.id)?.group).toBe("web");
+
+    ws = ungroupTabs(ws);
+    expect(ws.tabs.find((t) => t.id === t2.id)?.group).toBeNull();
+  });
+
+  it("collapses and expands all groups at once", () => {
+    let ws = emptyWorkspace();
+    const t1 = mustOpen(ws, "/code/devtools/r1");
+    const t2 = mustOpen(t1.workspace, "/code/web/r2");
+    const t3 = mustOpen(t2.workspace, "/code/infra/r3");
+    ws = setTabGroup(t3.workspace, t1.id, "devtools");
+    ws = setTabGroup(ws, t2.id, "web");
+    ws = setTabGroup(ws, t3.id, "infra");
+
+    ws = collapseAllGroups(ws);
+    expect(ws.collapsedGroups).toEqual(expect.arrayContaining(["devtools", "web", "infra"]));
+    expect(ws.collapsedGroups).toHaveLength(3);
+
+    ws = expandAllGroups(ws);
+    expect(ws.collapsedGroups).toEqual([]);
+  });
+});
+
 describe("adversarial stress", () => {
-  it("keeps invariants across 5_000 random open/close/reorder/pin operations", () => {
+  it("keeps invariants across 5_000 random open/close/reorder/pin/group operations", () => {
     let ws = emptyWorkspace();
     const rng = mulberry32(0x51f1e7);
     for (let i = 0; i < 5_000; i += 1) {
-      const roll = rng() % 9;
+      const roll = rng() % 13;
       if (roll === 0 || ws.tabs.length === 0) {
-        const result = openTab(ws, `/stress/repo-${rng() % 40}`, opts, { pinned: rng() % 5 === 0 });
+        const result = openTab(ws, `/stress/repo-${rng() % 40}`, opts, {
+          pinned: rng() % 5 === 0,
+          group: rng() % 3 === 0 ? `group-${rng() % 5}` : null,
+        });
         if (result.ok) ws = result.workspace;
       } else if (roll === 1) {
         const victim = ws.tabs[rng() % ws.tabs.length];
@@ -213,6 +326,15 @@ describe("adversarial stress", () => {
         ws = closeOtherTabs(ws, ws.tabs[rng() % ws.tabs.length].id);
       } else if (roll === 7 && ws.tabs.length > 0) {
         ws = closeTabsToTheRight(ws, ws.tabs[rng() % ws.tabs.length].id);
+      } else if (roll === 8 && ws.tabs.length > 0) {
+        const tab = ws.tabs[rng() % ws.tabs.length];
+        ws = setTabGroup(ws, tab.id, rng() % 2 === 0 ? `group-${rng() % 4}` : null);
+      } else if (roll === 9) {
+        ws = groupByParentFolder(ws);
+      } else if (roll === 10) {
+        ws = toggleGroupCollapsed(ws, `group-${rng() % 5}`);
+      } else if (roll === 11 && ws.tabs.length > 0) {
+        ws = closeGroup(ws, `group-${rng() % 5}`).workspace;
       } else if (ws.lastClosed.length > 0) {
         const reopened = reopenLastClosed(ws, opts);
         if (reopened.ok) ws = reopened.workspace;

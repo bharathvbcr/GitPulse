@@ -13,8 +13,17 @@ import { RETIRED_VIEWS, isViewTab } from "../repos/persist";
 import { WIP_DESTINATIONS, WIP_REASON_KINDS } from "../repos/wipSummary";
 
 describe("view sections", () => {
-  it("gives History the three lenses that were three tabs", () => {
-    expect(sectionsFor("history").map((s) => s.id)).toEqual(["graph", "diff", "reflog"]);
+  it("keeps the three lenses that were three tabs, and the one that never was", () => {
+    // Graph, Diff and Reflog were top-level tabs, and their order is what the
+    // consolidation promised. Suspects is a fourth reading of the same subject
+    // — the history read backwards, from a symptom to its causes — so it lands
+    // after them rather than displacing one.
+    expect(sectionsFor("history").map((s) => s.id)).toEqual([
+      "graph",
+      "diff",
+      "reflog",
+      "suspects",
+    ]);
   });
 
   it("opens a sectioned view on its first section", () => {

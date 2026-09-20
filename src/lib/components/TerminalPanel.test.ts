@@ -202,11 +202,11 @@ describe("TerminalPanel truncation disclosure", () => {
 });
 
 describe("TerminalPanel chrome popovers", () => {
-  it("keeps shortcuts, sessions, and tab options in the column instead of overlaying the grid", () => {
+  it("keeps shortcuts, sessions, find, and tab options in the column instead of overlaying the grid", () => {
     // On macOS `bg-surface` is translucent. An absolutely positioned bar at a
     // guessed header+tabs offset paints over xterm, so the prompt, the
     // session badge, and the shortcut legend occupy the same pixels.
-    // Find already takes a row in the session; these three must too.
+    // Find already takes a row in the session; these four must too.
     const ruleStart = source.indexOf(".terminal-popover {");
     expect(ruleStart).toBeGreaterThan(-1);
     const rule = source.slice(ruleStart, source.indexOf("}", ruleStart) + 1);
@@ -217,7 +217,7 @@ describe("TerminalPanel chrome popovers", () => {
     const panesIdx = source.indexOf('class="terminal-panes');
     expect(panesIdx).toBeGreaterThan(-1);
     const marks = [...source.matchAll(/class="terminal-popover/g)];
-    expect(marks).toHaveLength(5);
+    expect(marks).toHaveLength(4);
     for (const mark of marks) {
       expect(mark.index).toBeLessThan(panesIdx);
     }
@@ -229,6 +229,31 @@ describe("TerminalPanel chrome popovers", () => {
     expect(harness).toContain('check("tab options sit above the grid instead of overlapping it"');
     expect(harness).toContain('check("session list sits above the grid instead of overlapping it"');
     expect(harness).toContain('check("session search sits above the grid instead of overlapping it"');
-    expect(harness).toContain('check("launcher menu sits above the grid instead of overlapping it"');
+  });
+
+  it("opens the session-type picker as a compact overlay instead of a chrome row", () => {
+    // A full-width in-flow type list shoved the PTY down by its own height.
+    // This picker is a menu, not a toolbar, so it uses the shared portaled
+    // popover — `gp-menu` carries the float blur, so it can sit over xterm.
+    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{launcherMenuDismissal\}/);
+    expect(source).toContain("element: launcherTriggerEl");
+    expect(source).toContain("[data-terminal-launcher], [data-terminal-launcher-popup]");
+    expect(source).toContain("LAYERS.MENU");
+    expect(source).toContain('data-terminal-launcher-popup');
+    expect(source).toContain('aria-label="New session type menu"');
+    expect(source).toContain('aria-haspopup="listbox"');
+    expect(source).not.toContain("clampMenuPosition");
+    const menuBlock = source.slice(
+      source.indexOf('id="terminal-launcher-menu"'),
+      source.indexOf('aria-label="New session type menu"'),
+    );
+    expect(menuBlock).toContain("gp-menu gp-pop");
+    expect(menuBlock).not.toContain("terminal-popover");
+    const harness = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../../harness/terminal.html"),
+      "utf8",
+    );
+    expect(harness).toContain('check("launcher menu does not shift the session grid"');
+    expect(harness).toContain('check("launcher menu is a compact overlay"');
   });
 });

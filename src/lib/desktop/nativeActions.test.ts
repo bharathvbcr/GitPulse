@@ -73,7 +73,9 @@ describe("dispatchNativeMenu", () => {
         expected.push(`tab:${view.id}:${section.id}`);
       }
     }
-    expect(expected).toHaveLength(15);
+    // Written out so a registry that collapsed to nothing could not make the
+    // comparison below pass against an equally empty call list.
+    expect(expected).toHaveLength(16);
     expect(h.calls).toEqual(expected);
   });
 

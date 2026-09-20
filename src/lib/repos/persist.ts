@@ -17,6 +17,8 @@ export const STORAGE_KEY_LAST_PATH = "gitpulse_last_repo";
 /** The workspace schema version this build writes and understands. */
 export const WORKSPACE_VERSION = 1 as const;
 
+import { normalizeGroupName, MAX_COLLAPSED_GROUPS } from "./tabGroups";
+
 export type ViewTab = "work" | "code" | "history" | "insights";
 
 export const VIEW_TABS: readonly ViewTab[] = ["work", "code", "history", "insights"];
@@ -24,6 +26,7 @@ export const VIEW_TABS: readonly ViewTab[] = ["work", "code", "history", "insigh
 export interface PersistedTab {
   path: string;
   pinned: boolean;
+  group?: string | null;
   viewTab: ViewTab;
   /**
    * The section last open in each sectioned view, keyed by view id.
@@ -59,6 +62,7 @@ export interface PersistedWorkspace {
   activePath: string | null;
   recents: string[];
   lastClosed: string[];
+  collapsedGroups?: string[];
 }
 
 export interface StorageLike {
@@ -278,6 +282,7 @@ export function loadPersistedWorkspace(
     activePath: null,
     recents: [],
     lastClosed: [],
+    collapsedGroups: [],
   };
   if (!storage) return empty;
 
@@ -298,6 +303,7 @@ export function loadPersistedWorkspace(
     activePath: last,
     recents: last ? [last, ...recents.filter((path) => identityKey(path, options) !== identityKey(last, options))] : recents,
     lastClosed: [],
+    collapsedGroups: [],
   };
 }
 
@@ -346,6 +352,7 @@ export function workspaceToPersisted(
       return {
         path: tab.path,
         pinned: tab.pinned,
+        group: tab.group ? (normalizeGroupName(tab.group) ?? undefined) : undefined,
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
         terminalOpen: session?.terminalOpen === true,
@@ -356,6 +363,9 @@ export function workspaceToPersisted(
     activePath: active?.path ?? null,
     recents: ws.recents.slice(0, MAX_RECENT_REPOS),
     lastClosed: ws.lastClosed.slice(0, MAX_LAST_CLOSED),
+    collapsedGroups: (ws.collapsedGroups ?? [])
+      .map((g) => normalizeGroupName(g))
+      .filter((g): g is string => g !== null),
   };
 }
 
@@ -374,6 +384,7 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
     tabs.push({
       path,
       pinned: record.pinned === true,
+      group: normalizeGroupName(record.group) ?? undefined,
       viewTab: migrateViewTab(record.viewTab),
       viewSections: sanitizeViewSections(record.viewSections, record.viewTab),
       // Strict `=== true`: an absent field, and any non-boolean a hand-edited
@@ -395,7 +406,22 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
     activePath: activeExists ? activePath : tabs[0]?.path ?? null,
     recents,
     lastClosed,
+    collapsedGroups: sanitizeGroupList(raw.collapsedGroups),
   };
+}
+
+function sanitizeGroupList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const normalized = normalizeGroupName(item);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+    if (out.length >= MAX_COLLAPSED_GROUPS) break;
+  }
+  return out;
 }
 
 function sanitizePathList(raw: unknown, options: PathIdentityOptions, cap: number): string[] {

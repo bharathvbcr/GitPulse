@@ -394,7 +394,49 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// reference for a Swift, Kotlin, TypeScript, Java, C#, Python, PHP, Scala,
 /// Dart, Objective-C, C, C++, Solidity or Pascal field, so every receiver typed
 /// only by one stays `UninferredReceiver` until the file is re-extracted.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "54";
+///
+/// v55 resolves a Rust call receiver of exactly `super` against the inline
+/// module it is written inside — see `treesitter::rust_absorb_inline_super`. A
+/// v54 row records `super` for both `mod tests { super::f() }` and a file-level
+/// `super::f()`, which are different modules, so the resolver could only refuse
+/// both. Every `super::`-qualified call to a file-level function therefore had
+/// no target, and the function it named could be reported dead at the confident
+/// tier with its call sites in plain view.
+///
+/// v56 records a Rust `pub use` as an **export** and not only as an import —
+/// see `treesitter::rust_use_imports`. A v55 row carries no export record for a
+/// `use_declaration` of any visibility, so `compute_reexport_chains` had no
+/// Rust input whatsoever and a crate root's republished surface was invisible:
+/// the import bound to `lib.rs`, `lib.rs` declares none of those names, and the
+/// ladder fell through to the bare-name global lookup that the chain map exists
+/// to replace. That is the layout of every `lib.rs` in this workspace.
+///
+/// v57 exempts a method declared in an object literal that is handed to a call
+/// — see `treesitter::js_object_literal_argument_callee`. A v56 row carries no
+/// wiring for it, so every callback interface whose name is not in the two
+/// bundler/lifecycle allowlists stays confidently dead: measured on GitPulse,
+/// `registerLinkProvider({ provideLinks() {…} })` was reported at 0.9, the tier
+/// whose contract is "safe to act on", with coverage recording it executed.
+/// v58 — two wiring surfaces the extractor did not record, and one reference it
+/// should never have recorded.
+///
+/// A shell `source` / `.` now carries the resolver's glob marker (`alias = "."`)
+/// instead of a bare file import, because sourcing a script puts every name it
+/// defines in scope; a Cargo `build.rs` now emits a dynamic-reference form for
+/// each `cargo:rerun-if-changed=` path it declares, which is the one place a
+/// crate states that a file no `use` can reach is part of its build; and a Go
+/// **struct** literal's field key is no longer emitted as a name reference at
+/// all — `Command{run: nil}` names a field of `Command`, not a package-level
+/// `func run`. A map literal's key is untouched, because there it really is an
+/// expression.
+///
+/// All three change what an extraction *contains*, so a cached one is not
+/// merely older. Without the bump, `rust/tools/peak_rss.sh` and GitPulse's
+/// `src-tauri/swift/AppleIntelligence.swift` would keep being reported as files
+/// nothing depends on, and a cached Go field key would keep producing a
+/// fabricated `SamePackage` edge — from a cache, with no degraded marker to say
+/// why.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "58";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

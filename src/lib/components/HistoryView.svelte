@@ -31,8 +31,11 @@
   let {
     /** Reflog's loader, declared at module scope by App so it is stable. */
     loadReflog,
+    /** Suspects' loader, same contract: stable identity or LazyView remounts. */
+    loadSuspects,
   }: {
     loadReflog: ViewLoader;
+    loadSuspects: ViewLoader;
   } = $props();
 
   const section = $derived(activeSectionFor("history", $repoStore.viewSections));
@@ -53,6 +56,11 @@
       <DiffViewer />
     {:else if section === "reflog"}
       <LazyView load={loadReflog} name="the reflog" />
+    {:else if section === "suspects"}
+      <!-- The one section that reads the history backwards: from a symptom to
+           the commits that could have caused it. Lazy like the reflog — it
+           pulls the code-graph client, which no other History section needs. -->
+      <LazyView load={loadSuspects} name="regression suspects" />
     {:else}
       <div class="flex-1 flex flex-col min-h-0">
         <!-- What this graph is NOT drawing, above the graph it is about.

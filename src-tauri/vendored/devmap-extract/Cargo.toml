@@ -297,3 +297,11 @@ required-features = ["parse"]
 name = "a_declared_field_has_a_type"
 required-features = ["parse"]
 
+[[test]]
+name = "markup_and_style"
+required-features = ["parse"]
+
+[[test]]
+name = "markup_under_stress"
+required-features = ["parse"]
+

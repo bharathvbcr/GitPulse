@@ -46,8 +46,12 @@
 //!
 //! **What it deliberately does not do.** `css` and `html` appear in those
 //! permitted lists and no grammar for either is linked in this workspace, so
-//! they resolve to nothing routable and `<style>` regions are not touched. That
-//! is a gap, not a claim: nothing here reports anything about a stylesheet.
+//! they resolve to nothing routable and this module does not touch a `<style>`
+//! region. That is a boundary, not a gap: [`crate::markup`] reads the markup and
+//! stylesheet halves of the same file by scanner, from the same outer tree, and
+//! runs immediately after this merge. *This* module is the one that routes text
+//! back through a **grammar**, and a region it cannot route is a region it
+//! reports rather than reads.
 //!
 //! **Honesty.** A located region that is *not extracted* — an unparseable
 //! script, a language the registry does not permit there, a budget that ran out
@@ -341,7 +345,7 @@ fn collect_regions(root: Node, source: &str) -> Located {
     }
 }
 
-fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+pub(crate) fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
     let found = node
         .children(&mut cursor)
@@ -472,18 +476,27 @@ fn lone_js_identifier(text: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn span_of(node: Node) -> Span {
+pub(crate) fn span_of(node: Node) -> Span {
     Span {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
     }
 }
 
-fn text_of(node: Node, source: &str) -> String {
+/// The source text a node covers, borrowed.
+///
+/// The owner of "what does this node say", shared with [`crate::markup`] so the
+/// two tree walks cannot disagree about it. Borrowed rather than owned because
+/// one caller hands a whole `<style>` body to a scanner and copying it to do so
+/// would allocate the region twice per file.
+pub(crate) fn text_slice<'src>(node: Node, source: &'src str) -> &'src str {
     source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()
-        .to_string()
+}
+
+fn text_of(node: Node, source: &str) -> String {
+    text_slice(node, source).to_string()
 }
 
 /// Attributes of a start tag, read from the tag's own text.
@@ -972,7 +985,7 @@ fn shift(span: &mut Span, offset: usize) {
 
 /// Record the byte ranges no extractor read, so the file cannot report `Clean`
 /// over them.
-fn fold_unparsed_ranges(outcome: &mut ParseOutcome, mut unparsed: Vec<TextRange>) {
+pub(crate) fn fold_unparsed_ranges(outcome: &mut ParseOutcome, mut unparsed: Vec<TextRange>) {
     if unparsed.is_empty() {
         return;
     }
@@ -1008,7 +1021,7 @@ fn fold_unparsed_ranges(outcome: &mut ParseOutcome, mut unparsed: Vec<TextRange>
 /// gate digests. `symbols`, `imports` and `calls` are emitted in walk order and
 /// are left in it: the regions were merged in ascending byte order, so the
 /// merged sequence is still document order.
-fn reorder_after_merge(extraction: &mut Extraction) {
+pub(crate) fn reorder_after_merge(extraction: &mut Extraction) {
     extraction.exports.sort_by(|left, right| {
         (
             &left.exported_name,

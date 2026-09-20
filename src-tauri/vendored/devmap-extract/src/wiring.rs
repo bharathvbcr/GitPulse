@@ -879,6 +879,42 @@ pub fn js_bundler_plugin_hook_reason(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Longest callee expression carried into an exemption reason.
+///
+/// The reason is provenance a human reads, not an identity anything matches on,
+/// and a callee can be an arbitrarily long member chain. Bounded so one
+/// pathological expression cannot put a kilobyte into every annotation.
+const CALLEE_IN_REASON_MAX: usize = 60;
+
+/// Why a method written inside an object literal handed to a call is exempt.
+///
+/// Worded as a statement about the evidence rather than about the method, the
+/// same way [`GO_VALUE_MENTION_REASON`](crate::wiring) is: this does not claim
+/// the method runs. It says the syntax hands the object to a callee, so the
+/// callee — not this corpus — decides when its members are invoked, and an
+/// index that finds no call site has not shown that nothing calls it.
+///
+/// This is the structural counterpart to [`js_bundler_plugin_hook_reason`],
+/// which answers the same question from a *name* allowlist. A list can only
+/// ever cover the libraries somebody thought of: `registerLinkProvider({
+/// provideLinks() {…} })` is xterm's `ILinkProvider`, has no entry, and was
+/// reported dead at the confident tier — the tier whose contract is "safe to
+/// act on". Every callback interface of every other library had the same
+/// problem, and the shape they share is written in the syntax.
+pub fn js_object_literal_argument_reason(callee: &str) -> String {
+    let callee = callee.trim();
+    let shown: String = if callee.chars().count() > CALLEE_IN_REASON_MAX {
+        callee
+            .chars()
+            .take(CALLEE_IN_REASON_MAX)
+            .chain("…".chars())
+            .collect()
+    } else {
+        callee.to_string()
+    };
+    format!("declared in an object literal passed to `{shown}` — that callee decides when it runs")
+}
+
 fn looks_like_reexport_init(path: &str, source: &str) -> bool {
     let p = path.replace('\\', "/");
     let name = p.rsplit('/').next().unwrap_or(path);
@@ -1597,23 +1633,17 @@ fn file_suffix(path: &str) -> &str {
 /// kernel calls them unwired — confidently, and on every build.
 pub fn dynamic_reference_forms(path: &str, source: &str) -> Vec<String> {
     let suffix = file_suffix(path).to_ascii_lowercase();
-    if !CODE_CONFIG_SUFFIXES.contains(&suffix.as_str()) {
-        return Vec::new();
-    }
     let mut specs: Vec<String> = Vec::new();
-    for pattern in dynamic_reference_patterns() {
-        for capture in pattern.captures_iter(source) {
-            let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
-                continue;
-            };
-            if spec.is_empty() {
-                continue;
-            }
-            specs.extend(specs_for(path, spec));
-        }
+    // A Cargo build script names its inputs outright, and `rs` is deliberately
+    // not in `CODE_CONFIG_SUFFIXES` — adding it would run the Python and JS
+    // patterns over every Rust file in the corpus, which is the same
+    // over-matching the list's own comment warns about. So the suffix gate
+    // below covers the pattern sweeps only, and this one case is asked first.
+    if is_cargo_build_script(path) {
+        specs.extend(build_script_input_specs(path, source));
     }
-    if suffix == "html" || suffix == "htm" {
-        for pattern in html_reference_patterns() {
+    if CODE_CONFIG_SUFFIXES.contains(&suffix.as_str()) {
+        for pattern in dynamic_reference_patterns() {
             for capture in pattern.captures_iter(source) {
                 let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
                     continue;
@@ -1624,23 +1654,104 @@ pub fn dynamic_reference_forms(path: &str, source: &str) -> Vec<String> {
                 specs.extend(specs_for(path, spec));
             }
         }
-    }
-    // Python `wiring._package_json_script_keys`: npm script values name CLI
-    // files no import edge records. The kernel never scanned them, so every
-    // `scripts/*.mjs` in a Node project was an unwired candidate.
-    if file_suffix(path).eq_ignore_ascii_case("json")
-        && path
-            .replace('\\', "/")
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name == "package.json")
-    {
-        specs.extend(package_json_script_specs(path, source));
+        if suffix == "html" || suffix == "htm" {
+            for pattern in html_reference_patterns() {
+                for capture in pattern.captures_iter(source) {
+                    let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+                        continue;
+                    };
+                    if spec.is_empty() {
+                        continue;
+                    }
+                    specs.extend(specs_for(path, spec));
+                }
+            }
+        }
+        // Python `wiring._package_json_script_keys`: npm script values name CLI
+        // files no import edge records. The kernel never scanned them, so every
+        // `scripts/*.mjs` in a Node project was an unwired candidate.
+        if file_suffix(path).eq_ignore_ascii_case("json")
+            && path
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == "package.json")
+        {
+            specs.extend(package_json_script_specs(path, source));
+        }
     }
     let mut forms: Vec<String> = specs.iter().flat_map(|spec| module_forms(spec)).collect();
     forms.sort();
     forms.dedup();
     forms
+}
+
+/// Whether `path` is a Cargo build script — `build.rs` beside a manifest.
+///
+/// Matched on the file name rather than by reading `Cargo.toml`'s optional
+/// `build = "..."` key: a renamed build script is rare, and guessing at one
+/// would mean treating an arbitrary `.rs` file as a source of wiring evidence
+/// on the strength of its contents. A `build.rs` that is *not* registered as a
+/// build script is the harmless direction — its `cargo:` lines name real files
+/// either way.
+fn is_cargo_build_script(path: &str) -> bool {
+    normalize_path(path)
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "build.rs")
+}
+
+/// Files a Cargo build script declares as inputs, via `cargo:rerun-if-changed`.
+///
+/// This is the one place a Rust crate states "this file is part of my build"
+/// about something no `use` can reach: a `.swift` bridge, a `.proto`, a C
+/// source compiled by `cc`. GitPulse's `src-tauri/swift/AppleIntelligence.swift`
+/// is the measured case — `build.rs` compiles it with `swiftc` and declares it
+/// here, and it was still reported as a file nothing depends on, because the
+/// only edge to it is an argument to a subprocess.
+///
+/// Both spellings are accepted: `cargo:rerun-if-changed=` and the `cargo::`
+/// form Cargo 1.77 introduced.
+///
+/// A path built by interpolation — `println!("cargo:rerun-if-changed={}", dir)`
+/// — is refused for the same reason `langimports::shell` refuses
+/// `source "$HELPER"`: emitting the literal `{}` would invent a specifier the
+/// author never wrote, and emitting a guess at its expansion would be worse.
+fn build_script_input_specs(path: &str, source: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        regex::Regex::new(r#"cargo::?rerun-if-changed=([^\s\\"']+)"#)
+            .expect("build-script input pattern compiles")
+    });
+    let parent = match normalize_path(path).rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    };
+    let mut specs = Vec::new();
+    for capture in pattern.captures_iter(source) {
+        let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        // `{}`/`{dir}` is a format placeholder, and `$` is a shell or Cargo
+        // expansion. Either way the path is computed, not written.
+        if spec.contains('{') || spec.contains('}') || spec.contains('$') {
+            continue;
+        }
+        let spec = normalize_rel_path(spec);
+        if spec.is_empty() {
+            continue;
+        }
+        // The declaration is relative to the manifest directory, which is the
+        // build script's own. Both forms are emitted, the same way
+        // `package_json_script_specs` does: the bare one for a repository whose
+        // root *is* the crate, the joined one for a crate in a subdirectory.
+        if !parent.is_empty() {
+            specs.push(format!("{parent}/{spec}"));
+        }
+        specs.push(spec);
+    }
+    specs
 }
 
 #[cfg(test)]

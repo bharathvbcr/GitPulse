@@ -109,9 +109,18 @@ describe("sectionForChord", () => {
   });
 
   it("returns null past the end rather than clamping to the last section", () => {
-    // ⌥5 in a three-section view must fall through, not land on Reflog.
-    expect(sectionsFor("history")).toHaveLength(3);
-    expect(sectionForChord("history", chord("Digit5"))).toBeNull();
+    // The chord has to be exactly one past the end or this passes vacuously,
+    // so it is derived from the section count rather than written out: History
+    // gained a fourth lens and a hard-coded "Digit5" would have gone on
+    // testing the same thing while meaning something else.
+    const sections = sectionsFor("history");
+    expect(sections.length).toBeLessThan(SECTION_KEY_CODES.length);
+    expect(sectionForChord("history", chord(SECTION_KEY_CODES[sections.length]))).toBeNull();
+    // And the last real section still resolves, so "past the end" is a
+    // boundary rather than the whole map having stopped matching.
+    expect(sectionForChord("history", chord(SECTION_KEY_CODES[sections.length - 1]))?.id).toBe(
+      sections[sections.length - 1].id,
+    );
   });
 
   it("ignores Ctrl+Alt+digit, which already switches repository tabs", () => {

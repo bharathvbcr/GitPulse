@@ -3530,3 +3530,51 @@ it("does not replace a file chosen during repository hydration with an open dest
   expect(get(store).selectedFilePath).toBe("chosen.ts");
   for (const tab of get(store).openTabs) await store.closeTab(tab.id);
 });
+
+describe("repoStore tab grouping", () => {
+  it("assigns groups, groups by parent folder, collapses, renames, and closes groups", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/projects/devtools/alpha");
+    await store.openRepo("/projects/devtools/beta");
+    await store.openRepo("/projects/web/gamma");
+
+    expect(get(store).openTabs).toHaveLength(3);
+
+    // Group by parent folder
+    store.groupByParentFolder();
+    expect(get(store).openTabs.find((t) => t.path === "/projects/devtools/alpha")?.group).toBe("devtools");
+    expect(get(store).openTabs.find((t) => t.path === "/projects/devtools/beta")?.group).toBe("devtools");
+    expect(get(store).openTabs.find((t) => t.path === "/projects/web/gamma")?.group).toBe("web");
+
+    // Toggle collapse
+    store.toggleGroupCollapsed("devtools");
+    expect(get(store).collapsedGroups).toContain("devtools");
+    expect(store.isGroupCollapsed("devtools")).toBe(true);
+
+    store.setGroupCollapsed("devtools", false);
+    expect(get(store).collapsedGroups).not.toContain("devtools");
+
+    // Rename group
+    store.renameGroup("devtools", "core");
+    expect(get(store).openTabs.find((t) => t.path === "/projects/devtools/alpha")?.group).toBe("core");
+
+    // Close group
+    await store.closeGroup("core");
+    expect(get(store).openTabs).toHaveLength(1);
+    expect(get(store).openTabs[0].path).toBe("/projects/web/gamma");
+
+    // Ungroup
+    store.ungroupTabs();
+    expect(get(store).openTabs[0].group).toBeNull();
+
+    // Collapse all and expand all
+    store.groupByParentFolder();
+    store.collapseAllGroups();
+    expect(get(store).collapsedGroups.length).toBeGreaterThan(0);
+    store.expandAllGroups();
+    expect(get(store).collapsedGroups).toEqual([]);
+
+    for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+  });
+});
+

@@ -1269,7 +1269,7 @@
             an action to clear the filter, so let that one speak alone.
           -->
           {#if visibleRuns.length > 0}
-            <div class="mb-2">
+            <div class="mb-2 min-w-0">
               <DeliveryTimeline
                 title="Run duration and outcome"
                 rows={runRows}

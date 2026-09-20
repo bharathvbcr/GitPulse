@@ -215,6 +215,40 @@ fn important_surfaces(map: &Value, map_rel: &str) -> Vec<String> {
     lines
 }
 
+/// What GitPulse Insights answers that the code graph cannot: who else is in
+/// this repository right now.
+///
+/// DevMap describes the code. It has nothing to say about the other worktrees,
+/// the live agent sessions, or the file two of them are both holding. An agent
+/// that navigates the graph perfectly and then edits a file a sibling lane owns
+/// has still collided. The two tools are named together because neither one's
+/// answer is complete on its own.
+///
+/// The `ok` warning is the same honesty rule the rest of the kernel follows:
+/// GitPulse's facets fail independently, so a facet that could not scan must
+/// never be read as a facet that scanned and found nothing.
+pub const GITPULSE_STEP: &str = "Before you change anything, ask GitPulse Insights what else is \
+live in this repository. `gitpulse_insights` names the other worktrees, the running agent \
+sessions, uncommitted work, contended files and index health in one call. Then \
+`gitpulse_collision_risk` before touching a file another worktree may hold, \
+`gitpulse_active_changes` for what is in flight, `gitpulse_change_context` / \
+`gitpulse_provenance` for what changed and why, and `gitpulse_ledger_events` for the recorded \
+history. Its facets fail independently — check each `ok`, because a facet that could not scan \
+is not a facet that came back clean.";
+
+/// Why the guide addresses agents it will never be loaded by.
+///
+/// A subagent gets the prompt its parent wrote, not this file. So the rule that
+/// actually propagates is the one telling the parent to carry it forward; left
+/// out, the guide binds exactly one agent and every lane it spawns starts by
+/// grepping.
+pub const DELEGATION_RULE: &str = "This binds every agent working here, not only the one reading \
+this file. When you delegate — a subagent, a worktree lane, a handoff plan — name DevMap and \
+GitPulse Insights in the prompt with the same precedence, rather than leaving that agent to grep \
+its way in. When either tool cannot answer (truncated, `walk_incomplete`, empty on a built index, \
+or a capability it does not have), record the gap and say so; do not silently fall back to grep \
+and report the result as if the graph had confirmed it.";
+
 /// Render the guide for `map`, whose artifact sits at `map_rel` relative to the
 /// repository root.
 pub fn agent_guide_text(map: &Value, map_rel: &str, graph_rel: &str, store_rel: &str) -> String {
@@ -226,6 +260,8 @@ pub fn agent_guide_text(map: &Value, map_rel: &str, graph_rel: &str, store_rel: 
         format!("Use `{map_rel}` as the primary file index for this workspace."),
         format!("Repo map: `{map_rel}`"),
         format!("Code graph: `{graph_rel}` (symbol-level; query with `devmap`)."),
+        String::new(),
+        GITPULSE_STEP.to_string(),
         String::new(),
         "Workflow for agents:".to_string(),
         format!("1. Run `devmap paths --json` and `devmap status --json` first. Generated state is per-worktree and is not copied by Git. Read `{map_rel}` when present; if its location differs in this checkout, use the resolved `repo_map` path. If the store or map is missing, run `devmap build --manifest` from this worktree's root, then check status again. Never copy a sibling worktree's database."),
@@ -258,8 +294,12 @@ Always pass `repo_path` (the absolute repository path) on every `devmap_*` call,
 check `repository.root` in the envelope before trusting the answer — Cursor shares one \
 MCP process across workspace tabs. \
 Read `truncated` and `total` on every envelope before treating a list as complete. \
-When DevMap cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` \
-— do not switch indexes."
+When DevMap cannot answer, record a gap with \
+`devmap gap-record --tool <tool> --gap-id <id> --reason <why>` — do not switch \
+indexes. Give `--reason` what you asked, what came back, and why that is a gap. \
+It appends to `.devcouncil/codeintel/sessions/gaps.jsonl`, which \
+`devmap session-report` reads; go through the command rather than writing that \
+file, because the state directory is protected and a redirect at it is refused."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \
@@ -269,6 +309,8 @@ break before it is written."
         "10. Run `devmap build --manifest` after large refactors to refresh the database and exported maps, or `devmap serve` to keep the index warm; \
 `devmap status` reports generation, counts and freshness."
             .to_string(),
+        String::new(),
+        DELEGATION_RULE.to_string(),
         String::new(),
         "Important surfaces:".to_string(),
     ];
@@ -286,15 +328,18 @@ break before it is written."
 /// Cursor rule body: workflow summary plus the canonical hygiene rules.
 ///
 /// Frontmatter sets `alwaysApply: true` so every Cursor session gets DevMap
-/// navigation without depending on a skill being selected.
+/// navigation and GitPulse Insights without depending on a skill being
+/// selected.
 pub fn cursor_rule_text(map_rel: &str) -> String {
     format!(
         "---\n\
-description: DevMap navigation and repository hygiene\n\
+description: DevMap navigation, GitPulse Insights and repository hygiene\n\
 alwaysApply: true\n\
 ---\n\
 \n\
-# DevMap\n\
+# DevMap and GitPulse Insights\n\
+\n\
+{gitpulse}\n\
 \n\
 Use `{map_rel}` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.\n\
 \n\
@@ -302,8 +347,12 @@ Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `de
 \n\
 Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.\n\
 \n\
+{delegation}\n\
+\n\
 {rules}\n",
         map_rel = map_rel,
+        gitpulse = GITPULSE_STEP,
+        delegation = DELEGATION_RULE,
         rules = crate::hygiene::AGENT_RULES
     )
 }
@@ -621,6 +670,76 @@ mod tests {
         assert!(
             !rule.contains("GitNexus"),
             "generated Cursor rule must not name GitNexus: {rule}"
+        );
+    }
+
+    // The assertions below quote the guide's wording literally rather than
+    // comparing against `GITPULSE_STEP` / `DELEGATION_RULE`. A test that reads
+    // the constant under test agrees with whatever that constant says, which is
+    // exactly the property these are supposed to be able to falsify.
+
+    #[test]
+    fn the_guide_puts_gitpulse_insights_before_the_devmap_workflow() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        let gitpulse = text
+            .find("gitpulse_insights")
+            .expect("the guide must name GitPulse Insights");
+        let workflow = text
+            .find("Workflow for agents:")
+            .expect("the guide must keep its DevMap workflow");
+        assert!(
+            gitpulse < workflow,
+            "what else is live here is a question to ask before navigating, not after: {text}"
+        );
+        for tool in [
+            "gitpulse_collision_risk",
+            "gitpulse_active_changes",
+            "gitpulse_change_context",
+            "gitpulse_provenance",
+            "gitpulse_ledger_events",
+        ] {
+            assert!(text.contains(tool), "the guide omits {tool}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_guide_says_a_facet_that_could_not_scan_is_not_a_clean_facet() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(
+            text.contains("check each `ok`"),
+            "GitPulse facets fail independently; the guide must say so: {text}"
+        );
+        assert!(
+            text.contains("not a facet that came back clean"),
+            "a facet that could not scan must never read as one that scanned clean: {text}"
+        );
+    }
+
+    #[test]
+    fn the_guide_carries_both_tools_into_every_delegation() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(
+            text.contains("name DevMap and GitPulse Insights in the prompt"),
+            "a subagent reads its parent's prompt, not this file: {text}"
+        );
+        assert!(
+            text.contains("record the gap"),
+            "a tool that could not answer must be reported, not quietly swapped for grep: {text}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_rule_names_both_tools_and_the_delegation_rule() {
+        let rule = cursor_rule_text("m.json");
+        assert!(rule.contains("gitpulse_insights"), "{rule}");
+        assert!(rule.contains("devmap_impact"), "{rule}");
+        assert!(
+            rule.contains("name DevMap and GitPulse Insights in the prompt"),
+            "{rule}"
+        );
+        assert!(
+            rule.contains("description: DevMap navigation, GitPulse Insights"),
+            "the frontmatter description must say what the rule now covers: {rule}"
         );
     }
 

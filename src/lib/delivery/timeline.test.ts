@@ -4,10 +4,15 @@ import {
   barWidthPct,
   durationMs,
   formatDuration,
+  GLANCE_NAME_CHARS,
+  glanceName,
+  glanceState,
+  glanceTitle,
   longestDurationMs,
   medianSettledDurationMs,
   parseInstant,
   shortCommit,
+  TIMELINE_PREVIEW_COUNT,
   type TimelineRow,
 } from "./timeline";
 
@@ -29,6 +34,62 @@ function makeRow(overrides: Partial<TimelineRow> = {}): TimelineRow {
     ...overrides,
   };
 }
+
+describe("timeline preview length", () => {
+  it("draws three recent rows so a twenty-run sample cannot bury the rail", () => {
+    expect(TIMELINE_PREVIEW_COUNT).toBe(3);
+  });
+});
+
+describe("glance identity", () => {
+  it("prefers the shorter name, so a workflow wins over a commit subject", () => {
+    expect(
+      glanceName(
+        makeRow({
+          label: "chore(vendor): re-vendor dc-store from upstream",
+          sublabel: "CI",
+        }),
+      ),
+    ).toBe("CI");
+    expect(
+      glanceName(makeRow({ label: "rollout-7f3", sublabel: "fix the thing on main" })),
+    ).toBe("rollout-7f3");
+  });
+
+  it("caps a leftover long identity without splitting a code point", () => {
+    const out = glanceName(makeRow({ label: "👩‍👩‍👧‍👦".repeat(40), sublabel: "" }));
+    expect([...out].length).toBeLessThanOrEqual(GLANCE_NAME_CHARS + 1);
+    expect(out).not.toContain("�");
+    expect(out.endsWith("…")).toBe(true);
+  });
+
+  it("never invents a name when both fields are empty", () => {
+    expect(glanceName(makeRow({ label: "", sublabel: "" }))).toBe("");
+  });
+});
+
+describe("glance state", () => {
+  it("prints a four-word vocabulary, never the source's sentence", () => {
+    expect(glanceState("settled_ok")).toBe("Pass");
+    expect(glanceState("settled_bad")).toBe("Fail");
+    expect(glanceState("in_flight")).toBe("Live");
+    expect(glanceState("unknown")).toBe("—");
+  });
+});
+
+describe("glance tooltip", () => {
+  it("keeps the searchable full wording off the tile face", () => {
+    const row = makeRow({
+      label: "chore(vendor): re-vendor",
+      stateLabel: "Completed (no conclusion reported)",
+      branch: "main",
+      trigger: "push",
+    });
+    expect(glanceTitle(row)).toContain("Completed (no conclusion reported)");
+    expect(glanceTitle(row)).toContain("chore(vendor): re-vendor");
+    expect(glanceState(row.phase)).not.toContain("Completed");
+  });
+});
 
 describe("parsing an instant", () => {
   it("reads a real ISO timestamp", () => {

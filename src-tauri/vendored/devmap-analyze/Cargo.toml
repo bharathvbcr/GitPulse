@@ -59,6 +59,10 @@ name = "go_build_variant_liveness"
 required-features = ["parse"]
 
 [[test]]
+name = "go_function_value_liveness"
+required-features = ["parse"]
+
+[[test]]
 name = "member_use_liveness"
 required-features = ["parse"]
 

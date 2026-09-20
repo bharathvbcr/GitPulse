@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import { compile } from "svelte/compiler";
+import { get } from "svelte/store";
 import RepoTabBar from "./RepoTabBar.svelte";
 
 import { repoStore } from "../stores/repoStore";
@@ -258,5 +259,167 @@ describe("RepoTabBar", () => {
     expect(recentsMenu).toContain("max-h-");
     expect(recentsMenu).toContain("overflow-y-auto");
     expect(recentsMenu).toContain("shrink-0");
+  });
+
+  describe("tab grouping and collapsed group heads", () => {
+    it("renders group header with label, repository count, and chevron when tabs are grouped", async () => {
+      await repoStore.openRepo("/projects/backend/core", { allowBroken: true, activate: true });
+      await repoStore.openRepo("/projects/backend/api", { allowBroken: true, activate: false });
+      await repoStore.openRepo("/projects/frontend/web", { allowBroken: true, activate: false });
+
+      repoStore.setTabGroup(get(repoStore).openTabs[0].id, "backend");
+      repoStore.setTabGroup(get(repoStore).openTabs[1].id, "backend");
+
+      const { body } = render(RepoTabBar);
+      expect(body).toContain('data-group-header="backend"');
+      expect(body).toContain('data-group-head="backend"');
+      expect(body).toContain("backend");
+      expect(body).toContain("(2)");
+      expect(body).toContain('aria-expanded="true"');
+      expect(body).toContain("core");
+      expect(body).toContain("api");
+      expect(body).toContain("web");
+
+      repoStore.ungroupTabs();
+      while (get(repoStore).openTabs.length > 0) {
+        await repoStore.closeActiveTab();
+      }
+    });
+
+    it("collapses member tabs to a single tab head when group is collapsed", async () => {
+      await repoStore.openRepo("/projects/tools/lint", { allowBroken: true, activate: false });
+      await repoStore.openRepo("/projects/tools/format", { allowBroken: true, activate: false });
+      await repoStore.openRepo("/projects/other/app", { allowBroken: true, activate: true });
+
+      repoStore.setTabGroup(get(repoStore).openTabs[0].id, "tools");
+      repoStore.setTabGroup(get(repoStore).openTabs[1].id, "tools");
+
+      repoStore.setGroupCollapsed("tools", true);
+
+      const { body } = render(RepoTabBar);
+      expect(body).toContain('data-group-head="tools"');
+      expect(body).toContain('aria-expanded="false"');
+      expect(body).toContain("(2)");
+      // Member tabs of collapsed group are hidden from tab strip
+      expect(body).not.toContain("lint");
+      expect(body).not.toContain("format");
+      // Other tabs remain visible
+      expect(body).toContain("app");
+
+      // Expand group again
+      repoStore.setGroupCollapsed("tools", false);
+      const expandedBody = render(RepoTabBar).body;
+      expect(expandedBody).toContain('aria-expanded="true"');
+      expect(expandedBody).toContain("lint");
+      expect(expandedBody).toContain("format");
+
+      repoStore.ungroupTabs();
+      while (get(repoStore).openTabs.length > 0) {
+        await repoStore.closeActiveTab();
+      }
+    });
+
+    it("scales down 15+ repositories across multiple groups so they fit compactly", async () => {
+      for (let i = 1; i <= 5; i++) {
+        await repoStore.openRepo(`/repos/srv/api-${i}`, { allowBroken: true, activate: false });
+      }
+      for (let i = 1; i <= 5; i++) {
+        await repoStore.openRepo(`/repos/ui/web-${i}`, { allowBroken: true, activate: false });
+      }
+      for (let i = 1; i <= 5; i++) {
+        await repoStore.openRepo(`/repos/infra/k8s-${i}`, { allowBroken: true, activate: false });
+      }
+
+      // Group all by parent folder
+      repoStore.groupByParentFolder();
+
+      // Collapse all 3 groups
+      repoStore.setGroupCollapsed("srv", true);
+      repoStore.setGroupCollapsed("ui", true);
+      repoStore.setGroupCollapsed("infra", true);
+
+      const { body } = render(RepoTabBar);
+      const tablist = body.slice(
+        body.indexOf('role="tablist"'),
+        body.indexOf('data-testid="open-repo-tab"'),
+      );
+      // All 3 group heads are visible in tablist with counts of 5
+      expect(tablist).toContain('data-group-head="srv"');
+      expect(tablist).toContain('data-group-head="ui"');
+      expect(tablist).toContain('data-group-head="infra"');
+      expect(tablist).toContain("(5)");
+
+      // Member tabs are hidden from tablist to keep tab strip clean and compact
+      expect(tablist).not.toContain("api-1");
+      expect(tablist).not.toContain("web-1");
+      expect(tablist).not.toContain("k8s-1");
+
+      repoStore.ungroupTabs();
+      while (get(repoStore).openTabs.length > 0) {
+        await repoStore.closeActiveTab();
+      }
+    });
+
+    it("exposes tab group and group management menus with complete accessible semantics", () => {
+      expect(source).toContain("data-group-menu");
+      expect(source).toContain("data-group-head");
+      expect(source).toContain("groupChrome");
+      expect(source).toContain("promptSetGroup");
+      expect(source).toContain("promptRenameGroup");
+      expect(source).toContain("confirmCloseGroup");
+      expect(source).toContain("Change group…");
+      expect(source).toContain("Remove from group");
+      expect(source).toContain("Add to group…");
+      expect(source).toContain("Group all by parent folder");
+      expect(source).toContain("Ungroup all repositories");
+      expect(source).toContain("Close group repositories…");
+      expect(source).toContain("Rename group…");
+      expect(source).toContain("[data-tab-index], [data-group-head]");
+    });
+
+    it("supports spring-loaded drag auto-expansion and direct drop on group heads", () => {
+      expect(source).toContain("function onGroupDragOver");
+      expect(source).toContain("function onGroupDragLeave");
+      expect(source).toContain("function onGroupDrop");
+      expect(source).toContain("dragHoverGroup");
+      expect(source).toContain("dragHoverGroupTimer");
+      expect(source).toContain("400");
+      expect(source).toContain("repoStore.setGroupCollapsed(group, false)");
+      expect(source).toContain("repoStore.setTabGroup(id, group)");
+      expect(source).toContain("ondragover={(e) => onGroupDragOver(e, info.group, info.isCollapsed)}");
+      expect(source).toContain("ondragleave={(e) => onGroupDragLeave(e, info.group)}");
+      expect(source).toContain("ondrop={(e) => onGroupDrop(e, info.group)}");
+    });
+
+    it("supports keyboard navigation shortcuts and middle-click on group heads", () => {
+      expect(source).toContain("function onGroupKeydown");
+      expect(source).toContain('e.key === "ArrowRight" && info.isCollapsed');
+      expect(source).toContain('e.key === "ArrowLeft" && !info.isCollapsed');
+      expect(source).toContain('e.key === "F2"');
+      expect(source).toContain('promptRenameGroup(info.group)');
+      expect(source).toContain('e.key === "Delete"');
+      expect(source).toContain('confirmCloseGroup(info.group, info.tabCount)');
+      expect(source).toContain("onauxclick={(e) => {");
+      expect(source).toContain("e.button === 1");
+    });
+
+    it("provides rich context menus for tabs, group heads, and strip background", () => {
+      // Tab menu additions
+      expect(source).toContain('Move to group');
+      expect(source).toContain('Expand group');
+      expect(source).toContain('Collapse group');
+      expect(source).toContain('Collapse all groups');
+      expect(source).toContain('Expand all groups');
+
+      // Group head menu additions
+      expect(source).toContain('Add open ungrouped repositories');
+      expect(source).toContain('Close other groups…');
+
+      // Strip background menu
+      expect(source).toContain('data-strip-menu');
+      expect(source).toContain('oncontextmenu={onStripContext}');
+      expect(source).toContain('Reopen closed repository');
+      expect(source).toContain('Close all repositories…');
+    });
   });
 });

@@ -919,3 +919,90 @@ export interface WorkspaceLinksResult {
   count: number;
   repos_considered: number;
 }
+
+/** One cone symbol a suspect commit touched. */
+export interface CodeintelTouchedSymbol {
+  qualified_name: string;
+  file_path: string;
+  /** Call edges from the symptom down to this symbol. Zero is the symptom. */
+  distance: number;
+  lines: number;
+  /**
+   * `true` the body changed, `false` it only moved, `null` the question could
+   * not be asked. Three states, not two: render "could not tell" as "unchanged"
+   * and a reformat starts looking like evidence.
+   */
+  body_changed: boolean | null;
+}
+
+/** One commit that could have caused the symptom. */
+export interface CodeintelSuspect {
+  commit: string;
+  author: string;
+  author_time: number;
+  /** `body_changed` | `moved_only` | `unknown` — the primary sort key. */
+  evidence: string;
+  /**
+   * Comparable only against other scores in the same answer. Not a probability
+   * and must never be rendered as a percentage.
+   */
+  score: number;
+  nearest_distance: number;
+  touched: CodeintelTouchedSymbol[];
+}
+
+/** What the analysis examined, so an empty list can be read correctly. */
+export interface CodeintelSuspectScope {
+  indexed_head: string;
+  since: string;
+  cone_size: number;
+  blamed_symbols: number;
+  refusals: string[];
+}
+
+export interface CodeintelSuspectsPayload {
+  response: CodeintelResponse<CodeintelSuspect>;
+  /** Absent when the run was refused before it established a window. */
+  scope: CodeintelSuspectScope | null;
+}
+
+/**
+ * Unwraps the suspects payload, validating the envelope and the scope apart.
+ *
+ * The scope is optional on the wire and stays optional here rather than being
+ * defaulted to zeroes: `cone_size: 0` would say "the cone was empty", which is
+ * a measurement, and a run refused before it started made no measurement at
+ * all. Those are the two states this whole surface exists to keep separate.
+ */
+export function parseSuspectsPayload(
+  value: unknown,
+  command = "cmd_codeintel_suspects",
+): CodeintelSuspectsPayload {
+  if (!isRecord(value)) {
+    throw new Error(`${command} returned no payload`);
+  }
+  const response = parseCodeintelResponse<CodeintelSuspect>(value.response, command);
+  const raw = value.scope;
+  if (raw === undefined || raw === null) {
+    return { response, scope: null };
+  }
+  if (!isRecord(raw)) {
+    throw new Error(`${command} returned a corrupt scope`);
+  }
+  const count = (field: string): number => {
+    const n = raw[field];
+    return typeof n === "number" && Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0;
+  };
+  return {
+    response,
+    scope: {
+      indexed_head: typeof raw.indexed_head === "string" ? raw.indexed_head : "",
+      since: typeof raw.since === "string" ? raw.since : "",
+      cone_size: count("cone_size"),
+      blamed_symbols: count("blamed_symbols"),
+      refusals: Array.isArray(raw.refusals)
+        ? raw.refusals.filter((r): r is string => typeof r === "string")
+        : [],
+    },
+  };
+}

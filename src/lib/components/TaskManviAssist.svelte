@@ -59,10 +59,12 @@
     dirty = false,
     active = true,
     quick = false,
+    compose = false,
     startRequest = 0,
     onFlash = (_fields: EnhancementField[]) => {},
     onReview = (_ready: boolean) => {},
     onEngine = (_name: string) => {},
+    onStatus = (_status: { state: string | null; uncertain: boolean }) => {},
   }: {
     task: Task | null;
     notes?: string;
@@ -86,16 +88,12 @@
     dirty?: boolean;
     active?: boolean;
     quick?: boolean;
-    startRequest?: number;
     /**
-     * Reports the reviewable suggestion outward.
-     *
-     * The title and description inputs live in the task sheet, above this
-     * section, because that is where a reader writes them. This component
-     * still owns the enhancement lifecycle — creating, polling, accepting,
-     * undoing — and hands the sheet just enough to draw the two "use this"
-     * affordances beside the fields they would change.
+     * Draft copy: "What do you need?" A saved task passes false so this
+     * section reads as improving an existing record, not composing a new one.
      */
+    compose?: boolean;
+    startRequest?: number;
     /** Fields just accepted, so the sheet can flash the ones that changed. */
     onFlash?: (fields: EnhancementField[]) => void;
     /** A suggestion is ready to review, so the sheet can mark the Task tab. */
@@ -109,6 +107,8 @@
      * own, so the two cannot disagree about which one is running.
      */
     onEngine?: (name: string) => void;
+    /** Current proposal state and uncertain flag, so the sheet can latch open or show folded status. */
+    onStatus?: (status: { state: string | null; uncertain: boolean }) => void;
   } = $props();
 
   const labels = ENHANCEMENT_STATE_LABELS;
@@ -306,6 +306,7 @@
   // Whether something is waiting to be reviewed. The sheet draws a dot on the
   // Task tab from this, so a reader sitting on Agent knows to come back.
   $effect(() => { onReview(ready); });
+  $effect(() => { onStatus({ state: proposal?.state ?? null, uncertain: needsReconcile }); });
   $effect(() => {
     // Configuration belongs to the shared model selection. A picker change
     // must recover this editor without closing it or losing the draft.
@@ -609,18 +610,18 @@
     <div class="assist-head">
       <Sparkles size={13} class="text-accent shrink-0" />
       <div class="min-w-0">
-        <p class="assist-title">What do you need?</p>
-        <p class="assist-hint">Notes become a title and description you accept below.</p>
+        <p class="assist-title">{compose ? "What do you need?" : "Improve this task"}</p>
+        <p class="assist-hint">{compose ? "Notes become a title and description you accept below." : "Ask for a better title and description, or paste notes to rewrite them."}</p>
       </div>
     </div>
     <label class="notes-label">
-      <span class="sr-only">What do you need?</span>
+      <span class="sr-only">{compose ? "What do you need?" : "Improve this task"}</span>
       <textarea
         class="gp-field"
         value={notes}
         maxlength="65536"
         rows="4"
-        placeholder="Keep the original E42 across both repository links, and say how to reproduce it."
+        placeholder="Paste a rough idea, reproduction steps, or what you already know."
         disabled={disabled || acting}
         oninput={(event) => onNotes(event.currentTarget.value)}
         onkeydown={(event) => {

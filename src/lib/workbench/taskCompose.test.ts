@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   AGENT_COPY_PREAMBLE,
+  MAX_AGENT_COPY_TASKS,
+  MAX_SUBTASKS,
+  SUBTASK_CAP,
   applyNotesToDraft,
   canAskManvi,
   consumeNotes,
+  extractDraftSubtasks,
+  extractSubtasks,
+  extractSubtasksFromContent,
   formatDraftAgentCopy,
   joinAgentCopies,
-  MAX_AGENT_COPY_TASKS,
+  mergeSubtasks,
   sanitizeNotes,
   suggestionDiffers,
   titleFromNotes,
@@ -198,3 +204,112 @@ describe("agent copy", () => {
     expect(suggestionDiffers("Keep E42", "")).toBe(false);
   });
 });
+
+describe("subtask extraction and merging", () => {
+  it("extracts subtasks from markdown checkboxes across marker formats", () => {
+    const markdown = [
+      "- [ ] First criterion",
+      "- [x] Second completed criterion",
+      "* [ ] Star bullet criterion",
+      "+ [x] Plus bullet criterion",
+      "[ ] Bracket only criterion",
+      "[X] Uppercase X criterion",
+    ].join("\n");
+    expect(extractSubtasks(markdown)).toEqual([
+      "First criterion",
+      "Second completed criterion",
+      "Star bullet criterion",
+      "Plus bullet criterion",
+      "Bracket only criterion",
+      "Uppercase X criterion",
+    ]);
+  });
+
+  it("extracts subtasks from dedicated checklist and subtask sections", () => {
+    const brief = [
+      "## Description",
+      "Some descriptive text about the bug.",
+      "",
+      "## Task checklist",
+      "- [x] DevMap status/search/impact on symbols",
+      "- [ ] Expand attention latch for failed/interrupted states",
+      "- [ ] Replace sheet latch with riseAssistOpen",
+      "",
+      "## Acceptance criteria",
+      "No acceptance criteria recorded.",
+      "",
+      "Some trailing notes.",
+    ].join("\n");
+
+    const result = extractSubtasksFromContent(brief);
+    expect(result.subtasks).toEqual([
+      "DevMap status/search/impact on symbols",
+      "Expand attention latch for failed/interrupted states",
+      "Replace sheet latch with riseAssistOpen",
+    ]);
+    expect(result.remainingText).toContain("Some descriptive text about the bug.");
+    expect(result.remainingText).toContain("Some trailing notes.");
+    expect(result.remainingText).not.toContain("## Task checklist");
+    expect(result.remainingText).not.toContain("DevMap status/search");
+  });
+
+  it("extracts numbered and bulleted lists under subtask headings but not general lists", () => {
+    const text = [
+      "Supported browsers:",
+      "- Chrome",
+      "- Firefox",
+      "",
+      "Subtasks:",
+      "1. Wire parser",
+      "2. Add test suite",
+      "3. Deploy fix",
+    ].join("\n");
+
+    const extracted = extractSubtasks(text);
+    expect(extracted).toEqual([
+      "Wire parser",
+      "Add test suite",
+      "Deploy fix",
+    ]);
+  });
+
+  it("ignores empty, non-string, and placeholder criteria", () => {
+    expect(extractSubtasks("")).toEqual([]);
+    expect(extractSubtasks(null)).toEqual([]);
+    expect(extractSubtasks(undefined)).toEqual([]);
+    expect(extractSubtasks("## Acceptance criteria\nNo acceptance criteria recorded.")).toEqual([]);
+    expect(extractSubtasks("- [ ] None\n- [ ] N/A")).toEqual([]);
+  });
+
+  it("merges subtasks deduplicating case-insensitively and respecting bounds", () => {
+    const existing = ["Reproduce bug", "Add test"];
+    const incoming = ["add test", "Verify fix", "reproduce BUG"];
+    expect(mergeSubtasks(existing, incoming)).toEqual([
+      "Reproduce bug",
+      "Add test",
+      "Verify fix",
+    ]);
+
+    const capped = mergeSubtasks([], ["a", "b", "c"], 2);
+    expect(capped).toEqual(["a", "b"]);
+    expect(mergeSubtasks([], Array.from({ length: MAX_SUBTASKS + 10 }, (_, i) => `item ${i}`))).toHaveLength(MAX_SUBTASKS);
+
+    const longItem = "x".repeat(SUBTASK_CAP + 50);
+    const mergedLong = mergeSubtasks([], [longItem]);
+    expect(mergedLong[0]?.length).toBe(SUBTASK_CAP);
+  });
+
+  it("extractDraftSubtasks extracts from description and notes and reports new count", () => {
+    const draft = {
+      description: "Fix loop\n\n## Subtasks\n- [ ] Item 1\n- [ ] Item 2",
+      acceptance_criteria: ["Item 1"],
+    };
+    const notes = "- [ ] Item 3";
+    const result = extractDraftSubtasks(draft, notes);
+    expect(result.extracted).toBe(true);
+    expect(result.count).toBe(2); // Item 2 and Item 3 are new
+    expect(result.subtasks).toEqual(["Item 1", "Item 2", "Item 3"]);
+    expect(result.description).toBe("Fix loop");
+  });
+});
+

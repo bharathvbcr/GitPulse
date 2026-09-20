@@ -52,6 +52,14 @@ describe("TaskManviAssist", () => {
     expect(source).toMatch(/const page = await bounded\(listEnhancements\(saved\.id\)\)[\s\S]*?runAppleEnhancement/);
   });
 
+  it("speaks compose copy only when the sheet says this is a new task", () => {
+    expect(source).toContain("compose = false");
+    expect(source).toContain('{compose ? "What do you need?" : "Improve this task"}');
+    expect(source).toContain("Notes become a title and description you accept below.");
+    expect(source).toContain("Ask for a better title and description, or paste notes to rewrite them.");
+    expect(source).not.toContain("Keep the original E42 across both repository links");
+  });
+
   it("owns acceptance rather than publishing it to the sheet", () => {
     /*
      * Three arrangements have been tried. The assist used to carry its own
@@ -66,6 +74,8 @@ describe("TaskManviAssist", () => {
      */
     expect(source).toContain("onFlash?: (fields: EnhancementField[]) => void");
     expect(source).toContain("$effect(() => { onFlash([...flash]); })");
+    expect(source).toContain("onStatus?: (status: { state: string | null; uncertain: boolean }) => void");
+    expect(source).toContain("onStatus({ state: proposal?.state ?? null, uncertain: needsReconcile })");
     expect(source).not.toContain("acceptFields");
     expect(source).not.toContain("hideSuggestion");
     expect(source).not.toContain("AssistSuggestion");

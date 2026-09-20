@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
   import { bounded } from "../workbench/taskActions";
-  import { Clipboard } from "@lucide/svelte";
+  import { Clipboard, X } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import TaskAgentPanel from "./TaskAgentPanel.svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
@@ -15,10 +15,11 @@
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
   import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
   import { linkSummary, repositoryRows, shouldOfferFilter, triggerChips } from "../workbench/taskRepositories";
-  import { applyNotesToDraft, canAskManvi, consumeNotes, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { applyNotesToDraft, canAskManvi, consumeNotes, extractDraftSubtasks, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { sanitizeLogs } from "../workbench/taskLogs";
   import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
   import { editorTabBadge, editorTabHint, editorTabs, resolveEditorTab, type TaskEditorTab } from "../workbench/taskEditorTabs";
+  import { assistAttention, assistDisclosure, assistFoldStatus, editorSections, logsDisclosure, riseAssistOpen } from "../workbench/taskEditorLayout";
   import { handleTablistKeydown, focusTabAt, panelId, tabId, tabProps } from "../dom/tablist";
   import { crossfade } from "svelte/transition";
   import { isMacOS } from "../platform";
@@ -56,6 +57,8 @@
     return { ...base, locked_fields: base.locked_fields ?? [], logs: base.logs ?? "" };
   })());
   let criteria = $state(untrack(() => draft.acceptance_criteria.join("\n")));
+  let newSubtask = $state("");
+  const criteriaList = $derived(criteria.split("\n").map((s) => s.trim()).filter(Boolean));
   let labelChips = $state<string[]>(untrack(() => [...draft.labels]));
   let error = $state("");
   let note = $state("");
@@ -115,6 +118,31 @@
   let assistName = $state(assistEngineName(DEFAULT_ASSIST_ENGINE));
   const tabs = $derived(editorTabs(Boolean(current)));
   const tab = $derived(resolveEditorTab(requestedTab, Boolean(current)));
+  const saved = $derived(Boolean(current));
+  const sections = $derived(editorSections(saved));
+  let assistState = $state<string | null>(null);
+  let assistUncertain = $state(false);
+  const hasAssistWork = $derived(assistAttention({
+    notes,
+    busy: enhancementBusy,
+    reviewable,
+    state: assistState,
+    uncertain: assistUncertain,
+  }));
+  let assistOpened = $state(false);
+  let prevAssistWork = false;
+  $effect(() => {
+    const work = hasAssistWork;
+    untrack(() => {
+      assistOpened = riseAssistOpen(prevAssistWork, work, assistOpened);
+      prevAssistWork = work;
+    });
+  });
+  const assistChrome = $derived(assistDisclosure({ saved, opened: assistOpened }));
+  const assistStatus = $derived(!assistChrome.open ? assistFoldStatus({ state: assistState, uncertain: assistUncertain }) : "");
+  const hasLogs = $derived(Boolean((draft.logs ?? "").trim()));
+  let logsOpened = $state(false);
+  const logsChrome = $derived(logsDisclosure({ saved, hasLogs, opened: logsOpened }));
   let disposed = false;
   const kindIsCustom = $derived(!KIND_OPTIONS.includes(draft.kind as typeof KIND_OPTIONS[number]));
   $effect(() => { if (kindIsCustom) customKind = true; });
@@ -129,7 +157,6 @@
   });
   onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
   const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim() || (draft.logs ?? "").trim()));
-  const hasLogs = $derived(Boolean((draft.logs ?? "").trim()));
   const id = initial.value?.id ?? newID();
   const group = `task-sheet-${id}`;
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
@@ -220,6 +247,41 @@
     notes = next.notes;
     dirty = true;
     return true;
+  }
+  function addSubtaskItem() {
+    const text = newSubtask.trim();
+    if (!text) return;
+    const current = criteria.trim();
+    criteria = current ? `${current}\n${text}` : text;
+    newSubtask = "";
+    dirty = true;
+  }
+  function onSubtaskKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addSubtaskItem();
+    }
+  }
+  function removeSubtaskItem(index: number) {
+    const list = criteria.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (index < 0 || index >= list.length) return;
+    list.splice(index, 1);
+    criteria = list.join("\n");
+    dirty = true;
+  }
+  function extractSubtasksAction() {
+    const extracted = extractDraftSubtasks(
+      { description: draft.description, acceptance_criteria: criteria.split("\n").map((s) => s.trim()).filter(Boolean) },
+      notes,
+    );
+    if (!extracted.extracted) {
+      note = "No checklist items found to extract.";
+      return;
+    }
+    draft.description = extracted.description;
+    criteria = extracted.subtasks.join("\n");
+    dirty = true;
+    note = `Extracted ${extracted.count} subtask${extracted.count === 1 ? "" : "s"}`;
   }
   async function save(fromManvi = false): Promise<Task | null> {
     if (saving || adding || reloading || confirming || pendingDelete || (enhancementBusy && !fromManvi)) return null;
@@ -451,7 +513,7 @@
           tabindex={props.tabindex}
           data-active={tab === entry.id ? "true" : "false"}
           data-sheet-tab={entry.id}
-          title={editorTabHint(entry.id)}
+          title={editorTabHint(entry.id, saved)}
           onclick={() => { requestedTab = entry.id; focusTabAt(tabStrip, index); }}
         >
           {#if macos && tab === entry.id}
@@ -470,7 +532,7 @@
         </button>
       {/each}
     </div>
-    <p class="tab-hint">{editorTabHint(tab)}</p>
+    <p class="tab-hint">{editorTabHint(tab, saved)}</p>
   {/if}
   <div class="sheet-body">
   <form id="task-editor-form-{id}" novalidate
@@ -481,158 +543,243 @@
     <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
       <div class="pane" hidden={Boolean(current) && tab !== "task"} id={panelId(group, "task")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "task") : undefined}>
         <!--
-          One column, five numbered sections, in the order a task actually gets
-          written: what it touches, what you dictated, what it says, how it is
-          scheduled, who owns it.
+          One column, numbered sections, in an order `editorSections` owns.
+          A draft still dictates first: notes above the fields they fill. A
+          saved task leads with the record (title, logs, schedule, owner) and
+          folds the model last — the compose chrome labelled "Quick add" used
+          to sit above the title on a revision the reader had already written,
+          which is the layout this refuses.
 
-          This replaces a two-column grid. The columns were a container query
-          rather than a media query, which was the right call for a dock whose
-          width the window only partly decides — but the dock's floor is 380px
-          and the columns only fit past 520px, so the layout a reader got
-          depended on how far they had dragged a splitter. Numbering survives
-          that: the sheet reads as five things at every width.
-
-          Nothing is unnumbered and nothing is behind a disclosure. The model's
-          suggestions are not a sixth section either — they belong to the field
-          they were dictated into, so they live inside section 2.
+          The assist stays mounted when folded (`hidden`, not `{#if}`), so a
+          running suggestion can still cancel and history can still load. The
+          model's suggestions are not a seventh section; they live inside assist.
         -->
         <div class="steps">
-          <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">1</span><h3>Repositories</h3><span class="step-rule" aria-hidden="true"></span></div>
-            <!-- `enhancementBusy` disables the fields a running suggestion may
-                 rewrite. It wraps the *fields* and never the assist, which owns
-                 the cancel button for that same run. -->
-            <fieldset disabled={enhancementBusy}>
-              <TaskRepositoryPicker
-                {rows}
-                {summary}
-                {offerFilter}
-                chips={trigger.chips}
-                overflow={trigger.overflow}
-                bind:filter={repoFilter}
-                knownCount={known.length}
-                name={id}
-                {addable}
-                {adding}
-                {attaching}
-                workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}
-                disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
-                onToggle={membership}
-                onPrimary={setPrimary}
-                onAddPaths={(paths) => void addOpenPaths(paths)}
-                onAttachOutsiders={() => void attachOutsiders()}
-              />
-            </fieldset>
-          </section>
-
-          <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">2</span><h3>Quick add</h3><span class="step-rule" aria-hidden="true"></span></div>
-            <!-- Dictating the task, choosing which model reads it, and
-                 reviewing what came back are one surface, above the fields the
-                 result lands in. The assist owns the whole lifecycle (polling,
-                 history, accept, undo) and sits outside the enhancement-busy
-                 fieldset so a running suggestion cannot disable its own
-                 cancel. -->
-            <TaskManviAssist
-              task={current}
-              {notes}
-              {dirty}
-              {active}
-              onNotes={(value) => { notes = value; dirty = true; }}
-              bind:title={draft.title}
-              bind:description={draft.description}
-              bind:lockedFields={draft.locked_fields!}
-              repositoryIds={draft.repository_ids}
-              repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
-              prepareTask={prepareForManvi}
-              onApplied={applied}
-              onBusy={(busy) => { enhancementBusy = busy; }}
-              onFlash={(fields) => { flash = fields; }}
-              onReview={(ready) => { reviewable = ready; }}
-              onEngine={(name) => { assistName = name; }}
-              disabled={saving || reloading || pending !== null || pendingDelete !== null}
-            />
-          </section>
-
-          <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">3</span><h3>Title and description</h3><span class="step-rule" aria-hidden="true"></span></div>
-            <fieldset disabled={enhancementBusy}>
-              <label class:flash={flash.includes("title")}>Title
-                <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
-              </label>
-              <label class:flash={flash.includes("description")}>Description
-                <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
-              </label>
-              <label>Acceptance criteria<textarea class="gp-field" bind:value={criteria} rows="4" maxlength="65536" placeholder="One verifiable criterion per line"></textarea></label>
-            </fieldset>
-          </section>
-
-          <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">4</span><h3>Raw logs</h3><span class="step-rule" aria-hidden="true"></span></div>
-            <div class="logs-head">
-              <p class="meta">Paste a stack trace or terminal dump. It is saved with the task so you can copy it or send it to an agent.</p>
-              <button type="button" class="gp-btn" onclick={() => void copyLogs()} disabled={!hasLogs || copying || saving} aria-label="Copy raw logs">Copy logs</button>
-            </div>
-            <fieldset disabled={enhancementBusy}>
-              <label>Raw logs<textarea class="gp-field logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
-            </fieldset>
-            {#if logNotice}<p class="meta" role="status">{logNotice}</p>{/if}
-          </section>
-
-          <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">5</span><h3>Status and scheduling</h3><span class="step-rule" aria-hidden="true"></span></div>
-            <fieldset disabled={enhancementBusy}>
-              <div class="pair">
-                <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
-                <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
+          {#each sections as section (section.id)}
+            <section class="step" data-editor-section={section.id} data-assist-open={section.id === "assist" ? String(assistChrome.open) : undefined}>
+              <div class="step-head">
+                <span class="step-n" aria-hidden="true">{section.n}</span>
+                <h3>{section.heading}</h3>
+                {#if section.id === "assist" && assistStatus}
+                  <span class="assist-status" data-testid="task-assist-status">{assistStatus}</span>
+                {/if}
+                {#if section.id === "assist" && assistChrome.collapsible}
+                  <button
+                    type="button"
+                    class="gp-btn assist-toggle"
+                    data-testid="task-assist-toggle"
+                    aria-expanded={assistChrome.open}
+                    aria-controls="task-assist-body-{id}"
+                    onclick={() => { assistOpened = !assistChrome.open; }}
+                  >{assistChrome.open ? "Hide" : "Show"}</button>
+                {/if}
+                {#if section.id === "logs" && logsChrome.collapsible}
+                  <button
+                    type="button"
+                    class="gp-btn logs-toggle"
+                    data-testid="task-logs-toggle"
+                    aria-expanded={logsChrome.open}
+                    aria-controls="task-logs-body-{id}"
+                    onclick={() => { logsOpened = !logsChrome.open; }}
+                  >{logsChrome.open ? "Hide" : "Show"}</button>
+                {/if}
+                <span class="step-rule" aria-hidden="true"></span>
               </div>
-              <div class="pair">
-                <label>Type
-                  {#if customKind || kindIsCustom}
-                    <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
-                    <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
-                  {:else}
-                    <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
-                      {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
-                      <option value="__custom__">Custom…</option>
-                    </select>
-                  {/if}
-                </label>
-                <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
-              </div>
-              <div class="due-field">
-                <span class="field-label">Due</span>
-                <!-- `disabled` is passed rather than inherited: the popover is
-                     portaled to the body, so a disabled fieldset around this
-                     component would not reach the controls inside it. -->
-                <TaskDuePicker
-                  value={draft.due_at}
-                  disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
-                  onChange={(next) => { draft.due_at = next; dirty = true; }}
-                />
-              </div>
-              <label>Labels
-                <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
-              </label>
-              {#if current}
-                <div class="notifications-row">
-                  <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
-                  <NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />
+              {#if section.id === "repositories"}
+                <!-- `enhancementBusy` disables the fields a running suggestion may
+                     rewrite. It wraps the *fields* and never the assist, which owns
+                     the cancel button for that same run. -->
+                <fieldset disabled={enhancementBusy}>
+                  <TaskRepositoryPicker
+                    {rows}
+                    {summary}
+                    {offerFilter}
+                    chips={trigger.chips}
+                    overflow={trigger.overflow}
+                    bind:filter={repoFilter}
+                    knownCount={known.length}
+                    name={id}
+                    {addable}
+                    {adding}
+                    {attaching}
+                    workspace={draft.home_workspace_id ? { name: homeWorkspaceName, error: homeError } : null}
+                    disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
+                    onToggle={membership}
+                    onPrimary={setPrimary}
+                    onAddPaths={(paths) => void addOpenPaths(paths)}
+                    onAttachOutsiders={() => void attachOutsiders()}
+                  />
+                </fieldset>
+              {:else if section.id === "assist"}
+                <!-- Dictating, choosing a model, and reviewing what came back are
+                     one surface. On a draft it sits above the fields; on a saved
+                     task it follows the title and is folded. The assist owns the
+                     lifecycle (polling, history, accept, undo) and sits outside the
+                     enhancement-busy fieldset so a running suggestion cannot
+                     disable its own cancel. -->
+                <div id="task-assist-body-{id}" data-testid="task-assist-body" hidden={!assistChrome.open}>
+                  <TaskManviAssist
+                    task={current}
+                    compose={!current}
+                    {notes}
+                    {dirty}
+                    {active}
+                    onNotes={(value) => { notes = value; dirty = true; }}
+                    bind:title={draft.title}
+                    bind:description={draft.description}
+                    bind:lockedFields={draft.locked_fields!}
+                    repositoryIds={draft.repository_ids}
+                    repositoryNames={draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? "").filter(Boolean)}
+                    prepareTask={prepareForManvi}
+                    onApplied={applied}
+                    onBusy={(busy) => { enhancementBusy = busy; }}
+                    onFlash={(fields) => { flash = fields; }}
+                    onReview={(ready) => { reviewable = ready; }}
+                    onEngine={(name) => { assistName = name; }}
+                    onStatus={({ state, uncertain }) => { assistState = state; assistUncertain = uncertain; }}
+                    disabled={saving || reloading || pending !== null || pendingDelete !== null}
+                  />
                 </div>
+              {:else if section.id === "title"}
+                <fieldset disabled={enhancementBusy}>
+                  <label class:flash={flash.includes("title")}>Title
+                    <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
+                  </label>
+                  <label class:flash={flash.includes("description")}>Description
+                    <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+                  </label>
+                  <div class="subtasks-section">
+                    <div class="subtasks-head">
+                      <label for="task-criteria-{id}">Subtasks and acceptance criteria{#if criteriaList.length > 0} <span class="criteria-count">({criteriaList.length})</span>{/if}</label>
+                      <button
+                        type="button"
+                        class="gp-btn extract-subtasks-btn"
+                        data-testid="task-extract-subtasks"
+                        disabled={enhancementBusy || (!draft.description.trim() && !notes.trim())}
+                        onclick={extractSubtasksAction}
+                        title="Extract checklist items from description and notes"
+                      >
+                        Extract subtasks
+                      </button>
+                    </div>
+                    {#if criteriaList.length > 0}
+                      <ul class="subtasks-list" data-testid="task-subtasks-list">
+                        {#each criteriaList as item, index}
+                          <li class="subtask-item" data-testid="task-subtask-item-{index}">
+                            <span class="subtask-bullet" aria-hidden="true">•</span>
+                            <span class="subtask-text">{item}</span>
+                            <button
+                              type="button"
+                              class="subtask-remove"
+                              data-testid="task-subtask-remove-{index}"
+                              disabled={enhancementBusy}
+                              onclick={() => removeSubtaskItem(index)}
+                              aria-label="Remove subtask: {item}"
+                              title="Remove subtask"
+                            >
+                              <X size={12} />
+                            </button>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                    <div class="subtask-add-row" data-testid="task-subtask-add-row">
+                      <input
+                        class="gp-field subtask-add-input"
+                        data-testid="task-subtask-add-input"
+                        bind:value={newSubtask}
+                        disabled={enhancementBusy}
+                        maxlength="4096"
+                        placeholder="Add a subtask…"
+                        onkeydown={onSubtaskKeydown}
+                      />
+                      <button
+                        type="button"
+                        class="gp-btn subtask-add-btn"
+                        data-testid="task-subtask-add-button"
+                        disabled={enhancementBusy || !newSubtask.trim()}
+                        onclick={addSubtaskItem}
+                      >
+                        Add
+                      </button>
+                    </div>
+                    <label class="criteria-raw-label">
+                      <span class="sr-only">Acceptance criteria</span>
+                      <textarea
+                        id="task-criteria-{id}"
+                        class="gp-field criteria-textarea"
+                        data-testid="task-criteria"
+                        bind:value={criteria}
+                        rows="3"
+                        maxlength="65536"
+                        placeholder="One verifiable criterion per line"
+                      ></textarea>
+                    </label>
+                  </div>
+                </fieldset>
+              {:else if section.id === "logs"}
+                <div id="task-logs-body-{id}" data-testid="task-logs-body" hidden={!logsChrome.open}>
+                  <div class="logs-head">
+                    <p class="meta">Paste a stack trace or terminal dump. It is saved with the task so you can copy it or send it to an agent.</p>
+                    <button type="button" class="gp-btn" onclick={() => void copyLogs()} disabled={!hasLogs || copying || saving} aria-label="Copy raw logs">Copy logs</button>
+                  </div>
+                  <fieldset disabled={enhancementBusy}>
+                    <label>Raw logs<textarea class="gp-field logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
+                  </fieldset>
+                  {#if logNotice}<p class="meta" role="status">{logNotice}</p>{/if}
+                </div>
+              {:else if section.id === "schedule"}
+                <fieldset disabled={enhancementBusy}>
+                  <div class="pair">
+                    <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
+                    <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
+                  </div>
+                  <div class="pair">
+                    <label>Type
+                      {#if customKind || kindIsCustom}
+                        <input class="gp-field" bind:value={draft.kind} required maxlength="64" placeholder="Custom type" />
+                        <button type="button" class="gp-btn kind-preset" disabled={enhancementBusy} onclick={() => { customKind = false; draft.kind = "feature"; dirty = true; }}>Use preset</button>
+                      {:else}
+                        <select class="gp-select" value={draft.kind} onchange={(e) => onKindSelect(e.currentTarget.value)}>
+                          {#each KIND_OPTIONS as kind}<option value={kind}>{kind}</option>{/each}
+                          <option value="__custom__">Custom…</option>
+                        </select>
+                      {/if}
+                    </label>
+                    <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
+                  </div>
+                  <div class="due-field">
+                    <span class="field-label">Due</span>
+                    <!-- `disabled` is passed rather than inherited: the popover is
+                         portaled to the body, so a disabled fieldset around this
+                         component would not reach the controls inside it. -->
+                    <TaskDuePicker
+                      value={draft.due_at}
+                      disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
+                      onChange={(next) => { draft.due_at = next; dirty = true; }}
+                    />
+                  </div>
+                  <label>Labels
+                    <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
+                  </label>
+                  {#if current}
+                    <div class="notifications-row">
+                      <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
+                      <NativeNotificationSettings scope={{ kind: "global" }} taskID={current.id} />
+                    </div>
+                  {/if}
+                </fieldset>
+              {:else if section.id === "owner"}
+                <fieldset disabled={enhancementBusy}>
+                  <!-- The section heading already says "Owner", so the label is
+                       there for a screen reader rather than repeated on screen.
+                       Written on one line deliberately: the label's first child has
+                       to be the name, not a whitespace text node. -->
+                  <label class="owner-field"><span class="sr-only">Owner</span><input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" placeholder="Unassigned" /></label>
+                </fieldset>
               {/if}
-            </fieldset>
-          </section>
-
-          <section class="step">
-            <div class="step-head"><span class="step-n" aria-hidden="true">6</span><h3>Owner</h3><span class="step-rule" aria-hidden="true"></span></div>
-            <fieldset disabled={enhancementBusy}>
-              <!-- The section heading already says "Owner", so the label is
-                   there for a screen reader rather than repeated on screen.
-                   Written on one line deliberately: the label's first child has
-                   to be the name, not a whitespace text node. -->
-              <label class="owner-field"><span class="sr-only">Owner</span><input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" placeholder="Unassigned" /></label>
-            </fieldset>
-          </section>
+            </section>
+          {/each}
         </div>
       </div>
     </fieldset>
@@ -695,6 +842,12 @@
   .step-head h3{margin:0;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
   .step-n{flex-shrink:0;width:16px;height:16px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.34)}
   .step-rule{flex:1;height:1px;background:linear-gradient(to right,rgb(var(--c-border) / 0.55),transparent)}
+  .assist-status{font-size:10px;font-weight:500;color:rgb(var(--c-text-muted));letter-spacing:.01em}
+  .assist-toggle,.logs-toggle{flex-shrink:0;font-size:10px;padding:2px 8px;letter-spacing:.02em}
+  /* Same guard as `.pane[hidden]`: a later `display` on this body would
+     silently beat Tailwind's zero-specificity `[hidden]` and leave the
+     folded assist on screen. */
+  [data-testid="task-assist-body"][hidden],[data-testid="task-logs-body"][hidden]{display:none}
   .logs-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin:0 0 8px}
   .logs-head p{margin:0;flex:1}
   .logs-field{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;white-space:pre;overflow:auto}
@@ -706,4 +859,19 @@
   .owner-field{margin-bottom:0;gap:0}
   header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
   .error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
+  .subtasks-section{display:flex;flex-direction:column;gap:8px;margin-bottom:13px}
+  .subtasks-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .subtasks-head label{margin-bottom:0;font-weight:500}
+  .criteria-count{font-size:11px;font-weight:400;color:rgb(var(--c-text-muted))}
+  .extract-subtasks-btn{flex-shrink:0;font-size:10px;padding:2px 8px;letter-spacing:.02em}
+  .subtasks-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
+  .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;background:rgb(var(--c-bg) / 0.4);border:1px solid rgb(var(--c-border) / 0.5);font-size:11px}
+  .subtask-bullet{color:rgb(var(--c-text-muted));font-size:14px;line-height:1}
+  .subtask-text{flex:1;min-width:0;word-break:break-word}
+  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:4px}
+  .subtask-remove:hover{color:rgb(var(--c-text))}
+  .subtask-add-row{display:flex;gap:6px;align-items:center}
+  .subtask-add-input{flex:1;font-size:11px;padding:5px 8px}
+  .subtask-add-btn{flex-shrink:0;font-size:11px;padding:5px 10px}
+  .criteria-raw-label{margin-bottom:0}
 </style>

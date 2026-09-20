@@ -175,3 +175,59 @@ it("updates one crate without reading or rewriting unrelated upstreams", () => {
     expect(readFileSync(manifestPath, "utf8")).toBe(before);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+it("says so when a crate was vendored from an uncommitted tree", () => {
+  // `commit` on its own is a claim that the vendored bytes can be recovered by
+  // checking that commit out. Vendoring from a dirty tree makes that false, and
+  // it is the normal case rather than an exotic one: a crate is vendored right
+  // after it is changed and before the change is committed. Without the flag a
+  // later `--check` reports drift against the recorded commit that nobody can
+  // explain — or an operator checks it out and does not find the code.
+  const f = fixture();
+  try {
+    const git = (...args: string[]) =>
+      spawnSync("git", args, {
+        cwd: f.upstream,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Ada",
+          GIT_AUTHOR_EMAIL: "ada@example.com",
+          GIT_COMMITTER_NAME: "Ada",
+          GIT_COMMITTER_EMAIL: "ada@example.com",
+        },
+      });
+    git("init", "-q", "--initial-branch=main");
+    git("add", "-A");
+    expect(git("commit", "-q", "-m", "upstream", "--no-gpg-sign").status).toBe(0);
+
+    // Committed: the commit really does contain these bytes, so no flag.
+    expect(f.run("--crate=dc-glob").status).toBe(0);
+    const clean = JSON.parse(readFileSync(f.manifest, "utf8"));
+    expect(clean.crates[0].origin.commit_is_not_the_source).toBeUndefined();
+
+    // A dirty file somewhere else upstream says nothing about this crate.
+    writeFileSync(path.join(f.upstream, "rust/Cargo.lock"), "unrelated\n");
+    expect(f.run("--crate=dc-glob").status).toBe(0);
+    expect(
+      JSON.parse(readFileSync(f.manifest, "utf8")).crates[0].origin.commit_is_not_the_source,
+    ).toBeUndefined();
+
+    // The crate's own subtree is dirty: the recorded commit is no longer where
+    // these bytes came from, and the entry has to say it.
+    writeFileSync(path.join(f.upstream, "rust/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 9;\n");
+    expect(f.run("--crate=dc-glob").status).toBe(0);
+    const dirty = JSON.parse(readFileSync(f.manifest, "utf8"));
+    expect(dirty.crates[0].origin.commit_is_not_the_source).toBe(true);
+    expect(dirty.crates[0].origin.commit).toMatch(/^[0-9a-f]{40}$/);
+
+    // And the check surfaces it: a flag nothing reports is no better than none.
+    const checked = f.run("--check");
+    const entry = JSON.parse(checked.stdout).crates.find(
+      (c: { name: string }) => c.name === "dc-glob",
+    );
+    expect(entry.reason).toMatch(/uncommitted tree/);
+  } finally {
+    f.cleanup();
+  }
+});

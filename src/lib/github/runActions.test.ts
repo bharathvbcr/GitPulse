@@ -225,3 +225,10 @@ describe("useCompactRows", () => {
     expect(useCompactRows(RUN_PREVIEW_COUNT)).toBe(false);
   });
 });
+
+describe("run card preview length", () => {
+  it("shows three recent runs so the rail stays reachable", () => {
+    expect(RUN_PREVIEW_COUNT).toBe(3);
+    expect(RUN_PREVIEW_COUNT).toBeLessThan(COMPACT_ROW_THRESHOLD);
+  });
+});

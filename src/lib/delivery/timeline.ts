@@ -47,6 +47,64 @@ export interface TimelineRow {
 export const MAX_LABEL_CHARS = 200;
 
 /**
+ * Detail rows drawn before the reader asks for the rest.
+ *
+ * The outcome strip and the sample figures stay on the full listing: this
+ * only decides how many duration rows are on screen. Three is short enough
+ * that the rest of the CI rail stays reachable in a narrow column. Shared
+ * with App Hosting rollouts through DeliveryTimeline, not a GitHub-only
+ * constant — a second count is how "show all" would split in two.
+ */
+export const TIMELINE_PREVIEW_COUNT = 3;
+
+/**
+ * How many characters a glance tile may show for identity.
+ *
+ * The duration card is not the place for a commit subject. Sixteen code
+ * points is a workflow name or a short rollout id; anything longer is
+ * truncated, and the full string stays on the tile's `title`.
+ */
+export const GLANCE_NAME_CHARS = 16;
+
+/**
+ * The identity a glance tile shows.
+ *
+ * Actions puts the commit subject in `label` and the workflow name in
+ * `sublabel`. App Hosting inverts that: the rollout id is the label and the
+ * commit subject is the sublabel. Preferring the shorter non-empty of the
+ * two is how both sources land on the scannable name rather than the essay.
+ */
+export function glanceName(row: Pick<TimelineRow, "label" | "sublabel">): string {
+  const primary = displayText(row.label);
+  const secondary = displayText(row.sublabel);
+  const len = (value: string) => [...value].length;
+  let chosen = primary;
+  if (secondary && (!primary || len(secondary) <= len(primary))) chosen = secondary;
+  const chars = [...chosen];
+  if (chars.length <= GLANCE_NAME_CHARS) return chosen;
+  return `${chars.slice(0, GLANCE_NAME_CHARS).join("")}…`;
+}
+
+/**
+ * The verdict a glance tile shows.
+ *
+ * Phase, not the source's sentence: "Completed (no conclusion reported)" is
+ * a search term for the tooltip, not a cell. Unknown is an em dash, never
+ * a word that could be mistaken for a pass.
+ */
+export function glanceState(phase: MonitorPhase): string {
+  if (phase === "settled_ok") return "Pass";
+  if (phase === "settled_bad") return "Fail";
+  if (phase === "in_flight") return "Live";
+  return "—";
+}
+
+/** Full identity for the tooltip; every field is already bounded. */
+export function glanceTitle(row: TimelineRow): string {
+  return [row.label, row.stateLabel, row.branch, row.trigger].filter((part) => part.length > 0).join(" · ");
+}
+
+/**
  * One line of display text, bounded.
  *
  * Newlines are collapsed rather than trusted to CSS. Every label today lands

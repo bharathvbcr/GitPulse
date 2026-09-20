@@ -292,8 +292,22 @@
           check("session search filters to the renamed tab", () => visible('[aria-label="Matching terminals"] [role="option"]').length === 1 && visible('[aria-label="Matching terminals"] [role="option"]')[0].textContent.includes("Build logs"));
           await press(sessionSearch, "Enter");
           check("session search activates the match", () => visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
+          const gridBeforeLauncher = visible("[data-terminal-session]")[0].getBoundingClientRect();
           button("New session type").click(); await wait();
-          check("launcher menu sits above the grid instead of overlapping it", () => aboveGrid(label("New session type menu")));
+          const launcherMenu = label("New session type menu");
+          const gridAfterLauncher = visible("[data-terminal-session]")[0].getBoundingClientRect();
+          check("launcher menu does not shift the session grid", () => Math.abs(gridAfterLauncher.top - gridBeforeLauncher.top) < 1);
+          check("launcher menu is a compact overlay", () => {
+            const box = launcherMenu.getBoundingClientRect();
+            const dock = document.querySelector("[data-terminal-dock]").getBoundingClientRect();
+            const trigger = button("New session type").getBoundingClientRect();
+            return launcherMenu.parentElement === document.body
+              && getComputedStyle(launcherMenu).position === "fixed"
+              && box.width < dock.width - 16
+              && box.width >= 160
+              && box.top >= trigger.bottom - 1
+              && box.top <= trigger.bottom + 16;
+          });
           const launcherSearch = label("Search session types");
           launcherSearch.value = "zzzz-missing"; launcherSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
           check("launcher search reports no match", () => label("New session type menu").textContent.includes("No session types match"));

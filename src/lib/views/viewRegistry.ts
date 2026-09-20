@@ -176,6 +176,13 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
           "Every movement of HEAD. Recovery points after a reset, checkout or amend.",
         paletteCommand: "Open Reflog — HEAD movements and recovery points",
       },
+      {
+        id: "suspects",
+        label: "Suspects",
+        summary:
+          "Which commit since a known-good ref could have caused a symptom. Ranked by what the call graph reaches, not by how recent they are; the window ends at the indexed commit, not at HEAD.",
+        paletteCommand: "Find regression suspects — which commit broke this symbol",
+      },
     ],
   },
   insights: {
