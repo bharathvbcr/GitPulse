@@ -70,7 +70,7 @@
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine } from "@lucide/svelte";
+  import { AlertCircle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
@@ -85,6 +85,9 @@
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
+  import { openExternal } from "../desktop/openExternal";
+  import { repoStore } from "../stores/repoStore";
+  import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
   import {
     clampTerminalFontSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -144,12 +147,16 @@
   let resultCount = $state(0);
   let fontSize = $state(get(interfaceStore).terminalFontSize);
   let scrolledBack = $state(false);
+  /** What the pointer is currently over, shown in the footer so the target is
+   * readable before the click rather than only after it. */
+  let hoveredLink = $state<string | null>(null);
 
   /** Non-reactive handles: observers and the emulator must not tear down with runes. */
   let term: XTerm | null = null;
   let fitAddon: FitAddon | null = null;
   let searchAddon: SearchAddon | null = null;
   let searchKey: string | null = null;
+  let linkProvider: { dispose(): void } | null = null;
   let stopResize: (() => void) | null = null;
   let themeObserver: MutationObserver | null = null;
   let lifecycle: ReturnType<typeof createSessionLifecycle> | null = null;
@@ -175,6 +182,91 @@
     };
   }
 
+  /**
+   * xterm's buffer in the shape `links.ts` reads it.
+   *
+   * The per-character column map is built by walking cells rather than by
+   * indexing the translated string, because the two disagree wherever a
+   * double-width glyph sits: `translateToString` emits one character where the
+   * grid spent two cells, and a link range computed from string offsets then
+   * underlines text to the left of the link. Cells with width 0 are the
+   * placeholders that follow a wide glyph and carry no character of their own.
+   */
+  function linkBuffer(t: XTerm): LinkBuffer {
+    const scratch = t.buffer.active.getNullCell();
+    return {
+      row(index: number) {
+        // Re-read the active buffer every call: a program entering the
+        // alternate screen swaps it underneath a cached reference.
+        const line = t.buffer.active.getLine(index - 1);
+        if (!line) return null;
+        const chars: string[] = [];
+        const columns: number[] = [];
+        let column = 1;
+        const width = Math.min(line.length, t.cols);
+        for (let x = 0; x < width; x++) {
+          const cell = line.getCell(x, scratch);
+          if (!cell) break;
+          const cellWidth = cell.getWidth();
+          if (cellWidth === 0) continue;
+          // An untouched cell reads as the empty string and occupies a column.
+          const text = cell.getChars() || " ";
+          for (let i = 0; i < text.length; i++) columns.push(column);
+          chars.push(text);
+          column += cellWidth;
+        }
+        return { isWrapped: line.isWrapped, text: chars.join(""), columns };
+      },
+    };
+  }
+
+  /**
+   * Acts on a clicked link — the detected spans and OSC 8 hyperlinks both
+   * arrive here, so one policy covers both.
+   *
+   * A refusal is shown rather than swallowed: a click that silently does
+   * nothing is indistinguishable from a click that missed the link, and the
+   * reason is the only thing that tells the user the output asked for
+   * something GitPulse will not do.
+   */
+  async function activateLink(text: string) {
+    const action = resolveLinkAction(text, repoPath);
+    if (action.kind === "refused") {
+      warning = action.reason;
+      return;
+    }
+    if (action.kind === "url") {
+      try {
+        await openExternal(action.url);
+      } catch (err) {
+        warning = `Could not open ${action.url}: ${formatError(err)}`;
+      }
+      return;
+    }
+    // `selectFilePath` acts on whichever repository tab is active, so a click
+    // in a background repository's terminal would open the path in the wrong
+    // checkout. Refuse instead of opening someone else's file.
+    const state = get(repoStore);
+    const activePath = state.openTabs.find((tab) => tab.id === state.activeTabId)?.path ?? "";
+    if (activePath !== repoPath) {
+      warning = "Switch to this terminal's repository to open its files.";
+      return;
+    }
+    repoStore.selectFilePath(action.path);
+    repoStore.setActiveTab("code");
+  }
+
+  /** Hover text for a link, so the target is readable before it is clicked. */
+  function linkTitle(text: string): string {
+    const action = resolveLinkAction(text, repoPath);
+    if (action.kind === "url") return `Open ${action.url} in your browser`;
+    if (action.kind === "file") {
+      const at = action.line === null ? "" : ` (line ${action.line}${action.column === null ? "" : `, column ${action.column}`})`;
+      return `Open ${action.path}${at}`;
+    }
+    return action.reason;
+  }
+
   function ensureTerm(): XTerm | null {
     if (term) return term;
     const created = new XTerm({
@@ -193,6 +285,19 @@
       // draws the background as a plain CSS colour.
       allowTransparency: true,
       scrollback: 5000,
+      screenReaderMode: get(interfaceStore).terminalScreenReader,
+      /**
+       * OSC 8 hyperlinks — the ones a program embeds in its own output.
+       * `allowNonHttpProtocols` stays false so xterm drops a non-web target
+       * before `activate` ever sees it; `activateLink` then applies the same
+       * allowlist again. The duplication is deliberate: xterm's filter lives
+       * in its OSC provider only, so it protects this path and not the
+       * detected-span path, and only one of the two is a GitPulse decision.
+       */
+      linkHandler: {
+        activate: (_event, text) => { void activateLink(text); },
+        allowNonHttpProtocols: false,
+      },
     });
     fitAddon = new FitAddon();
     created.loadAddon(fitAddon);
@@ -201,6 +306,38 @@
     searchAddon.onDidChangeResults((result) => {
       resultIndex = result.resultIndex;
       resultCount = result.resultCount;
+    });
+    /**
+     * URLs and repository file references in ordinary output, which carries
+     * no OSC 8 markup at all — compilers, test runners and `git status` print
+     * plain text. Scanning happens on hover of a row xterm has not already
+     * asked about, so the per-call cost lands on a mousemove and is bounded
+     * inside `linksForRow`.
+     */
+    linkProvider = created.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        if (disposed || !term) { callback(undefined); return; }
+        try {
+          // A span GitPulse will refuse to open is not decorated as a link at
+          // all. Underlining it and then doing nothing on click is the worse
+          // option: the affordance would promise something the policy has
+          // already decided against, and a user who clicks twice learns to
+          // distrust the underline rather than the output.
+          const found = linksForRow(linkBuffer(created), bufferLineNumber)
+            .filter((link) => resolveLinkAction(link.text, repoPath).kind !== "refused");
+          callback(found.length ? found.map((link) => ({
+            range: link.range,
+            text: link.text,
+            activate: (_event, text) => { void activateLink(text); },
+            hover: () => { hoveredLink = linkTitle(link.text); },
+            leave: () => { hoveredLink = null; },
+          })) : undefined);
+        } catch {
+          // A buffer read that races a reset must not break linkification for
+          // the rest of the session; this row simply has no links this time.
+          callback(undefined);
+        }
+      },
     });
     created.onScroll(() => {
       scrolledBack = created.buffer.active.viewportY < created.buffer.active.baseY;
@@ -470,6 +607,8 @@
       disposed = true;
       lifecycle?.dispose();
       lifecycle = null;
+      linkProvider?.dispose();
+      linkProvider = null;
       stopResize?.();
       stopResize = null;
       themeObserver?.disconnect();
@@ -479,6 +618,16 @@
       fitAddon = null;
       searchAddon = null;
     };
+  });
+
+  /**
+   * Toggling screen reader support applies to every live session, not just
+   * the next one: someone turning it on has assistive technology running now,
+   * and telling them to restart their shells to be read is not an answer.
+   */
+  $effect(() => {
+    const on = $interfaceStore.terminalScreenReader;
+    if (term) term.options.screenReaderMode = on;
   });
 
   /** Theme flips re-resolve the palette from CSS variables. */
@@ -495,6 +644,9 @@
    */
   $effect(() => {
     if (active) reveal();
+    // A hover label left over from before the switch names a link the pointer
+    // is no longer on, in a tab that may not even be visible.
+    else hoveredLink = null;
   });
 
   $effect(() => {
@@ -536,11 +688,11 @@
       <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
     {/if}
   </div>
-  {#if error || exited || spawning || shellPath}
+  {#if error || exited || spawning || shellPath || hoveredLink}
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
-    <div class="shrink-0 min-w-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8">
+    <div data-terminal-status class="shrink-0 min-w-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8">
       {#if spawning}
         <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
         <span class="text-textMuted text-[11px]">Starting {launcherLabel(launcher)}…</span>
@@ -555,6 +707,10 @@
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Launch a new attempt from the task details." : "Restart this terminal"}>
           <RotateCw size={12} /> Restart
         </button>
+      {:else if hoveredLink}
+        <!-- Same row, so revealing a link target never resizes the grid. -->
+        <ExternalLink size={11} class="text-accent shrink-0" aria-hidden="true" />
+        <span class="text-[10px] text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
       {:else}
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
         <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${repoPath}`}>{shellPath.split(/[\\/]/).pop()} · {repoPath.split(/[\\/]/).pop()}</span>

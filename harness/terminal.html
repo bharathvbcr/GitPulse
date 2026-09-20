@@ -9,10 +9,15 @@
     <script type="module">
       import { mockIPC } from "@tauri-apps/api/mocks";
       import { emit } from "@tauri-apps/api/event";
+      import { createChecks } from "./checks.ts";
       import "../src/app.css";
 
+      const params = new URLSearchParams(location.search);
       const sessions = new Map();
       let written = [];
+      /** Every URL handed to the OS opener, so a refused scheme is provably
+       * refused rather than merely unobserved. */
+      const opened = [];
       const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [] };
       const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
       addEventListener("error", (event) => { report.errors.push(event.message); showReport(); });
@@ -23,16 +28,25 @@
           await emit("terminal-output", {id, data_b64:btoa(String.fromCharCode(...bytes.subarray(i, i + 4096)))});
         }
       };
+      /** One line carrying every span class the linkifier must judge: an
+       * openable URL with a query, a repository file with line and column, a
+       * refused scheme, and a path that climbs out of the repository. */
+      const LINK_LINE = "Links: https://example.com/a?b=1 src/lib/terminal/links.ts:12:5 file:///etc/passwd ../../etc/passwd:1";
       mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
+          case "plugin:opener|open_url": opened.push(args.url ?? args.path); return null;
           case "cmd_terminal_spawn": {
             const id = `fixture-${++report.spawned}`;
             sessions.set(id, args.repoPath);
             // The bus subscribes after the acknowledgement; emit on the next task.
             setTimeout(() => {
               const lines = Array.from({ length: 80 }, (_, i) => `line ${i + 1}: ${i % 10 === 0 ? "ERROR" : "passed"} · terminal verification`).join("\r\n");
-              void output(id, `\u001b]2;${args.repoPath.split("/").pop()} ${report.spawned}\u0007\u001b[32mSession ready\u001b[0m\r\n${lines}\r\nWrapped: ${"long text ".repeat(20)}needle end\r\nUnicode: 世界 café 🚀\r\n${args.repoPath} $ `);
+              // LINK_LINE sits last, immediately above the prompt: only
+              // rendered rows are in the DOM, and anything printed before the
+              // 80-line block has already scrolled into scrollback by the time
+              // the checks run.
+              void output(id, `\u001b]2;${args.repoPath.split("/").pop()} ${report.spawned}\u0007\u001b[32mSession ready\u001b[0m\r\n${lines}\r\nWrapped: ${"long text ".repeat(20)}needle end\r\nUnicode: 世界 café 🚀\r\n${LINK_LINE}\r\n${args.repoPath} $ `);
             }, 100);
             showReport();
             return { id, cwd: args.repoPath, shell: "/bin/zsh" };
@@ -73,137 +87,201 @@
       mount(Host, { target: document.querySelector("#app") });
       showReport();
 
-      document.querySelector("#stress").onclick = async (event) => {
-        event.currentTarget.disabled = true;
-        const input = [...document.querySelectorAll('textarea[aria-label="Terminal input"]')].find((el) => el.getClientRects().length);
-        const paste = (text) => { const clipboardData = new DataTransfer(); clipboardData.setData("text/plain", text); input.dispatchEvent(new ClipboardEvent("paste", {bubbles:true, cancelable:true, clipboardData})); };
-        const payload = "世界🚀é".repeat(25000);
-        written = [];
-        paste(payload);
-        const deadline = performance.now() + 10000;
-        while (written.join("").length < payload.length && performance.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-        const exact = written.join("") === payload;
-        const bounded = written.every((data) => new TextEncoder().encode(data).length <= 16384);
-        const before = report.writes;
-        paste("x".repeat(1024 * 1024 + 1));
-        await new Promise((r) => setTimeout(r, 100));
-        const refused = report.writes === before && document.body.textContent.includes("Paste was not sent");
-        input.dispatchEvent(new KeyboardEvent("keydown", {key:"W",ctrlKey:true,shiftKey:true,repeat:true,bubbles:true,cancelable:true}));
-        await new Promise((r) => setTimeout(r, 100));
-        const repeat = report.writes === before;
-        report.inputStress = {exact,bounded,refused,repeat,bytes:new TextEncoder().encode(payload).length,chunks:written.length};
-        showReport();
-        document.querySelector("#stress").textContent = exact && bounded && refused && repeat ? "4 input stress checks passed" : "Input stress FAILED";
-      };
+      const wait = (ms = 250) => new Promise((resolve) => setTimeout(resolve, ms));
+      const visible = (selector) => [...document.querySelectorAll(selector)].filter((el) => el.getClientRects().length);
+      const label = (name) => visible("[aria-label]").find((el) => el.getAttribute("aria-label") === name);
+      const button = (name) => label(name) ?? visible("button").find((el) => el.textContent.trim() === name);
 
-      document.querySelector("#checks").onclick = async (event) => {
-        event.currentTarget.disabled = true;
-        const results = [];
-        const wait = () => new Promise((resolve) => setTimeout(resolve, 250));
-        const visible = (selector) => [...document.querySelectorAll(selector)].filter((el) => el.getClientRects().length);
-        const label = (name) => visible("[aria-label]").find((el) => el.getAttribute("aria-label") === name);
-        const button = (name) => label(name) ?? visible("button").find((el) => el.textContent.trim() === name);
-        const check = (name, pass) => { results.push({ name, pass }); if (!pass) throw new Error(name); };
-        const input = async (text) => {
-          const field = label("Find in terminal output");
-          field.value = text;
-          field.dispatchEvent(new Event("input", { bubbles: true }));
-          await wait();
-        };
-        const press = async (target, key, modifiers = {}) => {
-          target.focus();
-          target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...modifiers }));
-          await wait();
-        };
-        const status = () => visible('[role="status"]')[0]?.textContent;
+      /**
+       * Points the mouse at one character of a rendered row, measured rather
+       * than computed.
+       *
+       * Deriving a cell width from the row's box over its text length looks
+       * right and is not: the DOM renderer does not pad a row out to `cols`,
+       * so the divisor is short, the estimated cell is too wide, and the error
+       * grows with the column — near the start of the line the pointer still
+       * lands inside the intended span, and further along it silently does
+       * not. A Range over the exact character asks the layout engine where
+       * that glyph actually is, which has no such failure mode.
+       */
+      const pointAt = (needle, offsetInNeedle = 0) => {
+        const row = visible(".xterm-rows > div").find((el) => el.textContent.includes(needle));
+        if (!row) throw new Error(`no rendered row contains ${needle}`);
+        const target = row.textContent.indexOf(needle) + offsetInNeedle;
+        const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+        let seen = 0;
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          if (target < seen + node.data.length) {
+            const range = document.createRange();
+            range.setStart(node, target - seen);
+            range.setEnd(node, target - seen + 1);
+            const box = range.getBoundingClientRect();
+            return { clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 };
+          }
+          seen += node.data.length;
+        }
+        throw new Error(`character ${target} of ${needle} is not in a rendered text node`);
+      };
+      const mouse = async (type, at) => {
+        visible(".xterm-screen")[0].dispatchEvent(new MouseEvent(type, { ...at, bubbles: true, cancelable: true }));
+        await wait(80);
+      };
+      const hover = async (needle, offset) => { await mouse("mousemove", pointAt(needle, offset)); };
+      const clickLink = async (needle, offset) => {
+        const at = pointAt(needle, offset);
+        await mouse("mousemove", at);
+        await mouse("mousedown", at);
+        await mouse("mouseup", at);
+      };
+      /**
+       * The session's status row, which is where a hovered link's target is
+       * shown. Scoped to that element deliberately: the tab panel's text
+       * contains the rendered grid, and the grid contains the very link line
+       * under test — asserting against the panel would make every negative
+       * check pass for the wrong reason.
+       */
+      const footer = () => visible("[data-terminal-status]")[0]?.textContent ?? "";
+
+      async function runChecks() {
+        const { results, check, stopped } = createChecks();
         try {
           const writesBefore = report.writes;
+          const status = () => visible('[role="status"]')[0]?.textContent;
+          const input = async (text) => {
+            const field = label("Find in terminal output");
+            field.value = text;
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            await wait();
+          };
+          const press = async (target, key, modifiers = {}) => {
+            target.focus();
+            target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...modifiers }));
+            await wait();
+          };
+
+          // ---- Linkification, against the real xterm and the real provider.
+          // Source assertions can show the provider is registered; only this
+          // can show it resolves a span, decorates it, and opens the target.
+          await hover("https://example.com/a?b=1", 3);
+          check("hovering a URL names its target, query string intact",
+            () => footer().includes("Open https://example.com/a?b=1 in your browser"));
+          check("a hovered link gets xterm's pointer decoration",
+            () => visible(".xterm-screen")[0].classList.contains("xterm-cursor-pointer"));
+          await hover("src/lib/terminal/links.ts:12:5", 3);
+          check("hovering a repository file names the path, line and column",
+            () => footer().includes("Open src/lib/terminal/links.ts (line 12, column 5)"));
+          await hover("file:///etc/passwd", 3);
+          check("a refused scheme is not a link at all",
+            () => !footer().includes("file:///etc/passwd")
+              && !visible(".xterm-screen")[0].classList.contains("xterm-cursor-pointer"));
+          await hover("../../etc/passwd:1", 3);
+          // Asserted on the decoration, not on the hover text. The hover text
+          // for a refused span never begins "Open …" whether or not the span
+          // was linkified, so a check written against it passes either way —
+          // it did, until the filter was removed to find that out.
+          check("a path climbing out of the repository is not a link",
+            () => !visible(".xterm-screen")[0].classList.contains("xterm-cursor-pointer")
+              && !footer().includes("Open ../../etc/passwd"));
+
+          const openedBefore = opened.length;
+          await clickLink("https://example.com/a?b=1", 3);
+          check("clicking a URL opens exactly that URL through the opener",
+            () => opened.length === openedBefore + 1 && opened.at(-1) === "https://example.com/a?b=1");
+          await clickLink("file:///etc/passwd", 3);
+          await clickLink("../../etc/passwd:1", 3);
+          check("a refused span never reaches the opener", () => opened.length === openedBefore + 1);
+          check("linkification writes nothing to the shell", () => report.writes === writesBefore);
+
+          // ---- Find.
           button("Find in terminal").click(); await wait();
-          await input("error"); check("case-insensitive search finds eight results", status() === "1 of 8");
-          await press(label("Find in terminal output"), "Enter"); check("Enter selects next match", status() === "2 of 8");
-          await press(label("Find in terminal output"), "Enter", { shiftKey: true }); check("Shift+Enter selects previous match", status() === "1 of 8");
-          button("Match case").click(); await wait(); check("case toggle invalidates highlights and counts", status() === "No matches");
-          await input("世界"); check("Unicode search", status() === "1 of 1");
-          await input("needle end"); check("wrapped output search", status() === "1 of 1");
-          await input("missing-query"); check("no-match state", status() === "No matches");
-          await input(""); check("empty query clears result count", status() === "");
-          await press(label("Find in terminal output"), "Escape"); check("Escape restores terminal focus", document.activeElement?.getAttribute("aria-label") === "Terminal input");
+          await input("error"); check("case-insensitive search finds eight results", () => status() === "1 of 8");
+          await press(label("Find in terminal output"), "Enter"); check("Enter selects next match", () => status() === "2 of 8");
+          await press(label("Find in terminal output"), "Enter", { shiftKey: true }); check("Shift+Enter selects previous match", () => status() === "1 of 8");
+          button("Match case").click(); await wait(); check("case toggle invalidates highlights and counts", () => status() === "No matches");
+          await input("世界"); check("Unicode search", () => status() === "1 of 1");
+          await input("needle end"); check("wrapped output search", () => status() === "1 of 1");
+          await input("missing-query"); check("no-match state", () => status() === "No matches");
+          await input(""); check("empty query clears result count", () => status() === "");
+          await press(label("Find in terminal output"), "Escape"); check("Escape restores terminal focus", () => document.activeElement?.getAttribute("aria-label") === "Terminal input");
+
+          // ---- Tabs, layout and session management.
           await press(button("New Shell session"), "T", { ctrlKey: true, shiftKey: true });
-          check("new-tab chord works from toolbar", visible('[role="tab"]').length === 2);
+          check("new-tab chord works from toolbar", () => visible('[role="tab"]').length === 2);
           await press(visible('[role="tab"][aria-selected="true"]')[0], "Home");
-          check("Home selects first tab and keeps strip focus", document.activeElement === visible('[role="tab"]')[0]);
+          check("Home selects first tab and keeps strip focus", () => document.activeElement === visible('[role="tab"]')[0]);
           await press(document.activeElement, "ArrowRight");
-          check("ArrowRight selects next tab and keeps strip focus", document.activeElement === visible('[role="tab"]')[1]);
+          check("ArrowRight selects next tab and keeps strip focus", () => document.activeElement === visible('[role="tab"]')[1]);
           const beforeHide = report.spawned;
           button("Hide the terminal dock").click(); await wait();
           button("Show terminal").click(); await wait();
-          check("hide/show preserves both sessions", report.spawned === beforeHide && report.killed === 0);
+          check("hide/show preserves both sessions", () => report.spawned === beforeHide && report.killed === 0);
           button("Repository Other").click(); await wait();
-          check("another repository gets its own session", report.spawned === beforeHide + 1);
+          check("another repository gets its own session", () => report.spawned === beforeHide + 1);
           button("Repository GitPulse").click(); await wait();
-          check("returning restores both original tabs", visible('[role="tab"]').length === 2 && report.killed === 0);
+          check("returning restores both original tabs", () => visible('[role="tab"]').length === 2 && report.killed === 0);
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
-          button("Expand terminal").click(); await wait(); check("expand grows the dock", dock.getBoundingClientRect().height > height);
-          button("Restore terminal size").click(); await wait(); check("restore returns previous height", dock.getBoundingClientRect().height === height);
+          button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
+          button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
           button("Toggle narrow layout").click(); await wait();
-          check("narrow toolbar stays inside its panel", label("Terminal").scrollWidth === label("Terminal").clientWidth);
-          button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", report.spawned === beforeHide + 1);
-          check("terminal palette follows the completed theme transition", getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
+          check("narrow toolbar stays inside its panel", () => label("Terminal").scrollWidth === label("Terminal").clientWidth);
+          button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", () => report.spawned === beforeHide + 1);
+          check("terminal palette follows the completed theme transition", () => getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
           button("Console").click(); await wait();
-          button("Shell").click(); await wait(); check("Console switch preserves sessions", report.spawned === beforeHide + 1 && report.killed === 0);
+          check("the console command field has an accessible name", () => !!label("Console command"));
+          button("Shell").click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
           for (let i = 0; i < 20; i++) button("Increase terminal text size")?.click();
-          await wait(); check("font size is bounded", button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);
+          await wait(); check("font size is bounded", () => button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);
           button("Reset terminal text size").click(); await wait();
           const beforeClear = report.spawned;
           button("Clear scrollback").click(); await wait();
-          check("clear keeps the prompt and running session", visible('[role="tabpanel"]')[0].textContent.includes("/fixture/GitPulse $") && report.spawned === beforeClear && report.killed === 0);
+          check("clear keeps the prompt and running session", () => visible('[role="tabpanel"]')[0].textContent.includes("/fixture/GitPulse $") && report.spawned === beforeClear && report.killed === 0);
           const aboveGrid = (el) => {
             const chrome = el.getBoundingClientRect();
             const grid = visible("[data-terminal-session]")[0].getBoundingClientRect();
             return chrome.bottom <= grid.top + 1;
           };
           button("Terminal shortcuts").click(); await wait();
-          check("shortcuts sit above the grid instead of overlapping it", aboveGrid(label("Terminal keyboard shortcuts")));
+          check("shortcuts sit above the grid instead of overlapping it", () => aboveGrid(label("Terminal keyboard shortcuts")));
           button("Terminal shortcuts").click(); await wait();
           const beforeOptions = report.spawned;
           button("Terminal tab options").click(); await wait();
-          check("tab options sit above the grid instead of overlapping it", aboveGrid(label("Terminal tab name").closest("form")));
+          check("tab options sit above the grid instead of overlapping it", () => aboveGrid(label("Terminal tab name").closest("form")));
           const name = label("Terminal tab name"); name.value = "Build logs"; name.dispatchEvent(new Event("input", { bubbles: true }));
           button("Rename").click(); await wait();
-          check("custom tab names survive program titles", visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
+          check("custom tab names survive program titles", () => visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
           button("Terminal tab options").click(); await wait();
           button("Move terminal tab left").click(); await wait();
-          check("tab reorder preserves sessions and selection", visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
+          check("tab reorder preserves sessions and selection", () => visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
           await press(label("Terminal tab name"), "Escape");
           button("Split terminal").click(); await wait();
-          check("split view shows two existing sessions", visible('[role="tabpanel"]').length === 2 && report.spawned === beforeOptions);
+          check("split view shows two existing sessions", () => visible('[role="tabpanel"]').length === 2 && report.spawned === beforeOptions);
           const panes = visible('[role="tabpanel"]').map((el) => el.getBoundingClientRect());
-          check("narrow split stacks panes without overlap", Math.min(panes[0].bottom, panes[1].bottom) <= Math.max(panes[0].top, panes[1].top) + 1);
+          check("narrow split stacks panes without overlap", () => Math.min(panes[0].bottom, panes[1].bottom) <= Math.max(panes[0].top, panes[1].top) + 1);
           interfaceStore.setTerminalDockHeight(200);
           button("Find in terminal").click(); await wait();
-          check("minimum dock height keeps both split terminals usable with Find open", visible('[data-terminal-session]').every((el) => el.getBoundingClientRect().height >= 60));
+          check("minimum dock height keeps both split terminals usable with Find open", () => visible('[data-terminal-session]').every((el) => el.getBoundingClientRect().height >= 60));
           const shortPanes = visible('[role="tabpanel"]').map((el) => el.getBoundingClientRect());
           const paneScroller = visible('.terminal-panes')[0];
-          check("short stacked panes scroll without overlap", Math.min(shortPanes[0].bottom, shortPanes[1].bottom) <= Math.max(shortPanes[0].top, shortPanes[1].top) + 1 && paneScroller.scrollHeight > paneScroller.clientHeight);
+          check("short stacked panes scroll without overlap", () => Math.min(shortPanes[0].bottom, shortPanes[1].bottom) <= Math.max(shortPanes[0].top, shortPanes[1].top) + 1 && paneScroller.scrollHeight > paneScroller.clientHeight);
           button("Close find").click(); interfaceStore.setTerminalDockHeight(400); await wait();
           button("Close split view").click(); await wait();
-          check("closing split preserves both sessions", visible('[role="tabpanel"]').length === 1 && report.killed === 0);
+          check("closing split preserves both sessions", () => visible('[role="tabpanel"]').length === 1 && report.killed === 0);
           button("All terminal sessions").click(); await wait();
-          check("session list sits above the grid instead of overlapping it", aboveGrid(label("Sessions across repositories")));
-          check("session manager includes both repositories", label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
+          check("session list sits above the grid instead of overlapping it", () => aboveGrid(label("Sessions across repositories")));
+          check("session manager includes both repositories", () => label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
           button("All terminal sessions").click(); await wait();
           for (let i = 0; i < 14; i++) { button("New Shell session").click(); await wait(); }
-          check("global session limit spans both repositories", visible('[role="tab"]').length === 15 && report.spawned === 16 && button("New Shell session").disabled);
+          check("global session limit spans both repositories", () => visible('[role="tab"]').length === 15 && report.spawned === 16 && button("New Shell session").disabled);
           const activeTab = visible('[role="tab"][aria-selected="true"]')[0].closest("[data-terminal-tab]").getBoundingClientRect();
           const strip = label("Terminal sessions").getBoundingClientRect();
-          check("new active tab scrolls into view", activeTab.left >= strip.left && activeTab.right <= strip.right + 1);
+          check("new active tab scrolls into view", () => activeTab.left >= strip.left && activeTab.right <= strip.right + 1);
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
-          check("close chord kills only its session", visible('[role="tab"]').length === 14 && report.killed === 1);
-          check("controls never write to the shell", report.writes === writesBefore);
-          check("no runtime errors", report.errors.length === 0);
+          check("close chord kills only its session", () => visible('[role="tab"]').length === 14 && report.killed === 1);
+          check("controls never write to the shell", () => report.writes === writesBefore);
+          check("no runtime errors", () => report.errors.length === 0);
         } catch (error) {
-          if (!results.some((result) => !result.pass)) results.push({ name: String(error), pass: false });
+          stopped(error);
         }
         report.checks = results;
         showReport();
@@ -213,8 +291,59 @@
         document.querySelector("#result").style.whiteSpace = "pre-wrap";
         document.querySelector("#checks").textContent = results.every((result) => result.pass) ? `${results.length} checks passed` : "Checks FAILED";
         document.querySelector("#stress").disabled = !results.every((result) => result.pass);
-      };
+        return results;
+      }
+
+      /** Input-path stress: exact large paste, chunk bound, atomic refusal,
+       * and a held chord that must not repeat. Reported as rows so a failure
+       * here fails the run rather than only recolouring a button. */
+      async function runStress() {
+        const { results, check, stopped } = createChecks();
+        try {
+          const field = [...document.querySelectorAll('textarea[aria-label="Terminal input"]')].find((el) => el.getClientRects().length);
+          if (!field) throw new Error("no visible terminal input");
+          const paste = (text) => { const clipboardData = new DataTransfer(); clipboardData.setData("text/plain", text); field.dispatchEvent(new ClipboardEvent("paste", {bubbles:true, cancelable:true, clipboardData})); };
+          const payload = "世界🚀é".repeat(25000);
+          written = [];
+          paste(payload);
+          const deadline = performance.now() + 10000;
+          while (written.join("").length < payload.length && performance.now() < deadline) await wait(50);
+          check("a 300 KB Unicode paste arrives byte for byte", () => written.join("") === payload);
+          check("every write stays inside the 16 KiB chunk bound", () => written.every((data) => new TextEncoder().encode(data).length <= 16384));
+          const before = report.writes;
+          paste("x".repeat(1024 * 1024 + 1));
+          await wait(100);
+          check("an oversize paste is refused in full and says so",
+            () => report.writes === before && document.body.textContent.includes("Paste was not sent"));
+          field.dispatchEvent(new KeyboardEvent("keydown", {key:"W",ctrlKey:true,shiftKey:true,repeat:true,bubbles:true,cancelable:true}));
+          await wait(100);
+          check("a held close chord does not repeat", () => report.writes === before);
+        } catch (error) {
+          stopped(error);
+        }
+        report.inputStress = results;
+        showReport();
+        document.querySelector("#stress").textContent = results.every((r) => r.pass) ? `${results.length} input stress checks passed` : "Input stress FAILED";
+        return results;
+      }
+
+      document.querySelector("#checks").onclick = async (event) => { event.currentTarget.disabled = true; await runChecks(); };
+      document.querySelector("#stress").onclick = async (event) => { event.currentTarget.disabled = true; await runStress(); };
       document.querySelector("#checks").disabled = false;
+
+      // Driven by scripts/browser-regressions.mjs. Everything above stays
+      // clickable for local work; `?check=1` is what makes the harness a gate
+      // instead of something a person has to remember to press.
+      if (params.has("check")) {
+        // The first session's output arrives on a timer after the spawn
+        // acknowledgement; linkification has nothing to find until it lands.
+        await wait(600);
+        const checks = await runChecks();
+        const stress = checks.every((row) => row.pass) ? await runStress() : [];
+        const results = [...checks, ...stress];
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors }));
+        if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+      }
     </script>
   </body>
 </html>
