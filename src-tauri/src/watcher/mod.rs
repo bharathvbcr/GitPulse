@@ -852,11 +852,25 @@ mod tests {
         (main, work_parent, work_path)
     }
 
-    struct RestoreCwd(std::path::PathBuf);
-    impl Drop for RestoreCwd {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
+    /// A relative spelling of `target` as seen from `from`, both canonical.
+    ///
+    /// Used where a test needs a relative path that really does resolve to
+    /// somewhere: the honest way to prove a lookup does *not* canonicalize is to
+    /// hand it a relative path that would find the target if it did.
+    fn relative_to(from: &Path, target: &Path) -> PathBuf {
+        let shared = from
+            .components()
+            .zip(target.components())
+            .take_while(|(here, there)| here == there)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in shared..from.components().count() {
+            relative.push("..");
         }
+        for part in target.components().skip(shared) {
+            relative.push(part);
+        }
+        relative
     }
 
     impl WatcherState {
@@ -1408,57 +1422,50 @@ mod tests {
         );
     }
 
+    /// A relative path names whatever the *caller's* cwd says it names, and the
+    /// watch registry is keyed by canonical repository paths, so resolving one
+    /// here would unwatch a repository nobody named.
+    ///
+    /// This used to prove it by `set_current_dir`-ing into the watched
+    /// repository and unwatching `"."`. Cwd is process-wide, so that needed a
+    /// whole second copy of this test binary to run one test in — with a 15s
+    /// deadline on a child that has to link, load and start libtest, which is
+    /// the most load-sensitive wait in the suite and the first to fail on a busy
+    /// machine. Handing `unwatch` a relative path that resolves to the watched
+    /// repository *from the cwd the test already has* proves the same thing:
+    /// an implementation that canonicalized would find the watch and remove it.
     #[test]
     fn test_unwatch_relative_path_does_not_canonicalize_against_cwd() {
-        const CHILD: &str = "GITPULSE_WATCHER_CWD_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            // Cwd is process-wide: a concurrent Git child can inherit this
-            // temporary directory and outlive it even after RestoreCwd runs.
-            // Keep every original assertion in an isolated, bounded process.
-            let output_dir = TempDir::new().unwrap();
-            let output_path = output_dir.path().join("child-output");
-            let output = std::fs::File::create(&output_path).unwrap();
-            let original_cwd = std::env::current_dir().unwrap();
-            let (mut command, _harness) = crate::test_support::isolated_libtest_command(
-                "watcher::tests::test_unwatch_relative_path_does_not_canonicalize_against_cwd",
-            );
-            let mut child = command
-                .env(CHILD, "1")
-                .stdin(std::process::Stdio::null())
-                .stderr(output.try_clone().unwrap())
-                .stdout(output)
-                .spawn()
-                .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break status;
-                }
-                if std::time::Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("isolated cwd test exceeded its deadline");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            let report = std::fs::read_to_string(output_path).unwrap();
-            assert!(status.success(), "isolated cwd test failed: {report}");
-            assert!(report.contains("1 passed; 0 failed"), "{report}");
-            assert_eq!(std::env::current_dir().unwrap(), original_cwd);
-            return;
-        }
         let dir = TempDir::new().unwrap();
         git_init(dir.path(), false);
         let state = WatcherState::default();
         let key = start_watch_inner(&state, dir.path().to_string_lossy().into_owned(), |_| {})
             .expect("watch");
 
-        let _restore = RestoreCwd(std::env::current_dir().unwrap());
-        std::env::set_current_dir(dir.path()).unwrap();
-        unwatch(&state, ".".into()).unwrap();
+        let repo = dir.path().canonicalize().expect("canonical repo");
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonical cwd");
+        let relative = relative_to(&cwd, &repo);
+        // Without this the test could pass on a path that resolves nowhere,
+        // which is a fixture that cannot fail rather than a behaviour that
+        // cannot break.
+        assert!(
+            relative.is_relative(),
+            "the fixture must hand `unwatch` a relative path: {}",
+            relative.display()
+        );
+        assert_eq!(
+            cwd.join(&relative).canonicalize().expect("resolvable"),
+            repo,
+            "the relative path must really resolve to the watched repository"
+        );
+
+        unwatch(&state, relative.to_string_lossy().into_owned()).unwrap();
         assert!(
             state.is_watching(&key).unwrap(),
-            "unwatch(\".\") must not treat cwd as the watched repo"
+            "unwatch must look a relative path up raw, not resolve it against cwd"
         );
         unwatch(&state, key.clone()).unwrap();
         assert!(!state.is_watching(&key).unwrap());

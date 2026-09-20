@@ -549,16 +549,7 @@ done
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let serial = sidecar::test_serial();
-        sidecar::set_test_binary(&serial, Some(script.to_string_lossy().into_owned()));
-        struct Clear<'a>(&'a sidecar::SidecarTestGuard);
-        impl Drop for Clear<'_> {
-            fn drop(&mut self) {
-                sidecar::set_test_binary(self.0, None);
-                sidecar::reset();
-            }
-        }
-        let _clear = Clear(&serial);
-        sidecar::reset();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         let before = crate::ledger::latest_cursor(repo).expect("cursor");
         let refused = guard_file(repo, "docs/elsewhere.md", "modify");
@@ -690,16 +681,7 @@ done
         std::fs::write(&script, FAKE_ALLOW).expect("write fake sidecar");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let serial = sidecar::test_serial();
-        sidecar::set_test_binary(&serial, Some(script.to_string_lossy().into_owned()));
-        struct Clear<'a>(&'a sidecar::SidecarTestGuard);
-        impl Drop for Clear<'_> {
-            fn drop(&mut self) {
-                sidecar::set_test_binary(self.0, None);
-                sidecar::reset();
-            }
-        }
-        let _clear = Clear(&serial);
-        sidecar::reset();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         let before = crate::ledger::latest_cursor(main_path).expect("family cursor");
         guard_file(&worktree, "src/planned.rs", "modify").expect("allowed write");
@@ -744,16 +726,7 @@ done
         std::fs::write(&script, FAKE_ALLOW).expect("write fake sidecar");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let serial = sidecar::test_serial();
-        sidecar::set_test_binary(&serial, Some(script.to_string_lossy().into_owned()));
-        struct Clear<'a>(&'a sidecar::SidecarTestGuard);
-        impl Drop for Clear<'_> {
-            fn drop(&mut self) {
-                sidecar::set_test_binary(self.0, None);
-                sidecar::reset();
-            }
-        }
-        let _clear = Clear(&serial);
-        sidecar::reset();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         let result = guard_file(&worktree, "src/planned.rs", "modify");
         assert!(

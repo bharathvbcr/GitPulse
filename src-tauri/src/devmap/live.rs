@@ -1070,10 +1070,6 @@ mod tests {
         std::fs::write(
             &bin,
             r#"#!/bin/sh
-if [ "$1" = "status" ]; then
-  printf '%s\n' '{"is_fresh":true,"schema_outdated":false}'
-  exit 0
-fi
 if [ "$1" = "build" ]; then
   printf '%s\n' '{"ok":true,"unchanged":true}'
   exit 0
@@ -1087,7 +1083,17 @@ exit 2
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
-        let _bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        // The storm below calls `maybe_refresh` twenty-odd times, and every call
+        // used to spawn a child just to be told the store is fresh. Each of those
+        // was a chance for the probe to miss its deadline and answer
+        // `SkipUnavailable`, which this loop reads as an unexpected decision and
+        // panics on — a verdict about how busy the host was. The stub no longer
+        // answers `status` at all, so a lost override fails loudly here instead
+        // of quietly standing in for the override.
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":true,"schema_outdated":false}"#,
+        ));
         struct ResetCooldowns;
         impl Drop for ResetCooldowns {
             fn drop(&mut self) {
@@ -1158,10 +1164,6 @@ exit 2
         std::fs::write(
             &bin,
             r#"#!/bin/sh
-if [ "$1" = "status" ]; then
-  printf '%s\n' '{"is_fresh":false,"schema_outdated":false}'
-  exit 0
-fi
 if [ "$1" = "build" ]; then
   echo boom >&2
   printf '%s\n' '{"ok":false}'
@@ -1176,7 +1178,13 @@ exit 2
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
-        let _bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        // Injected for the same reason as the storm above: this test is about
+        // what a *failed build* does to the cooldown, so the probe answering
+        // late must not be able to decide it.
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
         struct ResetCooldowns;
         impl Drop for ResetCooldowns {
             fn drop(&mut self) {
@@ -1217,10 +1225,6 @@ exit 2
         std::fs::write(
             &bin,
             r#"#!/bin/sh
-if [ "$1" = "status" ]; then
-  printf '%s\n' '{"is_fresh":false,"schema_outdated":false}'
-  exit 0
-fi
 if [ "$1" = "build" ]; then
   printf '%s\n' '{"ok":true,"unchanged":true}'
   exit 0
@@ -1234,7 +1238,14 @@ exit 2
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
-        let _bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        // "Stale status" is the premise of this test, so it is stated rather
+        // than spawned for: a probe that missed its deadline would make the
+        // premise `SkipUnavailable` instead, and the activation assertion below
+        // would be about the wrong thing.
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false}"#,
+        ));
         struct ResetCooldowns;
         impl Drop for ResetCooldowns {
             fn drop(&mut self) {
@@ -1273,10 +1284,6 @@ exit 2
             &bin,
             r#"#!/bin/sh
 printf '%s\n' "$*" >> argv.log
-if [ "$1" = "status" ]; then
-  if [ -f status.json ]; then cat status.json; else printf '%s\n' '{"is_fresh":false,"schema_outdated":false}'; fi
-  exit 0
-fi
 if [ "$1" = "build" ]; then
   printf '%s\n' '{"ok":true,"unchanged":true}'
   exit 0
@@ -1290,7 +1297,7 @@ exit 2
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
-        let _bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
         struct ResetCooldowns;
         impl Drop for ResetCooldowns {
             fn drop(&mut self) {
@@ -1299,18 +1306,17 @@ exit 2
         }
         let _reset = ResetCooldowns;
         let path = repo.path().to_string_lossy().into_owned();
-        std::fs::write(
-            repo.path().join("status.json"),
+        // The two payloads the stub used to serve from a file it re-read on every
+        // spawn. Stated directly, so what changes between the two calls is the
+        // payload and nothing else.
+        bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false}"#,
-        )
-        .unwrap();
+        ));
         let first = maybe_refresh(&path, true);
         assert_eq!(first.decision, LiveRefreshDecision::Refresh);
-        std::fs::write(
-            repo.path().join("status.json"),
+        bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false,"rebuild_reason":"payload-obsolete"}"#,
-        )
-        .unwrap();
+        ));
         let activation = maybe_refresh(&path, false);
         assert_eq!(
             activation.decision,
@@ -1364,14 +1370,6 @@ exit 2
             format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> argv.log
-if [ "$1" = "status" ]; then
-  if [ -f built ]; then
-    printf '%s\n' '{{"is_fresh":true,"schema_outdated":false,"rebuild_required":false}}'
-  else
-    printf '%s\n' '{{"is_fresh":false,"schema_outdated":false,"rebuild_required":false,"schema_relation":"missing","degraded_reason":"no devmap store at this path (run `devmap build`)"}}'
-  fi
-  exit 0
-fi
 if [ "$1" = "build" ]; then
   # A plain build writes the store and nothing else, exactly like the real
   # kernel; only --manifest writes the consumer artifacts.
@@ -1402,7 +1400,7 @@ exit 2
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
-        let _bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
         struct ResetCooldowns;
         impl Drop for ResetCooldowns {
             fn drop(&mut self) {
@@ -1411,6 +1409,14 @@ exit 2
         }
         let _reset = ResetCooldowns;
         let path = repo.path().to_string_lossy().into_owned();
+
+        // The store this repository does not have yet. The stub used to derive
+        // this from a marker file its own `build` branch wrote, which made every
+        // step here depend on a child answering in time; the sequence is short
+        // and known, so each step states the store it is acting on.
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":false,"schema_outdated":false,"rebuild_required":false,"schema_relation":"missing","degraded_reason":"no devmap store at this path (run `devmap build`)"}"#,
+        ));
 
         // Opening the tab is an activation, not a watcher tick.
         let cold = maybe_refresh(&path, false);
@@ -1432,6 +1438,12 @@ exit 2
             }),
             "the cold build must be a --manifest build, argv log:\n{log}"
         );
+
+        // The build above made the store current, so that is what the probe now
+        // reports for the rest of this test.
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":true,"schema_outdated":false,"rebuild_required":false}"#,
+        ));
 
         // A second activation costs one status call and no build: the store is
         // fresh and the artifacts are on disk.

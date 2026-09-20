@@ -68,7 +68,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
@@ -206,6 +206,72 @@ impl Registration {
         let _ = child.kill();
     }
 
+    /// Gives a child that has already been asked to stop `grace` to do it on
+    /// its own, then takes its whole group down and reaps it.
+    ///
+    /// The *order* is why this lives here rather than being spelled out at each
+    /// call site: the group is signalled while nothing has waited on the pid,
+    /// which is exactly what makes that pid provably still ours. Reaping first
+    /// — the shape [`Child::try_wait`] hands you for free — leaves nothing to
+    /// signal, and anything the child forked and walked away from outlives it.
+    /// That was a real leak on `harness::sidecar`'s clean shutdown path: a
+    /// harness that forked a helper left it running with ppid 1, owned by
+    /// nothing, for as long as the machine stayed up.
+    ///
+    /// `grace` is for a child whose owner has *already* asked it to stop over
+    /// whatever channel it has — the sidecar closes stdin, [`reap_all`] sends
+    /// SIGTERM. Pass [`Duration::ZERO`] when there was no ask, or when the
+    /// answer has stopped mattering because the child is out of budget or its
+    /// pipes have already faulted.
+    pub fn stop_and_reap(&self, child: &mut Child, grace: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && !self.exited(child) {
+            std::thread::sleep(LIVENESS_POLL);
+        }
+        self.kill_tree(child);
+        self.reap(|| child.wait())
+    }
+
+    /// True once the child has exited, **without** reaping it.
+    ///
+    /// Reaping is what frees the pid for reuse, and on Unix the pid *is* the
+    /// group id, so a graceful wait that reaps as it watches is one that has
+    /// given up the right to clean up after the child it was being polite to.
+    /// The zombie is left in place for [`Self::stop_and_reap`]'s own `wait`.
+    ///
+    /// A pid already forgotten means another reap path got there first, so
+    /// there is nothing left to wait for.
+    fn exited(&self, child: &mut Child) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = child;
+            match *lock(&self.slot.pid) {
+                Some(pid) => sys::exited_without_reaping(pid),
+                None => true,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut pid = lock(&self.slot.pid);
+            if pid.is_none() {
+                return true;
+            }
+            // There is no zombie to preserve here: a pid stays valid while
+            // this process holds the child's handle, so reaping it now does
+            // not make the tree kill that follows unsafe the way it would on
+            // Unix. What Windows cannot do either way is find a helper the
+            // child already abandoned — `taskkill /T` walks the live tree, and
+            // an exited parent has no children left to walk to.
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    *pid = None;
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
     /// The child's pid while it is still ours to signal.
     pub fn pid(&self) -> Option<u32> {
         *lock(&self.slot.pid)
@@ -329,8 +395,7 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     lock(registry()).insert(key, Arc::clone(&slot));
     let registration = Registration { key, slot };
     if shutting_down() {
-        registration.kill_tree(&mut child);
-        let _ = registration.reap(|| child.wait());
+        let _ = registration.stop_and_reap(&mut child, Duration::ZERO);
         return Err(refused(label));
     }
     Ok((child, registration))
@@ -694,6 +759,39 @@ mod sys {
         signal_group(pid, libc::SIGKILL)
     }
 
+    /// True once this pid has exited, with its zombie left in place.
+    ///
+    /// `WNOWAIT` is the entire reason this is not `Child::try_wait`: it reports
+    /// the exit without consuming it, so the kernel cannot recycle the pid and
+    /// the group stays ours to `killpg`. Reaping is the caller's job, once it
+    /// has swept the group.
+    ///
+    /// [`is_alive`] cannot answer this question. It asks about the *group*, and
+    /// the two platforms disagree about a group whose only member is an
+    /// unreaped zombie — macOS calls it unsignalable, Linux calls it alive — so
+    /// a grace window built on it would end instantly on one and run to the
+    /// full deadline on the other.
+    ///
+    /// The `siginfo_t` is zeroed first because macOS does not clear it when
+    /// `WNOHANG` finds nothing; a non-zero `si_signo` means "exited" only
+    /// because we wrote that zero ourselves. A call that fails reports "not
+    /// exited", which costs at most the rest of a grace window the caller was
+    /// already prepared to wait out.
+    pub(super) fn exited_without_reaping(pid: u32) -> bool {
+        // SAFETY: `info` is a correctly sized, zeroed `siginfo_t`, and is the
+        // only memory `waitid` is given to write.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let asked = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        asked == 0 && info.si_signo != 0
+    }
+
     /// Signal 0 checks for a signalable member without sending anything.
     ///
     /// An answer we could not obtain is reported as *alive*: the only thing
@@ -963,28 +1061,10 @@ mod tests {
     #[cfg(unix)]
     use std::sync::mpsc;
 
-    /// Process-level liveness, which is not the same question as
-    /// [`sys::is_alive`]: that one asks about a process *group*, and a
-    /// grandchild is not a group leader, so asking it about one always
-    /// answers "gone".
+    // Shared with `harness::sidecar`'s shutdown tests, which ask the same
+    // question about the same kind of abandoned helper.
     #[cfg(unix)]
-    fn process_alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-
-    /// Waits for a pid to leave the process table, so an assertion never
-    /// depends on how quickly `init` reaps a reparented orphan.
-    #[cfg(unix)]
-    fn wait_gone(pid: u32, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            if !process_alive(pid) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        false
-    }
+    use crate::test_support::{announced_pid, process_alive, wait_gone};
 
     /// Reaps `child`, refusing to block forever if the kill did not land.
     #[cfg(unix)]
@@ -1062,15 +1142,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
         let (mut child, guard) = spawn(&mut cmd, "sh").expect("spawn");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let grandchild: u32 = {
-            use std::io::BufRead;
-            let mut line = String::new();
-            std::io::BufReader::new(stdout)
-                .read_line(&mut line)
-                .expect("read grandchild pid");
-            line.trim().parse().expect("pid")
-        };
+        let grandchild = announced_pid(&mut child);
         assert!(process_alive(grandchild), "fixture never started");
 
         guard.kill_tree(&mut child);
@@ -1079,6 +1151,49 @@ mod tests {
         assert!(
             wait_gone(grandchild, Duration::from_secs(5)),
             "the grandchild survived a kill aimed at its parent"
+        );
+    }
+
+    /// The ordering `stop_and_reap` exists to enforce: a child that honours its
+    /// ask and exits *still* leaves its group behind, so the sweep has to run
+    /// while the pid is un-waited-on. Reap first — which is what polling
+    /// `try_wait` does — and there is nothing left to signal.
+    ///
+    /// Also pins the two things that ordering must not cost: the child's own
+    /// exit status survives the sweep, and noticing the exit ends the grace
+    /// window instead of waiting it out.
+    #[cfg(unix)]
+    #[test]
+    fn stop_and_reap_sweeps_a_helper_an_exited_child_left_behind() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $!; exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let (mut child, guard) = spawn(&mut cmd, "sh").expect("spawn");
+        let helper = announced_pid(&mut child);
+        assert!(process_alive(helper), "fixture never started its helper");
+
+        // Only now: the fixture has forked, so the one thing left to time is
+        // `sh` returning from `exit 0`.
+        let asked = Instant::now();
+        let grace = crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        let status = guard
+            .stop_and_reap(&mut child, grace)
+            .expect("reap a child that exited on its own");
+        let waited = asked.elapsed();
+
+        assert!(
+            status.success(),
+            "the group sweep overwrote an honourable exit status: {status:?}"
+        );
+        assert!(
+            waited < grace / 2,
+            "the grace window ran to its deadline instead of ending at the exit: {waited:?}"
+        );
+        assert!(
+            wait_gone(helper, Duration::from_secs(5)),
+            "the helper outlived the child that forked and abandoned it"
         );
     }
 

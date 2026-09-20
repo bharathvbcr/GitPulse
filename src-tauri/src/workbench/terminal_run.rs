@@ -378,8 +378,31 @@ mod tests {
             running
         );
         write_to_session(&terminals, &started.id, "finish\n").unwrap();
-        let exited: Value =
-            serde_json::from_str(&received.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        // The script exits as soon as it has read that line, so the only open
+        // question is when the host schedules it — which is not what this test is
+        // about. Watch the process itself go away first, then require the exit
+        // event, which is the property: an exit that happened is reported and
+        // recorded. Waiting 5s on the event alone made a busy host the likeliest
+        // way to fail this, and it failed exactly that way in a full-suite run.
+        // The outer bound is a backstop only: it turns a child that never exits
+        // into a failure instead of a suite that hangs.
+        let pid = running["item"]["process_id"].as_u64().unwrap() as libc::pid_t;
+        let waited = Instant::now();
+        // SAFETY: signal 0 checks for the process's existence and delivers
+        // nothing. The pid came from this test's own child moments ago.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                waited.elapsed() < Duration::from_secs(120),
+                "the pty child never exited after being told to finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let exited: Value = serde_json::from_str(
+            &received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an exit that happened must be reported"),
+        )
+        .unwrap();
         assert_eq!(exited["exit_code"], 37);
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
         assert_eq!(saved["item"]["state"], "exited");

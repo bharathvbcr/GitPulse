@@ -150,7 +150,25 @@ pub fn probe_release(tool: ExternalTool) -> ReleaseAvailability {
     }
 }
 
+/// Every network round trip this module has made, counted so a test can assert
+/// that a path it believes is local really made none.
+///
+/// A wall-clock bound cannot answer that question: a probe served from a warm
+/// DNS cache is fast, and a loaded machine is slow with no probe at all. This
+/// counts the thing itself. Callers serialize with [`super::network_serial`],
+/// because the count is process-wide and the suite runs in parallel.
+#[cfg(test)]
+pub(super) static NETWORK_PROBES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn network_probes() -> usize {
+    NETWORK_PROBES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn http_head_ok(url: &str) -> Result<bool, String> {
+    #[cfg(test)]
+    NETWORK_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let curl =
         git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     let mut cmd = Command::new(&curl);

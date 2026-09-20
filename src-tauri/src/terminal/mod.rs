@@ -2426,8 +2426,16 @@ mod tests {
         )
         .expect("runs git status");
 
+        // Checked first and named: this test's subject *is* running a process,
+        // so it cannot leave the spawn path, and a host that could not start
+        // `git` inside ten seconds must not read as a runner that mis-reports an
+        // exit code.
+        assert!(
+            !res.timed_out,
+            "the host did not run `git status` inside 10s; that is machine \
+             capacity, not the terminal runner"
+        );
         assert_eq!(res.exit_code, Some(0));
-        assert!(!res.timed_out);
         assert!(res.command.contains("git status"));
         assert!(res.stdout_tail.contains("On branch main"));
         assert!(res.gated);
@@ -3624,6 +3632,16 @@ mod tests {
             result.policy.is_some(),
             "a gated action must retain its verdict"
         );
+        // Before the exit code: a run that timed out reports `None`, which would
+        // satisfy `!= Some(0)` without `npm` ever having been asked anything.
+        // This test cannot be taken off the spawn path — running the command is
+        // the behaviour under test — so the least it can do is fail for the
+        // reason it failed.
+        assert!(
+            !result.timed_out,
+            "the host did not run the gated command inside its budget; \
+             that is machine capacity, not the gate"
+        );
         assert_ne!(
             result.exit_code,
             Some(0),
@@ -3746,6 +3764,13 @@ mod tests {
         )
         .expect("runs git log");
 
+        // A timeout reports `None`, which satisfies `!= Some(0)` without `git`
+        // having refused anything, so the timeout is ruled out by name first.
+        assert!(
+            !res.timed_out,
+            "the host did not run `git log` inside 5s; that is machine capacity, \
+             not the exit-code path"
+        );
         assert_ne!(res.exit_code, Some(0));
         assert!(!res.stderr_tail.is_empty());
     }

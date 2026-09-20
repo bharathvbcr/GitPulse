@@ -171,7 +171,7 @@ mod tests {
     #[test]
     #[ignore = "requires explicit built Manvi/dcstore and installed Codex; sends one read-only model turn"]
     fn installed_managed_codex_crosses_native_host_and_store_without_accepting_task() {
-        use crate::harness::sidecar::{set_test_binary, test_serial};
+        use crate::harness::sidecar::{bind_test_binary, test_serial};
         use std::os::unix::fs::PermissionsExt;
         let serial = test_serial();
         let binary = std::fs::canonicalize(
@@ -192,7 +192,7 @@ mod tests {
         let wrapper = dir.path().join("managed-manvi");
         std::fs::write(&wrapper, format!("#!/bin/sh\nexport MANVI_STORE_BINARY={}\nexport MANVI_CODEX_BINARY={}\nexec {} \"$@\"\n",quote(&store),quote(&codex),quote(&binary))).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        set_test_binary(&serial, Some(wrapper.to_str().unwrap().into()));
+        let _binary = bind_test_binary(&serial, wrapper.to_str().unwrap());
         let host = WorkbenchState(Arc::new(super::super::Inner {
             path: Some(dir.path().join("profile.sqlite")),
             ..Default::default()
@@ -251,7 +251,6 @@ mod tests {
             );
         }));
         host.shutdown();
-        set_test_binary(&serial, None);
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }

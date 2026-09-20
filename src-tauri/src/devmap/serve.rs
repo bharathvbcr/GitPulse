@@ -112,6 +112,59 @@ impl DaemonState {
 static SOCKETS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// Test seam: an endpoint answered without asking the binary, and a count of how
+/// many times the uncached resolution actually ran.
+///
+/// [`socket_path`]'s contract is that it asks *once* per repository. Proving that
+/// by counting a stub's invocations also made the assertion depend on that stub
+/// reaching `main` inside [`RESOLVE_TIMEOUT`]: when it did not, the first resolve
+/// failed, `socket_path` returned an error, and the test failed having learned
+/// nothing about the cache it exists to check. The question worth asking is "how
+/// many times did the uncached path run", so it is counted here and the process
+/// is dropped. Installed only through [`bind_test_endpoint`], which owns the
+/// serial that makes the override exclusive.
+#[cfg(test)]
+static TEST_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_ENDPOINT_RESOLVES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the uncached resolution has run since the binding was taken.
+#[cfg(test)]
+pub(crate) fn test_endpoint_resolves() -> usize {
+    TEST_ENDPOINT_RESOLVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) struct TestEndpointBinding(
+    /// Held, never read: the serial's whole job is to be released on drop.
+    #[allow(dead_code)]
+    std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+impl Drop for TestEndpointBinding {
+    fn drop(&mut self) {
+        *TEST_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        TEST_ENDPOINT_RESOLVES.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Answer every uncached endpoint resolution with `endpoint`, counting each one,
+/// until the returned binding is dropped.
+#[cfg(test)]
+pub(crate) fn bind_test_endpoint(endpoint: impl Into<String>) -> TestEndpointBinding {
+    let serial = super::cli::test_serial();
+    TEST_ENDPOINT_RESOLVES.store(0, std::sync::atomic::Ordering::Relaxed);
+    *TEST_ENDPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint.into());
+    TestEndpointBinding(serial)
+}
+
 /// Ask the binary where this repository's endpoint is.
 ///
 /// `--print-socket-path` is documented to return before opening a store or
@@ -143,6 +196,17 @@ pub(crate) fn clear_socket_cache() {
 }
 
 fn resolve_socket_path_uncached(repo: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    {
+        if let Some(canned) = TEST_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            TEST_ENDPOINT_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(canned);
+        }
+    }
     let binary = resolve_binary()?;
     let run = super::cli::run_devmap_public(
         &binary,
@@ -381,25 +445,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_endpoint_is_resolved_once_per_repository() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let log = dir.path().join("calls.log");
-        let bin = dir.path().join("devmap");
-        std::fs::write(
-            &bin,
-            format!(
-                "#!/bin/sh\nprintf 'x' >> {}\nprintf '%s\\n' '{}/ipc.sock'\n",
-                log.display(),
-                dir.path().display()
-            ),
-        )
-        .expect("write stub");
-        let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).expect("chmod");
+        let endpoint = dir.path().join("ipc.sock").to_string_lossy().into_owned();
 
         clear_socket_cache();
-        let _bound = super::super::cli::bind_test_binary(bin.to_string_lossy());
+        let _bound = bind_test_endpoint(endpoint.clone());
         struct ResetCache;
         impl Drop for ResetCache {
             fn drop(&mut self) {
@@ -410,9 +460,10 @@ mod tests {
 
         let first = socket_path(dir.path()).expect("first");
         let second = socket_path(dir.path()).expect("second");
+        assert_eq!(first, endpoint);
         assert_eq!(first, second);
         assert_eq!(
-            std::fs::read_to_string(&log).unwrap_or_default().len(),
+            test_endpoint_resolves(),
             1,
             "the binary was asked more than once for a path it cannot change"
         );

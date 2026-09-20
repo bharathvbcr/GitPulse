@@ -146,6 +146,50 @@ pub(crate) fn git_repo() -> TempDir {
     dir
 }
 
+/// Reads one pid a spawned fixture announced on its stdout.
+///
+/// It is also the synchronisation point for everything after it: a pid on the
+/// pipe proves the child reached its own `fork`, so a test that starts
+/// measuring here measures the behaviour under test rather than how long this
+/// host took to start a process.
+#[cfg(all(test, unix))]
+pub(crate) fn announced_pid(child: &mut std::process::Child) -> u32 {
+    use std::io::BufRead;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read announced pid");
+    line.trim().parse().expect("pid")
+}
+
+/// Process-level liveness, which is not the same question as
+/// `procguard::sys::is_alive`: that one asks about a process *group*, and a
+/// helper some child forked is not a group leader, so asking it about one
+/// always answers "gone".
+///
+/// A zombie answers "alive" here, which is the honest answer — a pid that has
+/// not been waited on is still in the table and still ours. Assertions about a
+/// process being gone therefore go through [`wait_gone`].
+#[cfg(all(test, unix))]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Waits for a pid to leave the process table, so an assertion never depends on
+/// how quickly `init` reaps a reparented orphan.
+#[cfg(all(test, unix))]
+pub(crate) fn wait_gone(pid: u32, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 /// Writes `content` to `dir/rel`, creating parent directories as needed.
 #[cfg(test)]
 pub(crate) fn write(dir: &Path, rel: &str, content: &str) {

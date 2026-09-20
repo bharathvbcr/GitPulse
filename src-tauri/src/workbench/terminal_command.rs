@@ -2,7 +2,9 @@
 //! terminal attempt. User task text never becomes shell syntax or an argv blob.
 
 use super::WorkbenchError;
-use crate::engine::git_cli::{capture_command, extended_child_path, resolve_spawn_program_with};
+use crate::engine::git_cli::{
+    capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
+};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -111,6 +113,23 @@ pub(super) fn check(
         &[],
     )
     .map_err(|e| error("capability_error", e))?;
+    advertises(provider, mode, &version, &help)
+}
+
+/// Whether what a build *said* proves it can be launched the way `mode` asks.
+///
+/// Split from [`check`] because this is the whole decision, and it is a decision
+/// about two byte strings: which stream they arrived on, what they bound, and
+/// what the help advertises. Driving it through two real `--version`/`--help`
+/// spawns made every case here wait on a child reaching `main` inside eight
+/// seconds — a bound on host load, not on any of this. `capture_command` owns
+/// the other half, that the spawn happens and its output comes back.
+fn advertises(
+    provider: &str,
+    mode: &str,
+    version: &CapturedOutput,
+    help: &CapturedOutput,
+) -> Result<(), WorkbenchError> {
     if !version.success
         || version.stdout.len() > 1024
         || version.stderr.len() > 1024
@@ -303,7 +322,7 @@ pub(super) fn arguments(
 
 #[cfg(test)]
 mod tests {
-    use super::{arguments, BriefFile};
+    use super::{arguments, BriefFile, CapturedOutput};
     #[test]
     #[ignore = "requires explicitly installed Claude Code, Codex, Grok and Antigravity binaries; probes help only"]
     fn installed_provider_help_supports_requested_modes() {
@@ -353,19 +372,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_refuses_a_build_that_advertises_the_flag_without_the_requested_value() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("scripted-cli");
-        std::fs::write(&path, "#!/bin/sh\ncase \"$1\" in\n--version) printf '2.1.263 (Claude Code)\\n';;\n--help) printf '  --permission-mode <mode>\\n    (choices: \"plan\", \"manual\")\\n';;\nesac\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let program = path.to_str().unwrap();
-        let cwd = root.path().to_str().unwrap();
-        assert!(super::check(program, cwd, "claude", "ask").is_ok());
+        let version = on_stdout("2.1.263 (Claude Code)\n");
+        let help = on_stdout("  --permission-mode <mode>\n    (choices: \"plan\", \"manual\")\n");
+        assert!(super::advertises("claude", "ask", &version, &help).is_ok());
         assert_eq!(
-            super::check(program, cwd, "claude", "bypass")
+            super::advertises("claude", "bypass", &version, &help)
                 .unwrap_err()
                 .code,
-            "unsupported_capability"
+            "unsupported_capability",
+            "the flag is advertised but the value `bypass` needs is not"
         );
     }
     #[test]
@@ -535,58 +550,108 @@ mod tests {
         .unwrap();
         assert!(bypass.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
-    #[cfg(unix)]
     #[test]
     fn grok_probe_requires_identity_permission_modes_and_cwd() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("scripted-grok");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\ncase \"$1\" in\n--version) printf 'grok 1.0.34 (deadbeef) [stable]\\n';;\n--help) printf 'Grok Build TUI\\n      --permission-mode <MODE>\\n          [possible values: default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\\n      --cwd <CWD>\\n          Working directory\\n';;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let program = path.to_str().unwrap();
-        let cwd = root.path().to_str().unwrap();
-        super::check(program, cwd, "grok", "ask").unwrap();
-        super::check(program, cwd, "grok", "bypass").unwrap();
-        std::fs::write(
-            &path,
-            "#!/bin/sh\ncase \"$1\" in\n--version) printf 'grok 1.0.34 (deadbeef) [stable]\\n';;\n--help) printf 'Grok Build TUI\\n      --permission-mode <MODE>\\n          [possible values: default, plan]\\n';;\nesac\n",
-        )
-        .unwrap();
+        let version = on_stdout("grok 1.0.34 (deadbeef) [stable]\n");
+        let help = on_stdout(
+            "Grok Build TUI\n      --permission-mode <MODE>\n          [possible values: \
+             default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
+                      Working directory\n",
+        );
+        super::advertises("grok", "ask", &version, &help).unwrap();
+        super::advertises("grok", "bypass", &version, &help).unwrap();
+
+        // The same build without the mode `ask` needs, and without `--cwd`.
+        let narrower = on_stdout(
+            "Grok Build TUI\n      --permission-mode <MODE>\n          [possible values: \
+             default, plan]\n",
+        );
         assert_eq!(
-            super::check(program, cwd, "grok", "ask").unwrap_err().code,
+            super::advertises("grok", "ask", &version, &narrower)
+                .unwrap_err()
+                .code,
             "unsupported_capability"
         );
     }
-    #[cfg(unix)]
+
     #[test]
     fn antigravity_help_on_stderr_is_still_capability_proof() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("scripted-agy");
-        // Help on stderr, version on stdout — the real `agy` layout.
-        std::fs::write(
-            &path,
-            "#!/bin/sh\ncase \"$1\" in\n--version) printf '1.1.22\\n';;\n--help) printf 'Usage of agy:\\n  --mode                          Set the agent execution mode for this session (accept-edits, plan)\\n  --prompt-interactive            Run an initial prompt interactively\\n  --dangerously-skip-permissions  Auto-approve all tool permission requests\\n  --sandbox                       Run in a sandbox\\n' >&2;;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let program = path.to_str().unwrap();
-        let cwd = root.path().to_str().unwrap();
-        super::check(program, cwd, "agy", "ask").unwrap();
-        super::check(program, cwd, "agy", "inspect").unwrap();
-        super::check(program, cwd, "agy", "bypass").unwrap();
-        std::fs::write(
-            &path,
-            "#!/bin/sh\ncase \"$1\" in\n--version) printf '1.1.22\\n';;\n--help) printf 'Usage of agy:\\n  --prompt-interactive            prompt\\n' >&2;;\nesac\n",
-        )
-        .unwrap();
+        // Help on stderr, version on stdout — the real `agy` layout, and the
+        // one a reader of stdout alone would report as having no controls.
+        let version = on_stdout("1.1.22\n");
+        let help = on_stderr(
+            "Usage of agy:\n  --mode                          Set the agent execution mode for \
+             this session (accept-edits, plan)\n  --prompt-interactive            Run an initial \
+             prompt interactively\n  --dangerously-skip-permissions  Auto-approve all tool \
+             permission requests\n  --sandbox                       Run in a sandbox\n",
+        );
+        super::advertises("agy", "ask", &version, &help).unwrap();
+        super::advertises("agy", "inspect", &version, &help).unwrap();
+        super::advertises("agy", "bypass", &version, &help).unwrap();
+
+        let without_controls =
+            on_stderr("Usage of agy:\n  --prompt-interactive            prompt\n");
         assert_eq!(
-            super::check(program, cwd, "agy", "ask").unwrap_err().code,
+            super::advertises("agy", "ask", &version, &without_controls)
+                .unwrap_err()
+                .code,
             "unsupported_capability"
         );
+    }
+
+    /// An answer too large to be a version or a help screen is not one, however
+    /// well it reads. Only a fake can produce this: a stub script that printed
+    /// 128KiB would be testing the shell's buffering as much as the bound.
+    #[test]
+    fn an_unbounded_answer_is_not_capability_proof() {
+        let version = on_stdout("grok 1.0.34 (deadbeef) [stable]\n");
+        let help = on_stdout(
+            "Grok Build TUI\n      --permission-mode <MODE>\n          [possible values: \
+             default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
+                      Working directory\n",
+        );
+        super::advertises("grok", "ask", &version, &help).expect("the bounded case still passes");
+
+        let mut flood = help.clone();
+        flood.stdout.resize(128 * 1024 + 1, b' ');
+        assert_eq!(
+            super::advertises("grok", "ask", &version, &flood)
+                .unwrap_err()
+                .code,
+            "capability_error",
+            "an over-cap help screen is an unusable answer, not an unsupported build"
+        );
+
+        let mut chatty = version.clone();
+        chatty.stderr.resize(1025, b' ');
+        assert_eq!(
+            super::advertises("grok", "ask", &chatty, &help)
+                .unwrap_err()
+                .code,
+            "capability_error"
+        );
+    }
+
+    /// What the provider printed, on the stream it printed it to. Building the
+    /// answer directly is what takes these cases off the spawn path: the
+    /// decision under test reads two byte strings and an exit status, and a
+    /// `#!/bin/sh` stub is only one way — the load-sensitive way — to produce
+    /// them.
+    fn on_stdout(text: &str) -> CapturedOutput {
+        CapturedOutput {
+            stdout: text.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            success: true,
+            status_code: 0,
+        }
+    }
+
+    fn on_stderr(text: &str) -> CapturedOutput {
+        CapturedOutput {
+            stdout: Vec::new(),
+            stderr: text.as_bytes().to_vec(),
+            success: true,
+            status_code: 0,
+        }
     }
 }

@@ -360,49 +360,35 @@ mod tests {
 
     #[test]
     fn ready_output_is_read_even_when_the_waiter_resumes_after_its_deadline() {
-        // This case requires all writer copies to be closed *before* the
-        // expired collection starts. Isolate it from other tests' forks;
-        // child exit alone cannot establish that precondition in a shared
-        // process. The separate retained-pipe tests cover missing EOF.
-        const CHILD: &str = "GITPULSE_EOF_FIXTURE_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let (mut command, _harness) = crate::test_support::isolated_libtest_command(
-                "engine::git_cli::pipe_drain::tests::ready_output_is_read_even_when_the_waiter_resumes_after_its_deadline",
-            );
-            command.arg("--test-threads=1");
-            command.env(CHILD, "1");
-            let run = crate::engine::git_cli::run_bounded_capped(
-                command,
-                "EOF fixture",
-                Duration::from_secs(30),
-                None,
-                16 * 1024,
+        // This case requires every copy of both write ends to be closed *before*
+        // the expired collection starts, and it establishes that rather than
+        // hoping for it: the pipes are created, filled and closed with no process
+        // creation in flight anywhere in this binary, so no fork window can hold
+        // a copy. See [`crate::procguard::with_inheritance_lock`] for why an
+        // overlapping spawn would otherwise keep one for its whole life.
+        //
+        // No child process takes part. The precondition is about descriptors,
+        // not about a process having exited, so reaping one proved nothing the
+        // `drop`s below do not — and paying for a child put this case's verdict
+        // at the mercy of how long the host takes to start one. The previous
+        // fixture re-ran this body in a freshly spawned copy of the whole test
+        // harness under a 30s bound, which on a loaded host is what failed.
+        // The separate retained-pipe tests cover missing EOF.
+        let (out, err) = crate::procguard::with_inheritance_lock(|| {
+            let (out_r, mut out_w) = std::io::pipe().expect("stdout pipe");
+            let (err_r, mut err_w) = std::io::pipe().expect("stderr pipe");
+            // Tiny enough to fit the kernel buffers, so neither write blocks.
+            out_w.write_all(b"complete").expect("fill stdout");
+            err_w.write_all(b"diagnostic").expect("fill stderr");
+            drop(out_w);
+            drop(err_w);
+            (
+                std::process::ChildStdout::from(std::os::fd::OwnedFd::from(out_r)),
+                std::process::ChildStderr::from(std::os::fd::OwnedFd::from(err_r)),
             )
-            .unwrap();
-            assert!(
-                run.success,
-                "{}\n{}",
-                String::from_utf8_lossy(&run.stdout),
-                String::from_utf8_lossy(&run.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&run.stdout).contains("1 passed"),
-                "fixture was not collected"
-            );
-            return;
-        }
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "printf complete; printf diagnostic >&2"]);
-        command
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let (mut child, guard) = crate::procguard::spawn(&mut command, "test").expect("spawn");
-        let drains =
-            OutputDrains::new(child.stdout.take(), child.stderr.take(), 64).expect("drains");
-        // These tiny writes fit in the kernel pipes. Reap first to prove both
-        // EOFs are available, and supply an already-expired handoff deadline.
-        let status = guard.reap(|| child.wait()).expect("wait");
-        assert!(status.success());
+        });
+        let drains = OutputDrains::new(Some(out), Some(err), 64).expect("drains");
+        // Already expired: the waiter is resuming late, with no patience left.
         let (stdout, stderr) = drains.finish(Instant::now() - Duration::from_secs(1));
         assert_eq!(stdout.bytes, b"complete");
         assert_eq!(stderr.bytes, b"diagnostic");

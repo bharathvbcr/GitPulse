@@ -1215,22 +1215,20 @@ mod tests {
     /// these tests silently exercised the harness-present path and asserted
     /// nothing about the degraded one. A test whose meaning changes with the
     /// machine is the same defect as a check that quietly does not run.
-    struct NoHarness(crate::harness::sidecar::SidecarTestGuard);
+    struct NoHarness(
+        // Field order is drop order: the override is removed while the serial
+        // guard is still held.
+        crate::harness::sidecar::TestBinaryBinding,
+        #[allow(dead_code)] crate::harness::sidecar::SidecarTestGuard,
+    );
     impl NoHarness {
         fn install() -> Self {
             let guard = crate::harness::sidecar::test_serial();
-            crate::harness::sidecar::set_test_binary(
+            let binary = crate::harness::sidecar::bind_test_binary(
                 &guard,
-                Some("/nonexistent/gitpulse-test/manvi".into()),
+                "/nonexistent/gitpulse-test/manvi",
             );
-            crate::harness::sidecar::reset();
-            Self(guard)
-        }
-    }
-    impl Drop for NoHarness {
-        fn drop(&mut self) {
-            crate::harness::sidecar::set_test_binary(&self.0, None);
-            crate::harness::sidecar::reset();
+            Self(binary, guard)
         }
     }
 

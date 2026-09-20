@@ -298,6 +298,10 @@ fn evaluate_json_response(value: &serde_json::Value, spec_id: &str) -> JsonProbe
     }
 }
 
+/// What running a component told us: whether it exited zero, and the text a
+/// reader should interpret — or why it could not be run at all.
+type ProbeAnswer = Result<(bool, String), String>;
+
 /// The probe itself, with lookup already done.
 ///
 /// Split out so a test can drive a real executable at a known path: passing a
@@ -305,6 +309,29 @@ fn evaluate_json_response(value: &serde_json::Value, spec_id: &str) -> JsonProbe
 /// found", and a test asserting "not installed" would pass without ever
 /// running the binary it claims to reject.
 fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
+    probe_located_with(spec, located, &mut |path, id, args| {
+        run_probe(path, id, args)
+    })
+}
+
+/// [`probe_located`] with the invocation injectable.
+///
+/// Everything below the `run` calls is a decision about an exit status and one
+/// string, and the identity rules it enforces are the security-relevant part:
+/// an impostor must not be reported as installed, and a legacy build that
+/// cannot answer `--version` must not be reported as absent. Reaching those
+/// branches through a `#!/bin/sh` stub made each of them wait on a child
+/// reaching `main` inside [`PROBE_TIMEOUT`], which is a measurement of host
+/// load. A fake runner also reaches answers a stub cannot give reliably — a
+/// probe that timed out, output on the stream the reader does not prefer.
+///
+/// `git_cli::run_bounded_capped` owns the other half: that a real child runs,
+/// and that its status and output come back.
+fn probe_located_with(
+    spec: &Spec<'_>,
+    located: Option<String>,
+    run: &mut dyn FnMut(&str, &str, &[&str]) -> ProbeAnswer,
+) -> ComponentStatus {
     let base = |installed: bool,
                 path: Option<String>,
                 version: VersionReading,
@@ -338,7 +365,7 @@ fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
                 _ => None,
             };
 
-            match run_probe(&path, spec.id, &["--version"]) {
+            match run(&path, spec.id, &["--version"]) {
                 Ok((true, text)) => {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
                         match evaluate_json_response(&value, spec.id) {
@@ -420,7 +447,7 @@ fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
                     }
 
                     if let Some(args) = fallback_args {
-                        if let Ok((_, fallback_text)) = run_probe(&path, spec.id, args) {
+                        if let Ok((_, fallback_text)) = run(&path, spec.id, args) {
                             if let Ok(value) =
                                 serde_json::from_str::<serde_json::Value>(fallback_text.trim())
                             {
@@ -472,7 +499,7 @@ fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
                 }
                 Err(detail) => {
                     if let Some(args) = fallback_args {
-                        if let Ok((_, fallback_text)) = run_probe(&path, spec.id, args) {
+                        if let Ok((_, fallback_text)) = run(&path, spec.id, args) {
                             if let Ok(value) =
                                 serde_json::from_str::<serde_json::Value>(fallback_text.trim())
                             {
@@ -526,7 +553,7 @@ fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
         // These exit 0 with a JSON object whether or not the request itself
         // succeeded, so the object — not the exit status — is the evidence
         // that the binary is the component it is named after.
-        Probe::JsonHandshake(args) => match run_probe(&path, spec.id, args) {
+        Probe::JsonHandshake(args) => match run(&path, spec.id, args) {
             Ok((_, text)) => {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
                     if value.is_object() {
@@ -784,43 +811,92 @@ mod tests {
         assert!(status.reason.is_some(), "a missing tool must say so");
     }
 
+    /// One component at a known path, answering `run` with canned output.
+    ///
+    /// The binary these tests used to write and `chmod` proved nothing the
+    /// canned answer does not: every branch below `run` reads an exit status
+    /// and one string. What the stub added was a wait on the host getting a
+    /// `#!/bin/sh` child to `main` inside [`PROBE_TIMEOUT`] — five seconds that
+    /// measure machine load, and that a busy machine loses, reporting an
+    /// installed component as absent. `git_cli::run_bounded_capped`'s own tests
+    /// own the half that needs a real child.
+    fn probed(
+        id: &'static str,
+        probe: Probe,
+        run: &mut dyn FnMut(&str, &str, &[&str]) -> ProbeAnswer,
+    ) -> ComponentStatus {
+        probe_located_with(
+            &Spec {
+                id,
+                label: id,
+                need: ComponentNeed::HostResolved,
+                purpose: "test",
+                probe,
+                presets: &["analysis"],
+                managed: None,
+            },
+            Some(format!("/nowhere/{id}")),
+            run,
+        )
+    }
+
     /// The distinction this module exists to keep: a component that runs but
     /// cannot report a version is installed, and must not be shown the same as
     /// one that is absent.
     #[test]
     fn a_component_without_a_version_flag_is_still_installed() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let bin = dir.path().join("fake-dcstore");
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":false,\"error\":\"--db is required\"}'\n",
-        )
-        .expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut asked = Vec::new();
+        let status = probed(
+            "fake-dcstore",
+            Probe::JsonHandshake(&[]),
+            &mut |_, _, args| {
+                asked.push(args.join(" "));
+                Ok((
+                    false,
+                    "{\"ok\":false,\"error\":\"--db is required\"}\n".into(),
+                ))
+            },
+        );
+        assert_eq!(
+            asked,
+            vec![String::new()],
+            "the handshake probe must run the component with its own arguments and nothing else"
+        );
+        assert!(status.installed, "{status:?}");
+        assert!(
+            matches!(status.version, VersionReading::NotExposed { .. }),
+            "{:?}",
+            status.version
+        );
+        assert!(status.reason.is_none());
+    }
 
-            let status = probe_located(
-                &Spec {
-                    id: "fake-dcstore",
-                    label: "fake",
-                    need: ComponentNeed::HostResolved,
-                    purpose: "test",
-                    probe: Probe::JsonHandshake(&[]),
-                    presets: &["analysis"],
-                    managed: None,
-                },
-                Some(bin.to_string_lossy().into_owned()),
-            );
-            assert!(status.installed, "{status:?}");
-            assert!(
-                matches!(status.version, VersionReading::NotExposed { .. }),
-                "{:?}",
-                status.version
-            );
-            assert!(status.reason.is_none());
-        }
+    /// A probe that could not run at all is the one case that must never read
+    /// as an answer — not as a versionless install, and not as an impostor.
+    #[test]
+    fn a_probe_that_could_not_run_reports_why_and_claims_nothing() {
+        let status = probed(
+            "dcstore",
+            Probe::VersionWithFallback(&[]),
+            &mut |_, _, _| Err("dcstore timed out after 5s".into()),
+        );
+        assert!(
+            !status.installed,
+            "a component that never answered is not installed: {status:?}"
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "the reason must carry what went wrong: {:?}",
+            status.reason
+        );
+        assert!(
+            status.path.is_some(),
+            "the path it tried is still worth reporting"
+        );
     }
 
     /// A file with the right name that does not behave like the component is
@@ -854,11 +930,7 @@ mod tests {
     /// When a component returns the universal JSON payload with matching identity
     /// and version, its version is reported directly as the clean version number.
     #[test]
-    #[cfg(unix)]
     fn universal_version_and_id_are_reported_for_analysis_components() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().expect("tempdir");
-
         let cases = [
             ("dcstore", "{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.2.3\"}\n"),
             ("dcverify", "{\"ok\":true,\"id\":\"dcverify\",\"component\":\"dc-verify\",\"version\":\"0.2.3\"}\n"),
@@ -866,21 +938,10 @@ mod tests {
         ];
 
         for (id, payload) in cases {
-            let bin = dir.path().join(id);
-            std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' '{payload}'\n")).expect("write");
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-            let spec = Spec {
-                id,
-                label: id,
-                need: ComponentNeed::HostResolved,
-                purpose: "test",
-                probe: Probe::VersionWithFallback(&[]),
-                presets: &["analysis"],
-                managed: None,
-            };
-
-            let status = probe_located(&spec, Some(bin.to_string_lossy().into_owned()));
+            let status = probed(id, Probe::VersionWithFallback(&[]), &mut |_, _, args| {
+                assert_eq!(args, ["--version"], "the version probe asks for --version");
+                Ok((true, payload.to_string()))
+            });
             assert!(
                 status.installed,
                 "expected {id} to be installed: {status:?}"
@@ -898,29 +959,17 @@ mod tests {
 
     /// An impostor binary returning JSON with an unexpected id is rejected.
     #[test]
-    #[cfg(unix)]
     fn an_impostor_with_wrong_id_is_rejected_as_unavailable() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let bin = dir.path().join("fake-dcstore-impostor");
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"id\":\"rogue_tool\",\"component\":\"rogue\",\"version\":\"1.0.0\"}'\n",
-        )
-        .expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let status = probe_located(
-            &Spec {
-                id: "dcstore",
-                label: "dcstore",
-                need: ComponentNeed::HostResolved,
-                purpose: "test",
-                probe: Probe::VersionWithFallback(&[]),
-                presets: &["analysis"],
-                managed: None,
+        let status = probed(
+            "dcstore",
+            Probe::VersionWithFallback(&[]),
+            &mut |_, _, _| {
+                Ok((
+                true,
+                "{\"ok\":true,\"id\":\"rogue_tool\",\"component\":\"rogue\",\"version\":\"1.0.0\"}\n"
+                    .into(),
+            ))
             },
-            Some(bin.to_string_lossy().into_owned()),
         );
 
         assert!(
@@ -946,31 +995,28 @@ mod tests {
     /// When `--version` fails on an older binary, fallback handshake executes and
     /// reports `NotExposed` instead of failing if the handshake succeeds.
     #[test]
-    #[cfg(unix)]
     fn legacy_binary_falling_back_to_handshake_reports_not_exposed() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let bin = dir.path().join("legacy-dcstore");
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'unknown flag --version' >&2; exit 2; fi\nprintf '%s\\n' '{\"ok\":false,\"error\":\"--db is required\"}'\n",
-        )
-        .expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let status = probe_located(
-            &Spec {
-                id: "dcstore",
-                label: "dcstore",
-                need: ComponentNeed::HostResolved,
-                purpose: "test",
-                probe: Probe::VersionWithFallback(&[]),
-                presets: &["analysis"],
-                managed: None,
+        let mut asked = Vec::new();
+        let status = probed(
+            "dcstore",
+            Probe::VersionWithFallback(&[]),
+            &mut |_, _, args| {
+                asked.push(args.join(" "));
+                if args == ["--version"] {
+                    return Ok((false, "unknown flag --version\n".into()));
+                }
+                Ok((
+                    false,
+                    "{\"ok\":false,\"error\":\"--db is required\"}\n".into(),
+                ))
             },
-            Some(bin.to_string_lossy().into_owned()),
         );
 
+        assert_eq!(
+            asked,
+            vec!["--version".to_string(), String::new()],
+            "a refused --version must be followed by the fallback handshake, in that order"
+        );
         assert!(
             status.installed,
             "legacy binary must still be detected as installed: {status:?}"

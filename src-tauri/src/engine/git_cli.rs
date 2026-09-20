@@ -1721,8 +1721,7 @@ fn run_with_gate(
         match pipe_drain::OutputDrains::new(child.stdout.take(), child.stderr.take(), stdout_cap) {
             Ok(output) => output,
             Err(error) => {
-                guard.kill_tree(&mut child);
-                let _ = guard.reap(|| child.wait());
+                guard.stop_and_reap(&mut child, Duration::ZERO).ok();
                 return Err(format!("Failed to prepare {label} output: {error}"));
             }
         };
@@ -1735,8 +1734,7 @@ fn run_with_gate(
     ) {
         Ok(output) => output,
         Err(error) => {
-            guard.kill_tree(&mut child);
-            let _ = guard.reap(|| child.wait());
+            guard.stop_and_reap(&mut child, Duration::ZERO).ok();
             return Err(format!("Failed to prepare {label} output: {error}"));
         }
     };
@@ -1748,8 +1746,7 @@ fn run_with_gate(
         match pipe_drain::InputFeed::new(child.stdin.take(), stdin_bytes.unwrap_or_default()) {
             Ok(input) => input,
             Err(error) => {
-                guard.kill_tree(&mut child);
-                let _ = guard.reap(|| child.wait());
+                guard.stop_and_reap(&mut child, Duration::ZERO).ok();
                 return Err(format!("Failed to prepare {label} stdin: {error}"));
             }
         };
@@ -1761,8 +1758,7 @@ fn run_with_gate(
     ) {
         Ok(input) => input,
         Err(error) => {
-            guard.kill_tree(&mut child);
-            let _ = guard.reap(|| child.wait());
+            guard.stop_and_reap(&mut child, Duration::ZERO).ok();
             return Err(format!("Failed to prepare {label} stdin: {error}"));
         }
     };
@@ -1776,9 +1772,8 @@ fn run_with_gate(
         input.pump();
         output.observe(observer, &mut cursors);
         if observer.cancelled() {
-            guard.kill_tree(&mut child);
             break guard
-                .reap(|| child.wait())
+                .stop_and_reap(&mut child, Duration::ZERO)
                 .map(|status| (status, true))
                 .map_err(|e| format!("Failed to reap cancelled {label}: {e}"));
         }
@@ -1789,8 +1784,7 @@ fn run_with_gate(
             Ok(Some(status)) => break Ok((status, false)),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    guard.kill_tree(&mut child);
-                    let _ = guard.reap(|| child.wait());
+                    guard.stop_and_reap(&mut child, Duration::ZERO).ok();
                     break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
                 }
                 #[cfg(unix)]
@@ -1798,8 +1792,7 @@ fn run_with_gate(
                     backoff.min(deadline.saturating_duration_since(Instant::now())),
                     Some(&input),
                 ) {
-                    guard.kill_tree(&mut child);
-                    let _ = guard.reap(|| child.wait());
+                    guard.stop_and_reap(&mut child, Duration::ZERO).ok();
                     break Err(format!("Failed to poll {label} output: {error}"));
                 }
                 #[cfg(not(unix))]
@@ -1807,8 +1800,7 @@ fn run_with_gate(
                 backoff = next_poll_backoff(backoff);
             }
             Err(e) => {
-                guard.kill_tree(&mut child);
-                let _ = guard.reap(|| child.wait());
+                guard.stop_and_reap(&mut child, Duration::ZERO).ok();
                 break Err(format!("Failed to wait on {}: {}", label, e));
             }
         }
@@ -3729,8 +3721,84 @@ mod tests {
     /// "env: node: No such file or directory"), which reads downstream as
     /// "npm is not installed". The child must see the fallback dirs on its own
     /// PATH too.
+    ///
+    /// Asserted on the command GitPulse builds, which is the whole of GitPulse's
+    /// side of this contract: the top-level program resolves to the fallback-dir
+    /// tool, and the child is handed a PATH on which that tool's `#!/usr/bin/env`
+    /// interpreter resolves. Both are decided before anything is spawned, so this
+    /// case cannot be lost to how long the host takes to start a process — which
+    /// is what the end-to-end sibling below is exposed to.
     #[cfg(unix)]
     #[test]
+    fn shebang_tool_in_fallback_dir_is_given_a_child_path_reaching_its_interpreter() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let interpreter = bin.join("gitpulse-fake-interp");
+        std::fs::write(&interpreter, "#!/bin/sh\necho INTERP_OK\n").unwrap();
+        std::fs::set_permissions(
+            &interpreter,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let tool = bin.join("gitpulse-fake-shebang-tool");
+        std::fs::write(&tool, "#!/usr/bin/env gitpulse-fake-interp\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let cmd = build_capture_command(
+            "gitpulse-fake-shebang-tool",
+            &[],
+            None,
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Some(home.path().as_os_str()),
+        );
+
+        // The tool itself was found in the fallback dir, not left as a bare name
+        // for an empty PATH to fail on.
+        assert_eq!(
+            Path::new(cmd.get_program()),
+            tool,
+            "the program must resolve to the fallback-dir tool"
+        );
+
+        // And the child's own PATH reaches the interpreter that tool's shebang
+        // names. Resolved by searching, not by string matching: `env` will do a
+        // PATH search, so this asserts the thing `env` will actually decide.
+        let child_path = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("the child must be handed a PATH");
+        let found = std::env::split_paths(child_path)
+            .map(|dir| dir.join("gitpulse-fake-interp"))
+            .find(|candidate| candidate.is_file());
+        assert_eq!(
+            found.as_deref(),
+            Some(interpreter.as_path()),
+            "child PATH must reach the interpreter: {child_path:?}"
+        );
+    }
+
+    /// The same contract, proved by running it: `/usr/bin/env` really does
+    /// resolve the interpreter through the PATH the sibling test above asserts.
+    ///
+    /// `#[ignore]`d because its verdict is not about GitPulse. It is bounded by a
+    /// 30s deadline on a child that does nothing but `echo`, and children on a
+    /// loaded host do not reliably reach `main` inside any such bound: measured
+    /// here, spawned stubs that blew a 30s and a 60s deadline went on to exit 0
+    /// one and fifty-seven seconds later respectively. As a gate this reported
+    /// host load; the assertion it was meant to make is made deterministically
+    /// above. Raising the deadline would only make the misreport rarer.
+    ///
+    /// Run it deliberately after changing spawn resolution or child PATH with
+    /// `cargo test --manifest-path src-tauri/Cargo.toml --lib
+    /// shebang_tool_in_fallback_dir_finds_interpreter_through_child_path --
+    /// --ignored`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "bounds a real process spawn on a wall clock; host load, not GitPulse, decides it"]
     fn shebang_tool_in_fallback_dir_finds_interpreter_through_child_path() {
         let home = tempfile::TempDir::new().unwrap();
         let bin = home.path().join(".local/bin");

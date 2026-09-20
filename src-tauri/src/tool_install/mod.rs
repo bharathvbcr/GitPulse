@@ -2374,6 +2374,10 @@ mod tests {
 
     #[test]
     fn ladder_cache_invalidates_after_clear() {
+        // Holds the same lock as `status_all_attribution_is_local_work`: this is
+        // the one test that reaches the release HEAD probe on purpose, and that
+        // test's whole assertion is that the counter does not move while it runs.
+        let _serial = network_serial();
         invalidate_ladder_cache();
         let first = assess_ladder(ExternalTool::Devmap);
         let second = assess_ladder(ExternalTool::Devmap);
@@ -2385,9 +2389,17 @@ mod tests {
 
     #[test]
     fn status_all_attribution_is_local_work() {
-        // Measured wall time for both tools in parallel without release HEAD.
         // Attribution: PATH/env resolve + cargo/go presence + local checkout
-        // discovery. Network probe is owned by assess_ladder (wizard) only.
+        // discovery. The release HEAD probe belongs to `assess_ladder` (wizard
+        // and install only), and this is the assertion that keeps it there.
+        //
+        // It used to be `elapsed < 5s`. That is not a test of "no network call":
+        // a HEAD served from a warm cache lands in milliseconds and would pass,
+        // while a machine busy compiling fails it with no probe made at all —
+        // which is exactly how it failed, in company with every other test on
+        // this host that waited on a child process. So count the probes instead.
+        let _serial = network_serial();
+        let before = release::network_probes();
         let started = Instant::now();
         let _ = status_all();
         let elapsed = started.elapsed();
@@ -2395,12 +2407,24 @@ mod tests {
             "attribution cmd_external_tools_status/status_all: {:?} (no release HEAD)",
             elapsed
         );
-        // Generous ceiling: a quiet machine is tens of ms; CI under load can
-        // be slower. A multi-second result means a network probe crept back.
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "status_all took {elapsed:?}; expected sub-second local work"
+        assert_eq!(
+            release::network_probes(),
+            before,
+            "status_all reached the network; the release HEAD probe belongs to the wizard path \
+             (took {elapsed:?})"
         );
+    }
+
+    /// Serializes the two tests that care about the process-wide network probe
+    /// count: the one that asserts it does not move, and the one that moves it.
+    ///
+    /// Poison-tolerant for the reason `sidecar::test_serial` is — a panicking
+    /// test must not wedge the ones after it, and what is behind this lock is
+    /// the emptiness of `()`.
+    fn network_serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]

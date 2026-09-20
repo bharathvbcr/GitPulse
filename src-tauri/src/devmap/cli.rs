@@ -182,6 +182,19 @@ fn build_guards() -> &'static Mutex<HashSet<String>> {
 #[cfg(test)]
 static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 
+/// Test seam: a canned [`status`] answer returned instead of running the probe.
+///
+/// A test that is about the *decision* taken from a status payload must not
+/// also be a test of whether a child process reaches `main` and answers inside
+/// [`STATUS_DEADLINE`]. Spawning a stub to deliver a fixed JSON document makes
+/// the deadline the subject: when the host is loaded the probe answers late,
+/// `status` reports `available: false`, and every such test fails as
+/// `SkipUnavailable` — a verdict about the host, not about the code under test.
+/// Installed only through [`bind_test_status`], which owns the same serial as
+/// [`TEST_BINARY`] and clears both on drop.
+#[cfg(test)]
+static TEST_STATUS: Mutex<Option<CliStatus>> = Mutex::new(None);
+
 /// Serializes every test that installs a global `devmap` override.
 ///
 /// `TEST_BINARY` is process-wide, so two tests that bind their own stub at the
@@ -210,6 +223,13 @@ fn set_test_binary(path: Option<String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
 }
 
+#[cfg(test)]
+fn set_test_status(status: Option<CliStatus>) {
+    *TEST_STATUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+}
+
 /// An installed override, held for as long as the test needs it.
 ///
 /// The only way to bind one, which is the point: `set_test_binary` is private
@@ -227,6 +247,22 @@ pub(crate) struct TestBinaryBinding(
 impl Drop for TestBinaryBinding {
     fn drop(&mut self) {
         set_test_binary(None);
+        // Both overrides live behind the one serial this binding owns, so both
+        // are released here. Leaving a canned status installed would hand it to
+        // whichever test took the serial next.
+        set_test_status(None);
+    }
+}
+
+#[cfg(test)]
+impl TestBinaryBinding {
+    /// Answer [`status`] with `status` instead of running the probe, until this
+    /// is called again or the binding is dropped.
+    ///
+    /// A method rather than a free function so the override cannot be installed
+    /// without holding the serial: the binding *is* the proof of exclusivity.
+    pub(crate) fn set_status(&self, status: CliStatus) {
+        set_test_status(Some(status));
     }
 }
 
@@ -237,6 +273,35 @@ pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
     let serial = test_serial();
     set_test_binary(Some(path.into()));
     TestBinaryBinding(serial)
+}
+
+/// A `devmap status --json` answer that parsed, for a test that is about what
+/// the decision logic does with it.
+#[cfg(test)]
+pub(crate) fn available_status(payload: &str) -> CliStatus {
+    CliStatus {
+        available: true,
+        binary: Some("test-override".into()),
+        lookup: Some(DevmapLookup::TestOverride),
+        reason: None,
+        status: Some(
+            serde_json::from_str(payload).expect("canned status payload must be valid JSON"),
+        ),
+    }
+}
+
+/// A probe that did not answer — the shape [`status`] returns when the child
+/// could not be run, did not exit inside [`STATUS_DEADLINE`], or wrote
+/// something that was not a JSON object.
+#[cfg(test)]
+pub(crate) fn unavailable_status(reason: &str) -> CliStatus {
+    CliStatus {
+        available: false,
+        binary: Some("test-override".into()),
+        lookup: Some(DevmapLookup::TestOverride),
+        reason: Some(reason.into()),
+        status: None,
+    }
 }
 
 /// Resolves the `devmap` binary (cached, including negative answers).
@@ -807,6 +872,20 @@ impl DoctorReport {
 
 /// `devmap status --json`.
 pub fn status(repo_path: &str) -> CliStatus {
+    // Sited ahead of the repo and binary checks on purpose: a test that installs
+    // a canned answer is saying "this is what the probe replied", and running
+    // any part of the probe anyway would put the child's start-up latency back
+    // on the path the override exists to take it off.
+    #[cfg(test)]
+    {
+        if let Some(canned) = TEST_STATUS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return canned;
+        }
+    }
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
         Err(e) => {
@@ -1782,12 +1861,10 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
-        )
-        .unwrap();
+        ));
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
         assert_eq!(
             outcome.decision,
@@ -1803,12 +1880,10 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":false,"schema_outdated":false,"rebuild_reason":"payload-obsolete"}"#,
-        )
-        .unwrap();
+        ));
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), false);
         assert_eq!(
             outcome.decision,
@@ -1824,12 +1899,10 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":true,"schema_outdated":false,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
-        )
-        .unwrap();
+        ));
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), false);
         assert_eq!(
             outcome.decision,
@@ -1846,7 +1919,7 @@ exit 2
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
         write_stub_artifacts(repo.path());
-        let _reset = bind_recording_devmap(repo.path());
+        let devmap = bind_recording_devmap(repo.path());
         for reason in [
             "source tree differs from the indexed generation; rebuild or drain watcher edits",
             "source discovery refusals differ from the indexed generation; rebuild required",
@@ -1854,13 +1927,9 @@ exit 2
             "source freshness unverified: this generation has no repository root",
         ] {
             let _ = fs::remove_file(repo.path().join("argv.log"));
-            fs::write(
-                repo.path().join("status.json"),
-                format!(
-                    r#"{{"is_fresh":false,"schema_outdated":false,"degraded_reason":{reason:?}}}"#
-                ),
-            )
-            .unwrap();
+            devmap.set_status(available_status(&format!(
+                r#"{{"is_fresh":false,"schema_outdated":false,"degraded_reason":{reason:?}}}"#
+            )));
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
             assert_eq!(
                 outcome.decision,
@@ -1878,7 +1947,7 @@ exit 2
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
         write_stub_artifacts(repo.path());
-        let _reset = bind_recording_devmap(repo.path());
+        let devmap = bind_recording_devmap(repo.path());
         for payload in [
             r#"{"is_fresh":false,"schema_outdated":false}"#,
             r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":null}"#,
@@ -1888,7 +1957,7 @@ exit 2
             r#"{"is_fresh":false,"schema_outdated":false,"message":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
         ] {
             let _ = fs::remove_file(repo.path().join("argv.log"));
-            fs::write(repo.path().join("status.json"), payload).unwrap();
+            devmap.set_status(available_status(payload));
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
             assert_eq!(
                 outcome.decision,
@@ -1910,12 +1979,10 @@ exit 2
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
         write_stub_artifacts(repo.path());
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":false,"schema_outdated":true,"rebuild_required":true,"rebuild_reason":"schema-behind","schema_relation":"upgradeable","degraded_reason":"store schema is 19, this binary speaks 20; run `devmap build` to migrate it"}"#,
-        )
-        .unwrap();
+        ));
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
         assert_eq!(
             outcome.decision,
@@ -1935,12 +2002,10 @@ exit 2
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
         write_stub_artifacts(repo.path());
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":false,"schema_outdated":true,"rebuild_required":false,"schema_relation":"newer","degraded_reason":"store schema is 21, newer than the 20 this binary speaks; install a matching or newer devmap binary"}"#,
-        )
-        .unwrap();
+        ));
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
         assert_eq!(
             outcome.decision,
@@ -1966,12 +2031,10 @@ exit 2
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":false,"schema_outdated":true,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
-        )
-        .unwrap();
+        ));
         let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
         assert_eq!(
             outcome.decision,
@@ -1985,18 +2048,89 @@ exit 2
         );
     }
 
+    /// [`status`] refuses a path it cannot use, and says which, without spawning
+    /// anything.
+    ///
+    /// The tests above hand `maybe_refresh` a canned answer, so they no longer
+    /// reach these arms; the `run_devmap` tests cover the child and the parse.
+    /// This covers the join: an unusable path is `available: false` carrying the
+    /// reason, which is what [`crate::devmap::LiveRefreshDecision::SkipUnavailable`]
+    /// goes on to report to the user.
+    #[test]
+    fn status_refuses_a_path_it_cannot_use_and_names_the_reason() {
+        // This module's own serial, not the sidecar's: what has to be excluded
+        // here is a concurrently installed `TEST_STATUS`, and that is the serial
+        // guarding it. Holding the sidecar's instead would exclude today's
+        // setters only because all of them happen to take both.
+        let _lock = test_serial();
+        for path in [
+            "",
+            "relative/path",
+            "/definitely/missing-gitpulse-devmap-status",
+        ] {
+            let answer = status(path);
+            assert!(!answer.available, "{path:?} was accepted: {answer:?}");
+            assert!(
+                answer.status.is_none(),
+                "{path:?} produced a payload: {answer:?}"
+            );
+            assert!(
+                answer
+                    .reason
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "{path:?} refused without saying why"
+            );
+        }
+    }
+
+    /// A probe that did not answer must stand down and say why, rather than
+    /// rebuild on a guess.
+    ///
+    /// This path used to be reachable only by accident: when the host was busy
+    /// enough that the stub child missed [`STATUS_DEADLINE`], the tests above
+    /// took it and failed with `SkipUnavailable`. Asking for it deliberately is
+    /// what separates "the probe is not ready" from "the probe will never be
+    /// ready", and it is the only assertion here that the refusal carries the
+    /// probe's own reason instead of a generic sentence.
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_stands_down_when_the_probe_cannot_answer() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        write_stub_artifacts(repo.path());
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(unavailable_status("devmap timed out after 30s"));
+        let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+        assert_eq!(
+            outcome.decision,
+            crate::devmap::LiveRefreshDecision::SkipUnavailable
+        );
+        assert!(outcome.build.is_none(), "{outcome:?}");
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("devmap timed out after 30s"),
+            "the refusal must carry the probe's own reason"
+        );
+        // Standing down means standing down: an unavailable probe must not be
+        // followed by a build spawned on no information at all.
+        let log = argv_log(repo.path());
+        assert!(
+            !log.lines().any(|line| line.starts_with("build ")),
+            "an unavailable probe spawned a build:\n{log}"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn live_refresh_obsolete_payload_never_falls_back_to_incremental_across_a_storm() {
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
-        let _reset = bind_recording_devmap(repo.path());
-        fs::write(
-            repo.path().join("status.json"),
+        let devmap = bind_recording_devmap(repo.path());
+        devmap.set_status(available_status(
             r#"{"is_fresh":false,"schema_outdated":false,"degraded_reason":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
-        )
-        .unwrap();
+        ));
         for repo_changed in [true, false] {
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), repo_changed);
             assert_eq!(

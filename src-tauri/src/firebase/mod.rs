@@ -36,7 +36,9 @@
 
 pub mod apphosting;
 
-use crate::engine::git_cli::{capture_command, sandbox_join_canonical, validate_repo};
+use crate::engine::git_cli::{
+    capture_command, sandbox_join_canonical, validate_repo, CapturedOutput,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -295,20 +297,37 @@ fn help_lists_rollout_listing(help: &str) -> bool {
         })
 }
 
+/// The one invocation this probe makes, named so a test can assert the argv
+/// instead of restating it.
+const ROLLOUTS_GROUP_HELP: &[&str] = &["apphosting:rollouts", "--help"];
+
 fn probe_rollout_listing(cli_present: bool) -> FirebaseCapability {
+    probe_rollout_listing_with(cli_present, |program, args| {
+        capture_command(program, args, None, PROBE_TIMEOUT, &[])
+    })
+}
+
+/// [`probe_rollout_listing`] with its one invocation injectable.
+///
+/// The decision is [`help_lists_rollout_listing`], which is pure and covered
+/// directly. What that cannot show is the plumbing around it: which program is
+/// asked, with which arguments, and that the answer's own text is what decides.
+/// A fake runner sees all three — and sees them without depending on this host
+/// getting a child process as far as `main` inside [`PROBE_TIMEOUT`], which is a
+/// measurement of machine load rather than of this module.
+/// `git_cli::capture_command` owns the other half, that a child really runs and
+/// its output comes back.
+fn probe_rollout_listing_with(
+    cli_present: bool,
+    run: impl FnOnce(&str, &[&str]) -> Result<CapturedOutput, String>,
+) -> FirebaseCapability {
     if !cli_present {
         return FirebaseCapability::unchecked(
             "The Firebase CLI could not be run, so what it supports is unknown.",
         );
     }
     let program = firebase_program();
-    match capture_command(
-        &program,
-        &["apphosting:rollouts", "--help"],
-        None,
-        PROBE_TIMEOUT,
-        &[],
-    ) {
+    match run(&program, ROLLOUTS_GROUP_HELP) {
         Ok(output) if output.success => {
             let available = help_lists_rollout_listing(&output.stdout_text());
             FirebaseCapability {
@@ -590,46 +609,52 @@ Commands:
         assert!(!help_lists_rollout_listing(prose));
     }
 
-    /// Writes a fake `firebase` whose `apphosting:rollouts --help` prints
-    /// `help`, and answers anything else the way commander does for a command
-    /// it does not know: exit non-zero, print nothing at all.
-    ///
-    /// Unix-only for the reason [`crate::devmap::cli`]'s recording stub is: a
-    /// `#!/bin/sh` script is not a Win32 application. The decision this
-    /// exercises is [`help_lists_rollout_listing`], which is pure and is
-    /// covered on every platform above; what only a real process can prove is
-    /// the plumbing between them — and plumbing that was never run is exactly
-    /// the defect this probe exists to catch.
-    #[cfg(unix)]
-    fn write_fake_firebase(dir: &std::path::Path, help: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("firebase");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"apphosting:rollouts\" ]; then\n  cat <<'HELP_EOF'\n{help}\nHELP_EOF\n  exit 0\nfi\nexit 1\n"
-        );
-        std::fs::write(&path, script).expect("write fake firebase");
-        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod");
-        path
+    /// One canned CLI answer, with the help text on the stream the real
+    /// `firebase` writes it to.
+    fn cli_answer(help: &str, success: bool) -> CapturedOutput {
+        CapturedOutput {
+            stdout: help.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            success,
+            status_code: i32::from(!success),
+        }
     }
 
-    #[cfg(unix)]
+    /// The plumbing between [`firebase_program`] and
+    /// [`help_lists_rollout_listing`]: which program is asked, with which
+    /// arguments, and that the answer's own text is what decides. Plumbing that
+    /// was never run is the defect this probe exists to catch, so the fake
+    /// runner asserts it was.
+    ///
+    /// This was a real `#!/bin/sh` fake installed over `FIREBASE_BIN_ENV`. That
+    /// proved the same plumbing plus one thing more — that a child process
+    /// really runs — and charged two prices for it: a process-global env
+    /// override, which had to be held under the *sidecar* serial and so blocked
+    /// every sidecar test while a process started, and a [`PROBE_TIMEOUT`] that
+    /// a loaded host blows through without anything here being wrong. The
+    /// remaining half is owned where it belongs, by
+    /// `git_cli::capture_command`'s own tests.
     #[test]
-    fn the_probe_reads_a_real_process_and_not_just_a_string() {
-        let _serial = crate::harness::sidecar::test_serial();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let previous = std::env::var(FIREBASE_BIN_ENV).ok();
-
+    fn the_probe_asks_the_cli_and_reads_the_answer_it_gets() {
         for (help, expected_available) in [
             (GROUP_HELP_WITHOUT_LISTING, false),
             (GROUP_HELP_WITH_LISTING, true),
         ] {
-            let bin = write_fake_firebase(dir.path(), help);
-            // SAFETY: the serial guard above is the repository's contract for
-            // installing a process-global override inside a test.
-            unsafe { std::env::set_var(FIREBASE_BIN_ENV, &bin) };
-            let capability = probe_rollout_listing(true);
+            let mut asked: Option<(String, String)> = None;
+            let capability = probe_rollout_listing_with(true, |program, args| {
+                asked = Some((program.to_string(), args.join(" ")));
+                Ok(cli_answer(help, true))
+            });
+            let (program, args) = asked.expect("the probe must actually ask the CLI");
+            assert_eq!(
+                program,
+                firebase_program(),
+                "the probe must ask the binary this module resolves, not a guess"
+            );
+            assert_eq!(
+                args, "apphosting:rollouts --help",
+                "the group help is the only thing this probe may ask for"
+            );
             assert!(
                 capability.checked,
                 "a probe that ran must say so, whatever it found"
@@ -640,14 +665,40 @@ Commands:
             );
             assert_eq!(capability.reason.is_none(), expected_available);
         }
+    }
 
-        // SAFETY: same serial guard; restores what the test replaced.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(FIREBASE_BIN_ENV, value),
-                None => std::env::remove_var(FIREBASE_BIN_ENV),
-            }
-        }
+    /// The honesty invariant at the two ends a real fake could not produce on
+    /// demand: a runner that could not start the CLI at all, and a CLI that ran
+    /// and exited non-zero. Neither is an answer about capability, so neither
+    /// may be reported as one.
+    #[test]
+    fn an_answer_the_probe_never_got_is_never_read_as_a_capability() {
+        let unrunnable = probe_rollout_listing_with(true, |_, _| {
+            Err("firebase: no such file or directory".into())
+        });
+        assert!(
+            !unrunnable.checked,
+            "a probe that could not run must not claim to have checked"
+        );
+        assert!(!unrunnable.available);
+        assert!(
+            unrunnable
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no such file"),
+            "the reason must carry what actually went wrong: {:?}",
+            unrunnable.reason
+        );
+
+        let refused =
+            probe_rollout_listing_with(true, |_, _| Ok(cli_answer(GROUP_HELP_WITH_LISTING, false)));
+        assert!(
+            !refused.checked,
+            "a non-zero exit is not an answer about capability, even with help text on stdout"
+        );
+        assert!(!refused.available);
+        assert!(refused.reason.is_some());
     }
 
     #[test]

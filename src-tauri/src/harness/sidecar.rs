@@ -177,10 +177,7 @@ impl Drop for Sidecar {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stdin = self.stdin.take();
-        // Recorded through the registration so `procguard`'s shutdown sweep
-        // cannot signal this pid after `shutdown_child` has waited on it.
-        self.guard
-            .reap(|| shutdown_child(&mut child, stdin, self.shutdown_grace));
+        shutdown_child(&mut child, stdin, self.shutdown_grace, &self.guard);
     }
 }
 
@@ -195,8 +192,9 @@ fn force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // The whole group, not just the direct child: a harness that forked a
     // helper holding our pipes is exactly the case this reader is faulting on.
-    guard.kill_tree(&mut child);
-    let _ = guard.reap(|| child.wait());
+    // No grace, because the fault is the answer: this connection is already
+    // unusable, so there is nothing left to wait politely for.
+    let _ = guard.stop_and_reap(&mut child, Duration::ZERO);
 }
 
 /// Starts the one canonical stdout pump used by production and live sidecar
@@ -244,24 +242,23 @@ fn spawn_stdout_pump(
 /// 1. Close stdin. The harness's documented clean shutdown is EOF on its
 ///    request stream; an honorable child exits on its own.
 /// 2. Wait up to `grace` for that exit.
-/// 3. Kill whatever remains, so a wedged child cannot leak past its owner.
-fn shutdown_child(child: &mut Child, stdin: Option<ChildStdin>, grace: Duration) {
+/// 3. Kill whatever is left of its process *group*, so neither a wedged child
+///    nor a helper an honorable one forked can leak past its owner.
+///
+/// Step 3 is [`crate::procguard::Registration::stop_and_reap`] and not a bare
+/// [`Child::kill`] on purpose. A `manvi serve` that forks a helper is the whole
+/// reason `procguard` puts each child in a group of its own, and this was the
+/// one shutdown path that never used it: observed with a stub harness whose
+/// helper survived the test binary that started it, reparented to init.
+fn shutdown_child(
+    child: &mut Child,
+    stdin: Option<ChildStdin>,
+    grace: Duration,
+    guard: &crate::procguard::Registration,
+) {
     // Dropping the write end is what sends EOF; there is no explicit close.
     drop(stdin);
-    let deadline = Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            // Still running at the deadline, or wait itself failed: either
-            // way the escalation below reaps the process or reports why not.
-            _ => break,
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = guard.stop_and_reap(child, grace);
 }
 
 impl Sidecar {
@@ -700,16 +697,54 @@ impl Drop for SidecarTestGuard {
 
 /// Installs a fake sidecar binary for the whole process.
 ///
-/// Takes the guard by reference rather than merely documenting that one is
-/// required: without it, "I forgot to serialize" is a silent race, and with it
-/// the same mistake does not compile.
+/// Private, and reachable only through [`bind_test_binary`], for the reason
+/// documented there.
 #[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn set_test_binary(_serial: &SidecarTestGuard, path: Option<String>) {
+fn set_test_binary(path: Option<String>) {
     let mut current = TEST_BINARY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *current = path;
+}
+
+/// A fake `manvi` installed for the whole process, removed when this is dropped.
+///
+/// The only way to install one, which is the point. Callers used to install the
+/// override and clear it on the last line of the test body, so a test that
+/// panicked before that line left a process-global path to a fake sidecar
+/// installed — pointing into a `TempDir` that unwinding then deleted. Every
+/// later test that reached the harness gate failed with `could not start
+/// …/profile-sidecar: No such file or directory`, and that is how one slow test
+/// became nineteen failures across seven unrelated modules, each of which looked
+/// like an independent flake because it passed when run on its own.
+///
+/// Requiring the serial guard keeps the other half of the contract: without it,
+/// "I forgot to serialize" is a silent race, and with it the same mistake does
+/// not compile.
+#[cfg(test)]
+pub(crate) struct TestBinaryBinding;
+
+#[cfg(test)]
+impl Drop for TestBinaryBinding {
+    fn drop(&mut self) {
+        set_test_binary(None);
+        // The slot as well as the path: a sidecar already spawned from the fake
+        // would otherwise stay cached and answer the next test from a binary
+        // that no longer exists.
+        reset();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bind_test_binary(
+    _serial: &SidecarTestGuard,
+    path: impl Into<String>,
+) -> TestBinaryBinding {
+    set_test_binary(Some(path.into()));
+    // Any sidecar cached from an earlier binary answers for that binary, so the
+    // slot is dropped on the way in as well as on the way out.
+    reset();
+    TestBinaryBinding
 }
 
 #[cfg(test)]
@@ -1351,6 +1386,10 @@ pub(crate) fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The shutdown tests below ask the same question `procguard`'s own do: did
+    // a helper the fixture forked outlive the process that owned it.
+    #[cfg(unix)]
+    use crate::test_support::{announced_pid, process_alive, wait_gone};
 
     /// Regression: an undecodable stdout line used to return
     /// HarnessError::Protocol, which drops a healthy sidecar and starts the
@@ -1484,24 +1523,35 @@ mod tests {
         holder.join().expect("holder thread");
     }
 
+    /// Spawns a shell script the way production spawns the harness — through
+    /// `procguard`, so the child leads a process group and the shutdown ladder
+    /// has the registration it needs. A child shape the tests can reach but
+    /// production cannot is a child shape the tests are not really covering.
+    fn registered_script(script: &str) -> (Child, crate::procguard::Registration, ChildStdin) {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, guard) =
+            crate::procguard::spawn(&mut command, "shutdown fixture").expect("spawn fixture");
+        let stdin = child.stdin.take().expect("piped stdin");
+        (child, guard, stdin)
+    }
+
     /// A child that honors stdin EOF exits on its own inside the grace
     /// window; no kill is needed and the exit status is its own.
     #[test]
     fn shutdown_closes_stdin_and_lets_an_honoring_child_exit_cleanly() {
-        let mut child = Command::new("sh")
-            .args(["-c", "cat > /dev/null; echo done >&2"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn honoring child");
-        let stdin = child.stdin.take().expect("piped stdin");
+        let (mut child, guard, stdin) = registered_script("cat > /dev/null; echo done >&2");
 
         let started = Instant::now();
         shutdown_child(
             &mut child,
             Some(stdin),
             crate::test_support::coverage_relaxed(Duration::from_millis(500)),
+            &guard,
         );
         let status = child.wait().expect("reap");
         assert!(
@@ -1515,17 +1565,10 @@ mod tests {
     /// shutdown stays bounded by roughly the grace period.
     #[test]
     fn shutdown_escalates_to_kill_when_child_ignores_eof() {
-        let mut child = Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn stubborn child");
-        let stdin = child.stdin.take().expect("piped stdin");
+        let (mut child, guard, stdin) = registered_script("sleep 30");
 
         let started = Instant::now();
-        shutdown_child(&mut child, Some(stdin), Duration::from_millis(200));
+        shutdown_child(&mut child, Some(stdin), Duration::from_millis(200), &guard);
         let elapsed = started.elapsed();
         let status = child.wait().expect("reap after kill");
         assert!(
@@ -1533,10 +1576,59 @@ mod tests {
             "escalation fired early: {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_millis(3_000),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(3_000)),
             "shutdown exceeded grace materially: {elapsed:?}"
         );
         assert!(!status.success(), "a SIGKILLed sleep cannot report success");
+    }
+
+    /// Regression: the clean path escalated with `child.kill()` — the direct
+    /// child and nothing else — so a harness that forked a helper and then
+    /// ignored the EOF kept that helper. Observed while rewriting the retry
+    /// test: four abandoned readers with ppid 1, the oldest 27 minutes old,
+    /// outliving the test binary that started them.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_takes_a_helper_a_stubborn_child_forked() {
+        let (mut child, guard, stdin) = registered_script("sleep 30 & echo $!; exec sleep 30");
+        let helper = announced_pid(&mut child);
+        assert!(process_alive(helper), "fixture never started its helper");
+
+        shutdown_child(&mut child, Some(stdin), Duration::from_millis(200), &guard);
+
+        assert!(
+            wait_gone(helper, Duration::from_secs(5)),
+            "the helper survived an escalation aimed at its parent alone"
+        );
+    }
+
+    /// The same leak from the other end of the ladder, and the harder half: an
+    /// *honorable* child is reaped by the grace loop, and a pid that has been
+    /// waited on is no longer ours to signal — so a shutdown that polls
+    /// `try_wait` has already lost the right to clean up after it.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_takes_a_helper_an_honoring_child_left_behind() {
+        let (mut child, guard, stdin) = registered_script("sleep 30 & echo $!; cat > /dev/null");
+        let helper = announced_pid(&mut child);
+        assert!(process_alive(helper), "fixture never started its helper");
+
+        shutdown_child(
+            &mut child,
+            Some(stdin),
+            crate::test_support::coverage_relaxed(Duration::from_millis(500)),
+            &guard,
+        );
+
+        let status = child.wait().expect("reap");
+        assert!(
+            status.success(),
+            "the group sweep must not turn a clean exit into a kill: {status:?}"
+        );
+        assert!(
+            wait_gone(helper, Duration::from_secs(5)),
+            "the helper outlived the sidecar whose child forked it"
+        );
     }
 
     /// Builds a live [`Sidecar`] around an arbitrary shell script, mirroring
@@ -1745,13 +1837,28 @@ mod tests {
     }
 
     /// Fake `manvi serve`: the first connection answers the handshake and then
-    /// wedges silently (never answering what follows); later connections speak
-    /// enough NDJSON to satisfy the handshake and one policy verdict. Each
-    /// spawn appends itself to a count file, so a test can prove which
-    /// connection actually served a request.
+    /// wedges; later connections speak enough NDJSON to satisfy the handshake
+    /// and any number of policy verdicts, each **stamped with the ordinal of the
+    /// connection that served it**.
+    ///
+    /// Two things here are deliberate, and both were defects before.
+    ///
+    /// The wedge blocks in `open(2)` on a FIFO nothing ever opens for writing,
+    /// so it is unbounded by construction and the test holds it for as long as
+    /// it likes. A `sleep 60` only *outlasted* the caller's deadline, which
+    /// makes the stall a race between two timers: on a loaded host the sleeping
+    /// connection could still be the faster of the two.
+    ///
+    /// The verdict names its server, so a test can prove the answer did not come
+    /// from the wedged connection. Counting spawns cannot prove that: the binary
+    /// override is process-global, so any other test that reaches the sidecar
+    /// while it is installed runs *this* script and bumps the same counter. That
+    /// is what made the count 8, 9 or 12 in a full run and exactly 2 in a
+    /// filtered one — a measurement of the rest of the suite, not of the retry.
     #[cfg(unix)]
     const FAKE_MANVI_SH: &str = r#"#!/bin/sh
 count_file="@COUNT_FILE@"
+dir=$(dirname "$count_file")
 n=0
 [ -f "$count_file" ] && n=$(cat "$count_file")
 n=$((n + 1))
@@ -1762,17 +1869,28 @@ reply() {
   printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
 }
 
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+
 if [ "$n" = "1" ]; then
-  IFS= read -r line || exit 1
-  reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
-  sleep 60
+  printf '%s\n' "$n" > "$dir/stalled_ordinal"
+  # Blocks in open(2) until something opens the write end. The test never does,
+  # so this connection cannot answer, cannot time itself out, and cannot win a
+  # race against the retry.
+  #
+  # A redirect on a builtin, so the *shell* is what blocks. `cat <fifo>` would
+  # fork a grandchild, and a graceful sidecar shutdown reaps the shell and
+  # forgets its pid, leaving nothing to signal the process group with: the
+  # grandchild was reparented to init and, blocked on a fifo no one ever opens,
+  # stayed there for the life of the machine. `sleep 60` hid that by ending on
+  # its own.
+  IFS= read -r wedged < "$dir/wedge.fifo"
+  printf '%s\n' "$n:$wedged" > "$dir/stall_released"
   exit 0
 fi
 
-IFS= read -r line || exit 1
-reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
 while IFS= read -r line; do
-  reply "$line" '{"action":"allow","rule":"stub","severity":"info","reason":"stub allow","target":"","task_id":"","demoted":""}'
+  reply "$line" '{"action":"allow","rule":"stub-'"$n"'","severity":"info","reason":"stub allow","target":"","task_id":"","demoted":""}'
 done
 "#;
 
@@ -1871,7 +1989,11 @@ done
 "#;
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        set_test_binary(&serial, Some(binary.to_str().unwrap().into()));
+        // Bound, not installed-and-cleared-at-the-end: this test is the one that
+        // leaked the override process-wide when a loaded host made its first
+        // `call` time out, and the nineteen failures that followed were other
+        // modules trying to spawn its deleted `TempDir`.
+        let _binary = bind_test_binary(&serial, binary.to_str().unwrap());
         let connection =
             ProfileConnection::new(dir.path().join("profile with spaces.sqlite"), None).unwrap();
         assert!(connection.slot.lock().unwrap().sidecar.is_none());
@@ -1916,7 +2038,6 @@ done
         assert!(connection
             .call("work.enhancements.configuration", serde_json::json!({}))
             .is_err());
-        set_test_binary(&serial, None);
     }
 
     #[test]
@@ -2009,6 +2130,7 @@ done
     #[test]
     fn the_sidecar_test_guard_excludes_other_threads() {
         let held = test_serial();
+        let me = thread::current().id();
         let (tx, rx) = mpsc::channel();
         let contender = thread::spawn(move || {
             let _guard = test_serial();
@@ -2023,14 +2145,59 @@ done
             "a second thread must not acquire the guard while it is held"
         );
         drop(held);
-        // Other tests also take this lock. After we drop, a sibling can
-        // acquire it before the contender; wait out a full sidecar hello
-        // rather than assuming we are next in line.
+
+        // What [`SidecarTestGuard::drop`] is actually for, asserted rather than
+        // inferred from how soon the next thread gets in: ownership is cleared
+        // while the mutex is still held, so nobody can observe a stale owner.
+        // Whoever holds this now, it is no longer this thread.
+        assert_ne!(
+            slot_test_owner().map(|(thread, _)| thread),
+            Some(me),
+            "a released guard left this thread recorded as the owner — the next \
+             thread in would read that as a re-entry and run unserialized"
+        );
+
+        // Liveness, which no number can bound honestly: every other sidecar
+        // test takes this same lock, one of them holds it for a whole `manvi`
+        // handshake, and `std::sync::Mutex` makes no fairness promise about who
+        // is admitted next. The budget below is a hang guard — it turns a guard
+        // that is never released into a failure instead of a suite that never
+        // ends — and is deliberately far past any real wait, because it is not
+        // measuring anything. The assertion above is what proves the release.
         rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
-            30,
+            120,
         )))
-        .expect("releasing the guard must let the waiting thread in");
+        .expect("releasing the guard must let a waiting thread in");
         contender.join().expect("contender thread");
+    }
+
+    /// The override is process-global, so a test that fails while holding one
+    /// used to hand every later test a path to a `TempDir` that unwinding had
+    /// already deleted — and those tests then failed with `could not start
+    /// …/profile-sidecar: No such file or directory`, in modules that never
+    /// touch the sidecar. Nineteen failures across seven modules came from one
+    /// slow test this way, each looking like an independent flake because each
+    /// passed when run alone.
+    ///
+    /// Asserted here because the damage never shows up where it is caused.
+    #[test]
+    fn a_failing_test_cannot_leave_its_fake_binary_installed() {
+        let serial = test_serial();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _binary = bind_test_binary(&serial, "/nonexistent/gitpulse-test/leaked-manvi");
+            assert!(
+                test_binary_override().is_some(),
+                "the fixture must install an override before it fails"
+            );
+            panic!("simulated failure while holding the binary override");
+        }));
+        assert!(outcome.is_err(), "the fixture must actually have failed");
+        assert_eq!(
+            test_binary_override(),
+            None,
+            "the override outlived the test that installed it; every later test \
+             reaching the harness gate would try to spawn a path that is gone"
+        );
     }
 
     /// Regression (one policy timeout kills the gate): a single timed-out
@@ -2055,17 +2222,26 @@ done
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .expect("make fake-manvi executable");
 
-        set_test_binary(&_serial, Some(script_path.to_string_lossy().into_owned()));
-        // Carries the guard the test already holds. Re-acquiring it here would
-        // deadlock on unwind: `SLOT_TEST_LOCK` is a plain `std::sync::Mutex`
-        // and is not reentrant.
-        struct ClearBinary<'a>(&'a SidecarTestGuard);
-        impl Drop for ClearBinary<'_> {
-            fn drop(&mut self) {
-                set_test_binary(self.0, None);
-            }
-        }
-        let _clear_on_unwind = ClearBinary(&_serial);
+        // What the wedged connection blocks on. It must exist before the first
+        // connection reaches it, or that connection would fail instead of
+        // stalling and the retry would be provoked by the wrong fault.
+        let wedge = dir.path().join("wedge.fifo");
+        let wedge_c = std::ffi::CString::new(wedge.as_os_str().as_encoded_bytes())
+            .expect("fifo path without NUL");
+        // SAFETY: a NUL-terminated path this test owns, in a directory it just
+        // created. 0o600 is the mode; no descriptor is created or retained here.
+        assert_eq!(
+            unsafe { libc::mkfifo(wedge_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo {}: {}",
+            wedge.display(),
+            std::io::Error::last_os_error()
+        );
+
+        // Carries the guard the test already holds; the binding cannot outlive it,
+        // and re-acquiring it would deadlock on unwind because `SLOT_TEST_LOCK`
+        // is a plain, non-reentrant `std::sync::Mutex`.
+        let _binary = bind_test_binary(&_serial, script_path.to_string_lossy());
 
         // Tests share the process-wide slot: an earlier test may have left a
         // live sidecar (spawned from the real manvi) sitting in it, which
@@ -2073,6 +2249,10 @@ done
         // answer from that inherited child. Reset so both attempts provably
         // go through the overridden binary.
         super::reset();
+        // Ordinals are counted from here, so "the wedged one was first" is a
+        // statement about this call and not about whatever ran earlier in the
+        // process.
+        std::fs::write(&count_file, "0\n").expect("seed connection count");
 
         let started = Instant::now();
         let verdict = super::call_policy::<RawDecision>(
@@ -2083,23 +2263,37 @@ done
         let elapsed = started.elapsed();
 
         let decision = verdict.expect("the fresh second connection must answer the verdict");
-        // The stub signs its verdicts; anything else means the request never
-        // reached the fake harness and the count below proves nothing.
         assert_eq!(decision.action, "allow");
-        assert_eq!(
-            decision.rule, "stub",
-            "verdict must come from the stub, not another binary"
-        );
         assert!(
             elapsed < Duration::from_secs(10),
             "retry exceeded any sane bound: {elapsed:?}"
         );
 
-        let count = std::fs::read_to_string(&count_file).expect("read connection count");
-        assert_eq!(
-            count.trim(),
-            "2",
-            "the verdict must land on the SECOND connection, not the stalled first"
+        // The first connection reached its wedge, so the fault the retry
+        // answered really was a stall and not a crash or a bad handshake.
+        let stalled = std::fs::read_to_string(dir.path().join("stalled_ordinal"))
+            .expect("the first connection must reach the wedge");
+        assert_eq!(stalled.trim(), "1");
+
+        // The verdict names the connection that served it. This is the whole
+        // assertion: the answer came from a *fresh* connection, and the wedged
+        // one contributed nothing.
+        let served: u32 = decision
+            .rule
+            .strip_prefix("stub-")
+            .unwrap_or_else(|| panic!("verdict must come from the stub, got {:?}", decision.rule))
+            .parse()
+            .expect("stub ordinal");
+        assert!(
+            served >= 2,
+            "the verdict must land on a connection after the stalled first, got {served}"
+        );
+
+        // Still wedged. Nothing opened the FIFO's write end, so the stall the
+        // retry was provoked by outlasted the verdict rather than racing it.
+        assert!(
+            !dir.path().join("stall_released").exists(),
+            "the stalled connection was released before the verdict was observed"
         );
 
         // Success must leave no respawn backoff armed: the next mutation gets

@@ -662,7 +662,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn model_fingerprint_change_retires_and_respawns_the_profile_worker() {
-        use crate::harness::sidecar::{set_test_binary, test_serial};
+        use crate::harness::sidecar::{bind_test_binary, test_serial};
         use std::os::unix::fs::PermissionsExt;
         let serial = test_serial();
         let dir = tempfile::TempDir::new().unwrap();
@@ -681,7 +681,7 @@ done
 "#;
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        set_test_binary(&serial, Some(binary.to_str().unwrap().into()));
+        let _binary = bind_test_binary(&serial, binary.to_str().unwrap());
         let outcome = std::panic::catch_unwind(|| {
             let path = dir.path().join("profile.sqlite");
             let host = state(&path);
@@ -708,7 +708,6 @@ done
             assert_eq!(second["model"], "model-b");
             host.shutdown();
         });
-        set_test_binary(&serial, None);
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
@@ -771,7 +770,7 @@ done
     #[test]
     #[ignore = "requires explicit GITPULSE_WORKBENCH_TEST_MANVI and GITPULSE_WORKBENCH_TEST_DCSTORE binaries"]
     fn real_profile_host_shares_native_revisions_and_refuses_a_stale_generation() {
-        use crate::harness::sidecar::{set_test_binary, test_serial};
+        use crate::harness::sidecar::{bind_test_binary, test_serial};
         use std::os::unix::fs::PermissionsExt;
         let serial = test_serial();
         let binary = std::fs::canonicalize(
@@ -810,7 +809,7 @@ done
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        set_test_binary(&serial, Some(wrapper.to_str().unwrap().into()));
+        let _binary = bind_test_binary(&serial, wrapper.to_str().unwrap());
         let outcome = std::panic::catch_unwind(|| {
             let path = dir.path().join("profile with spaces/workbench.sqlite");
             let host = state(&path);
@@ -860,7 +859,6 @@ done
             host.shutdown();
             assert!(host.request("enhancements.configuration", "{}").is_err());
         });
-        set_test_binary(&serial, None);
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
