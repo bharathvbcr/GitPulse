@@ -57,6 +57,7 @@
       const { repoStore } = await import("../src/lib/stores/repoStore");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
       const { terminalSessions } = await import("../src/lib/terminal/sessionRegistry");
+      const { MAX_TERMINAL_TABS } = await import("../src/lib/terminal/tabs");
       const { coverageMetric } = await import("../src/lib/metrics/repoMetrics");
       const { get } = await import("svelte/store");
       const Host = (await import("./CoverageHost.svelte")).default;
@@ -177,9 +178,14 @@
           button("Fail next agent launch").click(); await launch("codex");
           await until(() => document.body.textContent.includes("Fixture agent executable unavailable"));
           check("native spawn failures remain visible", document.body.textContent.includes("Fixture agent executable unavailable"));
-          for (let i = get(terminalSessions).length; i < 16; i++) slots.push(terminalSessions.reserve({ key: `fixture-slot-${i}`, repoPath: "/fixture/busy", label: "Busy", status: "running", close: async () => {} }));
+          // Filled and asserted from MAX_TERMINAL_TABS, never a transcribed
+          // number: the refusal text is built from that constant, so a hardcoded
+          // ceiling here does not fail with a wrong count — it fills short of
+          // capacity, never refuses, and times out waiting for a sentence that
+          // is never written. Raising the cap from 16 to 32 did exactly that.
+          for (let i = get(terminalSessions).length; i < MAX_TERMINAL_TABS; i++) slots.push(terminalSessions.reserve({ key: `fixture-slot-${i}`, repoPath: "/fixture/busy", label: "Busy", status: "running", close: async () => {} }));
           const beforeCap = spawned.length;
-          await launch("claude"); await until(() => document.body.textContent.includes("All 16 terminal sessions"));
+          await launch("claude"); await until(() => document.body.textContent.includes(`All ${MAX_TERMINAL_TABS} terminal sessions`));
           check("capacity refuses without spawning", spawned.length === beforeCap);
           slots.splice(0).forEach(slot => slot.release());
           mode = "measured"; button("Rescan coverage artifacts").click(); await until(() => prompt().includes("62.5%"));
