@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse health verification</title></head>
+  <body style="margin:0">
+    <!-- A fixed stage, not the window: a check that measures whether the
+         header clips its own text is measuring the viewport unless the
+         viewport is pinned. -->
+    <div id="app" style="width:1280px;height:820px;overflow:hidden"></div>
+    <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run health checks</button>
+    <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      import { mockIPC } from "@tauri-apps/api/mocks";
+      import "../src/app.css";
+
+      const errors = [];
+      addEventListener("error", event => errors.push(event.message));
+      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+
+      // Fixture shapes are the complete wire types, per src/lib/health/types.ts
+      // and src/lib/codeintel/types.ts. A fixture short of a field is not a
+      // smaller fixture: `invoke` answers `undefined`, the panel reads `.length`
+      // off it and throws mid-render, and the torn-down effects make the run
+      // look clean. That is how this repository lost a whole stress harness
+      // once already.
+      let mode = "findings";
+      let githubMode = "alerts";
+
+      const bigCount = 400;
+
+      const vulnerability = (i) => ({
+        name: `pkg-${i}`,
+        severity: ["critical", "high", "moderate", "low", "info"][i % 5],
+        is_direct: i % 3 === 0,
+        title: `Advisory ${i}`,
+        url: `https://example.invalid/advisory/${i}`,
+        range: `<1.${i}.0`,
+        fix_available: `1.${i}.0`,
+        via: [],
+        ecosystem: "npm",
+      });
+
+      // Inputs chosen to break layout rather than to look plausible: a package
+      // name with no break opportunity, a right-to-left title, a zero-width
+      // joiner, and a string that is markup if anything ever interpolates it raw.
+      const HOSTILE = [
+        { name: "a".repeat(300), title: "unbroken identifier" },
+        { name: "‮exe.txt", title: "مرحبا بالعالم" },
+        { name: "zero​width​joined", title: "​".repeat(50) },
+        { name: "<script>alert(1)<\/script>", title: "<img src=x onerror=alert(1)>" },
+        { name: "emoji-🔥👩‍💻", title: "surrogate pairs" },
+      ];
+
+      const healthReport = () => {
+        const base = {
+          node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true,
+          cargo_audit_present: true, pip_audit_present: false, govulncheck_present: false,
+          composer_present: false, bundler_audit_present: false,
+          scanners_ran: ["npm", "cargo"], audit_complete: false,
+          manifests: [{
+            path: "package.json", name: "gitpulse", version: "1.3.0", private: true,
+            license: "MIT", engines_node: ">=22", package_manager: "npm",
+            lockfile: "package-lock.json", has_workspaces: false,
+            dep_count: 57, dev_dep_count: 34, optional_dep_count: 0, peer_dep_count: 0,
+            lifecycle_scripts: ["postinstall", "prepare"],
+          }],
+          ecosystems: [{
+            family: "cargo",
+            manifests: ["backend/rust_gateway/Cargo.lock", "backend/rust_gateway/Cargo.toml",
+                        "backend/rust_gateway/crates/gateway/Cargo.toml",
+                        "backend/rust_gateway/crates/gateway/src/account.rs",
+                        "backend/rust_gateway/crates/gateway/src/extra.rs"],
+            note: "Cargo.lock files will be checked with cargo audit",
+          }],
+          issues: [{
+            severity: "info", code: "lifecycle_scripts",
+            message: "Install-time scripts: postinstall, prepare.", path: "package.json",
+          }],
+          vulnerabilities: [vulnerability(1)],
+          audit: { info: 0, low: 0, moderate: 0, high: 1, critical: 0, unknown: 0, total: 1 },
+          outdated: [{ name: "svelte", current: "5.0.0", wanted: "5.57.0", latest: "5.57.0", dep_type: "devDependencies", location: "/" }],
+          truncated: true,
+          limit_notices: [{ resource: "cargo ecosystem artifacts", kept: 4, total: 36, inventory_only: true }],
+        };
+        if (mode === "empty") {
+          return { ...base, audit_complete: true, issues: [], vulnerabilities: [], outdated: [],
+            audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, unknown: 0, total: 0 },
+            truncated: false, limit_notices: [], ecosystems: [] };
+        }
+        if (mode === "unrun") {
+          return { ...base, scanners_ran: [], audit_complete: false, npm_cli_present: false,
+            vulnerabilities: [], audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, unknown: 0, total: 0 } };
+        }
+        if (mode === "huge") {
+          return {
+            ...base,
+            vulnerabilities: Array.from({ length: bigCount }, (_, i) => vulnerability(i)),
+            audit: { info: 0, low: 100, moderate: 100, high: 100, critical: 100, unknown: 0, total: bigCount * 3 },
+            outdated: Array.from({ length: bigCount }, (_, i) => ({ name: `outdated-${i}`, current: "1.0.0", wanted: "2.0.0", latest: `3.${i}.0`, dep_type: "dependencies", location: "/" })),
+            issues: Array.from({ length: 60 }, (_, i) => ({ severity: ["info", "warning", "error"][i % 3], code: `code_${i}`, message: `Issue ${i}`, path: `src/f${i}.ts` })),
+            limit_notices: [{ resource: "outdated npm packages", kept: bigCount, total: bigCount * 3, inventory_only: false }],
+          };
+        }
+        if (mode === "hostile") {
+          return {
+            ...base,
+            vulnerabilities: HOSTILE.map((h, i) => ({ ...vulnerability(i), ...h })),
+            manifests: [{ ...base.manifests[0], name: HOSTILE[0].name, path: HOSTILE[0].name }],
+            ecosystems: [{ family: HOSTILE[0].name.slice(0, 40), manifests: [HOSTILE[0].name], note: HOSTILE[3].title }],
+            issues: [{ severity: "error", code: HOSTILE[3].name, message: HOSTILE[3].title, path: HOSTILE[0].name }],
+          };
+        }
+        return base;
+      };
+
+      const githubReport = (kind) => {
+        if (githubMode === "unavailable") {
+          return { available: false, cli_present: false, is_github_remote: true, slug: "owner/repo", alerts: [], truncated: false, error: "gh: command not found" };
+        }
+        if (githubMode === "clear") {
+          return { available: true, cli_present: true, is_github_remote: true, slug: "owner/repo", alerts: [], truncated: false, error: null };
+        }
+        const alerts = kind === "dependabot"
+          ? [{ number: 1, package: "rsa", ecosystem: "cargo", manifest_path: "Cargo.lock", scope: "runtime", severity: "HIGH", title: "Marvin Attack", advisory_id: "RUSTSEC-2023-0071", cve_id: "", vulnerable_range: "<=0.9.6", first_patched: "", url: "https://example.invalid/d/1", created_at: "2026-01-01T00:00:00Z" }]
+          : [{ number: 2, rule_id: "js/unused", rule_name: "Unused", severity: "warning", state: "open", tool: "CodeQL", tool_version: "2.0", title: "Unused local", path: "src/a.ts", start_line: 12, url: "https://example.invalid/c/2", dismissed_reason: "", created_at: "2026-01-02T00:00:00Z", updated_at: "2026-01-03T00:00:00Z" }];
+        return { available: true, cli_present: true, is_github_remote: true, slug: "owner/repo", alerts, truncated: true, error: null };
+      };
+
+      const deadSymbols = () => {
+        if (mode === "empty") {
+          return { source_freshness: { fresh: true, generation_id: 12 }, available: true, reason: null, items: [], total: 0, shown: 0, truncated: false, rungs: { deterministic: 0, high: 0, speculative: 0, filtered_out: 0 } };
+        }
+        const count = mode === "huge" ? 250 : 2;
+        return {
+          source_freshness: { fresh: true, generation_id: 12 },
+          available: true, reason: null,
+          items: Array.from({ length: count }, (_, i) => ({
+            symbol_name: mode === "hostile" ? HOSTILE[i % HOSTILE.length].name : `unused_${i}`,
+            file_path: `src/legacy${i}.rs`, confidence: 0.9, is_exempt: i % 2 === 1,
+            exemption_reason: i % 2 === 1 ? "public API" : null,
+          })),
+          total: count + 12, shown: count, truncated: true,
+          walk_incomplete: mode === "hostile" ? "170746 of 331397 unresolved attribution sites" : undefined,
+          rungs: { deterministic: count, high: 0, speculative: 0, filtered_out: 0 },
+        };
+      };
+
+      const codeintelStatus = () => ({
+        available: mode !== "unrun", is_fresh: true, freshness_reason: null,
+        source_freshness: true, analyzer_freshness: true, pending_count: 0,
+        db_path: "/fixture/.devcouncil/codeintel/devmap.sqlite", generation_id: 12,
+        total_files: 2077, total_symbols: 28845, total_edges: 91971,
+        reason: mode === "unrun" ? "no code graph has been built here" : null,
+      });
+
+      mockIPC((cmd, args) => {
+        switch (cmd) {
+          case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
+          case "cmd_scan_deps_health":
+            if (mode === "failed") throw new Error("Fixture health scan failed");
+            return healthReport();
+          case "cmd_github_dependabot_alerts":
+            if (githubMode === "throws") throw new Error("Fixture IPC failure");
+            return githubReport("dependabot");
+          case "cmd_github_code_scanning_alerts":
+            if (githubMode === "throws") throw new Error("Fixture IPC failure");
+            return githubReport("code-scanning");
+          case "cmd_codeintel_dead_symbols": return deadSymbols();
+          case "cmd_codeintel_status": return codeintelStatus();
+          case "cmd_copy_text": return null;
+          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
+          case "cmd_stash_list": return { entries: [], truncated: false };
+          case "cmd_list_tags": return { tags: [], truncated: false };
+          case "cmd_branch_stats": return {};
+          case "cmd_repo_operation": case "cmd_workspace_sync": return null;
+          default: throw new Error(`Unimplemented fixture: ${cmd}`);
+        }
+      }, { shouldMockEvents: true });
+
+      const { mount, tick } = await import("svelte");
+      const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
+      const { createChecks, CheckFailed } = await import("./checks.ts");
+      const { HEALTH_SECTIONS } = await import("../src/lib/health/sections.ts");
+      const HealthPanel = (await import("../src/lib/components/HealthPanel.svelte")).default;
+
+      interfaceStore.setAutoScanGithubAlerts(true);
+      await repoStore.openRepo("/fixture/Other");
+      await repoStore.openRepo("/fixture/GitPulse");
+      const root = document.querySelector("#app");
+      mount(HealthPanel, { target: root });
+
+      // `textContent` keeps the newlines and indentation Svelte emits between
+      // markup lines, so a probe for a phrase the template wraps reads as
+      // absent while it is plainly on screen. Both sides are collapsed to
+      // single spaces before comparing.
+      const flat = node => (node?.textContent ?? "").replace(/\s+/g, " ").trim();
+      const has = (node, phrase) => flat(node).includes(phrase.replace(/\s+/g, " ").trim());
+      const wait = (ms = 80) => new Promise(resolve => setTimeout(resolve, ms));
+      const until = async test => {
+        const end = Date.now() + 8000;
+        while (!test() && Date.now() < end) await wait(40);
+        if (!test()) throw new Error("Fixture condition timed out");
+      };
+      const button = name => [...root.querySelectorAll("button")]
+        .find(node => (node.getAttribute("aria-label") || node.textContent.trim()).includes(name));
+      const section = id => root.querySelector(`[data-health-section="${id}"]`);
+      const scroller = () => root.querySelector(".overflow-auto");
+      const header = () => root.querySelector(".gp-section-edge");
+      const rescan = async next => {
+        mode = next;
+        button("Scan local").click();
+        await until(() => !button("Scan local").disabled);
+        await wait(120);
+      };
+
+      const checksButton = document.querySelector("#checks");
+      checksButton.disabled = false;
+      checksButton.onclick = async () => {
+        checksButton.disabled = true;
+        // `createChecks`, not a local boolean helper: an assertion that throws
+        // (getComputedStyle on a null node) is recorded as that check failing,
+        // beside its name, and the run writes down where it stopped instead of
+        // ending in a short list of passes that reads as silence.
+        const { results, check, stopped } = createChecks();
+        const finish = () => {
+          const payload = { results, errors };
+          document.querySelector("#result").textContent = JSON.stringify(results, null, 2);
+          document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(payload));
+          document.title = `GitPulse health ${results.filter(r => r.pass).length}/${results.length}`;
+          const reportPath = new URL(location.href).searchParams.get("report");
+          if (reportPath?.startsWith("/__gp_result/")) return fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        };
+        try {
+          await until(() => !!section("summary"));
+
+          // ---- Information architecture -------------------------------------
+          // The complaint this panel was rewritten for: the verdict was nowhere
+          // and the inventory outranked the findings.
+          check("the verdict is the first thing in the scroll", () => {
+            const summary = section("summary").getBoundingClientRect();
+            const box = scroller().getBoundingClientRect();
+            return summary.top - box.top < 120;
+          });
+          check("the verdict is above the fold", () =>
+            section("summary").getBoundingClientRect().bottom < scroller().getBoundingClientRect().bottom);
+          check("findings come before inventory", () =>
+            section("vulnerabilities").getBoundingClientRect().top
+              < section("packages").getBoundingClientRect().top);
+          check("the high-severity finding is reachable without a long scroll", () => {
+            const box = scroller().getBoundingClientRect();
+            return section("vulnerabilities").getBoundingClientRect().top - box.top < box.height;
+          });
+          check("every catalog section renders", () =>
+            HEALTH_SECTIONS.filter(s => s.id !== "plan").every(s => !!section(s.id)));
+          check("sections render in catalog order", () => {
+            const tops = HEALTH_SECTIONS.filter(s => s.id !== "plan" && section(s.id))
+              .map(s => section(s.id).getBoundingClientRect().top);
+            return tops.every((top, i) => i === 0 || top >= tops[i - 1]);
+          });
+
+          // ---- The header stopped clipping its own summary -------------------
+          check("the header does not clip its contents", () =>
+            header().scrollWidth <= header().clientWidth + 1);
+          check("the header carries a non-empty verdict", () =>
+            has(header(), "action needed") || has(header(), "review"));
+          // The card owns the sentence; the header owns the tone word. Printing
+          // both put the same string on screen twice within about 130px.
+          check("the header does not repeat the card's headline", () =>
+            !has(header(), "Action needed: Vulnerabilities"));
+          check("the header no longer carries the quiet GitHub states", () =>
+            !has(header(), "not checked") && !has(header(), "0 open"));
+          check("the toolchain line left the button row", () =>
+            !has(header(), "node 22") && has(section("packages"), "node 22"));
+
+          // ---- The permission wall became a disclosure ----------------------
+          const disclosure = root.querySelector("details");
+          check("the permission note is collapsed by default", () => !disclosure.open);
+          // The defect was column height, so height is what is measured — not
+          // whether a node exists. Four lines of prose at this type size is
+          // ~64px of content; one summary line plus padding is well under 40.
+          const collapsedHeight = disclosure.getBoundingClientRect().height;
+          check("collapsed, the note costs one line rather than four", () =>
+            collapsedHeight > 0 && collapsedHeight < 40);
+          check("freshness stays visible while collapsed", () =>
+            disclosure.querySelector("summary").getBoundingClientRect().height > 0
+              && has(disclosure, "GitHub alerts"));
+          check("the prose is still reachable, and is what costs the height", () => {
+            disclosure.open = true;
+            const openHeight = disclosure.getBoundingClientRect().height;
+            disclosure.open = false;
+            return openHeight > collapsedHeight + 30;
+          });
+
+          // ---- One measure, no ragged edge ----------------------------------
+          check("every section shares one right edge", () => {
+            const rights = HEALTH_SECTIONS.map(s => section(s.id))
+              .filter(Boolean)
+              .map(node => Math.round(node.getBoundingClientRect().right));
+            return new Set(rights).size === 1;
+          });
+          check("the page does not scroll sideways", () =>
+            scroller().scrollWidth <= scroller().clientWidth + 1);
+
+          // ---- Honesty ------------------------------------------------------
+          check("a capped scan is not presented as complete", () =>
+            has(root, "reasons this is not a complete all-clear")
+              || has(root, "reason this is not a complete all-clear"));
+          check("the exact retained and observed counts are stated", () => {
+            root.querySelectorAll("details")[1].open = true;
+            return has(root, "cargo ecosystem artifacts: retained 4 of 36");
+          });
+          check("the capped-coverage note points at a facet, not at 'above'", () =>
+            has(root, "Vulnerabilities facet"));
+          check("a bounded section heading discloses the shortfall", () =>
+            has(section("dead-code").querySelector("h3"), "showing"));
+          check("the dead-code caveat renders above its table", () => {
+            const caveat = [...section("dead-code").querySelectorAll("p")]
+              .find(p => has(p, "floor"));
+            return !!caveat && caveat.getBoundingClientRect().top
+              < section("dead-code").querySelector("table").getBoundingClientRect().top;
+          });
+
+          // ---- Navigation ---------------------------------------------------
+          check("facet chips are controls when their section is present", () => {
+            const chips = root.querySelectorAll('[aria-label="Health summary by area"] button');
+            return chips.length >= 6;
+          });
+          check("every facet chip has readable text", () => {
+            const chips = [...root.querySelectorAll('[aria-label="Health summary by area"] li')];
+            return chips.length > 0 && chips.every(chip => chip.textContent.trim().length > 3);
+          });
+          {
+            // An in-page jump that the viewport follows but keyboard focus
+            // does not is unusable without a mouse: the next Tab resumes from
+            // the top of the page. Both halves are asserted.
+            const chip = [...root.querySelectorAll('[aria-label="Health summary by area"] button')]
+              .find(node => has(node, "Outdated"));
+            const before = scroller().scrollTop;
+            chip.click();
+            await wait(400);
+            check("a facet chip scrolls to its section", () => scroller().scrollTop > before);
+            check("the jump moves keyboard focus to the section", () =>
+              document.activeElement === section("outdated"));
+          }
+
+          // ---- Accessibility -------------------------------------------------
+          check("every table has an accessible name", () => {
+            const tables = [...root.querySelectorAll("table")];
+            return tables.length > 0 && tables.every(table => {
+              const caption = table.querySelector("caption");
+              return caption && caption.textContent.trim().length > 0;
+            });
+          });
+          check("every icon-only control is named", () => {
+            const iconButtons = [...root.querySelectorAll("button")]
+              .filter(node => node.textContent.trim() === "" && node.querySelector("svg"));
+            return iconButtons.every(node => (node.getAttribute("aria-label") || "").length > 0);
+          });
+          check("every section is labelled by a heading that exists", () =>
+            [...root.querySelectorAll("[data-health-section]")].every(node => {
+              const id = node.getAttribute("aria-labelledby");
+              return id && !!root.querySelector(`#${CSS.escape(id)}`);
+            }));
+
+          // ---- GitHub alert states are all distinguishable -------------------
+          githubMode = "clear";
+          button("Check GitHub alerts").click();
+          await until(() => !button("Check GitHub alerts").disabled);
+          await wait(120);
+          check("a checked-and-clear feed says so", () =>
+            has(section("dependabot"), "No open Dependabot alerts"));
+          githubMode = "unavailable";
+          button("Check GitHub alerts").click();
+          await until(() => has(section("dependabot"), "Could not fetch"));
+          check("an unreachable feed names its error", () =>
+            has(section("dependabot"), "gh: command not found"));
+          check("an unreachable feed is not an all-clear", () =>
+            has(root, "not a complete all-clear"));
+          githubMode = "alerts";
+          button("Check GitHub alerts").click();
+          await until(() => !!section("dependabot").querySelector("table"));
+          check("open alerts reach the header badge", () =>
+            has(header(), "Dependabot 1"));
+          check("a truncated alert list is marked as a floor", () =>
+            has(header(), "Dependabot 1+"));
+
+          // ---- Stress: a large report ----------------------------------------
+          await rescan("huge");
+          check("a large report renders every findings table", () =>
+            !!section("vulnerabilities").querySelector("table")
+              && !!section("outdated").querySelector("table"));
+          check("a large report still does not scroll sideways", () =>
+            scroller().scrollWidth <= scroller().clientWidth + 1);
+          check("a large report keeps one right edge", () => {
+            const rights = HEALTH_SECTIONS.map(s => section(s.id)).filter(Boolean)
+              .map(node => Math.round(node.getBoundingClientRect().right));
+            return new Set(rights).size === 1;
+          });
+          check("a capped total is headlined, not the surviving rows", () =>
+            has(section("vulnerabilities").querySelector("h3"), "showing"));
+          check("the header still does not clip under a large report", () =>
+            header().scrollWidth <= header().clientWidth + 1);
+
+          // ---- Stress: hostile strings ---------------------------------------
+          await rescan("hostile");
+          check("an unbreakable identifier does not widen the page", () =>
+            scroller().scrollWidth <= scroller().clientWidth + 1);
+          // The page staying put is not the same as the name being readable:
+          // the table's wrapper clips horizontally, so a 300-character package
+          // name can be silently cut off while the scroller measures fine.
+          // This measures the table against its own clip box.
+          check("a long identifier wraps inside its table instead of being clipped", () => {
+            const wrapper = section("vulnerabilities").querySelector("table").parentElement;
+            return wrapper.scrollWidth <= wrapper.clientWidth + 1;
+          });
+          check("markup in a field is text, not markup", () =>
+            has(root, "<script>alert(1)<\/script>")
+              && !root.querySelector("#app script"));
+          check("hostile content keeps one right edge", () => {
+            const rights = HEALTH_SECTIONS.map(s => section(s.id)).filter(Boolean)
+              .map(node => Math.round(node.getBoundingClientRect().right));
+            return new Set(rights).size === 1;
+          });
+          check("an incomplete walk is reported as incomplete", () =>
+            has(section("dead-code"), "Dead-code analysis is incomplete"));
+
+          // ---- Stress: nothing found, and nothing run -------------------------
+          // The all-clear has to be *reachable*, or `clearClaimable` could be
+          // vacuously false and the honesty invariant would be untested in the
+          // only direction that costs anything. Every facet must be clean for
+          // it, which is the point: the GitHub feeds are cleared too.
+          githubMode = "clear";
+          button("Check GitHub alerts").click();
+          await until(() => !button("Check GitHub alerts").disabled);
+          await rescan("empty");
+          // The exact sentence, with no `||` fallback: "No findings, with
+          // notes" also contains "no findings", so the looser probe would have
+          // passed on a verdict that is not an all-clear at all.
+          check("a genuinely clean scan may claim an all-clear", () =>
+            has(root, "Every scan completed with no findings."));
+          check("and says so without a caveat list", () =>
+            has(root, "Every scanner this repository supports ran to completion.")
+              && !has(root, "not a complete all-clear"));
+          check("empty sections state their emptiness", () =>
+            has(section("issues"), "No repository configuration issues")
+              && has(section("outdated"), "No outdated npm packages"));
+
+          await rescan("unrun");
+          check("an audit that never ran is never shown as clean", () =>
+            has(root, "did not run")
+              && !has(root, "Every scan completed with no findings"));
+          check("a missing code graph is named as missing", () =>
+            has(section("code-graph"), "No code graph for this repository"));
+
+          // ---- Stress: failure and recovery ----------------------------------
+          mode = "failed";
+          button("Scan local").click();
+          await until(() => has(root, "Fixture health scan failed"));
+          check("a failed scan reports the failure", () =>
+            has(root, "Fixture health scan failed"));
+          check("a failed local scan still shows fetched GitHub alerts", () =>
+            !!section("dependabot"));
+          await rescan("findings");
+          check("a rescan recovers from a failed scan", () =>
+            !has(root, "Fixture health scan failed") && !!section("summary"));
+
+          // ---- Stress: rapid repository switching -----------------------------
+          for (let i = 0; i < 6; i++) {
+            await repoStore.openRepo(i % 2 === 0 ? "/fixture/Other" : "/fixture/GitPulse");
+            await tick();
+          }
+          await wait(400);
+          check("rapid repository switching settles on one report", () => !!section("summary"));
+          check("rapid switching leaves no stale error banner", () =>
+            !has(root, "Fixture health scan failed"));
+
+          check("no unhandled runtime errors", () => errors.length === 0);
+          checksButton.textContent = `${results.length}/${results.length} health checks passed`;
+        } catch (error) {
+          const name = stopped(error);
+          checksButton.textContent = `Health checks FAILED: ${name}`;
+          if (!(error instanceof CheckFailed)) console.error(error);
+        } finally {
+          await finish();
+        }
+      };
+      if (new URL(location.href).searchParams.get("check") === "1") checksButton.click();
+    </script>
+  </body>
+</html>
