@@ -5,7 +5,12 @@
  */
 
 import type { DevmapPreviewFileResult, DevmapPreviewReport } from "./types";
-import { boundText, summarizeWalkIncomplete, tooltipWalkIncomplete } from "./walkIncomplete";
+import {
+  boundText,
+  firstClause,
+  summarizeWalkIncomplete,
+  tooltipWalkIncomplete,
+} from "./walkIncomplete";
 
 /** Per-file marker for the diff rail, sourced from the shared preview call. */
 export type PreviewMarkerKind =
@@ -60,6 +65,15 @@ export interface PreviewCommitSummary {
 }
 
 const UNRELIABLE_PARSE = /fallback|unreadable|error|unknown/i;
+
+/**
+ * Longest phrase a sidebar row will render.
+ *
+ * Every string interpolated into a glance comes from the engine and none of
+ * them carry a documented bound, so the bound is applied here rather than
+ * hoped for upstream.
+ */
+const GLANCE_MAX_CHARS = 72;
 
 export function isUnreliableParseStatus(parseStatus: string): boolean {
   return UNRELIABLE_PARSE.test(parseStatus.trim());
@@ -170,12 +184,90 @@ export function markerForHonesty(h: PreviewFileHonesty): PreviewMarker {
       brokenTotal: h.broken_total,
     };
   }
+  // Zero broken callers found is not the same as zero broken callers.
+  //
+  // `unreliable` above asks whether the PARSE could be trusted; it says
+  // nothing about whether the caller search finished. So a file with a clean
+  // parse whose walk stopped early — or whose bodies were never compared —
+  // fell through to "clean" and rendered in the rail as a bare `0` titled "No
+  // broken callers detected". `claim_clean` is the field that already knows
+  // better, and it is the one that decides here.
+  if (!h.claim_clean) {
+    const why = h.walk_incomplete
+      ? `walk incomplete: ${tooltipWalkIncomplete([h.walk_incomplete]) ?? h.walk_incomplete}`
+      : h.broken_truncated
+        ? "the broken-caller list was truncated"
+        : `${h.bodies_not_compared} body/bodies were not compared`;
+    return {
+      kind: "unreliable",
+      label: "!",
+      title: boundText(`Preview incomplete — not "nothing breaks". ${why}`),
+      brokenTotal: h.broken_total,
+    };
+  }
+
   return {
     kind: "clean",
     label: "0",
     title: "No broken callers detected for a reliable parse",
     brokenTotal: 0,
   };
+}
+
+/**
+ * One short phrase saying what this file's preview actually found.
+ *
+ * The commit composer used to render the report struct field by field —
+ * `parse=Unavailable · against=— · indexed=no · delta=no ·
+ * bodies_not_compared=0 · ambiguous_callers=0 · broken=0/0` — six lines of 9px
+ * monospace per file, most of it zeroes. Spending the reader's attention to
+ * say "nothing happened" is what buried the one line that did say something.
+ *
+ * So: name the first real finding and stop. The order is by severity, not by
+ * struct order, and every branch states a fact the fields actually carry —
+ * "unreliable" never degrades into a quiet "clean".
+ */
+export function fileGlance(h: PreviewFileHonesty): string {
+  if (!h.available) {
+    // `firstClause` answers null for a clause too long to sit on a line, and
+    // falling back to the raw reason would put the whole engine string in a
+    // sidebar row — which is the defect this function replaced, re-entering
+    // through the error path.
+    const reason = firstClause(h.reason) ?? boundText(h.reason ?? "", GLANCE_MAX_CHARS);
+    return reason ? `not previewed — ${reason}` : "not previewed";
+  }
+  if (h.degraded_reason) {
+    return (
+      firstClause(h.degraded_reason) ??
+      boundText(h.degraded_reason, GLANCE_MAX_CHARS) ??
+      "preview degraded"
+    );
+  }
+  if (!h.file_is_indexed) return "not in the index — callers unknown";
+  if (isUnreliableParseStatus(h.parse_status)) {
+    // parse_status is engine-supplied and has no documented length bound.
+    return `could not be parsed (${boundText(h.parse_status.trim().toLowerCase(), 24)})`;
+  }
+  if (!h.delta_available) return "no before/after to compare";
+  if (h.broken_total > 0) {
+    const n = h.broken_total.toLocaleString();
+    const caller = h.broken_total === 1 ? "caller" : "callers";
+    return h.broken_truncated
+      ? `at least ${n} ${caller} would break`
+      : `${n} ${caller} would break`;
+  }
+  if (h.walk_incomplete) return "search did not finish — cannot say it is clean";
+  if (h.bodies_not_compared > 0) {
+    const n = h.bodies_not_compared.toLocaleString();
+    return `${n} ${h.bodies_not_compared === 1 ? "body" : "bodies"} not compared`;
+  }
+  if (h.ambiguous_callers > 0) {
+    const n = h.ambiguous_callers.toLocaleString();
+    return `${n} ambiguous ${h.ambiguous_callers === 1 ? "caller" : "callers"}`;
+  }
+  if (h.claim_clean) return "no callers break";
+  // Reliable-looking but not clean-claimable: say so rather than round down.
+  return "incomplete — cannot claim it is safe";
 }
 
 export function summarizePreview(

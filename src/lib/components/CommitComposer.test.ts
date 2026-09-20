@@ -79,4 +79,42 @@ describe("CommitComposer", () => {
     expect(source).toContain("capFanout");
     expect(source).toContain("omittedLayeredImpact");
   });
+
+  it("summarizes each previewed file instead of printing the report struct", () => {
+    // The rail already derived a verdict per file from markerForHonesty; this
+    // panel re-rendered the raw fields beside it, so the two surfaces could
+    // describe the same preview differently. One owner, both callers.
+    expect(source).toContain("markerForHonesty(file)");
+    expect(source).toContain("fileGlance(file)");
+    // The telemetry is kept, but behind a disclosure rather than above the
+    // finding it was meant to support.
+    const summaryRegion = source.slice(0, source.indexOf("Preview details"));
+    expect(summaryRegion).not.toContain("bodies_not_compared=");
+    expect(source).toContain("bodies_not_compared=");
+    expect(source).toContain("<details");
+  });
+
+  it("keeps each commit toggle's label on one line", () => {
+    // "Include unstaged" broke across two lines inside its own label at
+    // sidebar width and took the commit button's row height with it. Each
+    // control refuses to wrap; the ROW wraps when it genuinely cannot fit.
+    const footer = source.slice(source.indexOf("<!-- The two toggles"));
+    expect(footer.length).toBeGreaterThan(0);
+    expect(footer).toContain("flex-wrap");
+    expect((footer.match(/whitespace-nowrap/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("keeps the impact harness's stand-in commit footer in step with this one", () => {
+    // harness/impact.html measures that footer's geometry against a copy.
+    const host = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../../harness/ImpactHost.svelte"),
+      "utf8",
+    );
+    const standIn = host.slice(host.indexOf("data-impact-commit-footer"));
+    expect(standIn).toContain("flex-wrap");
+    expect(standIn).toContain("whitespace-nowrap");
+    for (const label of ["Amend", "Include unstaged"]) {
+      expect(standIn, `stand-in footer is missing ${label}`).toContain(label);
+    }
+  });
 });

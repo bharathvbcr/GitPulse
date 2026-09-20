@@ -364,16 +364,55 @@ describe("DiffViewer store-emission memo guards", () => {
     expect(source).toContain("RungFilterControl");
     expect(source).toContain("bind:minRung");
     expect(source).toContain("getImpactAtRung");
-    expect(source).toContain('title="Change-set blast radius"');
+    // The layered panel names its own scope, because the header chip answers
+    // the same question for the open file alone. A fixed title cannot say how
+    // many files the walk covered, so the label is derived from the rail.
+    expect(source).toContain("Blast radius · all ${rail.entries.length} changed files");
+    expect(source).toContain("· this file");
     expect(source).toContain("{#if impactAvailable}");
     expect(source).toContain("boundText");
     expect(source).toContain("summarizeWalkIncomplete");
     expect(source).toContain("impactEdgesTitle");
-    expect(source).toContain("impactAvailable && impactWalkIncomplete");
+    // Walk-incompleteness still reaches the reader, now inside the chip's own
+    // wording ("at least N callers") rather than as a separate amber word.
+    // Feeding the flag into the count is what keeps that disclosure honest.
+    expect(source).toContain("hedgedCount(impactEdges, Boolean(impactWalkIncomplete)");
   });
 
   it("passes shared preview markers into the file rail", () => {
     expect(source).toContain("previewMarkers={$previewMarkers}");
+  });
+
+  it("lets the identity row wrap rather than run off a narrow pane", () => {
+    // Every chip in that row is shrink-0, so below ~500px their combined
+    // width exceeds the pane and the tail — the stage button, the impact
+    // chip — left the viewport with no scrollbar to reach it. Measured at
+    // 420px in harness/impact.html.
+    const identity = source.slice(
+      source.indexOf("<!-- Identity:"),
+      source.indexOf("<!-- Controls:"),
+    );
+    expect(identity.length).toBeGreaterThan(0);
+    expect(identity).toContain("flex-wrap");
+  });
+
+  it("keeps the impact harness's stand-in header in step with this one", () => {
+    // harness/impact.html measures geometry against a transcribed copy of the
+    // row above. A copy that silently drifts measures a layout this component
+    // no longer has — and reports it as a pass.
+    const host = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../../harness/ImpactHost.svelte"),
+      "utf8",
+    );
+    const standIn = host.slice(host.indexOf("data-impact-header"));
+    expect(standIn).toContain("flex-wrap");
+    expect(standIn).toContain("gap-y-1");
+    // The chips whose widths make the row overflow must all be present, or
+    // the harness is measuring an easier row than the real one.
+    for (const chip of ["+44 −3", "77 lines", "unstaged", "Stage File"]) {
+      expect(standIn, `stand-in header is missing ${chip}`).toContain(chip);
+    }
+    expect(standIn).toContain("RungFilterControl");
   });
 });
 

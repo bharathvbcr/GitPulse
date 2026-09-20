@@ -1,5 +1,6 @@
 import { isGraphTestPath, nodeCommunity, nodeLanguageKey, type CodeGraphModel, type LaidOutNode } from "./graphPayload";
 import type { GraphVizLink, GraphVizNode } from "./types";
+import { nodeFilePath } from "./nodeLabel";
 import type { LanguageIconKey } from "../language/languageLogos";
 
 export type TraceDirection = "outgoing" | "incoming" | "both";
@@ -123,10 +124,8 @@ export function graphNodeOpenPath(node: GraphVizNode): string | null {
   if (node.kind === "subsystem") return null;
   if (node.path?.trim()) return node.path;
   if (node.kind === "file" || node.kind === "doc") return node.id || null;
-  const separator = node.id.indexOf("::");
-  if (separator > 0) {
-    const prefix = node.id.slice(0, separator);
-    if (/[\\/]|\.[a-z0-9]+$/i.test(prefix)) return prefix;
-  }
-  return null;
+  // Same question the blast-radius labels ask of the same ids, so it has one
+  // answer: a second copy of the test would be free to drift from the one
+  // that governs whether a node opens in the editor.
+  return nodeFilePath(node.id);
 }

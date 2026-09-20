@@ -1,5 +1,9 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  // Same treatment the diff pane's blast radius gets: the qualification stays
+  // above the rows where it cannot be missed, but as one folded clause rather
+  // than the kernel's full essay. The verbatim text stays one disclosure away.
+  import { firstClause, summarizeWalkIncomplete } from "../codeintel/walkIncomplete";
   import type {
     FirebaseBackendsReport,
     FirebaseRolloutsReport,
@@ -514,6 +518,33 @@
   });
 </script>
 
+<!--
+  A listing that did not cover everything, said once and said short.
+
+  Kept above the rows rather than in a tooltip — a truncated answer wearing a
+  complete answer's clothes is the thing being prevented, and that was never
+  the problem here. The problem was the *form*: the kernel's full essay is
+  ~60 words of corpus statistics, so the warning that mattered read as a wall
+  of amber and got skipped. The first clause names the cause, and the verbatim
+  text is one disclosure away for whoever needs it.
+-->
+{#snippet qualification(walkIncomplete: string, what: string)}
+  {@const folded = summarizeWalkIncomplete([walkIncomplete]) ?? walkIncomplete}
+  {@const lead = firstClause(walkIncomplete)}
+  <div
+    class="mb-2 max-w-xl rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-400"
+  >
+    <span class="font-medium">{what} is incomplete</span>
+    {#if lead}<span class="opacity-90"> — {lead}</span>{/if}
+    <details class="mt-0.5">
+      <summary class="cursor-pointer text-[10px] opacity-70 hover:opacity-100">
+        What the engine reported
+      </summary>
+      <p class="mt-1 font-mono text-[10px] leading-relaxed opacity-90">{folded}</p>
+    </details>
+  </div>
+{/snippet}
+
 <section data-panel="firebase">
   <div class="flex items-center justify-between gap-3 mb-2">
     <h3 class="text-[11px] uppercase tracking-wider text-textMuted flex items-center gap-1.5">
@@ -679,9 +710,7 @@
         </div>
       {:else if backends}
         {#if backends.walk_incomplete}
-          <div class="mb-2 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 text-[11px] max-w-xl">
-            {backends.walk_incomplete}
-          </div>
+          {@render qualification(backends.walk_incomplete, "Backend listing")}
         {/if}
         {#if backends.backends.length === 0}
           <div class="mb-2 text-[11px] text-textMuted">
@@ -722,11 +751,7 @@
         </div>
 
         {#if rollouts.walk_incomplete}
-          <!-- Above the rows, not in a tooltip: a truncated answer wearing a
-               complete answer's clothes is the thing being prevented. -->
-          <div class="mb-2 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 text-[11px] max-w-xl">
-            {rollouts.walk_incomplete}
-          </div>
+          {@render qualification(rollouts.walk_incomplete, "Rollout listing")}
         {/if}
 
         {#if live}
