@@ -1,3 +1,5 @@
+import type { HealthTone } from "./summary";
+
 export type AuditSeverity = "critical" | "high" | "moderate" | "low" | "info";
 
 export function normalizeSeverity(severity: string): AuditSeverity {
@@ -182,4 +184,69 @@ export function dependabotBadgeClass(alerts: { severity: string }[]): string {
   if (tiers.has("critical") || tiers.has("high")) return "text-rose-300";
   if (tiers.has("moderate")) return "text-amber-300";
   return "text-sky-300";
+}
+
+/**
+ * Tone colours for the Health verdict, beside the severity colours they sit
+ * next to, so one module owns what this view's states look like.
+ *
+ * The `HealthTone` import is type-only: `summary.ts` reads `normalizeSeverity`
+ * and `formatAuditCounts` from here, so a value import back would be a cycle.
+ *
+ * `unknown` is amber and dashed, not grey. Grey reads as "nothing here",
+ * which is the exact misreading the honesty invariant exists to prevent: a
+ * check that could not run has to look different from one that ran and found
+ * nothing, and muted grey is already what "found nothing" looks like.
+ */
+export function toneChipClass(tone: HealthTone): string {
+  switch (tone) {
+    case "critical":
+      return "text-rose-200 bg-rose-500/15 border-rose-500/40";
+    case "warn":
+      return "text-amber-200 bg-amber-500/15 border-amber-500/40";
+    case "unknown":
+      return "text-amber-200 bg-amber-500/10 border-amber-500/30 border-dashed";
+    case "note":
+      return "text-sky-200 bg-sky-500/10 border-sky-500/30";
+    default:
+      return "text-emerald-200 bg-emerald-500/10 border-emerald-500/30";
+  }
+}
+
+/** Card surface for the verdict, in the same tiers as `toneChipClass`. */
+export function toneCardClass(tone: HealthTone): string {
+  switch (tone) {
+    case "critical":
+      return "border-rose-500/40 bg-rose-500/10";
+    case "warn":
+      return "border-amber-500/40 bg-amber-500/10";
+    case "unknown":
+      return "border-amber-500/30 bg-amber-500/5";
+    case "note":
+      return "border-sky-500/30 bg-sky-500/5";
+    default:
+      return "border-emerald-500/30 bg-emerald-500/5";
+  }
+}
+
+/**
+ * One phrase for a tone, for the accessible name of a colour-coded chip.
+ *
+ * Without it the chips carry their state in colour alone. "Not established"
+ * rather than "unknown": the latter reads as a value that happens to be
+ * unknown, not as a check whose result nobody has.
+ */
+export function toneLabel(tone: HealthTone): string {
+  switch (tone) {
+    case "critical":
+      return "action needed";
+    case "warn":
+      return "review";
+    case "unknown":
+      return "not established";
+    case "note":
+      return "note";
+    default:
+      return "clear";
+  }
 }

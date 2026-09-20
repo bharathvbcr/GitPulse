@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import HealthPanel, { dependabotFreshness } from "./HealthPanel.svelte";
+import { HEALTH_SECTIONS } from "../health/sections";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "HealthPanel.svelte"),
@@ -104,9 +105,30 @@ describe("HealthPanel rendering", () => {
     expect(body).toContain("Open a repository to scan dependency health");
   });
 
-  it("feeds scanners_ran into formatAuditCounts so an unrun audit never renders as clean", () => {
+  /**
+   * The "an unrun audit never renders as clean" contract used to be a string
+   * match on this file's `formatAuditCounts(report.audit, { complete, ran })`
+   * call. The verdict has one owner now, so the guard lives where the decision
+   * does: `summary.test.ts` asserts the *behaviour* — an unrun audit is tone
+   * `unknown` with the value "did not run", a partial one is marked a floor —
+   * over every way a facet can be left unestablished, which the string match
+   * could not check at all.
+   *
+   * What remains here is that this panel reads that owner and nothing else.
+   */
+  it("derives its verdict from the shared summary rather than its own arithmetic", () => {
+    expect(source).toContain('from "../health/summary"');
+    expect(source).toContain("summarizeHealth({");
+    expect(source).toContain("report: current,");
+    expect(source).toContain("dependabot,");
+    expect(source).toContain("codeScanning,");
+    expect(source).toContain("codegraph,");
+    // Still fed the two honesty inputs, now through the summary rather than a
+    // second local formatter.
     expect(source).toContain("report?.audit_complete === true");
-    expect(source).toContain("formatAuditCounts(report.audit, { complete: auditComplete, ran: auditsRan })");
+    expect(source).toContain("(report?.scanners_ran ?? []).length > 0");
+    // The panel must not re-derive the counts sentence beside the owner.
+    expect(source).not.toContain("formatAuditCounts(");
   });
 
   it("includes Dependabot in the copied report and shows every alert severity in the header", () => {
@@ -163,43 +185,49 @@ describe("HealthPanel rendering", () => {
     expect(source).toContain("autoScanGithubAlerts");
   });
 
-  it("shows an IPC failure instead of misdiagnosing it as a missing GitHub CLI", () => {
-    const section = source.slice(
-      source.indexOf("{#snippet dependabotSection()}"),
-      source.indexOf("{/snippet}"),
-    );
-    const errorBranch = section.indexOf("{#if dependabot.error}");
-    const missingCliBranch = section.indexOf("{:else if !dependabot.cli_present}");
-    expect(errorBranch).toBeGreaterThan(-1);
-    expect(missingCliBranch).toBeGreaterThan(-1);
-    expect(errorBranch).toBeLessThan(
-      missingCliBranch,
-    );
-    const renderedError = section.slice(errorBranch, missingCliBranch);
-    expect(renderedError).toContain("!dependabotRequestFailed");
+  /**
+   * Both alert sections were eighty-line hand-written copies of one five-state
+   * machine, and the branch-order contract was asserted twice — once per copy.
+   * They had already been fixed in lockstep twice. There is one implementation
+   * now (`health/GithubAlertsSection.svelte`), whose own test owns the branch
+   * order; what this file has to guarantee is that both call sites reach it
+   * and hand it the right `requestFailed`, which is the field that tells a
+   * failed request apart from a missing CLI.
+   */
+  it("routes both alert sections through the one shared state machine", () => {
+    expect(source).toContain('import GithubAlertsSection from "./health/GithubAlertsSection.svelte"');
+    expect(source).toContain('id="dependabot"');
+    expect(source).toContain('id="code-scanning"');
+    expect(source).toContain("requestFailed={dependabotRequestFailed}");
+    expect(source).toContain("requestFailed={codeScanningRequestFailed}");
+    // The copies must be gone, not merely unused.
+    expect(source).not.toContain("{#snippet dependabotSection()}");
+    expect(source).not.toContain("{#snippet codeScanningSection()}");
     expect(source).toContain("dependabotRequestFailed = snapshot.dependabotRequestFailed;");
     expect(source).toContain("dependabotRequestFailed = false;");
     expect(source).toContain("codeScanningRequestFailed = snapshot.codeScanningRequestFailed;");
   });
 
-  it("shows an IPC failure for code scanning instead of misdiagnosing it as a missing GitHub CLI", () => {
-    const section = source.slice(
-      source.indexOf("{#snippet codeScanningSection()}"),
-      source.indexOf("{/snippet}", source.indexOf("{#snippet codeScanningSection()}")),
+  it("labels outdated results as npm-only, through the catalog heading", () => {
+    // The heading text moved to the section catalog so the jump chip and the
+    // heading cannot disagree; the npm-only qualifier travels with it.
+    expect(HEALTH_SECTIONS.find((s) => s.id === "outdated")?.heading).toBe(
+      "Outdated npm packages",
     );
-    const errorBranch = section.indexOf("{#if codeScanning.error}");
-    const missingCliBranch = section.indexOf("{:else if !codeScanning.cli_present}");
-    expect(errorBranch).toBeGreaterThan(-1);
-    expect(missingCliBranch).toBeGreaterThan(-1);
-    expect(errorBranch).toBeLessThan(missingCliBranch);
-    const renderedError = section.slice(errorBranch, missingCliBranch);
-    expect(renderedError).toContain("!codeScanningRequestFailed");
+    expect(source).toContain('<HealthSection id="outdated" count={outdatedCount}');
+    expect(source).toContain("observedTotal(report, \"outdated npm packages\"");
   });
 
-  it("labels outdated results as npm-only and renders exact cap notices", () => {
-    expect(source).toContain("Outdated npm packages ({outdatedTotal})");
-    expect(source).toContain("report.limit_notices");
-    expect(source).toContain("retained {notice.kept} of {notice.total}");
+  /**
+   * The exact retained/observed numbers are still rendered, by the summary's
+   * caveat list rather than by a block in this file. `summary.test.ts` asserts
+   * the wording against real notices ("cargo ecosystem artifacts: retained 24
+   * of 36"), which is a stronger check than the template string match this
+   * replaces: that one could not tell whether the numbers were right.
+   */
+  it("hands limit notices to the summary rather than re-rendering them", () => {
+    expect(source).not.toContain("report.limit_notices");
+    expect(source).toContain("summarizeHealth({");
   });
 });
 
@@ -258,8 +286,17 @@ describe("HealthPanel flicker contracts", () => {
     const freshness = dependabotFreshness(checkedAt);
     expect(freshness.iso).toBe("2026-09-03T12:34:56.000Z");
     expect(freshness.label.length).toBeGreaterThan(0);
-    expect(source).toContain("This result may be cached");
+    expect(source).toContain("may be cached");
     expect(source).toContain("dependabotFreshness(dependabotCheckedAt)");
+    // The machine timestamp is what a reader can act on across timezones, and
+    // it is now on the always-visible summary line of the disclosure rather
+    // than inside four lines of prose about GitHub CLI permissions.
+    expect(source).toContain("<time datetime={displayedGithubFreshness.iso}>");
+    const disclosure = source.slice(source.indexOf("<details"), source.indexOf("</summary>"));
+    expect(disclosure, "freshness must stay visible when the note is collapsed").toContain(
+      "displayedGithubFreshness",
+    );
+    expect(disclosure).toContain('role="status"');
   });
 
   it("never shows the previous repository's health data while an uncached repo scans", () => {
@@ -334,14 +371,33 @@ describe("HealthPanel error-state separation (regression)", () => {
     expect(source).toContain("not stored — not that it is zero");
   });
 
-  it("discloses capped section counts instead of showing only what survived", () => {
+  /**
+   * This used to anchor on `">\n            Issues ("` — twelve literal
+   * spaces of indentation — and on a slice running to the first `gp-segmented`
+   * in the file. Both encoded where the markup happened to sit rather than
+   * what it had to say, so reindenting the template or adding a segmented
+   * control anywhere above broke a guard about counting.
+   *
+   * Counts are `SectionCount` objects now, rendered by one formatter that has
+   * no branch printing a survivor count alone (`counts.test.ts` proves that
+   * over its whole input space). So the guard here is the structural one: the
+   * panel hands sections a count object, never a sentence it built itself.
+   */
+  it("hands every counted section a count object rather than a built string", () => {
     expect(source).toContain("observedTotal(");
-    // Both bounded sections must headline the observed total, not just the
-    // rows that survived the cap.
-    const issuesHeading = source.slice(source.indexOf(">\n            Issues ("));
-    expect(issuesHeading.slice(0, 200)).toContain("issuesTotal");
-    const vulnHeading = source.slice(source.indexOf("Vulnerabilities ("));
-    expect(vulnHeading.slice(0, 300)).toContain("vulnerabilitiesTotal");
+    const counts = [...source.matchAll(/count=\{([^}]*)\}/g)].map((m) => m[1].trim());
+    expect(counts.length, "no counted sections found").toBeGreaterThan(3);
+    for (const expression of counts) {
+      expect(
+        expression,
+        `a section builds its own count text: ${expression}`,
+      ).not.toMatch(/["'`]/);
+    }
+    // Each count binding is built from an observed total, not a row count.
+    expect(source).toContain("total: issuesTotal,");
+    expect(source).toContain("total: outdatedTotal,");
+    expect(source).toContain("total: vulnerabilitiesTotal }");
+    expect(source).toContain("total: deadSymbolsTotal,");
   });
 
   /**
@@ -353,8 +409,15 @@ describe("HealthPanel error-state separation (regression)", () => {
    */
   it("does not print the direct-vulnerability count as a total when the scan was capped", () => {
     expect(source).toContain("vulnerabilitiesCapped");
-    const vulnHeading = source.slice(source.indexOf("Vulnerabilities ("), source.indexOf("gp-segmented"));
-    expect(vulnHeading).toContain('vulnerabilitiesCapped ? "at least " : ""');
+    const count = source.slice(
+      source.indexOf("let vulnerabilityCount"),
+      source.indexOf("let issuesCount"),
+    );
+    expect(count).toContain('filter === "direct"');
+    expect(count).toContain("atLeast: vulnerabilitiesCapped,");
+    expect(count).toContain('qualifier: "direct",');
+    // The "at least" wording itself is the formatter's, and is asserted there.
+    expect(count).not.toContain("at least");
   });
 
   /**
@@ -363,16 +426,45 @@ describe("HealthPanel error-state separation (regression)", () => {
    * "looked, nothing open". A clean local audit next to that blank read as an
    * all-clear for a repository whose alerts had never been fetched.
    */
-  it("distinguishes an unchecked Dependabot from a checked-and-clear one", () => {
-    expect(source).toContain("Dependabot not checked");
-    expect(source).toContain("Dependabot 0 open");
-    expect(source).toContain("Dependabot unavailable");
+  /**
+   * The four GitHub states must stay distinguishable. They used to be four
+   * literal strings in this header, crammed into a flex row of five
+   * `truncate` spans that rendered as "· Dependabot 0 … · Code scanning
+   * unav…" — distinguishable in the source and not on the screen.
+   *
+   * They are facets of the shared summary now. `summary.test.ts` asserts all
+   * four for both feeds, including that no two share a value *or* a tone —
+   * which the string matches never checked. What this file owns is that the
+   * header stopped competing with them: only open alerts, the one state worth
+   * header room, keep a badge here, and that badge does not clip.
+   */
+  it("keeps only open alert counts in the header, and does not truncate them", () => {
+    const header = source.slice(
+      source.indexOf('<div class="px-4 py-2 border-b'),
+      source.indexOf('<div class="flex-1 overflow-auto'),
+    );
+    expect(header).toContain("{#if openDependabotCount > 0}");
+    expect(header).toContain("{#if openCodeScanningCount > 0}");
+    // The states that are not findings moved to the summary card, which wraps.
+    expect(header).not.toContain("not checked");
+    expect(header).not.toContain("unavailable");
+    expect(header).not.toContain("0 open");
+    // Nothing in the header's status row clips its own text any more.
+    expect(header).not.toContain("truncate text-textMuted");
+    expect(header).not.toContain("truncate text-amber-300");
   });
 
-  it("distinguishes an unchecked code scanning result from a checked-and-clear one", () => {
-    expect(source).toContain("Code scanning not checked");
-    expect(source).toContain("Code scanning 0 open");
-    expect(source).toContain("Code scanning unavailable");
+  it("renders the verdict from the summary owner in the header", () => {
+    const header = source.slice(
+      source.indexOf('<div class="px-4 py-2 border-b'),
+      source.indexOf('<div class="flex-1 overflow-auto'),
+    );
+    expect(header).toContain("toneChipClass(summary.tone)");
+    expect(header).toContain("{toneLabel(summary.tone)}");
+    // The full sentence stays reachable without spending header width on a
+    // string the summary card repeats verbatim a few rows below.
+    expect(header).toContain("title={summary.headline}");
+    expect(header).not.toContain(">{summary.headline}<");
   });
 
   /**
@@ -384,8 +476,12 @@ describe("HealthPanel error-state separation (regression)", () => {
   it("keeps the dead-symbol total and truncation flag rather than counting rows", () => {
     expect(source).toContain("deadSymbolsTotal");
     expect(source).toContain("deadSymbolsTruncated");
-    const heading = source.slice(source.indexOf("Dead-code candidates ("));
-    expect(heading.slice(0, 260)).toContain("deadSymbolsTotal");
+    const count = source.slice(
+      source.indexOf("let deadCodeCount"),
+      source.indexOf("let dependabotCount"),
+    );
+    expect(count).toContain("total: deadSymbolsTotal,");
+    expect(count).toContain("atLeast: deadSymbolsTruncated,");
     // An empty result from a truncated query is not an all-clear.
     expect(source).toContain("this is not an all-clear");
   });
@@ -393,9 +489,16 @@ describe("HealthPanel error-state separation (regression)", () => {
   it("carries incomplete call evidence through both the panel and copied report", () => {
     expect(source).toContain("dead.value.walk_incomplete");
     expect(source).toContain("walk_incomplete: deadSymbolsIncomplete");
-    expect(source).toContain("Dead-code analysis is incomplete: {deadSymbolsIncomplete}");
+    expect(source).toContain("Dead-code analysis is incomplete: ${deadSymbolsIncomplete}");
     expect(source).toContain("deadSymbols.length === 0 && !deadSymbolsIncomplete");
     expect(source).toContain("{formatDeadCodeStatus(sym)}");
+    // The reason a table is unreliable now renders above it, not after it: a
+    // reader who jumps to the section met the rows first and the caveat second.
+    expect(source).toContain("caveat={deadCodeCaveat}");
+    const section = source.slice(source.indexOf('id="dead-code"'));
+    expect(section.indexOf("caveat={deadCodeCaveat}")).toBeLessThan(
+      section.indexOf("<HealthTable"),
+    );
   });
 
   /**
@@ -412,9 +515,15 @@ describe("HealthPanel error-state separation (regression)", () => {
   it("says how many ecosystem artifacts it is not showing", () => {
     expect(source).toContain("ecosystemArtifactTotal");
     expect(source).toContain("ecosystem artifacts`");
-    expect(source).toContain("more`");
+    expect(source).toContain("+{seen - shown.length} more");
     // The bare slice with no disclosure must be gone.
     expect(source).not.toContain('{eco.manifests.slice(0, 4).join(", ")}');
+    // And the paths are a list, not a comma-joined run inside a paragraph:
+    // four Rust crates used to render as three wrapped lines of file paths
+    // with no structure to scan.
+    expect(source).not.toContain('{shown.join(", ")}');
+    expect(source).toContain("<dl");
+    expect(source).toContain("<dt");
   });
 
   /**
@@ -431,21 +540,40 @@ describe("HealthPanel error-state separation (regression)", () => {
    * that fitted the token budget, and the direct-vulnerability filter counted
    * the rows that survived the scan cap.
    */
-  it("never headlines a bounded section with a bare row count", () => {
-    const headings = [...source.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/g)].map((m) => m[1]);
-    expect(headings.length, "no headings parsed — the scan is broken").toBeGreaterThan(3);
-    const counted = headings.filter((heading) => heading.includes("{"));
-    expect(counted.length, "no counted headings parsed").toBeGreaterThan(2);
-    for (const heading of counted) {
-      if (!/\.length/.test(heading)) continue;
-      const disclosesTotal = /Total\b/.test(heading);
-      const disclosesCap = /truncated|at least|showing/.test(heading);
-      expect(
-        disclosesTotal || disclosesCap,
-        `a heading prints a bare row count with no observed total and no cap ` +
-          `disclosure, so a bounded result reads as complete: ${heading.trim()}`,
-      ).toBe(true);
-    }
+  /**
+   * The same class, now guarded structurally: the panel writes no `<h3>` of
+   * its own at all, so there is no heading it can hand-build a count into.
+   * Every section's heading comes from `HealthSection`, which renders counts
+   * only through `formatSectionCount`.
+   *
+   * This is what the regex over heading text was reaching for and could not
+   * get: it checked that a sentence mentioned a total, not that the number in
+   * it was the observed one.
+   */
+  it("owns no headings of its own, so it cannot hand-build a count into one", () => {
+    expect(source).not.toMatch(/<h3\b/);
+    const sections = [...source.matchAll(/<HealthSection\b/g)];
+    expect(sections.length, "sections are no longer rendered by the shared shell")
+      .toBeGreaterThan(5);
+  });
+
+  it("renders its sections in the catalog's order", () => {
+    // The rendered order and the summary card's jump order are one decision.
+    // They were two, which is how the page came to open with an inventory of
+    // package manifests above the repository's high-severity vulnerability.
+    const rendered = [...source.matchAll(/<HealthSection[\s\S]{0,80}?id="([a-z-]+)"/g)]
+      .map((m) => m[1])
+      .concat([]);
+    const fromGithub = source.indexOf("{#snippet githubSections()}");
+    expect(fromGithub).toBeGreaterThan(-1);
+    const catalogOrder = HEALTH_SECTIONS.map((s) => s.id);
+    const seen = rendered.filter((id, index) => rendered.indexOf(id) === index);
+    const positions = seen.map((id) => catalogOrder.indexOf(id));
+    expect(positions.every((p) => p >= 0), `rendered ${seen.join(",")}`).toBe(true);
+    expect(
+      [...positions].sort((a, b) => a - b),
+      "sections render out of catalog order",
+    ).toEqual(positions);
   });
 
   it("names failed scanners, not only missing ones, when coverage is short", () => {

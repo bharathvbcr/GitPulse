@@ -23,6 +23,8 @@ import {
   observedTotal,
   skippedAudits,
 } from "./report";
+import { formatSectionCount, isBounded } from "./counts";
+import { summarizeHealth } from "./summary";
 import type {
   CodeScanningReport,
   DeadCodeReport,
@@ -437,5 +439,239 @@ describe("coverage gaps stay total on hostile issue lists", () => {
       50,
       "failedAudits over a saturated issue list",
     );
+  }, STRESS_TIMEOUT_MS);
+});
+
+/**
+ * The verdict and the counts are the two things a reader acts on before
+ * reading anything else, so they get the same adversarial treatment as the
+ * renderers above: hostile strings in every text-bearing field, out-of-contract
+ * numbers, and saturation.
+ */
+describe("the verdict stays total and stays honest", () => {
+  const graph = { available: true, db_path: "/x", total_files: 1, total_symbols: 1, total_edges: 1 };
+  const liveDeadCode = {
+    available: true,
+    reason: null,
+    total: 0,
+    shown: 0,
+    truncated: false,
+    walkIncomplete: null,
+  };
+
+  it("never throws on hostile strings in any text-bearing field", () => {
+    for (const hostile of HOSTILE_STRINGS) {
+      const input = {
+        report: bareReport({
+          scanners_ran: [hostile],
+          audit_complete: false,
+          issues: [{ severity: hostile, code: hostile, message: hostile, path: hostile }],
+          ecosystems: [{ family: hostile, manifests: [hostile], note: hostile }],
+          outdated: [{ name: hostile, current: hostile, wanted: hostile, latest: hostile, dep_type: hostile, location: hostile }],
+          truncated: true,
+          limit_notices: [{ resource: hostile, kept: 1, total: 2 }],
+        }),
+        dependabot: {
+          available: true, cli_present: true, is_github_remote: true, slug: hostile,
+          alerts: [{ severity: hostile } as never], truncated: true, error: hostile,
+        } as unknown as DependabotReport,
+        codeScanning: {
+          available: false, cli_present: false, is_github_remote: true, slug: hostile,
+          alerts: [], truncated: false, error: hostile,
+        } as unknown as CodeScanningReport,
+        codegraph: { ...graph, reason: hostile },
+        deadCode: { ...liveDeadCode, reason: hostile, walkIncomplete: hostile },
+      };
+      const summary = summarizeHealth(input);
+      expect(typeof summary.headline).toBe("string");
+      expect(summary.headline.length).toBeGreaterThan(0);
+      expect(summary.facets).toHaveLength(6);
+      for (const caveat of summary.caveats) expect(typeof caveat).toBe("string");
+      // An error *is* the error branch, so the feed can never read as clear.
+      expect(summary.clearClaimable).toBe(false);
+    }
+  }, STRESS_TIMEOUT_MS);
+
+  it("is pure: the same scan always yields the same verdict", () => {
+    const input = {
+      report: bareReport({ scanners_ran: ["npm"], audit_complete: true, npm_cli_present: true }),
+      dependabot: null,
+      codeScanning: null,
+      codegraph: graph,
+      deadCode: liveDeadCode,
+    };
+    expect(summarizeHealth(input)).toEqual(summarizeHealth(input));
+  });
+
+  /**
+   * The invariant stated as a fuzz rather than as a case list: across every
+   * combination of the states each input can be in, `clearClaimable` is true
+   * exactly when no facet is anything but clear. A future facet that forgets
+   * to be counted fails here.
+   */
+  it("claims clear exactly when no facet is unclear, across every combination", () => {
+    const reports = [
+      bareReport({ scanners_ran: ["npm"], audit_complete: true, npm_cli_present: true }),
+      bareReport({ scanners_ran: [], audit_complete: false, npm_cli_present: true }),
+      bareReport({ scanners_ran: ["npm"], audit_complete: false, npm_cli_present: true }),
+      bareReport({ scanners_ran: ["npm"], audit_complete: true, npm_cli_present: false }),
+      bareReport({
+        scanners_ran: ["npm"], audit_complete: true, npm_cli_present: true,
+        audit: { info: 0, low: 0, moderate: 0, high: 2, critical: 0, total: 2 },
+      }),
+      bareReport({
+        scanners_ran: ["npm"], audit_complete: true, npm_cli_present: true,
+        issues: [{ severity: "error", code: "x", message: "y", path: null }],
+      }),
+    ];
+    const feeds = [
+      null,
+      { available: true, cli_present: true, is_github_remote: true, slug: "o/r", alerts: [], truncated: false, error: null },
+      { available: false, cli_present: false, is_github_remote: true, slug: "o/r", alerts: [], truncated: false, error: "no gh" },
+      { available: true, cli_present: true, is_github_remote: true, slug: "o/r", alerts: [{ severity: "low" }], truncated: false, error: null },
+    ];
+    const graphs = [graph, null, { available: false, db_path: "", reason: "none" }];
+    const deads = [
+      liveDeadCode,
+      { ...liveDeadCode, available: false, reason: "budget" },
+      { ...liveDeadCode, truncated: true },
+      { ...liveDeadCode, walkIncomplete: "unresolved sites" },
+      { ...liveDeadCode, total: 3, shown: 3 },
+    ];
+
+    let sawClear = false;
+    let sawUnclear = false;
+    for (const report of reports) {
+      for (const dependabot of feeds) {
+        for (const codeScanning of feeds) {
+          for (const codegraph of graphs) {
+            for (const deadCode of deads) {
+              const summary = summarizeHealth({
+                report,
+                dependabot: dependabot as unknown as DependabotReport | null,
+                codeScanning: codeScanning as unknown as CodeScanningReport | null,
+                codegraph,
+                deadCode,
+              });
+              const everyFacetClear = summary.facets.every((f) => f.tone === "clear");
+              expect(
+                summary.clearClaimable,
+                `clearClaimable disagreed with the facets: ${JSON.stringify(
+                  summary.facets.map((f) => [f.id, f.tone]),
+                )}`,
+              ).toBe(everyFacetClear);
+              // And a verdict that is not an all-clear always says why.
+              if (!summary.clearClaimable) {
+                expect(summary.caveats.length).toBeGreaterThan(0);
+              }
+              if (summary.clearClaimable) sawClear = true;
+              else sawUnclear = true;
+            }
+          }
+        }
+      }
+    }
+    // Both outcomes have to be reachable, or the assertion above is vacuous.
+    expect(sawClear, "no input produced an all-clear").toBe(true);
+    expect(sawUnclear, "no input was refused an all-clear").toBe(true);
+  }, STRESS_TIMEOUT_MS);
+
+  it("stays total on out-of-contract counts rather than sanitising them away", () => {
+    for (const total of [Number.NaN, Number.POSITIVE_INFINITY, -1, 2 ** 53]) {
+      const summary = summarizeHealth({
+        report: bareReport({
+          scanners_ran: ["npm"],
+          audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total },
+        }),
+        dependabot: null,
+        codeScanning: null,
+        codegraph: graph,
+        deadCode: liveDeadCode,
+      });
+      expect(typeof summary.headline).toBe("string");
+      expect(summary.headline).not.toContain("undefined");
+    }
+  });
+
+  it("scales to a saturated scan without pathological slowdown", () => {
+    const alerts = Array.from({ length: 20_000 }, (_, i) => ({
+      severity: ["critical", "high", "moderate", "low", "info"][i % 5],
+    }));
+    const report = bareReport({
+      scanners_ran: ["npm"],
+      audit_complete: false,
+      npm_cli_present: true,
+      issues: Array.from({ length: 5_000 }, (_, i) => ({
+        severity: "warning", code: `c${i}`, message: "m".repeat(200), path: null,
+      })),
+      outdated: Array.from({ length: 20_000 }, (_, i) => ({
+        name: `p${i}`, current: "1.0.0", wanted: "2.0.0", latest: "3.0.0", dep_type: "dev", location: "/",
+      })),
+      truncated: true,
+      limit_notices: Array.from({ length: 2_000 }, (_, i) => ({
+        resource: `resource ${i}`, kept: i, total: i * 2,
+      })),
+    });
+    const started = performance.now();
+    const summary = summarizeHealth({
+      report,
+      dependabot: {
+        available: true, cli_present: true, is_github_remote: true, slug: "o/r",
+        alerts, truncated: true, error: null,
+      } as unknown as DependabotReport,
+      codeScanning: null,
+      codegraph: graph,
+      deadCode: { ...liveDeadCode, total: 50_000, shown: 200, truncated: true },
+    });
+    expectWithinBudget(
+      performance.now() - started,
+      60,
+      "summarizeHealth over a saturated scan",
+    );
+    expect(summary.clearClaimable).toBe(false);
+    // Every notice is still stated exactly; none is summarised into a count.
+    expect(summary.caveats.length).toBeGreaterThanOrEqual(2_000);
+  }, STRESS_TIMEOUT_MS);
+});
+
+describe("section counts stay honest on out-of-contract numbers", () => {
+  it("never prints a bare number for a count it cannot verify", () => {
+    for (const total of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const text = formatSectionCount({ shown: 3, total });
+      // Unknown resolves to a floor, never to a smaller complete-looking count.
+      expect(text).toBe("at least 3");
+      expect(isBounded({ shown: 3, total })).toBe(true);
+    }
+  });
+
+  it("never claims fewer items than the rows it is describing", () => {
+    for (const total of [0, -5, Number.NaN, 1]) {
+      const text = formatSectionCount({ shown: 9, total });
+      const printed = [...text.matchAll(/\d+/g)].map((m) => Number(m[0]));
+      for (const value of printed) expect(value).toBeGreaterThanOrEqual(9);
+    }
+  });
+
+  it("stays total on hostile qualifiers", () => {
+    for (const qualifier of HOSTILE_STRINGS) {
+      const text = formatSectionCount({ shown: 2, total: 7, qualifier });
+      expect(typeof text).toBe("string");
+      expect(text).toContain("showing 2");
+      expect(text).toContain("7");
+    }
+  }, STRESS_TIMEOUT_MS);
+
+  it("is fast enough to run per render on a saturated page", () => {
+    const counts = Array.from({ length: 200_000 }, (_, i) => ({
+      shown: i % 97,
+      total: i % 61,
+      atLeast: i % 3 === 0,
+      qualifier: i % 5 === 0 ? "direct" : undefined,
+    }));
+    const started = performance.now();
+    let sink = 0;
+    for (const count of counts) sink += formatSectionCount(count).length;
+    expectWithinBudget(performance.now() - started, 40, "formatSectionCount over 200k counts");
+    expect(sink).toBeGreaterThan(0);
   }, STRESS_TIMEOUT_MS);
 });

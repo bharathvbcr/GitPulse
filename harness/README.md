@@ -13,8 +13,45 @@ line above an assertion came to report `TypeError` and nothing else. `stopped`
 then writes down where the run ended, because the rows after a throw are absent,
 and absent reads exactly like never written.
 
-`harness/onboarding.html` uses it. The other harnesses still carry their own
-local helper; move them across as they are next edited.
+`harness/onboarding.html` and `harness/health.html` use it. The other harnesses
+still carry their own local helper; move them across as they are next edited.
+
+## Dependency health
+
+Run `npm run test:browser -- --harness health` or
+`npm run test:webkit -- --harness health`. For interactive inspection, open
+`/harness/health.html` on the development server.
+
+Health had no browser harness at all until this one, which is why a
+three-hundred-character package name could widen the whole pane unnoticed: every
+other test in the repository is source text or `render()` from `svelte/server`,
+and neither measures a box.
+
+`#app` is a fixed 1280×820 stage with `overflow:hidden`, so a width probe is
+measuring the component and not the window. The page drives `HealthPanel`
+through six scan fixtures — findings, nothing-found, nothing-*ran*, a saturated
+report, hostile strings, and a failed scan — crossed with the four GitHub alert
+states, and asserts:
+
+- **Information architecture.** The verdict is the first thing in the scroll and
+  is above the fold; findings render before inventory; every catalog section is
+  present and in `HEALTH_SECTIONS` order.
+- **Geometry.** The header does not clip its own contents, every section shares
+  one right edge, and nothing scrolls sideways — under the saturated and hostile
+  fixtures too. A long identifier is measured against its table's own clip box,
+  not just against the scroller: the table wrapper is `overflow-hidden`, so a
+  clipped name looks fine from outside and is unreadable inside.
+- **Honesty.** An unfetched feed, an unreachable one and a clear one all read
+  differently; a capped scan states its exact retained/observed counts; the
+  all-clear is reachable but only when every facet is established.
+- **Accessibility.** Every table has a caption, every icon-only control has a
+  name, every section is labelled by a heading that exists, and a summary chip's
+  jump moves keyboard focus as well as the viewport.
+
+Text probes go through `has()`, which collapses whitespace on both sides:
+`textContent` keeps the newlines Svelte emits between markup lines, so a probe
+for a phrase the template happens to wrap reads as absent while it is plainly on
+screen.
 
 ## Uncommitted previews
 
