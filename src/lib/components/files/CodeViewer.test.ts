@@ -104,4 +104,30 @@ describe("CodeViewer", () => {
     expect(source).toContain('aria-multiline="true"');
     expect(source).toContain("aria-readonly=");
   });
+
+  describe("reveal requests", () => {
+    const effect = source.slice(source.indexOf("const target = consumeReveal(path)") - 400);
+
+    it("waits for rows before acting on a reveal", () => {
+      // The request is recorded before the file is read. Scrolling a viewer
+      // with no rows lands at zero and looks like the reveal never happened.
+      expect(effect).toContain("const lineCount = rawLines.length");
+      expect(effect).toContain("if (!path || lineCount === 0) return;");
+    });
+
+    it("asks only for a reveal naming this viewer's own file", () => {
+      // A request for another file must stay in the slot, not be eaten here.
+      expect(effect).toContain("consumeReveal(path)");
+    });
+
+    it("clamps a line past the end of the file rather than refusing it", () => {
+      expect(effect).toContain("Math.min(target.line, lineCount)");
+    });
+
+    it("does not make the reveal depend on what scrolling reads", () => {
+      // `scrollToLine` reads the zoom level; tracking it would re-run this
+      // effect on every zoom change, long after the request was collected.
+      expect(effect).toContain("untrack(() => {");
+    });
+  });
 });

@@ -108,8 +108,11 @@ elsewhere on disk, or one that climbs out with `..`, is not a link either.
 Terminal output is untrusted text, so a span GitPulse will not open is never
 decorated as though it would.
 
-`path:line:column` is parsed and shown on hover. The file opens at the top;
-jumping to the line is not wired yet — use **Go to line** in the code viewer.
+`path:line:column` opens the file in the code viewer and lands on that line,
+with the line selected. A reference naming a line past the end of the file
+opens near the end rather than refusing. The request is dropped if nothing
+collects it within 30 seconds, so it cannot fire later when the same file is
+opened for an unrelated reason.
 
 Hyperlinks a program embeds itself (OSC 8) obey the same allowlist, checked
 against the escape sequence's target rather than its display text.

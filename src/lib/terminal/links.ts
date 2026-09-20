@@ -123,6 +123,14 @@ function isTokenChar(ch: string): boolean {
  */
 const URL_TERMINATORS = new Set(['"', "'", "`", "<", ">", "|", "\\"]);
 
+/**
+ * `devmap clones` reports this and `isTokenChar` as one structural group, and
+ * they are deliberately not merged. They are the same *shape* asking different
+ * questions — where a path ends, and where a URL ends — and collapsing them
+ * behind a which-set parameter would produce exactly the helper whose argument
+ * means "actually do the other thing". The single shared implementation is
+ * what truncated `https://x/a?b=1` to `https://x/a` before these were split.
+ */
 function isUrlChar(ch: string): boolean {
   return !isBlankOrControl(ch.charCodeAt(0)) && !URL_TERMINATORS.has(ch);
 }

@@ -248,6 +248,14 @@ describe("TerminalSession linkification", () => {
     expect(source).toContain("activePath !== repoPath");
   });
 
+  it("records the reveal before the selection that triggers the viewer", () => {
+    // The viewer reads the request as it mounts, so recording it afterwards
+    // is a race the click loses on a fast file read.
+    const body = source.slice(source.indexOf("async function activateLink"));
+    expect(body.indexOf("requestReveal(action.path, action.line, action.column)"))
+      .toBeLessThan(body.indexOf("repoStore.selectFilePath(action.path)"));
+  });
+
   it("maps buffer columns from cell widths rather than string offsets", () => {
     // A double-width glyph is one string index and two cells; reading the
     // offset as the column drags every later link range to the left.

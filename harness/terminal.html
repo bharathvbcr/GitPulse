@@ -31,7 +31,7 @@
       /** One line carrying every span class the linkifier must judge: an
        * openable URL with a query, a repository file with line and column, a
        * refused scheme, and a path that climbs out of the repository. */
-      const LINK_LINE = "Links: https://example.com/a?b=1 src/lib/terminal/links.ts:12:5 file:///etc/passwd ../../etc/passwd:1";
+      const LINK_LINE = "Links: https://example.com/a?b=1 src/lib/terminal/links.ts:240:5 file:///etc/passwd ../../etc/passwd:1";
       mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
@@ -167,9 +167,9 @@
             () => footer().includes("Open https://example.com/a?b=1 in your browser"));
           check("a hovered link gets xterm's pointer decoration",
             () => visible(".xterm-screen")[0].classList.contains("xterm-cursor-pointer"));
-          await hover("src/lib/terminal/links.ts:12:5", 3);
+          await hover("src/lib/terminal/links.ts:240:5", 3);
           check("hovering a repository file names the path, line and column",
-            () => footer().includes("Open src/lib/terminal/links.ts (line 12, column 5)"));
+            () => footer().includes("Open src/lib/terminal/links.ts (line 240, column 5)"));
           await hover("file:///etc/passwd", 3);
           check("a refused scheme is not a link at all",
             () => !footer().includes("file:///etc/passwd")
@@ -190,6 +190,22 @@
           await clickLink("file:///etc/passwd", 3);
           await clickLink("../../etc/passwd:1", 3);
           check("a refused span never reaches the opener", () => opened.length === openedBefore + 1);
+
+          // The whole of "follow a file reference": the click selects the
+          // file, the reveal request survives the view swap, and the viewer
+          // lands on the named line. VirtualList renders only the rows around
+          // its scroll position, so line 240 being in the DOM at all is the
+          // proof that the scroll happened — its absence is what a reveal that
+          // silently opened at the top would look like.
+          await clickLink("src/lib/terminal/links.ts:240:5", 3);
+          await wait(400);
+          check("clicking a file reference opens that file", () => !!visible("[data-code-host]").length);
+          check("the viewer lands on the line the reference named",
+            () => visible("[data-code-host]")[0].textContent.includes("line 240 of the fixture file"));
+          check("the viewer reports the revealed line as selected",
+            () => visible("[data-code-host]")[0].textContent.includes("Ln 240"));
+          repoStore.selectFilePath(null); await wait();
+
           check("linkification writes nothing to the shell", () => report.writes === writesBefore);
 
           // ---- Find.

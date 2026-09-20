@@ -38,6 +38,7 @@
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
+  import { consumeReveal } from "../../files/revealRequests";
 
   let {
     filePath,
@@ -357,6 +358,36 @@
         editDraft = source;
       });
     }
+  });
+
+  /**
+   * Lands on a line someone else named — today, a `path:line:col` reference
+   * clicked in the terminal.
+   *
+   * Gated on the line count rather than on the path alone: the request is
+   * recorded before the file is read, so acting on arrival would scroll a
+   * viewer that has no rows yet and land at zero. `rawLines.length` becoming
+   * non-zero is the earliest moment the destination exists.
+   *
+   * `consumeReveal` is keyed on this viewer's own path, so a request meant for
+   * another file is left in place rather than eaten here, and it clears on
+   * collection — which is what keeps this effect from re-firing every time the
+   * draft changes a keystroke at a time.
+   */
+  $effect(() => {
+    const path = filePath;
+    const lineCount = rawLines.length;
+    if (!path || lineCount === 0) return;
+    const target = consumeReveal(path);
+    if (!target) return;
+    // A reference can name a line past the end of the file it was written
+    // about; clamp rather than refuse, so the file still opens near the mark.
+    const line = Math.min(target.line, lineCount);
+    untrack(() => {
+      selectedLine = line;
+      selectedLineEnd = null;
+      scrollToLine(line - 1);
+    });
   });
 
   // Calculate indentation stats

@@ -88,6 +88,7 @@
   import { openExternal } from "../desktop/openExternal";
   import { repoStore } from "../stores/repoStore";
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
+  import { requestReveal } from "../files/revealRequests";
   import {
     clampTerminalFontSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -252,6 +253,10 @@
       warning = "Switch to this terminal's repository to open its files.";
       return;
     }
+    // Recorded before the selection, so the request is already waiting when
+    // the viewer mounts and reads the file. A reference with no line simply
+    // opens the file, which is why an unusable request is not an error here.
+    requestReveal(action.path, action.line, action.column);
     repoStore.selectFilePath(action.path);
     repoStore.setActiveTab("code");
   }
