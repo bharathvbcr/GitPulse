@@ -11,8 +11,54 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.3.0] - 2026-09-19
+
+A consolidation release. It joins live delivery observability — GitHub Actions
+workflow runs and Firebase App Hosting rollouts tied directly to repository
+commits — with four bodies of work that were in flight beside it: code-age
+history in Blame, a terminal dock that belongs to a repository rather than the
+workspace, terminal output whose links are safe to click and land where they
+point, and walkthrough replay moved out of the title bar.
+
 ### Added
 
+- **Live GitHub Actions Run Polling**: Automated, bounded polling for in-flight
+  workflow runs that refreshes only while runs are queued or executing, backing
+  off on failures, pausing while the window is hidden, and announcing newly
+  failed runs via dismissible notices.
+- **Delivery Timelines**: Visual duration and outcome timeline for workflow runs
+  and Firebase App Hosting rollouts, scaled to sample bounds with pass rates,
+  median execution times, and clean handling of queue time vs execution time.
+- **Firebase App Hosting Rollout Monitoring**: On-demand live refresh for
+  authorized project and backend pairs, providing live rollout status alongside
+  commit history.
+- **Action Dispatch & Rerun Controls**: Enhanced GitHub Actions panel with rerun
+  actions, branch filtering, and granular status reporting.
+- **Clickable terminal output.** A URL opens in the OS browser only when its
+  scheme is http or https, verified with a real URL parse at both detection and
+  activation. A file reference opens in the code viewer only when it resolves
+  inside the session's repository, with containment checked on normalised path
+  segments — a string prefix test calls `/repo-evil/x` and `/repo/../etc/passwd`
+  inside `/repo`, and segments do not. A span GitPulse will refuse to open is
+  never decorated as a link: underlining it and then doing nothing teaches
+  people to distrust the underline instead of the output. OSC 8 hyperlinks obey
+  the same allowlist, judged on the escape sequence's target rather than its
+  display text.
+- **A file reference lands on the line it names**, with the line selected; one
+  naming a line past the end of the file opens near the end rather than
+  refusing. The line travels as a one-shot request with an explicit consume, not
+  on the repository session: "scroll to line 12" is a navigation intent that must
+  not survive a restart or replay when the file is reopened for another reason.
+- **Screen reader support in the terminal.** The terminal had no accessible
+  text at all — `screenReaderMode` appeared nowhere — so a preference now builds
+  xterm's row tree and applies to running sessions. The Console command field had
+  no accessible name either; a placeholder is a hint, not a name.
+- **The terminal harness is CI-gated.** `npm run test:browser -- --harness
+  terminal` (and `--webkit`) runs in the automated sweep instead of waiting for
+  someone to press a button, with 75 real-DOM checks over the production
+  components and a simulated PTY transport.
 - **Code-age timeline in Blame**: a chronological axis above the gutter showing
   what percentage of the open file was last changed in each period. Resolution
   adapts to the file's history (daily through yearly) and is bounded; a history
@@ -92,6 +138,8 @@ before that tag is pushed.
 
 ### Hardened
 
+- Native menu main-thread safety and command gate stress test coverage.
+- Serde/TypeScript type sync expanded to 1188 data fields across 169 structs and 225 IPC handlers.
 - Closing a repository tab that holds live shells now asks first, and says how many
   will be ended. **Close Other Tabs** and **Close Tabs to the Right** are covered
   too, counting every repository they would discard; both bypassed the single-tab
@@ -109,33 +157,6 @@ before that tag is pushed.
 - The `showWalkthroughButton` preference and its **Layout** toggle, which
   existed only to hide the pill. Stored copies in existing profiles are
   ignored on read.
-
-## [1.3.0] - 2026-09-17
-
-A release introducing live delivery observability and CI timeline visualization,
-joining GitHub Actions workflow runs and Firebase App Hosting rollouts directly to
-repository commits with real-time lifecycle monitoring.
-
-### Added
-
-- **Live GitHub Actions Run Polling**: Automated, bounded polling for in-flight
-  workflow runs that refreshes only while runs are queued or executing, backing
-  off on failures, pausing while the window is hidden, and announcing newly
-  failed runs via dismissible notices.
-- **Delivery Timelines**: Visual duration and outcome timeline for workflow runs
-  and Firebase App Hosting rollouts, scaled to sample bounds with pass rates,
-  median execution times, and clean handling of queue time vs execution time.
-- **Firebase App Hosting Rollout Monitoring**: On-demand live refresh for
-  authorized project and backend pairs, providing live rollout status alongside
-  commit history.
-- **Action Dispatch & Rerun Controls**: Enhanced GitHub Actions panel with rerun
-  actions, branch filtering, and granular status reporting.
-
-### Hardened
-
-- Native menu main-thread safety and command gate stress test coverage.
-- Serde/TypeScript type sync expanded to 1188 data fields across 169 structs and 225 IPC handlers.
-
 ## [1.2.1] - 2026-09-16
 
 A release about one wrong comparison, and the two spellings a repository path
