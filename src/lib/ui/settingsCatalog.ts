@@ -109,6 +109,13 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tips hints onboarding tour tutorial reset",
   },
   {
+    id: "walkthrough-replay",
+    section: "appearance",
+    label: "Guided walkthrough",
+    keywords:
+      "tour guided replay onboarding walkthrough tutorial restart again header title bar",
+  },
+  {
     id: "status-bar",
     section: "layout",
     label: "Status bar",
@@ -143,12 +150,6 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "layout",
     label: "MANVI status badges",
     keywords: "manvi harness local model chips toolbar agents",
-  },
-  {
-    id: "walkthrough-button",
-    section: "layout",
-    label: "Walkthrough button",
-    keywords: "tour guided replay onboarding walkthrough header title bar hide show",
   },
   {
     id: "view-visibility",

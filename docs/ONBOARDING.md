@@ -4,8 +4,10 @@ The walkthrough opens the first time this version of GitPulse runs in a webview
 profile. It also introduces the tour to existing profiles that have never saved
 walkthrough progress. Six steps cover repositories and trust, the registered
 Work/Code/History/Insights views, Tasks and optional tools, platform access, and
-getting started. The title-bar **Walkthrough** button is available with or
-without an open repository.
+getting started. **Settings → Appearance → Guided walkthrough → Replay Tour** is
+the manual entry point, available with or without an open repository; Settings
+closes as the tour opens, because the guide renders below that dialog and its
+live steps point at header controls the dialog covers.
 
 **Start tour**, **Continue**, **Skip step**, and **Back** save the current step. **Later**, the close button, and
 Escape defer the tour without recording completion; reopen it to resume.

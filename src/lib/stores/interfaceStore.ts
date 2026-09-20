@@ -109,8 +109,6 @@ export interface InterfacePrefs {
   statusIconCounts: boolean;
   /** When the header's diagnostics button is drawn. */
   diagnosticsButton: DiagnosticsButtonMode;
-  /** Whether the title bar draws the Walkthrough replay button. */
-  showWalkthroughButton: boolean;
   /**
    * One exclusive application surface, independent of repository tab lifetime.
    *
@@ -270,7 +268,6 @@ const DEFAULTS: InterfacePrefs = {
   hideDockWhenClosed: true,
   statusIconCounts: false,
   diagnosticsButton: "always",
-  showWalkthroughButton: true,
   globalSurface: "repository",
   fleetPulseOpen: true,
   fleetHiddenColumns: [],
@@ -402,10 +399,6 @@ function readPrefs(): InterfacePrefs {
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
-      showWalkthroughButton: bool(
-        parsed.showWalkthroughButton,
-        DEFAULTS.showWalkthroughButton,
-      ),
       globalSurface: parsed.globalSurface === "tasks" || parsed.globalSurface === "fleet" || parsed.globalSurface === "repository"
         ? parsed.globalSurface
         : parsed.fleetOpen === true ? "fleet" : "repository",
@@ -537,8 +530,6 @@ function createInterfaceStore() {
     setAutoHideRepoTabs: (hide: boolean) => patch({ autoHideRepoTabs: hide }),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),
-    setShowWalkthroughButton: (show: boolean) =>
-      patch({ showWalkthroughButton: show }),
     /** Adds or removes one view from the header's hidden list. */
     setViewHidden: (view: ViewTab, hidden: boolean) =>
       patch((prefs) => ({

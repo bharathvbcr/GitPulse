@@ -42,6 +42,7 @@
   import { formatError } from "../ui/formatError";
   import { askConfirm } from "../stores/modalStore";
   import { repoStore } from "../stores/repoStore";
+  import { productTour } from "../tools/productTour";
   import {
     SETTINGS_SECTIONS,
     type SettingsSectionId,
@@ -82,6 +83,16 @@
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
   let launchAtLogin = $state(false);
+
+  /**
+   * Settings is the only entry point to the tour, so it has to get out of the
+   * way first: the guide sits at LAYERS.TOUR, deliberately below this dialog,
+   * and its live steps point at header controls this modal covers.
+   */
+  function replayWalkthrough() {
+    onClose?.();
+    productTour.open();
+  }
 
   async function refreshLaunchAtLogin() {
     try {
@@ -723,6 +734,27 @@
                       Reset Tips
                     </button>
                   </div>
+
+                  <div
+                    data-setting="walkthrough-replay"
+                    hidden={!shown("walkthrough-replay")}
+                    class="flex items-center justify-between gap-3"
+                  >
+                    <div class="min-w-0">
+                      <div class="text-textPrimary text-[11px] font-medium">Guided walkthrough</div>
+                      <div class="text-textMuted text-[10px] leading-snug">
+                        Replay the six-step tour. It starts from where you left off, or from the
+                        beginning once finished.
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onclick={replayWalkthrough}
+                      class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
+                    >
+                      Replay Tour
+                    </button>
+                  </div>
                 </div>
               {:else if entry.id === "layout"}
                 <div class="space-y-4">
@@ -818,15 +850,6 @@
                         ariaLabel="Show the language mix in the status bar"
                         checked={$interfaceStore.showLanguageBar}
                         onchange={(next) => interfaceStore.setShowLanguageBar(next)}
-                      />
-                    </div>
-                    <div data-setting="walkthrough-button" hidden={!shown("walkthrough-button")}>
-                      <SettingToggle
-                        label="Walkthrough button"
-                        description="Show the guided-tour button in the title bar. Turn this back on here to replay the tour."
-                        ariaLabel="Show the Walkthrough button in the header"
-                        checked={$interfaceStore.showWalkthroughButton}
-                        onchange={(next) => interfaceStore.setShowWalkthroughButton(next)}
                       />
                     </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>

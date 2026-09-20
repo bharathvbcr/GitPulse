@@ -16,11 +16,10 @@ describe("onboarding integration and native permission purposes", () => {
     expect(capability.windows).toEqual(["main"]);
     expect(capability.remote).toBeUndefined();
   });
-  it("mounts the production tour with existing actions and a persistent replay entry", () => {
+  it("mounts the production tour with existing actions", () => {
     const app = read("src/App.svelte");
     expect(app).toContain('<ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}');
     expect(app).toContain('onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}');
-    expect(app).toContain('onclick={() => productTour.open()}>Walkthrough</button>');
     expect(app).toContain('onTasks={() => interfaceStore.setTasksOpen(true)}');
     expect(app).toContain('repoStore.setActiveTab(view)');
     expect(app).toContain('repositoryPath={$repoStore.currentPath}');
@@ -28,5 +27,25 @@ describe("onboarding integration and native permission purposes", () => {
     expect(read("src/lib/components/HeaderRepoMenu.svelte")).toContain('data-tour="repository"');
     expect(read("src/lib/components/ViewTabBar.svelte")).toContain('data-tour="views"');
     expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="tasks"');
+  });
+
+  it("keeps the title bar clear of the walkthrough pill and replays from Settings", () => {
+    // These two halves are one fact. The pill was the only production caller
+    // of productTour.open(), so dropping it without rehoming replay strands
+    // the tour the first time anyone defers it.
+    const app = read("src/App.svelte");
+    expect(app).not.toContain('data-tour="replay"');
+    expect(app).not.toContain("productTour.open()");
+    expect(app).not.toContain('from "./lib/tools/productTour"');
+
+    const settings = read("src/lib/components/SettingsModal.svelte");
+    expect(settings).toContain('import { productTour } from "../tools/productTour";');
+    expect(settings).toContain('data-setting="walkthrough-replay"');
+    expect(settings).toContain("onclick={replayWalkthrough}");
+    // Settings has to close before the guide opens: the tour renders below
+    // this dialog by design, and its live steps point at controls it covers.
+    expect(settings).toMatch(
+      /function replayWalkthrough\(\) \{\s*onClose\?\.\(\);\s*productTour\.open\(\);\s*\}/,
+    );
   });
 });

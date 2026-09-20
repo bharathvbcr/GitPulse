@@ -75,6 +75,11 @@ before that tag is pushed.
 - A blame line with no knowable age — worktree-only, undated, or dated after
   now by a skewed clock — carries no row tint. It used to tint as the freshest
   code in the file, which also disagreed with the band filter that excludes it.
+- **Walkthrough moved out of the title bar**: the persistent **Walkthrough**
+  pill no longer sits in the header. Replay now lives in **Settings →
+  Appearance → Guided walkthrough**, beside **First-run coach marks**, and
+  Settings closes as the tour opens so the guide is not drawn underneath it.
+  The first-run tour itself is unchanged.
 
 ### Fixed
 
@@ -98,6 +103,12 @@ before that tag is pushed.
 - Randomized-sequence coverage for the terminal hosting rule, asserting over
   hundreds of open/close/switch steps that no repository is ever hosted — and so
   no shell ever started — without the user opening a terminal on it.
+
+### Removed
+
+- The `showWalkthroughButton` preference and its **Layout** toggle, which
+  existed only to hide the pill. Stored copies in existing profiles are
+  ignored on read.
 
 ## [1.3.0] - 2026-09-17
 
