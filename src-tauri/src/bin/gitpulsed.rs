@@ -45,6 +45,17 @@ use gitpulse_lib::engine::git_cli::validate_repo;
 use gitpulse_lib::{ingest, ledger};
 use std::time::{Duration, Instant};
 
+/// The library's environment-override guard, compiled into this crate too.
+///
+/// `gitpulse_lib::test_support` is `#[cfg(test)]` and `pub(crate)`, so it does
+/// not exist from here — but this binary overrides `GITPULSE_TRANSCRIPT_ROOT`
+/// exactly as `ingest` does and leaked it exactly as `ingest` did. Including
+/// the one implementation by path (as `tests/common/process_trust.rs` is
+/// already shared between two integration tests) keeps the two from drifting.
+#[cfg(test)]
+#[path = "../test_support/env.rs"]
+mod test_env;
+
 /// Floor on `--interval`.
 ///
 /// Each cycle walks the reflog and the transcript corpus for every repository,
@@ -363,14 +374,13 @@ mod tests {
     /// the developer's real `~/.claude/projects`.
     static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Restores the root even when `f` panics — see `test_env` for the class.
     fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ROOT_LOCK
+        let serial = ROOT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("GITPULSE_TRANSCRIPT_ROOT", root);
-        let out = f();
-        std::env::remove_var("GITPULSE_TRANSCRIPT_ROOT");
-        out
+        let _env = crate::test_env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root);
+        f()
     }
 
     #[test]

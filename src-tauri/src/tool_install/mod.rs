@@ -2203,16 +2203,11 @@ mod tests {
 
     #[test]
     fn explicit_missing_devmap_env_is_refused() {
-        let _lock = crate::harness::sidecar::test_serial();
-        unsafe {
-            std::env::set_var("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary");
-        }
-        tool_capability::invalidate(ExternalTool::Devmap);
+        let serial = crate::harness::sidecar::test_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary")
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
         let status = resolve_status(ExternalTool::Devmap);
-        unsafe {
-            std::env::remove_var("GITPULSE_DEVMAP_BIN");
-        }
-        tool_capability::invalidate(ExternalTool::Devmap);
         assert!(!status.installed);
         assert_eq!(status.lookup, ToolLookup::ExplicitMissing);
         assert!(
@@ -2228,16 +2223,11 @@ mod tests {
 
     #[test]
     fn explicit_missing_manvi_env_is_refused() {
-        let _lock = crate::harness::sidecar::test_serial();
-        unsafe {
-            std::env::set_var("GITPULSE_MANVI_BIN", "/no/such/manvi-binary");
-        }
-        tool_capability::invalidate(ExternalTool::Manvi);
+        let serial = crate::harness::sidecar::test_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_MANVI_BIN", "/no/such/manvi-binary")
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Manvi));
         let status = resolve_status(ExternalTool::Manvi);
-        unsafe {
-            std::env::remove_var("GITPULSE_MANVI_BIN");
-        }
-        tool_capability::invalidate(ExternalTool::Manvi);
         assert!(!status.installed);
         assert_eq!(status.lookup, ToolLookup::ExplicitMissing);
     }
@@ -2277,26 +2267,23 @@ mod tests {
             let go = bin.join("go");
             std::fs::write(&go, "#!/bin/sh\nprintf ran > \"$0.marker\"\nexit 7\n").unwrap();
             std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let old_path = std::env::var_os("PATH");
-            let old_root = std::env::var_os("GITPULSE_MANVI_ROOT");
-            let path = std::env::join_paths(
-                std::iter::once(bin.clone())
-                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
-            )
+            let path = std::env::join_paths(std::iter::once(bin.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
             .unwrap();
-            std::env::set_var("PATH", path);
-            std::env::set_var("GITPULSE_MANVI_ROOT", &repo);
-            let denied = install_from_checkout(ExternalTool::Manvi);
-            let started_before_approval = bin.join("go.marker").exists();
-            crate::test_support::trust_repo(&checkout);
-            let admitted = install_from_checkout(ExternalTool::Manvi);
-            for (key, value) in [("PATH", old_path), ("GITPULSE_MANVI_ROOT", old_root)] {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
+            let (denied, started_before_approval, admitted) = {
+                let _env = crate::test_support::env::bind_env(&_lock)
+                    .set("PATH", path)
+                    .set("GITPULSE_MANVI_ROOT", &repo);
+                let denied = install_from_checkout(ExternalTool::Manvi);
+                let started_before_approval = bin.join("go.marker").exists();
+                crate::test_support::trust_repo(&checkout);
+                (
+                    denied,
+                    started_before_approval,
+                    install_from_checkout(ExternalTool::Manvi),
+                )
+            };
             assert!(
                 !started_before_approval,
                 "unapproved source installer started"
@@ -2320,16 +2307,11 @@ mod tests {
 
     #[test]
     fn install_without_source_fails_closed_on_forced_checkout_rung() {
-        let _lock = crate::harness::sidecar::test_serial();
-        unsafe {
-            std::env::set_var("GITPULSE_DEVCOUNCIL_ROOT", "/no/such/devcouncil-root");
-        }
-        tool_capability::invalidate(ExternalTool::Devmap);
+        let serial = crate::harness::sidecar::test_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_DEVCOUNCIL_ROOT", "/no/such/devcouncil-root")
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
         let outcome = install_with_rung(ExternalTool::Devmap, Some(InstallRung::LocalCheckout));
-        unsafe {
-            std::env::remove_var("GITPULSE_DEVCOUNCIL_ROOT");
-        }
-        tool_capability::invalidate(ExternalTool::Devmap);
         assert!(!outcome.ok);
         assert!(
             outcome
@@ -2508,12 +2490,11 @@ mod tests {
             fs::write(&bin, b"x").unwrap();
         }
         let cfg_path = dir.path().join("tools.json");
-        unsafe {
-            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
-            std::env::remove_var("GITPULSE_DEVMAP_BIN");
-        }
-        crate::tool_config::invalidate_cache();
-        tool_capability::invalidate(ExternalTool::Devmap);
+        let _env = crate::test_support::env::bind_env(&_cfg_env)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path)
+            .remove("GITPULSE_DEVMAP_BIN")
+            .invalidating(crate::tool_config::invalidate_cache)
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
         let mut cfg = crate::tool_config::ToolConfig::default();
         cfg.devmap.binary = Some(bin.display().to_string());
         crate::tool_config::save(&cfg).unwrap();
@@ -2526,12 +2507,6 @@ mod tests {
             status.path.as_deref(),
             Some(bin.display().to_string().as_str())
         );
-
-        unsafe {
-            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
-        }
-        crate::tool_config::invalidate_cache();
-        tool_capability::invalidate(ExternalTool::Devmap);
     }
 
     #[test]
@@ -2540,11 +2515,11 @@ mod tests {
         let _cfg_env = crate::tool_config::lock_config_env();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
-        unsafe {
-            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
-            std::env::remove_var("GITPULSE_DEVMAP_BIN");
-        }
-        crate::tool_config::invalidate_cache();
+        let _env = crate::test_support::env::bind_env(&_cfg_env)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path)
+            .remove("GITPULSE_DEVMAP_BIN")
+            .invalidating(crate::tool_config::invalidate_cache)
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
         crate::tool_config::set_disabled(ExternalTool::Devmap, true).unwrap();
         tool_capability::invalidate(ExternalTool::Devmap);
         let status = resolve_status(ExternalTool::Devmap);
@@ -2555,11 +2530,6 @@ mod tests {
             "{:?}",
             status.reason
         );
-        unsafe {
-            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
-        }
-        crate::tool_config::invalidate_cache();
-        tool_capability::invalidate(ExternalTool::Devmap);
     }
 
     #[test]
@@ -2568,16 +2538,11 @@ mod tests {
         let _cfg_env = crate::tool_config::lock_config_env();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
-        unsafe {
-            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
-        }
-        crate::tool_config::invalidate_cache();
+        let _env = crate::test_support::env::bind_env(&_cfg_env)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path)
+            .invalidating(crate::tool_config::invalidate_cache);
         let bin = release::app_bin_dir().expect("app bin");
         assert_eq!(bin, dir.path().join("bin"), "{bin:?}");
-        unsafe {
-            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
-        }
-        crate::tool_config::invalidate_cache();
     }
 
     #[cfg(unix)]
@@ -2587,12 +2552,11 @@ mod tests {
         let _cfg_env = crate::tool_config::lock_config_env();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
-        unsafe {
-            std::env::set_var(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path);
-            std::env::remove_var("GITPULSE_DEVMAP_BIN");
-        }
-        crate::tool_config::invalidate_cache();
-        tool_capability::invalidate(ExternalTool::Devmap);
+        let _env = crate::test_support::env::bind_env(&_cfg_env)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg_path)
+            .remove("GITPULSE_DEVMAP_BIN")
+            .invalidating(crate::tool_config::invalidate_cache)
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
 
         let bin_dir = release::app_bin_dir().unwrap();
         assert!(
@@ -2616,12 +2580,6 @@ mod tests {
             keep.exists(),
             "directory named like a binary was removed: {msg}"
         );
-
-        unsafe {
-            std::env::remove_var(crate::tool_config::TOOL_CONFIG_ENV);
-        }
-        crate::tool_config::invalidate_cache();
-        tool_capability::invalidate(ExternalTool::Devmap);
     }
 
     #[test]

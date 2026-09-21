@@ -404,19 +404,16 @@ mod tests {
     use super::*;
 
     fn with_temp_config(f: impl FnOnce(&Path)) {
-        let _guard = crate::tool_config::lock_config_env();
+        let serial = crate::tool_config::lock_config_env();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tools.json");
-        // SAFETY: serialized behind lock_config_env; restored below.
-        unsafe {
-            std::env::set_var(TOOL_CONFIG_ENV, &path);
-        }
-        invalidate_cache();
+        // Dropped before `dir`, so the variable stops naming the temporary
+        // directory before the directory goes away — and before `serial`, so
+        // the restore is still serialized.
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(TOOL_CONFIG_ENV, &path)
+            .invalidating(invalidate_cache);
         f(&path);
-        unsafe {
-            std::env::remove_var(TOOL_CONFIG_ENV);
-        }
-        invalidate_cache();
     }
 
     #[test]

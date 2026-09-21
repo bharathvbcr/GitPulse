@@ -2715,10 +2715,16 @@ mod tests {
 
     #[test]
     fn mcp_info_never_claims_a_binary_it_did_not_find() {
+        // `GITPULSE_MCP_PATH` is process-global and `resolve_mcp_binary` reads
+        // it, so this took no serial at all: a concurrent test calling
+        // `mcp_info` saw the fake path, and this one raced whatever the
+        // developer's environment held. The serial is the sidecar's, which is
+        // the one every binary-path override in this crate takes.
+        let serial = crate::harness::sidecar::test_serial();
         // Force the miss path: an explicit env that is not a file.
-        std::env::set_var("GITPULSE_MCP_PATH", "/no/such/gitpulse-mcp");
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_MCP_PATH", "/no/such/gitpulse-mcp");
         let info = mcp_info();
-        std::env::remove_var("GITPULSE_MCP_PATH");
         assert!(!info.binary_found);
         assert!(!info.binary_error.is_empty());
         assert!(info.read_only);

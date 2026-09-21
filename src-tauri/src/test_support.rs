@@ -7,12 +7,22 @@
 //! the identity pins or the failure message need to change, and nothing fails
 //! when only six of them are.
 
+pub(crate) mod env;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// The sidecar serial is this crate's de-facto environment serial: the tests
+/// that override `GITPULSE_*` binary paths, `GITPULSE_DEVCOUNCIL_ROOT`,
+/// `GITPULSE_MANVI_ROOT` and `PATH` all take it, because the thing those
+/// variables ultimately steer is which binary a spawn finds. Declaring it here
+/// rather than in `env` keeps that module includable by `gitpulsed`, which is a
+/// separate crate and cannot name this type.
+impl env::EnvSerial for crate::harness::sidecar::SidecarTestGuard {}
 
 static HARNESS_CLONE_SEQ: AtomicU64 = AtomicU64::new(0);
 

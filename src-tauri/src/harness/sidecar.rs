@@ -2054,14 +2054,10 @@ done
 
     #[test]
     fn broken_manvi_bin_override_is_named_not_silent_absent() {
-        let _lock = test_serial();
-        unsafe {
-            std::env::set_var("GITPULSE_MANVI_BIN", "/no/such/manvi-override");
-        }
+        let serial = test_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_MANVI_BIN", "/no/such/manvi-override");
         let msg = resolve_binary_absence();
-        unsafe {
-            std::env::remove_var("GITPULSE_MANVI_BIN");
-        }
         assert!(
             msg.contains("GITPULSE_MANVI_BIN") && msg.contains("not a file"),
             "{msg}"

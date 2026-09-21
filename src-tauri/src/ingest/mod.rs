@@ -496,14 +496,17 @@ mod tests {
     static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Runs `f` with the transcript root pointed at `root`, restoring it after.
+    ///
+    /// "After" includes the case where `f` panics: a `f()` that failed used to
+    /// skip the restore and hand every later test in this process a transcript
+    /// root pointing into a deleted `TempDir`.
     fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ROOT_LOCK
+        let serial = ROOT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("GITPULSE_TRANSCRIPT_ROOT", root);
-        let out = f();
-        std::env::remove_var("GITPULSE_TRANSCRIPT_ROOT");
-        out
+        let _env =
+            crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root);
+        f()
     }
 
     fn transcript_fixture(dir: &std::path::Path, repo: &str, session: &str, ts: &str, file: &str) {

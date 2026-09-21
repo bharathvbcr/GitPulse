@@ -1373,19 +1373,16 @@ mod tests {
             lookup: DevmapLookup::PathSearch,
         };
 
-        let restore = std::env::var_os("PATH");
-        unsafe { std::env::set_var("PATH", LAUNCHD_MINIMAL) };
-        let run = run_devmap(
-            &binary,
-            dir.path(),
-            &["status", "--json"],
-            None,
-            Duration::from_secs(5),
-        );
-        match restore {
-            Some(value) => unsafe { std::env::set_var("PATH", value) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
+        let run = {
+            let _env = crate::test_support::env::bind_env(&_serial).set("PATH", LAUNCHD_MINIMAL);
+            run_devmap(
+                &binary,
+                dir.path(),
+                &["status", "--json"],
+                None,
+                Duration::from_secs(5),
+            )
+        };
         run.expect("stub devmap must run");
 
         let child_path = fs::read_to_string(&recorded).expect("child did not record its PATH");
@@ -1651,10 +1648,9 @@ exit 2
         // the order every binding site uses; reversing it anywhere would be a
         // lock-order inversion.
         let _no_override = test_serial();
-        // SAFETY: serialized behind the sidecar test guard; restored below.
-        std::env::set_var("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary");
+        let _env = crate::test_support::env::bind_env(&_lock)
+            .set("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary");
         let err = resolve_binary().expect_err("must refuse");
-        std::env::remove_var("GITPULSE_DEVMAP_BIN");
         assert!(err.contains("GITPULSE_DEVMAP_BIN"), "{err}");
         assert!(err.contains("not a file"), "{err}");
     }
