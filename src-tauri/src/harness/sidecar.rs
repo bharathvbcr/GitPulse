@@ -1213,6 +1213,34 @@ impl ProfileConnection {
         )
     }
 
+    /// What this worker's sidecar declared at handshake, spawning it if it has
+    /// not run yet.
+    ///
+    /// Read from the *profile* slot on purpose. The policy slot spawns without
+    /// a workbench module, so it never configures a managed lane and never
+    /// publishes an adapter set — asking it would answer "did not say" for
+    /// every build, new or old, and a gate fed that answer is no gate at all.
+    pub(crate) fn handshake(&self) -> Result<(String, HelloResult), HarnessError> {
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(HarnessError::Unavailable(
+                "the profile worker is shutting down".into(),
+            ));
+        }
+        let mut guard =
+            acquire_slot_for(&self.slot, Instant::now() + DEFAULT_CALL_TIMEOUT).ok_or_else(|| {
+                HarnessError::Busy(
+                    "the profile worker was busy for the whole handshake budget".into(),
+                )
+            })?;
+        if guard.closed {
+            return Err(HarnessError::Unavailable(
+                "the profile worker is shutting down".into(),
+            ));
+        }
+        let sidecar = guard.ensure()?;
+        Ok((sidecar.binary.clone(), sidecar.hello.clone()))
+    }
+
     /// Drops the live child (6 s grace) so the next call can spawn with a new
     /// model selection. Distinct from [`Self::shutdown`]: the connection stays
     /// reusable and does not refuse later work.

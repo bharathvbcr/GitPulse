@@ -254,6 +254,58 @@ impl WorkbenchState {
         params: Value,
         selection: Option<crate::harness::sidecar::ModelSelection>,
     ) -> Result<Value, WorkbenchError> {
+        let worker = self.worker(selection)?;
+        // Initialization is lazy and can overlap shutdown; never spawn after it.
+        if let Err(error) = self.check_open() {
+            worker.shutdown();
+            return Err(error);
+        }
+        worker.call(method, params).map_err(worker_error)
+    }
+
+    /// What the profile worker's harness declared at handshake.
+    ///
+    /// Spawns it if none is running, which a managed launch was about to do
+    /// anyway. Used to decide whether this build can drive a provider *before*
+    /// an attempt is stored and the repository's run capacity is taken.
+    ///
+    /// Reuses a live worker whatever its model fingerprint. A handshake
+    /// describes the *binary* — its protocol, ops and adapter set — and none of
+    /// that moves with a model selection, so going through [`Self::worker`]
+    /// with `None` would retire a perfectly good enhancement worker mid-flight
+    /// to learn something it had already told us.
+    fn worker_handshake(&self) -> Result<crate::harness::protocol::HelloResult, WorkbenchError> {
+        self.check_open()?;
+        let live = {
+            let guard = self.0.worker.lock().map_err(|_| {
+                WorkbenchError::new(
+                    "worker_error",
+                    "Task worker lock failed; restart the application.",
+                )
+            })?;
+            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
+        };
+        let worker = match live {
+            Some(worker) => worker,
+            None => self.worker(None)?,
+        };
+        if let Err(error) = self.check_open() {
+            worker.shutdown();
+            return Err(error);
+        }
+        worker
+            .handshake()
+            .map(|(_, hello)| hello)
+            .map_err(worker_error)
+    }
+
+    /// Resolves (building if needed) the profile worker for a model selection.
+    /// One owner for the fingerprint-and-rebuild dance, so a second caller
+    /// cannot grow a slightly different copy of it.
+    fn worker(
+        &self,
+        selection: Option<crate::harness::sidecar::ModelSelection>,
+    ) -> Result<Arc<crate::harness::sidecar::ProfileConnection>, WorkbenchError> {
         self.check_open()?;
         let path = self.profile_path()?;
         let fingerprint: WorkerFingerprint = selection
@@ -282,12 +334,7 @@ impl WorkbenchState {
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
         };
-        // Initialization is lazy and can overlap shutdown; never spawn after it.
-        if let Err(error) = self.check_open() {
-            worker.shutdown();
-            return Err(error);
-        }
-        worker.call(method, params).map_err(worker_error)
+        Ok(worker)
     }
 
     fn register(

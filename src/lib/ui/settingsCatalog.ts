@@ -155,7 +155,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "language-bar",
     section: "layout",
     label: "Language mix",
-    keywords: "languages breakdown status bar percentage code",
+    keywords: "languages breakdown status bar percentage code markdown notes prose options",
   },
   {
     id: "harness-badges",

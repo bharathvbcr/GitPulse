@@ -1,6 +1,7 @@
 <script lang="ts">
   import { RefreshCw } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
@@ -37,9 +38,15 @@
     partial: false,
     partialNotice: null,
     failed: false,
+    mode: "code-only",
+    note: null,
+    hasNotesOrMarkdown: false,
   };
 
-  /** Everything drawn below, derived by one tested function. */
+  /** Latest scan snapshot received from the metric. */
+  let rawSnapshot = $state<MetricSnapshot<LanguageStatsReport> | null>(null);
+
+  /** Everything drawn below, derived from snapshot and selected percentage mode. */
   let mix = $state<LanguageMix>(EMPTY);
 
   let open = $state(false);
@@ -49,13 +56,22 @@
   $effect(() => {
     const path = $repoStore.currentPath;
     if (!path) {
+      rawSnapshot = null;
       mix = EMPTY;
       open = false;
       return;
     }
     return locMetric.subscribe(path, (snap: MetricSnapshot<LanguageStatsReport>) => {
-      mix = describeLanguageMix(snap);
+      rawSnapshot = snap;
     });
+  });
+
+  $effect(() => {
+    if (!rawSnapshot) {
+      mix = EMPTY;
+      return;
+    }
+    mix = describeLanguageMix(rawSnapshot, $interfaceStore.codePercentageMode);
   });
 
   function tipFor(lang: LanguageStat): string {
@@ -141,6 +157,19 @@
       <span class="text-amber-600 dark:text-amber-400" title={mix.partialNotice ?? "Partial scan"}>⚠</span>
     {/if}
   </button>
+{:else if rawSnapshot?.value?.stats?.length}
+  <button
+    bind:this={triggerEl}
+    type="button"
+    data-language-trigger
+    aria-haspopup="dialog"
+    aria-expanded={open}
+    onclick={toggle}
+    class="inline-flex items-center gap-1.5 text-textMuted hover:text-textPrimary transition-colors shrink-0 text-xs"
+    title="No code files (markdown and notes excluded) — click to adjust options"
+  >
+    <span class="font-medium">Notes only</span>
+  </button>
 {:else if mix.failed}
   <span class="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 shrink-0" title="The language scan failed; see Diagnostics">
     <span>⚠</span><span>Languages</span>
@@ -157,14 +186,56 @@
     class="fixed w-72 gp-menu gp-pop p-3 text-xs text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
-    <div class="h-1.5 flex rounded-full overflow-hidden bg-background ring-1 ring-border/50 mb-2.5">
-      {#each mix.stats as lang (lang.language)}
-        <div
-          style="width: {Number.isFinite(lang.percentage) ? lang.percentage : 0}%; background-color: {lang.color_hex};"
-          title={tipFor(lang)}
-        ></div>
-      {/each}
+    <!-- Mode selector: two options for code percentage -->
+    <div
+      role="radiogroup"
+      aria-label="Code percentage calculation mode"
+      class="flex items-center p-0.5 mb-2.5 rounded-lg bg-surface border border-border/70 text-[11px]"
+    >
+      <button
+        type="button"
+        role="radio"
+        aria-checked={$interfaceStore.codePercentageMode === "code-only"}
+        onclick={() => interfaceStore.setCodePercentageMode("code-only")}
+        class="flex-1 py-1 px-2 rounded-md font-medium text-center transition-all {$interfaceStore.codePercentageMode === 'code-only' ? 'bg-surfaceActive text-textPrimary shadow-xs border border-border/40 font-semibold' : 'text-textMuted hover:text-textPrimary'}"
+        data-testid="mode-code-only"
+        title="Only code files: Exclude Markdown, notes, and documentation from code percentage"
+      >
+        Only code files
+      </button>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={$interfaceStore.codePercentageMode === "all"}
+        onclick={() => interfaceStore.setCodePercentageMode("all")}
+        class="flex-1 py-1 px-2 rounded-md font-medium text-center transition-all {$interfaceStore.codePercentageMode === 'all' ? 'bg-surfaceActive text-textPrimary shadow-xs border border-border/40 font-semibold' : 'text-textMuted hover:text-textPrimary'}"
+        data-testid="mode-all-files"
+        title="Include notes: Count markdowns and notes in percentage with explanatory note"
+      >
+        Include notes
+      </button>
     </div>
+
+    {#if mix.stats.length > 0}
+      <div class="h-1.5 flex rounded-full overflow-hidden bg-background ring-1 ring-border/50 mb-2.5">
+        {#each mix.stats as lang (lang.language)}
+          <div
+            style="width: {Number.isFinite(lang.percentage) ? lang.percentage : 0}%; background-color: {lang.color_hex};"
+            title={tipFor(lang)}
+          ></div>
+        {/each}
+      </div>
+    {/if}
+
+    {#if mix.note}
+      <div
+        data-testid="language-mix-note"
+        class="mb-2 px-2 py-1.5 rounded-md bg-accent/10 border border-accent/25 text-[10px] text-textMuted flex items-center gap-1.5 leading-tight"
+      >
+        <span class="text-accent font-semibold shrink-0">ℹ</span>
+        <span>{mix.note}</span>
+      </div>
+    {/if}
 
     {#if mix.partialNotice}
       <p class="mb-2 text-[10px] text-amber-600 dark:text-amber-400 leading-snug">
@@ -172,21 +243,27 @@
       </p>
     {/if}
 
-    <div class="flex flex-col gap-0.5 max-h-64 overflow-y-auto">
-      {#each mix.stats as lang (lang.language)}
-        <button
-          type="button"
-          onclick={() => handleLanguageClick(lang)}
-          disabled={lang.language === "Other"}
-          class="flex items-center gap-2 px-1.5 py-1 rounded-md hover:bg-surfaceHover transition-colors text-left disabled:hover:bg-transparent disabled:cursor-default"
-          title={tipFor(lang) + (lang.language !== "Other" ? " — Click to view files" : "")}
-        >
-          <LanguageLogo language={lang.language} size={13} class="shrink-0" />
-          <span class="text-textPrimary/90 font-medium truncate flex-1">{lang.language}</span>
-          <span class="text-textMuted tabular-nums text-[10px] shrink-0">{lang.percentage}%</span>
-        </button>
-      {/each}
-    </div>
+    {#if mix.stats.length === 0}
+      <div class="py-4 text-center text-textMuted text-[11px]" data-testid="empty-code-files">
+        No code files detected (markdown &amp; notes excluded)
+      </div>
+    {:else}
+      <div class="flex flex-col gap-0.5 max-h-64 overflow-y-auto">
+        {#each mix.stats as lang (lang.language)}
+          <button
+            type="button"
+            onclick={() => handleLanguageClick(lang)}
+            disabled={lang.language === "Other"}
+            class="flex items-center gap-2 px-1.5 py-1 rounded-md hover:bg-surfaceHover transition-colors text-left disabled:hover:bg-transparent disabled:cursor-default"
+            title={tipFor(lang) + (lang.language !== "Other" ? " — Click to view files" : "")}
+          >
+            <LanguageLogo language={lang.language} size={13} class="shrink-0" />
+            <span class="text-textPrimary/90 font-medium truncate flex-1">{lang.language}</span>
+            <span class="text-textMuted tabular-nums text-[10px] shrink-0">{lang.percentage}%</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
 
     <button
       type="button"

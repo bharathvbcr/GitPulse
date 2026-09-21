@@ -10,6 +10,7 @@ import {
   normalizeCheckout,
   preferredCheckout,
   reconcileHandoff,
+  runExpired,
   runStateLabel,
   sanitizeHandoff,
   supportsManaged,
@@ -270,5 +271,30 @@ describe("runStateLabel", () => {
     expect(runStateLabel("unresolved")).toBe("Unresolved");
     // An unknown state from a newer backend is shown, not swallowed.
     expect(runStateLabel("quantum")).toBe("quantum");
+  });
+});
+
+describe("runExpired", () => {
+  // Seconds on the wire, milliseconds in the browser. Reading `expires_at` as
+  // milliseconds would put every expiry ~55 millennia out, so nothing would
+  // ever expire and the phantom row this predicate exists to catch would stay
+  // exactly as invisible as it was.
+  const at = (seconds: number) => ({ state: "prepared", expires_at: seconds });
+
+  it("expires a prepared attempt at its second, not before", () => {
+    expect(runExpired(at(1_000), 999_999)).toBe(false);
+    // The boundary belongs to the store, whose own predicate keeps a prepared
+    // row only while `expires_at > now`; at equality it is already history.
+    expect(runExpired(at(1_000), 1_000_000)).toBe(true);
+    expect(runExpired(at(1_000), 1_000_001)).toBe(true);
+  });
+
+  it("calls no other state expired, however old", () => {
+    // Only `prepared` carries an expiry the store acts on. A running attempt
+    // whose `expires_at` has long passed is still a live process, and calling
+    // it expired would hide the only control that can stop it.
+    for (const state of ["starting", "running", "unresolved", "exited", "cancelled", "failed"]) {
+      expect(runExpired({ state, expires_at: 0 }, Date.now())).toBe(false);
+    }
   });
 });

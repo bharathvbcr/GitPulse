@@ -75,4 +75,16 @@ describe("LanguageSegment", () => {
     expect(source).toContain('locMetric.refresh(repoPath, { force: true })');
     expect(source).toContain("RefreshCw");
   });
+
+  it("offers two options for code percentage: code-only and include notes with explanatory note", () => {
+    // The panel must present both options clearly
+    expect(source).toContain('data-testid="mode-code-only"');
+    expect(source).toContain('data-testid="mode-all-files"');
+    expect(source).toContain("Only code files");
+    expect(source).toContain("Include notes");
+    expect(source).toContain('interfaceStore.setCodePercentageMode("code-only")');
+    expect(source).toContain('interfaceStore.setCodePercentageMode("all")');
+    expect(source).toContain('data-testid="language-mix-note"');
+    expect(source).toContain('data-testid="empty-code-files"');
+  });
 });

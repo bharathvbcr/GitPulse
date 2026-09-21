@@ -178,6 +178,61 @@ pub(super) fn prepare_managed(
     prepare_kind(state, input, "managed")
 }
 
+/// Refuses a managed provider the *installed* harness has no adapter for,
+/// before any attempt is stored.
+///
+/// Three source lists already agree about which providers may take this lane —
+/// the renderer, this workbench, and the harness's own `ManagedProviders`. All
+/// three describe source. None of them describes the binary on this machine,
+/// and that is the gap this closes: a harness built before Claude Code gained
+/// an adapter passes every source check, then refuses the launch in words
+/// written for the providers it *does* have ("requires a fresh Codex
+/// attempt"), after the attempt has already taken the repository's capacity.
+///
+/// A harness that did not publish its adapter set is *not* refused. Older
+/// builds drive Codex perfectly well, and turning "could not check" into "no"
+/// would break them; the launch proceeds and any failure is attributed
+/// honestly instead (see `managed_run::launch_with`). A handshake that could
+/// not be reached at all is likewise not a refusal — a busy or restarting
+/// sidecar is a transport condition, not a verdict about adapters.
+fn managed_adapter_gate(state: &WorkbenchState, provider: &str) -> Result<(), WorkbenchError> {
+    use crate::harness::protocol::ManagedAdapter;
+    let Ok(hello) = state.worker_handshake() else {
+        return Ok(());
+    };
+    match hello.managed_adapter(provider) {
+        ManagedAdapter::Present | ManagedAdapter::Unknown { .. } => Ok(()),
+        ManagedAdapter::Absent { published } => {
+            // Bounded before rendering. `published` is whatever the harness
+            // sent, and this string ends up in a toast: a build advertising
+            // thousands of adapters — or a corrupted line — must not become a
+            // megabyte of error text on its way to the screen.
+            const SHOWN: usize = 8;
+            let has = if published.is_empty() {
+                "no managed adapters".to_owned()
+            } else {
+                let names = published
+                    .iter()
+                    .take(SHOWN)
+                    .map(|p| p.chars().take(32).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match published.len().checked_sub(SHOWN) {
+                    Some(rest) if rest > 0 => format!("only: {names} (and {rest} more)"),
+                    _ => format!("only: {names}"),
+                }
+            };
+            Err(WorkbenchError::new(
+                "unsupported_operation",
+                format!(
+                    "The installed Manvi has no managed adapter for {provider}; it reports {has}. \
+                     Update Manvi, or hand this task to {provider} in a terminal instead."
+                ),
+            ))
+        }
+    }
+}
+
 fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value, WorkbenchError> {
     let input = parse(input)?;
     if kind == "managed"
@@ -187,6 +242,9 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
             "unsupported_operation",
             "Managed launches require Codex or Claude Code and an attempt identity of at most 100 characters.",
         ));
+    }
+    if kind == "managed" {
+        managed_adapter_gate(state, &input.provider)?;
     }
     let checkout = checkout(&input.repo_path)?;
     let body = json!({

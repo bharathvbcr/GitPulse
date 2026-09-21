@@ -40,6 +40,7 @@ import {
 } from "../ui/taskView";
 import type { TaskStatus } from "../workbench/vocabulary";
 import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
+import type { CodePercentageMode } from "../language/barStats";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks";
 
@@ -75,6 +76,8 @@ export interface InterfacePrefs {
   /** Columns a literal tab advances to, everywhere code is drawn. */
   tabWidth: TabWidth;
   showLanguageBar: boolean;
+  /** Whether code percentage counts only code files or includes markdowns & notes. */
+  codePercentageMode: CodePercentageMode;
   showHarnessBadges: boolean;
   /** Author-avatar column in the commit graph gutter. */
   showGraphAvatars: boolean;
@@ -255,6 +258,7 @@ const DEFAULTS: InterfacePrefs = {
   diffIgnoreWhitespace: false,
   tabWidth: DEFAULT_TAB_WIDTH,
   showLanguageBar: true,
+  codePercentageMode: "code-only",
   showHarnessBadges: true,
   showGraphAvatars: true,
   graphWidthMode: "balanced",
@@ -370,6 +374,8 @@ function readPrefs(): InterfacePrefs {
       ),
       tabWidth: isTabWidth(parsed.tabWidth) ? parsed.tabWidth : DEFAULTS.tabWidth,
       showLanguageBar: bool(parsed.showLanguageBar, DEFAULTS.showLanguageBar),
+      codePercentageMode:
+        parsed.codePercentageMode === "all" ? "all" : "code-only",
       showHarnessBadges: bool(parsed.showHarnessBadges, DEFAULTS.showHarnessBadges),
       showGraphAvatars: bool(parsed.showGraphAvatars, DEFAULTS.showGraphAvatars),
       graphWidthMode: isGraphWidthMode(parsed.graphWidthMode)
@@ -516,6 +522,7 @@ function createInterfaceStore() {
     setDiffIgnoreWhitespace: (ignore: boolean) => patch({ diffIgnoreWhitespace: ignore }),
     setTabWidth: (width: TabWidth) => patch({ tabWidth: width }),
     setShowLanguageBar: (show: boolean) => patch({ showLanguageBar: show }),
+    setCodePercentageMode: (mode: CodePercentageMode) => patch({ codePercentageMode: mode }),
     setShowHarnessBadges: (show: boolean) => patch({ showHarnessBadges: show }),
     setShowGraphAvatars: (show: boolean) => patch({ showGraphAvatars: show }),
     setGraphWidthMode: (mode: GraphWidthMode) => patch({ graphWidthMode: mode }),

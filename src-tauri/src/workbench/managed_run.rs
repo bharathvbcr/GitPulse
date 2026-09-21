@@ -77,6 +77,84 @@ pub(super) fn launch(state: &WorkbenchState, input: &str) -> Result<Value, Workb
     )
 }
 
+/// Hands back the repository when a preparation died before the harness took
+/// ownership, and says why in terms that are true.
+///
+/// A refused preparation used to leave the stored attempt sitting at
+/// `prepared`. Nothing ever moved it: the harness had not claimed it, so the
+/// harness would never finish it, and the store counts a prepared attempt as
+/// occupying the repository's single run slot until its five-minute expiry. So
+/// one failed launch locked the repository out of *every* further attempt —
+/// and then the row stayed on screen as "Prepared" forever, a phantom the
+/// panel had stopped polling because it had expired.
+///
+/// Only an unclaimed row is cancelled. Once `owner_id` is set the live Manvi
+/// session owns that attempt and its own failure path resolves it; cancelling
+/// underneath it would race a process that is still holding a provider.
+fn release_unclaimed(
+    state: &WorkbenchState,
+    id: &str,
+    error: WorkbenchError,
+) -> WorkbenchError {
+    let error = attribute(state, error);
+    let Ok(row) = saved(state, id) else {
+        return error;
+    };
+    if row["item"]["state"] != "prepared" || !row["item"]["owner_id"].is_null() {
+        return error;
+    }
+    let Some(revision) = row["item"]["revision"].as_i64() else {
+        return error;
+    };
+    let cancel = json!({
+        "id": id,
+        "request_id": format!("managed_release_{id}"),
+        "expected_revision": revision,
+    });
+    match state.with_store(|store| query(store, "runs.cancel", &cancel.to_string())) {
+        Ok(_) => error,
+        // The attempt is still real and still holds the slot. Saying so beats
+        // a clean-looking error that leaves the reader wondering why the next
+        // launch is refused as "repository busy".
+        Err(cancel) => WorkbenchError::new(
+            &error.code,
+            format!(
+                "{} The prepared attempt could not be released either ({}), so this repository \
+                 stays busy until it expires; use Cancel preparation on the run below.",
+                error.message, cancel.message
+            ),
+        ),
+    }
+}
+
+/// Names what GitPulse could and could not check about this harness.
+///
+/// A build that never published its adapter set cannot be asked which
+/// providers it drives, so a refusal from it may be about the provider rather
+/// than the attempt — and its wording will describe whichever providers that
+/// build happens to ship. Without this note the reader is handed a sentence
+/// about Codex for a Claude launch and no way to tell that the real answer is
+/// "this harness is too old to say".
+fn attribute(state: &WorkbenchState, error: WorkbenchError) -> WorkbenchError {
+    use crate::harness::protocol::ManagedAdapter;
+    let unknown = matches!(
+        state.worker_handshake().map(|hello| hello.managed_adapter("")),
+        Ok(ManagedAdapter::Unknown { .. })
+    );
+    if !unknown {
+        return error;
+    }
+    WorkbenchError::new(
+        &error.code,
+        format!(
+            "{} This Manvi build does not report which managed adapters it has, so GitPulse \
+             could not check the provider before launching; the wording above may describe a \
+             different provider than the one you chose. Updating Manvi is the usual fix.",
+            error.message
+        ),
+    )
+}
+
 fn launch_with(
     state: &WorkbenchState,
     input: &str,
@@ -92,10 +170,13 @@ fn launch_with(
     terminal_launch::revalidate(&row)?;
     // Stable for this attempt across UI reloads. The store forbids repeating a
     // consumed claim; only the owning live Manvi session can recover this call.
-    let prepared = call(
+    let prepared = match call(
         "work.runs.managed.prepare",
         json!({"id":id,"request_id":format!("managed_launch_{id}"),"expected_revision":1}),
-    )?;
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(release_unclaimed(state, &id, error)),
+    };
     let activation = (|| {
         let prepared: Prepared = serde_json::from_value(prepared)
             .map_err(|e| WorkbenchError::new("protocol_error", e.to_string()))?;
@@ -433,6 +514,102 @@ mod tests {
         assert_eq!(
             state.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["status"],
             "inbox"
+        );
+    }
+
+    /// Builds a registered repository, a task, and one prepared managed
+    /// attempt — the state a reader is in the instant before a launch.
+    fn prepared_attempt(
+        dir: &std::path::Path,
+        provider: &str,
+    ) -> (WorkbenchState, std::path::PathBuf) {
+        let root = dir.join("repo");
+        git_global(&["init", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&root);
+        let state = WorkbenchState(Arc::new(super::super::Inner {
+            path: Some(dir.join("profile.sqlite")),
+            ..Default::default()
+        }));
+        state
+            .register(root.to_str().unwrap(), "repo", "register")
+            .unwrap();
+        state.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Inspect repository","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
+        state.request("runs.prepare_managed", &json!({"id":"run","request_id":"prepare","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":provider,"permission_mode":"inspect","repo_path":root}).to_string()).unwrap();
+        (state, root)
+    }
+
+    /// A preparation the harness refuses must hand the repository back.
+    ///
+    /// It did not. The attempt was stored before the harness was asked, the
+    /// refusal returned straight to the caller, and the row stayed at
+    /// `prepared` — which the store counts as occupying this repository's
+    /// single run slot until a five-minute expiry. Nothing would ever move it:
+    /// the harness had not claimed it, so the harness would never finish it.
+    /// One refused launch therefore locked the repository out of *every*
+    /// further attempt, including the corrected one the reader was about to
+    /// make, and answered them all with "this repository already has a
+    /// prepared, active or unresolved run".
+    ///
+    /// The assertion that matters is the last one: not merely that the row
+    /// changed state, but that a *new* attempt can be prepared straight away.
+    #[test]
+    fn a_refused_preparation_hands_the_repository_back_instead_of_holding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, root) = prepared_attempt(dir.path(), "claude");
+        let refusal = launch_with(
+            &state,
+            r#"{"id":"run"}"#,
+            |op, _| {
+                assert_eq!(op, "work.runs.managed.prepare");
+                Err(WorkbenchError::new(
+                    "unsupported_operation",
+                    "a managed attempt must name a provider with a managed adapter",
+                ))
+            },
+            |_| panic!("a refused preparation observed a process"),
+        )
+        .expect_err("a refused preparation reported success");
+        assert_eq!(refusal.code, "unsupported_operation");
+
+        let row = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        assert_eq!(
+            row["item"]["state"], "cancelled",
+            "an unclaimed attempt survived its own refusal: {row}"
+        );
+
+        // The point of all of it: the next attempt is not refused as busy.
+        state.request("runs.prepare_managed", &json!({"id":"run2","request_id":"prepare2","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"inspect","repo_path":root}).to_string())
+            .expect("the repository was still held by a refused preparation");
+    }
+
+    /// Only an *unclaimed* attempt is released.
+    ///
+    /// Once the harness sets `owner_id` there is a live Manvi session holding
+    /// a provider against that row, and its own failure path resolves it.
+    /// Cancelling underneath it would race a running process and turn a
+    /// recoverable attempt into a lost one, so a failure after the claim
+    /// leaves the row exactly where its owner can still find it.
+    #[test]
+    fn an_attempt_already_claimed_is_left_to_the_session_that_owns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = prepared_attempt(dir.path(), "codex");
+        let failure = launch_with(
+            &state,
+            r#"{"id":"run"}"#,
+            |op, _| {
+                assert_eq!(op, "work.runs.managed.prepare");
+                // Claims, then dies — a provider that started and failed.
+                state.with_store(|store| query(store, "runs.claim", &json!({"id":"run","request_id":"claim","expected_revision":1,"kind":"managed","owner_id":"owner","session_id":"session"}).to_string()))?;
+                Err(WorkbenchError::new("process_unavailable", "the provider exited during startup"))
+            },
+            |_| panic!("a failed preparation observed a process"),
+        )
+        .expect_err("a failed preparation reported success");
+        assert_eq!(failure.code, "process_unavailable");
+        assert_eq!(
+            state.request("runs.get", r#"{"id":"run"}"#).unwrap()["item"]["state"],
+            "starting",
+            "a claimed attempt was cancelled out from under its owning session"
         );
     }
 

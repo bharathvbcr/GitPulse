@@ -60,6 +60,208 @@ pub struct HelloResult {
     pub ops: Vec<String>,
     #[serde(default)]
     pub posture: String,
+    /// Coding agents the running harness has a *managed* adapter for.
+    ///
+    /// `None` means this build did not say — every Manvi that predates the
+    /// field omits it — and must never be read as "it has none". `ops` cannot
+    /// stand in: `work.runs.managed.prepare` is registered whenever a managed
+    /// runner exists, so a codex-only harness and a codex+claude harness
+    /// advertise the identical operation.
+    #[serde(default)]
+    pub managed_providers: Option<Vec<String>>,
+}
+
+/// What the installed harness says about its adapter for one provider.
+///
+/// Three outcomes, never two. Collapsing `Unknown` into `Absent` would let a
+/// harness that was never asked refuse a lane that works, and collapsing it
+/// into `Present` would put the repository's single run slot behind a launch
+/// that cannot start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedAdapter {
+    /// The harness published its adapter set and this provider is in it.
+    Present,
+    /// The harness published its adapter set and this provider is not in it.
+    /// `published` is what it did list, for an error that names the truth.
+    Absent { published: Vec<String> },
+    /// The harness published no adapter set, so nothing was verified.
+    /// `reason` says why, in the harness's own terms where there is one.
+    Unknown { reason: String },
+}
+
+impl HelloResult {
+    /// Classifies one provider against this handshake. The only place that
+    /// decision is made; callers branch on the verdict rather than re-reading
+    /// `managed_providers` and inventing a fourth opinion about it.
+    pub fn managed_adapter(&self, provider: &str) -> ManagedAdapter {
+        match &self.managed_providers {
+            Some(published) if published.iter().any(|p| p == provider) => ManagedAdapter::Present,
+            Some(published) => ManagedAdapter::Absent {
+                published: published.clone(),
+            },
+            None => ManagedAdapter::Unknown {
+                reason: "this Manvi build does not report which managed adapters it has".into(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_adapter_tests {
+    use super::*;
+
+    fn hello(managed: Option<&[&str]>) -> HelloResult {
+        HelloResult {
+            protocol: 1,
+            ops: vec!["work.runs.managed.prepare".into()],
+            posture: "host".into(),
+            managed_providers: managed
+                .map(|list| list.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()),
+        }
+    }
+
+    /// The three verdicts must stay three. A harness that was never asked and
+    /// a harness that answered "none" look identical the moment they are
+    /// merged, and merging them breaks in opposite directions: fold Unknown
+    /// into Absent and every older build loses a managed lane that works; fold
+    /// it into Present and the repository's one run slot goes to a launch that
+    /// cannot start.
+    #[test]
+    fn an_unreported_adapter_set_is_neither_present_nor_absent() {
+        assert_eq!(
+            hello(Some(&["codex", "claude"])).managed_adapter("claude"),
+            ManagedAdapter::Present
+        );
+        assert_eq!(
+            hello(Some(&["codex"])).managed_adapter("claude"),
+            ManagedAdapter::Absent {
+                published: vec!["codex".into()]
+            },
+        );
+        // The empty list is a real answer — "a managed lane with no adapters"
+        // — and must not read as silence.
+        assert_eq!(
+            hello(Some(&[])).managed_adapter("claude"),
+            ManagedAdapter::Absent { published: vec![] },
+        );
+        let silent = hello(None).managed_adapter("claude");
+        assert!(
+            matches!(&silent, ManagedAdapter::Unknown { reason } if reason.contains("does not report")),
+            "a build that published nothing must say so, not answer for it: {silent:?}"
+        );
+    }
+
+    /// The op list was the obvious place to look and cannot answer: a
+    /// codex-only build and a codex+claude build register the identical
+    /// operation. This is the whole reason the adapter set travels separately.
+    #[test]
+    fn serving_the_managed_op_says_nothing_about_which_providers_it_drives() {
+        let codex_only = hello(Some(&["codex"]));
+        let both = hello(Some(&["codex", "claude"]));
+        assert_eq!(codex_only.ops, both.ops);
+        assert_ne!(
+            codex_only.managed_adapter("claude"),
+            both.managed_adapter("claude")
+        );
+    }
+
+    /// Hostile and malformed handshakes, because this field decides whether a
+    /// launch is offered and the reply is one line of NDJSON from a child
+    /// process that may be any version, corrupted, or half-written.
+    #[test]
+    fn a_malformed_adapter_set_never_silently_becomes_an_answer() {
+        // `null` is silence, not "no adapters". A harness that sends it has
+        // told us nothing, and Unknown is the only honest reading.
+        let null: HelloResult = serde_json::from_str(
+            r#"{"protocol":1,"ops":[],"posture":"host","managed_providers":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            null.managed_adapter("codex"),
+            ManagedAdapter::Unknown { .. }
+        ));
+
+        // Wrong types are refused outright rather than coerced. A hello this
+        // build cannot read is a protocol fault, and guessing at it is how a
+        // gate comes to pass on a payload nobody understood. Loud beats quiet:
+        // the caller already treats a failed handshake as "not verified".
+        for hostile in [
+            r#"{"protocol":1,"ops":[],"posture":"host","managed_providers":"codex"}"#,
+            r#"{"protocol":1,"ops":[],"posture":"host","managed_providers":[1,2]}"#,
+            r#"{"protocol":1,"ops":[],"posture":"host","managed_providers":{"codex":true}}"#,
+            r#"{"protocol":1,"ops":[],"posture":"host","managed_providers":[null]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<HelloResult>(hostile).is_err(),
+                "a hello this build cannot read was accepted: {hostile}"
+            );
+        }
+
+        // A field this build has never heard of is ignored, so a newer harness
+        // does not break an older host. Only a *type* change on a field we do
+        // read is a break, which is the case above.
+        let newer: HelloResult = serde_json::from_str(
+            r#"{"protocol":1,"ops":[],"posture":"host","managed_providers":["codex"],"future":{"x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.managed_adapter("codex"), ManagedAdapter::Present);
+
+        // Adversarial-but-well-typed content stays data: no provider matches
+        // by prefix, case, whitespace or substring, because a launch routed by
+        // a near-miss would reach an adapter written for someone else.
+        let tricky = hello(Some(&["CODEX", "codex ", " codex", "codexx", "cod"]));
+        assert!(matches!(
+            tricky.managed_adapter("codex"),
+            ManagedAdapter::Absent { .. }
+        ));
+        assert_eq!(hello(Some(&["codex"])).managed_adapter("codex"), ManagedAdapter::Present);
+        // Including the empty provider name, which is what an absent field in
+        // a caller's own payload would degrade to.
+        assert!(matches!(
+            hello(Some(&["codex"])).managed_adapter(""),
+            ManagedAdapter::Absent { .. }
+        ));
+    }
+
+    /// A large or duplicated adapter set is carried, not truncated, at the
+    /// decision boundary — the bound belongs where it is *rendered*, so a
+    /// caller asking "is claude present?" still gets the true answer.
+    #[test]
+    fn a_large_adapter_set_still_answers_precisely() {
+        let mut many: Vec<String> = (0..5_000).map(|i| format!("provider-{i}")).collect();
+        many.push("claude".into());
+        many.extend(std::iter::repeat_n("codex".to_string(), 100));
+        let hello = HelloResult {
+            protocol: 1,
+            ops: vec![],
+            posture: "host".into(),
+            managed_providers: Some(many),
+        };
+        assert_eq!(hello.managed_adapter("claude"), ManagedAdapter::Present);
+        assert_eq!(hello.managed_adapter("codex"), ManagedAdapter::Present);
+        assert!(matches!(
+            hello.managed_adapter("grok"),
+            ManagedAdapter::Absent { .. }
+        ));
+    }
+
+    /// A field absent from the wire decodes as Unknown rather than defaulting
+    /// to an empty list — `#[serde(default)]` on a `Vec` would have produced
+    /// exactly the collapse the type exists to prevent.
+    #[test]
+    fn an_older_harnesss_handshake_decodes_as_unknown() {
+        let old: HelloResult =
+            serde_json::from_str(r#"{"protocol":1,"ops":["hello"],"posture":"host"}"#).unwrap();
+        assert!(matches!(
+            old.managed_adapter("codex"),
+            ManagedAdapter::Unknown { .. }
+        ));
+        let new: HelloResult = serde_json::from_str(
+            r#"{"protocol":1,"ops":["hello"],"posture":"host","managed_providers":["codex"]}"#,
+        )
+        .unwrap();
+        assert_eq!(new.managed_adapter("codex"), ManagedAdapter::Present);
+    }
 }
 
 /// One policy decision, exactly as the gate rendered it.

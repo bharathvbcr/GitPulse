@@ -255,6 +255,34 @@ export function handoffGate(input: {
 }
 
 /** Short, non-repeating state word for a run row. */
+/**
+ * A prepared attempt past its expiry.
+ *
+ * The store stops counting such a row against the repository at exactly this
+ * moment — its "is this repository busy" predicate is
+ * `state IN ('starting','running','unresolved') OR (state='prepared' AND
+ * expires_at > now)` — and it refuses every transition out of it but `cancel`.
+ * So it is history that still says "Prepared", and telling the two apart is
+ * the difference between a run the reader can act on and a phantom the panel
+ * long ago stopped polling.
+ *
+ * `now` is a parameter so the caller can pass one instant to a whole render
+ * pass, rather than each call reading a slightly different clock.
+ */
+export function runExpired(run: { state: string; expires_at: number }, now: number = Date.now()): boolean {
+  if (run.state !== "prepared") return false;
+  // Negated rather than written as `<=`, so an unreadable expiry — NaN, a
+  // missing field, a string the wire should never have carried — lands on
+  // *expired*. Every NaN comparison is false, so `<= now` called such a row
+  // live forever: the panel would keep polling something that can never
+  // change and keep offering a recover button the store always refuses. This
+  // is also exactly the complement of the store's own "still holds the
+  // repository" test (`expires_at > now`), and the two must not drift apart:
+  // the panel calling a row live while the store has already released it is
+  // the phantom "Prepared" attempt this predicate exists to end.
+  return !(Number(run.expires_at) * 1000 > now);
+}
+
 export function runStateLabel(state: string): string {
   switch (state) {
     case "prepared": return "Prepared";

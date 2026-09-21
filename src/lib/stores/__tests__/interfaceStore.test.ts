@@ -21,10 +21,21 @@ describe("interfaceStore", () => {
     interfaceStore.reset();
   });
 
-  it("defaults to showing the language bar and harness badges", () => {
+  it("defaults to showing the language bar and harness badges, and code-only percentage mode", () => {
     const prefs = get(interfaceStore);
     expect(prefs.showLanguageBar).toBe(true);
+    expect(prefs.codePercentageMode).toBe("code-only");
     expect(prefs.showHarnessBadges).toBe(true);
+  });
+
+  it("updates code percentage mode between code-only and all, and reset restores default", () => {
+    interfaceStore.setCodePercentageMode("all");
+    expect(get(interfaceStore).codePercentageMode).toBe("all");
+    interfaceStore.setCodePercentageMode("code-only");
+    expect(get(interfaceStore).codePercentageMode).toBe("code-only");
+    interfaceStore.setCodePercentageMode("all");
+    interfaceStore.reset();
+    expect(get(interfaceStore).codePercentageMode).toBe("code-only");
   });
 
   it("status icon is opt-in and resets with interface preferences", () => {

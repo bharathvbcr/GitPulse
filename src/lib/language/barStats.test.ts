@@ -308,3 +308,309 @@ describe("describeLanguageMix", () => {
     expect(mix.dominant).toBeNull();
   });
 });
+
+describe("code percentage options: code-only vs all", () => {
+  it("in code-only mode, excludes markdown and notes and recalculates code percentages to 100%", () => {
+    const rawStats = [
+      stat("Markdown", 80, "prose"),
+      stat("Rust", 15),
+      stat("TypeScript", 5),
+    ];
+    // In code-only mode: Markdown is dropped, Rust and TypeScript scale to 100%
+    const picked = pickLanguageBarStats(rawStats, 6, "code-only");
+    expect(picked.map((s) => s.language)).toEqual(["Rust", "TypeScript"]);
+    // Total code lines = 15 + 5 = 20. Rust = 15/20 = 75%, TS = 5/20 = 25%
+    expect(picked.find((s) => s.language === "Rust")?.percentage).toBe(75);
+    expect(picked.find((s) => s.language === "TypeScript")?.percentage).toBe(25);
+    expect(picked.some((s) => s.language === "Markdown" || s.language === "Other")).toBe(false);
+  });
+
+  it("in code-only mode, never folds markdown or notes into Other", () => {
+    const rawStats = [
+      stat("Rust", 10),
+      stat("TypeScript", 10),
+      stat("Python", 10),
+      stat("Go", 10),
+      stat("C", 10),
+      stat("C++", 10),
+      stat("Markdown", 20, "prose"),
+      stat("AsciiDoc", 10, "prose"),
+      stat("Ruby", 10),
+    ];
+    // Cap at 6. The 7th programming language (TypeScript by alphabetical tie-break) folds into Other,
+    // but Markdown and AsciiDoc must be discarded entirely!
+    const picked = pickLanguageBarStats(rawStats, 6, "code-only");
+    const other = picked.find((s) => s.language === "Other");
+    expect(other).toBeDefined();
+    expect(other?.other_languages).toEqual(["TypeScript"]);
+    expect(other?.other_languages).not.toContain("Markdown");
+    expect(other?.other_languages).not.toContain("AsciiDoc");
+  });
+
+  it("in all mode, includes markdown and notes in the mix", () => {
+    const rawStats = [
+      stat("Markdown", 70, "prose"),
+      stat("Rust", 30),
+    ];
+    const picked = pickLanguageBarStats(rawStats, 6, "all");
+    expect(picked.map((s) => s.language)).toContain("Markdown");
+    expect(picked.map((s) => s.language)).toContain("Rust");
+  });
+
+  it("describeLanguageMix provides an informative note when in all mode and notes are present", () => {
+    const snap = snapshot({
+      value: {
+        stats: [stat("Markdown", 60, "prose"), stat("Rust", 40)],
+        truncated: false,
+        scanned_files: 10,
+        candidate_files: 10,
+      },
+    });
+
+    const codeOnlyMix = describeLanguageMix(snap, "code-only");
+    expect(codeOnlyMix.stats.map((s) => s.language)).toEqual(["Rust"]);
+    expect(codeOnlyMix.dominant?.language).toBe("Rust");
+    expect(codeOnlyMix.dominant?.percentage).toBe(100);
+    expect(codeOnlyMix.note).toBeNull();
+
+    const allMix = describeLanguageMix(snap, "all");
+    expect(allMix.stats.map((s) => s.language)).toEqual(["Markdown", "Rust"]);
+    expect(allMix.note).toContain("Note:");
+    expect(allMix.note).toContain("Markdown");
+  });
+
+  it("gracefully handles a pure markdown/notes repository in code-only mode without NaN", () => {
+    const rawStats = [
+      stat("Markdown", 90, "prose"),
+      stat("Text", 10, "prose"),
+    ];
+    const picked = pickLanguageBarStats(rawStats, 6, "code-only");
+    expect(picked).toEqual([]);
+
+    const snap = snapshot({
+      value: {
+        stats: rawStats,
+        truncated: false,
+        scanned_files: 5,
+        candidate_files: 5,
+      },
+    });
+    const mix = describeLanguageMix(snap, "code-only");
+    expect(mix.stats).toEqual([]);
+    expect(mix.dominant).toBeNull();
+    expect(mix.failed).toBe(false);
+  });
+});
+
+describe("stress testing and maximum hardening", () => {
+  it("handles 10,000 languages with half prose/markdown and half code seamlessly", () => {
+    const hugeStats: RepoLanguageStat[] = [];
+    for (let i = 0; i < 5000; i++) {
+      hugeStats.push({
+        language: `Lang${i}`,
+        color_hex: "#123456",
+        category: "programming",
+        code_lines: 10,
+        file_count: 1,
+        percentage: 0.01,
+      });
+      hugeStats.push({
+        language: `DocNote${i}.md`,
+        color_hex: "#654321",
+        category: "prose",
+        code_lines: 50,
+        file_count: 1,
+        percentage: 0.05,
+      });
+    }
+
+    const start = performance.now();
+    const pickedCodeOnly = pickLanguageBarStats(hugeStats, 6, "code-only");
+    const elapsed = performance.now() - start;
+
+    expect(elapsed).toBeLessThan(200); // Must be fast even on 10k items
+    expect(pickedCodeOnly).toHaveLength(7); // 6 shown + 1 Other
+    const other = pickedCodeOnly.find((s) => s.language === "Other");
+    expect(other).toBeDefined();
+    // None of the 5,000 markdown/doc languages must ever leak into other_languages
+    expect(other?.other_languages?.some((name) => name.startsWith("DocNote"))).toBe(false);
+    // All 6 shown must be programming languages
+    for (const item of pickedCodeOnly) {
+      if (item.language !== "Other") {
+        expect(item.language.startsWith("Lang")).toBe(true);
+      }
+    }
+    // Total percentages should sum close to 100%
+    const sumPct = pickedCodeOnly.reduce((sum, s) => sum + s.percentage, 0);
+    expect(sumPct).toBeGreaterThanOrEqual(99.0);
+    expect(sumPct).toBeLessThanOrEqual(101.0);
+  });
+
+  it("handles extreme scale line counts (billions) without float overflow", () => {
+    const rawStats: RepoLanguageStat[] = [
+      {
+        language: "Rust",
+        color_hex: "#dea584",
+        category: "programming",
+        code_lines: 8_000_000_000,
+        file_count: 5000,
+        percentage: 80,
+      },
+      {
+        language: "TypeScript",
+        color_hex: "#3178c6",
+        category: "programming",
+        code_lines: 2_000_000_000,
+        file_count: 2000,
+        percentage: 20,
+      },
+      {
+        language: "Markdown",
+        color_hex: "#083fa1",
+        category: "prose",
+        code_lines: 10_000_000_000,
+        file_count: 10000,
+        percentage: 50,
+      },
+    ];
+
+    const picked = pickLanguageBarStats(rawStats, 6, "code-only");
+    expect(picked.map((s) => s.language)).toEqual(["Rust", "TypeScript"]);
+    expect(picked[0].percentage).toBe(80);
+    expect(picked[1].percentage).toBe(20);
+    expect(picked.reduce((sum, s) => sum + s.percentage, 0)).toBe(100);
+  });
+
+  it("resilient against poisoned numbers: NaN, Infinity, negative values", () => {
+    const rawStats: RepoLanguageStat[] = [
+      {
+        language: "Rust",
+        color_hex: "#dea584",
+        category: "programming",
+        code_lines: -100,
+        file_count: -1,
+        percentage: Number.NaN,
+      },
+      {
+        language: "Python",
+        color_hex: "#3572A5",
+        category: "programming",
+        code_lines: 100,
+        file_count: 1,
+        percentage: Number.POSITIVE_INFINITY,
+      },
+      {
+        language: "Markdown",
+        color_hex: "#083fa1",
+        category: "prose",
+        code_lines: 500,
+        file_count: 5,
+        percentage: -50,
+      },
+    ];
+
+    const picked = pickLanguageBarStats(rawStats, 6, "code-only");
+    for (const stat of picked) {
+      expect(Number.isFinite(stat.percentage)).toBe(true);
+      expect(stat.percentage).toBeGreaterThanOrEqual(0);
+      expect(Number.isFinite(stat.code_lines ?? 0)).toBe(true);
+    }
+  });
+
+  it("handles zero code lines everywhere without divide-by-zero NaN", () => {
+    const rawStats: RepoLanguageStat[] = [
+      {
+        language: "Rust",
+        color_hex: "#dea584",
+        category: "programming",
+        code_lines: 0,
+        file_count: 10,
+        percentage: 0,
+      },
+      {
+        language: "TypeScript",
+        color_hex: "#3178c6",
+        category: "programming",
+        code_lines: 0,
+        file_count: 5,
+        percentage: 0,
+      },
+    ];
+
+    const picked = pickLanguageBarStats(rawStats, 6, "code-only");
+    expect(picked).toHaveLength(2);
+    expect(picked.every((s) => s.percentage === 0)).toBe(true);
+    expect(picked.every((s) => Number.isFinite(s.percentage))).toBe(true);
+  });
+
+  it("identifies markdown and notes across all common naming variations and casing", () => {
+    const names = [
+      "Markdown",
+      "markdown",
+      "MARKDOWN",
+      "Text",
+      "text",
+      "Plain Text",
+      "AsciiDoc",
+      "reStructuredText",
+      "notes",
+      "release_notes.md",
+      "meeting-notes.txt",
+    ];
+
+    for (const name of names) {
+      const item: RepoLanguageStat = {
+        language: name,
+        color_hex: "#000",
+        category: "unknown",
+        code_lines: 100,
+        file_count: 1,
+        percentage: 50,
+      };
+      const codeItem: RepoLanguageStat = {
+        language: "Rust",
+        color_hex: "#dea584",
+        category: "programming",
+        code_lines: 100,
+        file_count: 1,
+        percentage: 50,
+      };
+
+      const picked = pickLanguageBarStats([item, codeItem], 6, "code-only");
+      expect(picked.map((s) => s.language)).toEqual(["Rust"]);
+      expect(picked[0].percentage).toBe(100);
+    }
+  });
+
+  it("remains deterministic across 1,000 rapid mode switches", () => {
+    const rawStats: RepoLanguageStat[] = [
+      stat("Markdown", 50, "prose"),
+      stat("Rust", 30),
+      stat("Go", 20),
+    ];
+    const snap = snapshot({ value: { stats: rawStats, truncated: false, scanned_files: 3, candidate_files: 3 } });
+
+    let lastCodeOnly: string | null = null;
+    let lastAll: string | null = null;
+
+    for (let i = 0; i < 1000; i++) {
+      const codeOnlyMix = describeLanguageMix(snap, "code-only");
+      const allMix = describeLanguageMix(snap, "all");
+
+      const codeOnlyStr = JSON.stringify(codeOnlyMix);
+      const allStr = JSON.stringify(allMix);
+
+      if (lastCodeOnly !== null) {
+        expect(codeOnlyStr).toBe(lastCodeOnly);
+      }
+      if (lastAll !== null) {
+        expect(allStr).toBe(lastAll);
+      }
+
+      lastCodeOnly = codeOnlyStr;
+      lastAll = allStr;
+    }
+  });
+});
+
+

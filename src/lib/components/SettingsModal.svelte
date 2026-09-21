@@ -56,6 +56,7 @@
   import type { RefScope } from "../graph/refScope";
   import type { StatusBarMode } from "../ui/statusBarMode";
   import type { DiagnosticsButtonMode } from "../ui/diagnosticsButton";
+  import type { CodePercentageMode } from "../language/barStats";
   import { ACCENTS, accentSwatch } from "../ui/accents";
   import {
     TAB_WIDTHS,
@@ -385,6 +386,23 @@
       value: "issues",
       label: "When recorded",
       title: "Show it only once an error or warning has been recorded",
+    },
+  ];
+
+  const CODE_PERCENTAGE_OPTIONS: readonly {
+    value: CodePercentageMode;
+    label: string;
+    title: string;
+  }[] = [
+    {
+      value: "code-only",
+      label: "Only code files",
+      title: "Exclude Markdown, notes, and documentation from code percentage",
+    },
+    {
+      value: "all",
+      label: "Include notes",
+      title: "Include markdowns and notes with an explanatory note",
     },
   ];
 
@@ -853,6 +871,22 @@
                         checked={$interfaceStore.showLanguageBar}
                         onchange={(next) => interfaceStore.setShowLanguageBar(next)}
                       />
+                      {#if $interfaceStore.showLanguageBar}
+                        <div class="mt-2 ml-4 pl-3 border-l border-border/60 space-y-1.5">
+                          <div class="text-textMuted text-[10px]">Code percentage basis</div>
+                          <SettingSegment
+                            ariaLabel="Code percentage calculation options"
+                            options={CODE_PERCENTAGE_OPTIONS}
+                            value={$interfaceStore.codePercentageMode}
+                            onselect={(mode) => interfaceStore.setCodePercentageMode(mode)}
+                          />
+                          <p class="text-textMuted text-[10px] leading-snug">
+                            {$interfaceStore.codePercentageMode === "code-only"
+                              ? "Percentages reflect only programming code files; markdowns and notes are excluded."
+                              : "Note: Markdowns and note files are counted toward percentages with an explanatory note."}
+                          </p>
+                        </div>
+                      {/if}
                     </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
                       <SettingToggle

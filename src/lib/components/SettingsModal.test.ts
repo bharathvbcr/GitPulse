@@ -168,8 +168,16 @@ describe("SettingsModal layout options", () => {
     for (const label of ["Full", "Compact", "Hidden", "Always", "When recorded"]) {
       expect(layout, `missing option ${label}`).toContain(`>${label}`);
     }
-    // A fresh store is full + always, so exactly two options read as pressed.
-    expect(layout.match(/aria-pressed="true"/g)).toHaveLength(2);
+    // *Which* options are pressed, not how many. A bare count agreed just as
+    // readily when the wrong ones were selected — "Compact" and "When
+    // recorded" would have satisfied `toHaveLength(2)` — and then broke, with
+    // nothing in the failure naming the cause, the first time this panel grew
+    // another segment. Reading the label out of each pressed button checks the
+    // thing the test is named for and survives a fourth one being added.
+    const pressed = [...layout.matchAll(/aria-pressed="true"[^>]*>\s*([^<]*?)\s*</g)].map(
+      (match) => match[1],
+    );
+    expect(pressed.sort()).toEqual(["Always", "Full", "Only code files"]);
   });
 });
 

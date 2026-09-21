@@ -1,4 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -49,6 +51,74 @@ function harnessManagedProviders(): string[] | null {
   return [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
 }
 
+/**
+ * The adapter set the *installed* harness publishes at handshake, or a named
+ * reason it could not be asked.
+ *
+ * The four arms above all read source. Source parity is necessary and was not
+ * sufficient: a machine whose `manvi` binary predated the Claude adapter passed
+ * every one of them and still could not run a managed Claude attempt. It
+ * offered the lane, stored the attempt, took the repository's one run slot, and
+ * refused with a sentence written for the providers that build did have —
+ * "this managed adapter requires a fresh Codex attempt" — at a reader who had
+ * selected Claude Code.
+ *
+ * `ops` cannot answer this. `work.runs.managed.prepare` is registered whenever
+ * a managed runner exists, so a codex-only build advertises exactly the same
+ * operation as a codex+claude one. Only the adapter set separates them, which
+ * is why the handshake carries it.
+ */
+function installedManagedProviders(): { providers: string[] } | { skipped: string } {
+  const explicit = process.env.GITPULSE_MANVI_BIN;
+  if (explicit !== undefined && !existsSync(explicit)) {
+    // A path somebody typed is a statement; do not search past a typo, for the
+    // same reason the host does not.
+    return { skipped: `GITPULSE_MANVI_BIN is set to ${explicit}, which is not a file` };
+  }
+  let binary = explicit;
+  if (!binary) {
+    try {
+      binary = execFileSync(process.platform === "win32" ? "where" : "which", ["manvi"], {
+        encoding: "utf8",
+      }).split("\n")[0]?.trim();
+    } catch {
+      binary = undefined;
+    }
+  }
+  if (!binary) return { skipped: "no `manvi` binary is installed on this machine" };
+
+  // A profile database is what enables the workbench module, and with it the
+  // managed lane; without one the harness configures no managed runner and
+  // would truthfully report no adapter set at all. The file is never created:
+  // `hello` is answered before any store call, so this costs one short-lived
+  // child and touches nothing.
+  const profile = path.join(mkdtempSync(path.join(tmpdir(), "gp-parity-")), "profile.sqlite");
+  let line: string;
+  try {
+    line = execFileSync(binary, ["serve", "--workbench-db", profile], {
+      input: `${JSON.stringify({ id: "1", op: "hello", params: { protocol: 1, host: "gitpulse" } })}\n`,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: { ...process.env, MANVI_HARNESS_INIT_ENABLED: "false" },
+    }).split("\n")[0] ?? "";
+  } catch (cause) {
+    return { skipped: `\`${binary} serve\` could not be handshaken: ${String(cause)}` };
+  }
+  const hello = JSON.parse(line)?.result;
+  if (!hello?.ops?.includes("work.runs.managed.prepare")) {
+    return { skipped: `${binary} serves no managed lane, so it has no adapter set to compare` };
+  }
+  if (hello.managed_providers === undefined) {
+    return {
+      skipped:
+        `${binary} advertises a managed lane but publishes no adapter set, so which providers it ` +
+        `can actually drive is unverifiable from here — this is the exact condition that made a ` +
+        `stale harness refuse a Claude launch in Codex's words. Rebuild and install Manvi.`,
+    };
+  }
+  return { providers: [...(hello.managed_providers as string[])].sort() };
+}
+
 describe("managed provider parity", () => {
   const renderer: AgentProvider[] = [...MANAGED_PROVIDERS].sort();
 
@@ -94,6 +164,22 @@ describe("managed provider parity", () => {
         .not.toMatch(/\bprovider\b[^\n]*(===|!==)\s*"(codex|claude|grok|agy)"/);
     }
     expect(client).toContain("supportsManaged(run.provider)");
+  });
+
+  it("agrees with the adapter set the installed harness actually publishes", () => {
+    const installed = installedManagedProviders();
+    if ("skipped" in installed) {
+      // Not a pass, and deliberately loud. Every source arm can agree while
+      // the binary on this machine disagrees with all of them, so a run that
+      // could not reach the binary has established nothing about it and says
+      // which of the reachable states it was in instead of staying quiet.
+      expect(installed.skipped).toMatch(
+        /no `manvi` binary|not a file|could not be handshaken|serves no managed lane|publishes no adapter set/,
+      );
+      console.warn(`managed provider parity: installed-harness arm did not run — ${installed.skipped}`);
+      return;
+    }
+    expect(installed.providers).toEqual(renderer);
   });
 
   it("agrees with the harness's adapter set, or says it could not look", () => {

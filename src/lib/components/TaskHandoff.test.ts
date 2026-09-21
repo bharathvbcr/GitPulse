@@ -76,7 +76,12 @@ describe("the agent handoff has one implementation", () => {
   });
 
   it("shows the run before the form once one is live", () => {
-    expect(panel).toContain("const live = $derived(runs.filter((run) => LIVE.includes(run.state)))");
+    // "Live" has to mean the same thing here as it does to the store, which
+    // releases a prepared attempt the moment it expires. While this filter
+    // looked only at `state`, an expired preparation kept the form folded
+    // away — so the one control that could recover the situation was hidden
+    // behind a row that was already dead.
+    expect(panel).toContain("const live = $derived(runs.filter((run) => LIVE.includes(run.state) && !runExpired(run, clock)))");
     expect(panel).toContain("const formOpen = $derived(expandedForm ?? live.length === 0)");
     // Tailwind preflight's `[hidden]` has zero specificity; without this the
     // fold would be decorative and the form would stay on screen.
@@ -85,9 +90,22 @@ describe("the agent handoff has one implementation", () => {
 
   it("keeps polling scoped to runs that can still change", () => {
     expect(panel).toContain('["starting", "running"].includes(run.state)');
-    expect(panel).toContain("run.expires_at * 1000 > Date.now()");
+    expect(panel).toContain("run.expires_at * 1000 > clock");
     expect(panel).toContain('document.visibilityState !== "hidden"');
     expect(panel).toContain("if (!active)");
     expect(panel).toContain("runs.length >= 180");
+  });
+
+  it("answers 'keep polling' and 'still live' from one instant", () => {
+    // These two decisions used to read different clocks — the poll loop called
+    // `Date.now()` inline while the liveness filter had no clock at all — so
+    // the panel could stop polling a row and go on rendering it as live. The
+    // shared `clock` is advanced where polling is reconsidered, which is also
+    // the last tick after an expiry, and that tick is what flips the row.
+    expect(panel).toContain("let clock = $state(Date.now());");
+    expect(panel).toContain("clock = Date.now();");
+    // Nothing may reach for the wall clock again behind `clock`'s back.
+    const body = panel.slice(panel.indexOf("function schedule()"));
+    expect(body.slice(0, body.indexOf("async function refresh"))).not.toMatch(/expires_at[^\n]*Date\.now\(\)/);
   });
 });

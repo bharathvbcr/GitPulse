@@ -39,6 +39,26 @@ export interface LanguageStatsReport {
   candidate_files: number;
 }
 
+export type CodePercentageMode = "code-only" | "all";
+
+const NOTE_MARKDOWN_LANGUAGES = new Set([
+  "markdown",
+  "text",
+  "plain text",
+  "restructuredtext",
+  "asciidoc",
+  "notes",
+  "note",
+  "documentation",
+]);
+
+export function isMarkdownOrNote(stat: RepoLanguageStat | LanguageStat): boolean {
+  if (stat.category === "prose") return true;
+  const lower = stat.language.trim().toLowerCase();
+  if (NOTE_MARKDOWN_LANGUAGES.has(lower)) return true;
+  return lower.endsWith(".md") || lower.endsWith(".txt") || lower.startsWith("note");
+}
+
 const MAX_SHOWN = 6;
 const OTHER: LanguageStat = {
   language: "Other",
@@ -69,14 +89,22 @@ function compareByPercentageThenName(a: LanguageStat, b: LanguageStat): number {
  * Prefer programming languages so a small Rust crate cannot be sliced
  * off the bar by lockfiles / JSON / Markdown. Remainder folds into Other.
  * The bar itself is then ordered by percentage, with Other last.
+ *
+ * In "code-only" mode, markdowns and notes are excluded, and percentages
+ * are recalculated so the code files sum to 100%.
  */
 export function pickLanguageBarStats(
   stats: RepoLanguageStat[],
   maxShown = MAX_SHOWN,
+  mode: CodePercentageMode = "all",
 ): LanguageStat[] {
   if (stats.length === 0) return [];
+  const candidates =
+    mode === "code-only" ? stats.filter((s) => !isMarkdownOrNote(s)) : stats;
+  if (candidates.length === 0) return [];
+
   const merged = new Map<string, LanguageStat>();
-  for (const s of stats) {
+  for (const s of candidates) {
     const prev = merged.get(s.language);
     if (!prev) {
       merged.set(s.language, { ...s, percentage: finiteOrZero(s.percentage) });
@@ -86,8 +114,31 @@ export function pickLanguageBarStats(
     prev.code_lines = (prev.code_lines ?? 0) + finiteOrZero(s.code_lines);
     prev.file_count = (prev.file_count ?? 0) + finiteOrZero(s.file_count);
   }
-  const cap = Number.isFinite(maxShown) ? Math.max(0, Math.floor(maxShown)) : 0;
+
   const deduped = [...merged.values()];
+
+  if (mode === "code-only") {
+    const totalLines = deduped.reduce(
+      (sum, s) => sum + finiteOrZero(s.code_lines),
+      0,
+    );
+    if (totalLines > 0) {
+      for (const s of deduped) {
+        const lines = finiteOrZero(s.code_lines);
+        s.percentage = (lines / totalLines) * 100;
+      }
+    } else {
+      const rawSum = deduped.reduce((sum, s) => sum + finiteOrZero(s.percentage), 0);
+      for (const s of deduped) {
+        s.percentage =
+          rawSum > 0
+            ? (finiteOrZero(s.percentage) / rawSum) * 100
+            : 0;
+      }
+    }
+  }
+
+  const cap = Number.isFinite(maxShown) ? Math.max(0, Math.floor(maxShown)) : 0;
   const programming = deduped.filter(isProgramming).sort(compareByPercentageThenName);
   const rest = deduped.filter((s) => !isProgramming(s)).sort(compareByPercentageThenName);
   const shown: LanguageStat[] = [];
@@ -98,6 +149,13 @@ export function pickLanguageBarStats(
   const used = new Set(shown.map((s) => s.language));
   const leftover = deduped.filter((s) => !used.has(s.language));
   shown.sort(compareByPercentageThenName);
+
+  if (mode === "code-only") {
+    for (const s of shown) {
+      s.percentage = Math.round(s.percentage * 10) / 10;
+    }
+  }
+
   if (leftover.length === 0) return shown;
   const otherPct = leftover.reduce((sum, s) => sum + finiteOrZero(s.percentage), 0);
   const otherLines = leftover.reduce((sum, s) => sum + finiteOrZero(s.code_lines), 0);
@@ -130,6 +188,12 @@ export interface LanguageMix {
   partialNotice: string | null;
   /** True when the measurement failed and nothing survives to show. */
   failed: boolean;
+  /** Whether the percentage calculation only considers code files or includes markdowns/notes. */
+  mode: CodePercentageMode;
+  /** Informative note when notes/markdown are included in the calculation. */
+  note: string | null;
+  /** Whether markdowns or notes exist in the repository scan. */
+  hasNotesOrMarkdown: boolean;
 }
 
 /** The shape `describeLanguageMix` needs from a metric snapshot. */
@@ -138,6 +202,7 @@ export interface LanguageMixInput {
   state: "idle" | "loading" | "ready" | "failed";
   /** Non-null when the value no longer describes the repository. */
   stale: string | null;
+  mode?: CodePercentageMode;
 }
 
 const EMPTY_MIX: LanguageMix = {
@@ -146,6 +211,9 @@ const EMPTY_MIX: LanguageMix = {
   partial: false,
   partialNotice: null,
   failed: false,
+  mode: "code-only",
+  note: null,
+  hasNotesOrMarkdown: false,
 };
 
 /**
@@ -155,14 +223,24 @@ const EMPTY_MIX: LanguageMix = {
  * never renders as a complete reading — is a testable function rather than a
  * condition buried in markup.
  */
-export function describeLanguageMix(snapshot: LanguageMixInput): LanguageMix {
+export function describeLanguageMix(
+  snapshot: LanguageMixInput,
+  mode: CodePercentageMode = "code-only",
+): LanguageMix {
+  const effectiveMode = snapshot.mode ?? mode;
   const failed = snapshot.state === "failed" && snapshot.value === null;
   if (!snapshot.value || !Array.isArray(snapshot.value.stats)) {
-    return { ...EMPTY_MIX, failed };
+    return { ...EMPTY_MIX, failed, mode: effectiveMode };
   }
-  const stats = pickLanguageBarStats(snapshot.value.stats);
+  const hasNotesOrMarkdown = snapshot.value.stats.some(isMarkdownOrNote);
+  const stats = pickLanguageBarStats(snapshot.value.stats, MAX_SHOWN, effectiveMode);
   const truncated = snapshot.value.truncated === true;
   const stale = snapshot.stale !== null;
+  const note =
+    effectiveMode === "all" && hasNotesOrMarkdown
+      ? "Note: Includes Markdown and notes in percentage calculation."
+      : null;
+
   return {
     stats,
     dominant: stats.find((s) => s.language !== "Other") ?? stats[0] ?? null,
@@ -173,5 +251,8 @@ export function describeLanguageMix(snapshot: LanguageMixInput): LanguageMix {
         ? "The repository changed since this scan; percentages are a floor."
         : null,
     failed,
+    mode: effectiveMode,
+    note,
+    hasNotesOrMarkdown,
   };
 }

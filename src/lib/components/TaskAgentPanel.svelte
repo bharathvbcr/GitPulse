@@ -35,6 +35,7 @@
   } from "../workbench/client";
   import {
     PROVIDER_LABELS,
+    runExpired,
     runStateLabel,
     sanitizeHandoff,
     type HandoffGate,
@@ -63,6 +64,16 @@
   };
   /** Runs still worth watching; anything else is history. */
   const LIVE = ["prepared", "starting", "running"];
+  /**
+   * One instant per render pass, refreshed wherever polling is reconsidered.
+   *
+   * A prepared attempt stops being live at a wall-clock moment, not on any
+   * event, so without a value the view can depend on, an expired preparation
+   * keeps rendering as "Prepared" — which is precisely what it did: the panel
+   * stopped polling it the second it expired and then showed that last frame
+   * forever, offering a recover button the store would always refuse.
+   */
+  let clock = $state(Date.now());
 
   let settings = $state<HandoffSettings>(untrack(() => sanitizeHandoff($interfaceStore.taskHandoff)));
   let gate = $state<HandoffGate>({ ok: false, reason: "" });
@@ -86,7 +97,7 @@
   let generation = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
-  const live = $derived(runs.filter((run) => LIVE.includes(run.state)));
+  const live = $derived(runs.filter((run) => LIVE.includes(run.state) && !runExpired(run, clock)));
   // Null means "nobody has chosen"; the default follows whether a run is live.
   const formOpen = $derived(expandedForm ?? live.length === 0);
 
@@ -95,7 +106,12 @@
   function schedule() {
     if (timer) clearTimeout(timer);
     timer = null;
-    if (!disposed && active && document.visibilityState !== "hidden" && runs.some((run) => ["starting", "running"].includes(run.state) || (run.state === "prepared" && run.expires_at * 1000 > Date.now()))) {
+    if (disposed || !active || document.visibilityState === "hidden") return;
+    // Advanced before the decision below, so "keep polling" and "still live"
+    // are answered against one instant. The final tick after an expiry is what
+    // flips the row from Prepared to expired and then stops the loop.
+    clock = Date.now();
+    if (runs.some((run) => ["starting", "running"].includes(run.state) || (run.state === "prepared" && run.expires_at * 1000 > clock))) {
       timer = setTimeout(() => { timer = null; void refresh(); }, 1500);
     }
   }
@@ -225,15 +241,17 @@
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
   {#if !runs.length}<p>{loading ? "Loading runs…" : "No runs yet."}</p>{/if}
   {#each runs as run (run.id)}
-    <article class:is-live={LIVE.includes(run.state)}>
-      <strong>{PROVIDER_LABELS[run.provider] ?? run.provider} · {run.kind === "managed" ? "Managed" : "Terminal"} · {run.state === "exited" ? "Process exited" : runStateLabel(run.state)}</strong>
+    {@const expired = runExpired(run, clock)}
+    <article class:is-live={LIVE.includes(run.state) && !expired}>
+      <strong>{PROVIDER_LABELS[run.provider] ?? run.provider} · {run.kind === "managed" ? "Managed" : "Terminal"} · {run.state === "exited" ? "Process exited" : expired ? "Preparation expired" : runStateLabel(run.state)}</strong>
       <small>Revision {run.source_revision} · {PERMISSION_LABELS[run.permission_mode] ?? run.permission_mode}{run.exit_code !== null ? ` · exit ${run.exit_code}` : ""}</small>
       <small title={run.cwd}>{run.cwd}</small>
       {#if run.reason}<p>{run.reason}</p>{/if}
       {#if run.outcome_uncertain}<p class="error">Execution remains unresolved. Reconcile it before another attempt in this repository.</p>{/if}
-      {#if run.kind === "external_terminal" && LIVE.includes(run.state)}<button class="gp-btn" type="button" onclick={() => reopen(run)} disabled={busy}>Open terminal</button>{/if}
+      {#if expired}<p>This preparation expired before it started, so it no longer holds the repository. Cancel it to clear it from the history, then prepare a new attempt.</p>{/if}
+      {#if run.kind === "external_terminal" && LIVE.includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => reopen(run)} disabled={busy}>Open terminal</button>{/if}
       {#if run.kind === "managed"}
-        {#if ["prepared", "starting"].includes(run.state)}<button class="gp-btn" type="button" onclick={() => resumeManaged(run)} disabled={busy}>Start or recover managed launch</button>{/if}
+        {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => resumeManaged(run)} disabled={busy}>Start or recover managed launch</button>{/if}
         {#if ["starting", "running", "unresolved"].includes(run.state)}<button class="gp-btn" type="button" onclick={() => stopManaged(run)} disabled={busy}>Stop managed run</button>{/if}
         {#if run.provider_state}<p>Provider turn: {run.provider_state}. {run.provider_state === "completed" ? "Review the result before accepting the task." : ""}</p>{/if}
         <button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={busy}>View output and settings</button>

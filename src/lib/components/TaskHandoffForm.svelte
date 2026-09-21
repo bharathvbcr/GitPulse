@@ -148,6 +148,14 @@
   function choose(next: Partial<HandoffSettings>) {
     settings = reconcileHandoff({ ...settings, ...next });
     if (settings.permission !== "bypass") acknowledged = false;
+    // The message described a launch with the *previous* settings, so once
+    // they change it describes nothing the reader can act on. Leaving it up is
+    // how a managed refusal came to sit under a Terminal handoff, naming Codex
+    // at someone who had selected Claude Code — three ways wrong at once.
+    // Safe unconditionally: every control here is disabled while `pending`, so
+    // this cannot discard the warning for an in-flight retry.
+    error = "";
+    note = "";
   }
 
   async function browse() {
