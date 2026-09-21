@@ -178,6 +178,12 @@ verdict depended on how busy the machine was.
 - **A long blame line has somewhere to go.** Lines were clipped at the pane edge
   with no scrollbar to reach the rest; the pane now shares one horizontal
   scroller, as the diff does.
+- **Blame pane continuous flashing and state loss eliminated.** Background status
+  polls and content revision updates no longer unmount the code-age timeline strip
+  or replace the VirtualList with a loading screen. Implemented a stale-while-revalidate
+  (SWR) architecture, deep line equality checking (`areBlameLinesEqual`), and
+  subject-aware state tracking that preserves the user's scroll position and active
+  timeline filter selections across background revalidations.
 
 ### Hardened
 

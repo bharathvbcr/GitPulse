@@ -77,6 +77,27 @@ describe("BlameViewer audit fixes", () => {
     expect(source).toContain("if (key === prevKey) return;");
   });
 
+  it("re-blames on full refresh and repo events through content revisions while preserving SWR stability", () => {
+    // repoStore.refresh() advances contentRevisions so explicit user refreshes
+    // pull fresh blame, while SWR rendering keeps the pane from flashing or jumping.
+    expect(source).toContain("contentRevisions = repoStore.contentRevisions;");
+    expect(source).toContain("$contentRevisions[repo]");
+  });
+
+  it("preserves the timeline strip and virtual list during background revalidation without flashing", () => {
+    // Background revalidations must not unmount the timeline or replace the
+    // source list with a loading screen. Only initial load of a file blanks.
+    expect(source).toContain("{#if blameLines.length > 0 && !errorMsg}");
+    expect(source).not.toContain("{#if blameLines.length > 0 && !isLoading && !errorMsg}");
+    expect(source).toContain("{#if isLoading && blameLines.length === 0}");
+  });
+
+  it("guards blame lines with deep equality to avoid spurious re-renders and scroll/filter resets", () => {
+    // Identical lines returned from background revalidations must not reassign
+    // blameLines or reset scroll position and active selection filters.
+    expect(source).toContain("areBlameLinesEqual");
+  });
+
   it("sizes its rows from the density owner instead of a fixed class", () => {
     // The rows were `h-6` while VirtualList positioned them from
     // rowHeight("blame", density): at Compact the 24px row overhung its 20px

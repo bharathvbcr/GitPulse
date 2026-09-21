@@ -77,15 +77,48 @@
   let disposed = false;
   const detailScope = paneDetails.register("blame");
   let requestCount = 0;
+  let loadedSubject: string | null = null;
+
+  function areBlameLinesEqual(a: BlameLine[], b: BlameLine[]): boolean {
+    if (a === b) return true;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      const la = a[i];
+      const lb = b[i];
+      if (
+        la.line_no !== lb.line_no ||
+        la.commit_id !== lb.commit_id ||
+        la.timestamp !== lb.timestamp ||
+        la.author_name !== lb.author_name ||
+        la.content !== lb.content
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   async function loadBlameFor(repo: string, path: string) {
     if (!repo || !path) return;
+    const subject = `${repo}\u0000${path}`;
     if (running) {
       // One IPC pair at a time, plus the latest requested refresh. Content
       // storms cannot cancel/restart the same slow request indefinitely.
-      if (running.repo !== repo || running.path !== path) inflight?.cancel();
+      if (running.repo !== repo || running.path !== path) {
+        inflight?.cancel();
+        if (loadedSubject !== subject) {
+          blameLines = [];
+          selection = null;
+          listScroll = 0;
+          hoverCommit = null;
+          coverageHits = new Map();
+          coverageFailed = false;
+        }
+      }
       queued = { repo, path };
-      isLoading = true;
+      if (loadedSubject !== subject || blameLines.length === 0) {
+        isLoading = true;
+      }
       errorMsg = null;
       coverageFailed = false;
       return;
@@ -95,7 +128,9 @@
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
-    isLoading = true;
+    if (loadedSubject !== subject || blameLines.length === 0) {
+      isLoading = true;
+    }
     errorMsg = null;
     // The previous file's verdict must not bleed into the loading frame:
     // old lines linger until the guard applies, so clear eagerly.
@@ -111,13 +146,28 @@
           .catch(() => ({ ok: false as const, hits: new Map<number, number>() })),
       ]);
       if (!guard.isLive()) return;
-      blameLines = next;
-      blameNow = Date.now();
-      // A period selected in the file being replaced says nothing about the
-      // one arriving; carrying it over would open the new file pre-filtered.
-      selection = null;
-      listScroll = 0;
-      hoverCommit = null;
+      const isSubjectChange = loadedSubject !== subject;
+      const linesChanged = isSubjectChange || !areBlameLinesEqual(blameLines, next);
+      if (linesChanged) {
+        blameLines = next;
+        blameNow = Date.now();
+      }
+      if (isSubjectChange) {
+        // A period selected in the file being replaced says nothing about the
+        // one arriving; carrying it over would open the new file pre-filtered.
+        selection = null;
+        listScroll = 0;
+        hoverCommit = null;
+        loadedSubject = subject;
+      } else if (linesChanged) {
+        // Same file, but lines updated: preserve scroll and verify active selection
+        if (selection) {
+          const nextTimeline = buildBlameTimeline(next, blameNow);
+          if (selectionLabel(selection, nextTimeline) === null) {
+            selection = null;
+          }
+        }
+      }
       coverageHits = coverage.hits;
       coverageFailed = !coverage.ok;
     } catch (err: unknown) {
@@ -129,6 +179,7 @@
       hoverCommit = null;
       coverageHits = new Map();
       coverageFailed = false;
+      loadedSubject = null;
     } finally {
       if (guard.isLive()) isLoading = false;
       running = null;
@@ -168,8 +219,11 @@
   const blameFingerprint = $derived.by(() => {
     const selected = $repoStore.selectedFilePath;
     const repo = $repoStore.currentPath;
-    const statusCode = selected
-      ? ($repoStore.statuses.find((s) => s.path === selected)?.status_code ?? "")
+    const fileStatus = selected
+      ? $repoStore.statuses.find((s) => s.path === selected)
+      : undefined;
+    const statusCode = fileStatus
+      ? `${fileStatus.status_code}:${fileStatus.is_staged}:${fileStatus.additions}:${fileStatus.deletions}`
       : "";
     const tip =
       $repoStore.branches.find((b) => b.is_current)?.tip_commit_id ?? "";
@@ -200,7 +254,18 @@
         coverageFailed = false;
         errorMsg = null;
         isLoading = false;
+        loadedSubject = null;
         return;
+      }
+      const subject = `${repo}\u0000${selected}`;
+      if (loadedSubject !== subject) {
+        blameLines = [];
+        selection = null;
+        listScroll = 0;
+        hoverCommit = null;
+        coverageHits = new Map();
+        coverageFailed = false;
+        errorMsg = null;
       }
       void loadBlameFor(repo, selected);
     });
@@ -350,7 +415,7 @@
     axis cannot hold — worktree-only, clock-skewed, undated — ride beside it as
     named chips rather than being quietly left out of the denominator.
   -->
-  {#if blameLines.length > 0 && !isLoading && !errorMsg}
+  {#if blameLines.length > 0 && !errorMsg}
     <div class="px-4 py-2 border-b border-border/60 bg-surface/30 font-sans shrink-0 flex flex-col gap-1.5">
       <div class="flex items-end gap-3">
         {#if timeline.periods.length > 0}
@@ -490,7 +555,7 @@
 
     <!-- Blame Lines -->
     <div class="flex-1 min-w-0 flex flex-col">
-      {#if isLoading}
+      {#if isLoading && blameLines.length === 0}
         <div class="h-full flex items-center justify-center text-textMuted font-sans text-xs">
           Loading blame for {filePath}...
         </div>
