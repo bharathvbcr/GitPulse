@@ -110,6 +110,15 @@ pub struct HookInput {
     /// and Codex do not. The stdout schema splits on this, not on event-name
     /// casing: camelCase `sessionStart` is not a host signal.
     pub is_cursor: bool,
+    /// The host's own wording for a `Notification` event, when it sends one.
+    ///
+    /// Read best-effort and never required. The hook reference documents the
+    /// `Notification` event's *matchers* — which is how `notify` learns the
+    /// reason, from its own argument — but does not publish a field carrying
+    /// the message text. So this is used when it is there and its absence
+    /// changes nothing: the reason GitPulse shows comes from the matcher the
+    /// host routed through, not from a field that may not exist.
+    pub message: String,
 }
 
 impl HookInput {
@@ -143,6 +152,7 @@ impl HookInput {
             command: string_at(tool_input, "command"),
             source: string_at(Some(value), "source"),
             is_cursor: is_cursor_payload(value),
+            message: string_at(Some(value), "message"),
         }
     }
 }
@@ -925,7 +935,7 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 /// Every subcommand `gitpulse-hook` answers to.
-pub const SUBCOMMANDS: [&str; 3] = ["collision-guard", "command-gate", "session-brief"];
+pub const SUBCOMMANDS: [&str; 4] = ["collision-guard", "command-gate", "session-brief", "notify"];
 
 /// The arguments that ask this binary who it is instead of running a hook.
 pub const IDENTITY_FLAGS: [&str; 2] = ["--version", "-V"];
@@ -963,16 +973,150 @@ pub fn identity() -> String {
 /// An unknown subcommand is an `Err` for the binary to report on stderr; it is
 /// deliberately not a silent no-op, because a plugin whose hook name has
 /// drifted would otherwise look like a check that ran.
-pub fn dispatch(subcommand: &str, input: &HookInput) -> Result<HookOutput, String> {
+pub fn dispatch(
+    subcommand: &str,
+    argument: Option<&str>,
+    input: &HookInput,
+) -> Result<HookOutput, String> {
     match subcommand {
         "collision-guard" => Ok(run_collision_guard(input)),
         "command-gate" => Ok(run_command_gate(input)),
         "session-brief" => Ok(run_session_brief(input)),
+        "notify" => run_notify(argument, input, notify_send),
         other => Err(format!(
             "unknown subcommand '{other}'; expected one of {}",
             SUBCOMMANDS.join(", ")
         )),
     }
+}
+
+/* ── notify ───────────────────────────────────────────────────────────────── */
+
+/// The environment variable naming the agent that spawned this hook.
+///
+/// Set by GitPulse on the sessions it launches, where the launcher is known
+/// exactly. An external session has none and is identified from the payload.
+pub const AGENT_KIND_ENV: &str = "GITPULSE_AGENT_KIND";
+
+/// Wall-clock ceiling on one notification report.
+///
+/// Much shorter than [`BUDGET`]: a `Notification` hook runs while the user is
+/// already waiting, and there is nothing here worth waiting for. The socket is
+/// on the same machine; if it does not answer within this, it is not there.
+const NOTIFY_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Tells the running GitPulse that this agent wants the user.
+///
+/// The argument, not the payload, carries the reason: the hook reference
+/// documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`,
+/// `agent_completed`, …) but publishes no input field naming which one fired,
+/// so the plugin registers one entry per matcher and each passes its own word
+/// here. That makes the reason a fact about which hook the host chose to run,
+/// rather than a string parsed out of a payload.
+///
+/// This never produces a `systemMessage`, and that is a deliberate departure
+/// from the rest of this module. Everything else here is a *check*, where
+/// silence would be mistaken for a pass. This is a side effect: GitPulse being
+/// closed is the ordinary case, and a warning in the transcript on every turn
+/// would be noise the user cannot act on. Where it went instead is GitPulse's
+/// own notification settings, which report whether the socket is listening and
+/// how many reports it has accepted — a place the user looks when they wonder
+/// why nothing arrives, rather than one that interrupts them when they do not.
+fn run_notify(
+    argument: Option<&str>,
+    input: &HookInput,
+    send: impl FnOnce(&std::path::Path, &str) -> Result<(), String> + Send + 'static,
+) -> Result<HookOutput, String> {
+    let event = argument.unwrap_or_default();
+    if !crate::alerts::bridge::EVENTS
+        .iter()
+        .any(|(name, _)| *name == event)
+    {
+        // An Err rather than silence: an unknown reason means the plugin
+        // manifest and this binary have drifted, which is exactly the kind of
+        // mismatch that otherwise presents as "notifications stopped working".
+        return Err(format!(
+            "unknown notify event '{event}'; expected one of {}",
+            crate::alerts::bridge::EVENTS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let path = match std::env::var_os(crate::alerts::bridge::SOCKET_ENV) {
+        Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
+        _ => crate::alerts::bridge::socket_path()
+            .ok_or("no GitPulse configuration directory to find a notification socket in")?,
+    };
+    let payload = notify_payload(event, input);
+    // Detached at the deadline. A hook the host is waiting on must not be held
+    // by a socket that is not answering, and the report is worth nothing late.
+    match within_budget(NOTIFY_BUDGET, move || send(&path, &payload)) {
+        Some(Ok(())) => Ok(HookOutput::silent()),
+        Some(Err(error)) => Err(format!("notification report not delivered: {error}")),
+        None => Err("notification report exceeded its deadline; not retried".into()),
+    }
+}
+
+/// The JSON one report carries, matching `alerts::bridge::parse_report`.
+fn notify_payload(event: &str, input: &HookInput) -> String {
+    let agent = match std::env::var(AGENT_KIND_ENV) {
+        Ok(kind)
+            if crate::alerts::bridge::AGENTS
+                .iter()
+                .any(|(name, _)| *name == kind) =>
+        {
+            kind
+        }
+        // Nothing authoritative. Cursor identifies itself in its payload;
+        // otherwise this binary is only ever installed as a Claude Code,
+        // Codex or Cursor plugin, and Claude Code is the one whose
+        // `Notification` event exists.
+        _ if input.is_cursor => "cursor".to_string(),
+        _ => "claude".to_string(),
+    };
+    let mut report = serde_json::Map::new();
+    report.insert("v".into(), json!(1));
+    report.insert("event".into(), json!(event));
+    report.insert("agent".into(), json!(agent));
+    if let Ok(session) = std::env::var(crate::alerts::bridge::SESSION_ENV) {
+        if !session.is_empty() {
+            report.insert("session".into(), json!(session));
+        }
+    }
+    if !input.cwd.is_empty() {
+        report.insert("cwd".into(), json!(input.cwd));
+    }
+    if !input.message.is_empty() {
+        report.insert("message".into(), json!(input.message));
+    }
+    Value::Object(report).to_string()
+}
+
+#[cfg(unix)]
+fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    stream
+        .set_write_timeout(Some(NOTIFY_BUDGET))
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    // Half-close so the reader sees EOF and answers rather than waiting for
+    // its own timeout. The ack itself is not read: nothing here can act on it,
+    // and GitPulse's settings panel is where an undelivered report is visible.
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn notify_send(_path: &std::path::Path, _payload: &str) -> Result<(), String> {
+    Err("agent notification reports need a Unix socket, which this platform does not offer".into())
 }
 
 /* ── Shared helpers ───────────────────────────────────────────────────────── */
@@ -2223,7 +2367,7 @@ mod tests {
 
     #[test]
     fn an_unknown_subcommand_is_an_error_the_binary_reports_not_a_silent_no_op() {
-        let err = dispatch("collision-gaurd", &HookInput::default())
+        let err = dispatch("collision-gaurd", None, &HookInput::default())
             .expect_err("a typo must not pass for a check");
         assert!(err.contains("unknown subcommand"));
         for name in SUBCOMMANDS {
@@ -2231,14 +2375,276 @@ mod tests {
         }
     }
 
+    /// Subcommands that *report* something rather than *decide* something.
+    ///
+    /// They may legitimately fail when the thing they report to is absent —
+    /// GitPulse closed, no socket — so `dispatch` is only asked to route them.
+    /// Their own behaviour is covered by the notify tests below. Listed rather
+    /// than inferred so adding one is a deliberate act.
+    const REPORTERS: [&str; 1] = ["notify"];
+
     #[test]
     fn every_advertised_subcommand_dispatches() {
         for name in SUBCOMMANDS {
+            let outcome = dispatch(name, None, &HookInput::default());
+            if REPORTERS.contains(&name) {
+                let error = outcome.expect_err("a reporter with no argument has nothing to send");
+                assert!(
+                    !error.contains("unknown subcommand"),
+                    "{name} is advertised but was not routed: {error}"
+                );
+                continue;
+            }
             assert!(
-                dispatch(name, &HookInput::default()).is_ok(),
+                outcome.is_ok(),
                 "{name} is advertised but does not dispatch"
             );
         }
+    }
+
+    #[test]
+    fn a_reporter_is_a_subcommand_the_dispatcher_knows() {
+        for name in REPORTERS {
+            assert!(SUBCOMMANDS.contains(&name), "{name} is not advertised");
+        }
+    }
+
+    /* ── notify ───────────────────────────────────────────────────────────── */
+
+    /// Serialises the notify tests' environment overrides.
+    ///
+    /// These two variables are not hypothetical in this process: running the
+    /// suite from inside a GitPulse agent tab sets both, so a test that read
+    /// the ambient value would pass on a laptop and fail in CI, or the reverse.
+    /// Every notify test pins both.
+    static NOTIFY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn notify_serial() -> std::sync::MutexGuard<'static, ()> {
+        NOTIFY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn notify_input() -> HookInput {
+        HookInput {
+            hook_event_name: "Notification".into(),
+            session_id: "claude-abc".into(),
+            cwd: "/Users/me/GitPulse".into(),
+            message: "Claude needs your permission to use Bash".into(),
+            ..HookInput::default()
+        }
+    }
+
+    /// Captures what would have gone down the socket.
+    fn captured(
+        event: &str,
+        input: &HookInput,
+    ) -> (
+        Result<HookOutput, String>,
+        std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        let result = run_notify(Some(event), input, move |_, payload| {
+            *sink.lock().unwrap() = Some(payload.to_owned());
+            Ok(())
+        });
+        (result, seen)
+    }
+
+    /// The report a hook sends and the report the socket accepts are two
+    /// halves of one protocol that live in different modules. This asserts
+    /// they are the same protocol by feeding one to the other, which a schema
+    /// written twice could never do.
+    #[test]
+    fn what_the_hook_sends_is_what_the_socket_accepts() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(AGENT_KIND_ENV, "claude")
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let (result, seen) = captured("permission_prompt", &notify_input());
+        assert!(result.is_ok(), "{result:?}");
+        let payload = seen.lock().unwrap().clone().expect("a report was sent");
+        let notice =
+            crate::alerts::bridge::parse_report(payload.as_bytes()).expect("the socket accepts it");
+        assert_eq!(notice.key, "term-4-1");
+        assert_eq!(notice.label, "Claude Code");
+        assert_eq!(notice.place.as_deref(), Some("GitPulse"));
+        assert_eq!(notice.reason.as_deref(), Some("needs your permission"));
+        assert_eq!(
+            notice.detail.as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+    }
+
+    #[test]
+    fn every_event_the_plugin_can_route_produces_an_acceptable_report() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(AGENT_KIND_ENV, "codex")
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        for (event, phrase) in crate::alerts::bridge::EVENTS {
+            let (result, seen) = captured(event, &notify_input());
+            assert!(result.is_ok(), "{event}: {result:?}");
+            let payload = seen.lock().unwrap().clone().expect("a report was sent");
+            let notice = crate::alerts::bridge::parse_report(payload.as_bytes())
+                .unwrap_or_else(|e| panic!("{event} produced a report the socket refused: {e}"));
+            assert_eq!(notice.reason.as_deref(), Some(*phrase));
+            assert_eq!(notice.label, "Codex");
+        }
+    }
+
+    #[test]
+    fn an_event_the_manifest_and_this_binary_disagree_about_is_an_error() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        // The failure this catches is a plugin manifest updated without the
+        // binary, which otherwise presents as "notifications stopped working".
+        for event in ["", "Notification", "permission-prompt", "agent_completed "] {
+            let result = run_notify(Some(event), &notify_input(), |_, _| {
+                panic!("an unknown event reached the socket")
+            });
+            let error = result.expect_err(&format!("{event:?} was accepted"));
+            assert!(error.contains("unknown notify event"), "{error}");
+        }
+        assert!(run_notify(None, &notify_input(), |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_session_outside_gitpulse_still_reports_and_identifies_itself() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .remove(AGENT_KIND_ENV)
+            .remove(crate::alerts::bridge::SESSION_ENV)
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let (result, seen) = captured("agent_completed", &notify_input());
+        assert!(result.is_ok(), "{result:?}");
+        let payload = seen.lock().unwrap().clone().expect("a report was sent");
+        assert!(
+            !payload.contains("\"session\""),
+            "a session key was invented: {payload}"
+        );
+        let notice = crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap();
+        assert_eq!(notice.label, "Claude Code");
+        assert!(notice.key.starts_with("hook-claude-"), "{}", notice.key);
+    }
+
+    #[test]
+    fn an_agent_kind_the_socket_does_not_know_is_not_forwarded_as_one() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(AGENT_KIND_ENV, "not-an-agent")
+            .remove(crate::alerts::bridge::SESSION_ENV)
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let (_, seen) = captured("error", &notify_input());
+        let payload = seen.lock().unwrap().clone().unwrap();
+        assert!(crate::alerts::bridge::parse_report(payload.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_socket_that_never_answers_does_not_hold_the_users_turn() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let started = std::time::Instant::now();
+        let error = run_notify(Some("idle_prompt"), &notify_input(), |_, _| {
+            thread::sleep(Duration::from_secs(30));
+            Ok(())
+        })
+        .expect_err("a hung socket must not report success");
+        assert!(error.contains("deadline"), "{error}");
+        assert!(
+            started.elapsed() < NOTIFY_BUDGET * 4,
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The shipped plugin manifest and this binary have to agree twice over:
+    /// on which subcommands exist, and on which notification events each
+    /// `notify` entry passes. A manifest matcher that reached a `notify` word
+    /// this binary does not know would fail at the moment the user most needs
+    /// it, with nothing in the UI to explain why — so it fails here instead.
+    #[test]
+    fn the_shipped_manifest_asks_only_for_events_this_binary_serves() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate has a parent directory")
+            .join("plugins/gitpulse/hooks/hooks.json");
+        let parsed: Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|e| panic!("{}: {e}", manifest.display())),
+        )
+        .expect("hooks.json is valid JSON");
+        let events = parsed["hooks"]
+            .as_object()
+            .expect("hooks.json has a hooks object");
+        let known: Vec<&str> = crate::alerts::bridge::EVENTS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+
+        let mut notify_entries = 0;
+        for (event_name, groups) in events {
+            for group in groups.as_array().into_iter().flatten() {
+                let matcher = group["matcher"].as_str().unwrap_or_default();
+                for handler in group["hooks"].as_array().into_iter().flatten() {
+                    let command = handler["command"].as_str().unwrap_or_default();
+                    let mut words = command.split_whitespace();
+                    assert_eq!(
+                        words.next(),
+                        Some("gitpulse-hook"),
+                        "{event_name} spawns something else: {command}"
+                    );
+                    let subcommand = words.next().unwrap_or_default();
+                    assert!(
+                        SUBCOMMANDS.contains(&subcommand),
+                        "{event_name} asks for an unknown subcommand: {command}"
+                    );
+                    if subcommand != "notify" {
+                        assert_eq!(words.next(), None, "{command} passes an unread argument");
+                        continue;
+                    }
+                    notify_entries += 1;
+                    let argument = words.next().unwrap_or_default();
+                    assert!(
+                        known.contains(&argument),
+                        "{event_name}/{matcher} reports '{argument}', which the socket refuses; known: {known:?}"
+                    );
+                    assert_eq!(words.next(), None, "{command} passes a third word");
+                    // A `Notification` entry's matcher is what decides the
+                    // sentence the user reads. If the matcher and the argument
+                    // ever drift, the banner names the wrong reason and nothing
+                    // else in the system can tell.
+                    if event_name == "Notification" {
+                        assert_eq!(
+                            matcher, argument,
+                            "the matcher and the reported reason disagree"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            notify_entries >= known.len(),
+            "{notify_entries} manifest entries for {} known events: an event the binary \
+             serves that nothing routes to it is a sentence no user can ever see",
+            known.len()
+        );
+    }
+
+    #[test]
+    fn a_report_never_produces_a_decision_or_a_transcript_warning() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let (result, _) = captured("agent_completed", &notify_input());
+        let output = result.unwrap();
+        assert!(output.is_silent());
+        assert_eq!(output.render(), None);
     }
 
     #[test]
@@ -2273,7 +2679,7 @@ mod tests {
                 "{flag} is both an identity flag and a subcommand"
             );
             assert!(
-                dispatch(flag, &HookInput::default()).is_err(),
+                dispatch(flag, None, &HookInput::default()).is_err(),
                 "{flag} must not dispatch as a hook"
             );
         }

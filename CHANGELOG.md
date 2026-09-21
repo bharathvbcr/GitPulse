@@ -13,24 +13,76 @@ before that tag is pushed.
 
 Nothing yet.
 
-## [1.3.0] - 2026-09-20
+## [1.3.0] - 2026-09-21
 
 A consolidation release. It joins live delivery observability — GitHub Actions
 workflow runs and Firebase App Hosting rollouts tied directly to repository
-commits — with the bodies of work that were in flight beside it: code-age history
-in Blame, a terminal dock that belongs to a repository rather than the workspace,
-terminal output whose links are safe to click and land where they point, and
-walkthrough replay moved out of the title bar.
+commits — with the bodies of work that were in flight beside it: native
+notifications for agent sessions, Claude Code supervised in the managed lane,
+code-age history in Blame, a terminal dock that belongs to a repository rather
+than the workspace, terminal output whose links are safe to click and land where
+they point, and walkthrough replay moved out of the title bar.
 
-Re-cut on 2026-09-20 over a wider tree, adding regression suspects — which commits
-could have caused this symptom, answered from the code graph rather than from
-blame recency — a Health view that reaches a verdict, repository tab groups, and
-the coverage and impact surfaces reduced to what they can actually claim. Two
-process-lifecycle defects are fixed behind them: an ordinary policy-harness
-shutdown that leaked whatever the harness had forked, and a test suite whose
-verdict depended on how busy the machine was.
+Re-cut on 2026-09-21 over a wider tree, adding native notifications for agent
+sessions, quiet hours and sound control, managed Claude Code runs hosted over
+stream-json, regression suspects from the code graph, a Health view that reaches
+a verdict, repository tab groups, and the coverage and impact surfaces reduced
+to what they can actually claim. Two process-lifecycle defects are fixed behind
+them: an ordinary policy-harness shutdown that leaked whatever the harness had
+forked, and a test suite whose verdict depended on how busy the machine was.
 
 ### Added
+
+- **Native notifications for agent sessions.** An agent running in a GitPulse
+  terminal tab was completely silent: Claude Code only sends desktop
+  notifications in a handful of terminals it recognises, Codex's OSC 9 probe
+  recognises a similar short list, and GitPulse's terminal matched neither — so
+  the only signal a waiting agent could give was an unread dot on a tab you had
+  to be looking at. Three layers now carry it, each independently sufficient:
+  - GitPulse reads the PTY itself and understands every notification convention
+    a terminal program has to choose between — `BEL`, OSC 9, OSC 777 and kitty's
+    chunked OSC 99 — so a CLI that signals *any* of them is heard, whatever it
+    is. ConEmu's OSC 9 sub-commands for progress and working directory, which
+    Claude Code's progress bar emits continuously, are not notifications and are
+    not treated as any.
+  - Sessions GitPulse launches are given each CLI's own documented notification
+    flag (`claude --settings`, `codex -c tui.notifications`) for that session
+    only — no file of yours is written — so the CLIs actually emit something.
+    Turn it off under **Configure agent CLIs GitPulse launches**.
+  - The GitPulse plugin's `Notification` and `StopFailure` hooks report *why* an
+    agent stopped — permission, idle, input, finished, asking, error — over a
+    private local socket, which also covers a Claude Code running outside a
+    GitPulse tab.
+- **Quiet hours, sound and per-kind control** for those notifications, and a
+  counter panel that distinguishes a notice suppressed by a rule you set from
+  one that was lost. Notifications are suppressed while you are looking at the
+  session they are about.
+- **Claude Code runs in the managed lane.** Previously only Codex could be
+  supervised by GitPulse — every Claude Code handoff opened a terminal and
+  GitPulse stepped back. A managed Claude run is now hosted over Claude Code's
+  own `stream-json` protocol, so its permission requests arrive as structured
+  approvals you answer in GitPulse, its output is captured, and its completion
+  is a receipt rather than a guess. All six permission modes map to real Claude
+  Code modes, and the one that does not round-trip (`ask` is reported by the CLI
+  as `default`) is verified as such rather than assumed.
+
+  Two honest differences from managed Codex, both visible in the run's recorded
+  configuration: Claude Code has no OS sandbox, so the record says so instead of
+  naming a confinement that does not exist — a managed Claude run is supervised,
+  not confined — and its model is not in that record, because the CLI names it
+  only after the record has been written and made immutable. Repository settings
+  files are deliberately not loaded for a managed run, so a checkout cannot
+  widen the permissions of the run inspecting it.
+- **Claude Code is now the default agent** for a new task handoff, and leads the
+  provider list. The connection still defaults to a terminal in `ask` mode: a
+  first launch should be the reversible one, and the managed lane stays a
+  deliberate choice. An existing remembered preference is untouched.
+- **Platform coverage is written down.** [Platform
+  coverage](docs/QUALIFICATION.md#platform-coverage) separates what is *known
+  absent* off macOS — desktop notifications for activity and agent sessions, the
+  agent hook socket, the menu-bar status item — from what is merely *unverified*
+  there, such as managed runs. macOS is the platform GitPulse is developed and
+  hand-tested on, and the docs now say so instead of leaving it to be discovered.
 
 - **Regression suspects — which commits could have caused this?** Blame joined to
   the code graph, and the order of operations is the whole argument: a
@@ -164,6 +216,13 @@ verdict depended on how busy the machine was.
 
 ### Fixed
 
+- The activity ledger recorded any shell whose path merely contained an agent's
+  name — `/Users/claude/bin/zsh` — as an agent session. It now matches the
+  program actually launched.
+- Managed Codex could not start at all against codex-cli 0.153.4. The harness
+  still passed `--listen stdio://`, which that build no longer accepts; rather
+  than failing it exits successfully having written nothing, so the run reported
+  only "managed provider connection ended" and named no cause.
 - **An ordinary policy-harness shutdown no longer leaks process groups.** Closing
   the sidecar escalated with a kill aimed at the direct child only, so anything
   `manvi serve` had forked survived — observed outliving the process that started

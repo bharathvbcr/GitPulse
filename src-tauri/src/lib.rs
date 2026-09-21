@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod alerts;
 pub mod analyzer;
 pub mod ci_local;
 pub mod codeintel;
@@ -110,6 +111,12 @@ pub fn run() {
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());
             workbench::notifications::install(app.handle());
+            // Session notifications share the notification centre installed
+            // above, so they start after it — but unconditionally, because a
+            // centre that failed to install is a fault the status readout has
+            // to be able to report rather than a reason to have no worker.
+            alerts::start(workbench::notifications::session_host(app.handle()));
+            alerts::bridge::apply(tool_config::session_alerts().hook_bridge);
             crate::tool_install::set_app_handle(app.handle().clone());
             crate::devmap::set_build_progress_handle(app.handle().clone());
             if let Err(error) = storage::hygiene::global::start_scheduler() {
@@ -373,6 +380,11 @@ pub fn run() {
             cmd_external_tool_set_disabled,
             cmd_tool_config_get,
             cmd_tool_config_save,
+            cmd_agent_defaults,
+            cmd_agent_defaults_save,
+            cmd_session_alerts,
+            cmd_session_alerts_save,
+            cmd_session_alerts_visible,
             cmd_tool_ladder,
             cmd_tool_preflight,
             cmd_tool_verify,

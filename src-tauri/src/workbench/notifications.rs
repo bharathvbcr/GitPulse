@@ -39,6 +39,16 @@ mod platform {
     ) -> Result<bool, WorkbenchError> {
         Err(unsupported())
     }
+    pub(super) fn post(
+        _native: &str,
+        _heading: &str,
+        _body: &str,
+        _sound: bool,
+        _category: &str,
+    ) -> Result<bool, WorkbenchError> {
+        Err(unsupported())
+    }
+    pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
 }
 
 pub(super) struct Coordinator {
@@ -318,24 +328,76 @@ fn run(
         reconcile = true;
         match event {
             Ok(Event::Activate(native)) => {
-                if let Err(error) = activate(&host, &native) {
-                    if let Ok(mut current) = status.lock() {
-                        current.error = Some(error.message);
+                // Two namespaces arrive through one delegate. A session banner
+                // has no durable claim behind it — the session either still
+                // exists or it does not — so it skips the store entirely and
+                // asks the renderer to raise the tab. An activity banner keeps
+                // the acknowledged-claim path it always had.
+                let session = crate::alerts::native_session_key(&native).map(str::to_owned);
+                if session.is_none() {
+                    if let Err(error) = activate(&host, &native) {
+                        if let Ok(mut current) = status.lock() {
+                            current.error = Some(error.message);
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 let opening = app.clone();
                 if let Err(error)=app.run_on_main_thread(move||{
                     if let Some(window)=opening.get_webview_window("main") {
                         for result in [window.show(),window.unminimize(),window.set_focus()] {if let Err(error)=result {log::warn!(target:"workbench","notification window activation: {error}");}}
                     }
-                    if let Err(error)=opening.emit("workbench-notification-open",()) {log::warn!(target:"workbench","notification activation wake: {error}");}
+                    let emitted = match &session {
+                        Some(key) => opening.emit("gitpulse-session-notification-open", key.clone()),
+                        None => opening.emit("workbench-notification-open", ()),
+                    };
+                    if let Err(error)=emitted {log::warn!(target:"workbench","notification activation wake: {error}");}
                 }) {if let Ok(mut current)=status.lock(){current.error=Some(error.to_string());}}
             }
             Ok(Event::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+/// The [`crate::alerts::Host`] backed by this process's notification centre.
+///
+/// Session banners share the centre, the delegate and the user's OS-level
+/// permission with activity banners — there is only one of each per
+/// application — so they are posted through this module rather than through a
+/// second bridge that would need its own delegate and its own authorization.
+struct SessionHost {
+    app: tauri::AppHandle,
+}
+
+impl crate::alerts::Host for SessionHost {
+    fn submit(&self, native: &str, heading: &str, body: &str, sound: bool) -> Result<bool, String> {
+        platform::post(native, heading, body, sound, platform::SESSION_CATEGORY)
+            .map_err(|error| error.message)
+    }
+
+    /// Both halves are required, and the window half is asked of the window
+    /// rather than of the renderer.
+    ///
+    /// The renderer reports which tab is on screen, which only it knows. It
+    /// cannot be trusted to report focus: a webview that has been throttled,
+    /// or has stopped running scripts entirely, is exactly the situation in
+    /// which a notification matters most, and its last word would have been
+    /// "focused". So an unreported tab counts as unattended and the window's
+    /// own focus is read natively.
+    fn attended(&self, key: &str) -> bool {
+        if !crate::alerts::session_is_visible(key) {
+            return false;
+        }
+        self.app
+            .get_webview_window("main")
+            .is_some_and(|window| window.is_focused().unwrap_or(false))
+    }
+}
+
+/// The delivery host for [`crate::alerts::start`].
+pub(crate) fn session_host(app: &tauri::AppHandle) -> Arc<dyn crate::alerts::Host> {
+    Arc::new(SessionHost { app: app.clone() })
 }
 
 pub(super) fn native_request(
@@ -427,6 +489,104 @@ mod tests {
             assert_eq!(notice_id(id), None);
         }
     }
+    /// The rule that silences a notification overnight is written twice: once
+    /// in SQL here, for activity notices, and once in Rust as
+    /// `alerts::policy::in_quiet_hours`, for session notices, because a
+    /// terminal session exists whether or not a profile database does.
+    ///
+    /// Two implementations of one rule drift. This drives the real store over
+    /// a grid of windows and minutes and fails when they disagree, which a
+    /// hand-written table of expectations could never do — it would only prove
+    /// each file agreed with itself.
+    #[test]
+    fn quiet_hours_are_the_same_rule_the_session_notifier_applies() {
+        let root = tempfile::tempdir().unwrap();
+        let host = WorkbenchState(Arc::new(super::super::Inner {
+            path: Some(root.path().join("work.sqlite")),
+            ..Default::default()
+        }));
+        call(&host,"repositories.put",json!({"id":"r","request_id":"r","expected_revision":0,"name":"r","identity_key":"local:r"})).unwrap();
+        call(&host,"items.put",json!({"id":"t","request_id":"t","expected_revision":0,"title":"t","repository_ids":["r"],"primary_repository_id":"r"})).unwrap();
+        call(
+            &host,
+            "notifications.settings.put",
+            json!({"id":"profile","request_id":"on","expected_revision":1,"enabled":true}),
+        )
+        .unwrap();
+        call(&host,"enhancements.create",json!({"id":"p","request_id":"p","expected_revision":0,"task_id":"t","source_revision":1,"fields":["title"],"provider":"local","model":"configured"})).unwrap();
+        call(
+            &host,
+            "enhancements.complete",
+            json!({"id":"p","request_id":"complete","expected_revision":1,"title":"Better"}),
+        )
+        .unwrap();
+        // Outside any quiet window the notice is pending, so an empty page
+        // later means "silenced", not "nothing to say".
+        assert_eq!(
+            call(
+                &host,
+                "notifications.pending.list",
+                json!({"minute_of_day":720,"limit":3})
+            )
+            .unwrap()["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let mut compared = 0;
+        let windows: [(u16, u16); 5] = [
+            (22 * 60, 7 * 60),
+            (9 * 60, 17 * 60),
+            (0, 1),
+            (1439, 1438),
+            (1, 0),
+        ];
+        // A stepped sweep plus every window's own edges. The sweep alone is
+        // what a disagreement usually looks like, but the edges are where it
+        // actually lives: a half-open window written closed differs from the
+        // store at exactly one minute, and a grid of every 37th minute lands
+        // on none of them. Verified by mutation — flipping `<` to `<=` in
+        // `in_quiet_hours` left the stepped-only version green.
+        let minutes: Vec<u16> = {
+            let mut minutes: Vec<u16> = (0..1440u16).step_by(37).collect();
+            for (start, end) in windows {
+                for edge in [start, end] {
+                    minutes.extend([edge.saturating_sub(1), edge, (edge + 1).min(1439)]);
+                }
+            }
+            minutes.sort_unstable();
+            minutes.dedup();
+            minutes
+        };
+        // The store's optimistic concurrency means every write needs the
+        // revision the previous one produced, which is what the counter is —
+        // not an index into `windows`.
+        for (revision, (start, end)) in (2u64..).zip(windows) {
+            call(&host,"notifications.settings.put",json!({"id":"profile","request_id":format!("q{start}-{end}"),"expected_revision":revision,"enabled":true,"quiet_start":start,"quiet_end":end})).unwrap();
+            for &minute in &minutes {
+                let page = call(
+                    &host,
+                    "notifications.pending.list",
+                    json!({"minute_of_day": minute, "limit": 3}),
+                )
+                .unwrap();
+                let store_silent = page["items"].as_array().is_some_and(Vec::is_empty);
+                assert_eq!(
+                    crate::alerts::policy::in_quiet_hours(minute, start, end),
+                    store_silent,
+                    "window {start}..{end} disagreed at minute {minute}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(
+            compared,
+            windows.len() * minutes.len(),
+            "the comparison did not cover the grid"
+        );
+    }
+
     #[test]
     fn timeout_retains_claim_and_a_second_attempt_never_calls_the_os() {
         let root = tempfile::tempdir().unwrap();

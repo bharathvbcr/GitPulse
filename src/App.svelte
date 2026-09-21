@@ -58,6 +58,7 @@
   import Tooltip from "./lib/components/Tooltip.svelte";
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import NativeNotificationBridge from "./lib/components/NativeNotificationBridge.svelte";
+  import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
   import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
@@ -961,6 +962,7 @@
   <!-- Global Toast Notification Queue -->
   <ToastContainer />
   <NativeNotificationBridge />
+  <SessionNotificationBridge />
 
   <!-- The repository surface. Hidden, not unmounted, while Fleet is open. -->
   <div class="flex-1 flex flex-col min-h-0" class:hidden={$interfaceStore.globalSurface !== "repository"}>

@@ -6,6 +6,15 @@ export interface TerminalSessionRecord {
   repoPath: string;
   label: string;
   status: string;
+  /**
+   * The backend's own id for the PTY, once one has started.
+   *
+   * Absent while a session is still spawning, and absent for good if it never
+   * did. It is what a native notification is keyed by, so this is the only
+   * bridge from a banner the user clicked back to the tab that raised it —
+   * `key` is a renderer invention the backend has never seen.
+   */
+  sessionId?: string;
   close: () => Promise<void>;
   /**
    * Brings this session on screen inside its own panel: selects its tab in
@@ -44,6 +53,21 @@ export function sessionsByRepo(
   return counts;
 }
 
+/**
+ * The tab that owns a backend PTY id, or null.
+ *
+ * Null for an id nothing is running — a banner for a session that has since
+ * ended is the ordinary case, not an error, and the caller shows the terminal
+ * rather than inventing a tab.
+ */
+export function sessionByNativeId(
+  records: readonly TerminalSessionRecord[],
+  sessionId: string,
+): TerminalSessionRecord | null {
+  if (!sessionId) return null;
+  return records.find((record) => record.sessionId === sessionId) ?? null;
+}
+
 /** Capacity belongs to the app, including starts and closes still in flight. */
 export function createSessionRegistry() {
   const records = new Map<string, TerminalSessionRecord>();
@@ -60,7 +84,16 @@ export function createSessionRegistry() {
       return {
         update(status: string) {
           if (released) return;
-          records.set(record.key, { ...record, status });
+          const current = records.get(record.key) ?? record;
+          records.set(record.key, { ...current, status });
+          publish();
+        },
+        /** Records the backend id once the PTY has one. */
+        identify(sessionId: string) {
+          if (released || !sessionId) return;
+          const current = records.get(record.key) ?? record;
+          if (current.sessionId === sessionId) return;
+          records.set(record.key, { ...current, sessionId });
           publish();
         },
         release() {

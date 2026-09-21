@@ -3,7 +3,7 @@ mod background;
 mod discovery;
 pub mod global;
 pub mod providers;
-mod tree;
+pub(crate) mod tree;
 
 use crate::engine::git_cli::{
     build_capture_command, capture_command, git_with_stdin, run_observed, validate_repo,

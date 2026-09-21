@@ -180,10 +180,12 @@ pub(super) fn prepare_managed(
 
 fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value, WorkbenchError> {
     let input = parse(input)?;
-    if kind == "managed" && (input.provider != "codex" || input.id.len() > 100) {
+    if kind == "managed"
+        && (!super::terminal_command::is_managed_provider(&input.provider) || input.id.len() > 100)
+    {
         return Err(WorkbenchError::new(
             "unsupported_operation",
-            "Managed launches require Codex and an attempt identity of at most 100 characters.",
+            "Managed launches require Codex or Claude Code and an attempt identity of at most 100 characters.",
         ));
     }
     let checkout = checkout(&input.repo_path)?;
@@ -459,6 +461,66 @@ mod tests {
                     .to_string(),
                 )
                 .unwrap();
+        }
+    }
+
+    /// The managed lane admits exactly the providers with a harness adapter.
+    ///
+    /// Both directions matter and they fail differently: a provider wrongly
+    /// admitted here has its attempt stored and its repository capacity taken
+    /// before the harness refuses it, and a provider wrongly excluded is an
+    /// adapter nobody can reach.
+    #[test]
+    fn managed_preparation_admits_every_provider_with_an_adapter_and_no_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        for provider in ["codex", "claude", "grok", "agy", "shell", ""] {
+            let mut input = prepare(&root);
+            input["id"] = json!(format!("managed-{provider}"));
+            input["request_id"] = json!(format!("prepare-managed-{provider}"));
+            input["provider"] = json!(provider);
+            let result = state.request("runs.prepare_managed", &input.to_string());
+            let expected = super::super::terminal_command::is_managed_provider(provider);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "provider {provider:?} admitted={} expected={expected}",
+                result.is_ok()
+            );
+            match result {
+                Ok(row) => {
+                    assert_eq!(row["item"]["kind"], "managed");
+                    assert_eq!(row["item"]["provider"], provider);
+                    // One prepared run per checkout: cancel before the next.
+                    state
+                        .request(
+                            "runs.cancel",
+                            &json!({
+                                "id": format!("managed-{provider}"),
+                                "request_id": format!("cancel-managed-{provider}"),
+                                "expected_revision": 1
+                            })
+                            .to_string(),
+                        )
+                        .unwrap();
+                }
+                // Two gates refuse, at different depths: a provider GitPulse
+                // cannot launch at all fails `parse` as invalid input, and a
+                // launchable provider without a managed adapter fails the
+                // managed check. Either is a refusal before anything is stored.
+                Err(error) => assert!(
+                    matches!(
+                        error.code.as_str(),
+                        "unsupported_operation" | "invalid_input"
+                    ),
+                    "{provider:?} was refused as {}",
+                    error.code
+                ),
+            }
         }
     }
 

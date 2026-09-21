@@ -3374,8 +3374,20 @@ pub async fn cmd_terminal_spawn(
     program: Option<String>,
     args: Option<Vec<String>>,
     env: Option<std::collections::HashMap<String, String>>,
+    permission_mode: Option<String>,
+    acknowledged: Option<bool>,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
     let state = state.inner().clone();
+    // Expanded here, at the boundary, rather than in the caller: the flags for
+    // a mode are the workbench's table and the frontend never carries them.
+    // The refusals inside are what make a bypassed session impossible without
+    // an acknowledgement, whatever the frontend did or forgot to do.
+    let args = crate::workbench::terminal_command::apply_permission_mode(
+        program.as_deref(),
+        permission_mode.as_deref(),
+        acknowledged.unwrap_or(false),
+        args,
+    )?;
     off_thread(move || {
         crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols, program, args, env)
     })
@@ -4338,6 +4350,114 @@ pub async fn cmd_tool_config_save(
         crate::tool_config::view()
     })
     .await
+}
+
+/// What agent-session notifications did and did not do, plus the settings
+/// that governed it.
+///
+/// One command answers both because the settings panel has to show them
+/// together: "enabled, and nothing has been delivered" reads very differently
+/// from "enabled, and nine were suppressed because you were watching".
+#[tauri::command(async)]
+pub async fn cmd_session_alerts() -> Result<SessionAlertsView, String> {
+    off_thread(|| {
+        Ok(SessionAlertsView {
+            settings: crate::tool_config::session_alerts(),
+            status: crate::alerts::status(),
+            // Named here rather than assembled in the UI so the two spellings
+            // of "which platform can do this" cannot drift apart.
+            bridge_supported: cfg!(unix),
+        })
+    })
+    .await
+}
+
+#[derive(serde::Serialize)]
+pub struct SessionAlertsView {
+    pub settings: crate::tool_config::SessionAlertSettings,
+    pub status: crate::alerts::SessionAlertStatus,
+    pub bridge_supported: bool,
+}
+
+/// What a terminal tab starts an agent CLI with, and which modes exist.
+///
+/// The mode list travels with the settings rather than being written down in
+/// the frontend: a chooser that offered a mode this build cannot expand would
+/// be offering a launch that fails at spawn.
+#[tauri::command(async)]
+pub async fn cmd_agent_defaults() -> Result<AgentDefaultsView, String> {
+    off_thread(|| {
+        Ok(AgentDefaultsView {
+            defaults: crate::tool_config::agent_defaults(),
+            modes: crate::workbench::terminal_command::PERMISSION_MODES
+                .iter()
+                .map(|mode| (*mode).to_owned())
+                .collect(),
+            launchers: crate::workbench::terminal_command::permission_launchers(),
+        })
+    })
+    .await
+}
+
+#[derive(serde::Serialize)]
+pub struct AgentDefaultsView {
+    pub defaults: crate::tool_config::AgentDefaults,
+    /// Every permission mode, least authority first.
+    pub modes: Vec<String>,
+    /// Launchers that accept one. Strictly smaller than the tab strip's list:
+    /// `shell` and `manvi` have no policy, and offering them a mode would
+    /// produce a refusal at spawn rather than a setting.
+    pub launchers: Vec<String>,
+}
+
+#[tauri::command(async)]
+pub async fn cmd_agent_defaults_save(
+    defaults: crate::tool_config::AgentDefaults,
+) -> Result<AgentDefaultsView, String> {
+    off_thread(move || {
+        crate::tool_config::set_agent_defaults(defaults)?;
+        Ok(AgentDefaultsView {
+            defaults: crate::tool_config::agent_defaults(),
+            modes: crate::workbench::terminal_command::PERMISSION_MODES
+                .iter()
+                .map(|mode| (*mode).to_owned())
+                .collect(),
+            launchers: crate::workbench::terminal_command::permission_launchers(),
+        })
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_session_alerts_save(
+    settings: crate::tool_config::SessionAlertSettings,
+) -> Result<SessionAlertsView, String> {
+    off_thread(move || {
+        let bridge = settings.hook_bridge && settings.enabled;
+        crate::tool_config::set_session_alerts(settings)?;
+        // Applied here rather than at the next launch: turning the bridge off
+        // has to actually remove the socket, or "off" would mean "still bound,
+        // ignoring you".
+        crate::alerts::bridge::apply(bridge);
+        Ok(SessionAlertsView {
+            settings: crate::tool_config::session_alerts(),
+            status: crate::alerts::status(),
+            bridge_supported: cfg!(unix),
+        })
+    })
+    .await
+}
+
+/// Reports which terminal sessions the user can actually see.
+///
+/// Plural because a split terminal shows two at once. Only the renderer knows
+/// which tabs are on screen; whether the *window* has focus is read natively
+/// at decision time, so a renderer that stops running — the case in which a
+/// notification matters most — cannot leave a session looking attended.
+#[tauri::command(async)]
+pub async fn cmd_session_alerts_visible(session_ids: Vec<String>) -> Result<(), String> {
+    crate::alerts::set_visible_sessions(session_ids);
+    Ok(())
 }
 
 #[tauri::command(async)]

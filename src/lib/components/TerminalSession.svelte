@@ -70,7 +70,7 @@
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
+  import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
@@ -81,7 +81,19 @@
   import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind } from "../terminal/tabs";
-  import { agentPromptArgs } from "../terminal/launchRequests";
+  import { agentNotifyArgs, agentPromptArgs } from "../terminal/launchRequests";
+  import {
+    effectiveMode,
+    PERMISSION_LABELS,
+    requiresAcknowledgement,
+    type PermissionMode,
+  } from "../terminal/agentDefaults";
+  import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
+  import {
+    loadSessionAlerts,
+    sessionAlertSettings,
+    terminalAttendance,
+  } from "../stores/sessionAlertsStore";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -116,6 +128,7 @@
     initialPrompt,
     taskRunId,
     active,
+    onscreen = false,
     onTitle,
     onChord,
     onStatus = () => {},
@@ -128,6 +141,15 @@
     initialPrompt?: string;
     taskRunId?: string;
     active: boolean;
+    /**
+     * Whether the user can actually see this session right now — the selected
+     * tab of a dock that is itself open, or either half of a split.
+     *
+     * Distinct from `active`: an active tab inside a collapsed dock is on
+     * nobody's screen, and suppressing its notifications would be the one
+     * failure this whole feature exists to prevent.
+     */
+    onscreen?: boolean;
     onTitle: (title: string) => void;
     onStatus?: (status: string) => void;
     onActivity?: () => void;
@@ -142,6 +164,39 @@
     revealSelf?: () => void;
   } = $props();
 
+  /**
+   * The backend's id for this PTY, once it has one.
+   *
+   * Empty until `started`, and deliberately not defaulted to the tab id: a
+   * wrong id would tell the notifier that some other session is on screen.
+   */
+  let nativeSessionId = "";
+  /**
+   * Whether GitPulse adds each CLI's notification flags to this launch.
+   *
+   * Read once, before the spawn, because it becomes argv. A change takes
+   * effect on the next session rather than this one, which is the only thing
+   * a command line can mean.
+   */
+  let configureAgents = sessionAlertSettings().configure_agents;
+  /**
+   * The permission mode this tab launches with, or null for the CLI's own
+   * default. Read once before the spawn for the same reason `configureAgents`
+   * is: it becomes argv, and a change can only mean the next session.
+   */
+  let permissionMode: PermissionMode | null = null;
+  /**
+   * Set when the reader has agreed to this tab running without permission
+   * checks. Per tab and per app run — never stored, because the stored thing
+   * is the preference and this is the agreement to act on it once.
+   *
+   * A restart reuses it: the agreement was about this tab, and a reader who
+   * pressed restart is not asking to be asked again about a session they are
+   * already watching.
+   */
+  let acknowledgedBypass = $state(false);
+  /** Shown instead of a spawn while a bypass launch waits to be agreed to. */
+  let awaitingAcknowledgement = $state(false);
   let container = $state<HTMLDivElement | null>(null);
   let warning = $state<string | null>(null);
   let shellPath = $state("");
@@ -405,8 +460,26 @@
     // A bare name, resolved backend-side against the same PATH repair every
     // other GitPulse spawn uses — a GUI-launched app's own PATH does not
     // contain the directories these CLIs install into.
-    const args = agentPromptArgs(kind, initialPrompt);
-    return kind === "shell" ? {} : { program: kind, args: args ?? [] };
+    //
+    // Notification flags come first. Claude Code's prompt form is `-- <text>`,
+    // after which everything is positional, so a flag appended behind it would
+    // be read as part of the prompt.
+    const args = [...agentNotifyArgs(kind, configureAgents), ...(agentPromptArgs(kind, initialPrompt) ?? [])];
+    return kind === "shell" ? {} : { program: kind, args };
+  }
+
+  /**
+   * The mode this tab will start in, decided here rather than in the backend
+   * because the reader has to be told — and, for bypass, asked — before
+   * anything spawns.
+   *
+   * A task run is excluded: its permission mode was chosen in the handoff
+   * form for that run, and a host-wide default must not quietly re-decide it.
+   */
+  function resolvePermissionMode(): PermissionMode | null {
+    if (taskRunId) return null;
+    const view = agentDefaults();
+    return effectiveMode(view.defaults, launcher, view.launchers);
   }
 
   function createLifecycle() {
@@ -424,6 +497,12 @@
           return invoke<TerminalSpawned>("cmd_terminal_spawn", {
             repoPath, rows: Math.max(dims?.rows ?? 24, 2), cols: Math.max(dims?.cols ?? 80, 2),
             program: cfg.program, args: cfg.args,
+            permissionMode,
+            // Sent only for the mode that needs it. The backend refuses an
+            // acknowledgement attached to any other mode, so a bug that sent
+            // this unconditionally would fail on the next ordinary launch
+            // rather than wait to matter.
+            acknowledged: requiresAcknowledgement(permissionMode) ? acknowledgedBypass : false,
           });
         },
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
@@ -439,6 +518,11 @@
         },
         started(spawned) {
           shellPath = spawned.shell;
+          // The backend's own id for this PTY, which is what a notification is
+          // keyed by. The tab id is a renderer invention and means nothing to
+          // the notifier.
+          nativeSessionId = spawned.id;
+          terminalAttendance.report(nativeSessionId, onscreen);
           harnessStore.recordAction({
             repoPath,
             kind: "terminal-session",
@@ -476,6 +560,29 @@
   }
 
   async function spawnPty() { await lifecycle?.start(); }
+
+  /** Agreed to for this tab. The stored preference is untouched. */
+  function acknowledgeBypass() {
+    acknowledgedBypass = true;
+    awaitingAcknowledgement = false;
+    void spawnPty();
+  }
+
+  /**
+   * Declining starts the session at "ask every time" rather than not at all.
+   *
+   * A reader who opened a terminal wants a terminal; the thing they declined
+   * was the authority, not the session. Narrowing is always safe — the
+   * backend accepts any mode without an acknowledgement except bypass — and
+   * the stored default is left alone, because this is one launch and not a
+   * change of mind about every future one.
+   */
+  function declineBypass() {
+    permissionMode = "ask";
+    acknowledgedBypass = false;
+    awaitingAcknowledgement = false;
+    void spawnPty();
+  }
 
   export function restart() { void lifecycle?.restart(); }
 
@@ -616,9 +723,30 @@
     });
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
     lifecycle = createLifecycle();
-    void spawnPty();
+    // Awaited before the spawn so the launch arguments reflect the saved
+    // setting rather than the default the store starts at. A failure keeps
+    // that default, which is the shipped behaviour and not silence.
+    void Promise.allSettled([loadSessionAlerts(), loadAgentDefaults()])
+      .then(([alerts]) => {
+        if (alerts.status === "fulfilled") configureAgents = alerts.value.settings.configure_agents;
+        // Read after the load settles, from the store rather than the
+        // resolved value, so a failed read falls back to "the CLI's own
+        // default" rather than to a stale mode.
+        permissionMode = resolvePermissionMode();
+      })
+      .finally(() => {
+        if (disposed) return;
+        // A launch that turns permission checks off waits to be agreed to.
+        // Nothing spawns until it is; the reader sees why, not a blank tab.
+        if (requiresAcknowledgement(permissionMode) && !acknowledgedBypass) {
+          awaitingAcknowledgement = true;
+          return;
+        }
+        void spawnPty();
+      });
     return () => {
       disposed = true;
+      if (nativeSessionId) terminalAttendance.forget(nativeSessionId);
       lifecycle?.dispose();
       lifecycle = null;
       linkProvider?.dispose();
@@ -670,6 +798,19 @@
     const timer = setTimeout(() => runFind(false, true), 120);
     return () => clearTimeout(timer);
   });
+
+  /**
+   * Tells the notifier whether the user can see this session.
+   *
+   * Reported from here rather than from the panel because only this component
+   * knows the backend id, and only after the PTY has started. Before that
+   * there is nothing to report and nothing that could notify.
+   */
+  $effect(() => {
+    const visible = onscreen;
+    if (!nativeSessionId) return;
+    terminalAttendance.report(nativeSessionId, visible);
+  });
 </script>
 
 <div class="h-full w-full flex flex-col min-h-0 min-w-0">
@@ -700,6 +841,48 @@
     ></div>
     {#if scrolledBack}
       <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
+    {/if}
+    {#if awaitingAcknowledgement}
+      <!-- Covers the grid rather than sitting beside it: nothing has spawned,
+           and an empty terminal next to a notice reads as a session that
+           started and printed nothing. -->
+      <div
+        data-terminal-acknowledge
+        class="absolute inset-2 bg-surface/95 flex flex-col items-center justify-center gap-2 px-6 text-center"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="gp-bypass-title-{tabId}"
+      >
+        <AlertTriangle size={18} class="text-amber-500 shrink-0" aria-hidden="true" />
+        <span id="gp-bypass-title-{tabId}" class="text-textPrimary text-xs font-medium">
+          Start {launcherLabel(launcher)} with no permission checks?
+        </span>
+        <p class="text-textMuted text-[11px] leading-snug max-w-sm">
+          Your saved default for {launcherLabel(launcher)} is
+          <span class="text-textPrimary">{PERMISSION_LABELS.bypass.label}</span>. This session will
+          run without permission prompts and without a sandbox, in
+          <span class="font-mono">{repoPath.split(/[\\/]/).pop()}</span>. GitPulse asks every time
+          rather than remembering the answer.
+        </p>
+        <div class="flex items-center gap-2 mt-1">
+          <button
+            type="button"
+            class="gp-btn py-1! text-[11px]!"
+            data-testid="bypass-acknowledge"
+            onclick={acknowledgeBypass}
+          >
+            Start this session
+          </button>
+          <button
+            type="button"
+            class="gp-btn py-1! text-[11px]!"
+            data-testid="bypass-decline"
+            onclick={declineBypass}
+          >
+            Use {PERMISSION_LABELS.ask.label.toLowerCase()} instead
+          </button>
+        </div>
+      </div>
     {/if}
   </div>
   {#if error || exited || spawning || shellPath || hoveredLink}

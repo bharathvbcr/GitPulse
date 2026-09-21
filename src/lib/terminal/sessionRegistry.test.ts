@@ -1,6 +1,11 @@
 import { get } from "svelte/store";
 import { describe, expect, it, vi } from "vitest";
-import { createSessionRegistry, sessionsByRepo, type TerminalSessionRecord } from "./sessionRegistry";
+import {
+  createSessionRegistry,
+  sessionByNativeId,
+  sessionsByRepo,
+  type TerminalSessionRecord,
+} from "./sessionRegistry";
 import { MAX_TERMINAL_TABS } from "./tabs";
 
 function record(overrides: Partial<TerminalSessionRecord> = {}): TerminalSessionRecord {
@@ -145,5 +150,59 @@ describe("sessionsByRepo", () => {
     registry.reserve(record({ key: "b", repoPath: "/r/two" }));
     registry.reserve(record({ key: "c", repoPath: "/r/one" }));
     expect(sessionsByRepo(get(registry))).toEqual(new Map([["/r/one", 2], ["/r/two", 1]]));
+  });
+});
+
+
+/**
+ * A clicked notification names the backend's PTY id, which is the only handle
+ * the OS ever saw. Without this bridge a banner opens the window and then does
+ * nothing, because the tab key it would need is a renderer invention.
+ */
+describe("finding the tab a notification belongs to", () => {
+  it("publishes the backend id once the PTY has one", () => {
+    const registry = createSessionRegistry();
+    const slot = registry.reserve(record());
+    expect(get(registry)[0].sessionId).toBeUndefined();
+    slot.identify("term-9-1a");
+    expect(get(registry)[0].sessionId).toBe("term-9-1a");
+    expect(sessionByNativeId(get(registry), "term-9-1a")?.key).toBe("session-a");
+  });
+
+  it("keeps the id across a status change", () => {
+    // The status updater used to rebuild the row from the record it captured
+    // at reservation time, which would have discarded an id learned later.
+    const registry = createSessionRegistry();
+    const slot = registry.reserve(record());
+    slot.identify("term-9-1a");
+    slot.update("exited");
+    expect(get(registry)[0]).toMatchObject({ status: "exited", sessionId: "term-9-1a" });
+  });
+
+  it("answers null for an id nothing is running", () => {
+    const registry = createSessionRegistry();
+    const slot = registry.reserve(record());
+    slot.identify("term-9-1a");
+    expect(sessionByNativeId(get(registry), "term-9-2b")).toBeNull();
+    expect(sessionByNativeId(get(registry), "")).toBeNull();
+    slot.release();
+    expect(sessionByNativeId(get(registry), "term-9-1a")).toBeNull();
+  });
+
+  it("never matches a session that has no id yet", () => {
+    // Every unstarted session has an undefined id; an empty query must not
+    // collide with all of them at once.
+    const registry = createSessionRegistry();
+    registry.reserve(record({ key: "a" }));
+    registry.reserve(record({ key: "b" }));
+    expect(sessionByNativeId(get(registry), undefined as unknown as string)).toBeNull();
+  });
+
+  it("ignores an identify after release", () => {
+    const registry = createSessionRegistry();
+    const slot = registry.reserve(record());
+    slot.release();
+    slot.identify("term-9-1a");
+    expect(get(registry)).toHaveLength(0);
   });
 });

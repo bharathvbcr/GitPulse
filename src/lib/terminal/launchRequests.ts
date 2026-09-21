@@ -9,6 +9,54 @@ export function isPromptLauncher(value: unknown): value is PromptLauncher {
   return PROMPT_LAUNCHERS.some((launcher) => launcher === value);
 }
 
+/**
+ * The arguments that make an agent CLI speak to this terminal.
+ *
+ * Neither Claude Code nor Codex says anything here by default. Claude Code
+ * sends a desktop notification only in Ghostty, kitty and iTerm2 and is
+ * otherwise silent unless `preferredNotifChannel` is set; Codex probes for a
+ * terminal it recognises and falls back to nothing it can be sure of. So an
+ * agent working in a GitPulse tab used to stop on a permission prompt with no
+ * sign at all, which is the whole defect.
+ *
+ * Each flag below is that CLI's own documented, **session-scoped** override:
+ *
+ * * `claude --settings '<json>'` sits above the user's files and below managed
+ *   settings, merges key by key — a key not named here keeps its value from
+ *   wherever it was set — lasts one session and writes no file.
+ * * `codex -c key=value` is parsed as TOML and applies to that invocation.
+ *   The inner quotes are part of the TOML, not the shell: these are argv
+ *   entries and nothing expands them.
+ *
+ * `notification_condition = "always"` is deliberate. Codex's default is to
+ * notify only when it believes the terminal is unfocused, a judgement it can
+ * only make from escape sequences the tab may not send. GitPulse knows the
+ * answer exactly — it knows which tab is on screen and whether its own window
+ * has focus — so the CLI is asked to always report and GitPulse decides.
+ *
+ * Launchers absent from this map get nothing. Manvi, Grok and Antigravity
+ * publish no notification setting this code has read, and inventing a flag for
+ * them would at best be ignored and at worst refuse to start. They still reach
+ * the user if they emit a bell or an OSC notification of their own accord,
+ * because the detection side does not depend on any of this.
+ */
+export const AGENT_NOTIFY_ARGS: Partial<Record<LauncherKind, readonly string[]>> = {
+  claude: ["--settings", JSON.stringify({ preferredNotifChannel: "terminal_bell" })],
+  codex: [
+    "-c",
+    "tui.notifications=true",
+    "-c",
+    'tui.notification_method="osc9"',
+    "-c",
+    'tui.notification_condition="always"',
+  ],
+};
+
+export function agentNotifyArgs(launcher: LauncherKind, enabled: boolean): string[] {
+  if (!enabled) return [];
+  return [...(AGENT_NOTIFY_ARGS[launcher] ?? [])];
+}
+
 /** Interactive CLIs that accept an initial prompt. No shell interpolation. */
 export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string[] | null {
   if (prompt === undefined) return null;

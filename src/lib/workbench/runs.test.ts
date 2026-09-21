@@ -24,9 +24,16 @@ describe("task attempt transport", () => {
     native.mockResolvedValueOnce(JSON.stringify({ok:true,item:managed}));
     expect(await launchManagedRun("run")).toMatchObject(managed);
     expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.launch_managed",input:'{"id":"run"}'});
-    for (const change of [{id:"other"},{kind:"external_terminal"},{provider:"claude"}]) {
+    // A provider with no adapter in the harness, not merely a different one:
+    // Claude Code is a managed provider now, and a receipt naming it must be
+    // accepted rather than read as a foreign one.
+    for (const change of [{id:"other"},{kind:"external_terminal"},{provider:"grok"},{provider:"agy"}]) {
       native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{...managed,...change}}));
       await expect(launchManagedRun("run")).rejects.toMatchObject({code:"protocol_error"});
+    }
+    for (const provider of ["codex","claude"]) {
+      native.mockResolvedValueOnce(JSON.stringify({ok:true,item:{...managed,provider}}));
+      expect(await launchManagedRun("run")).toMatchObject({provider});
     }
     native.mockResolvedValueOnce('{"ok":true}');
     await stopManagedRun("run");

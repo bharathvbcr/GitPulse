@@ -2,7 +2,7 @@ import { PRIORITY_LABELS } from "./boardDrag";
 import { ARCHIVE_STATUS, archiveState } from "./taskArchive";
 import { STATUSES, STATUS_LABELS, type TaskCard, type TaskStatus } from "./client";
 import { displayTitle, isRevision, isTaskId } from "./taskDelete";
-import type { AgentProvider } from "./vocabulary";
+import type { AgentProvider, ManagedProvider } from "./vocabulary";
 
 export type TaskMenuSubmenu = "move" | "priority" | "copy" | "due" | "owner" | "label" | "agent";
 
@@ -27,10 +27,16 @@ export type TaskMenuIcon =
 /** Relative due targets the menu can set without opening the editor. */
 export type TaskDueChoice = "today" | "tomorrow" | "next_week" | "clear";
 
-/** How a handoff starts. Mirrors `RunKind` plus the provider it applies to. */
+/**
+ * How a handoff starts. Mirrors `RunKind` plus the provider it applies to.
+ *
+ * The managed arm names its providers rather than accepting any, so a menu
+ * entry for a provider with no managed adapter fails to typecheck instead of
+ * reaching `handoffGate` and being refused at the button.
+ */
 export type TaskAgentTarget =
   | { provider: AgentProvider; kind: "external_terminal" }
-  | { provider: "codex"; kind: "managed" };
+  | { provider: ManagedProvider; kind: "managed" };
 
 export type TaskMenuAction =
   | { kind: "open" }
@@ -107,6 +113,7 @@ const AGENT_TARGETS: readonly { id: string; label: string; hint: string; target:
   { id: "agent-codex", label: "Codex", hint: "Terminal", target: { provider: "codex", kind: "external_terminal" } },
   { id: "agent-grok", label: "Grok", hint: "Terminal", target: { provider: "grok", kind: "external_terminal" } },
   { id: "agent-agy", label: "Antigravity", hint: "Terminal", target: { provider: "agy", kind: "external_terminal" } },
+  { id: "agent-claude-managed", label: "Claude Code", hint: "Managed", target: { provider: "claude", kind: "managed" } },
   { id: "agent-codex-managed", label: "Codex", hint: "Managed", target: { provider: "codex", kind: "managed" } },
 ];
 

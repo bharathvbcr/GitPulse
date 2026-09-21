@@ -142,8 +142,19 @@ describe("TerminalSession PTY contracts", () => {
     const mountBody = source.slice(mountIdx, source.indexOf("$effect(", mountIdx));
     expect(mountBody).toContain("void spawnPty();");
 
-    // Mount starts once; explicit Restart delegates to the serial lifecycle.
-    expect(source.match(/void spawnPty\(\)/g)?.length).toBe(1);
+    // Mount starts once. The other two are the bypass acknowledgement's
+    // answers — both user gestures, neither reactive. Named rather than
+    // counted: a bare count would let any third call site through, and the
+    // thing being guarded is *which* code may start a session, not how many
+    // places do.
+    const SPAWN_SITES = ["acknowledgeBypass", "declineBypass"];
+    expect(source.match(/void spawnPty\(\)/g)?.length).toBe(SPAWN_SITES.length + 1);
+    for (const site of SPAWN_SITES) {
+      const start = source.indexOf(`function ${site}(`);
+      expect(start, `${site} is not a plain function`).toBeGreaterThan(-1);
+      const body = source.slice(start, source.indexOf("\n  }", start));
+      expect(body, `${site} does not start the session`).toContain("void spawnPty();");
+    }
     const restartBody = source.slice(
       source.indexOf("export function restart()"),
       source.indexOf("export function reveal()"),

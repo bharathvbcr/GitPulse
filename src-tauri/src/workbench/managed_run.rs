@@ -39,7 +39,10 @@ fn parse(input: &str) -> Result<String, WorkbenchError> {
 
 fn saved(state: &WorkbenchState, id: &str) -> Result<Value, WorkbenchError> {
     let row = state.with_store(|store| query(store, "runs.get", &json!({"id":id}).to_string()))?;
-    if row["item"]["kind"] != "managed" || row["item"]["provider"] != "codex" {
+    let managed = row["item"]["provider"]
+        .as_str()
+        .is_some_and(super::terminal_command::is_managed_provider);
+    if row["item"]["kind"] != "managed" || !managed {
         return Err(WorkbenchError::new(
             "run_kind_mismatch",
             "This attempt belongs to another execution adapter.",
@@ -171,6 +174,24 @@ mod tests {
     #[test]
     #[ignore = "requires explicit built Manvi/dcstore and installed Codex; sends one read-only model turn"]
     fn installed_managed_codex_crosses_native_host_and_store_without_accepting_task() {
+        installed_managed_provider_crosses_native_host_and_store("codex");
+    }
+
+    /// The same crossing for Claude Code.
+    ///
+    /// A separate `#[ignore]`d test rather than a loop inside one, because the
+    /// two need different binaries present and each should be runnable — and
+    /// reportable — on its own. Both call the same body, so the assertions
+    /// about what a managed run must never do cannot drift apart.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires explicit built Manvi/dcstore and installed Claude Code; sends one read-only model turn"]
+    fn installed_managed_claude_crosses_native_host_and_store_without_accepting_task() {
+        installed_managed_provider_crosses_native_host_and_store("claude");
+    }
+
+    #[cfg(unix)]
+    fn installed_managed_provider_crosses_native_host_and_store(provider: &str) {
         use crate::harness::sidecar::{bind_test_binary, test_serial};
         use std::os::unix::fs::PermissionsExt;
         let serial = test_serial();
@@ -182,15 +203,29 @@ mod tests {
             std::env::var("GITPULSE_WORKBENCH_TEST_DCSTORE").expect("Supply dcstore"),
         )
         .unwrap();
-        let codex = std::fs::canonicalize(
-            std::env::var("GITPULSE_WORKBENCH_TEST_CODEX").expect("Supply Codex"),
+        let (variable, supply) = match provider {
+            "codex" => ("GITPULSE_WORKBENCH_TEST_CODEX", "MANVI_CODEX_BINARY"),
+            "claude" => ("GITPULSE_WORKBENCH_TEST_CLAUDE", "MANVI_CLAUDE_BINARY"),
+            other => panic!("no managed adapter for {other}"),
+        };
+        let agent = std::fs::canonicalize(
+            std::env::var(variable).unwrap_or_else(|_| panic!("Supply {provider} via {variable}")),
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let quote =
             |p: &std::path::Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\\''"));
         let wrapper = dir.path().join("managed-manvi");
-        std::fs::write(&wrapper, format!("#!/bin/sh\nexport MANVI_STORE_BINARY={}\nexport MANVI_CODEX_BINARY={}\nexec {} \"$@\"\n",quote(&store),quote(&codex),quote(&binary))).unwrap();
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport MANVI_STORE_BINARY={}\nexport {supply}={}\nexec {} \"$@\"\n",
+                quote(&store),
+                quote(&agent),
+                quote(&binary)
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _binary = bind_test_binary(&serial, wrapper.to_str().unwrap());
         let host = WorkbenchState(Arc::new(super::super::Inner {
@@ -204,7 +239,7 @@ mod tests {
             host.register(root.to_str().unwrap(), "repo", "register")
                 .unwrap();
             host.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Verify the managed response path","description":"Reply with MANVI_NATIVE_RUN_OK only. Do not call tools or change files.","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
-            host.request("runs.prepare_managed", &json!({"id":"run","request_id":"prepare","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"codex","permission_mode":"inspect","repo_path":root}).to_string()).unwrap();
+            host.request("runs.prepare_managed", &json!({"id":"run","request_id":"prepare","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":provider,"permission_mode":"inspect","repo_path":root}).to_string()).unwrap();
             let active = host
                 .request("runs.launch_managed", r#"{"id":"run"}"#)
                 .unwrap();
@@ -230,12 +265,54 @@ mod tests {
                 "{}",
                 result["item"]["reason"]
             );
-            assert_eq!(result["item"]["provider_state"], "completed");
+            assert_eq!(
+                result["item"]["provider_state"], "completed",
+                "{}",
+                result["item"]
+            );
             assert_eq!(result["item"]["session_id"], session);
             assert!(result["item"]["output"]
                 .as_str()
                 .unwrap()
                 .contains("MANVI_NATIVE_RUN_OK"));
+            // The configuration the adapter verified, not one it assumed. The
+            // build identity can only have come from the provider's own
+            // handshake, so this is what separates "a model answered" from "a
+            // fixture answered"; the sandbox line is here because Claude Code
+            // has none and a managed run must not imply otherwise.
+            let configuration = result["item"]["effective_configuration"]
+                .as_str()
+                .expect("the run recorded no effective configuration");
+            let configuration: Value = serde_json::from_str(configuration).unwrap();
+            // Symlink-resolved, because the adapter resolves the checkout
+            // before handing it to the provider and reports what it resolved.
+            let resolved = std::fs::canonicalize(&root).unwrap();
+            assert_eq!(configuration["cwd"], resolved.to_str().unwrap());
+            let agent = configuration["provider_user_agent"].as_str().unwrap();
+            match provider {
+                "claude" => {
+                    assert!(
+                        agent.starts_with("claude-code/") && agent.len() > "claude-code/".len(),
+                        "provider identity was {agent}"
+                    );
+                    assert_eq!(configuration["approvalPolicy"], "plan");
+                    // Claude Code has no OS sandbox. `inspect` is enforced by
+                    // its `plan` permission mode, and this record must not
+                    // imply a confinement that does not exist.
+                    assert_eq!(configuration["sandbox"]["type"], "none");
+                    assert_eq!(configuration["sandbox"]["networkAccess"], true);
+                    // Empty on purpose, and this asserts the limit rather than
+                    // hiding it: the CLI names its model only on a frame that
+                    // exists once a turn is running, which is after this record
+                    // is written and the store has made it immutable. What the
+                    // record carries is what could be verified beforehand.
+                    assert_eq!(configuration["model"], "");
+                }
+                _ => {
+                    assert!(!agent.is_empty());
+                    assert_eq!(configuration["sandbox"]["type"], "readOnly");
+                }
+            }
             assert_eq!(
                 host.request("runs.launch_managed", r#"{"id":"run"}"#)
                     .unwrap(),
@@ -253,6 +330,56 @@ mod tests {
         host.shutdown();
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Every provider with a managed adapter reaches launch, and one without
+    /// is refused as belonging to another adapter.
+    ///
+    /// Parameterised rather than written for one provider, because `saved` is
+    /// the gate that decides which stored attempts this native host will drive
+    /// — and a gate named after a single provider is exactly how the lane
+    /// stayed shut for the other one.
+    #[test]
+    fn managed_controls_accept_every_provider_with_an_adapter_and_refuse_the_rest() {
+        for (provider, kind, expected) in [
+            // Both managed adapters must get past `saved` and be refused only
+            // because the attempt has no process running yet.
+            ("codex", "managed", "invalid_state"),
+            ("claude", "managed", "invalid_state"),
+            // A terminal attempt belongs to a different adapter whichever
+            // provider it names, and must never reach the managed controls.
+            ("claude", "external_terminal", "run_kind_mismatch"),
+            ("grok", "external_terminal", "run_kind_mismatch"),
+        ] {
+            let label = format!("{provider}/{kind}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            git_global(&["init", root.to_str().unwrap()]).unwrap();
+            crate::test_support::trust_repo(&root);
+            let state = WorkbenchState(Arc::new(super::super::Inner {
+                path: Some(dir.path().join("profile.sqlite")),
+                ..Default::default()
+            }));
+            state
+                .register(root.to_str().unwrap(), "repo", "register")
+                .unwrap();
+            state.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Inspect repository","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
+            let method = if kind == "managed" {
+                "runs.prepare_managed"
+            } else {
+                "runs.prepare_terminal"
+            };
+            state.request(method, &json!({"id":"run","request_id":"prepare","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":provider,"permission_mode":"inspect","repo_path":root}).to_string()).unwrap_or_else(|e| panic!("{label}: {} {}", e.code, e.message));
+            // `runs.stop_managed` and not `runs.launch_managed`: both read the
+            // same `saved` gate, but only stop reaches its verdict without
+            // asking the harness to start a model session — which, on a
+            // machine that has one installed, a gate test would really do.
+            let error = state
+                .request("runs.stop_managed", r#"{"id":"run"}"#)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: stop reported success"));
+            assert_eq!(error.code, expected, "{label}: {}", error.message);
         }
     }
 

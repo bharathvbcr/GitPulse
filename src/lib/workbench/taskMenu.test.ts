@@ -270,11 +270,16 @@ describe("agent handoff entry", () => {
       ["Codex", "Terminal"],
       ["Grok", "Terminal"],
       ["Antigravity", "Terminal"],
+      ["Claude Code", "Managed"],
       ["Codex", "Managed"],
     ]);
     expect(items.find((item) => item.id === "agent-codex-managed")?.action).toEqual({
       kind: "agent",
       target: { provider: "codex", kind: "managed" },
+    });
+    expect(items.find((item) => item.id === "agent-claude-managed")?.action).toEqual({
+      kind: "agent",
+      target: { provider: "claude", kind: "managed" },
     });
     expect(submenuTitle("agent")).toBe("Send to agent");
   });

@@ -57,6 +57,18 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tray title counts conflicts changed menu bar" },
   { id: "launch-at-login", section: "layout", label: "Launch at login",
     keywords: "autostart launch agent login item startup background" },
+  {
+    id: "session-alerts",
+    section: "agents",
+    label: "Agent session notifications",
+    keywords: "notification notifications banner alert agent session terminal claude codex bell osc permission idle finished quiet hours sound hook socket attention desktop notify",
+  },
+  {
+    id: "agent-defaults",
+    section: "agents",
+    label: "Agent launch defaults",
+    keywords: "agent default permission mode terminal launch claude codex grok antigravity skip permissions bypass sandbox plan ask accept edits preapproved auto review dangerously authority yolo",
+  },
   { id: "hygiene-defaults", section: "hygiene", label: "Hygiene defaults", keywords: "repository hygiene default retention days inherit override per repository shared cache review weekly all repositories scope storage preview" },
   { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {

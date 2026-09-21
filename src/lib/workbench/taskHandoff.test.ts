@@ -45,10 +45,17 @@ describe("sanitizeHandoff", () => {
   });
 
   it("refuses a managed connection for a provider that has none", () => {
-    expect(sanitizeHandoff({ provider: "claude", kind: "managed", permission: "ask" }).kind)
+    // Grok has no managed adapter, so a stored `{grok, managed}` must come
+    // back as a terminal handoff rather than a launch that cannot succeed.
+    expect(sanitizeHandoff({ provider: "grok", kind: "managed", permission: "ask" }).kind)
       .toBe("external_terminal");
-    expect(supportsManaged("claude")).toBe(false);
+    expect(supportsManaged("grok")).toBe(false);
+    expect(supportsManaged("agy")).toBe(false);
+    // Both adapters that exist are restored as managed.
     expect(supportsManaged("codex")).toBe(true);
+    expect(supportsManaged("claude")).toBe(true);
+    expect(sanitizeHandoff({ provider: "claude", kind: "managed", permission: "ask" }).kind)
+      .toBe("managed");
   });
 
   it("treats Grok as a first-class terminal-only provider", () => {
@@ -84,9 +91,10 @@ describe("sanitizeHandoff", () => {
   });
 
   it("keeps a settings object coherent when the provider changes under it", () => {
-    expect(reconcileHandoff({ provider: "claude", kind: "managed", permission: "ask" }))
-      .toEqual({ provider: "claude", kind: "external_terminal", permission: "ask" });
+    expect(reconcileHandoff({ provider: "grok", kind: "managed", permission: "ask" }))
+      .toEqual({ provider: "grok", kind: "external_terminal", permission: "ask" });
     expect(reconcileHandoff({ provider: "codex", kind: "managed", permission: "ask" }).kind).toBe("managed");
+    expect(reconcileHandoff({ provider: "claude", kind: "managed", permission: "ask" }).kind).toBe("managed");
   });
 
   it("describes a handoff in one readable phrase", () => {
@@ -237,9 +245,13 @@ describe("handoffGate", () => {
   });
 
   it("refuses a managed connection the provider does not offer", () => {
-    const gate = handoffGate({ ...base, settings: { provider: "claude", kind: "managed", permission: "ask" } });
+    const gate = handoffGate({ ...base, settings: { provider: "grok", kind: "managed", permission: "ask" } });
     expect(gate.ok).toBe(false);
-    expect(gate.reason).toMatch(/Claude Code supports terminal handoffs only/);
+    expect(gate.reason).toMatch(/Grok supports terminal handoffs only/);
+    // And lets through the two that do offer one.
+    for (const provider of ["codex", "claude"] as const) {
+      expect(handoffGate({ ...base, settings: { provider, kind: "managed", permission: "ask" } }).ok).toBe(true);
+    }
   });
 
   it("requires an explicit authorization for every bypass attempt", () => {

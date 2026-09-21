@@ -412,15 +412,28 @@ report spawns, kills, writes, resizes, runtime errors and individual assertions.
 Native PTY stress tests are separate. See [the archived terminal audit](../docs/archive/TERMINAL_AUDIT.md)
 for commands, ownership contracts, reproduced failures and platform limits.
 
-Managed Codex is also covered by `/harness/task-runs.html`: the retained checks
+Managed runs are also covered by `/harness/task-runs.html`: the retained checks
 exercise a lost managed launch reply, one-session retry, output loaded on demand,
 multiple question answers, Stop without task acceptance, and failed initialization
 without a provider thread or automatic replacement.
 The transport is simulated. For the real native/provider path, explicitly run the
-ignored `installed_managed_codex_crosses_native_host_and_store_without_accepting_task`
-Rust test with `GITPULSE_WORKBENCH_TEST_MANVI`,
-`GITPULSE_WORKBENCH_TEST_DCSTORE` and `GITPULSE_WORKBENCH_TEST_CODEX` set to absolute
-binary paths. That test sends one read-only marker turn to the installed provider.
+ignored Rust tests — one per provider, because each needs a different binary
+present and each should be reportable on its own:
+
+```sh
+GITPULSE_WORKBENCH_TEST_MANVI=/abs/manvi \
+GITPULSE_WORKBENCH_TEST_DCSTORE=/abs/dcstore \
+GITPULSE_WORKBENCH_TEST_CLAUDE=/abs/claude \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib \
+  workbench::managed_run::tests::installed_managed_claude -- --ignored
+```
+
+and the same with `GITPULSE_WORKBENCH_TEST_CODEX` for
+`installed_managed_codex`. Each sends one read-only marker turn to the installed
+provider and asserts the recorded configuration came from that provider's own
+handshake — a build identity a fixture could not produce. Supply a Manvi built
+from the harness checkout you are testing; the installed one may predate the
+adapter.
 
 Health evidence fixtures: open
 `stress.html?c=HealthPanel&scenario=mount&tabs=1&health-evidence=rows&css=1`

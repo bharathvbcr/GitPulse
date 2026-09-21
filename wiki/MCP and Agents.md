@@ -36,19 +36,35 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
 ## Hooks
 
-`plugins/gitpulse/hooks/hooks.json` registers three hooks, all spawning `gitpulse-hook`:
+`plugins/gitpulse/hooks/hooks.json` registers nine hooks, all spawning `gitpulse-hook`:
 
 | Event | Subcommand | What it does |
 | --- | --- | --- |
 | `PreToolUse` on `Edit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file. |
 | `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push. |
 | `SessionStart` | `session-brief` | Adds a repository snapshot to the session's context. |
+| `Notification`, one entry per matcher | `notify <matcher>` | Tells a running GitPulse that this agent wants the user, and why. |
+| `StopFailure` | `notify error` | Same, for a turn that ended on an error. |
 
-Three properties are deliberate:
+The reason travels as the subcommand's argument, not in the payload: the hook reference documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`, `elicitation_dialog`) but publishes no input field naming which one fired. Registering one entry per matcher makes the reason a fact about which hook the host chose to run rather than a string parsed out of a message.
+
+Four properties are deliberate:
 
 - **No hook ever answers `allow`.** An approval GitPulse did not earn would override the user's own permission rules. The gate can refuse or escalate; it cannot wave anything through.
 - **Every hook exits 0.** Exit 2 blocks a tool call whatever the JSON says, and a hook that crashed must never be the reason an edit is refused. Failures degrade to "no decision".
 - **A check that could not run says so.** Anything that did not scan, scanned partially, or could not reach the harness emits a `systemMessage` naming the gap, rather than the silence that means "clean".
+- **`notify` is the one exception, because it is not a check.** GitPulse being closed is its ordinary case, and a `systemMessage` on every turn would be noise the user cannot act on. Where an undelivered report is visible instead is **Settings → Notifications → Agent session notifications**, which reports whether the socket is listening and how many reports it has accepted — a place a user looks when they wonder why nothing arrives, not one that interrupts them when they do not.
+
+### The notification socket
+
+`notify` writes one small JSON report to a Unix socket in GitPulse's own configuration directory (`agent-notify.sock`; `GITPULSE_NOTIFY_SOCKET` overrides the path, `GITPULSE_SESSION_ID` names the terminal tab it is running in). It exists only while GitPulse is running and only while **Accept reports from agent hooks** is on; it is not a platform GitPulse offers on Windows, which has no Unix socket.
+
+- The directory is `0700` and the socket `0600`, and every peer's uid is checked — a connection whose uid cannot be read is refused, not trusted.
+- A report is a closed vocabulary: a protocol version, one of six event names, one of six agent names, and an optional session key, working directory and message. Anything else is refused and counted.
+- Reports are rate limited and coalesced per session alongside every other signal, and the most a report can do is raise a banner and focus a terminal tab.
+- The budget is 1.5 s, well inside a host's own hook timeout, and a socket that is not there costs the turn nothing.
+
+Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#platform-coverage).
 
 The command gate runs without a bound task scope, so it reaches the hard rungs (force-push, destructive commands) and not the scope rungs. That is a smaller gate than the desktop app's, and a real one.
 

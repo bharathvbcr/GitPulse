@@ -341,6 +341,11 @@ export function classify({ binPath, version, storeSchema, error, expected, expec
  * internal error, not an empty list: "we could not find out what the manifest
  * declares" must never be served as "it declares nothing".
  *
+ * Only the *first* word after the binary is a subcommand. `notify` takes the
+ * notification type as a second word — the matcher's own name — and counting
+ * that as a subcommand would report every correctly installed binary as
+ * drifted, because it serves `notify` and never served `permission_prompt`.
+ *
  * @param {string} [root]
  * @returns {string[]}
  */
@@ -359,9 +364,9 @@ export function declaredHookSubcommands(root = REPO_ROOT) {
       if (!isRecord(group) || !Array.isArray(group.hooks)) continue;
       for (const handler of group.hooks) {
         if (!isRecord(handler) || typeof handler.command !== "string") continue;
-        const [bin, ...rest] = handler.command.trim().split(/\s+/);
-        if (bin !== HOOK_BIN) continue;
-        for (const word of rest) found.add(word);
+        const [bin, subcommand] = handler.command.trim().split(/\s+/);
+        if (bin !== HOOK_BIN || !subcommand) continue;
+        found.add(subcommand);
       }
     }
   }

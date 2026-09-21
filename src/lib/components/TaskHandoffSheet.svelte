@@ -56,7 +56,7 @@
   /**
    * Set once the store has accepted a preparation.
    *
-   * Everything after that point — starting managed Codex, opening a terminal —
+   * Everything after that point — starting a managed session, opening a terminal —
    * can fail without the attempt ceasing to exist. Pressing launch again here
    * would build a new preparation identity and leave two runs for one
    * intention, so the sheet stops offering it and says where the attempt is.
@@ -120,7 +120,7 @@
         <span class="meta gate">{gate.ok ? `${shortcutTextLabel("⌘↩", $hostPlatform.os)} to launch` : gate.reason}</span>
         <button type="button" class="gp-btn" disabled={busy} onclick={onClose}>Cancel</button>
         <button type="button" class="gp-btn-primary" disabled={!gate.ok} onclick={() => void form?.launch()}>
-          {busy ? "Preparing…" : pending ? "Retry preparation" : settings.kind === "managed" ? "Start managed Codex" : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
+          {busy ? "Preparing…" : pending ? "Retry preparation" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
         </button>
       {/if}
     </footer>

@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 68 contracts over
- * 173 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 72 contracts over
+ * 177 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -180,6 +180,21 @@ export const CONTRACTS = Object.freeze([
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
+  // Agent-session notifications. Three files because the envelope, the
+  // counters and the saved preferences each live with the thing that owns
+  // them; one TypeScript module mirrors all three. The counters matter most:
+  // the panel subtracts and sums them to say what was suppressed and what was
+  // lost, so a field that silently read as undefined would report zero — the
+  // exact "a check that did not run looks like one that passed" shape this
+  // subsystem exists to avoid.
+  { label: "session-alerts", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertsView"] },
+  { label: "session-alert-status", rustPath: rust("alerts", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertStatus"] },
+  { label: "session-alert-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertSettings"] },
+  // What an agent CLI starts with in a terminal tab, and which modes this
+  // build can expand. `modes` and `launchers` are what the chooser renders, so
+  // a renamed field would empty the chooser rather than fail — leaving a panel
+  // that offers nothing while reporting nothing wrong.
+  { label: "agent-defaults", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "agentDefaultsStore.ts"), structs: ["AgentDefaultsView"] },
   // Per-repository DevCouncil setup, and the inventory behind it. These land
   // on every repository the user opens, so a rename that made `exclude` or
   // `workspace_registry` read as undefined would silently turn "we hid the

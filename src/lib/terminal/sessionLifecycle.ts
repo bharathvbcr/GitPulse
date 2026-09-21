@@ -105,6 +105,9 @@ export function createSessionLifecycle(options: {
       if (id && id !== spawned.id) throw new Error("Reconnect returned a different terminal. The existing session remains owned.");
       const reattached = id === spawned.id;
       id = spawned.id;
+      // Published before the session can produce anything: a notification that
+      // arrives before the registry knows this id has no tab to open.
+      slot?.identify(spawned.id);
       if (disposed || timedOut) {
         await closeCurrent();
         if (timedOut) state("error", "Starting terminal timed out; the late process was closed. Retry to start again.");

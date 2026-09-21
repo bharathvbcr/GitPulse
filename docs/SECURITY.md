@@ -224,7 +224,7 @@ flowchart TD
 - Local AI suggestions and the policy sidecar do not read/write ordinary shell
   sessions. Explicit Claude, Manvi, Codex and task launches create dedicated PTY
   sessions; the launched process receives that session's input.
-- Terminal handoffs remain user-controlled. Managed Codex runs use the separate
+- Terminal handoffs remain user-controlled. Managed runs (Codex and Claude Code) use the separate
   Manvi configuration/decision protocol. A worktree is not an OS sandbox, and
   native launch validation alone does not prove the provider's effective policy.
   See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the verification limits.

@@ -13,7 +13,7 @@ use tauri::{Emitter, State};
 mod managed_run;
 pub(crate) mod notifications;
 mod process_birth;
-mod terminal_command;
+pub(crate) mod terminal_command;
 mod terminal_launch;
 mod terminal_run;
 

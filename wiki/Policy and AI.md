@@ -34,7 +34,7 @@ Suggested remediation scripts run only through `cmd_manvi_run_action`: a purpose
 Ordinary shell sessions are outside this remediation path. Local AI suggestions
 and the policy sidecar do not read/write them. Explicit agent launchers and saved
 task handoffs start dedicated CLI sessions in the terminal dock, under those
-providers' permissions. Managed Codex runs use a separate Manvi protocol.
+providers' permissions. Managed runs (Codex and Claude Code) use a separate Manvi protocol.
 
 Task title/description suggestions use the profile Manvi provider/model, are bound
 to saved revisions, respect field locks and require selected acceptance. See

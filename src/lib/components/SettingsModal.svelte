@@ -69,6 +69,8 @@
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
   import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
+  import SessionAlertSettings from "./SessionAlertSettings.svelte";
+  import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   import HygieneDefaultsPanel from "./HygieneDefaultsPanel.svelte";
 
@@ -1185,6 +1187,12 @@
                       repoPath={$repoStore.currentPath}
                       active={isOpen && activeSection === "agents"}
                     />
+                  </div>
+                  <div class="border-border/70 mt-3 border-t pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
+                    <SessionAlertSettings active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
+                    <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
                   </div>
                   <div class="border-border/70 mt-3 border-t pt-3">
                     <AgentIntegrationPanel

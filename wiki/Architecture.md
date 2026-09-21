@@ -87,7 +87,7 @@ records are separate from read-only repository execution tasks and leases.
 
 Saved briefs bind revisions. Task editor copying distinguishes saved records from
 new unsaved drafts, and Manvi title/description proposals need selected acceptance.
-Terminal handoffs and managed Codex runs retain separate permission and lifecycle
+Terminal handoffs and managed runs retain separate permission and lifecycle
 contracts. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
 ## Vendored crates

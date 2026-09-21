@@ -27,7 +27,7 @@
  * is exactly the change a preference must not be able to make on its own.
  */
 
-import { asAgentProvider, PERMISSION_MODES, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
+import { asAgentProvider, PERMISSION_MODES, supportsManaged, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
 
@@ -52,8 +52,17 @@ export interface CheckoutCandidate {
 /** Longest checkout path accepted, matching the workbench's own input cap. */
 export const MAX_CHECKOUT_LENGTH = 4_096;
 
+/**
+ * What a profile with no remembered handoff starts from.
+ *
+ * Claude Code, because it is the agent this project is developed with and the
+ * one its integration surfaces — plugin, hooks, notifications, managed adapter
+ * — are exercised against. The connection stays terminal and the mode stays
+ * `ask`: a first launch should be the reversible one, whichever provider runs
+ * it, and the managed lane is a deliberate choice rather than a default.
+ */
 export function defaultHandoff(): HandoffSettings {
-  return { provider: "codex", kind: "external_terminal", permission: "ask" };
+  return { provider: "claude", kind: "external_terminal", permission: "ask" };
 }
 
 export function isAgentProvider(value: unknown): value is AgentProvider {
@@ -69,8 +78,8 @@ export function isRunKind(value: unknown): value is RunKind {
  *
  * Three rules, and each one closes a hole a plain `JSON.parse` would leave:
  * an unknown provider or mode falls back to the default; `bypass` is never
- * restored; and a managed run is only offered for the provider that supports
- * one, so a stored `{claude, managed}` cannot arrive at a launch button that
+ * restored; and a managed run is only offered for a provider that has an
+ * adapter, so a stored `{grok, managed}` cannot arrive at a launch button that
  * would fail.
  */
 export function sanitizeHandoff(value: unknown): HandoffSettings {
@@ -85,10 +94,14 @@ export function sanitizeHandoff(value: unknown): HandoffSettings {
   return { provider, kind, permission };
 }
 
-/** Only Codex has a managed connection today; Claude Code, Grok and Antigravity are terminal-only. */
-export function supportsManaged(provider: AgentProvider): boolean {
-  return provider === "codex";
-}
+/**
+ * Providers with a managed connection. Grok and Antigravity are terminal-only.
+ *
+ * Re-exported, not redefined: the list belongs to `vocabulary.ts`, which the
+ * wire-response guards can also reach. Handoff callers keep importing it from
+ * here.
+ */
+export { MANAGED_PROVIDERS, supportsManaged } from "./vocabulary";
 
 /**
  * The handoff a menu choice starts from.
@@ -124,8 +137,8 @@ export const PROVIDER_LABELS: Record<AgentProvider, string> = {
   agy: "Antigravity",
 };
 
-/** Display order on the handoff control. Codex first because it is the default. */
-export const PROVIDER_CHOICES: readonly AgentProvider[] = ["codex", "claude", "grok", "agy"];
+/** Display order on the handoff control. Claude Code first because it is the default. */
+export const PROVIDER_CHOICES: readonly AgentProvider[] = ["claude", "codex", "grok", "agy"];
 
 export function describeHandoff(settings: HandoffSettings): string {
   const connection = settings.kind === "managed" ? "managed" : "terminal";

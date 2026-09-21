@@ -105,8 +105,16 @@ describe("plugin hooks", () => {
 
   it("declares only hook events this plugin actually handles", () => {
     // An event named here that the binary has no subcommand for spawns a
-    // process per matching tool call to do nothing.
-    expect(Object.keys(hooks.hooks).sort()).toEqual(["PreToolUse", "SessionStart"]);
+    // process per matching tool call to do nothing. Spelled out rather than
+    // derived so adding an event is a deliberate act: each one costs the user
+    // a process, and `Notification` and `StopFailure` are the two that report
+    // rather than decide.
+    expect(Object.keys(hooks.hooks).sort()).toEqual([
+      "Notification",
+      "PreToolUse",
+      "SessionStart",
+      "StopFailure",
+    ]);
   });
 
   it("spawns a bounded command for every entry", () => {
@@ -137,7 +145,14 @@ describe("plugin hooks", () => {
         for (const handler of group.hooks) {
           const [bin, ...rest] = String(handler.command).split(/\s+/);
           expect(bin).toBe("gitpulse-hook");
-          expect(rest.length, `${handler.command} names no subcommand`).toBe(1);
+          expect(rest.length, `${handler.command} names no subcommand`).toBeGreaterThan(0);
+          // Only `notify` takes a second word, and it is the notification type
+          // the matcher routed. A stray argument anywhere else is a typo the
+          // binary would silently ignore.
+          expect(rest.length, `${handler.command} passes more than one argument`).toBeLessThanOrEqual(2);
+          if (rest.length === 2) {
+            expect(rest[0], `${handler.command} argues with a subcommand that takes none`).toBe("notify");
+          }
           declared.add(rest[0]);
         }
       }
@@ -430,11 +445,40 @@ describe("the package's executables are installable", () => {
  * stated. Both sides are parsed rather than repeated.
  */
 describe("hook budgets sit inside the host's timeouts", () => {
+  const hookSource = readFileSync(
+    path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"),
+    "utf8",
+  );
+
   function hookBudgetSeconds(): number {
-    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"), "utf8");
-    const match = /pub const BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+    const match = /pub const BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(hookSource);
     expect(match, "hooks::BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
     return Number(match![1]);
+  }
+
+  /**
+   * The ceiling the work behind one subcommand actually waits out.
+   *
+   * Not every subcommand shares `BUDGET`. `notify` reports rather than checks,
+   * runs while the user is already waiting, and has nothing worth waiting for,
+   * so it has its own much shorter one. Which budget applies is *derived* from
+   * the source — the subcommand's handler is read and the constant it passes
+   * to `within_budget` is the answer — rather than listed here, because a list
+   * would go stale exactly when a handler changed its mind.
+   */
+  function budgetSecondsFor(subcommand: string): number {
+    const handler = new RegExp(
+      `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?within_budget\\(\\s*([A-Z_]+)`,
+    ).exec(hookSource);
+    if (!handler) return hookBudgetSeconds();
+    const constant = handler[1];
+    if (constant === "BUDGET") return hookBudgetSeconds();
+    const declared = new RegExp(
+      `const ${constant}: Duration = Duration::from_(secs|millis)\\((\\d+)\\)`,
+    ).exec(hookSource);
+    expect(declared, `${constant} is not a plain Duration constant; update this contract`).toBeTruthy();
+    const value = Number(declared![2]);
+    return declared![1] === "secs" ? value : value / 1000;
   }
 
   function declaredTimeouts(): Array<{ event: string; command: string; timeout: number }> {
@@ -462,13 +506,22 @@ describe("hook budgets sit inside the host's timeouts", () => {
   });
 
   it("gives every hook longer than the work inside it is allowed to take", () => {
-    const budget = hookBudgetSeconds();
     for (const { event, command, timeout } of declaredTimeouts()) {
+      const subcommand = command.split(/\s+/)[1] ?? "";
+      const budget = budgetSecondsFor(subcommand);
       expect(Number.isFinite(timeout), `${event} ${command} has no numeric timeout`).toBe(true);
       expect(
         timeout,
-        `${event} "${command}" is killed by the host after ${timeout}s, but the hook waits ${budget}s before reporting that its check could not run — the host discards the output of a timed-out hook, so that notice would never be delivered`,
+        `${event} "${command}" is killed by the host after ${timeout}s, but the hook waits ${budget}s before giving up — the host discards the output of a timed-out hook, so whatever it had to say would never be delivered`,
       ).toBeGreaterThan(budget);
     }
+  });
+
+  it("reads a different budget for a subcommand that declares one", () => {
+    // Guards the derivation itself: if the regex stopped matching, every
+    // subcommand would silently fall back to BUDGET and this contract would
+    // check the wrong number while still passing.
+    expect(budgetSecondsFor("notify")).toBeLessThan(hookBudgetSeconds());
+    expect(budgetSecondsFor("collision-guard")).toBe(hookBudgetSeconds());
   });
 });

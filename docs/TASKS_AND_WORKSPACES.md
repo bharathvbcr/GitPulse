@@ -283,12 +283,46 @@ launch. A terminal handoff opens a dedicated task-bound session in the existing
 [terminal dock](TERMINAL.md). It runs under that CLI's configured permissions;
 finishing the process does not accept the task or mark it Done.
 
-Managed Codex runs use a separate Manvi host protocol for configuration checks,
+Managed runs use a separate Manvi host protocol for configuration checks,
 structured questions/approvals and completion receipts. A saved decision and its
 delivery to the provider are separate states. Terminal handoffs do not produce
-those structured callbacks. Managed Claude and full crash recovery remain
-qualification gaps; see the [implementation contract](AGENTIC_WORKSPACES_PLAN.md)
-and [architecture](ARCHITECTURE.md#agentic-workbench-implemented-core-broader-qualification-in-progress).
+those structured callbacks. Full crash recovery remains a qualification gap; see
+the [implementation contract](AGENTIC_WORKSPACES_PLAN.md) and
+[architecture](ARCHITECTURE.md#agentic-workbench-implemented-core-broader-qualification-in-progress).
+
+### Providers with a managed lane
+
+Codex and Claude Code. Grok and Antigravity are terminal-only, and the limit is
+mechanical rather than editorial: a managed run needs an adapter in the harness
+that speaks that provider's own session protocol. The three places that decide
+this — the renderer's choice, the Rust workbench's gate, and the harness's
+adapter set — are held in agreement by `managed-provider-parity-contract`.
+
+Two things differ between the two managed providers, and both are visible in a
+run's recorded effective configuration:
+
+- **Sandbox.** Codex runs inside its own OS sandbox (`read-only`,
+  `workspace-write`, or full access) and the recorded configuration names it.
+  Claude Code has no sandbox, so the record says `none` with network access, and
+  `inspect` is enforced by Claude Code's `plan` permission mode instead. A
+  managed Claude run is *supervised*, not *confined*.
+- **Model.** Codex reports its model when the thread is created, before the run
+  is recorded. Claude Code names its model only once a turn is running, which is
+  after the host has written the configuration and the store has made it
+  immutable — so the field is empty for a managed Claude run, and the build
+  identity (`claude-code/<version>`) is recorded in its place, read from the
+  executable and then checked against the live session.
+
+Repository settings files (`.claude/settings.json` and the `.local` variant) are
+not loaded for a managed Claude run — only the operator's user settings are. A
+checkout cannot widen the permissions of the run inspecting it, or empty the
+approval surface the managed lane exists to provide. `CLAUDE.md` and other
+project context are unaffected; only settings files are scoped.
+
+> [!NOTE]
+> Managed runs are verified on macOS only. Neither adapter uses a Unix-specific
+> API, but both end-to-end tests are `#[cfg(unix)]`, so Windows is untried
+> rather than known-good. See [platform coverage](QUALIFICATION.md#platform-coverage).
 
 ## Keyboard controls
 

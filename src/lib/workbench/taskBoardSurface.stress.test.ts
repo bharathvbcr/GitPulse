@@ -33,6 +33,7 @@ import {
   normalizeCheckout,
   reconcileHandoff,
   sanitizeHandoff,
+  supportsManaged,
 } from "./taskHandoff";
 
 /** Names that exist on every object and have bitten this codebase before. */
@@ -252,7 +253,11 @@ describe("the handoff gate under hostile settings", () => {
       expect(reconcileHandoff(settings)).toEqual(settings);
       expect(sanitizeHandoff(settings)).toEqual(settings);
       // And the pair is always one the launch button could actually run.
-      if (settings.kind === "managed") expect(settings.provider).toBe("codex");
+      // Derived from the list the launch path itself consults, so a provider
+      // gaining or losing an adapter cannot leave this invariant behind.
+      if (settings.kind === "managed") {
+        expect(supportsManaged(settings.provider), JSON.stringify(value)).toBe(true);
+      }
     }
   });
 

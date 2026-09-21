@@ -85,6 +85,37 @@ export function canOpenTab(state: TabState): boolean {
   return state.tabs.length < MAX_TERMINAL_TABS;
 }
 
+/** What the panel knows about where a pane stands. */
+export interface PaneVisibility {
+  /** The dock itself is open. */
+  visible: boolean;
+  /** The panel is showing terminals rather than the console. */
+  mode: string;
+  /** The two tabs a split is showing, or null/undefined when not split. */
+  splitIds?: readonly string[] | null;
+  activeId: string | null;
+  tabId: string;
+}
+
+/**
+ * Whether the user can actually see this tab's terminal.
+ *
+ * Three things used to answer this separately in the panel — the `hidden`
+ * class, the unread-dot guard, and nothing at all for notifications — and they
+ * did not agree: the unread guard consulted `splitIds` without a fallback, so
+ * outside split view it relied on the caller having already checked. That was
+ * true and undocumented, which is the shape a bug takes when someone adds a
+ * third caller.
+ *
+ * Being the *selected* tab is not the same as being visible. A selected tab in
+ * a collapsed dock is on nobody's screen, and treating it as watched is
+ * exactly how a waiting agent goes unannounced.
+ */
+export function paneOnScreen({ visible, mode, splitIds, activeId, tabId }: PaneVisibility): boolean {
+  if (!visible || mode !== "shell") return false;
+  return splitIds ? splitIds.includes(tabId) : tabId === activeId;
+}
+
 /**
  * Opens a tab and focuses it, or returns the state unchanged at the ceiling.
  *

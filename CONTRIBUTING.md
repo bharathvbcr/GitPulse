@@ -113,6 +113,19 @@ This validates the current host. Run it before opening a pull request; the
 platform jobs in `.github/workflows/ci.yml` and `.github/workflows/coverage.yml`
 must still pass on their respective operating systems.
 
+> [!IMPORTANT]
+> **macOS is the platform this project is developed and hand-tested on.** CI
+> runs the automated suites elsewhere, but no one drives a running Windows or
+> Linux build regularly, so a change that only breaks there will not be caught
+> by a person — only by whatever assertion happens to cover it. If you are
+> touching anything platform-shaped, read
+> [platform coverage](docs/QUALIFICATION.md#platform-coverage) first: it
+> separates what is *known absent* off macOS from what is merely *unverified*,
+> and those need different treatment. Write the other platform's behaviour as a
+> `cfg` arm you can compile here rather than relying on a build nobody runs —
+> the Windows target cannot even be cross-checked from a macOS checkout
+> (`libsqlite3-sys` needs a Windows toolchain).
+
 It expands to the full suite — frontend type check, Vitest under V8 coverage, Vite
 build, `cargo fmt`, `cargo clippy -D warnings`, the Rust suites under `cargo llvm-cov`,
 and `npm run check:coverage` to enforce the floors against the two LCOV reports those
@@ -190,10 +203,10 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` (TypeScript 6 compatibility API for Svelte) and stable TypeScript 7 `tsc` type validation on `tsconfig.node.json` |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (226 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (231 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `npm run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 68 contracts (173 structs, 1207 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 72 contracts (177 structs, 1236 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `npm run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -246,6 +259,7 @@ several were added after the drift had already happened.
 | `diagnostics-contract` | The crash log going quiet. The panic hook captures its logger at install time, so installing it before `logging::init()` binds nothing and every later panic is recorded where no one can read it — a hook that looks installed and is inert. It also pins the reverse gap: a new `[[bin]]` inherits neither the logger nor the hook and is absent from `LOGGED_BINARIES`, so it writes no durable log, and nothing about a silent binary looks wrong. Both lists are derived from Cargo.toml rather than restated here. |
 | `plugin-contract` | The Agent Plugins 1.0 package drifting from the published schemas. A extra top-level field, a mismatched `$schema` version between `plugin.json` and `mcp.json`, or a `command` that is a shell string rather than one token, and a conformant client rejects or skips the package while Settings still copies it. |
 | `codex-plugin-contract` | The native Codex manifest, repo marketplace entry, or Tauri resource map disappearing or pointing at a second package root. It also pins the portable `.mcp.json` and shared skill paths. |
+| `managed-provider-parity-contract` | Three processes disagreeing about which agents may run in the *managed* lane. The renderer offers the choice, the Rust workbench prepares and launches the attempt, and the harness has to own an adapter that speaks the provider's protocol — and each disagreement fails differently and quietly. Renderer wider than Rust: the option is offered and the launch refused, with nothing telling the reader that was inevitable. Rust wider than the harness: the attempt is stored and claimed, taking the checkout's capacity, and only then dies. Harness wider than Rust: an adapter nobody can reach. The lists are read from the deciding code rather than restated, and the harness arm reports that it could not look when the sibling checkout is absent instead of passing as though it had compared. |
 | `repository-trust-control-contract` | The trust refusal naming a control the UI does not have. Rust owns the message and Svelte owns the button; no compiler and no runtime path compares them, so a rename drifts silently — and the reader, handed words that match nothing on screen, concludes the control was removed. It said "Extend Trust" while the button read "Extend trust to every worktree". Also pins that the refusal offers approving the worktree *before* the panel (one dialog, no navigation, and the grant covers every worktree) and that the panel is still mounted where the message says to look. |
 | `cursor-plugin-contract` | The plugin logo going missing or moving somewhere no client reads it. Cursor is the only one of the three that renders a `logo`; Claude Code documents no field for one, and the Agent Plugins schema sets `additionalProperties: false`, so the same key in `plugin.json` invalidates the package. The test resolves the logo, keeps it inside the package, and checks the bytes are really a PNG — a `logo` naming a deleted file still parses, and nothing else looks. |
 | `portable-paths.contract` | A `file:` URL's `pathname` used as a filesystem path. It is a real path on macOS and Linux and "/D:/a/repo/…" on Windows, so it passes review and every local run, then fails only on the Windows runner — and fails silently in the worse half of the cases: fed to a directory scan it returns `[]`, and the assertions built on it pass while checking nothing. Two of the three Windows CI failures on 2026-09-03 were this. |
@@ -296,7 +310,7 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (226 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (231 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health

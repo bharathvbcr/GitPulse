@@ -18,6 +18,13 @@ These are the release workflow's targets. Check that the chosen release includes
 the asset for your machine. Building an installer does not establish that every
 workflow has been tested on that platform.
 
+> [!NOTE]
+> GitPulse is developed and hand-tested on macOS. Windows and Linux builds are
+> produced and covered by the automated suites, but are not exercised against a
+> running app by a person. Some features are deliberately macOS-only — desktop
+> notifications among them — and others are simply untried elsewhere.
+> [Platform coverage](QUALIFICATION.md#platform-coverage) lists which is which.
+
 Git must be installed and available to the app. For native build dependencies,
 see [Contributing](../CONTRIBUTING.md).
 

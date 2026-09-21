@@ -2,6 +2,9 @@
   import { onMount, tick } from "svelte";
   import { createVisibleInterval } from "../dom/visibleInterval";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import { isTauri } from "../platform";
+  import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
@@ -11,7 +14,9 @@
     ArrowUpFromLine,
     Bug,
     CheckCircle2,
+    ExternalLink,
     GitBranch,
+    ListPlus,
     LoaderCircle,
     RefreshCw,
     Rocket,
@@ -22,6 +27,7 @@
   } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
+  import { toastStore } from "../stores/toastStore";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
   import { harnessPermissionMode } from "../harness/availability";
   import {
@@ -31,7 +37,15 @@
     type BranchCleanupPlan,
     type CommitReviewReport,
     type TagCleanupPlan,
+    type IssueInfo,
   } from "../ops/model";
+  import { registerRepository, type TaskCard } from "../workbench/client";
+  import {
+    createTaskFromIssue,
+    batchCreateTasksFromIssues,
+    findTaskForIssue,
+    listAllRepositoryTasks,
+  } from "../workbench/issueTask";
   import ManviHarnessPane from "./ManviHarnessPane.svelte";
   import {
     MANVI_FOCUS_TARGETS,
@@ -92,6 +106,17 @@
   let releaseMessage = $state("");
   let releaseConfirmed = $state(false);
   let lastRepo: string | null = null;
+
+  let repoTasks = $state<TaskCard[]>([]);
+  let taskAddingNumber = $state<number | null>(null);
+  let batchAdding = $state(false);
+
+  let unimportedIssues = $derived(
+    github?.issues
+      ? github.issues.filter((issue) => !findTaskForIssue(repoTasks, issue.number))
+      : [],
+  );
+  let unimportedCount = $derived(unimportedIssues.length);
 
   let tagPlan = $state<TagCleanupPlan | null>(null);
   let selectedTags = $state<string[]>([]);
@@ -170,6 +195,7 @@
       if ($repoStore.currentPath === repo) {
         github = next;
         if (opts.background) pollError = null;
+        void loadRepoTasks(repo);
       }
     } catch (error) {
       if ($repoStore.currentPath !== repo) return;
@@ -383,6 +409,108 @@
     return run.conclusion || run.status || "unknown";
   }
 
+  function openTasksView() {
+    repoStore.setViewSection("work", "tasks");
+  }
+
+  let repoTasksGeneration = 0;
+  let refreshTasksTimer: number | null = null;
+
+  function scheduleRefreshRepoTasks() {
+    if (refreshTasksTimer !== null) window.clearTimeout(refreshTasksTimer);
+    refreshTasksTimer = window.setTimeout(() => {
+      refreshTasksTimer = null;
+      const repo = $repoStore.currentPath;
+      if (repo) void loadRepoTasks(repo);
+    }, 200);
+  }
+
+  async function loadRepoTasks(repoPath: string = $repoStore.currentPath ?? "") {
+    if (!repoPath) {
+      repoTasks = [];
+      return;
+    }
+    const currentGen = ++repoTasksGeneration;
+    try {
+      const registered = await registerRepository(repoPath);
+      if ($repoStore.currentPath !== repoPath || !registered?.id || currentGen !== repoTasksGeneration) return;
+      const tasks = await listAllRepositoryTasks(registered.id);
+      if ($repoStore.currentPath === repoPath && currentGen === repoTasksGeneration) {
+        repoTasks = tasks;
+      }
+    } catch {
+      // Non-fatal: if task catalog cannot be reached, repoTasks remains empty
+    }
+  }
+
+  async function addIssueToTask(issue: IssueInfo) {
+    const repoPath = $repoStore.currentPath;
+    if (!repoPath) {
+      notice = "No active repository found.";
+      return;
+    }
+    if (taskAddingNumber !== null || batchAdding || busy !== null) return;
+    taskAddingNumber = issue.number;
+    notice = null;
+    try {
+      const saved = await createTaskFromIssue(issue, repoPath);
+      if ($repoStore.currentPath === repoPath) {
+        repoTasks = [saved, ...repoTasks.filter((t) => t.id !== saved.id)];
+        toastStore.success(`Created task for issue #${issue.number}`);
+        notice = `Task [#${issue.number}] created. Available on the Tasks board for agent handoff.`;
+      }
+    } catch (err) {
+      if ($repoStore.currentPath === repoPath) {
+        notice = formatError(err);
+      }
+    } finally {
+      taskAddingNumber = null;
+    }
+  }
+
+  async function addAllIssuesToTasks() {
+    const repoPath = $repoStore.currentPath;
+    if (!repoPath || !github?.issues?.length) return;
+    if (batchAdding || taskAddingNumber !== null || busy !== null) return;
+
+    if (unimportedIssues.length === 0) {
+      notice = "All open issues are already in tasks.";
+      return;
+    }
+
+    const count = unimportedIssues.length;
+    const confirmed = await askConfirm({
+      title: "Add all issues to tasks",
+      message: `Create ${count} task${count === 1 ? "" : "s"} from open GitHub issues for coding agents to work on?`,
+      confirmLabel: "Add tasks",
+    });
+    if (!confirmed || $repoStore.currentPath !== repoPath) return;
+
+    batchAdding = true;
+    notice = null;
+    try {
+      const result = await batchCreateTasksFromIssues(unimportedIssues, repoPath, repoTasks);
+      if ($repoStore.currentPath === repoPath) {
+        repoTasks = [...result.created, ...repoTasks];
+        if (result.created.length > 0) {
+          toastStore.success(
+            `Created ${result.created.length} task${result.created.length === 1 ? "" : "s"} from GitHub issues`,
+          );
+          notice = `Added ${result.created.length} task${result.created.length === 1 ? "" : "s"} to Tasks board for agent handoff.`;
+        }
+        if (result.errors.length > 0) {
+          notice = `Added ${result.created.length} tasks; ${result.errors.length} failed: ${result.errors[0].error}`;
+        }
+      }
+    } catch (err) {
+      if ($repoStore.currentPath === repoPath) {
+        notice = formatError(err);
+      }
+    } finally {
+      batchAdding = false;
+    }
+  }
+
   /**
    * A deep link from elsewhere in the app (the header chips, the storage
    * panel) names a section, not just this view. Switching the pane is only
@@ -474,11 +602,29 @@
     // window is on screen AND this pane is the one showing. The visibility
     // half belongs to the timer now — it used to keep firing behind other
     // windows and merely decline the work, which still woke the renderer.
-    return createVisibleInterval(() => {
+    const stopInterval = createVisibleInterval(() => {
       if (pane === "ops" && $repoStore.currentPath) {
         void loadIssues(undefined, { background: true });
       }
     }, ISSUE_REFRESH_MS);
+
+    const listeners = createListenerTracker();
+    if (isTauri()) {
+      void listen("workbench-changed", scheduleRefreshRepoTasks)
+        .then((stop) => listeners.track(stop))
+        .catch(() => {
+          // Live updates unavailable in non-Tauri preview mode
+        });
+    }
+
+    return () => {
+      stopInterval();
+      listeners.dispose();
+      if (refreshTasksTimer !== null) {
+        window.clearTimeout(refreshTasksTimer);
+        refreshTasksTimer = null;
+      }
+    };
   });
 
   // `lastRepo` memoizes this effect's real dependency: repoStore republishes
@@ -493,6 +639,7 @@
     selectedBranches = [];
     review = null;
     github = null;
+    repoTasks = [];
     notice = null;
     pollError = null;
     const tag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
@@ -500,7 +647,10 @@
     releaseMessage = `Release ${tag}`;
     releaseConfirmed = false;
     pendingIssueRepo = null; // a queued request for an older repo is obsolete
-    if (repo) void loadIssues(repo);
+    if (repo) {
+      void loadIssues(repo);
+      void loadRepoTasks(repo);
+    }
   });
 </script>
 
@@ -530,7 +680,14 @@
     </div>
 
     {#if notice}
-      <div class="rounded-xl border border-border bg-surface px-3 py-2 text-textSecondary">{notice}</div>
+      <div class="flex items-center justify-between rounded-xl border border-border bg-surface px-3 py-2 text-textSecondary">
+        <span>{notice}</span>
+        {#if notice.includes("Tasks board")}
+          <button type="button" class="gp-btn text-xs py-0.5 px-2 ml-2 shrink-0" onclick={openTasksView}>
+            Open Tasks
+          </button>
+        {/if}
+      </div>
     {/if}
 
     {#if pollError}
@@ -697,19 +854,88 @@
       <section class="gp-card p-4">
         <div class="mb-3 flex items-center justify-between">
           <div><h3 class="font-semibold">Issue monitor</h3><p class="text-textMuted">Refreshes open GitHub issues every minute while this view is visible.</p></div>
-          <button class="gp-icon-btn" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
+          <div class="flex items-center gap-2">
+            {#if unimportedCount > 0}
+              <button
+                type="button"
+                class="gp-btn text-xs py-1 px-2.5"
+                onclick={addAllIssuesToTasks}
+                disabled={batchAdding || busy !== null}
+                title="Add all unimported open issues into tasks for agent handoff"
+              >
+                {#if batchAdding}
+                  <LoaderCircle size={12} class="animate-spin text-accent" />
+                  <span>Importing…</span>
+                {:else}
+                  <ListPlus size={12} class="text-accent" />
+                  <span>Add all ({unimportedCount}) to tasks</span>
+                {/if}
+              </button>
+            {/if}
+            <button class="gp-icon-btn" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
+          </div>
         </div>
         {#if github?.error}
           <div class="text-amber-400">{github.error}</div>
         {:else if github?.issues_error}
           <div class="flex items-center gap-2 text-amber-400"><AlertTriangle size={14} /> Issue monitor unavailable: {github.issues_error}</div>
         {:else}
-          <div class="max-h-44 space-y-1 overflow-auto">
+          <div class="max-h-56 space-y-1.5 overflow-auto">
             {#each github?.issues ?? [] as issue (issue.number)}
-              <button class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-surfaceHover" onclick={() => openExternal(issue.url)}>
-                <Bug size={13} class="text-accent" /><span class="font-mono text-textMuted">#{issue.number}</span><span class="min-w-0 flex-1 truncate">{issue.title}</span>
-                {#if issue.labels[0]}<span class="gp-pill">{issue.labels[0]}</span>{/if}
-              </button>
+              {@const inTask = findTaskForIssue(repoTasks, issue.number)}
+              <div class="flex items-center justify-between gap-2 rounded-lg border border-border/50 bg-surface/50 px-2.5 py-2 hover:bg-surfaceHover transition-colors">
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                  <Bug size={13} class="text-accent shrink-0" />
+                  <button
+                    type="button"
+                    class="font-mono text-textMuted hover:text-accent hover:underline text-left text-xs shrink-0 cursor-pointer"
+                    onclick={() => openExternal(issue.url)}
+                    title={`Open issue #${issue.number} on GitHub`}
+                  >
+                    #{issue.number}
+                  </button>
+                  <span class="min-w-0 flex-1 truncate text-xs font-medium" title={issue.title}>{issue.title}</span>
+                  {#if issue.labels[0]}<span class="gp-pill text-[10px] shrink-0">{issue.labels[0]}</span>{/if}
+                </div>
+
+                <div class="flex items-center gap-1.5 shrink-0">
+                  {#if inTask}
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-accent/10 text-accent hover:bg-accent/20 border border-accent/30 transition-colors cursor-pointer"
+                      onclick={openTasksView}
+                      title={`Issue #${issue.number} is in tasks. Click to view on Tasks board.`}
+                    >
+                      <CheckCircle2 size={11} class="text-emerald-400" />
+                      <span>In tasks</span>
+                    </button>
+                  {:else}
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-surface hover:bg-surfaceHover border border-border text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50 cursor-pointer"
+                      onclick={() => addIssueToTask(issue)}
+                      disabled={taskAddingNumber === issue.number || batchAdding || busy !== null}
+                      title={`Create task from issue #${issue.number} for agents to work on`}
+                    >
+                      {#if taskAddingNumber === issue.number}
+                        <LoaderCircle size={11} class="animate-spin text-accent" />
+                        <span>Adding…</span>
+                      {:else}
+                        <ListPlus size={11} class="text-accent" />
+                        <span>+ Task</span>
+                      {/if}
+                    </button>
+                  {/if}
+                  <button
+                    type="button"
+                    class="gp-icon-btn p-1 text-textMuted hover:text-textPrimary cursor-pointer"
+                    title={`Open issue #${issue.number} on GitHub`}
+                    onclick={() => openExternal(issue.url)}
+                  >
+                    <ExternalLink size={12} />
+                  </button>
+                </div>
+              </div>
             {:else}
               <div class="py-3 text-textMuted">No open issues found.</div>
             {/each}

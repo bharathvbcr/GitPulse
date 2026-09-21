@@ -97,20 +97,41 @@ pub(super) fn install(
     let delegate: Retained<NotificationDelegate> = unsafe { msg_send![super(allocated), init] };
     center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     DELEGATE.with(|slot| *slot.borrow_mut() = Some(delegate));
-    let action = UNNotificationAction::actionWithIdentifier_title_options(
-        &NSString::from_str("open"),
-        &NSString::from_str("Open task"),
-        UNNotificationActionOptions::Foreground,
-    );
-    let category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
-        &NSString::from_str("gitpulse-workbench"),
-        &NSArray::from_retained_slice(&[action]),
-        &NSArray::<NSString>::new(),
-        UNNotificationCategoryOptions::empty(),
-    );
-    center.setNotificationCategories(&NSSet::from_retained_slice(&[category]));
+    // Two categories, because the two kinds of banner resolve to different
+    // places when they are clicked: an activity notice opens the task it is
+    // about, a session notice raises the terminal tab that asked. Registering
+    // one category with a generic verb would make the button lie about one of
+    // them. `setNotificationCategories` replaces the whole set, so both are
+    // registered in the same call rather than in two.
+    let categories: Vec<_> = [
+        (WORKBENCH_CATEGORY, "Open task"),
+        (SESSION_CATEGORY, "Open session"),
+    ]
+    .into_iter()
+    .map(|(identifier, verb)| {
+        let action = UNNotificationAction::actionWithIdentifier_title_options(
+            &NSString::from_str("open"),
+            &NSString::from_str(verb),
+            UNNotificationActionOptions::Foreground,
+        );
+        UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+            &NSString::from_str(identifier),
+            &NSArray::from_retained_slice(&[action]),
+            &NSArray::<NSString>::new(),
+            UNNotificationCategoryOptions::empty(),
+        )
+    })
+    .collect();
+    center.setNotificationCategories(&NSSet::from_retained_slice(&categories));
     Ok(())
 }
+
+/// Category and thread for the workbench's activity notices.
+pub(super) const WORKBENCH_CATEGORY: &str = "gitpulse-workbench";
+/// Category and thread for terminal and agent session notices. A separate
+/// thread so macOS groups a noisy session apart from task activity instead of
+/// collapsing both into one stack.
+pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
 
 fn timeout() -> WorkbenchError {
     WorkbenchError::new("timeout","macOS notification reply was not confirmed. Recheck status; a delivery will not be sent again automatically.")
@@ -157,12 +178,33 @@ pub(super) fn authorization(request: bool) -> Result<String, WorkbenchError> {
 }
 
 pub(super) fn submit(native: &str, title: &str, sound: bool) -> Result<bool, WorkbenchError> {
+    post(
+        native,
+        "GitPulse activity",
+        title,
+        sound,
+        WORKBENCH_CATEGORY,
+    )
+}
+
+/// One submission, whatever raised it.
+///
+/// `identifier` is what macOS replaces on: re-posting the same one updates the
+/// existing banner rather than stacking another, which is what makes a chatty
+/// session produce one live notification instead of a column of them.
+pub(super) fn post(
+    native: &str,
+    heading: &str,
+    body: &str,
+    sound: bool,
+    category: &str,
+) -> Result<bool, WorkbenchError> {
     let center = center()?;
     let content = UNMutableNotificationContent::new();
-    content.setTitle(&NSString::from_str("GitPulse activity"));
-    content.setBody(&NSString::from_str(title));
-    content.setCategoryIdentifier(&NSString::from_str("gitpulse-workbench"));
-    content.setThreadIdentifier(&NSString::from_str("gitpulse-workbench"));
+    content.setTitle(&NSString::from_str(heading));
+    content.setBody(&NSString::from_str(body));
+    content.setCategoryIdentifier(&NSString::from_str(category));
+    content.setThreadIdentifier(&NSString::from_str(category));
     if sound {
         content.setSound(Some(&UNNotificationSound::defaultSound()));
     }

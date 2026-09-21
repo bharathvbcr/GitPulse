@@ -54,6 +54,7 @@
     initialState,
     launcherLabel,
     openTab,
+    paneOnScreen,
     setTabTitle,
     renameTab,
     moveTab,
@@ -1008,11 +1009,12 @@
               launcher={tab.launcher}
               initialPrompt={tab.initialPrompt}
               active={visible && tab.id === tabState.activeId && mode === "shell"}
+              onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
               revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => sessions[tab.id]?.reveal()); }}
               onStatus={(status) => { tabStatuses = { ...tabStatuses, [tab.id]: status }; terminalLaunchRequests.update(tab.id, status); }}
-              onActivity={() => { if (visible && mode === "shell" && splitIds?.includes(tab.id)) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
+              onActivity={() => { if (paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
           </div>
         {/each}

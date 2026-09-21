@@ -37,7 +37,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (226 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (231 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -185,7 +185,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +226 Registered Handlers
+        +231 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -365,7 +365,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `npm run check:ipc` | Verifies all 226 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1207 data fields, over 173 structs, in 68 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1236 data fields, over 177 structs, in 72 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
@@ -613,8 +613,8 @@ Task launches normalize conflicting Git roots and child-only `DEVCOUNCIL_ROOT`
 without changing global configuration or ordinary shells. Requested permission
 modes are explicit argv; advanced bypass needs acknowledgment on each new attempt.
 CLI help proves advertised controls, not effective account policy or containment
-of an unrestricted child. These terminals remain user-controlled; managed Codex
-uses the separate verified-configuration protocol below.
+of an unrestricted child. These terminals remain user-controlled; managed runs
+use the separate verified-configuration protocol below.
 
 Manvi schema eight supplies the durable request binding for those protocols.
 `AgentDecisions.svelte` reads one run's bounded request pages and verifies the
@@ -642,9 +642,13 @@ inbox classifies it as failure even when the helper's exit code is zero.
 The inspector presents structured question fields and one-time approval/denial.
 Complete request text remains available unchanged. Run lists omit output and
 settings; those are loaded only when requested, with explicit retention limits.
-The installed Codex 0.153.4 read-only path passed both direct-protocol and native
-GitPulse-to-Manvi-to-provider tests. Actual account approval variants, escaped
-process descendants, managed Claude and full crash recovery remain unqualified.
+The installed Claude Code 2.1.278 read-only path passed the native
+GitPulse-to-Manvi-to-provider test, which asserts the recorded configuration
+carries that build's own handshake identity. The Codex path passed the same
+tests against 0.153.4 when they were written; it is currently unverifiable on
+this machine, whose Codex account rejects its configured model. Actual account
+approval variants, escaped process descendants and full crash recovery remain
+unqualified.
 
 Process reaping evidence is carried separately from exit status. An unconfirmed
 exit stays unresolved in the store. During shutdown, new work is refused while

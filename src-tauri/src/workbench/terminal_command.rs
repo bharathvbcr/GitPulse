@@ -75,6 +75,21 @@ pub(super) fn is_terminal_provider(provider: &str) -> bool {
     matches!(provider, "codex" | "claude" | "grok" | "agy")
 }
 
+/// Providers GitPulse can run in the **managed** lane, where the harness hosts
+/// the session over a protocol and GitPulse mediates every approval — rather
+/// than handing the task to a terminal and stepping back.
+///
+/// Strictly smaller than [`is_terminal_provider`], and it is smaller for a
+/// mechanical reason rather than a policy one: a managed run needs an adapter
+/// in the harness that speaks that provider's own session protocol. Grok and
+/// Antigravity have none, so admitting them here would hand their output to a
+/// reader written for someone else's wire format. This list is the mirror of
+/// the harness's own `codingagent.ManagedProviders`; the two are checked
+/// against each other by `managed-provider-parity-contract`.
+pub(super) fn is_managed_provider(provider: &str) -> bool {
+    matches!(provider, "codex" | "claude")
+}
+
 pub(super) fn program(provider: &str) -> Result<String, WorkbenchError> {
     if !is_terminal_provider(provider) {
         return Err(error("invalid_input", "Unsupported terminal provider."));
@@ -231,6 +246,123 @@ fn advertised_option(help: &str, flag: &str, value: Option<&str>) -> bool {
         })
 }
 
+/// Permission modes, in the order a chooser should offer them: least
+/// authority first, so the dangerous end of the range is the far end rather
+/// than a neighbour of the safe default.
+///
+/// Read by `agentDefaults.contract.test.ts`, which fails if the frontend's
+/// list drifts from this one. The frontend needs the *names* to render a
+/// chooser and to say which mode a tab will start in; it must never carry the
+/// flags, because a transcribed flag table is a table that drifts.
+pub(crate) const PERMISSION_MODES: [&str; 6] = [
+    "inspect",
+    "ask",
+    "edit",
+    "auto_review",
+    "preapproved",
+    "bypass",
+];
+
+/// The one mode that turns a safety control off, named once so the two places
+/// that must treat it specially cannot disagree about which one it is.
+pub(crate) const BYPASS_MODE: &str = "bypass";
+
+/// Launchers that accept a permission mode, derived by asking [`policy`]
+/// rather than by writing the list down a second time.
+///
+/// Every launcher the tab strip offers is tried against every mode, and one
+/// that can express them all is included. Derived because the alternative —
+/// a hand-kept list — is the thing that goes stale when a provider gains or
+/// loses a policy, and a stale list here is a chooser offering a mode that
+/// refuses at spawn.
+pub(crate) fn permission_launchers() -> Vec<String> {
+    crate::terminal::AGENT_LAUNCHERS
+        .iter()
+        .filter(|launcher| {
+            PERMISSION_MODES
+                .iter()
+                .all(|mode| policy(launcher, mode).is_ok())
+        })
+        .map(|launcher| (*launcher).to_owned())
+        .collect()
+}
+
+/// Whether this launcher/mode pair is one a launch could actually apply.
+///
+/// Asks [`policy`] rather than restating its arms, so a pair this accepts is
+/// exactly a pair that expands. Used to validate stored defaults at the point
+/// they are saved *and* again when they are read, because the file they live
+/// in is editable by hand.
+pub(crate) fn validate_permission_default(launcher: &str, mode: &str) -> Result<(), String> {
+    if !is_terminal_provider(launcher) {
+        return Err(format!("{launcher} does not take a permission mode"));
+    }
+    policy(launcher, mode)
+        .map(|_| ())
+        .map_err(|error| error.message)
+}
+
+/// Expands a stored default permission mode into that provider's own flags,
+/// ahead of the arguments the caller already built.
+///
+/// This exists so the terminal tab strip and the workbench handoff share one
+/// table. [`policy`] is the only place that knows which flag means "plan" for
+/// which CLI; the frontend knows mode *names* and nothing else, so there is no
+/// second copy to drift.
+///
+/// **Order matters and is why the flags go in front.** Claude Code's prompt
+/// form is `-- <text>`, after which every argument is positional: a permission
+/// flag appended behind the prompt would be read as part of the prompt rather
+/// than obeyed. The caller's own arguments (notification flags, then the
+/// prompt) keep their relative order behind these.
+///
+/// Refuses rather than ignores in three cases, all of them the same rule: a
+/// control the user asked for that cannot be applied must never look like one
+/// that was.
+///
+/// * A mode for a launcher with no policy (`shell`, `manvi`) — silently
+///   dropping it would leave a tab the user believes is in plan mode running
+///   with the CLI's own default.
+/// * An unknown mode — the same, one layer down.
+/// * An acknowledgement that does not match the mode. Exactly as
+///   [`arguments`] does it: `bypass` needs one and every other mode must not
+///   carry one. The symmetry is the point — a caller that hardcoded
+///   `acknowledged: true` would fail on its very first ordinary launch, rather
+///   than working until the day someone stores `bypass` and silently getting
+///   the session nobody agreed to.
+pub(crate) fn apply_permission_mode(
+    program: Option<&str>,
+    mode: Option<&str>,
+    acknowledged: bool,
+    args: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(mode) = mode.map(str::trim).filter(|mode| !mode.is_empty()) else {
+        return Ok(args);
+    };
+    let provider = program.map(str::trim).unwrap_or_default();
+    if !is_terminal_provider(provider) {
+        return Err(format!(
+            "{} does not take a permission mode.",
+            if provider.is_empty() {
+                "The login shell"
+            } else {
+                provider
+            }
+        ));
+    }
+    if (mode == BYPASS_MODE) != acknowledged {
+        return Err(if acknowledged {
+            "Only bypass takes an acknowledgment.".into()
+        } else {
+            "Bypass requires acknowledgment for this attempt.".to_owned()
+        });
+    }
+    let (flags, _) = policy(provider, mode).map_err(|error| error.message)?;
+    let mut expanded: Vec<String> = flags.into_iter().map(String::from).collect();
+    expanded.extend(args.unwrap_or_default());
+    Ok(Some(expanded))
+}
+
 fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), WorkbenchError> {
     let flags = match (provider, mode) {
         ("codex", "inspect") => vec!["--sandbox", "read-only", "--ask-for-approval", "never"],
@@ -318,6 +450,290 @@ pub(super) fn arguments(
         ));
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod permission_default_tests {
+    use super::{
+        apply_permission_mode, permission_launchers, policy, validate_permission_default,
+        BYPASS_MODE, PERMISSION_MODES,
+    };
+
+    fn args(items: &[&str]) -> Option<Vec<String>> {
+        Some(items.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// The load-bearing property. Claude Code's `-- <text>` makes everything
+    /// after it positional, so a permission flag that landed behind the prompt
+    /// would be read as prompt text and the session would run unrestricted
+    /// while appearing configured.
+    #[test]
+    fn policy_flags_precede_the_callers_own_arguments() {
+        let out = apply_permission_mode(
+            Some("claude"),
+            Some("inspect"),
+            false,
+            args(&["--settings", "{}", "--", "do the thing"]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--permission-mode",
+                "plan",
+                "--settings",
+                "{}",
+                "--",
+                "do the thing"
+            ]
+        );
+        let separator = out.iter().position(|a| a == "--").unwrap();
+        assert!(
+            out.iter().position(|a| a == "--permission-mode").unwrap() < separator,
+            "a permission flag after `--` is prompt text, not a permission"
+        );
+    }
+
+    #[test]
+    fn every_mode_expands_for_every_launcher_that_offers_them() {
+        for launcher in permission_launchers() {
+            for mode in PERMISSION_MODES {
+                let acknowledged = mode == BYPASS_MODE;
+                let out =
+                    apply_permission_mode(Some(&launcher), Some(mode), acknowledged, None).unwrap();
+                assert!(
+                    out.is_some(),
+                    "{launcher}/{mode} expanded to nothing at all"
+                );
+                assert_eq!(
+                    out.unwrap(),
+                    policy(&launcher, mode).unwrap().0,
+                    "{launcher}/{mode} disagreed with the policy table"
+                );
+            }
+        }
+    }
+
+    /// `agy`'s `ask` is the one pair with no flags. It must still be offered
+    /// and still expand — to an empty list, which is a mode that was applied,
+    /// not a mode that was skipped.
+    #[test]
+    fn a_mode_whose_policy_is_empty_is_still_applied() {
+        assert_eq!(policy("agy", "ask").unwrap().0, Vec::<&str>::new());
+        let out = apply_permission_mode(Some("agy"), Some("ask"), false, args(&["--keep"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec!["--keep"]);
+    }
+
+    #[test]
+    fn bypass_without_acknowledgment_is_refused_for_every_launcher() {
+        for launcher in permission_launchers() {
+            let refused = apply_permission_mode(Some(&launcher), Some(BYPASS_MODE), false, None);
+            assert!(
+                refused.is_err(),
+                "{launcher} produced a bypassed session with no acknowledgment"
+            );
+        }
+    }
+
+    /// The symmetry that makes a hardcoded `acknowledged: true` fail loudly on
+    /// an ordinary launch instead of lying dormant until bypass is stored.
+    #[test]
+    fn an_acknowledgment_without_bypass_is_refused() {
+        for mode in PERMISSION_MODES.iter().filter(|m| **m != BYPASS_MODE) {
+            assert!(
+                apply_permission_mode(Some("claude"), Some(mode), true, None).is_err(),
+                "{mode} accepted an acknowledgment it does not need"
+            );
+        }
+    }
+
+    /// A mode asked for and not applied must be a refusal, never a quiet
+    /// passthrough: a tab the user believes is in plan mode would otherwise
+    /// run with the CLI's own default.
+    #[test]
+    fn a_launcher_with_no_policy_refuses_a_mode_rather_than_dropping_it() {
+        for launcher in [None, Some(""), Some("shell"), Some("manvi"), Some("bash")] {
+            let refused = apply_permission_mode(launcher, Some("inspect"), false, None);
+            assert!(
+                refused.is_err(),
+                "{launcher:?} silently ignored a permission mode"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_mode_is_refused_rather_than_guessed() {
+        for mode in ["", "  ", "plan", "yolo", "BYPASS", "inspect ", "--sandbox"] {
+            let out = apply_permission_mode(Some("claude"), Some(mode), false, args(&["--keep"]));
+            if mode.trim().is_empty() {
+                // Nothing asked for, so the caller's arguments pass through.
+                assert_eq!(out.unwrap().unwrap(), vec!["--keep"]);
+            } else if mode == "inspect " {
+                // Trimmed, then honoured: a stored value with stray space is a
+                // typo, not a different mode.
+                assert_eq!(
+                    out.unwrap().unwrap(),
+                    vec!["--permission-mode", "plan", "--keep"]
+                );
+            } else {
+                assert!(out.is_err(), "{mode:?} was accepted");
+            }
+        }
+    }
+
+    #[test]
+    fn no_mode_leaves_the_arguments_exactly_as_they_came() {
+        assert_eq!(
+            apply_permission_mode(Some("claude"), None, false, args(&["--settings", "{}"]))
+                .unwrap()
+                .unwrap(),
+            vec!["--settings", "{}"]
+        );
+        assert!(
+            apply_permission_mode(None, None, false, None)
+                .unwrap()
+                .is_none(),
+            "a plain shell gained arguments it never asked for"
+        );
+    }
+
+    /// The chooser's list is derived, so this pins what it derives *to* — a
+    /// provider silently dropping out of the list would otherwise be invisible.
+    #[test]
+    fn permission_launchers_are_the_terminal_providers_and_not_the_tab_strip() {
+        let mut launchers = permission_launchers();
+        launchers.sort();
+        assert_eq!(launchers, vec!["agy", "claude", "codex", "grok"]);
+        assert!(
+            !launchers.contains(&"manvi".to_owned()),
+            "manvi has no policy; offering it a mode would refuse at spawn"
+        );
+    }
+
+    /// Sweeps the whole grid plus the ways a caller could be wrong, and
+    /// asserts the one property that must hold across all of it: every call
+    /// either applies exactly the policy table's flags, or refuses. There is
+    /// no third outcome, and in particular no "returned the arguments
+    /// unchanged while the caller believes a mode was applied".
+    #[test]
+    fn every_input_either_applies_the_table_or_refuses_and_never_silently_passes() {
+        let launchers = [
+            "claude", "codex", "grok", "agy", "manvi", "shell", "", "sh", "CLAUDE",
+        ];
+        let modes = [
+            "inspect",
+            "ask",
+            "edit",
+            "auto_review",
+            "preapproved",
+            "bypass",
+            "plan",
+            "yolo",
+            "",
+            "  ",
+            "BYPASS",
+            "bypass\u{0}",
+            "../bypass",
+        ];
+        let (mut applied, mut refused, mut passthrough) = (0usize, 0usize, 0usize);
+        for launcher in launchers {
+            for mode in modes {
+                for acknowledged in [false, true] {
+                    let carried = args(&["--carried"]);
+                    let outcome = apply_permission_mode(
+                        Some(launcher),
+                        Some(mode),
+                        acknowledged,
+                        carried.clone(),
+                    );
+                    let Ok(out) = outcome else {
+                        refused += 1;
+                        continue;
+                    };
+                    let out = out.expect("an applied mode must produce arguments");
+                    if mode.trim().is_empty() {
+                        // Nothing was asked for, so nothing was applied and the
+                        // caller's own arguments survive untouched.
+                        assert_eq!(out, vec!["--carried"]);
+                        passthrough += 1;
+                        continue;
+                    }
+                    // Anything else that succeeded must be exactly the table's
+                    // flags followed by what the caller passed.
+                    let (flags, _) =
+                        policy(launcher, mode.trim()).expect("a mode applied without a policy arm");
+                    let mut expected: Vec<String> = flags.into_iter().map(String::from).collect();
+                    expected.push("--carried".into());
+                    assert_eq!(out, expected, "{launcher}/{mode}/ack={acknowledged}");
+                    // And bypass only ever with an acknowledgement.
+                    assert_eq!(mode.trim() == BYPASS_MODE, acknowledged);
+                    applied += 1;
+                }
+            }
+        }
+        // Carrying all three numbers rather than one total: a sweep where
+        // everything refused would "pass" a refusal-only assertion while
+        // proving nothing about the applied path.
+        assert_eq!(
+            applied,
+            permission_launchers().len() * PERMISSION_MODES.len(),
+            "expected exactly one applied outcome per real launcher/mode pair"
+        );
+        assert!(refused > 0 && passthrough > 0, "a branch went untested");
+    }
+
+    /// A caller that hands over an enormous argument list must not have the
+    /// flags silently dropped or reordered; expansion is a prepend and stays
+    /// one whatever the volume.
+    #[test]
+    fn expansion_prepends_regardless_of_how_many_arguments_the_caller_brought() {
+        let carried: Vec<String> = (0..10_000).map(|i| format!("--arg{i}")).collect();
+        let out = apply_permission_mode(
+            Some("claude"),
+            Some("inspect"),
+            false,
+            Some(carried.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.len(), carried.len() + 2);
+        assert_eq!(&out[..2], &["--permission-mode", "plan"]);
+        assert_eq!(&out[2..], &carried[..]);
+    }
+
+    #[test]
+    fn stored_defaults_are_validated_against_the_policy_table() {
+        assert!(validate_permission_default("claude", "edit").is_ok());
+        for (launcher, mode) in [
+            ("manvi", "edit"),
+            ("shell", "edit"),
+            ("claude", "yolo"),
+            ("", "edit"),
+            ("claude", ""),
+        ] {
+            assert!(
+                validate_permission_default(launcher, mode).is_err(),
+                "{launcher}={mode} passed validation"
+            );
+        }
+    }
+
+    /// Bypass is storable — that is the whole point of the acknowledgement
+    /// design — but storing it must not be what applies it.
+    #[test]
+    fn bypass_validates_as_a_stored_default_yet_still_needs_acknowledgment() {
+        assert!(validate_permission_default("claude", BYPASS_MODE).is_ok());
+        assert!(apply_permission_mode(Some("claude"), Some(BYPASS_MODE), false, None).is_err());
+        assert_eq!(
+            apply_permission_mode(Some("claude"), Some(BYPASS_MODE), true, None)
+                .unwrap()
+                .unwrap(),
+            vec!["--permission-mode", "bypassPermissions"]
+        );
+    }
 }
 
 #[cfg(test)]

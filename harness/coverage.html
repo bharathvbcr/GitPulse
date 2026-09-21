@@ -8,6 +8,8 @@
     <script type="module">
       import { mockIPC } from "@tauri-apps/api/mocks";
       import { emit } from "@tauri-apps/api/event";
+      import { agentNotifyArgs, agentPromptArgs } from "../src/lib/terminal/launchRequests";
+      import { sessionAlertSettings } from "../src/lib/stores/sessionAlertsStore";
       import "../src/app.css";
       let mode = "empty";
       let sequence = 0;
@@ -86,6 +88,17 @@
         select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); await tick();
       };
       const launch = async agent => { await choose("Coverage coding agent", agent); button(agent === "codex" ? "Run in Codex" : "Run in Claude Code").click(); };
+      // Derived, never transcribed. The configuration flags a launched CLI
+      // carries are owned by launchRequests.ts and read through the same
+      // toggle the terminal reads; a harness that restated the argv here
+      // reported "wrong prompt" the moment that owner gained a flag, which is
+      // precisely what it did. What stays pinned is the part this file is
+      // actually about: the preview reaches the CLI as one literal argument,
+      // last, exactly once, and nothing is typed into a shell.
+      const expectedArgv = (kind, text) => [
+        ...agentNotifyArgs(kind, sessionAlertSettings().configure_agents),
+        ...agentPromptArgs(kind, text),
+      ];
       const checks = document.querySelector("#checks");
       checks.disabled = false;
       checks.onclick = async () => {
@@ -167,12 +180,13 @@
           await launch("codex");
           await until(() => spawned.some(row => row.program === "codex"));
           const codex = spawned.find(row => row.program === "codex");
-          check("Codex receives exact preview as one literal prompt", JSON.stringify(codex.args) === JSON.stringify(["--", expectedPrompt]));
+          check("Codex receives exact preview as one literal prompt", JSON.stringify(codex.args) === JSON.stringify(expectedArgv("codex", expectedPrompt)));
+          check("Codex prompt is the last argument and appears once", codex.args.at(-1) === expectedPrompt && codex.args.filter(arg => arg === expectedPrompt).length === 1);
           check("Codex runs in the selected checkout", codex.repoPath === "/fixture/GitPulse");
           check("first launch creates one session", spawned.length === 1);
           check("prompt is not typed into a shell", writes.length === 0);
           await launch("claude"); await until(() => spawned.some(row => row.program === "claude"));
-          check("Claude receives same prompt", spawned.find(row => row.program === "claude").args[1] === expectedPrompt);
+          check("Claude receives same prompt", JSON.stringify(spawned.find(row => row.program === "claude").args) === JSON.stringify(expectedArgv("claude", expectedPrompt)));
           button("Hide the terminal dock").click(); await tick();
           button("View agent session").click(); await tick();
           check("view agent reopens existing tab without spawning", spawned.length === 2 && visible('[role="tab"][aria-selected="true"]').some(node => node.textContent.includes("Claude")));

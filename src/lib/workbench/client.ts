@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { selectionWire, type ModelSelection } from "./taskModel";
-import { PERMISSION_MODES, STATUSES, asAgentProvider, type AgentProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
+import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
 
@@ -111,7 +111,7 @@ export async function updateAttention(input: AttentionWrite): Promise<Attention>
 export interface AgentDecision extends RecordVersion {
   run_id: string; task_id: string; source_revision: number; repository_id: string; repository_revision: number;
   owner_id: string; session_id: string; provider_thread_id: string; provider_turn_id: string; protocol_request_id: string;
-  provider: "codex" | "claude"; permission_mode: PermissionMode; policy_revision: 1; cwd: string;
+  provider: ManagedProvider; permission_mode: PermissionMode; policy_revision: 1; cwd: string;
   kind: "permission" | "question"; payload: string; payload_digest: string; created_at: number; expires_at: number;
   state: "pending" | "decided" | "dispatching" | "resolved" | "cancelled";
   decision: "allow_once" | "deny" | "answer" | null; answer: string | null; actionable: boolean; reason: string;
@@ -126,7 +126,8 @@ export function agentDecision(value: unknown): AgentDecision {
   const mode = PERMISSION_MODES.find((mode) => mode === raw.permission_mode);
   const payload = text(raw.payload), digest = text(raw.payload_digest), answer = nullableText(raw.answer), cwd = text(raw.cwd);
   const created = integer(raw.created_at), expires = integer(raw.expires_at);
-  if ((provider !== "codex" && provider !== "claude") || (kind !== "permission" && kind !== "question") || !mode || raw.policy_revision !== 1 ||
+  const named = asAgentProvider(provider);
+  if (!named || !supportsManaged(named) || (kind !== "permission" && kind !== "question") || !mode || raw.policy_revision !== 1 ||
       (state !== "pending" && state !== "decided" && state !== "dispatching" && state !== "resolved" && state !== "cancelled") ||
       (decision !== null && decision !== "allow_once" && decision !== "deny" && decision !== "answer") ||
       (decision === "answer" && (kind !== "question" || !answer?.trim())) || (decision === "allow_once" && kind !== "permission") ||
@@ -139,7 +140,7 @@ export function agentDecision(value: unknown): AgentDecision {
   return { ...base, id: id(base.id), run_id: id(raw.run_id), task_id: id(raw.task_id), source_revision: positive(raw.source_revision),
     repository_id: id(raw.repository_id), repository_revision: positive(raw.repository_revision), owner_id: id(raw.owner_id), session_id: id(raw.session_id),
     provider_thread_id: opaque(raw.provider_thread_id), provider_turn_id: opaque(raw.provider_turn_id), protocol_request_id: opaque(raw.protocol_request_id),
-    provider, permission_mode: mode, policy_revision: 1, cwd, kind, payload, payload_digest: digest, created_at: created, expires_at: expires,
+    provider: named, permission_mode: mode, policy_revision: 1, cwd, kind, payload, payload_digest: digest, created_at: created, expires_at: expires,
     state, decision, answer, actionable, reason: text(raw.reason) };
 }
 export async function listAgentDecisions(runID: string, cursor?: string): Promise<Page<AgentDecision>> {
@@ -412,7 +413,7 @@ export async function prepareTaskRun(input: RunPreparation): Promise<TaskRun> {
 }
 export async function launchManagedRun(id: string): Promise<TaskRun> {
   const run = record(await request("runs.launch_managed", {id}), taskRun);
-  return run.id === id && run.kind === "managed" && run.provider === "codex" ? run : invalid();
+  return run.id === id && run.kind === "managed" && supportsManaged(run.provider) ? run : invalid();
 }
 export async function stopManagedRun(id: string): Promise<void> {
   const result = object(await request("runs.stop_managed", {id}));
@@ -492,8 +493,23 @@ export async function enhancementConfiguration(selection?: ModelSelection | null
   return { provider, model, model_source, providers };
 }
 export function scopeParams(scope: Scope): Record<string, string> { return scope.kind === "global" ? {} : scope.kind === "workspace" ? { workspace_id: scope.id } : { repository_id: scope.id }; }
-export async function listTasks(scope: Scope, status: TaskStatus, query: string, cursor?: string): Promise<Page<TaskCard>> {
-  return page(await request("items.list", { ...scopeParams(scope), status, query, limit: 30, ...(cursor ? { cursor } : {}) }), taskCard);
+export async function listTasks(
+  scope: Scope,
+  status?: TaskStatus | null,
+  query = "",
+  cursor?: string,
+  limit = 30,
+): Promise<Page<TaskCard>> {
+  return page(
+    await request("items.list", {
+      ...scopeParams(scope),
+      ...(status ? { status } : {}),
+      query,
+      limit,
+      ...(cursor ? { cursor } : {}),
+    }),
+    taskCard,
+  );
 }
 export function taskDraft(full: Task): TaskDraft {
   const { id: _id, revision: _revision, updated_at: _updated, ...draft } = full;

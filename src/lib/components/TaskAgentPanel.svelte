@@ -151,7 +151,7 @@
     if (disposed) return;
     runs = runs.map((item) => item.id === current.id ? current : item);
     reviewingRunID = current.id;
-    note = current.state === "running" ? "Managed Codex started. Review its requests below." : `Managed attempt: ${current.state}.`;
+    note = current.state === "running" ? `Managed ${PROVIDER_LABELS[current.provider]} started. Review its requests below.` : `Managed attempt: ${current.state}.`;
     schedule();
   }
   async function resumeManaged(run: TaskRun) {
@@ -208,7 +208,7 @@
     />
     <div class="launch-row">
       <button class="gp-btn-primary" type="button" onclick={() => void form?.launch()} disabled={!gate.ok}>
-        {launching ? "Preparing…" : preparePending ? "Retry preparation" : settings.kind === "managed" ? "Start managed Codex" : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
+        {launching ? "Preparing…" : preparePending ? "Retry preparation" : settings.kind === "managed" ? `Start managed ${PROVIDER_LABELS[settings.provider]}` : `Launch in ${PROVIDER_LABELS[settings.provider]}`}
       </button>
       {#if !gate.ok && gate.reason}<span class="meta gate">{gate.reason}</span>{/if}
     </div>

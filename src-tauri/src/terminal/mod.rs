@@ -346,6 +346,90 @@ fn build_pty_command(
     PtyCommand { cmd, resolved }
 }
 
+/// The agent CLIs a terminal tab can start, by the name they are invoked as.
+///
+/// The same set the tab strip offers, minus the user's own shell.
+/// `terminal_launcher_kinds_match_the_tab_strip` in `tabs.contract.test.ts`
+/// reads this list and fails if the frontend's drifts from it.
+pub const AGENT_LAUNCHERS: [&str; 5] = ["claude", "manvi", "codex", "grok", "agy"];
+
+/// Which agent CLI a PTY program is, or `None` for a shell.
+///
+/// Matched on the file *stem*, not on the whole path. `shell.contains("claude")`
+/// — which is what the ledger used to ask — is true of `/Users/claude/bin/zsh`,
+/// so a user with that name had every interactive shell they opened recorded as
+/// an agent session. One owner now answers the question for the ledger's actor
+/// kind, for what a hook reports as its agent, and for whether a bell is worth
+/// a banner, because those three must never disagree about what a session is.
+pub(crate) fn launcher_kind(program: &str) -> Option<&'static str> {
+    let stem = std::path::Path::new(program).file_stem()?.to_str()?;
+    AGENT_LAUNCHERS.into_iter().find(|kind| *kind == stem)
+}
+
+/// What a banner calls that agent. Resolved through the bridge's vocabulary so
+/// a session's own notification and a hook's report about it never use two
+/// different names for the same CLI.
+pub(crate) fn agent_launcher(program: &str) -> Option<&'static str> {
+    let kind = launcher_kind(program)?;
+    crate::alerts::bridge::AGENTS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, label)| *label)
+}
+
+/// One session's standing interest in its own output.
+///
+/// Owned by the reader thread and touched by nothing else, so reading a
+/// terminal costs no lock. It holds the resumable scanner state plus the two
+/// strings a banner needs, resolved once at spawn.
+struct SessionWatcher {
+    key: String,
+    label: String,
+    place: Option<String>,
+    is_agent: bool,
+    scanner: crate::alerts::scan::Scanner,
+    /// The scanner's own overflow count, mirrored so only the delta is
+    /// reported and the total cannot be double-counted.
+    reported_drops: u64,
+}
+
+impl SessionWatcher {
+    fn new(session_id: &str, program: &str, cwd: &std::path::Path) -> Self {
+        let agent = agent_launcher(program);
+        Self {
+            key: session_id.to_owned(),
+            label: agent.unwrap_or("Terminal").to_owned(),
+            place: cwd
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            is_agent: agent.is_some(),
+            scanner: crate::alerts::scan::Scanner::new(),
+            reported_drops: 0,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for signal in self.scanner.feed(bytes) {
+            crate::alerts::offer(crate::alerts::Notice {
+                key: self.key.clone(),
+                origin: crate::alerts::Origin::Terminal,
+                label: self.label.clone(),
+                place: self.place.clone(),
+                // A terminal signal carries no reason of its own; only the
+                // hook bridge knows why. Saying "needs your attention" here
+                // would be inventing one.
+                reason: None,
+                detail: signal.title.or(signal.body),
+                is_agent: self.is_agent,
+                channel: signal.channel.label(),
+            });
+        }
+        let dropped = self.scanner.dropped();
+        crate::alerts::record_scan_drops(dropped.saturating_sub(self.reported_drops));
+        self.reported_drops = dropped;
+    }
+}
+
 static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn normalize_task_environment(cmd: &mut CommandBuilder, cwd: &std::path::Path) {
@@ -686,6 +770,25 @@ fn spawn_session_inner<R: tauri::Runtime>(
         .map_err(|e| format!("Failed to take PTY writer: {e}"))?;
     let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("term-{}-{:x}", std::process::id(), count);
+    // What an agent's own hook needs in order to report back precisely: which
+    // GitPulse session it is running under, and where to say so. Both are set
+    // after the caller's `env` map has been applied, and deliberately so —
+    // these two name *this* process's socket and *this* PTY, and an IPC caller
+    // supplying its own values would be pointing hooks at neither.
+    cmd.env(crate::alerts::bridge::SESSION_ENV, &session_id);
+    // Which agent this is, decided here where the launcher is known rather
+    // than guessed from a hook payload that names only the host.
+    match launcher_kind(&resolved) {
+        Some(kind) => cmd.env(crate::hooks::AGENT_KIND_ENV, kind),
+        None => cmd.env_remove(crate::hooks::AGENT_KIND_ENV),
+    }
+    match crate::alerts::bridge::socket_path() {
+        Some(path) => cmd.env(crate::alerts::bridge::SOCKET_ENV, path),
+        // Nothing to point at. Removing it matters: a stale value inherited
+        // from a parent GitPulse would send this session's hooks to a socket
+        // that is not ours.
+        None => cmd.env_remove(crate::alerts::bridge::SOCKET_ENV),
+    }
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }
@@ -767,16 +870,25 @@ fn spawn_session_inner<R: tauri::Runtime>(
         }
     }
 
+    // What a banner from this session will say. Resolved once, here, because
+    // the reader thread outlives every borrow it could otherwise take.
+    let watcher = SessionWatcher::new(&session_id, &resolved, &repo);
+
     let reader_thread = thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
         .spawn(move || {
             let mut reservation = Some(reservation);
             let mut failure = None;
+            let mut watcher = watcher;
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        // Read before the liveness check below: a session being
+                        // torn down can still be asking for attention, and this
+                        // costs one pass over bytes already in cache.
+                        watcher.observe(&buf[..n]);
                         // On close, drain kernel output until EOF. Leaving a
                         // full tty queue undrained can prevent a killed writer
                         // from completing on macOS, stranding its process slot.
@@ -891,12 +1003,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         return Err(format!("Task process bookkeeping failed; the child was asked to stop. Inspect the run before another attempt: {error}"));
     }
 
-    let actor_kind = if shell.contains("claude")
-        || shell.contains("manvi")
-        || shell.contains("codex")
-        || shell.contains("grok")
-        || shell.contains("agy")
-    {
+    let actor_kind = if agent_launcher(&resolved).is_some() {
         crate::ledger::ActorKind::Agent
     } else {
         crate::ledger::ActorKind::Human
@@ -4076,6 +4183,110 @@ mod tests {
         assert!(
             reserve_session(&state).is_ok(),
             "released slots must be reusable"
+        );
+    }
+
+    // -- agent session attention ----------------------------------------------
+
+    #[test]
+    fn every_launcher_the_ui_offers_is_recognised_and_has_a_name_to_show() {
+        // Derived from the list rather than repeating it: a launcher added to
+        // AGENT_LAUNCHERS with no entry in the bridge's vocabulary would
+        // otherwise produce banners for a CLI the hook path cannot name.
+        for kind in AGENT_LAUNCHERS {
+            assert_eq!(launcher_kind(kind), Some(kind));
+            // The same name as an absolute path, which is what resolution
+            // actually hands us on a GUI launch.
+            assert_eq!(
+                launcher_kind(&format!("/opt/homebrew/bin/{kind}")),
+                Some(kind)
+            );
+            let label = agent_launcher(kind)
+                .unwrap_or_else(|| panic!("{kind} has no display name in alerts::bridge::AGENTS"));
+            assert!(!label.is_empty());
+        }
+        assert_eq!(agent_launcher("claude"), Some("Claude Code"));
+    }
+
+    #[test]
+    fn a_shell_is_not_an_agent_however_its_path_is_spelled() {
+        for program in [
+            "/bin/zsh",
+            "/bin/bash",
+            "/usr/local/bin/fish",
+            // The defect the stem match exists for: a user called claude.
+            "/Users/claude/bin/zsh",
+            "/Users/codex/.local/bin/bash",
+            "/opt/grok-tools/bin/sh",
+            "",
+        ] {
+            assert_eq!(agent_launcher(program), None, "{program}");
+        }
+    }
+
+    #[test]
+    fn a_watcher_turns_an_agent_bell_into_a_notice_and_a_shell_bell_into_a_flagged_one() {
+        let mut agent = SessionWatcher::new(
+            "term-1",
+            "/opt/homebrew/bin/claude",
+            std::path::Path::new("/w/x"),
+        );
+        assert!(agent.is_agent);
+        assert_eq!(agent.label, "Claude Code");
+        assert_eq!(agent.place.as_deref(), Some("x"));
+
+        let mut shell = SessionWatcher::new("term-2", "/bin/zsh", std::path::Path::new("/w/x"));
+        assert!(!shell.is_agent);
+        assert_eq!(shell.label, "Terminal");
+
+        // `observe` offers into a hub that is not running in unit tests, which
+        // is a no-op; what is asserted here is that it neither panics nor
+        // retains anything across a stream of hostile bytes.
+        for _ in 0..64 {
+            agent.observe(b"\x1b]9;4;1;40\x07\x07\x1b]0;title\x07");
+            shell.observe(&[0x1b, b']', b'9', b';']);
+        }
+        assert_eq!(agent.reported_drops, agent.scanner.dropped());
+    }
+
+    #[test]
+    fn a_session_tells_its_own_hooks_which_session_and_socket_to_use() {
+        // The values are set on the command after the IPC caller's `env` map,
+        // so a caller cannot redirect an agent's hooks somewhere else.
+        let dir = tempfile::tempdir().unwrap();
+        let caller = HashMap::from([
+            (
+                crate::alerts::bridge::SESSION_ENV.to_string(),
+                "term-999".to_string(),
+            ),
+            (
+                crate::alerts::bridge::SOCKET_ENV.to_string(),
+                "/tmp/attacker.sock".to_string(),
+            ),
+        ]);
+        let PtyCommand { mut cmd, .. } = build_pty_command(
+            "claude",
+            false,
+            None,
+            Some(&caller),
+            dir.path(),
+            &gui_launch_env(dir.path()),
+        );
+        // What `spawn_session_inner` does after building the command.
+        cmd.env(crate::alerts::bridge::SESSION_ENV, "term-7-1a");
+        match crate::alerts::bridge::socket_path() {
+            Some(path) => cmd.env(crate::alerts::bridge::SOCKET_ENV, path),
+            None => cmd.env_remove(crate::alerts::bridge::SOCKET_ENV),
+        }
+        assert_eq!(
+            env_of(&cmd, crate::alerts::bridge::SESSION_ENV).as_deref(),
+            Some("term-7-1a")
+        );
+        let socket = env_of(&cmd, crate::alerts::bridge::SOCKET_ENV);
+        assert_ne!(socket.as_deref(), Some("/tmp/attacker.sock"));
+        assert!(
+            socket.is_none_or(|s| s.ends_with(crate::alerts::bridge::SOCKET_NAME)),
+            "the socket variable pointed somewhere that is not this app's socket"
         );
     }
 

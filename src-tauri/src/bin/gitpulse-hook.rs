@@ -82,7 +82,10 @@ fn decide() {
         }
     };
 
-    match hooks::dispatch(&subcommand, &input) {
+    // `notify` takes the matcher's name as a second argument, because a
+    // `Notification` payload does not say which matcher routed it.
+    let argument = std::env::args().nth(2);
+    match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
         Ok(output) => {
             if let Some(json) = output.render_for_host(input.is_cursor) {
                 emit(format!("{json}\n"));

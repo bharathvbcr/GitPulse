@@ -128,7 +128,7 @@
       const typed=field("Checkout path");typed.value="/fixture/elsewhere";typed.dispatchEvent(new Event("input",{bubbles:true}));await pause(30);
       button("Browse").click();await wait(()=>field("Checkout path").value==="/fixture/GitPulse");
       check("Browse replaces a typed checkout with the folder that was picked",true);
-      button("Launch in Codex").click();await wait(()=>button("Reconnect attempt"));
+      button("Launch in Claude Code").click();await wait(()=>button("Reconnect attempt"));
       check("Lost launch response retains one task process and starts no shell",report.taskSpawns===1&&report.shellSpawns===0);
       button("Reconnect attempt").click();await wait(()=>document.querySelector('textarea[aria-label="Terminal input"]')&&!button("Reconnect attempt"));
       check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
@@ -168,18 +168,18 @@
       await finish();button("Refresh").click();await wait(()=>document.body.textContent.includes("Process exited"));
       check("Process completion remains separate from task acceptance",task.status==="ready");
       await openLaunchForm();set("Permission mode","edit");await pause(30);
-      button("Launch in Codex").click();await wait(()=>report.taskSpawns===2);
+      button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===2);
       await openLaunchForm();
       check("A deliberate permission mode is remembered for the next launch",field("Permission mode").value==="edit");
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();set("Permission mode","bypass");await pause(30);
-      check("Bypass requires acknowledgment on this attempt",button("Launch in Codex").disabled);
+      check("Bypass requires acknowledgment on this attempt",button("Launch in Claude Code").disabled);
       document.querySelector('label.ack input').click();await pause(30);
-      button("Launch in Codex").click();await wait(()=>report.taskSpawns===3);
+      button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===3);
       await openLaunchForm();
       check("Bypass never survives the attempt it was authorized for",field("Permission mode").value==="ask"&&!document.querySelector('label.ack input'));
       await finish();button("Refresh").click();await pause(100);
-      await openLaunchForm();losePreparation=true;button("Launch in Codex").click();await wait(()=>button("Retry preparation"));
+      await openLaunchForm();losePreparation=true;button("Launch in Claude Code").click();await wait(()=>button("Retry preparation"));
       const uncertain=preparations.at(-1);
       check("Lost preparation reply locks every launch field",
         [...group("Coding agent").querySelectorAll("button"),...group("Connection").querySelectorAll("button"),field("Permission mode"),field("Checkout path")].every(el=>el.matches(":disabled")));
@@ -187,9 +187,9 @@
       check("Preparation retry preserves the exact saved request",preparations.at(-1)===uncertain);
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();seg("Connection","Managed").click();await pause(30);
-      button("Start managed Codex").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
+      button("Start managed Claude Code").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
       check("A lost managed launch response retains one provider session",report.managedSpawns===1);
-      button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Codex started"));
+      button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Claude Code started"));
       check("Managed retry reuses the original session",report.managedSpawns===1);
       check("Run history does not fetch full output or effective settings",report.detailReads===0);
       const managed=[...runs.values()].find(run=>run.kind==="managed");

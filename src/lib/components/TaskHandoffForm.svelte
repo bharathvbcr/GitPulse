@@ -226,7 +226,9 @@
       if (run.kind === "managed") {
         const started = await bounded(launchManagedRun(run.id));
         if (disposed) return;
-        toastStore.success(`Managed Codex ${started.state === "running" ? "started" : started.state}.`);
+        toastStore.success(
+          `Managed ${PROVIDER_LABELS[settings.provider]} ${started.state === "running" ? "started" : started.state}.`,
+        );
         onLaunched(started);
         return;
       }
@@ -317,7 +319,7 @@
       {#each PERMISSION_MODES as mode (mode)}<option value={mode}>{PERMISSION_LABELS[mode]}</option>{/each}
     </select>
   </label>
-  <p class="meta">These are requested settings. {settings.kind === "managed" ? "Manvi verifies the effective Codex settings before sending the task." : "The provider handles requests in its own terminal."}</p>
+  <p class="meta">These are requested settings. {settings.kind === "managed" ? `Manvi verifies the effective ${PROVIDER_LABELS[settings.provider]} settings before sending the task.` : "The provider handles requests in its own terminal."}</p>
   {#if settings.permission === "bypass"}
     <label class="ack">
       <input type="checkbox" bind:checked={acknowledged} disabled={locked} />

@@ -146,3 +146,49 @@ describe("ManviOpsPanel deep-link landing", () => {
     expect(teardown).toContain("window.removeEventListener(event, clearRealign);");
   });
 });
+
+describe("ManviOpsPanel issue monitor task integration", () => {
+  it("wires issueToTask and batch creation helpers", () => {
+    expect(source).toContain("createTaskFromIssue");
+    expect(source).toContain("batchCreateTasksFromIssues");
+    expect(source).toContain("findTaskForIssue");
+  });
+
+  it("provides individual task creation and in-task detection for each issue", () => {
+    expect(source).toContain("{@const inTask = findTaskForIssue(repoTasks, issue.number)}");
+    expect(source).toContain('onclick={() => addIssueToTask(issue)}');
+    expect(source).toContain("In tasks");
+    expect(source).toContain("+ Task");
+  });
+
+  it("offers batch task creation for all unimported open issues", () => {
+    expect(source).toContain("addAllIssuesToTasks");
+    expect(source).toContain("unimportedCount > 0");
+    expect(source).toContain("Add all ({unimportedCount}) to tasks");
+  });
+
+  it("allows seamless navigation to tasks view from issue monitor and notice banner", () => {
+    expect(source).toContain("function openTasksView()");
+    expect(source).toContain('repoStore.setViewSection("work", "tasks")');
+    expect(source).toContain("Open Tasks");
+  });
+
+  it("queries repository tasks across all statuses via listAllRepositoryTasks", () => {
+    expect(source).toContain("listAllRepositoryTasks");
+    expect(source).toContain("const tasks = await listAllRepositoryTasks(registered.id);");
+  });
+
+  it("subscribes to live workbench-changed events with debounced refresh and teardown", () => {
+    expect(source).toContain('listen("workbench-changed", scheduleRefreshRepoTasks)');
+    expect(source).toContain("createListenerTracker()");
+    expect(source).toContain("listeners.dispose();");
+    expect(source).toContain("function scheduleRefreshRepoTasks()");
+  });
+
+  it("guards against race conditions during asynchronous task operations", () => {
+    expect(source).toContain("let repoTasksGeneration = 0;");
+    expect(source).toContain("const currentGen = ++repoTasksGeneration;");
+    expect(source).toContain("currentGen === repoTasksGeneration");
+    expect(source).toContain("if ($repoStore.currentPath === repoPath)");
+  });
+});

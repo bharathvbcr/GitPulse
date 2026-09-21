@@ -818,9 +818,9 @@ describe("remembered agent handoff", () => {
     interfaceStore.reset();
   });
 
-  it("starts on a terminal Codex handoff that asks for permissions", () => {
+  it("starts on a terminal Claude Code handoff that asks for permissions", () => {
     expect(get(interfaceStore).taskHandoff).toEqual({
-      provider: "codex",
+      provider: "claude",
       kind: "external_terminal",
       permission: "ask",
     });
@@ -841,10 +841,19 @@ describe("remembered agent handoff", () => {
   });
 
   it("refuses to remember a managed connection the provider does not offer", () => {
+    interfaceStore.setTaskHandoff({ provider: "agy", kind: "managed", permission: "edit" });
+    expect(get(interfaceStore).taskHandoff).toEqual({
+      provider: "agy",
+      kind: "external_terminal",
+      permission: "edit",
+    });
+  });
+
+  it("remembers a managed connection for a provider that does offer one", () => {
     interfaceStore.setTaskHandoff({ provider: "claude", kind: "managed", permission: "edit" });
     expect(get(interfaceStore).taskHandoff).toEqual({
       provider: "claude",
-      kind: "external_terminal",
+      kind: "managed",
       permission: "edit",
     });
   });
@@ -892,10 +901,10 @@ describe("remembered agent handoff", () => {
   });
 
   it("resets with the rest of the board view", () => {
-    interfaceStore.setTaskHandoff({ provider: "claude", kind: "external_terminal", permission: "inspect" });
+    interfaceStore.setTaskHandoff({ provider: "codex", kind: "managed", permission: "inspect" });
     interfaceStore.resetTaskView();
     expect(get(interfaceStore).taskHandoff).toEqual({
-      provider: "codex",
+      provider: "claude",
       kind: "external_terminal",
       permission: "ask",
     });
