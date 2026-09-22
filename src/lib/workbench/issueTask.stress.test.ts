@@ -79,7 +79,9 @@ describe("issueTask adversarial stress testing", () => {
     };
   }
 
-  it("survives 2,500 hostile issues without breaking task invariants", { timeout: 15_000 }, () => {
+  // Coverage instrumentation pushed this past 15s during ci:local. The
+  // bound is the run, not the invariant.
+  it("survives 2,500 hostile issues without breaking task invariants", { timeout: 60_000 }, () => {
     const totalIterations = 2_500;
     const encoder = new TextEncoder();
 

@@ -1226,8 +1226,8 @@ impl ProfileConnection {
                 "the profile worker is shutting down".into(),
             ));
         }
-        let mut guard =
-            acquire_slot_for(&self.slot, Instant::now() + DEFAULT_CALL_TIMEOUT).ok_or_else(|| {
+        let mut guard = acquire_slot_for(&self.slot, Instant::now() + DEFAULT_CALL_TIMEOUT)
+            .ok_or_else(|| {
                 HarnessError::Busy(
                     "the profile worker was busy for the whole handshake budget".into(),
                 )

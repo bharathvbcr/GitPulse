@@ -91,11 +91,7 @@ pub(super) fn launch(state: &WorkbenchState, input: &str) -> Result<Value, Workb
 /// Only an unclaimed row is cancelled. Once `owner_id` is set the live Manvi
 /// session owns that attempt and its own failure path resolves it; cancelling
 /// underneath it would race a process that is still holding a provider.
-fn release_unclaimed(
-    state: &WorkbenchState,
-    id: &str,
-    error: WorkbenchError,
-) -> WorkbenchError {
+fn release_unclaimed(state: &WorkbenchState, id: &str, error: WorkbenchError) -> WorkbenchError {
     let error = attribute(state, error);
     let Ok(row) = saved(state, id) else {
         return error;
@@ -138,7 +134,9 @@ fn release_unclaimed(
 fn attribute(state: &WorkbenchState, error: WorkbenchError) -> WorkbenchError {
     use crate::harness::protocol::ManagedAdapter;
     let unknown = matches!(
-        state.worker_handshake().map(|hello| hello.managed_adapter("")),
+        state
+            .worker_handshake()
+            .map(|hello| hello.managed_adapter("")),
         Ok(ManagedAdapter::Unknown { .. })
     );
     if !unknown {

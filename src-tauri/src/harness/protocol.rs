@@ -214,7 +214,10 @@ mod managed_adapter_tests {
             tricky.managed_adapter("codex"),
             ManagedAdapter::Absent { .. }
         ));
-        assert_eq!(hello(Some(&["codex"])).managed_adapter("codex"), ManagedAdapter::Present);
+        assert_eq!(
+            hello(Some(&["codex"])).managed_adapter("codex"),
+            ManagedAdapter::Present
+        );
         // Including the empty provider name, which is what an absent field in
         // a caller's own payload would degrade to.
         assert!(matches!(

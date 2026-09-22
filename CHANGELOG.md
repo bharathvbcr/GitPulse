@@ -224,7 +224,9 @@ forked, and a test suite whose verdict depended on how busy the machine was.
   different volumes, and a terminal-hosting stress test that crossed Vitest's
   5s default on a loaded Ubuntu runner. The seams are `cfg(unix)` with their
   callers, the fixture is created on the cwd's volume, and that stress test
-  has room past the default timeout. The process-admission storm that failed
+  has room past the default timeout. The same run's menu-payload and issue-task
+  stress tests crossed their limits once coverage instrumentation was on, so
+  those limits moved with the work. The process-admission storm that failed
   the same run because every spawn was refused — a result that proves nothing
   — is retried, and an escape still fails on the first attempt.
 - The activity ledger recorded any shell whose path merely contained an agent's

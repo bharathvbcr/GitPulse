@@ -302,7 +302,9 @@ describe("every flag combination the builder branches on", () => {
     { status: "degraded", reason: "polling" },
   ];
 
-  it("projects a sendable payload for all of them", () => {
+  // The cartesian product is about ten thousand payloads. Under coverage that
+  // crossed Vitest's 5s default while the rest of ci:local was also running.
+  it("projects a sendable payload for all of them", { timeout: 30_000 }, () => {
     let checked = 0;
     for (const theme of themes) {
       for (const globalSurface of surfaces) {
@@ -386,7 +388,7 @@ describe("generated hostile workspaces", () => {
   const LABELS = ["a", "", "Repo & Co", "\u0000\u001f\u007f", "x".repeat(9000), "\u{1f600}".repeat(3000)];
   const BUSY = ["fetch", "pull", "push", "stash", "unstash", "stage", "unstage", "commit", ""];
 
-  it("projects a sendable payload for 4000 of them", () => {
+  it("projects a sendable payload for 4000 of them", { timeout: 30_000 }, () => {
     for (let seed = 1; seed <= 4000; seed += 1) {
       const next = random(seed);
       const pick = <T,>(list: readonly T[]): T => list[Math.floor(next() * list.length)] as T;
