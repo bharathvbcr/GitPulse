@@ -149,12 +149,19 @@ tauri-plugin-autostart = "2.5.1"
 # `setpgid` in the post-fork child and `killpg` at shutdown are what stop a
 # `git` this process started from outliving it when a supervisor sends SIGTERM
 # — a plain `Child` has no killing `Drop`, and `process::exit` runs none anyway.
-# Unix-scoped because the calls do not exist elsewhere; Windows keeps the
-# `taskkill /T /F` tree kill it already had.
+# Unix-scoped for process-group calls because those do not exist elsewhere;
+# Windows keeps the `taskkill /T /F` tree kill it already had.
 #
 # Already resolved in Cargo.lock at 0.2.189 as a transitive dependency of
 # rusqlite and tauri, so this adds a direct edge, not a crate to the build.
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Quiet hours read the local clock. `localtime_s` is the Windows spelling of
+# the same call, and it lives in this crate. The unix edge above does not
+# apply on Windows, so `alerts::policy::local_minute` did not compile there
+# and clippy never got past it.
+[target.'cfg(windows)'.dependencies]
 libc = "0.2"
 
 # One GitPulse per machine, everywhere except macOS.

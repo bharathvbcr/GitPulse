@@ -216,6 +216,10 @@ forked, and a test suite whose verdict depended on how busy the machine was.
 
 ### Fixed
 
+- **Quiet hours compile on Windows.** The local clock is read through `libc`,
+  and that dependency was declared only for Unix. `localtime_s`, the Windows
+  spelling of the same call, was already written, but the crate was not linked,
+  so the Windows CI leg stopped at clippy before any test ran.
 - **Windows CI can finish, which the release gate requires before it will
   prepare a draft.** Three failures on the last `main` run would have refused
   `v1.3.0` at `release-state ready`: clippy `-D warnings` on Unix-only devmap
