@@ -206,7 +206,9 @@ describe("timeline arithmetic at scale and under hostile clocks", () => {
     return Array.from({ length: count }, (_, i) => runTimelineRow(fuzzRun(random, i)));
   }
 
-  it("keeps every derived number finite over a large sample", () => {
+  // Ten thousand rows across seven clocks is about seventy thousand
+  // assertions. On the Windows runner that crossed Vitest's 5s default.
+  it("keeps every derived number finite over a large sample", { timeout: 30_000 }, () => {
     const random = rng(0xabcdef);
     const rows = fuzzRows(random, 10_000);
     const clocks = [

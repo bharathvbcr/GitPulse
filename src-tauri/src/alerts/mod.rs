@@ -388,6 +388,9 @@ pub fn status() -> SessionAlertStatus {
     }
 }
 
+/// The socket that increments this is Unix-only. A callerless function on
+/// Windows is dead code under `-D warnings`.
+#[cfg(unix)]
 pub(crate) fn count_bridge_rejection() {
     if let Some(hub) = hub() {
         hub.counters.bridge_rejected.fetch_add(1, Ordering::Relaxed);

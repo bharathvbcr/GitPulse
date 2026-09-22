@@ -216,6 +216,9 @@ forked, and a test suite whose verdict depended on how busy the machine was.
 
 ### Fixed
 
+- **The notification bridge no longer fails Windows clippy.** Its socket
+  is Unix-only, but the accept-loop timeouts and the rejection counter were
+  still compiled everywhere, so `-D warnings` treated them as dead code.
 - **Quiet hours compile on Windows.** The local clock is read through `libc`,
   and that dependency was declared only for Unix. `localtime_s`, the Windows
   spelling of the same call, was already written, but the crate was not linked,

@@ -49,6 +49,10 @@ pub const SESSION_ENV: &str = "GITPULSE_SESSION_ID";
 pub const MAX_REPORT_BYTES: usize = 8 * 1024;
 
 /// Wall-clock ceiling on one connection.
+///
+/// Only the Unix accept loop reads this. On Windows the socket is not offered,
+/// and a constant with no caller fails `clippy -D warnings` there.
+#[cfg(unix)]
 const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the accept loop waits for a connection before re-checking whether
@@ -58,6 +62,7 @@ const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 /// `poll`, so a connection is accepted the moment it arrives. An earlier
 /// version slept for this long between `accept` attempts, which cost every
 /// single hook report up to 200 ms and made a burst of them take minutes.
+#[cfg(unix)]
 const ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Debug, Clone, Default)]
