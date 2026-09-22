@@ -268,4 +268,13 @@ describe("FileTreePanel", () => {
     expect(source).toContain("ancestorsOf(selected)");
     expect(source).toContain("if (changed) collapsed = next;");
   });
+
+  it("scrolls long names instead of painting them through the status marks", () => {
+    expect(source).toContain("contentWidth");
+    expect(source).toContain("w-max min-w-full");
+    expect(source).toContain("whitespace-nowrap text-textPrimary font-medium");
+    expect(source).not.toContain('class="truncate text-textPrimary font-medium"');
+    expect(source).toContain("gp-header-scroll");
+    expect(source).toContain("max-h-[min(16rem,45%)]");
+  });
 });

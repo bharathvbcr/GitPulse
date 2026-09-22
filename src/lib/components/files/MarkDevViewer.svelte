@@ -27,6 +27,7 @@
   import { docsBacklinks, type DocBacklink } from "../../docs/client";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
+  import ScrollCue from "../ScrollCue.svelte";
 
   let {
     filePath,
@@ -97,6 +98,7 @@
   });
 
   let previewContainerEl: HTMLDivElement | undefined = $state();
+  let markdevBar: HTMLDivElement | undefined = $state();
 
   async function handleCopySource() {
     if (!(await copyText(rawContent))) {
@@ -163,7 +165,9 @@
 
 <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text relative">
   <!-- MarkDev Integrated Header Toolbar -->
-  <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 gp-section-edge bg-surface/80 shrink-0 select-none gap-2">
+  <div class="relative shrink-0 border-b border-border/70 gp-section-edge bg-surface/80 select-none" data-tip-place="above">
+    <div bind:this={markdevBar} class="gp-header-scroll">
+      <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
     <!-- Left: MarkDev Brand & Outline Toggle -->
     <div class="flex items-center gap-2 shrink-0">
       <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-border/70 shadow-xs">
@@ -276,6 +280,9 @@
         <span>Open in MarkDev</span>
       </button>
     </div>
+      </div>
+    </div>
+    <ScrollCue target={markdevBar} axis="x" />
   </div>
 
   <!-- Main Viewport Surface -->
@@ -309,7 +316,7 @@
       <!-- Fully Rendered View -->
       <div
         bind:this={previewContainerEl}
-        class="flex-1 min-h-0 p-8 overflow-y-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
+        class="flex-1 min-h-0 min-w-0 p-8 overflow-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
       >
         <div class="gp-card p-8 border-border/60 max-w-4xl mx-auto shadow-card">
           {@html renderedHtml}
@@ -362,7 +369,7 @@
         <!-- Right: Live Rendered Preview Pane -->
         <div
           bind:this={previewContainerEl}
-          class="flex-1 min-w-0 h-full p-6 overflow-y-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
+          class="flex-1 min-w-0 h-full p-6 overflow-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
         >
           <div class="gp-card p-6 border-border/60 max-w-2xl mx-auto shadow-card">
             {@html renderedHtml}

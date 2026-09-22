@@ -84,6 +84,7 @@
   /** Id of the editor region the open-file tabs control. */
   const EDITOR_PANE_ID = "gitpulse-editor-pane";
   let tabStrip: HTMLDivElement | undefined = $state();
+  let pathStrip: HTMLElement | undefined = $state();
 
 
   let explorerOpen = $state(true);
@@ -704,23 +705,26 @@
       answer used to require scrolling the tree by hand.
     -->
     <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 border-b border-border/50 gp-section-edge shrink-0 text-xs">
+      <div class="relative min-w-0 flex-1">
       <nav
-        class="flex items-center gap-0.5 text-[11px] min-w-0 flex-1 text-textMuted font-mono"
+        bind:this={pathStrip}
+        class="gp-header-scroll text-[11px] text-textMuted font-mono"
         aria-label="Path to the open file"
       >
+        <div class="flex items-center gap-0.5 min-w-max py-0.5">
         {#each pathSegments as seg, idx}
           {#if idx > 0}
             <ChevronRight size={10} class="shrink-0 text-textMuted/40" aria-hidden="true" />
           {/if}
           {#if idx === pathSegments.length - 1}
-            <span class="text-textPrimary font-semibold truncate select-text">{seg}</span>
+            <span class="text-textPrimary font-semibold select-text">{seg}</span>
           {:else}
             {@const dir = pathSegments.slice(0, idx + 1).join("/")}
             <button
               type="button"
               onclick={() => revealDirectory(dir)}
               title="Reveal {dir}/ in the Explorer"
-              class="shrink-0 max-w-[14ch] truncate rounded px-1 py-0.5 hover:bg-surfaceHover hover:text-textPrimary transition-colors"
+              class="shrink-0 rounded px-1 py-0.5 hover:bg-surfaceHover hover:text-textPrimary transition-colors"
             >{seg}</button>
           {/if}
         {/each}
@@ -733,7 +737,10 @@
         {#if activeTabDirty}
           <span class="ml-1.5 shrink-0 text-[10px] font-semibold text-amber-400">Unsaved</span>
         {/if}
+        </div>
       </nav>
+      <ScrollCue target={pathStrip} axis="x" />
+      </div>
 
       <div class="flex items-center gap-1 shrink-0">
         <button

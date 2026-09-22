@@ -4,7 +4,7 @@
   import { shortcutTextLabel } from "../../ui/platformCopy";
   import { repoStore } from "../../stores/repoStore";
   import { densityStore } from "../../stores/densityStore";
-  import { rowHeight } from "../../ui/density";
+  import { CODE_ZOOM_MAX, CODE_ZOOM_MIN, rowHeight, scaledRowHeight } from "../../ui/density";
   import { invoke } from "@tauri-apps/api/core";
   import {
     detectLanguageFromPath,
@@ -35,6 +35,7 @@
     Hash,
   } from "@lucide/svelte";
   import VirtualList from "../VirtualList.svelte";
+  import ScrollCue from "../ScrollCue.svelte";
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
@@ -61,6 +62,10 @@
   } = $props();
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
+  let actionBar: HTMLDivElement | undefined = $state();
+  let searchBar: HTMLDivElement | undefined = $state();
+  let goToBar: HTMLDivElement | undefined = $state();
+  let statusBar: HTMLDivElement | undefined = $state();
   const OVERSCAN = 20;
   const MAX_RENDER_LINES = 80_000;
 
@@ -75,6 +80,8 @@
   let wordWrap = $state(false);
   let showWhitespace = $state(false);
   let zoomPercent = $state(100);
+  /** One height for the virtual slot and the row box, so they cannot overlap. */
+  let rowPx = $derived(scaledRowHeight(ROW_HEIGHT, zoomPercent));
 
   let selectedLine = $state<number | null>(null);
   let selectedLineEnd = $state<number | null>(null);
@@ -204,8 +211,7 @@
   }
 
   function scrollToLine(lineIdx: number) {
-    const rowH = Math.round(ROW_HEIGHT * (zoomPercent / 100));
-    scrollTop = Math.max(0, lineIdx * rowH - 80);
+    scrollTop = Math.max(0, lineIdx * rowPx - 80);
   }
 
   function handleGoToLine() {
@@ -407,7 +413,7 @@
 </script>
 
 <div
-  class="flex flex-col h-full bg-background font-sans text-xs min-h-0 relative select-text"
+  class="flex flex-col h-full bg-background font-sans text-xs min-h-0 relative overflow-hidden select-text"
   onkeydown={handleKeydown}
   tabindex="0"
   role="textbox"
@@ -415,10 +421,19 @@
   aria-readonly={isEditing ? "false" : "true"}
   aria-label="Code Viewer"
 >
-  <!-- Top Editor Actions Bar -->
-  <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 gp-section-edge bg-surface/70 shrink-0 select-none">
-    <!-- Left: File stats and Search button -->
-    <div class="flex items-center gap-2 min-w-0">
+  <!--
+    Editor chrome. The two clusters used to share one justify-between row and
+    painted over each other, and over the first source line, once the editor
+    was narrower than their content. The row now scrolls, and tips from it
+    open above the bar so they do not cover the file.
+  -->
+  <div
+    class="relative shrink-0 border-b border-border/70 gp-section-edge bg-surface/80 select-none"
+    data-tip-place="above"
+  >
+    <div bind:this={actionBar} class="gp-header-scroll">
+      <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
+    <div class="flex items-center gap-2 shrink-0">
       <span class="text-[11px] font-mono text-textMuted">{rawLines.length}{linesTruncated ? "+" : ""} lines</span>
       <span class="text-textMuted/40">•</span>
       <span class="text-[11px] font-mono text-textMuted">{(byteSize / 1024).toFixed(1)} KB</span>
@@ -449,8 +464,7 @@
       </button>
     </div>
 
-    <!-- Right: View Controls (Wrap, Whitespace, Zoom, Edit, Copy) -->
-    <div class="flex items-center gap-1.5">
+    <div class="flex items-center gap-1.5 shrink-0">
       <button
         type="button"
         onclick={() => (wordWrap = !wordWrap)}
@@ -473,14 +487,14 @@
       <div class="flex items-center rounded-full border border-border/70 bg-surface px-1.5 py-0.5 gap-1">
         <button
           type="button"
-          onclick={() => (zoomPercent = Math.max(70, zoomPercent - 10))}
+          onclick={() => (zoomPercent = Math.max(CODE_ZOOM_MIN, zoomPercent - 10))}
           class="text-textMuted hover:text-textPrimary text-[10px] px-1"
           title="Zoom out"
         >−</button>
         <span class="text-[10px] font-mono text-textMuted min-w-8 text-center">{zoomPercent}%</span>
         <button
           type="button"
-          onclick={() => (zoomPercent = Math.min(160, zoomPercent + 10))}
+          onclick={() => (zoomPercent = Math.min(CODE_ZOOM_MAX, zoomPercent + 10))}
           class="text-textMuted hover:text-textPrimary text-[10px] px-1"
           title="Zoom in"
         >+</button>
@@ -537,12 +551,17 @@
         {/if}
       </button>
     </div>
+      </div>
+    </div>
+    <ScrollCue target={actionBar} axis="x" />
   </div>
 
-  <!-- Search Bar Dropdown -->
+  <!-- Search Bar -->
   {#if isSearchOpen}
-    <div class="px-3 py-2 bg-surface border-b border-border/80 gp-section-edge flex items-center justify-between gap-3 shrink-0 shadow-md select-none animate-in fade-in duration-100">
-      <div class="flex items-center gap-2 flex-1 max-w-md">
+    <div class="relative shrink-0 border-b border-border/80 gp-section-edge bg-surface select-none" data-tip-place="above">
+      <div bind:this={searchBar} class="gp-header-scroll">
+        <div class="flex items-center justify-between gap-3 px-3 py-2 min-w-max w-full">
+      <div class="flex items-center gap-2 shrink-0 min-w-48 max-w-md flex-1">
         <div class="flex items-center gap-1.5 bg-background border border-border rounded-full px-2.5 py-1 flex-1 focus-within:border-accent/70">
           <Search size={12} class="text-textMuted shrink-0" />
           <input
@@ -608,15 +627,20 @@
           type="button"
           onclick={() => { isSearchOpen = false; searchQuery = ""; }}
           class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
+          aria-label="Close find"
         >✕</button>
       </div>
+        </div>
+      </div>
+      <ScrollCue target={searchBar} axis="x" />
     </div>
   {/if}
 
-  <!-- Go to Line Modal / Overlay -->
   {#if goToLineOpen}
-    <div class="absolute top-10 left-1/2 -translate-x-1/2 gp-pop rounded-xl bg-surface border border-border p-3 shadow-float flex items-center gap-2 z-30">
-      <span class="text-xs text-textMuted">Go to line (1–{rawLines.length}):</span>
+    <div class="relative shrink-0 border-b border-border/70 bg-surface select-none">
+      <div bind:this={goToBar} class="gp-header-scroll">
+        <div class="flex items-center gap-2 px-3 py-2 min-w-max">
+      <span class="text-xs text-textMuted shrink-0">Go to line (1–{rawLines.length}):</span>
       <input
         type="number"
         min="1"
@@ -629,8 +653,11 @@
         placeholder="Line number"
         class="gp-field w-24!"
       />
-      <button type="button" class="gp-btn-primary py-1! px-3!" onclick={handleGoToLine}>Go</button>
-      <button type="button" class="gp-btn py-1! px-2!" onclick={() => (goToLineOpen = false)}>Cancel</button>
+      <button type="button" class="gp-btn-primary py-1! px-3! shrink-0" onclick={handleGoToLine}>Go</button>
+      <button type="button" class="gp-btn py-1! px-2! shrink-0" onclick={() => (goToLineOpen = false)}>Cancel</button>
+        </div>
+      </div>
+      <ScrollCue target={goToBar} axis="x" />
     </div>
   {/if}
 
@@ -660,8 +687,9 @@
         >
           <VirtualList
             items={rawLines}
-            rowHeight={Math.round(ROW_HEIGHT * (zoomPercent / 100))}
+            rowHeight={rowPx}
             overscan={OVERSCAN}
+            contentWidth
             bind:scrollTop
             class="h-full"
           >
@@ -673,21 +701,24 @@
                   : lineNum >= Math.min(selectedLine, selectedLineEnd) && lineNum <= Math.max(selectedLine, selectedLineEnd))}
               {@const tokens = tokensForLine(line ?? "", lineIdx)}
               <div
-                class="flex items-center w-full leading-5 transition-colors {isHighlighted
-                  ? 'bg-accent/15 border-l-2 border-accent'
-                  : 'hover:bg-surface/50 border-l-2 border-transparent'}"
+                class="relative flex items-center w-max min-w-full overflow-hidden {isHighlighted
+                  ? 'bg-accent/15'
+                  : 'hover:bg-surface/50'}"
+                style:height="{rowPx}px"
+                style:line-height="{rowPx}px"
               >
-                <!-- Line Number Gutter -->
+                {#if isHighlighted}
+                  <span class="absolute inset-y-0 left-0 w-[2px] bg-accent" aria-hidden="true"></span>
+                {/if}
                 <button
                   type="button"
                   onclick={(e) => handleLineClick(lineNum, e)}
-                  class="w-12 shrink-0 text-right pr-3 pl-1 select-none text-[11px] font-mono text-textMuted/60 hover:text-textPrimary transition-colors cursor-pointer"
+                  class="w-12 shrink-0 self-stretch text-right pr-3 pl-1 select-none text-[11px] font-mono text-textMuted/60 hover:text-textPrimary transition-colors cursor-pointer"
                 >
                   {lineNum}
                 </button>
 
-                <!-- Code Line Content with Syntax Tokens -->
-                <div class="flex-1 min-w-0 pr-4 whitespace-pre">
+                <div class="pr-4 whitespace-pre">
                   {#if tokens.length === 0}
                     <span>&nbsp;</span>
                   {:else}
@@ -711,8 +742,10 @@
   </div>
 
   <!-- Bottom Status Bar -->
-  <div class="flex items-center justify-between px-3 py-1 bg-surface/90 border-t border-border/70 gp-section-edge shrink-0 text-[10px] font-mono text-textMuted select-none">
-    <div class="flex items-center gap-3">
+  <div class="relative shrink-0 border-t border-border/70 gp-section-edge bg-surface/90 text-[10px] font-mono text-textMuted select-none">
+    <div bind:this={statusBar} class="gp-header-scroll">
+      <div class="flex items-center justify-between gap-3 px-3 py-1 min-w-max w-full">
+    <div class="flex items-center gap-3 shrink-0">
       <span>Ln {selectedLine ?? 1}, Col 1</span>
       <span>•</span>
       <span>{indentInfo}</span>
@@ -722,10 +755,13 @@
         <span class="text-emerald-400 font-bold flex items-center gap-1">✓ Saved</span>
       {/if}
     </div>
-    <div class="flex items-center gap-3">
+    <div class="flex items-center gap-3 shrink-0">
       <span>{rawLines.length} lines</span>
       <span>•</span>
       <span class="text-accent font-semibold">{language.toUpperCase()}</span>
     </div>
+      </div>
+    </div>
+    <ScrollCue target={statusBar} axis="x" />
   </div>
 </div>

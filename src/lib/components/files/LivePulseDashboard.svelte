@@ -330,7 +330,7 @@
                 <div class="flex items-center gap-1.5 min-w-0">
                   <LanguageLogo filePath={s.path} size={12} class="shrink-0" />
                   <span class="px-1 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(kind)}">{statusBadgeLabel(kind)}</span>
-                  <span class="text-xs font-medium text-textPrimary truncate">{formatPathParts(s.path).name}</span>
+                  <span class="min-w-0 text-xs font-medium text-textPrimary truncate">{formatPathParts(s.path).name}</span>
                 </div>
                 <div class="text-[10px] text-textMuted font-mono truncate max-w-[180px] pl-4">
                   {s.path}

@@ -94,6 +94,19 @@ describe("CodeViewer", () => {
     expect(source).toContain("linesTruncated");
   });
 
+  it("scrolls long lines and chrome instead of letting them overlap", () => {
+    expect(source).toContain("contentWidth");
+    expect(source).toContain("scaledRowHeight");
+    expect(source).toContain("style:height=\"{rowPx}px\"");
+    expect(source).toContain("rowHeight={rowPx}");
+    expect(source).not.toContain("leading-5");
+    expect(source).not.toContain("min-w-0 pr-4");
+    expect(source).not.toContain("absolute top-10");
+    expect(source).toContain("gp-header-scroll");
+    expect(source).toContain('data-tip-place="above"');
+    expect(source).toContain("<ScrollCue");
+  });
+
   it("has no accessibility compiler warnings", () => {
     const { warnings } = compile(source, { generate: "client" });
     expect(warnings.filter(({ code }) => code.startsWith("a11y_"))).toEqual([]);

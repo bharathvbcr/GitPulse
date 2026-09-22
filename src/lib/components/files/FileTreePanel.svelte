@@ -56,6 +56,7 @@
   import { popover, restoreFocusTo } from "../../ui/popover";
   import { enumerateFocusables } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
+  import ScrollCue from "../ScrollCue.svelte";
   import EmptyState from "../EmptyState.svelte";
   import LanguageLogo from "../LanguageLogo.svelte";
 
@@ -111,6 +112,7 @@
   let contextMenuRow = $state<FileRow | null>(null);
   let menuAnchor = $state<{ x: number; y: number } | null>(null);
   let menuEl: HTMLDivElement | undefined = $state();
+  let explorerChrome: HTMLDivElement | undefined = $state();
   let contextMenuOpener: HTMLElement | null = null;
 
   let containerEl: HTMLDivElement | undefined = $state();
@@ -772,7 +774,7 @@
 
 </script>
 
-<div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 border-r border-border/70 select-none">
+<div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 overflow-hidden border-r border-border/70 select-none">
   <!--
     Explorer chrome.
 
@@ -784,7 +786,9 @@
     filter: `filtersOpen` is the toggle OR'd with "a filter is actually
     applied", so a narrowed listing always shows what narrowed it.
   -->
-  <div class="flex items-center justify-between gap-1 px-2.5 h-9 shrink-0 border-b border-border/60 gp-section-edge bg-surface/80">
+  <div class="relative shrink-0 h-9 border-b border-border/60 gp-section-edge bg-surface/80" data-tip-place="above">
+    <div bind:this={explorerChrome} class="gp-header-scroll h-full">
+      <div class="flex items-center justify-between gap-1 px-2.5 h-9 min-w-max w-full">
     <div class="flex items-baseline gap-1.5 min-w-0">
       <span class="text-[11px] font-bold uppercase tracking-wider text-textMuted">Explorer</span>
       <span
@@ -838,9 +842,12 @@
         <SlidersHorizontal size={13} />
       </button>
     </div>
+      </div>
+    </div>
+    <ScrollCue target={explorerChrome} axis="x" />
   </div>
 
-  <div class="px-2 pt-2 pb-1.5 shrink-0 border-b border-border/60 gp-section-edge bg-surface/30 space-y-1.5">
+  <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain border-b border-border/60 gp-section-edge bg-surface/30 space-y-1.5">
     <div class="flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-accent/70 transition-colors">
       <Search size={12} class="text-textMuted shrink-0" />
       <input
@@ -987,6 +994,7 @@
           items={rows}
           rowHeight={ROW_HEIGHT}
           overscan={OVERSCAN}
+          contentWidth
           bind:scrollTop
           scrollCue
           class="h-full"
@@ -1012,7 +1020,7 @@
                 onkeydown={(e) => { if (e.key === "Enter") rowAction(r); }}
                 oncontextmenu={(e) => openContextMenu(r, e)}
                 style="height: {ROW_HEIGHT}px;"
-                class="relative flex items-center gap-1 w-full pr-1.5 text-left cursor-pointer group transition-colors {isOpen
+                class="relative flex items-center gap-1 w-max min-w-full pr-1.5 text-left cursor-pointer group transition-colors {isOpen
                   ? 'bg-accent/15 text-textPrimary'
                   : isCursor
                     ? 'bg-surfaceHover text-textPrimary'
@@ -1035,6 +1043,12 @@
                   the guides are both `inset` so neither adds to the box —
                   selection used to come with `border-l-2`, which widened the
                   row and nudged every glyph in it 2px sideways.
+
+                  The name is one line and the row is as wide as that line.
+                  A shrinking `truncate` child used to keep its content width
+                  and paint the tail of `verdict.schema.json` through the
+                  status marks. The list scrolls sideways to the rest of the
+                  name instead.
                 -->
                 {#if isOpen}
                   <span class="absolute inset-y-0 left-0 w-[2px] bg-accent" aria-hidden="true"></span>
@@ -1048,7 +1062,7 @@
                 {/each}
 
                 <div
-                  class="flex items-center gap-1.5 min-w-0 flex-1"
+                  class="flex items-center gap-1.5 shrink-0"
                   style="padding-left: {INDENT_BASE + r.depth * INDENT_STEP}px;"
                 >
                   {#if r.kind === "dir"}
@@ -1059,7 +1073,7 @@
                       <ChevronDown size={12} class="shrink-0 text-textMuted" />
                       <FolderOpen size={13} class="shrink-0 text-amber-400" />
                     {/if}
-                    <span class="truncate text-textPrimary font-medium">{r.name}</span>
+                    <span class="whitespace-nowrap text-textPrimary font-medium">{r.name}</span>
                     {#if dirtyCount > 0}
                       <!-- A collapsed folder says how much it is hiding, not
                            merely that it hides something. -->
@@ -1071,14 +1085,14 @@
                   {:else}
                     <span class="w-3 shrink-0" aria-hidden="true"></span>
                     <LanguageLogo filePath={r.path} size={14} class="shrink-0" />
-                    <span class="truncate {isOpen ? 'text-accent font-semibold' : status ? 'text-textPrimary' : 'text-textPrimary/80'}">
+                    <span class="whitespace-nowrap {isOpen ? 'text-accent font-semibold' : status ? 'text-textPrimary' : 'text-textPrimary/80'}">
                       {#each highlightMatches(r.name, debouncedQuery) as chunk, i (`${i}:${chunk.matched}:${chunk.text}`)}{#if chunk.matched}<mark class="bg-accent/30 text-textPrimary rounded-sm font-semibold">{chunk.text}</mark>{:else}{chunk.text}{/if}{/each}
                     </span>
                   {/if}
                 </div>
 
                 <!-- Right: Git Status Badge & Churn -->
-                <div class="flex items-center gap-1 shrink-0">
+                <div class="ml-auto flex items-center gap-1 shrink-0 pl-2">
                   {#if status && changeKind !== "clean"}
                     <span class="px-1 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(changeKind)}">{statusBadgeLabel(changeKind)}</span>
                     {#if status.additions > 0 || status.deletions > 0}

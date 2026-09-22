@@ -23,4 +23,11 @@ describe("Tooltip destination guides", () => {
     expect(source).toContain("ViewGuideCard");
     expect(source).toContain("tipGuideOf");
   });
+
+  it("places the bubble through the shared owner and honors data-tip-place on an ancestor", () => {
+    expect(source).toContain("placeTooltipBubble");
+    expect(source).toContain("preferredTipSide");
+    expect(source).toContain('closest("[data-tip-place]")');
+    expect(source).not.toContain("rect.bottom + 8");
+  });
 });

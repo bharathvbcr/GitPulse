@@ -54,5 +54,27 @@ export function rowHeight(surface: DensitySurface, density: DensityMode): number
   return row[density] ?? row.spacious;
 }
 
+/** Zoom stops the code viewer’s own controls already enforce. */
+export const CODE_ZOOM_MIN = 70;
+export const CODE_ZOOM_MAX = 160;
+
+/**
+ * Pixel height of one code row at `zoomPercent`.
+ *
+ * The virtual list places row n at n times this value, and the row box has
+ * to be exactly that tall. A second leading (the old fixed `leading-5`) drew
+ * a 20px line into the 17px compact slot, so neighbouring rows overlapped.
+ * Non-finite zoom fails closed to the unscaled height. Anything outside the
+ * control range clamps to it, so a hostile value cannot collapse the window
+ * or stretch a row across the pane.
+ */
+export function scaledRowHeight(base: number, zoomPercent: number): number {
+  if (!Number.isFinite(base) || base <= 0) return 0;
+  const unscaled = Math.max(1, Math.round(base));
+  if (!Number.isFinite(zoomPercent)) return unscaled;
+  const clamped = Math.min(CODE_ZOOM_MAX, Math.max(CODE_ZOOM_MIN, zoomPercent));
+  return Math.max(1, Math.round(base * (clamped / 100)));
+}
+
 /** Every surface this module sizes; used by the contract test. */
 export const DENSITY_SURFACES = Object.keys(ROW_HEIGHTS) as DensitySurface[];

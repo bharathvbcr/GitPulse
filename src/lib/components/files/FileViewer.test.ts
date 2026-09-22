@@ -225,4 +225,12 @@ describe("FileViewer", () => {
     expect(source).toContain("LanguageLogo");
     expect(source).toContain("filePath={tab.path}");
   });
+
+  it("scrolls a long path instead of letting segments cover the path actions", () => {
+    const path = source.slice(source.indexOf("bind:this={pathStrip}"));
+    expect(path).toContain("gp-header-scroll");
+    expect(path).toContain("min-w-max");
+    expect(path).toContain('target={pathStrip} axis="x"');
+    expect(path).not.toContain("max-w-[14ch]");
+  });
 });

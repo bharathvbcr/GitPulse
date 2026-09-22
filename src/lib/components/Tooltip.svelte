@@ -6,6 +6,7 @@
     TOOLTIP_ANCHOR_SELECTOR,
     tooltipAnchorFromTarget,
   } from "../dom/tipText";
+  import { placeTooltipBubble, preferredTipSide } from "../dom/tipPlace";
   import { destinationGuide, type DestinationGuide } from "../views/viewGuide";
   import { LAYERS } from "../ui/layers";
   import ViewGuideCard from "./ViewGuideCard.svelte";
@@ -74,14 +75,14 @@
     if (!activeEl || !bubble) return;
     const rect = activeEl.getBoundingClientRect();
     const box = bubble.getBoundingClientRect();
-    let nextLeft = rect.left + rect.width / 2 - box.width / 2;
-    nextLeft = Math.min(Math.max(8, nextLeft), window.innerWidth - box.width - 8);
-    let nextTop = rect.bottom + 8;
-    if (rect.bottom + box.height + 12 > window.innerHeight && rect.top - box.height - 8 > 0) {
-      nextTop = rect.top - box.height - 8;
-    }
-    left = Math.max(8, nextLeft);
-    top = Math.max(8, nextTop);
+    const next = placeTooltipBubble(
+      { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      { width: box.width, height: box.height },
+      { width: window.innerWidth, height: window.innerHeight },
+      preferredTipSide(activeEl.closest("[data-tip-place]")?.getAttribute("data-tip-place")),
+    );
+    left = next.left;
+    top = next.top;
     placed = true;
   }
 

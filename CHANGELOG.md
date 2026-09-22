@@ -13,6 +13,18 @@ before that tag is pushed.
 
 Nothing yet.
 
+## [1.3.1] - 2026-09-22
+
+Fixes and visual polish for code navigation, viewer layout scaling, and tooltip placement.
+
+### Fixed
+
+- **Code viewer zoom row height scaling.** Code line heights in `CodeViewer` now scale proportionally with editor zoom stops (70%–160%) using `scaledRowHeight`. The virtual row containers and text line heights stay perfectly matched, eliminating visual line overlap and row clipping at compact zoom.
+- **Boundary-aware tooltip bubble placement.** Tooltip positioning now calculates viewport edges through `placeTooltipBubble`, keeping tooltips fully on-screen across arbitrary window sizes and respecting preferred directional hints (`above` vs `below`).
+- **Responsive horizontal header controls and scroll cues.** File viewer headers across `CodeViewer`, `FileTreePanel`, `MarkDevViewer`, and `MediaViewer` now gracefully scroll horizontally when horizontal space is constrained, paired with `ScrollCue` visual indicators to ensure all controls and action buttons remain reachable on narrower viewports.
+- **MarkDev rendered view layout and scrolling.** The markdown rendered preview pane now uses bidirectional scroll containers and proper flex bounds, preventing text clipping on oversized formatted blocks.
+- **Breadcrumb path navigation typing.** Fixed navigation strip element bindings in `FileViewer` to ensure strict type compliance.
+
 ## [1.3.0] - 2026-09-21
 
 A consolidation release. It joins live delivery observability — GitHub Actions

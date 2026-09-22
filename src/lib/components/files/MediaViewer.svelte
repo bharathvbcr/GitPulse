@@ -11,6 +11,7 @@
   import { bytesFromBase64Prefix, hexDumpRows } from "../../files/hexDump";
   import CodeViewer from "./CodeViewer.svelte";
   import LazyMount from "../LazyMount.svelte";
+  import ScrollCue from "../ScrollCue.svelte";
   // The Markdown reader and its 21 KB parser are only reachable through a
   // .md file, and shipped in the startup chunk regardless. Module scope: the
   // loader identity is LazyMount's cache key.
@@ -46,6 +47,8 @@
   let imageFit = $state(true);
   let naturalWidth = $state<number | null>(null);
   let naturalHeight = $state<number | null>(null);
+  let imageBar: HTMLDivElement | undefined = $state();
+  let binaryBar: HTMLDivElement | undefined = $state();
 
   let isSvg = $derived(filePath.toLowerCase().endsWith(".svg"));
   let isMarkdown = $derived(
@@ -88,8 +91,10 @@
   <!-- Image Viewer Surface -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-none">
     <!-- Image Top Bar Controls -->
-    <div class="flex items-center justify-between px-3 py-2 border-b border-border/70 gp-section-edge bg-surface/70 shrink-0">
-      <div class="flex items-center gap-2">
+    <div class="relative shrink-0 border-b border-border/70 gp-section-edge bg-surface/70 select-none" data-tip-place="above">
+      <div bind:this={imageBar} class="gp-header-scroll">
+        <div class="flex items-center justify-between gap-2 px-3 py-2 min-w-max w-full">
+      <div class="flex items-center gap-2 shrink-0">
         <ImageIcon size={13} class="text-teal-400" />
         <span class="font-medium text-textPrimary">{blob.mime}</span>
         {#if naturalWidth && naturalHeight}
@@ -98,7 +103,7 @@
         {/if}
       </div>
 
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 shrink-0">
         <button
           type="button"
           onclick={() => { imageFit = true; imageZoom = 100; }}
@@ -130,6 +135,9 @@
           >+</button>
         </div>
       </div>
+        </div>
+      </div>
+      <ScrollCue target={imageBar} axis="x" />
     </div>
 
     <!-- Image Canvas Area with Transparency Grid -->
@@ -161,14 +169,16 @@
 {:else if blob.is_binary}
   <!-- Binary Hex View & File Inspector -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text">
-    <div class="flex items-center justify-between px-3 py-2 border-b border-border/70 gp-section-edge bg-surface/70 shrink-0">
-      <div class="flex items-center gap-2">
+    <div class="relative shrink-0 border-b border-border/70 gp-section-edge bg-surface/70 select-none" data-tip-place="above">
+      <div bind:this={binaryBar} class="gp-header-scroll">
+        <div class="flex items-center justify-between gap-2 px-3 py-2 min-w-max w-full">
+      <div class="flex items-center gap-2 shrink-0">
         <Binary size={13} class="text-amber-400" />
         <span class="font-semibold text-textPrimary">Binary File</span>
         <span class="text-textMuted/60">•</span>
         <span class="font-mono text-textMuted">{blob.mime}</span>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 shrink-0">
         <button
           type="button"
           onclick={openMediaInDefaultApp}
@@ -178,17 +188,20 @@
           <span>Open in External App</span>
         </button>
       </div>
+        </div>
+      </div>
+      <ScrollCue target={binaryBar} axis="x" />
     </div>
 
     <div class="flex-1 min-h-0 p-4 overflow-auto gp-scroll font-mono text-[11px] leading-5">
       <div class="space-y-1">
-        <div class="flex items-center gap-4 text-textMuted/60 border-b border-border/60 pb-1 select-none font-bold">
+        <div class="flex items-center gap-4 text-textMuted/60 border-b border-border/60 pb-1 select-none font-bold min-w-max">
           <span class="w-20">Offset</span>
           <span class="flex-1">00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F</span>
           <span class="w-36">Decoded ASCII</span>
         </div>
         {#each hexRows as r}
-          <div class="flex items-center gap-4 hover:bg-surface/60 transition-colors">
+          <div class="flex items-center gap-4 hover:bg-surface/60 transition-colors min-w-max">
             <span class="w-20 text-accent/80 font-bold select-none">{r.offset}</span>
             <span class="flex-1 text-textPrimary/90 tracking-wider">
               {r.hex.slice(0, 8).join(" ")} &nbsp; {r.hex.slice(8).join(" ")}

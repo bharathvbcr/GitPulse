@@ -1,7 +1,7 @@
 {
   "name": "gitpulse",
   "displayName": "GitPulse",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Read-only GitPulse control plane for agents: worktrees, collisions, ledger, provenance, and in-process code intelligence.",
   "author": {
     "name": "GitPulse Team",

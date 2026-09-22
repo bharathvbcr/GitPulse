@@ -69,4 +69,10 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("if (!(await copyText(code)))");
     expect(source).toContain('repoStore.setError("Could not copy to clipboard")');
   });
+
+  it("scrolls the rendered page inside the pane", () => {
+    expect(source).toContain("min-h-0 min-w-0");
+    expect(source).toContain("overflow-auto gp-scroll");
+    expect(source).not.toContain("overflow-y-auto gp-scroll bg-background");
+  });
 });
