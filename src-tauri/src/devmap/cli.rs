@@ -254,7 +254,10 @@ impl Drop for TestBinaryBinding {
     }
 }
 
-#[cfg(test)]
+// Callers live in `#[cfg(unix)]` tests. A `#[cfg(test)]` method with no Windows
+// caller is dead code, and `cargo clippy --all-targets -D warnings` then fails
+// the Windows CI leg the release gate requires to be green.
+#[cfg(all(test, unix))]
 impl TestBinaryBinding {
     /// Answer [`status`] with `status` instead of running the probe, until this
     /// is called again or the binding is dropped.
@@ -277,7 +280,7 @@ pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
 
 /// A `devmap status --json` answer that parsed, for a test that is about what
 /// the decision logic does with it.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn available_status(payload: &str) -> CliStatus {
     CliStatus {
         available: true,
@@ -293,7 +296,7 @@ pub(crate) fn available_status(payload: &str) -> CliStatus {
 /// A probe that did not answer — the shape [`status`] returns when the child
 /// could not be run, did not exit inside [`STATUS_DEADLINE`], or wrote
 /// something that was not a JSON object.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn unavailable_status(reason: &str) -> CliStatus {
     CliStatus {
         available: false,

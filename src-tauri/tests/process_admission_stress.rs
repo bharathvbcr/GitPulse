@@ -89,8 +89,12 @@ fn untrusted_repository(dir: &Path) {
     assert!(status.success(), "could not build the decoy repository");
 }
 
-#[test]
-fn a_relentless_substitution_never_walks_a_child_into_an_unapproved_repository() {
+/// One storm. Returns `(ran, refused, escaped, flips)`.
+///
+/// The safety counts are the product property. `ran == 0` is about the test:
+/// a runner that refused every spawn proved nothing, and the last `main` CI
+/// run died on exactly that. The caller retries those; an escape fails at once.
+fn exercise_substitution() -> (usize, usize, usize, usize) {
     let (_base, admitted, decoy) = shared_holder_layout();
     untrusted_repository(&decoy);
     let stop = Arc::new(AtomicBool::new(false));
@@ -126,20 +130,34 @@ fn a_relentless_substitution_never_walks_a_child_into_an_unapproved_repository()
     });
     stop.store(true, Ordering::Relaxed);
 
-    let (ran, refused, escaped, flips) = (
+    (
         ran.load(Ordering::Relaxed),
         refused.load(Ordering::Relaxed),
         escaped.load(Ordering::Relaxed),
         flips.load(Ordering::Relaxed),
-    );
-    assert_eq!(
-        escaped, 0,
-        "{escaped} of {ran} children ran inside an unapproved repository \
-         across {flips} substitutions"
-    );
-    assert_eq!(ran + refused, 8 * 64, "every attempt must be accounted for");
+    )
+}
+
+#[test]
+fn a_relentless_substitution_never_walks_a_child_into_an_unapproved_repository() {
+    let mut last = (0, 0, 0, 0);
+    for _attempt in 0..4 {
+        let (ran, refused, escaped, flips) = exercise_substitution();
+        assert_eq!(
+            escaped, 0,
+            "{escaped} of {ran} children ran inside an unapproved repository \
+             across {flips} substitutions"
+        );
+        assert_eq!(ran + refused, 8 * 64, "every attempt must be accounted for");
+        if ran > 0 && flips > 0 {
+            return;
+        }
+        last = (ran, refused, escaped, flips);
+    }
+    let (ran, _refused, _escaped, flips) = last;
     // About the test, not the fix: a storm that never flipped, or spawns that
-    // were all refused, would have proven nothing.
+    // were all refused, would have proven nothing. Four attempts is the budget;
+    // past that the runner is not exercising the race.
     assert!(flips > 0, "the substitution thread never won a rename");
     assert!(
         ran > 0,

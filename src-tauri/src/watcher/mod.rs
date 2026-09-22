@@ -857,7 +857,34 @@ mod tests {
     /// Used where a test needs a relative path that really does resolve to
     /// somewhere: the honest way to prove a lookup does *not* canonicalize is to
     /// hand it a relative path that would find the target if it did.
+    ///
+    /// `canonicalize` on Windows prefixes `\\?\`. `Path::push` treats that
+    /// prefix as absolute and replaces everything already pushed, so a
+    /// comparison of a verbatim path against a plain one comes back absolute.
+    /// Strip it before walking components.
+    fn without_verbatim_prefix(path: &Path) -> PathBuf {
+        let text = path.as_os_str().to_string_lossy();
+        let rest = text.strip_prefix("\\\\?\\").unwrap_or(text.as_ref());
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return PathBuf::from(format!("\\\\{unc}"));
+        }
+        PathBuf::from(rest)
+    }
+
+    #[test]
+    fn a_verbatim_prefix_is_stripped_before_the_relative_walk() {
+        let stripped = without_verbatim_prefix(Path::new("\\\\?\\C:\\Users\\temp"));
+        let text = stripped.as_os_str().to_string_lossy();
+        assert!(
+            !text.starts_with("\\\\?\\"),
+            "verbatim prefix survived: {text}"
+        );
+        assert!(text.contains("C:"), "{text}");
+    }
+
     fn relative_to(from: &Path, target: &Path) -> PathBuf {
+        let from = without_verbatim_prefix(from);
+        let target = without_verbatim_prefix(target);
         let shared = from
             .components()
             .zip(target.components())
@@ -1436,17 +1463,20 @@ mod tests {
     /// an implementation that canonicalized would find the watch and remove it.
     #[test]
     fn test_unwatch_relative_path_does_not_canonicalize_against_cwd() {
-        let dir = TempDir::new().unwrap();
+        // The system temp directory and the runner's cwd are different volumes
+        // on GitHub's Windows image (`C:\Users\...\Temp` against `D:\a\...`).
+        // No relative path crosses a volume, so the fixture has to live on the
+        // cwd's volume or `unwatch` is handed an absolute path and the
+        // assertion cannot tell a bad fixture from a lookup that canonicalized.
+        let cwd_for_fixture = std::env::current_dir().expect("cwd");
+        let dir = tempfile::tempdir_in(&cwd_for_fixture).expect("tempdir on the cwd volume");
         git_init(dir.path(), false);
         let state = WatcherState::default();
         let key = start_watch_inner(&state, dir.path().to_string_lossy().into_owned(), |_| {})
             .expect("watch");
 
         let repo = dir.path().canonicalize().expect("canonical repo");
-        let cwd = std::env::current_dir()
-            .expect("cwd")
-            .canonicalize()
-            .expect("canonical cwd");
+        let cwd = cwd_for_fixture.canonicalize().expect("canonical cwd");
         let relative = relative_to(&cwd, &repo);
         // Without this the test could pass on a path that resolves nowhere,
         // which is a fixture that cannot fail rather than a behaviour that

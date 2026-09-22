@@ -216,6 +216,17 @@ forked, and a test suite whose verdict depended on how busy the machine was.
 
 ### Fixed
 
+- **Windows CI can finish, which the release gate requires before it will
+  prepare a draft.** Three failures on the last `main` run would have refused
+  `v1.3.0` at `release-state ready`: clippy `-D warnings` on Unix-only devmap
+  test seams that were still compiled for Windows, a watcher fixture whose
+  relative path cannot exist when the temp directory and the runner cwd are
+  different volumes, and a terminal-hosting stress test that crossed Vitest's
+  5s default on a loaded Ubuntu runner. The seams are `cfg(unix)` with their
+  callers, the fixture is created on the cwd's volume, and that stress test
+  has room past the default timeout. The process-admission storm that failed
+  the same run because every spawn was refused — a result that proves nothing
+  — is retried, and an escape still fails on the first attempt.
 - The activity ledger recorded any shell whose path merely contained an agent's
   name — `/Users/claude/bin/zsh` — as an agent session. It now matches the
   program actually launched.

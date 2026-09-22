@@ -123,27 +123,29 @@ static SOCKETS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, String>>> 
 /// many times did the uncached path run", so it is counted here and the process
 /// is dropped. Installed only through [`bind_test_endpoint`], which owns the
 /// serial that makes the override exclusive.
-#[cfg(test)]
+// The only caller is a `#[cfg(unix)]` test. Leaving these as `#[cfg(test)]`
+// makes them dead on Windows, and clippy `-D warnings` fails that CI leg.
+#[cfg(all(test, unix))]
 static TEST_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static TEST_ENDPOINT_RESOLVES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// How many times the uncached resolution has run since the binding was taken.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_endpoint_resolves() -> usize {
     TEST_ENDPOINT_RESOLVES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct TestEndpointBinding(
     /// Held, never read: the serial's whole job is to be released on drop.
     #[allow(dead_code)]
     std::sync::MutexGuard<'static, ()>,
 );
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for TestEndpointBinding {
     fn drop(&mut self) {
         *TEST_ENDPOINT
@@ -155,7 +157,7 @@ impl Drop for TestEndpointBinding {
 
 /// Answer every uncached endpoint resolution with `endpoint`, counting each one,
 /// until the returned binding is dropped.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn bind_test_endpoint(endpoint: impl Into<String>) -> TestEndpointBinding {
     let serial = super::cli::test_serial();
     TEST_ENDPOINT_RESOLVES.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -196,7 +198,7 @@ pub(crate) fn clear_socket_cache() {
 }
 
 fn resolve_socket_path_uncached(repo: &Path) -> Result<String, String> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     {
         if let Some(canned) = TEST_ENDPOINT
             .lock()

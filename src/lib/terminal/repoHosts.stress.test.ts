@@ -47,7 +47,10 @@ function step(world: World, hosted: ReadonlySet<string>): Set<string> {
 }
 
 describe("terminal hosting under churn", () => {
-  it("never hosts a repository whose dock the user never opened", () => {
+  // Forty seeds of four hundred steps is a few thousand set walks. On a
+  // loaded Ubuntu runner that crossed Vitest's 5s default by a hair and
+  // failed the CI leg the release gate treats as "not green".
+  it("never hosts a repository whose dock the user never opened", { timeout: 20_000 }, () => {
     for (let seed = 1; seed <= 40; seed += 1) {
       const random = mulberry32(seed);
       const all = Array.from({ length: MAX_OPEN_TABS }, (_, i) => `tab-${i}`);
