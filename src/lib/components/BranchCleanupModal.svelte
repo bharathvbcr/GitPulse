@@ -217,6 +217,7 @@
 
 {#if isOpen}
   <!-- Backdrop -->
+  <!-- Justified: the scrim is a pointer dismiss for the dialog. Escape and the close button are the keyboard path; the scrim itself is presentation, not a focus stop. -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div
     class="gp-scrim bg-black/40 flex items-center justify-center p-4 select-none gp-gpu"
@@ -227,6 +228,7 @@
     role="presentation"
   >
     <!-- Card Container -->
+    <!-- Justified: the click stops the scrim dismiss from firing when the pointer lands on the dialog. The dialog is focused by trapFocus; this handler activates nothing. -->
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
     <div
       class="w-full max-w-4xl gp-card shadow-float rounded-2xl flex flex-col max-h-[85vh] overflow-hidden focus:outline-hidden gp-gpu"

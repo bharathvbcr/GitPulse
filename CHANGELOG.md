@@ -56,6 +56,9 @@ checks beside cargo audit.
   send.** Squash and rebase detection stays on the dead-branch scan, which is
   the path that runs `git merge-tree`. The fast branch list remains a single
   `for-each-ref`.
+- **Dead-branch cleanup is judged on the git commands it actually runs.**
+  Each `git branch -d/-D` and `git push --delete` is authorized before the
+  first delete. A refusal stops the batch before any branch is removed.
 
 ## [1.3.1] - 2026-09-22
 

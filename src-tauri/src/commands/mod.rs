@@ -949,15 +949,24 @@ pub async fn cmd_deadbranch_clean(
     create_backup: bool,
 ) -> Result<Guarded<crate::engine::deadbranch::DeadbranchCleanResult>, String> {
     off_thread(move || {
-        let flag = if force { "-D" } else { "-d" };
-        let policy = guard(
+        let policy = std::cell::RefCell::new(None);
+        let result = crate::engine::deadbranch::clean_branches_with_gate(
             &repo_path,
-            &["git", "branch", flag, "deadbranch:batch_clean"],
+            &branches,
+            force,
+            create_backup,
+            |argv| {
+                let verdict = guard(&repo_path, argv)?;
+                let mut slot = policy.borrow_mut();
+                *slot = Some(match slot.take() {
+                    Some(prev) => strictest_verdict(prev, verdict),
+                    None => verdict,
+                });
+                Ok(())
+            },
         )?;
-        let result =
-            crate::engine::deadbranch::clean_branches(&repo_path, &branches, force, create_backup)?;
         Ok(Guarded {
-            policy,
+            policy: policy.into_inner().unwrap_or_else(no_git_verdict),
             output: result,
         })
     })
@@ -978,10 +987,23 @@ pub async fn cmd_deadbranch_restore(
     branches: Option<Vec<String>>,
 ) -> Result<Guarded<crate::engine::deadbranch::DeadbranchRestoreResult>, String> {
     off_thread(move || {
-        let policy = guard(&repo_path, &["git", "branch", "deadbranch:restore"])?;
-        let result = crate::engine::deadbranch::restore_backup(&repo_path, &backup_path, branches)?;
+        let policy = std::cell::RefCell::new(None);
+        let result = crate::engine::deadbranch::restore_backup_with_gate(
+            &repo_path,
+            &backup_path,
+            branches,
+            |argv| {
+                let verdict = guard(&repo_path, argv)?;
+                let mut slot = policy.borrow_mut();
+                *slot = Some(match slot.take() {
+                    Some(prev) => strictest_verdict(prev, verdict),
+                    None => verdict,
+                });
+                Ok(())
+            },
+        )?;
         Ok(Guarded {
-            policy,
+            policy: policy.into_inner().unwrap_or_else(no_git_verdict),
             output: result,
         })
     })
@@ -2533,6 +2555,28 @@ pub struct Guarded<T> {
 /// guard_command`), so this file keeps no second copy of render→check→refuse.
 fn guard(repo_path: &str, argv: &[&str]) -> Result<crate::harness::PolicyVerdict, String> {
     crate::harness::guard_command(repo_path, argv)
+}
+
+/// A guarded action that selected no git command. The gate did not run
+/// because there was nothing to judge; `checked` stays false so that is
+/// not reported as an allow.
+fn no_git_verdict() -> crate::harness::PolicyVerdict {
+    crate::harness::PolicyVerdict {
+        status: crate::harness::PolicyStatus::Unchecked,
+        checked: false,
+        target: "no git command".to_string(),
+        rule: String::new(),
+        severity: String::new(),
+        reason: String::new(),
+        demoted: String::new(),
+        grant_id: String::new(),
+        granted_by: String::new(),
+        widened: String::new(),
+        degraded: Vec::new(),
+        task_id: String::new(),
+        detail: "no git command was required".to_string(),
+        detail_code: "no_mutation".to_string(),
+    }
 }
 
 /// Picks the verdict a multi-command action should report.

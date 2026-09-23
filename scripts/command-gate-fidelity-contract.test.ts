@@ -65,6 +65,8 @@ const DERIVED_ARGV = Object.freeze({
   cmd_unlock_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_prune_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_worktree_merge_teardown: "worktree merge-teardown argv is built in engine::worktree, not git_writer",
+  cmd_deadbranch_clean: "clean_mutation_argv in engine::deadbranch builds each git branch -d/-D and git push --delete; clean_branches_with_gate authorizes every line before the first delete",
+  cmd_deadbranch_restore: "restore_backup_with_gate authorizes each git branch <name> <sha> from the backup file before the first restore",
   cmd_write_file_content: "writes through the sandbox, gated by path not command",
   cmd_discard_changes: "gated by path not command; covered by file-gate-fidelity-contract",
   cmd_save_conflict: "conflict_session::mutation builds argv once for judging and execution; native conflict gate regressions cover hash-object, update-index and denial",

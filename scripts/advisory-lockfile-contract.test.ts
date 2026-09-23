@@ -66,12 +66,12 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
   });
 
   it("installs the Health-scan npm refreshes", () => {
-    expect(PKG.dependencies?.["@lucide/svelte"]).toBe("^1.45.0");
-    expect(NPM_LOCK.packages["node_modules/@lucide/svelte"]?.version).toBe("1.45.0");
+    expect(PKG.dependencies?.["@lucide/svelte"]).toBe("^1.47.0");
+    expect(NPM_LOCK.packages["node_modules/@lucide/svelte"]?.version).toBe("1.47.0");
     expect(PKG.devDependencies?.vite).toBe("^8.3.0");
     expect(NPM_LOCK.packages["node_modules/vite"]?.version).toBe("8.3.0");
-    expect(PKG.devDependencies?.["@types/node"]).toBe("^26.5.1");
-    expect(NPM_LOCK.packages["node_modules/@types/node"]?.version).toBe("26.5.1");
+    expect(PKG.devDependencies?.["@types/node"]).toBe("^26.6.2");
+    expect(NPM_LOCK.packages["node_modules/@types/node"]?.version).toBe("26.6.2");
   });
 
   it("excludes local framework ports from CodeQL default setup", () => {

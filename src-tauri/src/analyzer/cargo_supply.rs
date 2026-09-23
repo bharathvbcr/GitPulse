@@ -65,7 +65,7 @@ pub(crate) fn classify_bin_audit(stdout: &str, stderr: &str, success: bool) -> B
     let stderr = stderr.to_ascii_lowercase();
     if stderr.contains("was not built with 'cargo auditable'")
         || stderr.contains("no dependency information found")
-        || stderr.contains(AUDITABLE_EXTRACT_MARKER)
+        || auditable_extract_failed(&stderr)
     {
         return BinAuditKind::NotAuditable;
     }

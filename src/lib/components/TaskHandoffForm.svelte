@@ -210,9 +210,10 @@
           const wtPath = `${path}/.gitpulse/worktrees/${laneId}`;
           await invoke("cmd_add_worktree", {
             repoPath: path,
-            newPath: wtPath,
-            branch: `agent/${laneId}`,
+            targetPath: wtPath,
+            newBranch: `agent/${laneId}`,
             startPoint: null,
+            detach: false,
             cowCaches: true,
           });
           agentCheckoutPath = wtPath;

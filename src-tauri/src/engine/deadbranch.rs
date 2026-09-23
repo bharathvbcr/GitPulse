@@ -499,13 +499,70 @@ pub fn create_backup(repo_path: &str, branches: &[StaleBranchInfo]) -> Result<St
     Ok(backup_path.to_string_lossy().to_string())
 }
 
-/// Safely cleans the specified branches with pre-deletion backup and guard verification.
+/// The exact `git` argv a cleanup will run for one selected branch.
+///
+/// Local deletes are `git branch -d/-D <short>`. A squash or rebase merge
+/// uses `-D`, matching the execute path, because `-d` refuses a branch git
+/// does not consider merged. Remote deletes are `git push <remote> --delete`.
+pub fn clean_mutation_argv(branch: &StaleBranchInfo, force: bool) -> Result<Vec<String>, String> {
+    if branch.is_remote {
+        let Some((remote, remote_branch)) = branch.name.split_once('/') else {
+            return Err("Invalid remote branch format".to_string());
+        };
+        if remote.is_empty() || remote_branch.is_empty() {
+            return Err("Invalid remote branch format".to_string());
+        }
+        return Ok(vec![
+            "git".to_string(),
+            "push".to_string(),
+            remote.to_string(),
+            "--delete".to_string(),
+            remote_branch.to_string(),
+        ]);
+    }
+    validate_ref_name(&branch.short_name)?;
+    let flag = if force || branch.merged_by_tree {
+        "-D"
+    } else {
+        "-d"
+    };
+    Ok(vec![
+        "git".to_string(),
+        "branch".to_string(),
+        flag.to_string(),
+        branch.short_name.clone(),
+    ])
+}
+
+/// Safely cleans the specified branches with pre-deletion backup.
+///
+/// Does not consult the command gate. Production callers use
+/// [`clean_branches_with_gate`] so each argv is judged before any delete.
 pub fn clean_branches(
     repo_path: &str,
     branch_names: &[String],
     force: bool,
     create_backup_file: bool,
 ) -> Result<DeadbranchCleanResult, String> {
+    clean_branches_with_gate(repo_path, branch_names, force, create_backup_file, |_| {
+        Ok(())
+    })
+}
+
+/// Same as [`clean_branches`], but `authorize` sees every `git` argv before
+/// the first delete. A refusal returns before any branch is removed. The
+/// backup, when requested, is written before that check so a refused cleanup
+/// still has a restorable tip list.
+pub fn clean_branches_with_gate<F>(
+    repo_path: &str,
+    branch_names: &[String],
+    force: bool,
+    create_backup_file: bool,
+    mut authorize: F,
+) -> Result<DeadbranchCleanResult, String>
+where
+    F: FnMut(&[&str]) -> Result<(), String>,
+{
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
     let _guard = _repo_lock
@@ -567,31 +624,28 @@ pub fn clean_branches(
 
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
+    let mut planned = Vec::new();
 
     for b in to_clean {
-        if b.is_remote {
-            // For remote branches, e.g. "origin/feature" -> push origin --delete feature
-            let parts: Vec<&str> = b.name.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                let remote = parts[0];
-                let remote_branch = parts[1];
-                match git_text(&repo, &["push", remote, "--delete", remote_branch]) {
-                    Ok(_) => deleted.push(b.name),
-                    Err(err) => failed.push((b.name, err)),
-                }
-            } else {
-                failed.push((b.name, "Invalid remote branch format".to_string()));
-            }
-        } else {
-            // For local branches: use -D if force requested or if squash/rebase merged by tree
-            let use_force = force || b.merged_by_tree;
-            let flag = if use_force { "-D" } else { "-d" };
+        match clean_mutation_argv(&b, force) {
+            Ok(argv) => planned.push((b, argv)),
+            Err(err) if b.is_remote => failed.push((b.name, err)),
+            Err(err) => return Err(err),
+        }
+    }
 
-            validate_ref_name(&b.short_name)?;
-            match git_text(&repo, &["branch", flag, &b.short_name]) {
-                Ok(_) => deleted.push(b.name),
-                Err(err) => failed.push((b.name, err)),
-            }
+    // Judge every line before the first delete, so a refusal cannot land
+    // halfway through the batch.
+    for (_, argv) in &planned {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        authorize(&refs)?;
+    }
+
+    for (b, argv) in planned {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match git_text(&repo, &refs[1..]) {
+            Ok(_) => deleted.push(b.name),
+            Err(err) => failed.push((b.name, err)),
         }
     }
 
@@ -682,11 +736,28 @@ pub fn list_backups(repo_path: &str) -> Result<Vec<DeadbranchBackupInfo>, String
 }
 
 /// Restores branches from a saved backup file.
+///
+/// Does not consult the command gate. Production callers use
+/// [`restore_backup_with_gate`].
 pub fn restore_backup(
     repo_path: &str,
     backup_path: &str,
     branches_to_restore: Option<Vec<String>>,
 ) -> Result<DeadbranchRestoreResult, String> {
+    restore_backup_with_gate(repo_path, backup_path, branches_to_restore, |_| Ok(()))
+}
+
+/// Same as [`restore_backup`], but `authorize` sees each `git branch <name> <sha>`
+/// before the first restore.
+pub fn restore_backup_with_gate<F>(
+    repo_path: &str,
+    backup_path: &str,
+    branches_to_restore: Option<Vec<String>>,
+    mut authorize: F,
+) -> Result<DeadbranchRestoreResult, String>
+where
+    F: FnMut(&[&str]) -> Result<(), String>,
+{
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
     let _guard = _repo_lock
@@ -700,6 +771,7 @@ pub fn restore_backup(
 
     let mut restored = Vec::new();
     let mut failed = Vec::new();
+    let mut planned: Vec<(String, Vec<String>)> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -720,11 +792,29 @@ pub fn restore_backup(
                     continue;
                 }
 
-                match git_text(&repo, &["branch", name, sha]) {
-                    Ok(_) => restored.push(name.to_string()),
-                    Err(err) => failed.push((name.to_string(), err)),
-                }
+                planned.push((
+                    name.to_string(),
+                    vec![
+                        "git".to_string(),
+                        "branch".to_string(),
+                        name.to_string(),
+                        sha.to_string(),
+                    ],
+                ));
             }
+        }
+    }
+
+    for (_, argv) in &planned {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        authorize(&refs)?;
+    }
+
+    for (name, argv) in planned {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match git_text(&repo, &refs[1..]) {
+            Ok(_) => restored.push(name),
+            Err(err) => failed.push((name, err)),
         }
     }
 

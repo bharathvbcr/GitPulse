@@ -104,6 +104,7 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
             ("section:insights:pulse", "Pulse"),
             ("section:insights:coverage", "Coverage"),
             ("section:insights:health", "Health"),
+            ("section:insights:secrets", "Secrets"),
             ("section:insights:storage", "Storage"),
         ],
     },

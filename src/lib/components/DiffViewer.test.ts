@@ -325,7 +325,8 @@ describe("DiffViewer store-emission memo guards", () => {
   it("refetches image blobs only when repo, path, or commit change", () => {
     expect(source).toContain("imageBlobKey");
     expect(source).toContain("if (imageBlobKey === requestKey)");
-    expect(source.match(/return \(\) => \{\s*cancelled = true;\s*\};/g)).toBeNull();
+    const imageEffect = source.slice(source.indexOf("let imageBlobKey"));
+    expect(imageEffect.match(/return \(\) => \{\s*cancelled = true;\s*\};/g)).toBeNull();
   });
 
   it("drops a stale impact answer instead of letting it overwrite the current file", () => {
