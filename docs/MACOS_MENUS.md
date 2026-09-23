@@ -40,9 +40,9 @@ Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · 
 | File | Open/Clone Repository, Open Recent, Clear Recent Repositories, Open Repositories, Close/Reopen Repository Tab, Next/Previous Repository Tab, Close Window. Recent history is capped at 12; identical names display distinguishing paths. Clearing history preserves repositories, tabs and closed-tab recovery. |
 | Edit | Native Undo, Redo, Cut, Copy, Paste, Select All for the focused control. |
 | View | Work, Code, History, Insights, Fleet, Show/Hide Terminal, Search Commits, Command Palette, Refresh, System/Light/Dark Appearance, Toggle Dark/Light, Full Screen, Zoom In, Zoom Out, Actual Size. |
-| Go → Work | Overview, Resolve, Remote, Stack, Policy. |
+| Go → Work | Overview, Resolve, Remote, Policy, Tasks. |
 | Go → Code | Explorer, Blame, Map. |
-| Go → History | Graph, Diff, Reflog. |
+| Go → History | Graph, Diff, Reflog, Suspects. |
 | Go → Insights | Pulse, Coverage, Health, Storage. |
 | Repository | Fetch, Pull, Push, Stash Working Tree, Pop Stash, Stage All, Unstage All, Quick Commit, Interactive Rebase, Create Branch, Rename Current Branch, Continue/Abort/Skip Operation, Copy Repository Path, Copy Branch, Copy Selected Commit SHA or HEAD SHA, Reveal in Finder, Open Remote Website. |
 | Window | Minimize, maximize/zoom, Close Window. |

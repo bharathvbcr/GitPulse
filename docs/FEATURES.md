@@ -8,7 +8,7 @@ session; use the sections below for controls, prerequisites, and limits.
 
 ## Find a workflow
 
-- [Work: Overview, Resolve, Remote, Stack, Policy, and Tasks](#1-work-work)
+- [Work: Overview, Resolve, Remote, Policy, and Tasks](#1-work-work)
 - [Tasks and saved workspaces](TASKS_AND_WORKSPACES.md)
 - [Code](#2-code-code), [History](#3-history-history), and [Insights](#4-insights-insights)
 - [Command palette](COMMAND_PALETTE.md), [terminal](TERMINAL.md), and [native menus](MACOS_MENUS.md)
@@ -37,9 +37,9 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The four views"]
-        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy · Tasks"]
+        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map — file selection plus the code/docs map"]
-        History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog — three lenses on one commit selection"]
+        History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository"]
     end
 
@@ -54,9 +54,9 @@ flowchart TD
 
 ## 1. Work (`work`)
 
-Everything in flight, and the actions that unblock it. Six sections cover
-worktree activity, conflict resolution, GitHub, branch stacks, policy and the
-repository's shared task board.
+Everything in flight, and the actions that unblock it. Five sections cover
+worktree activity, conflict resolution, GitHub, policy and the repository's
+shared task board (with branch stack hierarchy embedded directly in Overview).
 
 ### 1.1 Overview
 
@@ -172,15 +172,15 @@ repository's shared task board.
       Exec --> Report["Honest Accounting<br/>(Passed / Failed / Skipped · scope named)"]
   ```
 
-### 1.4 Stack
+#### Branch Stack Hierarchy (in Overview)
 
-- **The Chain, As A Chain**: The hierarchy renders as a tree — parents above, children indented under them — rather than a flat list with "based on X" on every row, which made the reader rebuild the shape in their head.
+- **The Chain, As A Chain**: The hierarchy renders as a tree — parents above, children indented under them — rather than a flat list with "based on X" on every row, which made the reader rebuild the shape in their head. Embedded directly in Overview as a collapsible card.
 - **Each Branch, Joined To What Is Known About It**: How far it is ahead of its parent and behind the default branch, its tracking state (`↑`/`↓`, `upstream gone`, or `untracked` — never `0↑ 0↓` for a branch with no upstream), and when it last moved and by whom.
 - **Updating A Stack Cascades**: Rebasing one branch moves every branch above it off the commit it was cut from, so a single restack silently strands the rest of the stack. The action plans the whole subtree from the tree on screen *before* the first rewrite — the last moment those fork points exist — names every branch it will touch in the confirmation, and runs the steps in parent-before-child order. Each step is an independently gated, independently rolled-back rebase; a cascade that stops part-way reports which branches were rebased and which are still on their old base, then reloads so a second attempt cannot plan from a stale tree.
 - **Fork Points Are Recorded, Not Recomputed**: Once a parent has been rebased, `merge-base` collapses back to the trunk and would replay the parent's own commits onto the parent. `cmd_restack` accepts the parent tip the stack was read at, refuses one that is not an ancestor of the branch (rather than silently widening the rewrite), and so does not depend on the reflog — which a fresh clone, a bare repository, or `gc.reflogExpire` will not have.
 - **What The Hierarchy Cannot See, It Says**: A branch appears as a child only while it sits on its parent's *current* tip. Git records no "cut from" link, so a branch left behind by a rebase of its parent reappears as its own root, not as a stale child — stated on the page, with the local branches the walk placed on no stack listed by name. Otherwise a stack that fell apart reads as a repository that never had one.
 
-### 1.5 Policy (Manvi wrap)
+### 1.4 Policy (Manvi wrap)
 
 - **Policy Monitor**: Displays real-time status of the Manvi command and file write gates (Manvi's wrap around selected DevCouncil modules).
 - **Merged Branch Cleanup**: Identifies merged local branches and plans safe deletions without touching active or unmerged heads.
@@ -189,7 +189,7 @@ repository's shared task board.
 
 ---
 
-### 1.6 Tasks
+### 1.5 Tasks
 
 Work → Tasks shows tasks linked to the active repository. The **Tasks** button
 beside Fleet opens global and saved-workspace scopes over the same records.
@@ -230,24 +230,26 @@ reading of the same open file. Sections switch from the segmented control
 ### 2.1 Explorer
 
 - **IDE File Explorer**: Recursive directory tree navigation with real-time Git status markers (staged, unstaged, untracked, ignored).
-- **Virtualized Code Viewer**: High-performance line-virtualized code viewer. Syntax highlighting has one owner and two backends: MarkDev tree-sitter for rust / JavaScript / TypeScript / Python / JSON / shell, and the existing regex tokenizer for the rest of the supported set.
+- **Virtualized Code Viewer**: High-performance line-virtualized code viewer. Syntax highlighting has one owner and two backends: MarkDev tree-sitter for Rust / JavaScript / TypeScript / Python / JSON / shell, and the existing regex tokenizer for the rest of the supported set. Virtualized row heights scale proportionally with editor zoom stops (70%–160%) via `scaledRowHeight`, preventing line overlaps and row clipping at compact zoom.
 - **In-File Search & Filter**: Search with case-sensitivity toggle (`Aa`), regular expression support (`.*`), match count badges, and keyboard navigation (`Enter` / `Shift+Enter`).
 - **Go To Line**: Fast modal overlay to jump directly to any line number (1–N).
 - **Line Selection & Range Inspection**: Single-click line selection, shift-click line range highlighting, indentation style detection, and file status bar.
 - **Inline Editor**: Instant toggle between read-only syntax viewing and direct in-memory text editing with save feedback.
 - **Copy & Formatting Tools**: One-click whole-file or line-range copying with persistent feedback, whitespace character rendering toggle (`·` / `→`), and zoom font scaling (`⌘+` / `⌘-` / `⌘0`).
+- **Responsive Header Controls & Scroll Cues**: File viewer headers across `CodeViewer`, `FileTreePanel`, `MarkDevViewer`, and `MediaViewer` scroll horizontally when horizontal space is constrained, paired with `ScrollCue` visual indicators to ensure all buttons and controls remain reachable on narrower viewports.
+- **Boundary-Aware Tooltip Placement**: Tooltip bubbles position dynamically relative to viewport boundaries via `placeTooltipBubble`, keeping labels on-screen across arbitrary window sizes while respecting directional hints (`above` vs `below`).
 - **Specialized Media & Binary Previews**:
-  - **Markdown / MarkDev**: Rendered from MarkDev's Rust flat parse model (UTF-16 offsets). Outline, task lists, callouts, tables, validated math / highlight adjacency, and backlinks from the repo docs vault. Commit message bodies and MANVI verdict detail use the same renderer.
+  - **Markdown / MarkDev**: Rendered from MarkDev's Rust flat parse model (UTF-16 offsets). Outline, task lists, callouts, tables, validated math / highlight adjacency, and backlinks from the repo docs vault. Preview panes feature bidirectional scrolling and flex-bound layouts to prevent text clipping on oversized formatted blocks. Commit message bodies and MANVI verdict detail use the same renderer.
   - **Images & Media**: Visual viewer with dimensions, aspect ratios, and format inspection.
   - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters for compiled and binary artifacts.
 - **Live Pulse Dashboard**: Uncommitted churn overview, active branch status, and instant staging accelerators. The commit composer shows a **what this commit breaks** summary from `devmap preview` over staged paths (shared with the Diff file rail).
 - **Language Logo Vector Icons**: High-fidelity vector SVG logos for 34+ programming languages, configuration formats, and markup types rendered across the file tree, tab bar, diff toolbar, and dashboard.
 - **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
-- **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
+- **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. Toggles between lines-of-code (`loc`) and percentage (`percentage`) mode. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
 
 ### 2.2 Blame
 
-- **Line Authorship Viewer**: Interactive gutter displaying commit author, commit age and commit SHA for every line. The age follows the shared timestamp preference (relative or `YYYY-MM-DD`), with the other form on hover.
+- **Line Authorship Viewer**: Interactive gutter displaying commit author, commit age and commit SHA for every line. Hardened with an SWR (stale-while-revalidate) architecture and deep equality guards to eliminate unnecessary re-renders. The age follows the shared timestamp preference (relative or `YYYY-MM-DD`), with the other form on hover.
 - **Commit Blocks**: Consecutive lines from one commit state their hash and author once, at the head of the block; a continuation line keeps its hash reachable on hover or focus, and hovering any line marks the whole commit down the left edge.
 - **Code Age Timeline**: A chronological axis above the gutter showing what percentage of *this file* was last changed in each period. The resolution adapts to the file's history (daily through yearly) and is bounded — a history too long for even a yearly axis folds its oldest lines into the leading column and says so. Every column is a share of the whole file, and clicking one filters the gutter to exactly the lines that column counted. Quiet periods are drawn as empty columns rather than omitted, so a gap reads as a gap.
 - **Off-axis lines are named, not dropped**: Worktree-only, clock-skewed (author date after now) and undated lines cannot sit on a commit-date axis, so they ride beside it as labelled, selectable chips carrying their own share. The columns plus the chips account for 100% of the file — a bar summing to 100% of *some* of the file would overstate every period it drew.
@@ -278,10 +280,10 @@ DevCouncil's `devmap` module. GitPulse takes this component without requiring th
 
 ## 3. History (`history`)
 
-Three lenses on one subject — what happened to this repository — switched by
-the segmented control in the view's own header, which also carries the commit
-filter. Graph, Diff and Reflog were three top-level tabs; they share
-`selectedCommitId`, so switching lens keeps the commit you were looking at.
+Four lenses on one subject — what happened to this repository — switched by
+the segmented control in the view's own header (Graph, Diff, Reflog, Suspects), which also carries the commit
+filter. Graph, Diff and Reflog were three top-level tabs; with Suspects they share
+selected commit context, so switching lens keeps the commit or regression window you were looking at.
 The split was expensive in a way the code admitted: the Diff tab had to grow
 its own commit picker purely so you would not have to walk back to Graph for
 the commit you had just selected.
@@ -319,6 +321,12 @@ the commit you had just selected.
 
 - **Reference Log Browser**: Full history of HEAD movements, checkouts, commits, rebases, and resets.
 - **Recovery Points**: Instant checkout or branch creation from detached reflog entries to recover discarded commits.
+
+### 3.4 Suspects
+
+- **Regression Suspects Finder**: Pinpoints which commit between a known-good ref and a failing commit could have caused a regression or affected a given symbol.
+- **Graph-Ranked Candidates**: Joins blame history with the DevMap code graph (`dc-regress` and `dc-regress-store`), ranking suspects by what the call graph actually reaches from the symptom rather than simple chronological recency.
+- **Indexed Search Window**: Analyzes the historical commit window up to the currently indexed commit, reporting exact commit reachability and blame attribution.
 
 ---
 
@@ -373,6 +381,7 @@ rather than presenting a floor as a total.
   - GitHub Dependabot and code scanning alerts (via local `gh` CLI), fetched when a repository opens. Critical and high findings raise a warning. Turn off under Settings → Analysis. The Health **Scan local** button still does not call GitHub.
 - **Code map status & dead symbols**: When a DevMap store is present (schema 20), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
+- **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, and repository health signals into a single explicit verdict with one canonical owner per repeated decision.
 
 ### 4.4 Storage
 
@@ -527,6 +536,9 @@ sessions survive and nothing re-hydrates on the way back.
   open repository closes its tab and drops it from the workspace; removing a
   recent repository purges it from workspace history so stale or moved project
   paths stay clean without lingering.
+- **Repository Tab Groups.** Open repository tabs can be organized into named,
+  color-coded tab groups with collapse/expand and bulk close/reload controls,
+  simplifying navigation across multi-repository workspaces.
 
 ---
 
