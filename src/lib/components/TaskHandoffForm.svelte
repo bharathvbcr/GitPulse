@@ -108,6 +108,7 @@
   let repositoryId = $state(untrack(() => primaryRepositoryId));
   let checkout = $state("");
   let acknowledged = $state(false);
+  let provisionWorktree = $state(false);
   let busy = $state(false);
   let error = $state("");
   let note = $state("");
@@ -202,6 +203,20 @@
         }
         const repo = await bounded(getRepository(selected));
         if (disposed) return;
+        let agentCheckoutPath = path;
+        if (provisionWorktree) {
+          note = "Provisioning isolated agent worktree with CoW cache…";
+          const laneId = newID().slice(0, 8);
+          const wtPath = `${path}/.gitpulse/worktrees/${laneId}`;
+          await invoke("cmd_add_worktree", {
+            repoPath: path,
+            newPath: wtPath,
+            branch: `agent/${laneId}`,
+            startPoint: null,
+            cowCaches: true,
+          });
+          agentCheckoutPath = wtPath;
+        }
         pending = {
           kind: settings.kind,
           id: newID(),
@@ -210,7 +225,7 @@
           source_revision: latest.revision,
           repository_id: repo.id,
           repository_revision: repo.revision,
-          repo_path: path,
+          repo_path: agentCheckoutPath,
           provider: settings.provider,
           permission_mode: settings.permission,
           acknowledge_bypass: acknowledged,
@@ -321,6 +336,11 @@
   {:else if candidates[0].source === "derived"}
     <p class="meta">Suggested from this repository's git directory. Open the repository in GitPulse to confirm it.</p>
   {/if}
+
+  <label class="ack">
+    <input type="checkbox" bind:checked={provisionWorktree} disabled={locked} />
+    Provision isolated agent worktree with CoW build caches
+  </label>
 
   <label>Permission mode
     <select class="gp-select" bind:value={settings.permission} disabled={locked} onchange={() => { acknowledged = false; }}>

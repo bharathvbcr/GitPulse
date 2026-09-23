@@ -23,6 +23,11 @@ pub use suspects::{
 
 pub const DEFAULT_CODEINTEL_BUDGET: u32 = 2000;
 
+/// Hard cap on symbols returned for one file. A megabyte of generated source
+/// can declare thousands of symbols; the collision and diff callers need a
+/// bounded page, not the whole corpus.
+pub const MAX_FILE_SYMBOLS: usize = 256;
+
 /// Schema version this GitPulse build can read. Pinned to the linked
 /// `devmap_store` constant so a re-vendor that drifts fails a test rather than
 /// shipping a dead panel.
@@ -52,6 +57,65 @@ pub struct CodeintelSymbolHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span_omitted_bytes: Option<u32>,
     pub score: f32,
+}
+
+/// One symbol declared in a single file, with line spans for hunk joins.
+///
+/// Unlike a search hit this carries no source body and no score — the caller
+/// already named the file, and the join is on line ranges.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeintelFileSymbol {
+    pub symbol_name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub span_start_line: u32,
+    pub span_end_line: u32,
+}
+
+/// Bounded symbols-in-file read against one DevMap generation.
+///
+/// `head_matches` is the whole point of carrying `requested_head_sha` and
+/// `generation_head_sha` together: a caller that joins these spans to a
+/// working-tree diff must refuse the join when the index was built at a
+/// different commit. An empty `items` with `available: true` and
+/// `head_matches: true` means the file genuinely has no indexed symbols;
+/// `available: false` means the check could not run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelFileSymbols {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub file_path: String,
+    pub requested_head_sha: String,
+    pub generation_id: Option<u32>,
+    pub generation_head_sha: Option<String>,
+    /// True only when `generation_head_sha` equals `requested_head_sha`.
+    pub head_matches: bool,
+    pub items: Vec<CodeintelFileSymbol>,
+    pub total: u32,
+    pub shown: u32,
+    pub truncated: bool,
+}
+
+impl CodeintelFileSymbols {
+    fn unavailable(
+        file_path: impl Into<String>,
+        requested_head_sha: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason.into()),
+            file_path: file_path.into(),
+            requested_head_sha: requested_head_sha.into(),
+            generation_id: None,
+            generation_head_sha: None,
+            head_matches: false,
+            items: Vec::new(),
+            total: 0,
+            shown: 0,
+            truncated: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +608,140 @@ pub fn search(
         }),
         Err(e) => CodeintelResponse::unavailable(format!("Search failed: {e}")),
     }
+}
+
+/// Lists symbols declared in one file from the latest DevMap generation.
+///
+/// `head_sha` is the commit the caller intends to join against (typically that
+/// worktree's `HEAD`). The page reports whether the indexed generation was
+/// built at that SHA; a mismatch must not be treated as a verified span join.
+///
+/// Line ranges are computed from the blob at `generation_head_sha` when the
+/// content hash matches, so dirty working-tree bytes never silently rebase
+/// stored coordinates onto a different revision.
+pub fn symbols_for_file(repo_path: &str, file_path: &str, head_sha: &str) -> CodeintelFileSymbols {
+    if let Err(e) = require_argument("file_path", file_path) {
+        return CodeintelFileSymbols::unavailable(file_path, head_sha, e);
+    }
+    if let Err(e) = require_argument("head_sha", head_sha) {
+        return CodeintelFileSymbols::unavailable(file_path, head_sha, e);
+    }
+    if head_sha.chars().any(char::is_whitespace) || head_sha.len() > 128 {
+        return CodeintelFileSymbols::unavailable(
+            file_path,
+            head_sha,
+            "head_sha must be whitespace-free and at most 128 characters",
+        );
+    }
+    let store = match open_repo_map(repo_path) {
+        Ok(s) => s,
+        Err(e) => return CodeintelFileSymbols::unavailable(file_path, head_sha, e),
+    };
+    let page = match store.latest_symbols_for_file(file_path) {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            return CodeintelFileSymbols::unavailable(
+                file_path,
+                head_sha,
+                "No generation indexed; the code map has not been built yet",
+            );
+        }
+        Err(e) => {
+            return CodeintelFileSymbols::unavailable(
+                file_path,
+                head_sha,
+                format!("Failed to read symbols for file: {e}"),
+            );
+        }
+    };
+
+    let head_matches = page.head_sha == head_sha;
+    let mut reason = None;
+    if !head_matches {
+        reason = Some(format!(
+            "indexed generation head_sha {} is not the requested {}",
+            page.head_sha, head_sha
+        ));
+    }
+
+    let source = if page.rows.is_empty() {
+        Some(String::new())
+    } else {
+        blob_for_line_spans(repo_path, file_path, &page.head_sha, &page.rows)
+    };
+    let total = page.rows.len() as u32;
+    let truncated = page.rows.len() > MAX_FILE_SYMBOLS;
+    let items: Vec<CodeintelFileSymbol> = page
+        .rows
+        .into_iter()
+        .take(MAX_FILE_SYMBOLS)
+        .map(|row| {
+            let (span_start_line, span_end_line) = match &source {
+                Some(text) => {
+                    let span = devmap_extract::model::Span {
+                        start_byte: row.span_start,
+                        end_byte: row.span_end,
+                    };
+                    span.line_range(text)
+                }
+                None => (0, 0),
+            };
+            CodeintelFileSymbol {
+                symbol_name: row.name,
+                qualified_name: row.qualified_name,
+                kind: row.kind,
+                span_start_line,
+                span_end_line,
+            }
+        })
+        .collect();
+    let shown = items.len() as u32;
+    if source.is_none() && reason.is_none() {
+        reason = Some(format!(
+            "could not read blob for {file_path} at {} to convert byte spans to lines",
+            page.head_sha
+        ));
+    }
+
+    CodeintelFileSymbols {
+        available: true,
+        reason,
+        file_path: file_path.to_string(),
+        requested_head_sha: head_sha.to_string(),
+        generation_id: Some(page.generation),
+        generation_head_sha: Some(page.head_sha),
+        head_matches,
+        items,
+        total,
+        shown,
+        truncated,
+    }
+}
+
+/// Source bytes for line conversion, verified against the stored content hash.
+///
+/// Prefers the blob at `generation_head_sha`. Falls back to the working tree
+/// when that revision cannot be read but the on-disk bytes still match the
+/// indexed hash — the same identity check search uses — so a fixture (or a
+/// dirty tree whose file was not rewritten) can still convert spans.
+fn blob_for_line_spans(
+    repo_path: &str,
+    file_path: &str,
+    generation_head_sha: &str,
+    rows: &[devmap_store::StoredSymbol],
+) -> Option<String> {
+    let expected = rows.first().map(|row| row.content_hash)?;
+    let matching = |commit: Option<&str>| -> Option<String> {
+        let blob =
+            crate::engine::git_reader::GitReader::get_file_blob(repo_path, file_path, commit)
+                .ok()?;
+        let text = blob.text?;
+        if devmap_extract::content_hash(&text) != expected {
+            return None;
+        }
+        Some(text)
+    };
+    matching(Some(generation_head_sha)).or_else(|| matching(None))
 }
 
 /// Computes blast radius / impact for a symbol or file.
@@ -1946,8 +2144,12 @@ mod tests {
                 let r = trace_between(&root, "a", "b", None);
                 ("trace_between", r.available, r.reason)
             },
+            {
+                let r = symbols_for_file(&root, "src/caller.rs", "abc");
+                ("symbols_for_file", r.available, r.reason)
+            },
         ];
-        assert_eq!(surfaces.len(), 5, "all read surfaces must be covered");
+        assert_eq!(surfaces.len(), 6, "all read surfaces must be covered");
         for (name, available, reason) in surfaces {
             assert!(!available, "{name} claimed availability with no map");
             let reason = reason.unwrap_or_else(|| panic!("{name} gave no reason"));
@@ -1979,6 +2181,10 @@ mod tests {
             (
                 "trace_between",
                 trace_between(&root, "a", "b", None).available,
+            ),
+            (
+                "symbols_for_file",
+                symbols_for_file(&root, "src/caller.rs", "abc").available,
             ),
         ]
         .into_iter()
@@ -2709,6 +2915,52 @@ mod tests {
         );
     }
 
+    /// Symbols-in-file is the span read collision and entity-diff both need.
+    /// Search already carries spans on hits, but nothing listed every symbol
+    /// in one file — and nothing said when the generation was not the SHA
+    /// the caller asked for.
+    #[test]
+    fn symbols_for_file_lists_spans_and_reports_a_head_sha_mismatch() {
+        let repo = repo_with_one_generation();
+        let root = repo.path().to_string_lossy().to_string();
+
+        let matched = symbols_for_file(&root, "src/caller.rs", "fixture");
+        assert!(matched.available, "{:?}", matched.reason);
+        assert!(matched.head_matches, "fixture is the generation head_sha");
+        assert_eq!(matched.generation_head_sha.as_deref(), Some("fixture"));
+        assert_eq!(matched.items.len(), 1);
+        assert_eq!(matched.items[0].symbol_name, "probe_caller");
+        assert_eq!(matched.items[0].span_start_line, 1);
+        assert!(
+            matched.items[0].span_end_line >= 1,
+            "expected a real line span, got {:?}",
+            matched.items[0]
+        );
+
+        let mismatched = symbols_for_file(&root, "src/caller.rs", "deadbeefdeadbeef");
+        assert!(mismatched.available, "mismatch is still a completed read");
+        assert!(
+            !mismatched.head_matches,
+            "a different SHA must not claim head_matches"
+        );
+        let reason = mismatched.reason.expect("mismatch states why");
+        assert!(
+            reason.contains("deadbeefdeadbeef") && reason.contains("fixture"),
+            "reason must name both SHAs: {reason}"
+        );
+        // Spans remain usable for display, but callers must check head_matches
+        // before joining them to a working-tree diff.
+        assert_eq!(mismatched.items.len(), 1);
+    }
+
+    #[test]
+    fn symbols_for_file_blank_arguments_are_refused() {
+        let repo = repo_with_one_generation();
+        let root = repo.path().to_string_lossy().to_string();
+        assert!(!symbols_for_file(&root, "  ", "fixture").available);
+        assert!(!symbols_for_file(&root, "src/caller.rs", "").available);
+    }
+
     #[test]
     fn edited_source_is_withheld_without_losing_the_stored_hit() {
         let repo = repo_with_one_generation();
@@ -3005,6 +3257,10 @@ mod tests {
                 {
                     let r = trace_between(root, "probe_caller", "probe_callee", None);
                     ("trace_between", r.available, r.reason)
+                },
+                {
+                    let r = symbols_for_file(root, "src/caller.rs", "abc");
+                    ("symbols_for_file", r.available, r.reason)
                 },
             ];
             let refused: Vec<&str> = probes

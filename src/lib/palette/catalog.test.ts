@@ -160,7 +160,7 @@ describe("command catalog and context", () => {
   it("dispatches each supported overlay event and the optional tools wizard", async () => {
     const dispatchEvent = vi.fn(); vi.stubGlobal("window", { dispatchEvent });
     const commands = buildCommands(ready(), () => {});
-    for (const [id, event] of [["settings", "gitpulse:settings"], ["mcp_setup", "gitpulse:settings"], ["shortcuts", "gitpulse:shortcuts"], ["diagnostics", "gitpulse:diagnostics"]]) {
+    for (const [id, event] of [["settings", "gitpulse:settings"], ["mcp_setup", "gitpulse:settings"], ["shortcuts", "gitpulse:shortcuts"], ["diagnostics", "gitpulse:diagnostics"], ["clean_branches", "gitpulse:branch-cleanup"]]) {
       await commands.find(command => command.id === id)?.action();
       expect(dispatchEvent.mock.lastCall?.[0].type).toBe(event);
     }

@@ -290,7 +290,7 @@ impl LanguageDetector {
             | "bun.lock"
             | "bun.lockb"
             | "npm-shrinkwrap.json" => Some("npm"),
-            "cargo.toml" | "cargo.lock" => Some("cargo"),
+            "cargo.toml" | "cargo.lock" | "deny.toml" => Some("cargo"),
             "go.mod" | "go.sum" | "go.work" => Some("go"),
             "pyproject.toml" | "requirements.txt" | "pipfile" | "pipfile.lock" | "poetry.lock"
             | "setup.py" | "setup.cfg" => Some("python"),
@@ -1147,6 +1147,7 @@ mod tests {
             LanguageDetector::ecosystem_hint("src-tauri/Cargo.toml"),
             Some("cargo")
         );
+        assert_eq!(LanguageDetector::ecosystem_hint("deny.toml"), Some("cargo"));
         assert!(LanguageDetector::is_rust_source_or_manifest("Cargo.toml"));
         assert!(!LanguageDetector::should_count_for_stats(
             "Cargo.lock",

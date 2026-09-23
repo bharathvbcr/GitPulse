@@ -89,6 +89,7 @@
   // fresh function each render and remount the view every update.
   const loadCoverageViewer = () => import("./lib/components/CoverageViewer.svelte");
   const loadHealthPanel = () => import("./lib/components/HealthPanel.svelte");
+  const loadSecretsPanel = () => import("./lib/components/SecretsPanel.svelte");
   const loadStoragePanel = () => import("./lib/components/StoragePanel.svelte");
   const loadTerminalPanel = () => import("./lib/components/TerminalPanel.svelte");
   const loadCodeStackViewer = () => import("./lib/components/CodeStackViewer.svelte");
@@ -116,6 +117,7 @@
   const loadShortcutsModal = () => import("./lib/components/ShortcutsModal.svelte");
   const loadCommandPalette = () => import("./lib/components/CommandPalette.svelte");
   const loadDiagnosticsModal = () => import("./lib/components/DiagnosticsModal.svelte");
+  const loadBranchCleanupModal = () => import("./lib/components/BranchCleanupModal.svelte");
   import HeaderRepoMenu from "./lib/components/HeaderRepoMenu.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
@@ -165,6 +167,7 @@
   let isSettingsModalOpen = $state(false);
   let isShortcutsOpen = $state(false);
   let isDiagnosticsOpen = $state(false);
+  let isBranchCleanupOpen = $state(false);
 
   // One latch per overlay: false until the first open, true forever after.
   // Unmounting on close would cut the exit transition and re-fetch nothing
@@ -175,6 +178,7 @@
   let settingsMounted = $state(false);
   let shortcutsMounted = $state(false);
   let diagnosticsMounted = $state(false);
+  let branchCleanupMounted = $state(false);
   // The palette owns ⌘K itself, so App has to arm it before the first press
   // can reach it; see the global keydown handler.
   let paletteMounted = $state(false);
@@ -182,6 +186,7 @@
 
   function openCloneDialog() { isCloneModalOpen = true; }
   function openRebaseDialog() { isRebaseModalOpen = true; }
+  function openBranchCleanupDialog() { isBranchCleanupOpen = true; }
 
   /** Arms the palette chunk and asks it to open once it is there. */
   function openCommandPalette() {
@@ -194,6 +199,7 @@
     if (isSettingsModalOpen) settingsMounted = true;
     if (isShortcutsOpen) shortcutsMounted = true;
     if (isDiagnosticsOpen) diagnosticsMounted = true;
+    if (isBranchCleanupOpen) branchCleanupMounted = true;
   });
   let dropActive = $state(false);
   let headerScroller: HTMLDivElement | undefined = $state();
@@ -454,6 +460,8 @@
     };
     window.addEventListener("gitpulse:settings", openSettings);
     track(() => window.removeEventListener("gitpulse:settings", openSettings));
+    window.addEventListener("gitpulse:branch-cleanup", openBranchCleanupDialog);
+    track(() => window.removeEventListener("gitpulse:branch-cleanup", openBranchCleanupDialog));
     const openToolsSetup = () => openSetupWizard("devmap", "explain");
     window.addEventListener("gitpulse:setup-tools", openToolsSetup);
     track(() => window.removeEventListener("gitpulse:setup-tools", openToolsSetup));
@@ -866,7 +874,10 @@
     const path = $repoStore.currentPath;
     if (path === lastModalRepoPath) return;
     lastModalRepoPath = path;
-    untrack(() => { isRebaseModalOpen = false; });
+    untrack(() => {
+      isRebaseModalOpen = false;
+      isBranchCleanupOpen = false;
+    });
   });
 </script>
 
@@ -1052,6 +1063,7 @@
                   loadPulse={loadPulseView}
                   loadCoverage={loadCoverageViewer}
                   loadHealth={loadHealthPanel}
+                  loadSecrets={loadSecretsPanel}
                   loadStorage={loadStoragePanel}
                 />
               {/if}
@@ -1178,6 +1190,9 @@
     {/if}
     {#if paletteMounted}
       <LazyMount load={loadCommandPalette} name="The command palette" props={{ openSignal: paletteOpenSignal, onClone: openCloneDialog, onRebase: openRebaseDialog }} />
+    {/if}
+    {#if branchCleanupMounted}
+      <LazyMount load={loadBranchCleanupModal} name="Branch cleanup" props={{ isOpen: isBranchCleanupOpen, onClose: () => (isBranchCleanupOpen = false) }} />
     {/if}
     <Tooltip />
   </svelte:boundary>

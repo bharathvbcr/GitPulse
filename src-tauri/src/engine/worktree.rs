@@ -118,6 +118,25 @@ pub fn resolve_worktree_family(
 /// tree from turning one listing call into hundreds of subprocess spawns.
 const MAX_DIRTY_SCANS: usize = 32;
 
+use crate::engine::cow_clone::reflink_ignored_caches;
+use crate::engine::portless::{detect_worktree_routes, WorktreeRouteInfo};
+use crate::engine::worktree_hooks::{execute_worktree_hooks, load_worktree_hooks};
+
+/// Diff stats for uncommitted changes in a worktree (`HEAD±`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeDiffStat {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// Divergence stats between worktree branch and default/main branch (`main↕`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeDivergence {
+    pub ahead: usize,
+    pub behind: usize,
+}
+
 /// One entry of `git worktree list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeInfo {
@@ -137,6 +156,15 @@ pub struct WorktreeInfo {
     /// Working-tree change count from `git status`; `None` when not scanned
     /// (bare entries, or past the scan cap).
     pub dirty_files: Option<usize>,
+    /// Uncommitted line insertions/deletions diff stats.
+    #[serde(default)]
+    pub diff_stat: Option<WorktreeDiffStat>,
+    /// Ahead/behind divergence against default branch.
+    #[serde(default)]
+    pub main_divergence: Option<WorktreeDivergence>,
+    /// Active portless or dev server routes for this worktree.
+    #[serde(default)]
+    pub active_routes: Vec<WorktreeRouteInfo>,
 }
 
 /// One parsed block of `worktree list --porcelain`, before dirty counting.
@@ -451,6 +479,17 @@ fn status_paths(bytes: &[u8]) -> Vec<String> {
 /// Every entry comes back with `dirty_files: None`, which already means "not
 /// scanned" in this type — so a caller cannot mistake an unscanned worktree
 /// for a clean one.
+/// Lists every worktree of the repository without scanning any of them.
+///
+/// Exactly one `git` spawn, whatever the worktree count. [`list_worktrees`]
+/// additionally runs `git status` in up to [`MAX_DIRTY_SCANS`] worktrees,
+/// which is right for the Work view of ONE repository and wrong for a sweep
+/// over a whole workspace: twenty-four repositories with a dozen agent
+/// worktrees each is several hundred subprocesses for a column of counts.
+///
+/// Every entry comes back with `dirty_files: None`, which already means "not
+/// scanned" in this type — so a caller cannot mistake an unscanned worktree
+/// for a clean one.
 pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
     let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
@@ -461,6 +500,9 @@ pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String>
             name: display_name(&entry.path),
             is_main: idx == 0,
             dirty_files: None,
+            diff_stat: None,
+            main_divergence: None,
+            active_routes: Vec::new(),
             path: entry.path,
             head: entry.head,
             branch: entry.branch,
@@ -472,8 +514,72 @@ pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String>
         .collect())
 }
 
+/// Measures uncommitted line insertions/deletions in a worktree.
+pub fn measure_diff_stat(dir: &Path) -> Option<WorktreeDiffStat> {
+    let stdout = git_text(dir, &["diff", "HEAD", "--shortstat"]).ok()?;
+    parse_shortstat(&stdout)
+}
+
+pub fn parse_shortstat(text: &str) -> Option<WorktreeDiffStat> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Some(WorktreeDiffStat::default());
+    }
+    let mut stat = WorktreeDiffStat::default();
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        if p.contains("file") {
+            if let Some(num) = p.split_whitespace().next().and_then(|s| s.parse().ok()) {
+                stat.files_changed = num;
+            }
+        } else if p.contains("insertion") {
+            if let Some(num) = p.split_whitespace().next().and_then(|s| s.parse().ok()) {
+                stat.insertions = num;
+            }
+        } else if p.contains("deletion") {
+            if let Some(num) = p.split_whitespace().next().and_then(|s| s.parse().ok()) {
+                stat.deletions = num;
+            }
+        }
+    }
+    Some(stat)
+}
+
+/// Measures commit divergence (ahead/behind count) compared to default branch (`main` or `master`).
+pub fn measure_main_divergence(repo: &Path, branch: Option<&str>) -> Option<WorktreeDivergence> {
+    let b = branch?;
+    if b == "main" || b == "master" {
+        return Some(WorktreeDivergence {
+            ahead: 0,
+            behind: 0,
+        });
+    }
+    let default_ref = if git_text(repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
+        "main"
+    } else if git_text(repo, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
+        "master"
+    } else {
+        return None;
+    };
+
+    let stdout = git_text(
+        repo,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{default_ref}...{b}"),
+        ],
+    )
+    .ok()?;
+    let mut parts = stdout.trim().split_whitespace();
+    let behind = parts.next()?.parse().ok()?;
+    let ahead = parts.next()?.parse().ok()?;
+    Some(WorktreeDivergence { ahead, behind })
+}
+
 /// Lists every worktree of the repository, main entry first, with dirty-file
-/// counts for the worktrees closest to the front of the list.
+/// counts, diff deltas, and detected portless routes for the worktrees closest to the front.
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
     let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
@@ -487,32 +593,50 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    let dirty: HashMap<usize, usize> = scan_targets
+    type ScannedMetrics = (
+        usize,
+        Option<WorktreeDiffStat>,
+        Option<WorktreeDivergence>,
+        Vec<WorktreeRouteInfo>,
+    );
+
+    let metrics: HashMap<usize, ScannedMetrics> = scan_targets
         .into_par_iter()
         .filter_map(|idx| {
-            let dir = Path::new(&parsed[idx].path);
+            let entry = &parsed[idx];
+            let dir = Path::new(&entry.path);
             if !dir.is_dir() {
                 return None;
             }
             let stdout = git_text(dir, &["status", "--porcelain", "-z"]).ok()?;
-            Some((idx, count_status_entries(stdout.as_bytes())))
+            let dirty = count_status_entries(stdout.as_bytes());
+            let diff_stat = measure_diff_stat(dir);
+            let divergence = measure_main_divergence(&repo, entry.branch.as_deref());
+            let routes = detect_worktree_routes(&entry.path, entry.branch.as_deref());
+            Some((idx, (dirty, diff_stat, divergence, routes)))
         })
         .collect();
 
     Ok(parsed
         .into_iter()
         .enumerate()
-        .map(|(idx, entry)| WorktreeInfo {
-            name: display_name(&entry.path),
-            is_main: idx == 0,
-            dirty_files: dirty.get(&idx).copied(),
-            path: entry.path,
-            head: entry.head,
-            branch: entry.branch,
-            is_bare: entry.is_bare,
-            is_detached: entry.is_detached,
-            is_locked: entry.is_locked,
-            is_prunable: entry.is_prunable,
+        .map(|(idx, entry)| {
+            let scanned = metrics.get(&idx);
+            WorktreeInfo {
+                name: display_name(&entry.path),
+                is_main: idx == 0,
+                dirty_files: scanned.as_ref().map(|s| s.0),
+                diff_stat: scanned.as_ref().and_then(|s| s.1.clone()),
+                main_divergence: scanned.as_ref().and_then(|s| s.2.clone()),
+                active_routes: scanned.as_ref().map(|s| s.3.clone()).unwrap_or_default(),
+                path: entry.path,
+                head: entry.head,
+                branch: entry.branch,
+                is_bare: entry.is_bare,
+                is_detached: entry.is_detached,
+                is_locked: entry.is_locked,
+                is_prunable: entry.is_prunable,
+            }
         })
         .collect())
 }
@@ -567,6 +691,168 @@ pub fn add_worktree(
     }
     git_text(&repo, &args)?;
     Ok(target_path.to_string())
+}
+
+/// Creates a linked worktree with optional Copy-on-Write cache cloning and lifecycle hooks.
+pub fn add_worktree_extended(
+    repo_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+    cow_caches: bool,
+) -> Result<String, String> {
+    let created = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
+    if cow_caches {
+        let repo = validate_repo(repo_path)?;
+        let target = Path::new(target_path);
+        let _ = reflink_ignored_caches(&repo, target);
+        let hooks = load_worktree_hooks(&repo);
+        let branch_name = new_branch.unwrap_or("");
+        let _ = execute_worktree_hooks(
+            &repo,
+            target,
+            &hooks.post_create,
+            "post_create",
+            &[
+                ("GITPULSE_BRANCH", branch_name),
+                ("GITPULSE_WORKTREE_PATH", target_path),
+            ],
+        );
+    }
+    Ok(created)
+}
+
+/// Outcome of merging a worktree branch and tearing down the worktree directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeTeardownResult {
+    pub merged_branch: String,
+    pub target_branch: String,
+    pub commits_merged: usize,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
+}
+
+/// Merges a worktree branch into target_branch (defaulting to main/master) in the primary
+/// repository checkout, tears down the worktree cleanly, and prunes the merged branch.
+pub fn merge_and_teardown_worktree(
+    repo_path: &str,
+    worktree_path: &str,
+    target_branch: Option<&str>,
+    squash: bool,
+) -> Result<MergeTeardownResult, String> {
+    let family = resolve_worktree_family(repo_path, worktree_path)?;
+    if family.worktree == family.anchor {
+        return Err("Cannot merge and teardown the repository's primary checkout".into());
+    }
+
+    let repo = family.anchor.clone();
+    let worktree = family.worktree.clone();
+
+    // 1. Resolve branch name
+    let branch_raw = git_text(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = branch_raw.trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err("Worktree has a detached HEAD; cannot merge an unbranched checkout".into());
+    }
+
+    // 2. Pre-merge hooks
+    let hooks = load_worktree_hooks(&repo);
+    execute_worktree_hooks(
+        &repo,
+        &worktree,
+        &hooks.pre_merge,
+        "pre_merge",
+        &[
+            ("GITPULSE_BRANCH", &branch),
+            ("GITPULSE_WORKTREE_PATH", &worktree.to_string_lossy()),
+        ],
+    )?;
+
+    // 3. Collision / uncommitted changes check
+    let (changed, _) = changed_paths(&worktree.to_string_lossy())?;
+    if !changed.is_empty() {
+        return Err(format!(
+            "Worktree has {} uncommitted file changes; commit or stash them before merging",
+            changed.len()
+        ));
+    }
+
+    let default_target = if git_text(&repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
+        "main"
+    } else if git_text(&repo, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
+        "master"
+    } else {
+        "main"
+    };
+    let target = target_branch.unwrap_or(default_target);
+
+    // Count commits being merged
+    let count_stdout = git_text(
+        &repo,
+        &["rev-list", "--count", &format!("{target}..{branch}")],
+    )
+    .unwrap_or_else(|_| "0".into());
+    let commits_merged: usize = count_stdout.trim().parse().unwrap_or(0);
+
+    // 4. Merge in anchor repository
+    {
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if squash {
+            git_text(&repo, &["merge", "--squash", &branch])?;
+            let commit_msg = format!("Merge branch '{branch}' (squashed)");
+            let _ = git_text(&repo, &["commit", "-m", &commit_msg]);
+        } else {
+            if let Err(ff_err) = git_text(&repo, &["merge", "--ff-only", &branch]) {
+                let commit_msg = format!("Merge branch '{branch}' into {target}");
+                git_text(&repo, &["merge", &branch, "-m", &commit_msg])
+                    .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
+            }
+        }
+    }
+
+    // 5. Remove worktree
+    remove_worktree(repo_path, &worktree.to_string_lossy(), true)?;
+
+    // 6. Delete merged branch
+    let branch_deleted = git_text(
+        &repo,
+        &["branch", if squash { "-D" } else { "-d" }, &branch],
+    )
+    .is_ok();
+
+    // 7. Post-merge hooks
+    let _ = execute_worktree_hooks(
+        &repo,
+        &repo,
+        &hooks.post_merge,
+        "post_merge",
+        &[
+            ("GITPULSE_BRANCH", &branch),
+            ("GITPULSE_TARGET_BRANCH", target),
+        ],
+    );
+
+    Ok(MergeTeardownResult {
+        merged_branch: branch,
+        target_branch: target.to_string(),
+        commits_merged,
+        worktree_removed: true,
+        branch_deleted,
+    })
+}
+
+/// The exact argv [`merge_and_teardown_worktree`] would execute, for policy gating.
+pub fn merge_teardown_argv(branch: &str, squash: bool) -> Vec<String> {
+    if squash {
+        vec!["merge".into(), "--squash".into(), branch.into()]
+    } else {
+        vec!["merge".into(), "--ff-only".into(), branch.into()]
+    }
 }
 
 /// Removes a linked worktree. Git refuses the main worktree itself.
@@ -1277,5 +1563,100 @@ some-future-field whatever
             status_paths(b"R  new.rs\0old.rs\0"),
             vec!["new.rs", "old.rs"]
         );
+    }
+
+    #[test]
+    fn test_parse_shortstat_cases() {
+        let empty = parse_shortstat("");
+        assert_eq!(empty, Some(WorktreeDiffStat::default()));
+
+        let text = " 3 files changed, 25 insertions(+), 4 deletions(-)";
+        let stat = parse_shortstat(text).expect("parsed shortstat");
+        assert_eq!(stat.files_changed, 3);
+        assert_eq!(stat.insertions, 25);
+        assert_eq!(stat.deletions, 4);
+
+        let insertions_only = " 1 file changed, 10 insertions(+)";
+        let stat2 = parse_shortstat(insertions_only).expect("parsed shortstat");
+        assert_eq!(stat2.files_changed, 1);
+        assert_eq!(stat2.insertions, 10);
+        assert_eq!(stat2.deletions, 0);
+    }
+
+    #[test]
+    fn test_merge_teardown_argv_shape() {
+        let normal = merge_teardown_argv("feature-1", false);
+        assert_eq!(normal, vec!["merge", "--ff-only", "feature-1"]);
+
+        let squash = merge_teardown_argv("feature-1", true);
+        assert_eq!(squash, vec!["merge", "--squash", "feature-1"]);
+    }
+
+    #[test]
+    fn test_merge_and_teardown_lifecycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_path = dir.path().to_str().unwrap();
+        // git init -b main
+        let _ = std::process::Command::new("git")
+            .args(["init", "-b", "main", repo_path])
+            .output()
+            .expect("git init");
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@gitpulse.local"])
+            .current_dir(repo_path)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "GitPulse Tester"])
+            .current_dir(repo_path)
+            .output();
+
+        let readme = dir.path().join("README.md");
+        std::fs::write(&readme, "hello\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(repo_path)
+            .output();
+        crate::test_support::trust_repo(dir.path());
+
+        // Add linked worktree
+        let wt_dir = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_dir.path().to_str().unwrap();
+        let created =
+            add_worktree_extended(repo_path, wt_path, Some("feature-x"), None, false, false)
+                .expect("created worktree");
+        assert_eq!(created, wt_path);
+        crate::test_support::trust_repo(wt_dir.path());
+
+        // Add commit in worktree
+        let feature_file = wt_dir.path().join("feature.txt");
+        std::fs::write(&feature_file, "lane work\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(wt_path)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "feature commit"])
+            .current_dir(wt_path)
+            .output();
+
+        // Merge and teardown
+        let res = merge_and_teardown_worktree(repo_path, wt_path, Some("main"), false)
+            .expect("merged and torn down");
+        assert_eq!(res.merged_branch, "feature-x");
+        assert_eq!(res.target_branch, "main");
+        assert_eq!(res.commits_merged, 1);
+        assert!(res.worktree_removed);
+        assert!(res.branch_deleted);
+
+        // Verify main has the merged file
+        assert!(dir.path().join("feature.txt").exists());
+        // Verify worktree directory is removed or no longer tracked
+        let worktrees = list_worktrees(repo_path).expect("worktrees");
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
     }
 }

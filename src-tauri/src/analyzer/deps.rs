@@ -3,7 +3,10 @@
 //! GitPulse does not install packages or apply fixes. It inventories manifests,
 //! flags lockfile / engine / install-script issues locally, and — when the
 //! matching CLI is on PATH — runs read-only audits: `npm audit` / `npm outdated`,
-//! `cargo audit`, `pip-audit --no-deps` (pinned requirements files only),
+//! `cargo audit`, `cargo deny --offline` when `deny.toml` is present,
+//! `cargo crev verify` when cargo-crev is installed, `cargo audit bin` for
+//! release binaries (the cargo-auditable embed), `pip-audit --no-deps`
+//! (pinned requirements files only),
 //! `govulncheck -json`, `composer audit --locked`, and `bundler-audit check`.
 //! A missing CLI is reported as such — and a CLI that exists but fails to run
 //! (wrong interpreter, non-zero exit, timeout) is reported with its real cause,
@@ -11,6 +14,11 @@
 //! health. Scanner advisory databases are never refreshed implicitly — a stale
 //! DB is the user's call, not a background write outside the repo.
 
+#[allow(unused_imports)]
+use crate::analyzer::cargo_supply::{
+    self, classify_bin_audit, crev_summary, file_contains_auditable_section,
+    parse_cargo_crev_jsonl, parse_cargo_deny_sarif, BinAuditKind,
+};
 use crate::analyzer::language::LanguageDetector;
 use crate::engine::git_cli::{
     capture_command_with_env, git_text, resolve_spawn_program_with, sandbox_join,
@@ -30,6 +38,9 @@ const MAX_OUTDATED: usize = 200;
 const MAX_ISSUES: usize = 48;
 const MAX_NPM_ROOTS: usize = 6;
 const MAX_CARGO_LOCKS: usize = 6;
+const MAX_DENY_CONFIGS: usize = 6;
+const MAX_AUDITABLE_BINS: usize = 4;
+const MAX_AUDITABLE_BIN_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_PY_REQUIREMENTS: usize = 6;
 const MAX_GO_MODS: usize = 4;
 const MAX_COMPOSER_LOCKS: usize = 6;
@@ -197,13 +208,23 @@ pub struct DepsHealthReport {
     pub npm_version: Option<String>,
     pub npm_cli_present: bool,
     pub cargo_audit_present: bool,
+    /// `cargo-deny` is on PATH and this checkout has at least one `deny.toml`.
+    /// Absence is not a clean policy check. `serde(default)` keeps older
+    /// serialized reports loadable.
+    #[serde(default)]
+    pub cargo_deny_present: bool,
+    /// `cargo-crev` is on PATH. Reviews are checked when it is; a checkout
+    /// with no local web of trust still gets an explicit summary.
+    #[serde(default)]
+    pub cargo_crev_present: bool,
     pub pip_audit_present: bool,
     pub govulncheck_present: bool,
     pub composer_present: bool,
     pub bundler_audit_present: bool,
     /// Scanners that issued at least one real CLI command during this scan
-    /// (`npm`, `cargo`, `pip-audit`, `govulncheck`, `composer`,
-    /// `bundler-audit`). The `*_present` flags say what COULD run; this says
+    /// (`npm`, `cargo`, `cargo-deny`, `cargo-crev`, `pip-audit`,
+    /// `govulncheck`, `composer`, `bundler-audit`). The `*_present` flags say
+    /// what COULD run; this says
     /// what DID. `serde(default)` keeps older serialized reports loadable.
     #[serde(default)]
     pub scanners_ran: Vec<String>,
@@ -228,6 +249,7 @@ pub struct DepsHealthReport {
 #[derive(Debug, Default)]
 struct ScanTargets {
     cargo_locks: Vec<String>,
+    deny_configs: Vec<String>,
     /// requirements*.txt files (pinned lists pip-audit can audit without pip).
     py_requirements: Vec<String>,
     go_mods: Vec<String>,
@@ -318,6 +340,12 @@ impl DepsScanner {
             if enrich_cargo(&repo, &targets, &mut report, &env) {
                 ran.push("cargo".into());
             }
+            if enrich_cargo_deny(&repo, &targets, &mut report, &env) {
+                ran.push("cargo-deny".into());
+            }
+            if enrich_cargo_crev(&repo, &targets, &mut report, &env) {
+                ran.push("cargo-crev".into());
+            }
             if enrich_python(&repo, &targets, &mut report, &env) {
                 ran.push("pip-audit".into());
             }
@@ -400,6 +428,21 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
     let npm_version = npm_probe.version().map(str::to_string);
     let npm_cli_present = npm_version.is_some();
     let cargo_audit_present = !targets.cargo_locks.is_empty() && cargo_audit_available(env);
+    let cargo_deny_present = !targets.deny_configs.is_empty() && cargo_deny_available(env);
+    let cargo_crev_installed = !targets.cargo_locks.is_empty() && cargo_crev_available(env);
+    // `cargo crev verify` calls `Local::auto_create_or_open`, which writes a
+    // new identity under the crev config dir when none exists. Presence means
+    // the identity is already there; GitPulse does not create one.
+    let cargo_crev_present = cargo_crev_installed && crev_identity_configured(env);
+    if cargo_crev_installed && !cargo_crev_present {
+        push_issue(
+            &mut issues,
+            "info",
+            "cargo_crev_unconfigured",
+            "cargo-crev is installed but has no local identity, so reviews were not checked. GitPulse does not create one.".into(),
+            None,
+        );
+    }
     // Scanner probes are gated on artifacts: a pure-Node repo never pays for a
     // pip-audit / govulncheck / composer spawn.
     let pip_audit_present = pip_audit_present(&targets)
@@ -449,13 +492,13 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             files.truncate(MAX_ECOSYSTEM_MANIFESTS);
         }
         let note = match family.as_str() {
-            "cargo" => {
-                if cargo_audit_present {
-                    "Cargo.lock files will be checked with cargo audit".into()
-                } else {
-                    "Install cargo-audit (`cargo install cargo-audit`) to scan Rust crates".into()
-                }
-            }
+            "cargo" => cargo_family_note(
+                &files,
+                cargo_audit_present,
+                cargo_deny_present,
+                cargo_crev_installed,
+                cargo_crev_present,
+            ),
             "go" => {
                 if govulncheck_present {
                     "Go modules will be checked with govulncheck".into()
@@ -503,6 +546,8 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             npm_version,
             npm_cli_present,
             cargo_audit_present,
+            cargo_deny_present,
+            cargo_crev_present,
             pip_audit_present,
             govulncheck_present,
             composer_present,
@@ -526,6 +571,10 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
 fn collect_side_target(name: &str, rel: &str, targets: &mut ScanTargets) {
     if name == "Cargo.lock" {
         targets.cargo_locks.push(rel.to_string());
+        return;
+    }
+    if name.eq_ignore_ascii_case("deny.toml") {
+        targets.deny_configs.push(rel.to_string());
         return;
     }
     if name == "go.mod" {
@@ -568,6 +617,12 @@ fn cap_scan_targets(targets: &mut ScanTargets, notices: &mut Vec<ScanLimitNotice
         &mut targets.cargo_locks,
         MAX_CARGO_LOCKS,
         "Cargo.lock audit targets",
+        notices,
+    );
+    cap_target_list(
+        &mut targets.deny_configs,
+        MAX_DENY_CONFIGS,
+        "deny.toml audit targets",
         notices,
     );
     cap_target_list(
@@ -825,7 +880,588 @@ fn enrich_cargo(
             }
         }
     }
+    if scan_auditable_binaries(repo, &targets.cargo_locks, report, env, audit_program) {
+        ran = true;
+    }
     ran
+}
+
+fn cargo_family_note(
+    files: &[String],
+    audit: bool,
+    deny: bool,
+    crev_installed: bool,
+    crev_ready: bool,
+) -> String {
+    let has = |name: &str| {
+        files.iter().any(|file| {
+            file.rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(file.as_str())
+                .eq_ignore_ascii_case(name)
+        })
+    };
+    let has_lock = has("Cargo.lock");
+    let has_deny = has("deny.toml");
+    if !has_lock && !has_deny {
+        return if audit {
+            "Cargo.lock files will be checked with cargo audit".into()
+        } else {
+            "Install cargo-audit (`cargo install cargo-audit`) to scan Rust crates".into()
+        };
+    }
+    let mut checks = Vec::new();
+    if has_lock && audit {
+        checks.push("cargo audit");
+    }
+    if has_deny && deny {
+        checks.push("cargo deny");
+    }
+    if has_lock && crev_ready {
+        checks.push("cargo crev");
+    }
+    let mut note = if checks.is_empty() {
+        "Rust supply chain checks did not run".to_string()
+    } else {
+        format!("Rust supply chain checks: {}", checks.join(", "))
+    };
+    if has_lock && !audit {
+        note.push_str(". Install cargo-audit (`cargo install cargo-audit`) to scan advisories");
+    }
+    if has_deny && !deny {
+        note.push_str(
+            ". Install cargo-deny (`cargo install --locked cargo-deny`) to enforce deny.toml",
+        );
+    }
+    if has_lock && crev_installed && !crev_ready {
+        note.push_str(
+            ". cargo-crev is installed but has no local identity, so reviews were not checked",
+        );
+    } else if has_lock && !crev_installed {
+        note.push_str(". Install cargo-crev (`cargo install cargo-crev`) to check review trust");
+    }
+    note.push_str(
+        ". Release binaries are scanned with `cargo audit bin` when cargo-auditable embedded them",
+    );
+    note
+}
+
+/// `cargo deny check` for every `deny.toml`. Policy hits stay health issues;
+/// vulnerability advisories join the vulnerability list and are deduped against
+/// cargo-audit by advisory id. `--offline` refuses the network fetch cargo-deny
+/// would otherwise perform. The `cargo-deny` binary is invoked directly so a
+/// repository `[alias] deny` cannot turn the scan into a build.
+fn enrich_cargo_deny(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
+    if !report.cargo_deny_present {
+        return false;
+    }
+    let Some(program) = cargo_deny_program(env) else {
+        return false;
+    };
+    let mut ran = false;
+    for rel in &targets.deny_configs {
+        let manifest = match cargo_manifest_beside(repo, rel) {
+            Ok(path) => path,
+            Err(msg) => {
+                push_issue(
+                    &mut report.issues,
+                    "error",
+                    "cargo_deny_failed",
+                    msg,
+                    Some(rel.clone()),
+                );
+                continue;
+            }
+        };
+        let manifest_arg = manifest.to_string_lossy().into_owned();
+        let cwd = manifest.parent().unwrap_or(repo);
+        match capture_scanner_command(
+            env,
+            program,
+            &[
+                "--offline",
+                "--format",
+                "sarif",
+                "--manifest-path",
+                &manifest_arg,
+                "check",
+            ],
+            Some(cwd),
+            AUDIT_TIMEOUT,
+            &[("CARGO_TERM_COLOR", "never")],
+        ) {
+            Ok(out) => {
+                ran = true;
+                let text = out.stdout_text();
+                if text.trim().is_empty() {
+                    push_issue(
+                        &mut report.issues,
+                        "warning",
+                        "cargo_deny_failed",
+                        if out.stderr_text().is_empty() {
+                            format!("cargo deny exited {}", out.status_code)
+                        } else {
+                            cargo_supply::bound_message(&out.stderr_text())
+                        },
+                        Some(rel.clone()),
+                    );
+                    continue;
+                }
+                match parse_cargo_deny_sarif(&text) {
+                    Ok(scan) => {
+                        for advisory in scan.advisories {
+                            append_new_vuln(
+                                report,
+                                Vulnerability {
+                                    name: advisory.package,
+                                    severity: advisory.severity,
+                                    is_direct: true,
+                                    title: advisory.title,
+                                    url: format!(
+                                        "https://rustsec.org/advisories/{}",
+                                        advisory.advisory_id
+                                    ),
+                                    range: advisory.advisory_id,
+                                    fix_available: if advisory.version.is_empty() {
+                                        "see advisory".into()
+                                    } else {
+                                        advisory.version
+                                    },
+                                    via: Vec::new(),
+                                    ecosystem: "cargo".into(),
+                                },
+                            );
+                        }
+                        for lint in scan.lints {
+                            push_issue(
+                                &mut report.issues,
+                                &lint.severity,
+                                &lint.code,
+                                lint.message,
+                                Some(rel.clone()),
+                            );
+                        }
+                    }
+                    Err(err) => push_issue(
+                        &mut report.issues,
+                        "warning",
+                        "cargo_deny_failed",
+                        err,
+                        Some(rel.clone()),
+                    ),
+                }
+            }
+            Err(err) => {
+                ran = true;
+                push_issue(
+                    &mut report.issues,
+                    "warning",
+                    "cargo_deny_failed",
+                    err,
+                    Some(rel.clone()),
+                );
+            }
+        }
+    }
+    ran
+}
+
+/// `cargo crev verify --json` against the local web of trust.
+///
+/// A non-zero exit means unverified crates, which is a finding, not a crashed
+/// scanner. `CARGO_NET_OFFLINE` keeps the scan from fetching proofs or the
+/// crate index. The binary is invoked directly so `[alias] crev` cannot run
+/// repository code.
+fn enrich_cargo_crev(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
+    if !report.cargo_crev_present || targets.cargo_locks.is_empty() {
+        return false;
+    }
+    let Some(program) = cargo_crev_program(env) else {
+        return false;
+    };
+    let mut ran = false;
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    for rel in &targets.cargo_locks {
+        let Ok(lock) = sandbox_join_canonical(repo, rel) else {
+            continue;
+        };
+        let Some(dir) = lock.parent() else {
+            continue;
+        };
+        if !dir.join("Cargo.toml").is_file() || seen_dirs.iter().any(|seen| seen == dir) {
+            continue;
+        }
+        seen_dirs.push(dir.to_path_buf());
+        match capture_scanner_command(
+            env,
+            program,
+            &["crev", "verify", "--json"],
+            Some(dir),
+            AUDIT_TIMEOUT,
+            &[("CARGO_TERM_COLOR", "never"), ("CARGO_NET_OFFLINE", "true")],
+        ) {
+            Ok(out) => {
+                ran = true;
+                let stdout = out.stdout_text();
+                let stderr = out.stderr_text();
+                if stdout.trim().is_empty() {
+                    let lowered = stderr.to_ascii_lowercase();
+                    if lowered.contains("no trusted") || lowered.contains("crevid") {
+                        push_issue(
+                            &mut report.issues,
+                            "info",
+                            "cargo_crev_unconfigured",
+                            cargo_supply::bound_message(&stderr),
+                            Some(rel.clone()),
+                        );
+                    } else {
+                        push_issue(
+                            &mut report.issues,
+                            "warning",
+                            "cargo_crev_failed",
+                            if stderr.is_empty() {
+                                format!("cargo crev exited {}", out.status_code)
+                            } else {
+                                cargo_supply::bound_message(&stderr)
+                            },
+                            Some(rel.clone()),
+                        );
+                    }
+                    continue;
+                }
+                match parse_cargo_crev_jsonl(&stdout) {
+                    Ok(scan) => {
+                        if let Some((severity, message)) = crev_summary(&scan) {
+                            push_issue(
+                                &mut report.issues,
+                                &severity,
+                                "cargo_crev_trust",
+                                message,
+                                Some(rel.clone()),
+                            );
+                        }
+                    }
+                    Err(err) => push_issue(
+                        &mut report.issues,
+                        "warning",
+                        "cargo_crev_failed",
+                        err,
+                        Some(rel.clone()),
+                    ),
+                }
+            }
+            Err(err) => {
+                ran = true;
+                push_issue(
+                    &mut report.issues,
+                    "warning",
+                    "cargo_crev_failed",
+                    err,
+                    Some(rel.clone()),
+                );
+            }
+        }
+    }
+    ran
+}
+
+/// Scans executables that already embed cargo-auditable's `.dep-v0` section.
+///
+/// A normal `cargo build` leaves binaries with no section, and sometimes a
+/// partial list recovered from panic messages. That partial list is not
+/// merged: cargo-audit says it is incomplete, and treating it as the binary's
+/// dependency set would under-report. `--no-fetch` keeps the advisory
+/// database from being updated as a side effect of opening the repository.
+/// Binaries without the section are not passed to `cargo audit bin` at all.
+fn scan_auditable_binaries(
+    repo: &Path,
+    locks: &[String],
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+    program: &str,
+) -> bool {
+    let configured = auditable_config_path(repo, locks);
+    let executables = auditable_binaries(repo, locks);
+    let mut embedded: Vec<(String, PathBuf)> = executables
+        .iter()
+        .filter(|(_, path)| file_contains_auditable_section(path))
+        .cloned()
+        .collect();
+    if embedded.is_empty() {
+        if let Some(path) = configured {
+            if executables.is_empty() {
+                push_issue(
+                    &mut report.issues,
+                    "info",
+                    "cargo_auditable_unbuilt",
+                    "cargo-auditable is configured, but no executable under target/release or target/debug was found to scan".into(),
+                    Some(path),
+                );
+            } else {
+                push_issue(
+                    &mut report.issues,
+                    "warning",
+                    "cargo_auditable_missing",
+                    format!(
+                        "{} built executable(s) have no .dep-v0 cargo-auditable section. Build with `cargo auditable build` so `cargo audit bin` can read exact crate versions",
+                        executables.len()
+                    ),
+                    Some(path),
+                );
+            }
+        }
+        return false;
+    }
+    if embedded.len() > MAX_AUDITABLE_BINS {
+        record_limit(
+            report,
+            "cargo-auditable binaries",
+            MAX_AUDITABLE_BINS,
+            embedded.len(),
+        );
+        embedded.truncate(MAX_AUDITABLE_BINS);
+    }
+    let mut ran = false;
+    for (label, path) in embedded {
+        let arg = path.to_string_lossy().into_owned();
+        match capture_scanner_command(
+            env,
+            program,
+            &["audit", "--json", "--no-fetch", "bin", &arg],
+            Some(repo),
+            AUDIT_TIMEOUT,
+            &[("CARGO_TERM_COLOR", "never")],
+        ) {
+            Ok(out) => {
+                ran = true;
+                let stdout = out.stdout_text();
+                let stderr = out.stderr_text();
+                match classify_bin_audit(&stdout, &stderr, out.success) {
+                    BinAuditKind::NotAuditable => {
+                        push_issue(
+                            &mut report.issues,
+                            "warning",
+                            "cargo_auditable_missing",
+                            format!(
+                                "{label} has no complete cargo-auditable dependency list. A panic-message recovery is not merged into this report. Build with `cargo auditable build`"
+                            ),
+                            Some(label),
+                        );
+                    }
+                    BinAuditKind::Failed => {
+                        push_issue(
+                            &mut report.issues,
+                            "warning",
+                            "cargo_audit_bin_failed",
+                            if stderr.is_empty() {
+                                format!("cargo audit bin exited {}", out.status_code)
+                            } else {
+                                cargo_supply::bound_message(&stderr)
+                            },
+                            Some(label),
+                        );
+                    }
+                    BinAuditKind::Complete => match parse_cargo_audit_json(&stdout) {
+                        Ok((vulns, warnings)) => {
+                            for vuln in vulns {
+                                append_new_vuln(report, vuln);
+                            }
+                            for mut warning in warnings {
+                                warning.path = Some(label.clone());
+                                push_issue(
+                                    &mut report.issues,
+                                    &warning.severity,
+                                    &warning.code,
+                                    warning.message,
+                                    warning.path,
+                                );
+                            }
+                        }
+                        Err(err) => push_issue(
+                            &mut report.issues,
+                            "warning",
+                            "cargo_audit_bin_failed",
+                            err,
+                            Some(label),
+                        ),
+                    },
+                }
+            }
+            Err(err) => {
+                ran = true;
+                push_issue(
+                    &mut report.issues,
+                    "warning",
+                    "cargo_audit_bin_failed",
+                    err,
+                    Some(label),
+                );
+            }
+        }
+    }
+    ran
+}
+
+fn append_new_vuln(report: &mut DepsHealthReport, vuln: Vulnerability) {
+    let duplicate = !vuln.range.is_empty()
+        && report.vulnerabilities.iter().any(|existing| {
+            existing.ecosystem == vuln.ecosystem
+                && existing.name == vuln.name
+                && existing.range == vuln.range
+        });
+    if !duplicate {
+        report.vulnerabilities.push(vuln);
+    }
+}
+
+fn cargo_manifest_beside(repo: &Path, deny_rel: &str) -> Result<PathBuf, String> {
+    let deny = sandbox_join_canonical(repo, deny_rel)?;
+    let Some(dir) = deny.parent() else {
+        return Err(format!("{deny_rel} has no parent directory"));
+    };
+    let manifest = dir.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Err(format!(
+            "{deny_rel} has no Cargo.toml in the same directory"
+        ));
+    }
+    let canon = manifest
+        .canonicalize()
+        .map_err(|err| format!("Cannot read Cargo.toml beside {deny_rel}: {err}"))?;
+    if !canon.starts_with(repo) {
+        return Err(format!(
+            "Cargo.toml beside {deny_rel} escaped the repository"
+        ));
+    }
+    Ok(canon)
+}
+
+fn auditable_binaries(repo: &Path, locks: &[String]) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    for rel in locks {
+        let Ok(lock) = sandbox_join_canonical(repo, rel) else {
+            continue;
+        };
+        let Some(dir) = lock.parent() else {
+            continue;
+        };
+        let mut bins = executables_in(&dir.join("target").join("release"), repo);
+        if bins.is_empty() {
+            bins = executables_in(&dir.join("target").join("debug"), repo);
+        }
+        for bin in bins {
+            found.push((repo_relative(repo, &bin), bin));
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn executables_in(dir: &Path, repo: &Path) -> Vec<PathBuf> {
+    let Ok(canon_dir) = dir.canonicalize() else {
+        return Vec::new();
+    };
+    if !canon_dir.starts_with(repo) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&canon_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_candidate_binary_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_AUDITABLE_BIN_BYTES {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        let Ok(canon) = path.canonicalize() else {
+            continue;
+        };
+        if canon.starts_with(repo) {
+            out.push(canon);
+        }
+    }
+    out
+}
+
+fn is_candidate_binary_name(name: &str) -> bool {
+    if name.starts_with('.') {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".exe") && !lower[..lower.len() - 4].contains('.')
+    }
+    #[cfg(not(windows))]
+    {
+        !name.contains('.')
+    }
+}
+
+fn auditable_config_path(repo: &Path, locks: &[String]) -> Option<String> {
+    for rel in locks {
+        let Ok(lock) = sandbox_join_canonical(repo, rel) else {
+            continue;
+        };
+        let Some(dir) = lock.parent() else {
+            continue;
+        };
+        for name in [".cargo/config.toml", ".cargo/config"] {
+            let path = dir.join(name);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
+                continue;
+            }
+            let Some(canon) = path.canonicalize().ok() else {
+                continue;
+            };
+            if !canon.starts_with(repo) {
+                continue;
+            }
+            let Some(text) = std::fs::read_to_string(&canon).ok() else {
+                continue;
+            };
+            if text.to_ascii_lowercase().contains("auditable") {
+                return Some(repo_relative(repo, &canon));
+            }
+        }
+    }
+    None
+}
+
+fn repo_relative(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Audits pinned requirements files with `pip-audit --no-deps`.
@@ -1534,6 +2170,76 @@ fn cargo_audit_available(env: &ScanEnv) -> bool {
     cargo_audit_program(env).is_some()
 }
 
+/// Direct `cargo-deny` only. `cargo deny` would honor `[alias] deny` in the
+/// checkout and could build or run repository code.
+fn cargo_deny_program(env: &ScanEnv) -> Option<&'static str> {
+    let ok = capture_scanner_command(
+        env,
+        "cargo-deny",
+        &["--version"],
+        None,
+        VERSION_TIMEOUT,
+        &[("CARGO_TERM_COLOR", "never")],
+    )
+    .map(|out| out.success)
+    .unwrap_or(false);
+    ok.then_some("cargo-deny")
+}
+
+fn cargo_deny_available(env: &ScanEnv) -> bool {
+    cargo_deny_program(env).is_some()
+}
+
+/// Direct `cargo-crev` only, for the same alias reason as cargo-deny.
+/// `--help` is the probe: this binary does not advertise a root `--version`.
+fn cargo_crev_program(env: &ScanEnv) -> Option<&'static str> {
+    let ok = capture_scanner_command(
+        env,
+        "cargo-crev",
+        &["crev", "--help"],
+        None,
+        VERSION_TIMEOUT,
+        &[("CARGO_TERM_COLOR", "never")],
+    )
+    .map(|out| out.success)
+    .unwrap_or(false);
+    ok.then_some("cargo-crev")
+}
+
+fn cargo_crev_available(env: &ScanEnv) -> bool {
+    cargo_crev_program(env).is_some()
+}
+
+/// `directories::ProjectDirs` for the `crev` application, which is where
+/// `cargo crev` reads `config.yaml`. Any of the platform layouts counts.
+/// A missing file means verify must not run: the tool would create the
+/// identity itself.
+fn crev_identity_configured(env: &ScanEnv) -> bool {
+    if let Some(root) = std::env::var_os("CARGO_CREV_ROOT_DIR_OVERRIDE") {
+        let root = PathBuf::from(root);
+        if root.join("config.yaml").is_file() || root.join("crev").join("config.yaml").is_file() {
+            return true;
+        }
+    }
+    let Some(home) = env.home() else {
+        return false;
+    };
+    let home = Path::new(home);
+    [
+        home.join(".config").join("crev").join("config.yaml"),
+        home.join("Library")
+            .join("Application Support")
+            .join("crev")
+            .join("config.yaml"),
+        home.join("AppData")
+            .join("Roaming")
+            .join("crev")
+            .join("config.yaml"),
+    ]
+    .iter()
+    .any(|path| path.is_file())
+}
+
 /// npm's binary name for this platform.
 ///
 /// Canonical for the crate: [`crate::ci_local`] plans `npm` CI steps and calls
@@ -1824,6 +2530,10 @@ fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: 
             report.cargo_audit_present && ran("cargo"),
         ),
         (
+            !targets.deny_configs.is_empty(),
+            report.cargo_deny_present && ran("cargo-deny"),
+        ),
+        (
             !targets.py_requirements.is_empty(),
             report.pip_audit_present && ran("pip-audit"),
         ),
@@ -1852,6 +2562,9 @@ fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: 
         "audit_cwd",
         "audit_failed",
         "cargo_audit_failed",
+        "cargo_deny_failed",
+        "cargo_crev_failed",
+        "cargo_audit_bin_failed",
         "pip_audit_failed",
         "govulncheck_failed",
         "composer_audit_failed",
@@ -4539,6 +5252,244 @@ not-json-at-all
                 .iter()
                 .any(|issue| issue.code == "cargo_audit_failed"),
             "nested lockfile audit failed: {:?}",
+            report.issues
+        );
+    }
+
+    /// cargo-deny, cargo-crev, and cargo-auditable (via `cargo audit bin`)
+    /// join the same health scan as cargo-audit. Each tool is the direct
+    /// binary, so a repository cargo alias cannot run in its place.
+    #[cfg(unix)]
+    #[test]
+    fn rust_supply_chain_tools_feed_the_health_report() {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        write(
+            repo.path(),
+            "deny.toml",
+            "[advisories]\nvulnerability = \"deny\"\n",
+        );
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        git_add(repo.path(), "deny.toml");
+        let release = repo.path().join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        // The section name is what selects a binary for `cargo audit bin`.
+        write_exec(&release, "demo", "#!/bin/sh\n# .dep-v0\nexit 0\n");
+        let home = TempDir::new().unwrap();
+        let crev_cfg = home.path().join(".config").join("crev");
+        fs::create_dir_all(&crev_cfg).unwrap();
+        fs::write(crev_cfg.join("config.yaml"), "version: 0\n").unwrap();
+
+        let stubs = TempDir::new().unwrap();
+        let cargo_log = stubs.path().join("cargo-invoked");
+        let deny_log = stubs.path().join("deny-args");
+        let crev_log = stubs.path().join("crev-env");
+        let sarif = stubs.path().join("deny.sarif");
+        fs::write(
+            &sarif,
+            r#"{"runs":[{"results":[
+                {"level":"error","message":{"text":"Uncontrolled recursion"},"partialFingerprints":{"cargo-deny/advisory-id":"RUSTSEC-2019-0001","cargo-deny/krate":"ammonia@0.7.0"},"ruleId":"a:vulnerability"},
+                {"level":"error","message":{"text":"license is not explicitly allowed"},"partialFingerprints":{"cargo-deny/krate":"leftpad@1.0.0"},"ruleId":"l:rejected"}
+            ]}]}"#,
+        )
+        .unwrap();
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\nif [ \"$4\" = bin ]; then echo \"demo was not built with 'cargo auditable', the report will be incomplete\" >&2; echo '{\"vulnerabilities\":{\"list\":[{\"advisory\":{\"id\":\"RUSTSEC-2024-9999\",\"package\":\"frombin\",\"title\":\"partial\"}}]}}'; exit 0; fi\necho '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        write_exec(
+            stubs.path(),
+            "cargo-deny",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'cargo-deny 0.20.2'; exit 0; fi\necho \"$*\" >> {}\ncat {}\nexit 1\n",
+                deny_log.display(),
+                sarif.display()
+            ),
+        );
+        write_exec(
+            stubs.path(),
+            "cargo-crev",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = crev ] && [ \"$2\" = --help ]; then exit 0; fi\necho \"OFFLINE=${{CARGO_NET_OFFLINE-<unset>}}\" >> {}\necho '{{\"name\":\"libc\",\"version\":\"0.2.1\",\"source\":\"registry\",\"status\":\"warn\"}}'\nexit 1\n",
+                crev_log.display()
+            ),
+        );
+        write_exec(
+            stubs.path(),
+            "cargo",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nexit 64\n",
+                cargo_log.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: Some(home.path().as_os_str().to_owned()),
+            },
+        )
+        .expect("scan");
+
+        assert!(
+            !cargo_log.exists(),
+            "a cargo alias path was used: {}",
+            fs::read_to_string(&cargo_log).unwrap_or_default()
+        );
+        let deny_args = fs::read_to_string(&deny_log).unwrap_or_default();
+        assert!(
+            deny_args.contains("--offline")
+                && deny_args.contains("sarif")
+                && deny_args.contains("check"),
+            "cargo-deny was not the offline SARIF check: {deny_args}"
+        );
+        let crev_env = fs::read_to_string(&crev_log).unwrap_or_default();
+        assert!(
+            crev_env.contains("OFFLINE=true"),
+            "cargo-crev was allowed to use the network: {crev_env}"
+        );
+        assert_eq!(
+            report.scanners_ran,
+            vec![
+                "cargo".to_string(),
+                "cargo-crev".to_string(),
+                "cargo-deny".to_string()
+            ]
+        );
+        assert!(report.vulnerabilities.iter().any(|vuln| {
+            vuln.name == "ammonia" && vuln.range == "RUSTSEC-2019-0001" && vuln.ecosystem == "cargo"
+        }));
+        assert!(
+            !report
+                .vulnerabilities
+                .iter()
+                .any(|vuln| vuln.name == "frombin"),
+            "panic-message recovery was merged: {:?}",
+            report.vulnerabilities
+        );
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "cargo_deny_license"));
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "cargo_crev_trust"));
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "cargo_auditable_missing"));
+        assert!(
+            report.audit_complete,
+            "findings are not scanner failures: {:?}",
+            report.issues
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_toml_without_cargo_deny_is_not_a_complete_audit() {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        write(repo.path(), "deny.toml", "[advisories]\n");
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        git_add(repo.path(), "deny.toml");
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\necho '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+        assert!(report.cargo_audit_present);
+        assert!(!report.cargo_deny_present);
+        assert!(!report
+            .scanners_ran
+            .iter()
+            .any(|scanner| scanner == "cargo-deny"));
+        assert!(!report.audit_complete);
+    }
+
+    /// `cargo crev verify` creates an identity when none exists. A Health scan
+    /// must not be that write.
+    #[cfg(unix)]
+    #[test]
+    fn crev_without_an_identity_is_not_invoked() {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        let home = TempDir::new().unwrap();
+        let stubs = TempDir::new().unwrap();
+        let invoked = stubs.path().join("crev-invoked");
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\necho '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        write_exec(
+            stubs.path(),
+            "cargo-crev",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = crev ] && [ \"$2\" = --help ]; then exit 0; fi\nexit 0\n",
+                invoked.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: Some(home.path().as_os_str().to_owned()),
+            },
+        )
+        .expect("scan");
+        let crev_calls = fs::read_to_string(&invoked).unwrap_or_default();
+        assert!(
+            !crev_calls.contains("verify"),
+            "verify ran without an identity: {crev_calls}"
+        );
+        assert!(!report.cargo_crev_present);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "cargo_crev_unconfigured"));
+        assert!(
+            report.audit_complete,
+            "a missing crev identity is not a failed audit: {:?}",
             report.issues
         );
     }

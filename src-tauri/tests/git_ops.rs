@@ -1639,8 +1639,66 @@ fn normal_delete_of_merged_branch_still_succeeds() {
     run_git(repo.dir.path(), &["checkout", "main"]);
     run_git(repo.dir.path(), &["merge", "--ff-only", "feature"]);
 
-    GitWriter::delete_branch(&repo.path_str(), "feature", false)
+    let tip = GitWriter::delete_branch(&repo.path_str(), "feature", false)
         .expect("deleting a merged branch with -d must succeed");
+    assert_eq!(tip.len(), 40);
+}
+
+#[test]
+fn deleted_branch_tip_is_durable_for_restore_after_toast_death() {
+    // The sidebar Undo toast holds the tip in memory. This test drops that
+    // handle on purpose and restores only from the ledger before_ref that
+    // delete_branch wrote — the same path a restart must use.
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("chore: first");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("g.txt", "g\n");
+    repo.commit_all("feat: g");
+    let tip_before = git_out(repo.dir.path(), &["rev-parse", "feature"]);
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    run_git(repo.dir.path(), &["merge", "--ff-only", "feature"]);
+
+    let path = repo.path_str();
+    let returned =
+        GitWriter::delete_branch(&path, "feature", false).expect("merged branch must delete");
+    assert_eq!(returned, tip_before);
+
+    // Process would have dropped the toast here. Read the durable tip.
+    let events = gitpulse_lib::ledger::tail(&path, 0, 100).expect("ledger tail");
+    let recorded = events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.object.as_deref() == Some("feature")
+                && e.before_ref.is_some()
+                && e.detail_json
+                    .as_deref()
+                    .is_some_and(|d| d.contains("branch.delete"))
+        })
+        .expect("delete must journal before_ref for restore");
+    let tip = recorded
+        .before_ref
+        .as_deref()
+        .expect("before_ref is the restore SHA");
+    assert_eq!(tip, tip_before);
+
+    let missing = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/feature"])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("spawn");
+    assert!(
+        !missing.status.success(),
+        "feature must be gone before restore"
+    );
+
+    GitWriter::create_branch(&path, "feature", Some(tip)).expect("restore from ledger tip");
+    assert_eq!(
+        git_out(repo.dir.path(), &["rev-parse", "feature"]),
+        tip_before,
+        "restored branch must point at the deleted tip"
+    );
 }
 
 #[test]

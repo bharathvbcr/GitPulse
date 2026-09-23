@@ -65,6 +65,9 @@ function worktree(path: string, branch: string | null): WorktreeInfo {
     is_locked: false,
     is_prunable: false,
     dirty_files: 0,
+    diff_stat: null,
+    main_divergence: null,
+    active_routes: [],
   };
 }
 

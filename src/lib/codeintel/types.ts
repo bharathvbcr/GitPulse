@@ -27,6 +27,33 @@ export interface CodeintelSymbolHit {
   score: number;
 }
 
+/** One symbol from `symbols_for_file` — spans only, no source body. */
+export interface CodeintelFileSymbol {
+  symbol_name: string;
+  qualified_name: string;
+  kind: string;
+  span_start_line: number;
+  span_end_line: number;
+}
+
+/**
+ * Bounded symbols-in-file page. `head_matches` must be true before joining
+ * these spans to a working-tree or commit diff.
+ */
+export interface CodeintelFileSymbols {
+  available: boolean;
+  reason?: string | null;
+  file_path: string;
+  requested_head_sha: string;
+  generation_id?: number | null;
+  generation_head_sha?: string | null;
+  head_matches: boolean;
+  items: CodeintelFileSymbol[];
+  total: number;
+  shown: number;
+  truncated: boolean;
+}
+
 export interface CodeintelEdge {
   source_file: string;
   target_file: string;
@@ -269,6 +296,69 @@ export function parseCodeintelResponse<T>(
     truncated: value.truncated === true,
     ...(foldedWalk !== undefined ? { walk_incomplete: foldedWalk } : {}),
     ...(histogram ? { rungs: histogram } : {}),
+  };
+}
+
+/** Unwraps `cmd_codeintel_symbols_for_file`. */
+export function parseCodeintelFileSymbols(
+  value: unknown,
+  command = "cmd_codeintel_symbols_for_file",
+): CodeintelFileSymbols {
+  if (!isRecord(value)) {
+    throw new Error(`${command} returned no payload`);
+  }
+  if (typeof value.available !== "boolean") {
+    throw new Error(`${command} omitted available`);
+  }
+  if (typeof value.head_matches !== "boolean") {
+    throw new Error(`${command} omitted head_matches`);
+  }
+  if (typeof value.file_path !== "string" || typeof value.requested_head_sha !== "string") {
+    throw new Error(`${command} omitted file_path or requested_head_sha`);
+  }
+  if (!Array.isArray(value.items)) {
+    throw new Error(`${command} omitted items`);
+  }
+  const items: CodeintelFileSymbol[] = value.items.map((raw, index) => {
+    if (!isRecord(raw)) throw new Error(`${command} items[${index}] is not an object`);
+    for (const key of ["symbol_name", "qualified_name", "kind"] as const) {
+      if (typeof raw[key] !== "string") {
+        throw new Error(`${command} items[${index}] omitted ${key}`);
+      }
+    }
+    for (const key of ["span_start_line", "span_end_line"] as const) {
+      if (typeof raw[key] !== "number" || !Number.isFinite(raw[key])) {
+        throw new Error(`${command} items[${index}] omitted ${key}`);
+      }
+    }
+    return {
+      symbol_name: raw.symbol_name as string,
+      qualified_name: raw.qualified_name as string,
+      kind: raw.kind as string,
+      span_start_line: raw.span_start_line as number,
+      span_end_line: raw.span_end_line as number,
+    };
+  });
+  const total =
+    typeof value.total === "number" && Number.isFinite(value.total)
+      ? Math.max(0, Math.trunc(value.total))
+      : items.length;
+  const shown =
+    typeof value.shown === "number" && Number.isFinite(value.shown)
+      ? Math.max(0, Math.trunc(value.shown))
+      : items.length;
+  return {
+    available: value.available,
+    reason: optionalString(value.reason) ?? null,
+    file_path: value.file_path,
+    requested_head_sha: value.requested_head_sha,
+    generation_id: optionalFiniteNumber(value.generation_id) ?? null,
+    generation_head_sha: optionalString(value.generation_head_sha) ?? null,
+    head_matches: value.head_matches,
+    items,
+    total,
+    shown,
+    truncated: value.truncated === true,
   };
 }
 

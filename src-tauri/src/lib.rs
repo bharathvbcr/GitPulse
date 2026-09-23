@@ -30,6 +30,7 @@ pub mod ops;
 pub mod output;
 pub mod procguard;
 pub mod repository_trust;
+pub mod secrets;
 pub mod stack;
 pub mod storage;
 pub mod syntax;
@@ -192,6 +193,10 @@ pub fn run() {
             cmd_create_branch,
             cmd_delete_branch,
             cmd_rename_branch,
+            cmd_deadbranch_scan,
+            cmd_deadbranch_clean,
+            cmd_deadbranch_list_backups,
+            cmd_deadbranch_restore,
             cmd_clone_repo,
             cmd_conflict_snapshot,
             cmd_save_conflict,
@@ -215,6 +220,7 @@ pub fn run() {
             cmd_scan_coverage,
             cmd_get_file_coverage,
             cmd_scan_deps_health,
+            cmd_scan_secrets,
             cmd_storage_scan,
             cmd_cache_inventory,
             cmd_cleaner_state,
@@ -276,6 +282,10 @@ pub fn run() {
             cmd_lock_worktree,
             cmd_unlock_worktree,
             cmd_prune_worktree,
+            cmd_worktree_merge_teardown,
+            cmd_worktree_cow_sync,
+            cmd_worktree_routes,
+            cmd_worktree_ai_summary,
             cmd_create_tag,
             cmd_delete_tag,
             cmd_publish_release,
@@ -326,6 +336,7 @@ pub fn run() {
             cmd_local_scan,
             cmd_codeintel_status,
             cmd_codeintel_search,
+            cmd_codeintel_symbols_for_file,
             cmd_codeintel_impact,
             cmd_codeintel_dead_symbols,
             cmd_codeintel_suspects,

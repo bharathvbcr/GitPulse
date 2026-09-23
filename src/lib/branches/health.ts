@@ -107,6 +107,9 @@ export function branchHealth(
 
   // 3. Fully merged: no unique commits left, so it is safe to delete. Checked
   //    before staleness because it is the actionable half of "old branch".
+  //    Squash and rebase merges are not visible here — that verdict comes from
+  //    the dead-branch scan (`StaleBranchInfo.merged_by_tree`), which is the
+  //    path that actually runs `git merge-tree`.
   if (branch.commits_ahead_of_base === 0 && branch.compared_to) {
     return {
       code: "merged",

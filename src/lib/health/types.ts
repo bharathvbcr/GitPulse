@@ -78,13 +78,18 @@ export interface DepsHealthReport {
   npm_version?: string | null;
   npm_cli_present: boolean;
   cargo_audit_present: boolean;
+  /** True when deny.toml exists and cargo-deny is on PATH. */
+  cargo_deny_present?: boolean;
+  /** True when a Cargo.lock exists and cargo-crev is on PATH. */
+  cargo_crev_present?: boolean;
   pip_audit_present?: boolean;
   govulncheck_present?: boolean;
   composer_present?: boolean;
   bundler_audit_present?: boolean;
   /**
    * Scanners that actually dispatched a command this scan ("npm", "cargo",
-   * "pip-audit", "govulncheck", "composer", "bundler-audit").
+   * "cargo-deny", "cargo-crev", "pip-audit", "govulncheck", "composer",
+   * "bundler-audit").
    * Empty or absent means nothing ran — zero findings then mean nothing.
    */
   scanners_ran?: string[];
@@ -371,6 +376,8 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
     npm_version: typeof value.npm_version === "string" ? value.npm_version : value.npm_version === null ? null : undefined,
     npm_cli_present: value.npm_cli_present,
     cargo_audit_present: value.cargo_audit_present,
+    cargo_deny_present: typeof value.cargo_deny_present === "boolean" ? value.cargo_deny_present : undefined,
+    cargo_crev_present: typeof value.cargo_crev_present === "boolean" ? value.cargo_crev_present : undefined,
     pip_audit_present: typeof value.pip_audit_present === "boolean" ? value.pip_audit_present : undefined,
     govulncheck_present: typeof value.govulncheck_present === "boolean" ? value.govulncheck_present : undefined,
     composer_present: typeof value.composer_present === "boolean" ? value.composer_present : undefined,

@@ -83,6 +83,16 @@ fn a_merged_branch_becomes_a_cleanup_candidate_and_the_current_one_never_does() 
     );
     // Deleting the checked-out branch is not something to propose.
     assert!(!names.contains(&"main"));
+    let done = plan
+        .candidates
+        .iter()
+        .find(|c| c.name == "feature/done")
+        .expect("candidate");
+    assert_eq!(
+        done.tip_commit_id.len(),
+        40,
+        "cleanup candidates must carry the tip SHA for restore"
+    );
 }
 
 #[test]

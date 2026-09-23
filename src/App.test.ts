@@ -127,6 +127,7 @@ const DEFERRED_OVERLAYS = [
   "ShortcutsModal",
   "CommandPalette",
   "DiagnosticsModal",
+  "BranchCleanupModal",
 ];
 
 describe("App overlay code splitting", () => {
@@ -155,6 +156,7 @@ describe("App overlay code splitting", () => {
       "settingsMounted",
       "shortcutsMounted",
       "diagnosticsMounted",
+      "branchCleanupMounted",
     ]) {
       expect(script, `${latch} latch missing`).toContain(`let ${latch} = $state(false)`);
       expect(template, `${latch} does not gate a render`).toContain(`{#if ${latch}}`);

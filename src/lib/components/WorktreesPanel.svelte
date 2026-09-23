@@ -1,10 +1,10 @@
 <script lang="ts">
-  import type { WorktreeInfo } from "../branches/types";
+  import type { MergeTeardownResult, WorktreeInfo, WorktreeRouteInfo } from "../branches/types";
   import type { TaskScope, TaskView } from "../tasks/types";
   import { invoke } from "@tauri-apps/api/core";
   import { reportPanelError } from "../diagnostics/report";
   import { repoStore } from "../stores/repoStore";
-  import { harnessStore } from "../stores/harnessStore";
+  import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     FolderGit2,
@@ -15,7 +15,12 @@
     Unlock,
     Sparkles,
     AlertTriangle,
+    GitMerge,
+    Globe,
+    Zap,
+    RefreshCw,
   } from "@lucide/svelte";
+  import { openExternal } from "../desktop/openExternal";
   import { agentKind, agentSessionSlug, isAgentWorktree } from "../work/agentWorktree";
   import { trustExtended } from "../repos/trustExtension";
 
@@ -40,6 +45,12 @@
   let newPath = $state("");
   let newBranch = $state("");
   let startPoint = $state("");
+  let cowCaches = $state(true);
+  let mergeConfirmPath = $state<string | null>(null);
+  let mergingPath = $state<string | null>(null);
+  let mergeTimer: ReturnType<typeof setTimeout> | null = null;
+  let aiSummaries = $state<Record<string, string>>({});
+  let loadingSummaries = $state<Record<string, boolean>>({});
   let inflight: AsyncGuard | null = null;
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -73,6 +84,10 @@
       if (confirmTimer !== null) clearTimeout(confirmTimer);
       confirmTimer = null;
       removingPath = null;
+      if (mergeTimer !== null) clearTimeout(mergeTimer);
+      mergeTimer = null;
+      mergeConfirmPath = null;
+      mergingPath = null;
     };
   });
 
@@ -219,6 +234,7 @@
         newBranch: branch || null,
         startPoint: base || null,
         detach: !branch,
+        cowCaches,
       });
       createCompleted = true;
       harnessStore.recordAction({
@@ -305,6 +321,122 @@
   function open(wt: WorktreeInfo) {
     void repoStore.openRepo(wt.path);
   }
+
+  function spawnAgentLane() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    const laneId = `agent-${Date.now().toString(36)}`;
+    newPath = `${repo}/.gitpulse/worktrees/${laneId}`;
+    newBranch = `agent/${laneId}`;
+    startPoint = "";
+    cowCaches = true;
+    showAddForm = true;
+  }
+
+  async function mergeTeardown(wt: WorktreeInfo) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    if (mergeConfirmPath !== wt.path) {
+      mergeConfirmPath = wt.path;
+      if (mergeTimer !== null) clearTimeout(mergeTimer);
+      mergeTimer = setTimeout(() => {
+        mergeTimer = null;
+        if (mergeConfirmPath === wt.path) mergeConfirmPath = null;
+      }, 4000);
+      return;
+    }
+    mergeConfirmPath = null;
+    mergingPath = wt.path;
+    error = null;
+    let mergeCompleted = false;
+    try {
+      if (!(await repoStore.trustRepo(wt.path))) return;
+      if ($repoStore.currentPath !== repo) return;
+      const res = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", {
+        repoPath: repo,
+        worktreePath: wt.path,
+        targetBranch: null,
+        squash: false,
+      });
+      mergeCompleted = true;
+      harnessStore.recordAction({
+        repoPath: repo,
+        kind: "worktree-remove",
+        label: `Merged ${wt.branch ?? wt.name} into main (${res.output.commits_merged} commits) & teardown`,
+        ok: true,
+      });
+      if ($repoStore.currentPath !== repo) return;
+      if ($repoStore.currentPath === wt.path) {
+        const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
+        if (stranded) await repoStore.closeTab(stranded.id);
+        return;
+      }
+      await load();
+    } catch (err: unknown) {
+      if (!mergeCompleted) {
+        harnessStore.recordAction({
+          repoPath: repo,
+          kind: "worktree-remove",
+          label: `${wt.branch ?? wt.name} merge-teardown`,
+          ok: false,
+        });
+      }
+      if ($repoStore.currentPath !== repo) return;
+      error = reportPanelError("worktrees", err);
+    } finally {
+      mergingPath = null;
+    }
+  }
+
+  async function fetchAiSummary(wt: WorktreeInfo) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    loadingSummaries = { ...loadingSummaries, [wt.path]: true };
+    try {
+      const summary = await invoke<string>("cmd_worktree_ai_summary", {
+        repoPath: repo,
+        worktreePath: wt.path,
+        branch: wt.branch ?? null,
+      });
+      aiSummaries = { ...aiSummaries, [wt.path]: summary };
+    } catch (err: unknown) {
+      error = reportPanelError("worktrees", err);
+    } finally {
+      loadingSummaries = { ...loadingSummaries, [wt.path]: false };
+    }
+  }
+
+  async function syncCowCaches(wt: WorktreeInfo) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      await invoke("cmd_worktree_cow_sync", { repoPath: repo, targetPath: wt.path });
+      await load();
+    } catch (err: unknown) {
+      error = reportPanelError("worktrees", err);
+    }
+  }
+
+  async function refreshRoutes(wt: WorktreeInfo) {
+    try {
+      const routes = await invoke<WorktreeRouteInfo[]>("cmd_worktree_routes", {
+        worktreePath: wt.path,
+        branch: wt.branch ?? null,
+      });
+      wt.active_routes = routes;
+    } catch {
+      // best-effort discovery
+    }
+  }
+
+  async function openRoute(wt: WorktreeInfo, url: string) {
+    try {
+      await openExternal(url);
+      void refreshRoutes(wt);
+    } catch (err: unknown) {
+      error = reportPanelError("worktrees", err);
+    }
+  }
 </script>
 
 <div>
@@ -314,6 +446,14 @@
       <span>Worktrees ({worktrees.length})</span>
     </span>
     <div class="flex items-center gap-1">
+      <button
+        onclick={spawnAgentLane}
+        title="Spawn dedicated Agent Lane (CoW cloned)"
+        aria-label="Spawn agent lane"
+        class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
+      >
+        <Zap size={11} />
+      </button>
       <button
         onclick={prune}
         title="Prune stale worktree metadata"
@@ -359,6 +499,10 @@
           class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
         />
       </div>
+      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
+        <input type="checkbox" bind:checked={cowCaches} class="rounded border-border text-accent focus:ring-accent" />
+        <span>CoW Build Cache Sharing (reflink / clonefile)</span>
+      </label>
       <div class="flex items-center justify-between">
         <span class="text-[9px] text-textMuted">No branch name creates a detached checkout.</span>
         <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn-primary px-2! py-0.5! text-[10px]!">
@@ -424,6 +568,23 @@
             </button>
             {#if !wt.is_main}
               <button
+                onclick={() => void mergeTeardown(wt)}
+                disabled={mergingPath === wt.path}
+                title={mergingPath === wt.path ? "Merging and tearing down..." : mergeConfirmPath === wt.path ? "Click again to confirm merge into main & remove worktree" : "Merge into main & teardown worktree"}
+                aria-label="Merge and teardown {wt.name}"
+                class="p-0.5 rounded-full {mergingPath === wt.path ? 'opacity-50 cursor-not-allowed' : mergeConfirmPath === wt.path ? 'text-amber-400' : 'hover:bg-surfaceHover hover:text-accent'}"
+              >
+                <GitMerge size={11} class={mergingPath === wt.path ? "animate-spin" : ""} />
+              </button>
+              <button
+                onclick={() => void syncCowCaches(wt)}
+                title="Sync build cache via CoW reflink"
+                aria-label="Sync build cache"
+                class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
+              >
+                <RefreshCw size={10} />
+              </button>
+              <button
                 onclick={() => void toggleLock(wt)}
                 title={wt.is_locked ? "Unlock this worktree" : "Lock this worktree"}
                 aria-label={wt.is_locked ? `Unlock ${wt.name}` : `Lock ${wt.name}`}
@@ -444,6 +605,14 @@
                 <Trash2 size={11} />
               </button>
             {/if}
+            <button
+              onclick={() => void fetchAiSummary(wt)}
+              title="Show high-density status & AI summary"
+              aria-label="AI summary for {wt.name}"
+              class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
+            >
+              <Sparkles size={10} />
+            </button>
           </div>
          </div>
 
@@ -504,6 +673,56 @@
               onclick={() => void repoStore.previewUncommitted(wt.path)}>{wt.dirty_files} changed</button>
           {/if}
          </div>
+
+          <!-- Portless / Localhost routes badge -->
+          {#if wt.active_routes && wt.active_routes.length > 0}
+            <div class="flex items-center gap-1 flex-wrap pt-0.5 min-w-0">
+              {#each wt.active_routes as route}
+                <button
+                  type="button"
+                  onclick={() => void openRoute(wt, route.url)}
+                  title="Open {route.url} in browser ({route.is_portless ? 'Portless: ' + route.hostname : 'Localhost'})"
+                  class="shrink-0 inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-px text-[9px] font-mono text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25 transition-colors"
+                >
+                  <Globe size={9} />
+                  <span>:{route.port}</span>
+                  {#if route.is_portless}
+                    <span class="text-[8px] opacity-75">portless</span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
+
+          <!-- High-density status board metrics: HEAD± uncommitted diff & main↕ divergence -->
+          {#if wt.diff_stat || wt.main_divergence}
+            <div class="flex items-center gap-2 text-[9px] font-mono text-textMuted pt-0.5 min-w-0">
+              {#if wt.diff_stat && (wt.diff_stat.insertions > 0 || wt.diff_stat.deletions > 0)}
+                <span title="HEAD± uncommitted changes: +{wt.diff_stat.insertions} -{wt.diff_stat.deletions} ({wt.diff_stat.files_changed} files)">
+                  HEAD± <span class="text-emerald-500 font-semibold">+{wt.diff_stat.insertions}</span> <span class="text-rose-400 font-semibold">-{wt.diff_stat.deletions}</span>
+                </span>
+              {/if}
+              {#if wt.main_divergence && (wt.main_divergence.ahead > 0 || wt.main_divergence.behind > 0)}
+                <span title="main↕ divergence: {wt.main_divergence.ahead} ahead, {wt.main_divergence.behind} behind">
+                  main↕ <span class="text-accent font-semibold">↑{wt.main_divergence.ahead}</span> <span class="text-amber-400 font-semibold">↓{wt.main_divergence.behind}</span>
+                </span>
+              {/if}
+            </div>
+          {/if}
+
+          {#if mergeConfirmPath === wt.path}
+            <div class="text-[9px] font-semibold text-amber-400 pt-0.5">
+              Merge {wt.branch ?? wt.name} into main & delete worktree? Click GitMerge icon again.
+            </div>
+          {/if}
+
+          {#if aiSummaries[wt.path]}
+            <div class="text-[9px] font-mono text-textMuted bg-surface/80 rounded px-1.5 py-0.5 mt-0.5 truncate" title={aiSummaries[wt.path]}>
+              ⚡ {aiSummaries[wt.path]}
+            </div>
+          {:else if loadingSummaries[wt.path]}
+            <div class="text-[9px] text-textMuted/60 italic mt-0.5">Summarizing diff…</div>
+          {/if}
 
           <!--
             The task line. A worktree bound to a DevCouncil task has every

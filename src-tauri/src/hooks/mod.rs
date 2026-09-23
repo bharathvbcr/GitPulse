@@ -357,6 +357,9 @@ pub struct CollisionFacts {
     /// Empty when the scan covered every worktree and kept every row;
     /// otherwise what it missed.
     pub partial: String,
+    /// Symbol classification for `target`, when the collision payload carried
+    /// one. Absence means the notice stays at today's file-level wording.
+    pub entity: Option<crate::insights::EntityCollisionVerdict>,
 }
 
 /// The collision-guard contract, over facts someone else gathered.
@@ -413,7 +416,7 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
         }
         reason.push('\n');
     }
-    reason.push_str("Editing it here will conflict when these branches meet.");
+    reason.push_str(&entity_collision_tail(facts));
     if !facts.partial.is_empty() {
         reason.push_str(&format!("\n(Scan was incomplete: {}.)", facts.partial));
     }
@@ -421,6 +424,45 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
     HookOutput {
         hook_specific_output: Some(decision(PRE_TOOL_USE, PermissionDecision::Ask, reason)),
         system_message: None,
+    }
+}
+
+/// Closing sentence for a positive collision finding.
+///
+/// Shared-symbol and file-level keep the historical "will conflict" wording.
+/// Disjoint symbols are a distinct notice — file overlap is not a merge
+/// promise — and must never borrow the collision sentence.
+fn entity_collision_tail(facts: &CollisionFacts) -> String {
+    match facts.entity.as_ref() {
+        Some(entity)
+            if matches!(
+                entity.kind,
+                crate::insights::EntityCollisionKind::DisjointSymbols
+            ) =>
+        {
+            format!(
+                "Same file, distinct symbols on the old-side ranges — file overlap, not a merge promise. {}",
+                entity.reason
+            )
+        }
+        Some(entity)
+            if matches!(entity.kind, crate::insights::EntityCollisionKind::FileLevel)
+                && !entity.reason.is_empty() =>
+        {
+            format!(
+                "Editing it here will conflict when these branches meet. (Symbol check stayed at file level: {}.)",
+                entity.reason
+            )
+        }
+        Some(entity)
+            if matches!(
+                entity.kind,
+                crate::insights::EntityCollisionKind::SharedSymbol
+            ) =>
+        {
+            format!("{}.", entity.reason.trim_end_matches('.'))
+        }
+        _ => "Editing it here will conflict when these branches meet.".into(),
     }
 }
 
@@ -448,13 +490,13 @@ pub fn collision_facts(
             target: target.to_string(),
             others: Vec::new(),
             partial: String::new(),
+            entity: None,
         };
     }
 
-    let others = risk
-        .items
-        .iter()
-        .find(|item| item.path == target)
+    let matched = risk.items.iter().find(|item| item.path == target);
+    let entity = matched.and_then(|item| item.entity.clone());
+    let others = matched
         .map(|item| {
             item.worktrees
                 .iter()
@@ -519,6 +561,7 @@ pub fn collision_facts(
         target: target.to_string(),
         others,
         partial: partial.join("; "),
+        entity,
     }
 }
 
@@ -581,6 +624,7 @@ fn unchecked(target: &str, why: &str) -> HookOutput {
         target: target.to_string(),
         others: Vec::new(),
         partial: String::new(),
+        entity: None,
     })
 }
 
@@ -1377,6 +1421,7 @@ mod tests {
                     party("/repo", "main"),
                     party("/repo/.claude/worktrees/feature", "claude/feature"),
                 ],
+                entity: None,
             }]),
             ledger: LedgerStatus {
                 recording: true,
@@ -1583,6 +1628,7 @@ mod tests {
             target: "src/lib.rs".to_string(),
             others: Vec::new(),
             partial: String::new(),
+            entity: None,
         });
         let failed = collision_decision(&CollisionFacts {
             ok: false,
@@ -1590,6 +1636,7 @@ mod tests {
             target: "src/lib.rs".to_string(),
             others: Vec::new(),
             partial: String::new(),
+            entity: None,
         });
 
         // The whole contract in one assertion: these must not be the same bytes.
@@ -1616,6 +1663,7 @@ mod tests {
             target: "src/lib.rs".to_string(),
             others: Vec::new(),
             partial: String::new(),
+            entity: None,
         });
         let partial = collision_decision(&CollisionFacts {
             ok: true,
@@ -1623,6 +1671,7 @@ mod tests {
             target: "src/lib.rs".to_string(),
             others: Vec::new(),
             partial: "2 worktree(s) were not scanned".to_string(),
+            entity: None,
         });
         assert_ne!(complete.render(), partial.render());
         assert!(partial
@@ -1684,6 +1733,7 @@ mod tests {
                 agent_kind: "claude".to_string(),
             }],
             partial: String::new(),
+            entity: None,
         });
         let specific = output
             .hook_specific_output
@@ -1699,8 +1749,77 @@ mod tests {
         assert!(reason.contains("/repo/.claude/worktrees/feature"));
         assert!(reason.contains("claude/feature"));
         assert!(reason.contains("feature-a1b2"));
+        assert!(reason.contains("will conflict when these branches meet"));
         // `ask` serialises to the documented wire value, not the Rust name.
         assert!(output.render().expect("renders").contains("\"ask\""));
+    }
+
+    #[test]
+    fn disjoint_symbol_verdict_does_not_use_the_collision_wording() {
+        let output = collision_decision(&CollisionFacts {
+            ok: true,
+            error: String::new(),
+            target: "src/lib.rs".to_string(),
+            others: vec![CollisionOther {
+                worktree: "/repo/wt/feature".to_string(),
+                branch: "feature".to_string(),
+                session: String::new(),
+                agent_kind: String::new(),
+            }],
+            partial: String::new(),
+            entity: Some(crate::insights::EntityCollisionVerdict {
+                path: "src/lib.rs".into(),
+                kind: crate::insights::EntityCollisionKind::DisjointSymbols,
+                reason: "src/lib.rs is dirty in multiple worktrees, but no shared symbol was seen on the old-side ranges — file overlap, not a merge promise".into(),
+                shared_symbols: Vec::new(),
+            }),
+        });
+        let reason = output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|s| s.permission_decision_reason.as_deref())
+            .unwrap_or_default();
+        assert!(
+            !reason.contains("will conflict when these branches meet"),
+            "disjoint must not use collision wording: {reason}"
+        );
+        assert!(reason.contains("not a merge promise"), "{reason}");
+    }
+
+    #[test]
+    fn head_sha_mismatch_entity_keeps_file_level_collision_wording() {
+        let output = collision_decision(&CollisionFacts {
+            ok: true,
+            error: String::new(),
+            target: "src/lib.rs".to_string(),
+            others: vec![CollisionOther {
+                worktree: "/repo/wt/feature".to_string(),
+                branch: "feature".to_string(),
+                session: String::new(),
+                agent_kind: String::new(),
+            }],
+            partial: String::new(),
+            entity: Some(crate::insights::EntityCollisionVerdict {
+                path: "src/lib.rs".into(),
+                kind: crate::insights::EntityCollisionKind::FileLevel,
+                reason: "indexed generation head_sha abc is not the requested def".into(),
+                shared_symbols: Vec::new(),
+            }),
+        });
+        let reason = output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|s| s.permission_decision_reason.as_deref())
+            .unwrap_or_default();
+        assert!(
+            reason.contains("will conflict when these branches meet"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("not a merge promise"),
+            "mismatch must not use disjoint wording: {reason}"
+        );
+        assert!(reason.contains("head_sha"), "{reason}");
     }
 
     #[test]
@@ -1708,6 +1827,7 @@ mod tests {
         let risk = clean_risk(vec![CollisionItem {
             path: "src/lib.rs".to_string(),
             worktrees: vec![party("/repo", "main"), party("/repo/wt/feature", "feature")],
+            entity: None,
         }]);
         let facts = collision_facts(&risk, Path::new("/repo"), "src/lib.rs", &no_sessions);
         assert_eq!(facts.others.len(), 1);
@@ -1719,6 +1839,7 @@ mod tests {
         let risk = clean_risk(vec![CollisionItem {
             path: "src/other.rs".to_string(),
             worktrees: vec![party("/repo", "main"), party("/repo/wt/x", "x")],
+            entity: None,
         }]);
         let facts = collision_facts(&risk, Path::new("/repo"), "src/lib.rs", &no_sessions);
         assert!(facts.ok);
@@ -1779,6 +1900,7 @@ mod tests {
             target: "a.txt".into(),
             others: Vec::new(),
             partial: String::new(),
+            entity: None,
         };
         let message = collision_decision(&facts)
             .system_message
@@ -1894,6 +2016,7 @@ mod tests {
                 agent_kind: String::new(),
             }],
             partial: "1 worktree(s) were not scanned".to_string(),
+            entity: None,
         });
         let specific = output.hook_specific_output.expect("still decides");
         assert_eq!(specific.permission_decision, Some(PermissionDecision::Ask));

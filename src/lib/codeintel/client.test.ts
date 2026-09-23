@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   getCodeintelStatus,
   searchSymbols,
+  symbolsForFile,
   getImpact,
   getImpactAtRung,
   getImpactLayered,
@@ -86,6 +87,39 @@ describe("codeintel client", () => {
     });
     expect(res.items).toHaveLength(1);
     expect(res.items[0].symbol_name).toBe("testFn");
+  });
+
+  it("loads symbols for one file at a named head", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      available: true,
+      reason: null,
+      file_path: "src/lib.rs",
+      requested_head_sha: "abc",
+      generation_id: 1,
+      generation_head_sha: "abc",
+      head_matches: true,
+      items: [
+        {
+          symbol_name: "main",
+          qualified_name: "main",
+          kind: "Function",
+          span_start_line: 1,
+          span_end_line: 10,
+        },
+      ],
+      total: 1,
+      shown: 1,
+      truncated: false,
+    });
+
+    const res = await symbolsForFile("/repo", "src/lib.rs", "abc");
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_symbols_for_file", {
+      repoPath: "/repo",
+      filePath: "src/lib.rs",
+      headSha: "abc",
+    });
+    expect(res.head_matches).toBe(true);
+    expect(res.items[0].symbol_name).toBe("main");
   });
 
   it("computes impact and callers", async () => {

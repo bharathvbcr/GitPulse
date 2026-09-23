@@ -189,13 +189,11 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "insights",
     label: "Insights",
     summary:
-      "On-demand measurements of this repository: activity, coverage, dependency health and disk. A scan that could not run is never shown as clean.",
-    paletteCommand: "Open Insights — activity, dependencies, coverage and disk",
-    // Four scans of one subject: this repository. They were four header
-    // entries, each empty until someone ran it — over half the Inspect menu
-    // costing attention every session and paying occasionally. As sections
-    // they share one scan-card shell and one honesty contract about
-    // truncation, which is the thing all four actually had in common.
+      "On-demand measurements of this repository: activity, coverage, dependency health, secrets and disk. A scan that could not run is never shown as clean.",
+    paletteCommand: "Open Insights — activity, dependencies, coverage, secrets and disk",
+    // Scans of one subject: this repository. They were separate header
+    // entries, each empty until someone ran it. As sections they share one
+    // scan-card shell and one honesty contract about truncation.
     sections: [
       {
         id: "pulse",
@@ -217,6 +215,13 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         summary:
           "Local audits across ecosystems, Dependabot and code scanning alerts, and dead code from the code graph. A scanner that did not run is listed, not implied clean.",
         paletteCommand: "Scan npm vulnerabilities and updates",
+      },
+      {
+        id: "secrets",
+        label: "Secrets",
+        summary:
+          "Working-tree secret scan via Kingfisher on PATH. A missed or truncated scan is listed, never implied clean. No secret values are shown.",
+        paletteCommand: "Scan working tree for secrets",
       },
       {
         id: "storage",

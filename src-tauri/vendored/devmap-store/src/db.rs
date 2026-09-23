@@ -1011,6 +1011,20 @@ pub struct FileEdges {
     pub analysis: Option<AnalysisDisclosure>,
 }
 
+/// Symbols declared in one file in the latest generation, with that
+/// generation's identity so a caller can compare `head_sha` to the one they
+/// asked for.
+///
+/// Travels as one page for the same reason [`SearchPage`] does: the rows and
+/// the generation they came from must be one snapshot. A second "latest"
+/// read for the head SHA could describe a different generation.
+#[derive(Debug, Clone)]
+pub struct FileSymbolsPage {
+    pub generation: u32,
+    pub head_sha: String,
+    pub rows: Vec<StoredSymbol>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredSymbol {
     pub name: String,
@@ -6151,6 +6165,58 @@ impl Store {
             out.entry(path).or_default().insert(name);
         }
         Ok(out)
+    }
+
+    /// Symbols declared in `path` in the latest generation.
+    ///
+    /// `None` when the store holds no generation. An empty `rows` with `Some`
+    /// means the generation exists and this path has no indexed symbols (or
+    /// is not in the generation at all) — a completed read, not a missing map.
+    ///
+    /// Bounded to one file on purpose: callers that need the whole corpus use
+    /// [`Self::all_symbols`]. The generation's `head_sha` travels with the
+    /// rows so a mismatch against the SHA the caller asked for is visible.
+    pub fn latest_symbols_for_file(&self, path: &str) -> Result<Option<FileSymbolsPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let head_sha: String = snapshot.query_row(
+            "SELECT head_sha FROM generations WHERE id = ?1",
+            params![generation],
+            |row| row.get(0),
+        )?;
+        let mut stmt = snapshot.prepare(
+            "SELECT n.name, n.qualified_name, n.kind, p.path,
+                    n.span_start, n.span_end, n.is_exported, f.content_hash
+             FROM generation_nodes n
+             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
+             JOIN paths p ON p.id = n.file_id
+             WHERE n.generation_id = ?1 AND p.path = ?2
+             ORDER BY n.span_start, n.ordinal",
+        )?;
+        let rows = stmt
+            .query_map(params![generation, path], |row| {
+                let name: String = row.get(0)?;
+                let path: String = row.get(3)?;
+                let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
+                Ok(StoredSymbol {
+                    name,
+                    qualified_name: row.get(1)?,
+                    kind: row.get(2)?,
+                    path,
+                    span_start,
+                    span_end,
+                    is_exported: row.get::<_, i64>(6)? != 0,
+                    content_hash: row.get::<_, i64>(7)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(FileSymbolsPage {
+            generation,
+            head_sha,
+            rows,
+        }))
     }
 
     /// Every edge of the latest generation, rendered for comparison.

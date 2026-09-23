@@ -42,6 +42,36 @@ describe("validateWorkResponse", () => {
     ).not.toThrow();
   });
 
+  it("accepts cmd_collision_risk payloads with an entity verdict on a row", () => {
+    expect(() =>
+      validateWorkResponse("cmd_collision_risk", {
+        ok: true,
+        truncated: false,
+        error: "",
+        overlapping_files: 1,
+        worktrees_involved: 2,
+        scanned_worktrees: 2,
+        unscanned_worktrees: 0,
+        failed_worktrees: 0,
+        items: [
+          {
+            path: "src/lib.rs",
+            worktrees: [
+              { path: "/a", agent_kind: "claude", branch: "main" },
+              { path: "/b", agent_kind: "", branch: "feat" },
+            ],
+            entity: {
+              path: "src/lib.rs",
+              kind: "disjoint_symbols",
+              reason: "file overlap, not a merge promise",
+              shared_symbols: [],
+            },
+          },
+        ],
+      }),
+    ).not.toThrow();
+  });
+
   it("rejects malformed non-object payloads with command-scoped error", () => {
     expect(() => validateWorkResponse("cmd_task_scope", "not-an-object")).toThrow(
       "cmd_task_scope: invalid response",

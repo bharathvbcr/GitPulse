@@ -24,6 +24,9 @@ function worktree(path: string, extra: Partial<WorktreeInfo> = {}): WorktreeInfo
     is_locked: false,
     is_prunable: false,
     dirty_files: 0,
+    diff_stat: null,
+    main_divergence: null,
+    active_routes: [],
     ...extra,
   };
 }

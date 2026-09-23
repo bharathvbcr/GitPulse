@@ -64,6 +64,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_lock_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_unlock_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_prune_worktree: "worktree argv is built in engine::worktree, not git_writer",
+  cmd_worktree_merge_teardown: "worktree merge-teardown argv is built in engine::worktree, not git_writer",
   cmd_write_file_content: "writes through the sandbox, gated by path not command",
   cmd_discard_changes: "gated by path not command; covered by file-gate-fidelity-contract",
   cmd_save_conflict: "conflict_session::mutation builds argv once for judging and execution; native conflict gate regressions cover hash-object, update-index and denial",

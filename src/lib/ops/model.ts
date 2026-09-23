@@ -2,6 +2,8 @@ import type { PolicyVerdict } from "../stores/harnessStore";
 
 export interface BranchCleanupCandidate {
   name: string;
+  /** Tip SHA for restore via `createBranch(name, tip)` after delete. */
+  tip_commit_id: string;
   last_summary: string;
   last_author: string;
   last_commit_timestamp: number;

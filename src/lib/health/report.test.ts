@@ -667,6 +667,29 @@ describe("audits that ran and failed", () => {
     expect(coverageGap(report)).toBe("failed: cargo-audit");
   });
 
+  it("names cargo-deny when deny.toml is present and the CLI is not", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = true;
+    report.cargo_deny_present = false;
+    report.ecosystems = [
+      { family: "cargo", manifests: ["Cargo.lock", "deny.toml"], note: "" },
+    ];
+    expect(skippedAudits(report)).toEqual(["cargo-deny"]);
+  });
+
+  it("names cargo-deny, cargo-crev, and cargo audit bin when those scans fail", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = true;
+    report.cargo_deny_present = true;
+    report.cargo_crev_present = true;
+    report.issues = [
+      { severity: "warning", code: "cargo_deny_failed", message: "exited 1", path: "deny.toml" },
+      { severity: "warning", code: "cargo_crev_failed", message: "exited 2", path: "Cargo.lock" },
+      { severity: "warning", code: "cargo_audit_bin_failed", message: "exited 1", path: "target/release/demo" },
+    ];
+    expect(failedAudits(report)).toEqual(["cargo audit bin", "cargo-crev", "cargo-deny"]);
+  });
+
   it("reports both halves when one scanner is absent and another failed", () => {
     const report = emptyReport();
     report.npm_cli_present = false;

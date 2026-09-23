@@ -84,9 +84,20 @@ export interface CollisionParty {
   agent_kind: string;
 }
 
+export type EntityCollisionKind = "shared_symbol" | "disjoint_symbols" | "file_level";
+
+export interface EntityCollisionVerdict {
+  path: string;
+  kind: EntityCollisionKind;
+  reason: string;
+  shared_symbols: string[];
+}
+
 export interface CollisionItem {
   path: string;
   worktrees: CollisionParty[];
+  /** Present on the first overlapping row when symbol classification ran. */
+  entity?: EntityCollisionVerdict;
 }
 
 export interface CollisionRisk {

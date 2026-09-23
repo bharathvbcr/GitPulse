@@ -12,12 +12,9 @@
    * Insights: what this repository is like, as opposed to what is happening
    * in it.
    *
-   * Pulse, Coverage, Health and Storage were four top-level entries, and
-   * every one of them is empty until a scan has run — four permanent claims
-   * on the header that pay off occasionally. They are also the same shape:
-   * an on-demand measurement that must say when it was capped rather than
-   * presenting a floor as a total. Gathering them here is what lets that
-   * contract have one owner instead of four.
+   * Pulse, Coverage, Health, Secrets and Storage are on-demand measurements
+   * that must say when they were capped rather than presenting a floor as a
+   * total. Gathering them here is what lets that contract have one owner.
    *
    * Every section stays lazily loaded. A user who opens Insights for the
    * activity heatmap should not pay for the coverage parser, and the entry
@@ -28,11 +25,13 @@
     loadPulse,
     loadCoverage,
     loadHealth,
+    loadSecrets,
     loadStorage,
   }: {
     loadPulse: ViewLoader;
     loadCoverage: ViewLoader;
     loadHealth: ViewLoader;
+    loadSecrets: ViewLoader;
     loadStorage: ViewLoader;
   } = $props();
 
@@ -47,6 +46,8 @@
       <LazyView load={loadCoverage} name="Coverage" />
     {:else if section === "health"}
       <LazyView load={loadHealth} name="Health" />
+    {:else if section === "secrets"}
+      <LazyView load={loadSecrets} name="Secrets" />
     {:else if section === "storage"}
       <LazyView load={loadStorage} name="Storage" />
     {:else}

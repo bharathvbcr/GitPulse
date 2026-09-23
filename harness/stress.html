@@ -159,7 +159,7 @@
       // HealthPanel threw on `.length` mid-render and tore its effects down.
       const healthReport = () => ({
         node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true,
-        cargo_audit_present: true, pip_audit_present: false, govulncheck_present: false,
+        cargo_audit_present: true, cargo_deny_present: false, cargo_crev_present: false, pip_audit_present: false, govulncheck_present: false,
         composer_present: false, bundler_audit_present: false,
         scanners_ran: ["npm", "cargo"], audit_complete: false,
         manifests: [{

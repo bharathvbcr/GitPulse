@@ -139,7 +139,10 @@
     getImpactLayeredMany,
     cancelCodeintelQuery,
     newCodeintelCancelToken,
+    symbolsForFile,
   } from "../codeintel/client";
+  import { hunkSymbolLabels, type HunkLineRange } from "../diff/symbolGroups";
+  import { parseHunkHeaderNumbers } from "../diff/patchBuilder";
   import { previewMarkers } from "../codeintel/previewStore";
   import {
     composeLayeredImpacts,
@@ -552,6 +555,62 @@
 
   const currentSection = $derived(sectionAt(outline, topLineIndex));
   const currentHunk = $derived(hunkAt(currentSection, topLineIndex));
+
+  /**
+   * Symbol labels for the current single-file diff, from `symbols_for_file`.
+   * Empty when the index head_sha does not match the revision we asked for —
+   * never invent groups from a stale generation.
+   */
+  let hunkSymbols = $state<Map<string, string>>(new Map());
+  const currentHunkSymbol = $derived.by(() => {
+    if (!currentSection || !currentHunk) return "";
+    const key = `${currentSection.path}#${currentHunk.index}`;
+    return hunkSymbols.get(key) ?? "";
+  });
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const section = singleSection;
+    const commitId = $repoStore.selectedCommitId;
+    if (!repo || !section?.path) {
+      hunkSymbols = new Map();
+      return;
+    }
+    const path = section.path;
+    const hunks: HunkLineRange[] = section.hunks.map((hunk) => {
+      const nums = parseHunkHeaderNumbers(hunk.header);
+      return {
+        key: `${path}#${hunk.index}`,
+        old_start: nums.old_start,
+        old_lines: nums.old_lines,
+        new_start: nums.new_start,
+        new_lines: nums.new_lines,
+      };
+    });
+    let cancelled = false;
+    void (async () => {
+      try {
+        // Work: HEAD. History: parent first (old side), then the commit itself.
+        const candidates = commitId
+          ? [`${commitId}^`, commitId]
+          : [await invoke<string>("cmd_get_head_id", { repoPath: repo })];
+        for (const headSha of candidates) {
+          if (cancelled || !headSha) continue;
+          const page = await symbolsForFile(repo, path, headSha);
+          if (cancelled) return;
+          if (!page.available || !page.head_matches) continue;
+          hunkSymbols = hunkSymbolLabels(hunks, page.items);
+          return;
+        }
+        if (!cancelled) hunkSymbols = new Map();
+      } catch {
+        if (!cancelled) hunkSymbols = new Map();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
 
   // --- selection and staging ----------------------------------------------
 
@@ -1489,7 +1548,9 @@
           {/if}
           {#if currentHunk}
             <span class="shrink-0 font-mono opacity-70">{currentHunk.header}</span>
-            {#if currentHunk.heading}
+            {#if currentHunkSymbol}
+              <span class="min-w-0 truncate font-mono text-accent/80">{currentHunkSymbol}</span>
+            {:else if currentHunk.heading}
               <span class="min-w-0 truncate font-mono opacity-60">{currentHunk.heading}</span>
             {/if}
           {/if}

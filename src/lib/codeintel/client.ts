@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   parseCodeintelResponse,
   parseCodeintelStatus,
+  parseCodeintelFileSymbols,
   parseInitReport,
   parseIntegrationPlan,
   parseSuiteReport,
@@ -12,6 +13,7 @@ import {
   type CodeintelDeadSymbol,
   type CodeintelEdge,
   type CodeintelExplore,
+  type CodeintelFileSymbols,
   type CodeintelLayeredImpact,
   type CodeintelNeighbors,
   type CodeintelResponse,
@@ -57,6 +59,18 @@ export async function searchSymbols(
     query,
     tokenBudget,
   }).then(asResponse("cmd_codeintel_search"));
+}
+
+/** Bounded symbols-in-file span read for hunk grouping and collision joins. */
+export async function symbolsForFile(
+  repoPath: string,
+  filePath: string,
+  headSha: string,
+): Promise<CodeintelFileSymbols> {
+  return parseCodeintelFileSymbols(
+    await invoke("cmd_codeintel_symbols_for_file", { repoPath, filePath, headSha }),
+    "cmd_codeintel_symbols_for_file",
+  );
 }
 
 export async function getImpact(

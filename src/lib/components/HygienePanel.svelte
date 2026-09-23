@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { RefreshCw, ShieldCheck, FolderTree, Clock, X } from "@lucide/svelte";
+  import { RefreshCw, ShieldCheck, FolderTree, Clock, X, GitBranch, Trash2 } from "@lucide/svelte";
   import type { StorageReport } from "../storage/types";
   import type { CacheInventory, HygienePlan, HygieneOutcome } from "../storage/hygiene/types";
   import { DEFAULT_HYGIENE_DEFAULTS, INHERITED_OVERRIDE, RETENTION_CHOICES, ignoreRule, loadHygieneSettings, resolveRetention, reviewDue, saveDefaults, saveOverride, type HygieneDefaults, type RepoHygieneOverride } from "../storage/hygiene/preferences";
@@ -155,6 +155,29 @@
     <label class="flex items-center gap-2"><input type="checkbox" aria-label="Review shared caches weekly" bind:checked={defaults.reviewSharedCaches} onchange={persistDefaults} />Review shared caches weekly while a Storage page is open</label>
     <p class="text-textMuted">Shared caches belong to the host, not to one repository, so this switch and its weekly timer are shared by every repository — reviewing once covers them all. Change the inherited default, roots and scheduled cleanup in Settings → Repo hygiene.</p>
   </div>
+  <div class="rounded-xl border border-border/60 p-3 text-xs bg-surface/50 flex items-center justify-between gap-4">
+    <div class="flex items-center gap-3 min-w-0">
+      <div class="w-8 h-8 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center border border-emerald-500/20 shrink-0">
+        <GitBranch size={15} />
+      </div>
+      <div class="min-w-0">
+        <strong class="text-textPrimary flex items-center gap-1.5">
+          Stale & Dead Branches
+          <span class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-accent/10 text-accent border border-accent/20">deadbranch</span>
+        </strong>
+        <p class="text-textMuted mt-0.5">Detect merged, squash-merged, or inactive branches and prune safely with restorable backups.</p>
+      </div>
+    </div>
+    <button
+      type="button"
+      class="gp-btn shrink-0 flex items-center gap-1.5 hover:text-emerald-400"
+      onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:branch-cleanup"))}
+    >
+      <Trash2 size={12} />
+      <span>Clean branches…</span>
+    </button>
+  </div>
+
   <p class="text-xs text-textMuted">Cleanup checks ignore rules, tracked files, producer markers, modification times and open files. Stop builds first. Recent output, environments and persistent state are preserved.</p>
 
   {#if error}<p role="alert" class="rounded-lg border border-rose-400/30 bg-rose-400/5 p-3 text-xs text-rose-300">{error}</p>{/if}

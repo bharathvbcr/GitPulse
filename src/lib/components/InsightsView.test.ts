@@ -9,20 +9,26 @@ const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "InsightsView.svelte"), "utf8");
 
 describe("InsightsView", () => {
-  it("hosts the four scans that were four header entries", () => {
+  it("hosts the scans that were separate header entries", () => {
     expect(sectionsFor("insights").map((s) => s.id)).toEqual([
       "pulse",
       "coverage",
       "health",
+      "secrets",
       "storage",
     ]);
   });
 
   it("keeps every pane lazy", () => {
     // Opening Insights for the activity heatmap must not pay for the coverage
-    // parser, the dependency auditor or the disk walker. Four loaders in, four
-    // LazyView render sites, no static import of a panel.
-    for (const loader of ["loadPulse", "loadCoverage", "loadHealth", "loadStorage"]) {
+    // parser, the dependency auditor, the secrets scanner or the disk walker.
+    for (const loader of [
+      "loadPulse",
+      "loadCoverage",
+      "loadHealth",
+      "loadSecrets",
+      "loadStorage",
+    ]) {
       expect(source).toContain(`${loader}: ViewLoader`);
       expect(source).toContain(`load={${loader}}`);
     }

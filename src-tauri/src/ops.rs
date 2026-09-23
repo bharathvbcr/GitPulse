@@ -25,6 +25,10 @@ const MAX_RELEASE_MESSAGE_BYTES: usize = 4 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BranchCleanupCandidate {
     pub name: String,
+    /// Tip SHA before delete — same restore input the sidebar Undo toast uses
+    /// with `createBranch(name, tip)`. Survives in the cleanup list so the ops
+    /// panel can show it and restore after the toast is gone.
+    pub tip_commit_id: String,
     pub last_summary: String,
     pub last_author: String,
     pub last_commit_timestamp: i64,
@@ -185,6 +189,7 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, String>
         } else if merged.contains(branch.name.as_str()) {
             candidates.push(BranchCleanupCandidate {
                 name: branch.name.clone(),
+                tip_commit_id: branch.tip_commit_id.clone(),
                 last_summary: branch.last_summary.clone(),
                 last_author: branch.last_author.clone(),
                 last_commit_timestamp: branch.last_commit_timestamp,
@@ -613,6 +618,11 @@ mod tests {
         assert_eq!(plan.unmerged_branches, 1);
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].name, "merged-work");
+        assert_eq!(
+            plan.candidates[0].tip_commit_id.len(),
+            40,
+            "ops panel restore needs the tip on every candidate"
+        );
     }
 
     #[test]

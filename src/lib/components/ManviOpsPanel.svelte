@@ -289,8 +289,10 @@
   async function cleanBranches() {
     if (selectedBranches.length === 0) return;
     const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const names = [...selectedBranches];
+    if (!repo || !cleanup) return;
+    const selected = cleanup.candidates.filter((c) => selectedBranches.includes(c.name));
+    if (selected.length === 0) return;
+    const names = selected.map((c) => c.name);
     const confirmed = await askConfirm({
       title: "Delete merged branches",
       message: `Delete ${names.length} merged local branch${names.length === 1 ? "" : "es"}?\n\n${names.join("\n")}`,
@@ -303,17 +305,43 @@
     notice = null;
     let deleted = 0;
     const failures: string[] = [];
+    // Tips captured from the plan before delete — same restore input the
+    // sidebar toast uses. The durable ledger before_ref survives toast death.
+    const restoredTips: { name: string; tip: string }[] = [];
     try {
-      for (const name of names) {
+      for (const candidate of selected) {
         if ($repoStore.currentPath !== repo) break;
-        const outcome = await repoStore.deleteBranch(name, false);
-        if (outcome.ok) deleted += 1;
-        else failures.push(`${name}: ${outcome.error ?? "failed"}`);
+        const tip = candidate.tip_commit_id;
+        const outcome = await repoStore.deleteBranch(candidate.name, false);
+        if (outcome.ok) {
+          deleted += 1;
+          if (tip) restoredTips.push({ name: candidate.name, tip });
+        } else {
+          failures.push(`${candidate.name}: ${outcome.error ?? "failed"}`);
+        }
       }
       if ($repoStore.currentPath === repo) {
         notice = failures.length
           ? `Deleted ${deleted} of ${names.length}. ${failures.join(" ")}`
           : `Deleted ${deleted} merged branch${deleted === 1 ? "" : "es"}.`;
+        if (restoredTips.length === 1) {
+          const { name, tip } = restoredTips[0];
+          toastStore.action(`Deleted branch "${name}"`, "Undo", async () => {
+            await repoStore.createBranch(name, tip);
+            toastStore.success(`Restored branch "${name}"`);
+          });
+        } else if (restoredTips.length > 1) {
+          toastStore.action(
+            `Deleted ${restoredTips.length} merged branches`,
+            "Undo",
+            async () => {
+              for (const { name, tip } of restoredTips) {
+                await repoStore.createBranch(name, tip);
+              }
+              toastStore.success(`Restored ${restoredTips.length} branches`);
+            },
+          );
+        }
         await scanBranches();
       }
     } finally {
@@ -737,7 +765,11 @@
             {#each cleanup.candidates as branch, i (`${branch.name}#${i}`)}
               <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
                 <input type="checkbox" checked={isSelected(branch.name)} onchange={() => toggleSelected(branch.name)} />
-                <span class="min-w-0 flex-1"><span class="font-mono">{branch.name}</span><span class="ml-2 truncate text-textMuted">{branch.last_summary}</span></span>
+                <span class="min-w-0 flex-1">
+                  <span class="font-mono">{branch.name}</span>
+                  <span class="ml-2 font-mono text-textMuted" title={branch.tip_commit_id}>{branch.tip_commit_id.slice(0, 7)}</span>
+                  <span class="ml-2 truncate text-textMuted">{branch.last_summary}</span>
+                </span>
                 {#if branch.upstream_gone}<span class="gp-pill">upstream gone</span>{/if}
               </label>
             {:else}

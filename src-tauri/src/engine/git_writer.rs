@@ -418,7 +418,17 @@ impl GitWriter {
         Ok(())
     }
 
-    pub fn delete_branch(repo_path: &str, branch_name: &str, force: bool) -> Result<(), String> {
+    /// Deletes a local branch after capturing its tip SHA.
+    ///
+    /// The tip is resolved **before** `git branch -d` / `-D` removes the ref,
+    /// then written to the ledger as `before_ref` so either delete door
+    /// (sidebar toast or ops cleanup) can restore with [`Self::create_branch`]
+    /// after the in-memory Undo toast is gone. Returns that tip on success.
+    pub fn delete_branch(
+        repo_path: &str,
+        branch_name: &str,
+        force: bool,
+    ) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -439,9 +449,18 @@ impl GitWriter {
                 ));
             }
         }
+        // Capture before the ref disappears — after `-d`/`-D` there is nothing
+        // to rev-parse, and the Undo toast is not a durable store.
+        let tip = git_text(&repo, &["rev-parse", &format!("refs/heads/{branch_name}")])?
+            .trim()
+            .to_string();
+        validate_oid(&tip)?;
         let flag = if force { "-D" } else { "-d" };
         git_text(&repo, &["branch", flag, branch_name])?;
-        Ok(())
+        // Journal only after a successful delete so a refused `-d` never claims
+        // the branch is gone. The tip itself was resolved before the ref left.
+        record_deleted_branch_tip(repo_path, branch_name, &tip, force);
+        Ok(tip)
     }
 
     pub fn rename_branch(repo_path: &str, old_name: &str, new_name: &str) -> Result<(), String> {
@@ -1410,10 +1429,48 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Journals the tip SHA of a branch about to be deleted.
+///
+/// Gate rows authorise the request; this row is the restore record. `before_ref`
+/// holds the tip so `create_branch(name, tip)` can put the ref back after the
+/// in-memory Undo toast is gone. Uses [`crate::ledger::record`] so a ledger
+/// outage never blocks the delete itself.
+pub(crate) fn record_deleted_branch_tip(
+    repo_path: &str,
+    branch_name: &str,
+    tip: &str,
+    force: bool,
+) {
+    use crate::ledger::{ActorKind, Draft, Outcome};
+
+    let flag = if force { "-D" } else { "-d" };
+    let argv = ["git", "branch", flag, branch_name];
+    let address = crate::ledger::bindings::repository_address(repo_path).ok();
+    let ledger_repo = address
+        .as_ref()
+        .map(|address| address.anchor.clone())
+        .unwrap_or_else(|| repo_path.to_string());
+    let worktree_path = address
+        .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+
+    let _ = crate::ledger::record(Draft {
+        repo_path: ledger_repo,
+        worktree_path,
+        actor_kind: Some(ActorKind::Human),
+        action: crate::ledger::action_for_argv(&argv),
+        object: Some(branch_name.to_string()),
+        argv_json: serde_json::to_string(&argv).ok(),
+        outcome: Some(Outcome::Ok),
+        before_ref: Some(tip.to_string()),
+        detail_json: Some(r#"{"phase":"mutate","kind":"branch.delete"}"#.to_string()),
+        ..Default::default()
+    });
+}
+
 /// True when `branch_name` is the branch the repository's HEAD resolves to by
 /// default: the primary remote's HEAD branch first, then conventional
 /// main/master/trunk/develop — the same resolution `list_branches` uses.
-fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
+pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
     let remote = crate::engine::git_reader::resolve_default_remote(repo);
     let head_ref = crate::engine::git_reader::remote_head_ref(&remote);
     let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
@@ -1423,7 +1480,10 @@ fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
 
 /// True when any worktree of `repo` (including the main one) has
 /// `branch_name` checked out.
-fn is_checked_out_in_any_worktree(repo: &Path, branch_name: &str) -> Result<bool, String> {
+pub(crate) fn is_checked_out_in_any_worktree(
+    repo: &Path,
+    branch_name: &str,
+) -> Result<bool, String> {
     let stdout = git_text(repo, &["worktree", "list", "--porcelain"])?;
     let target = format!("refs/heads/{branch_name}");
     Ok(stdout

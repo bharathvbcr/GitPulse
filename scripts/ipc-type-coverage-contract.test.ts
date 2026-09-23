@@ -73,8 +73,13 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["CodeintelAffectedTests", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelClones", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelExplore", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["CodeintelFileSymbols", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelLayeredImpact", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelNeighbors", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["DeadbranchBackupInfo", { reason: "deadbranch backup list; mirrored in src/lib/branches/types.ts" }],
+  ["DeadbranchCleanResult", { reason: "deadbranch prune outcome; mirrored in src/lib/branches/types.ts" }],
+  ["DeadbranchRestoreResult", { reason: "deadbranch restore outcome; mirrored in src/lib/branches/types.ts" }],
+  ["DeadbranchScanResult", { reason: "deadbranch scan result; mirrored in src/lib/branches/types.ts" }],
   ["DocRenameOutcome", { reason: "MarkDev docs IPC; pending CONTRACTS row" }],
   ["DocsStatus", { reason: "MarkDev docs IPC; pending CONTRACTS row" }],
   ["Graph", { reason: "MarkDev vault graph JSON; pending CONTRACTS row" }],
@@ -87,6 +92,9 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["PreviewOutcome", { reason: "devmap preview batch; pending CONTRACTS row" }],
   ["RepoMapLoad", { reason: "repo map panel load; pending CONTRACTS row" }],
   ["SearchHit", { reason: "MarkDev / vault search hit; pending CONTRACTS row" }],
+  ["SecretsReport", { reason: "mirrored in src/lib/secrets/types.ts — pending CONTRACTS row" }],
+  ["MergeTeardownResult", { reason: "worktree merge-teardown result; mirrored in src/lib/branches/types.ts" }],
+  ["ReflinkResult", { reason: "worktree CoW clone result; mirrored in src/lib/branches/types.ts" }],
   ["SyntaxHighlightSpan", { reason: "syntax highlight IPC; pending CONTRACTS row" }],
   ["ToolConfigView", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["ToolsStatus", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
@@ -96,6 +104,7 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["WorkspaceSearchResult", { reason: "workspace registry IPC; pending CONTRACTS row" }],
   ["WorkspaceSnapshot", { reason: "workspace registry IPC; pending CONTRACTS row" }],
   ["WorkspaceUnregisterResult", { reason: "workspace registry IPC; pending CONTRACTS row" }],
+  ["WorktreeRouteInfo", { reason: "worktree route scanner result; mirrored in src/lib/branches/types.ts" }],
 ]);
 
 /**

@@ -293,9 +293,9 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    // 231 since cmd_agent_defaults and cmd_agent_defaults_save; `npm run check:ipc` prints all three
+    // 241 since deadbranch commands; `npm run check:ipc` prints all three
     // numbers, so a bump made without re-running it will not agree.
-    expect(found.size).toBe(231);
+    expect(found.size).toBe(241);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

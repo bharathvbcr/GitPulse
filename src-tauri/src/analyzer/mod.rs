@@ -1,3 +1,4 @@
+pub mod cargo_supply;
 pub mod conventional;
 pub mod coverage;
 pub mod deps;

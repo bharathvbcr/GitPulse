@@ -903,7 +903,10 @@ pub async fn cmd_delete_branch(
     off_thread(move || {
         let flag = if force { "-D" } else { "-d" };
         let policy = guard(&repo_path, &["git", "branch", flag, branch_name.as_str()])?;
-        GitWriter::delete_branch(&repo_path, &branch_name, force)?;
+        // Tip is journalled inside delete_branch as ledger before_ref; callers
+        // that still hold the name (sidebar toast / cleanup candidate) restore
+        // with create_branch and do not need the SHA on this wire.
+        let _tip = GitWriter::delete_branch(&repo_path, &branch_name, force)?;
         Ok(Guarded { policy, output: () })
     })
     .await
@@ -922,6 +925,65 @@ pub async fn cmd_rename_branch(
         )?;
         GitWriter::rename_branch(&repo_path, &old_name, &new_name)?;
         Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_deadbranch_scan(
+    repo_path: String,
+    config: Option<crate::engine::deadbranch::DeadbranchConfig>,
+) -> Result<crate::engine::deadbranch::DeadbranchScanResult, String> {
+    off_thread(move || {
+        let conf = config.unwrap_or_default();
+        crate::engine::deadbranch::scan_stale_branches(&repo_path, &conf)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_deadbranch_clean(
+    repo_path: String,
+    branches: Vec<String>,
+    force: bool,
+    create_backup: bool,
+) -> Result<Guarded<crate::engine::deadbranch::DeadbranchCleanResult>, String> {
+    off_thread(move || {
+        let flag = if force { "-D" } else { "-d" };
+        let policy = guard(
+            &repo_path,
+            &["git", "branch", flag, "deadbranch:batch_clean"],
+        )?;
+        let result =
+            crate::engine::deadbranch::clean_branches(&repo_path, &branches, force, create_backup)?;
+        Ok(Guarded {
+            policy,
+            output: result,
+        })
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_deadbranch_list_backups(
+    repo_path: String,
+) -> Result<Vec<crate::engine::deadbranch::DeadbranchBackupInfo>, String> {
+    off_thread(move || crate::engine::deadbranch::list_backups(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_deadbranch_restore(
+    repo_path: String,
+    backup_path: String,
+    branches: Option<Vec<String>>,
+) -> Result<Guarded<crate::engine::deadbranch::DeadbranchRestoreResult>, String> {
+    off_thread(move || {
+        let policy = guard(&repo_path, &["git", "branch", "deadbranch:restore"])?;
+        let result = crate::engine::deadbranch::restore_backup(&repo_path, &backup_path, branches)?;
+        Ok(Guarded {
+            policy,
+            output: result,
+        })
     })
     .await
 }
@@ -1227,6 +1289,15 @@ pub async fn cmd_get_file_coverage(
 #[tauri::command(async)]
 pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport, String> {
     off_thread(move || DepsScanner::scan(&repo_path)).await
+}
+
+/// On-demand Kingfisher secrets scan of the working tree.
+///
+/// Kingfisher stdout is parsed in memory and dropped — never logged. A missed
+/// or truncated scan returns `ok: false` and is never implied clean.
+#[tauri::command(async)]
+pub async fn cmd_scan_secrets(repo_path: String) -> Result<crate::secrets::SecretsReport, String> {
+    off_thread(move || crate::secrets::scan_secrets(&repo_path)).await
 }
 
 /// Full disk-usage scan of the repository (git internals, build/cache
@@ -2122,6 +2193,7 @@ pub async fn cmd_add_worktree(
     new_branch: Option<String>,
     start_point: Option<String>,
     detach: bool,
+    cow_caches: Option<bool>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let argv_owned = crate::engine::worktree::add_worktree_argv(
@@ -2132,12 +2204,14 @@ pub async fn cmd_add_worktree(
         );
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
-        let created = crate::engine::worktree::add_worktree(
+        let cow = cow_caches.unwrap_or(false);
+        let created = crate::engine::worktree::add_worktree_extended(
             &repo_path,
             &target_path,
             new_branch.as_deref(),
             start_point.as_deref(),
             detach,
+            cow,
         )?;
         Ok(Guarded {
             policy,
@@ -2204,6 +2278,114 @@ pub async fn cmd_prune_worktree(repo_path: String) -> Result<Guarded<()>, String
         let policy = guard(&repo_path, &refs)?;
         crate::engine::worktree::prune_worktree(&repo_path)?;
         Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+/// Merges a worktree branch into target_branch (defaulting to main), tears down
+/// the worktree cleanly, and prunes the merged branch.
+#[tauri::command(async)]
+pub async fn cmd_worktree_merge_teardown(
+    repo_path: String,
+    worktree_path: String,
+    target_branch: Option<String>,
+    squash: Option<bool>,
+) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
+    off_thread(move || {
+        let is_squash = squash.unwrap_or(false);
+        let branch = target_branch.as_deref().unwrap_or("main");
+        let argv_owned = crate::engine::worktree::merge_teardown_argv(branch, is_squash);
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let result = crate::engine::worktree::merge_and_teardown_worktree(
+            &repo_path,
+            &worktree_path,
+            target_branch.as_deref(),
+            is_squash,
+        )?;
+        Ok(Guarded {
+            policy,
+            output: result,
+        })
+    })
+    .await
+}
+
+/// Reflink-copies standard ignored build caches from anchor to target worktree.
+#[tauri::command(async)]
+pub async fn cmd_worktree_cow_sync(
+    repo_path: String,
+    target_path: String,
+) -> Result<Vec<crate::engine::cow_clone::ReflinkResult>, String> {
+    off_thread(move || {
+        let repo = crate::engine::validate_repo(&repo_path)?;
+        let target = std::path::Path::new(&target_path);
+        crate::engine::cow_clone::reflink_ignored_caches(&repo, target)
+    })
+    .await
+}
+
+/// Discovers live portless and localhost dev server routes for a worktree.
+#[tauri::command(async)]
+pub async fn cmd_worktree_routes(
+    worktree_path: String,
+    branch: Option<String>,
+) -> Result<Vec<crate::engine::portless::WorktreeRouteInfo>, String> {
+    off_thread(move || {
+        Ok(crate::engine::portless::detect_worktree_routes(
+            &worktree_path,
+            branch.as_deref(),
+        ))
+    })
+    .await
+}
+
+/// Provides a high-density 1-line diff & status summary of a worktree.
+#[tauri::command(async)]
+pub async fn cmd_worktree_ai_summary(
+    repo_path: String,
+    worktree_path: String,
+    branch: Option<String>,
+) -> Result<String, String> {
+    off_thread(move || {
+        let wt = std::path::Path::new(&worktree_path);
+        if !wt.exists() {
+            return Err("Worktree path does not exist".to_string());
+        }
+        let diff_stat = crate::engine::worktree::measure_diff_stat(wt);
+        let repo = crate::engine::validate_repo(&repo_path).ok();
+        let divergence = repo
+            .as_ref()
+            .and_then(|r| crate::engine::worktree::measure_main_divergence(r, branch.as_deref()));
+        let log_out = git_text(wt, &["log", "-1", "--pretty=%s"]).unwrap_or_default();
+        let last_msg = log_out.trim();
+
+        let mut parts = Vec::new();
+        if let Some(stat) = diff_stat {
+            if stat.files_changed > 0 {
+                parts.push(format!(
+                    "HEAD±: {} files (+{}, -{})",
+                    stat.files_changed, stat.insertions, stat.deletions
+                ));
+            } else {
+                parts.push("HEAD±: clean".to_string());
+            }
+        }
+        if let Some(div) = divergence {
+            if div.ahead > 0 || div.behind > 0 {
+                parts.push(format!("main↕: +{} -{}", div.ahead, div.behind));
+            } else {
+                parts.push("main↕: synced".to_string());
+            }
+        }
+        if !last_msg.is_empty() {
+            parts.push(format!("tip: \"{last_msg}\""));
+        }
+        if parts.is_empty() {
+            Ok("Worktree clean".to_string())
+        } else {
+            Ok(parts.join(" · "))
+        }
     })
     .await
 }
@@ -3666,6 +3848,21 @@ pub async fn cmd_codeintel_search(
     token_budget: Option<u32>,
 ) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelSymbolHit>, String> {
     off_thread(move || Ok(crate::codeintel::search(&repo_path, &query, token_budget))).await
+}
+
+/// Bounded symbols-in-file span read for one path at a named head SHA.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_symbols_for_file(
+    repo_path: String,
+    file_path: String,
+    head_sha: String,
+) -> Result<crate::codeintel::CodeintelFileSymbols, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::symbols_for_file(
+            &repo_path, &file_path, &head_sha,
+        ))
+    })
+    .await
 }
 
 /// Blast radius and impact graph for a symbol or file.

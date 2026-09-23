@@ -1143,6 +1143,15 @@
       >
         <Tag size={12} />
       </button>
+      <button
+        type="button"
+        onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:branch-cleanup"))}
+        title="Clean stale branches (Deadbranch)"
+        aria-label="Clean stale branches"
+        class="p-1 rounded-full hover:bg-surfaceHover hover:text-emerald-400 text-textMuted transition-colors"
+      >
+        <Sparkles size={12} />
+      </button>
     </div>
   </div>
 

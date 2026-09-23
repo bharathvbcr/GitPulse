@@ -20,6 +20,65 @@ export interface BranchInfo {
   compared_to?: string | null;
 }
 
+export interface DeadbranchConfig {
+  days_threshold?: number;
+  protected_branches?: string[];
+  exclude_patterns?: string[];
+  include_remote?: boolean;
+  merged_only?: boolean;
+  check_squash?: boolean;
+}
+
+export type DeadbranchSeverity = "fresh" | "moderate" | "stale";
+
+export interface StaleBranchInfo {
+  name: string;
+  short_name: string;
+  age_days: number;
+  severity: DeadbranchSeverity;
+  is_merged: boolean;
+  merged_by_tree: boolean;
+  is_remote: boolean;
+  is_protected: boolean;
+  is_wip: boolean;
+  is_current_or_worktree: boolean;
+  last_commit_sha: string;
+  last_commit_timestamp: number;
+  last_author: string;
+  last_summary: string;
+}
+
+export interface DeadbranchScanResult {
+  default_branch: string;
+  branches: StaleBranchInfo[];
+  total_scanned: number;
+  stale_count: number;
+  merged_count: number;
+  squash_merged_count: number;
+  warnings: string[];
+}
+
+export interface DeadbranchCleanResult {
+  deleted: string[];
+  failed: [string, string][];
+  backup_path: string | null;
+  message: string;
+}
+
+export interface DeadbranchBackupInfo {
+  filename: string;
+  path: string;
+  timestamp: number;
+  branch_count: number;
+  repo_name: string;
+}
+
+export interface DeadbranchRestoreResult {
+  restored: string[];
+  failed: [string, string][];
+  message: string;
+}
+
 export interface TagInfo {
   name: string;
   commit_id: string;
@@ -133,6 +192,26 @@ export interface ReflogEntry {
   timestamp: number;
 }
 
+export interface WorktreeDiffStat {
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+}
+
+export interface WorktreeDivergence {
+  ahead: number;
+  behind: number;
+}
+
+export interface WorktreeRouteInfo {
+  hostname: string;
+  port: number;
+  url: string;
+  is_portless: boolean;
+  is_listening: boolean;
+  pid: number | null;
+}
+
 /** One linked worktree, as reported by `git worktree list --porcelain`. */
 export interface WorktreeInfo {
   path: string;
@@ -145,4 +224,25 @@ export interface WorktreeInfo {
   is_locked: boolean;
   is_prunable: boolean;
   dirty_files: number | null;
+  diff_stat: WorktreeDiffStat | null;
+  main_divergence: WorktreeDivergence | null;
+  active_routes: WorktreeRouteInfo[];
 }
+
+export interface MergeTeardownResult {
+  merged_branch: string;
+  target_branch: string;
+  commits_merged: number;
+  worktree_removed: boolean;
+  branch_deleted: boolean;
+}
+
+export interface ReflinkResult {
+  source: string;
+  destination: string;
+  files_cloned: number;
+  bytes_cloned: number;
+  is_cow: boolean;
+  duration_ms: number;
+}
+

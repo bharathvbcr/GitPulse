@@ -74,6 +74,7 @@ export function skippedAudits(report: DepsHealthReport): string[] {
     skipped.push("npm audit/outdated");
   }
   if (!report.cargo_audit_present && has("Cargo.lock")) skipped.push("cargo-audit");
+  if (!report.cargo_deny_present && has("deny.toml")) skipped.push("cargo-deny");
   if (
     !report.pip_audit_present &&
     files.some((f) => {
@@ -103,6 +104,9 @@ export const AUDIT_FAILURE_LABELS: Readonly<Record<string, string>> = Object.fre
   audit_cwd: "audit path validation",
   audit_failed: "npm audit",
   cargo_audit_failed: "cargo-audit",
+  cargo_deny_failed: "cargo-deny",
+  cargo_crev_failed: "cargo-crev",
+  cargo_audit_bin_failed: "cargo audit bin",
   pip_audit_failed: "pip-audit",
   govulncheck_failed: "govulncheck",
   composer_audit_failed: "composer audit",

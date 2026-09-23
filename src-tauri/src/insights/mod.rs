@@ -5,6 +5,13 @@
 //! a check that did not run must never look like one that ran and found
 //! nothing. Nothing here mutates a repository.
 
+mod entity_collision;
+
+pub use entity_collision::{
+    classify_overlapping_path, classify_party_symbols, parse_old_side_ranges,
+    symbols_touching_ranges, EntityCollisionKind, EntityCollisionVerdict, LineRange,
+};
+
 use crate::codeintel::{self, CodeintelStatus};
 use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
@@ -137,6 +144,10 @@ pub struct CollisionParty {
 pub struct CollisionItem {
     pub path: String,
     pub worktrees: Vec<CollisionParty>,
+    /// Symbol classification for this path. Populated only for the first
+    /// overlapping row after the porcelain scan — never inside that scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<EntityCollisionVerdict>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1233,7 +1244,11 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
     let mut items: Vec<CollisionItem> = by_path
         .into_iter()
         .filter(|(_, parties)| parties.len() > 1)
-        .map(|(path, worktrees)| CollisionItem { path, worktrees })
+        .map(|(path, worktrees)| CollisionItem {
+            path,
+            worktrees,
+            entity: None,
+        })
         .collect();
     items.sort_by(|a, b| a.path.cmp(&b.path));
     let overlapping_files = items.len() as u32;
@@ -1272,9 +1287,13 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
 }
 
 /// Overlapping dirty files across worktrees of `repo_path`.
+///
+/// The porcelain path scan stays bounded and cheap. Symbol classification runs
+/// afterwards on the first overlapping path only — see
+/// [`entity_collision::enrich_first_item`].
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
     match worktree::list_worktrees(repo_path) {
-        Ok(list) => collision_from_list(&list),
+        Ok(list) => entity_collision::enrich_first_item(collision_from_list(&list)),
         Err(error) => empty_collisions(error),
     }
 }
@@ -1734,6 +1753,50 @@ mod tests {
             .flat_map(|i| i.worktrees.iter())
             .find(|p| p.agent_kind == "claude");
         assert!(agent.is_some(), "agent worktree must be labelled: {risk:?}");
+        // Symbol classification runs on the first overlapping path *after*
+        // the porcelain scan — the row must carry a verdict (typically
+        // file_level here: no DevMap store in the fixture).
+        let first = risk.items.first().expect("at least one overlap");
+        let entity = first.entity.as_ref().expect("first overlap is classified");
+        assert_eq!(entity.path, first.path);
+        assert!(
+            matches!(
+                entity.kind,
+                EntityCollisionKind::FileLevel
+                    | EntityCollisionKind::DisjointSymbols
+                    | EntityCollisionKind::SharedSymbol
+            ),
+            "{entity:?}"
+        );
+    }
+
+    #[test]
+    fn porcelain_collision_scan_does_not_embed_entity_verdicts() {
+        // `collision_from_list` is the porcelain path scan. Enrichment is a
+        // separate pass — putting git-diff or index opens inside the scan
+        // would fight its bound.
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::create_dir_all(main.path().join(".claude/worktrees")).unwrap();
+        let wt = main.path().join(".claude/worktrees/session-b");
+        worktree::add_worktree(
+            repo,
+            wt.to_str().unwrap(),
+            Some("agent/session-b"),
+            Some("main"),
+            false,
+        )
+        .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
+        fs::write(main.path().join("shared.txt"), "main-edit").unwrap();
+        fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
+
+        let list = worktree::list_worktrees(repo).expect("list");
+        let scanned = collision_from_list(&list);
+        assert!(
+            scanned.items.iter().all(|item| item.entity.is_none()),
+            "porcelain scan must leave entity unset: {scanned:?}"
+        );
     }
 
     #[test]

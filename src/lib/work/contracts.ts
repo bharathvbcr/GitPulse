@@ -87,6 +87,14 @@ export function validateWorkResponse(command: string, value: unknown): void {
         list(risk.items, entry => {
           const item = fields(entry, ["path"]);
           list(item.worktrees, party => { const p = fields(party, ["path", "agent_kind"]); nullableText(p.branch); });
+          if (item.entity != null) {
+            const entity = fields(item.entity, ["path", "kind", "reason"]);
+            const kind = String(entity.kind);
+            if (!["shared_symbol", "disjoint_symbols", "file_level"].includes(kind)) {
+              throw new Error(`unknown entity kind: ${kind}`);
+            }
+            list(entity.shared_symbols ?? [], (name) => { if (typeof name !== "string") throw new Error("shared_symbols entry"); });
+          }
         });
         break;
       }

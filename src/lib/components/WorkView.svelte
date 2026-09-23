@@ -611,6 +611,20 @@
           {/if}
         </span>
       </div>
+      {#if collisions.items[0]?.entity}
+        {@const entity = collisions.items[0].entity}
+        <p class="mt-1.5 ml-6">
+          {#if entity.kind === "shared_symbol"}
+            Shared symbol{entity.shared_symbols.length === 1 ? "" : "s"} on {entity.path}:
+            {entity.shared_symbols.join(", ") || "unknown"} — real collision when these branches meet.
+          {:else if entity.kind === "disjoint_symbols"}
+            {entity.path}: same file, distinct symbols on the old-side ranges — file overlap, not a merge promise.
+          {:else}
+            {entity.path}: file-level overlap
+            {entity.reason ? ` (${entity.reason})` : ""}.
+          {/if}
+        </p>
+      {/if}
       {#if collisions.failed_worktrees > 0 || collisions.unscanned_worktrees > 0 || collisions.truncated}
         <p class="mt-1">{collisions.scanned_worktrees} scanned · {collisions.failed_worktrees} failed · {collisions.unscanned_worktrees} unscanned{collisions.truncated ? " · results truncated" : ""}</p>
       {/if}

@@ -14,6 +14,7 @@ describe("modal accessible-name contract", () => {
     ["CommandPalette.svelte", "command-palette-title"],
     ["SettingsModal.svelte", "settings-modal-title"],
     ["QuickEnhanceSheet.svelte", "quick-enhance-title"],
+    ["BranchCleanupModal.svelte", "deadbranch-title"],
   ])("gives %s a title referenced by its dialog", (file, titleId) => {
     const text = source(file);
     expect(text).toContain(`aria-labelledby="${titleId}"`);

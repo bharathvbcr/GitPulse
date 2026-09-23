@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Upload, Wrench, X } from "@lucide/svelte";
+import { Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type RepoState } from "../stores/repoStore";
 import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -114,6 +114,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "pull", label: "Pull (fast-forward)", category: "Git actions", icon: Download, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.pull() },
     { id: "push", label: "Push Current Branch", category: "Git actions", icon: Upload, disabledReason: unavailable ?? (!state.currentBranch ? "Check out a branch first." : undefined), action: () => repoStore.push() },
     { id: "rebase", label: "Interactive Rebase…", description: "Open the rebase planner to review commits before applying changes", category: "Git actions", icon: GitBranch, closeBefore: true, disabledReason: worktree ?? (!state.currentBranch ? "Check out a branch first." : !host.onRebase ? "The rebase planner is unavailable in this window." : undefined), action: () => host.onRebase?.() },
+    { id: "clean_branches", label: "Clean Stale / Dead Branches…", description: "Identify and safely prune merged and stale branches with deadbranch", category: "Git actions", icon: Trash2, closeBefore: true, disabledReason: unavailable, action: () => dispatch("gitpulse:branch-cleanup") },
     { id: "stash", label: "Stash Working Tree", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.statuses.length ? undefined : "The working tree is clean."), action: () => repoStore.stashSave() },
     { id: "stash_pop", label: "Pop Stash", description: state.stashEntries[0]?.subject ?? "Apply and remove the latest stash", category: "Git actions", icon: Layers, disabledReason: worktree ?? (state.stashFailed ? "Stash status is unavailable. Refresh first." : !state.stashEntries.length ? "No stash entries in this repository." : undefined), action: () => repoStore.stashPop() },
     ...views,

@@ -14,7 +14,7 @@ flowchart TD
     subgraph Boundary["Security & Isolation Boundary"]
         direction TB
         Webview["Tauri Webview<br/>(Strict CSP: default-src 'self')"]
-        IPCBoundary["Tauri IPC Seam<br/>(231 Policy-Checked Custom cmd_* Handlers)"]
+        IPCBoundary["Tauri IPC Seam<br/>(241 Policy-Checked Custom cmd_* Handlers)"]
         LocalEngine["Rust Core Engine<br/>(Validated paths, git sandbox & policy gates)"]
         
         Webview -->|Typed IPC Only| IPCBoundary
