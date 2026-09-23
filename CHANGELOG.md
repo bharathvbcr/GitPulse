@@ -13,6 +13,50 @@ before that tag is pushed.
 
 Nothing yet.
 
+## [1.3.5] - 2026-09-23
+
+Stale-branch cleanup with backups, a redacted secret scan, worktree cache
+sync and named local routes, symbol-level collision notes, and supply-chain
+checks beside cargo audit.
+
+### Added
+
+- **Dead-branch cleanup.** Scan local and remote branches for age, protection,
+  work-in-progress names, ancestry merges, and squash or rebase merges
+  (`git merge-tree`). Cleaning writes a restorable tip backup first and
+  records it in the ledger. Restore puts those tips back.
+- **Secrets panel.** An optional Kingfisher scan for the Insights Secrets
+  section. Findings keep rule, path, and line only. Secret-bearing fields are
+  dropped, stdout is not logged, and a missed or truncated scan is reported
+  as not clean.
+- **Worktree copy-on-write cache sync.** Missing build caches (`node_modules`,
+  `target`, `.venv`, and the other standard cache directories) can be cloned
+  from the anchor checkout with APFS clonefile, Linux `FICLONE`, or a bounded
+  copy when copy-on-write is unavailable.
+- **Worktree routes.** When portless is running, a worktree is matched to its
+  named localhost URL. Otherwise the worktree gets a stable port derived from
+  its name.
+- **Worktree lifecycle hooks.** Trusted repositories can declare
+  `post_create`, `pre_merge`, and `post_merge` commands in
+  `.gitpulse/hooks.toml`. Untrusted checkouts refuse to run them.
+- **Symbol-level collision notes.** After the path collision scan names an
+  overlapping file, DevMap symbol spans say whether the two sides touch the
+  same symbol or only the same file. A missing or stale index stays a
+  file-level notice.
+- **Diff symbol groups.** Unified-diff hunks can be grouped under the symbols
+  declared in that file.
+- **Supply-chain parsers** for `cargo deny` SARIF and `cargo crev` JSONL,
+  reported next to `cargo audit` in dependency health.
+- **npm dependency updates** for lucide, the Tauri CLI, Svelte, Vitest
+  coverage, and `@types/node`.
+
+### Fixed
+
+- **Branch-list health no longer claims a squash-merge flag the list does not
+  send.** Squash and rebase detection stays on the dead-branch scan, which is
+  the path that runs `git merge-tree`. The fast branch list remains a single
+  `for-each-ref`.
+
 ## [1.3.1] - 2026-09-22
 
 Fixes and visual polish for code navigation, viewer layout scaling, and tooltip placement.
