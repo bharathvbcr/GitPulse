@@ -4,13 +4,17 @@ Mutating Git (commit, push, rebase, branch delete, worktree prune, …) is evalu
 
 ```mermaid
 flowchart TD
-    Action["User or UI requests a mutation"] --> Gate["guard_command / guard_file"]
-    Gate --> Harness["manvi serve"]
-    Harness -->|Allowed| Run["Execute"]
-    Harness -->|Demoted| RunSafe["Execute safer variant"]
-    Harness -->|Warned| RunWarn["Execute, warning logged"]
-    Harness -->|Blocked| Refuse["Refuse, explain"]
-    Harness -->|Unchecked| RunUnchecked["Execute with explicit unchecked status"]
+    subgraph MutationFlow["Mutating Action Evaluation"]
+        Action["User or UI requests Git mutation"] --> Grants{"Local Grant Active?<br/>(Overrides per task_id)"}
+        Grants -->|Yes| RunFast["Execute with active grant record"]
+        Grants -->|No| Gate["guard_command / guard_file"]
+        Gate --> Harness["manvi serve (NDJSON stdio)"]
+        Harness -->|Allowed| Run["Execute command"]
+        Harness -->|Demoted| RunSafe["Execute safer variant"]
+        Harness -->|Warned| RunWarn["Execute & log warning"]
+        Harness -->|Blocked| Refuse["Refuse action & render explanation"]
+        Harness -->|Unchecked| RunUnchecked["Execute with explicit unchecked record"]
+    end
 ```
 
 ## Verdict ladder
@@ -28,6 +32,29 @@ Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI d
 ## Local AI
 
 Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go to a **loopback** OpenAI-compatible server: Ollama, LM Studio, llama.cpp, vLLM. Remote URLs are rejected. See [[Security]].
+
+```mermaid
+flowchart LR
+    subgraph GitPulseCore["GitPulse Desktop"]
+        UIComp["Commit / Review / Health Suggestion"]
+        PromptPrep["Harness prompt preparation & token limits"]
+        ActionRunner["cmd_manvi_run_action<br/>(argv allowlist, no shell)"]
+    end
+
+    subgraph LoopbackAI["Local Loopback AI (127.0.0.1 Only)"]
+        Ollama["Ollama / LM Studio / llama.cpp"]
+    end
+
+    subgraph TerminalIsolation["Isolated Agent PTYs"]
+        DockPTY["Dedicated Terminal Session<br/>(Claude Code, Codex, Custom)"]
+    end
+
+    UIComp --> PromptPrep
+    PromptPrep -->|OpenAI-compatible HTTP| Ollama
+    Ollama -->|Completions| UIComp
+    UIComp --> ActionRunner
+    UIComp -.->|Explicit handoff only| DockPTY
+```
 
 Suggested remediation scripts run only through `cmd_manvi_run_action`: a purpose-limited argv allowlist (npm, cargo, pytest, go, swift, dart, …), no shell string, explicit confirmation, hard timeout and capped output.
 

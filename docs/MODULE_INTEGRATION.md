@@ -29,6 +29,86 @@ The module owner implements behavior once. Host adapters translate their UI or
 transport types; they do not copy policy decisions, schema migrations, parsers
 or HTML assets into independent implementations.
 
+```mermaid
+flowchart TD
+    subgraph DevCouncil["DevCouncil (Components & Modules)"]
+        direction TB
+        DCLibs["Rust Libraries:<br/><code>devmap-store</code> · <code>devmap-query</code><br/><code>devmap-resolve</code> · <code>dc-store</code> · <code>dc-verify</code>"]
+        DCCLI["Process Tools:<br/><code>devmap</code> CLI (build, search, impact, explore)<br/><code>devmap serve</code> (background watcher daemon)"]
+    end
+
+    subgraph Manvi["Manvi (Wrap & Harness)"]
+        direction TB
+        ManviWrap["Go Embedding & Harness Wrap"]
+        ManviSidecar["<code>manvi serve --posture host</code> (NDJSON stdio)"]
+        ManviPolicy["Policy Evaluation Engine (5-verdict ladder)"]
+        ManviWorkbench["Workbench API wrap of <code>dc-store</code>"]
+        ManviAgents["Managed Agent Hosting (Claude Code · Codex)"]
+        ManviWrap --> ManviSidecar
+        ManviSidecar --> ManviPolicy
+        ManviSidecar --> ManviWorkbench
+        ManviSidecar --> ManviAgents
+    end
+
+    subgraph GitPulseHost["GitPulse Desktop Host"]
+        direction TB
+        UIHost["Svelte 5 UI (Work · Code · History · Insights)"]
+        RustIPC["Rust Core (231 Handlers, Tauri 2 IPC)"]
+        InProcessReaders["In-process Vendored Readers<br/>(<code>src-tauri/vendored/</code>)"]
+        CLIGate["Live Indexing Gate & Daemon Probe<br/>(<code>src-tauri/src/devmap/</code>)"]
+        HarnessClient["Harness Client & Grants<br/>(<code>src-tauri/src/harness/</code>)"]
+        WorkbenchCmd["Workbench Bridge<br/>(<code>src-tauri/src/commands/workbench.rs</code>)"]
+
+        UIHost --> RustIPC
+        RustIPC --> InProcessReaders
+        RustIPC --> CLIGate
+        RustIPC --> HarnessClient
+        RustIPC --> WorkbenchCmd
+    end
+
+    DCLibs -.->|Vendored Path Deps| InProcessReaders
+    DCCLI <-->|CLI build/search & socket probe| CLIGate
+    DCLibs -.->|Wrapped by Manvi| ManviWorkbench
+    ManviSidecar <-->|NDJSON Stdio v1 protocol| HarnessClient
+    ManviSidecar <-->|cmd_workbench_request| WorkbenchCmd
+```
+
+### Integration Sequence: Policy & Workbench
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Svelte 5 UI
+    participant Rust as GitPulse Rust Core
+    participant Manvi as manvi serve (Sidecar)
+    participant DevCouncil as dc-store / DevMap
+    participant Git as Git Engine / CLI
+
+    Note over UI,Manvi: 1. Policy Gate Evaluation (Mutating Git Actions)
+    UI->>Rust: Request mutation (commit, push, rebase)
+    Rust->>Rust: Evaluate local policy grants
+    alt No cached grant
+        Rust->>Manvi: NDJSON request (guard_command / guard_file)
+        Manvi->>Manvi: Evaluate 5-stage policy safety ladder
+        Manvi-->>Rust: Verdict (Allowed · Demoted · Warned · Blocked · Unchecked)
+    end
+    alt Blocked
+        Rust-->>UI: Refusal & rationale
+    else Allowed / Demoted / Warned / Unchecked
+        Rust->>Git: Execute command / sanitized variant
+        Git-->>Rust: Execution output
+        Rust-->>UI: Success & ledger event
+    end
+
+    Note over UI,DevCouncil: 2. Profile Workbench & Tasks
+    UI->>Rust: cmd_workbench_request (Tasks / Briefs CRUD)
+    Rust->>Manvi: Dispatch workbench operation
+    Manvi->>DevCouncil: Read / Write dc-store workbench database
+    DevCouncil-->>Manvi: Revisions, receipts & membership
+    Manvi-->>Rust: Typed response payload
+    Rust-->>UI: Reactive store update
+```
+
 ## Integrate or replace a module
 
 For a Rust host, a dependency declaration selects the existing query library:
@@ -139,6 +219,24 @@ instead of reporting zero indexed. The sweep never claims the whole fleet when
 it did part of it: the summary carries both numbers whenever they differ.
 
 ## Where a `devmap serve` daemon is running, the gate stands down
+
+```mermaid
+flowchart TD
+    RepoOpen["Repository Opened / Tab Focused"] --> IgnoreCheck["1. Exclude Hygiene:<br/>Ensure .devmap/ in $GIT_COMMON_DIR/info/exclude"]
+    IgnoreCheck --> ProbeSocket["2. Probe Daemon Socket:<br/>Path from devmap serve --print-socket-path"]
+    
+    ProbeSocket -->|Socket Connects & Pending > 0| StandDown["Daemon Active & Work Queued:<br/>Answer skip_daemon (Avoid 2nd writer lock)"]
+    ProbeSocket -->|Socket Absent or Idle| CheckCLI["3. Consult CLI Status:<br/>devmap status --json"]
+    
+    CheckCLI --> CheckArtifacts{"Are artifacts missing?<br/>(repo_map.json missing or rebuild_required?)"}
+    CheckArtifacts -->|Yes| BuildManifest["Run devmap build --manifest<br/>(Full rebuild + manifest generation)"]
+    CheckArtifacts -->|No, but stale| BuildDb["Run devmap build<br/>(Database-only incremental update)"]
+    CheckArtifacts -->|No, store is fresh| UpToDate["Index Current:<br/>Serve queries via in-process readers"]
+
+    BuildManifest --> UpToDate
+    BuildDb --> UpToDate
+    StandDown --> UpToDate
+```
 
 `devmap serve` watches the tree itself, enqueues what changed, and rebuilds
 inside its own process. Where one is serving, GitPulse's poll-and-build loop is

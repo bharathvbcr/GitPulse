@@ -7,30 +7,50 @@ GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 own
 ```mermaid
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
-        Views["4 views + Tasks + Fleet + terminal dock"]
-        Stores["Domain stores with injectable deps"]
-        Canvas["GPU canvas graph"]
-        Guards["Async cancellation guards"]
+        direction TB
+        Views["4 Views · 16 Sections<br/>(Work, Code, History, Insights)"]
+        Canvas["GPU Canvas Graph"]
+        Dock["Terminal Dock (portable-pty)"]
+        Stores["Domain Stores & SWR Cache"]
+        Guards["Async Cancellation Guards"]
+        Views --> Canvas
+        Views --> Dock
+        Views --> Stores --> Guards
     end
+
     subgraph IPC["Tauri 2 IPC"]
         Bridge["invoke('cmd_*') — 231 handlers, check:ipc"]
     end
-    subgraph Backend["Rust / Rayon"]
-        Git["Git sandbox"]
-        Graph["Lane solver"]
-        Analyzers["Coverage, health, LOC"]
-        Ledger["Event ledger"]
-        MCP["gitpulse-mcp"]
+
+    subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
+        direction TB
+        Git["Git Sandbox & CLI Reader"]
+        Graph["Topological Lane Solver"]
+        Analyzers["Coverage, Health & LOC Analyzers"]
+        Ledger["Event Ledger WAL"]
+        MCP["gitpulse-mcp & gitpulsed"]
+        DevMapSubsys["DevMap Query & Gate Subsystem"]
     end
-    subgraph Local["Your machine"]
-        GitCLI["git"]
-        GhCLI["gh"]
-        LLM["Local LLMs on loopback"]
-        Manvi["manvi serve (wraps DevCouncil)"]
-        DevCouncil["DevCouncil modules (devmap, selected crates)"]
+
+    subgraph Integrations["Modular Sidecars & Local Tools"]
+        direction TB
+        subgraph ManviBox["Manvi Harness"]
+            Manvi["manvi serve --posture host<br/>(5-verdict policy ladder & dc-store workbench)"]
+        end
+        subgraph DevCouncilBox["DevCouncil & DevMap"]
+            Vendored["Vendored Readers (devmap-store, devmap-query)"]
+            DevMapCLI["devmap CLI & daemon watcher socket"]
+        end
+        subgraph LocalBox["Local Host"]
+            LocalTools["git CLI · gh CLI · loopback LLMs"]
+        end
     end
-    Frontend --> Bridge --> Backend
-    Backend --> Local
+
+    Guards --> Bridge
+    Bridge --> Backend
+    Backend --> ManviBox
+    Backend --> DevCouncilBox
+    Backend --> LocalBox
 ```
 
 The 231-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `npm run check:ipc`.
@@ -63,6 +83,38 @@ There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/rep
 A `ViewTab` is stored on the **active repository's** session and its pane lives inside `{#key currentPath}`. Fleet answers a question about the **workspace**. If it were a view it would be scoped wrong and destroyed on every repo switch — taking the live terminal PTY with it.
 
 Fleet is swapped by **hiding, never unmounting**. Open state is a UI preference, not part of the persisted workspace blob.
+
+## DevCouncil, Manvi, and DevMap integration
+
+DevCouncil supplies components and modules, Manvi wraps them, and GitPulse integrates them through in-process readers, the CLI, and a background sidecar.
+
+```mermaid
+flowchart LR
+    subgraph DC["DevCouncil (Modules)"]
+        DCLib["Vendored crates<br/>(devmap-*, dc-*)"]
+        DCCLI["devmap CLI / serve"]
+    end
+    subgraph MV["Manvi (Wrap)"]
+        MVSidecar["manvi serve (NDJSON)"]
+        MVPolicy["Policy engine"]
+        MVWorkbench["dc-store wrap"]
+        MVPolicy --> MVSidecar
+        MVWorkbench --> MVSidecar
+    end
+    subgraph GP["GitPulse (Host)"]
+        Rust["Rust core (Tauri 2)"]
+        Gate["devmap gate & probe"]
+        Client["Harness client"]
+        UI["Svelte 5 frontend"]
+        Gate --> Rust
+        Client --> Rust
+        Rust --> UI
+    end
+
+    DCLib --> Rust
+    DCCLI <--> Gate
+    MVSidecar <--> Client
+```
 
 ## Headless binaries
 

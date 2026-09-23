@@ -16,11 +16,11 @@ updatable; this app takes only the subset it needs. See
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        UI["Views & Components<br/><code>src/lib/components/</code>"]
+        UI["Views & Components (16 Sections)<br/><code>src/lib/components/</code>"]
         Stores["State & Mutation Stores<br/><code>src/lib/stores/</code>"]
         Registry["View Registry & Routerless Nav<br/><code>src/lib/views/</code>"]
-        Canvas["Canvas 2D rendering<br/><code>src/lib/canvas/</code>"]
-        Async["Async Guards & Debounce<br/><code>src/lib/async/</code>"]
+        Canvas["Canvas 2D Rendering<br/><code>src/lib/canvas/</code>"]
+        Async["Async Guards & Cancellation<br/><code>src/lib/async/</code>"]
         
         UI --> Stores
         UI --> Canvas
@@ -31,7 +31,7 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["Contract Enforced by <code>check:ipc</code>"]
+        ContractCheck["231 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
@@ -39,7 +39,7 @@ flowchart TB
         direction TB
         CmdRegistry["Command Registry (231 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
-        subgraph Subsystems["Core + Control-Plane Subsystems"]
+        subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
             GraphSolver["Graph Solver & Nogap Bounds<br/><code>src-tauri/src/graph/</code>"]
             Analyzers["Analyzers (LOC, Coverage, Health)<br/><code>src-tauri/src/analyzer/</code>"]
@@ -47,9 +47,12 @@ flowchart TB
             OpsPlanner["Ops Planner & Releases<br/><code>src-tauri/src/ops.rs</code>"]
             PtyTerminal["PTY Lifecycle & Terminal<br/><code>src-tauri/src/terminal/</code>"]
             Grants["Policy Grants & Overrides<br/><code>src-tauri/src/grants/</code>"]
-            Ingest["Attribution Ingest<br/><code>src-tauri/src/ingest/</code>"]
             Ledger["Event Ledger & Provenance<br/><code>src-tauri/src/ledger/</code>"]
             MCP["MCP Read Surface<br/><code>src-tauri/src/mcp/</code>"]
+            HarnessBridge["Harness Policy Client<br/><code>src-tauri/src/harness/</code>"]
+            WorkbenchBridge["Workbench Command Bridge<br/><code>src-tauri/src/commands/workbench.rs</code>"]
+            DevmapSubsystem["DevMap Gate & Query Subsystem<br/><code>src-tauri/src/devmap/</code>"]
+            VendoredDevCouncil["Vendored DevCouncil Readers<br/><code>src-tauri/vendored/devmap-*</code>"]
         end
         
         CmdRegistry --> Subsystems
@@ -57,11 +60,18 @@ flowchart TB
 
     subgraph External["Local System & Sidecars"]
         direction TB
-        LocalGit["<code>git</code> CLI"]
-        LocalGh["<code>gh</code> CLI (GitHub)"]
-        LocalLLM["Local LLMs (Ollama / LM Studio)"]
-        ManviSidecar["Manvi wrap<br/>(<code>manvi serve</code> via stdio)"]
-        DevCouncilMods["DevCouncil modules<br/>(<code>devmap</code> CLI + selected crates)"]
+        subgraph ManviSidecar["Manvi Sidecar"]
+            ManviHost["<code>manvi serve --posture host</code><br/>(NDJSON stdio: policy ladder & workbench API)"]
+        end
+        subgraph DevCouncilExternal["DevCouncil Tools & Daemon"]
+            DevMapCLI["<code>devmap</code> CLI (build, search, impact)"]
+            DevMapDaemon["<code>devmap serve</code> (background watcher socket)"]
+        end
+        subgraph HostTools["Host Tools & Services"]
+            LocalGit["<code>git</code> CLI"]
+            LocalGh["<code>gh</code> CLI (GitHub)"]
+            LocalLLM["Local LLMs on Loopback (Ollama / LM Studio)"]
+        end
     end
 
     Async --> Invoke
@@ -71,9 +81,11 @@ flowchart TB
     Analyzers --> LocalGh
     Analyzers --> LocalLLM
     OpsPlanner --> LocalGh
-    OpsPlanner --> ManviSidecar
-    Subsystems --> ManviSidecar
-    Subsystems --> DevCouncilMods
+    HarnessBridge <-->|NDJSON Stdio| ManviHost
+    WorkbenchBridge <-->|IPC request| ManviHost
+    DevmapSubsystem <-->|CLI invocations| DevMapCLI
+    DevmapSubsystem <-->|Socket probe| DevMapDaemon
+    VendoredDevCouncil -.->|In-process read| DevmapSubsystem
 ```
 
 ---
@@ -240,6 +252,17 @@ classDiagram
         +prepare_prompt()
         +settle_reply()
     }
+    class WorkbenchStore {
+        +cmd_workbench_request()
+        +read_profile_briefs()
+        +sync_task_records()
+    }
+    class DevMapSubsystem {
+        +devmap_status()
+        +devmap_query()
+        +devmap_build()
+        +preview_blast_radius()
+    }
 
     CommandRegistry --> GitEngine
     CommandRegistry --> GraphSolver
@@ -251,6 +274,41 @@ classDiagram
     CommandRegistry --> IngestPipeline
     CommandRegistry --> LedgerStore
     CommandRegistry --> MCPServer
+    CommandRegistry --> WorkbenchStore
+    CommandRegistry --> DevMapSubsystem
+```
+
+### DevMap Code Intelligence Query Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Svelte 5 (Code Map / Suspects / Palette)
+    participant IPC as Tauri IPC (cmd_codeintel_*)
+    participant Subsystem as src-tauri/src/devmap/
+    participant Vendored as Vendored devmap-query (in-process)
+    participant Daemon as devmap serve (Socket)
+    participant CLI as devmap CLI (Process)
+
+    UI->>IPC: invoke("cmd_codeintel_search", { query, repo_path })
+    IPC->>Subsystem: Route to DevMap adapter
+    Subsystem->>Subsystem: Check store freshness & schema
+    alt In-process store is fresh and ready
+        Subsystem->>Vendored: Query local store (.devmap/store.db)
+        Vendored-->>Subsystem: Return symbol / graph results
+    else Store is stale or unindexed
+        Subsystem->>Daemon: Probe socket for queued indexing
+        alt Daemon actively building
+            Daemon-->>Subsystem: Return skip_daemon / pending
+        else No daemon running
+            Subsystem->>CLI: Spawn bounded devmap build --manifest
+            CLI-->>Subsystem: Generation committed & manifest written
+        end
+        Subsystem->>Vendored: Query newly committed store
+        Vendored-->>Subsystem: Return symbol / graph results
+    end
+    Subsystem-->>IPC: CodeintelSearchResponse
+    IPC-->>UI: Render interactive graph / suggestions
 ```
 
 ### Subsystem Responsibilities

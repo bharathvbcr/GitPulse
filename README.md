@@ -105,14 +105,46 @@ for code intelligence. Modules can be updated independently.
 
 ```mermaid
 flowchart TB
-    UI["Svelte frontend: views, stores, and canvas"] --> IPC["Tauri IPC contracts"]
-    subgraph Backend["Rust backend (Tauri 2 / Rayon)"]
-        Commands["Native command registry"] --> Git["Git operations and repository analysis"]
-        Commands --> Tasks["Tasks, terminal, and local state"]
+    subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
+        direction LR
+        Views["4 Views · 16 Sections<br/>(Work, Code, History, Insights)"]
+        Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
+        TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end
-    IPC --> Commands
-    Commands --> Manvi["Manvi: policy and agent hosting"]
-    Commands --> DevMap["DevCouncil modules: code intelligence"]
+
+    subgraph IPC["Tauri 2 IPC Seam"]
+        Bridge["invoke('cmd_*') — 231 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
+    end
+
+    subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
+        direction TB
+        GitEngine["Git Sandbox & CLI Reader"]
+        LaneSolver["Topological Lane Solver"]
+        Analyzers["Coverage, Health & LOC"]
+        Ledger["Durable WAL Event Ledger"]
+        Headless["Headless Binaries<br/>(gitpulse-mcp · gitpulsed · gitpulse-hook)"]
+    end
+
+    subgraph Integrations["Modular Integrations & Local Tools"]
+        direction TB
+        subgraph ManviWrap["Manvi (Wraps DevCouncil Modules)"]
+            ManviSidecar["manvi serve --posture host<br/>(5-verdict policy gate & workbench DB)"]
+        end
+        subgraph DevCouncilMods["DevCouncil & DevMap"]
+            Vendored["Vendored Readers<br/>(devmap-store, devmap-query, dc-store)"]
+            DevMapCLI["devmap CLI & daemon socket<br/>(build --manifest, search, impact)"]
+        end
+        subgraph LocalTools["Local Machine"]
+            CLI["git & gh CLI"]
+            LocalLLM["Loopback-Only LLMs<br/>(Ollama / LM Studio)"]
+        end
+    end
+
+    Frontend --> Bridge
+    Bridge --> Backend
+    Backend --> ManviWrap
+    Backend --> DevCouncilMods
+    Backend --> LocalTools
 ```
 
 See [architecture](docs/ARCHITECTURE.md) for ownership and contracts, and

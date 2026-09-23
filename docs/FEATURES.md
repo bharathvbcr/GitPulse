@@ -264,6 +264,24 @@ reading of the same open file. Sections switch from the segmented control
 
 DevCouncil's `devmap` module. GitPulse takes this component without requiring the rest of the DevCouncil suite, and updates it independently of the Manvi wrap.
 
+```mermaid
+flowchart TD
+    subgraph DevMapEngine["DevMap Architecture (Code → Map)"]
+        direction TB
+        Paths["Resolve State Paths<br/>(devmap paths --json)"] --> Status["Read Index Status<br/>(generation, freshness, schema)"]
+        Status --> Gate{"Artifacts or Schema Outdated?"}
+        Gate -->|Yes| BuildCLI["devmap build --manifest<br/>(Writes .devmap/store.db & repo_map.json)"]
+        Gate -->|No| Ready["Index Ready"]
+        BuildCLI --> Ready
+
+        Ready --> Projections["Graph & Metadata Projections"]
+        Projections --> Subsystems["Subsystems & Critical Files<br/>(repo_map.json)"]
+        Projections --> CanvasGraph["Interactive Code & Doc Graph<br/>(Canvas stack)"]
+        Projections --> Vault["Repo Docs Vault<br/>(Markdown search & backlink graph)"]
+        Projections --> CrossRepo["Cross-Repo Search & Links<br/>(workspace.json open tabs registry)"]
+    end
+```
+
 - **Repo map navigator**: Reads the `repo_map` path resolved by `devmap paths --json` (`.devmap/repo_map.json` by default, with legacy `.devcouncil` support) — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates. Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
 - **Code & doc graph canvas**: Renderer-agnostic payloads from DevMap viz / map-preview and the MarkDev doc graph, drawn on the shared canvas stack (not the commit-lane graph). The legend names node caps and truncation rather than implying the picture is the whole graph.
 - **Repo docs vault**: Built from `git ls-files` of markdown (git is the authority — no ignored / vendor walk). Full-text search, broken-link report, and backlinks in the markdown viewer. Caps and skips are reported on the status strip.
@@ -323,6 +341,29 @@ the commit you had just selected.
 - **Recovery Points**: Instant checkout or branch creation from detached reflog entries to recover discarded commits.
 
 ### 3.4 Suspects
+
+```mermaid
+flowchart LR
+    subgraph Input["Symptom Input"]
+        Symptom["Failing Symbol / Path<br/>+ Known-Good Base Ref"]
+    end
+
+    subgraph Analysis["DevMap + Git Analysis"]
+        Blame["Git Blame Window<br/>(Commits modifying symbol or path)"]
+        GraphSearch["DevMap Call Graph Traversal<br/>(Reachable callers & dependencies)"]
+        Ranker["dc-regress Ranking Engine<br/>(Score by graph proximity & churn)"]
+        Blame --> Ranker
+        GraphSearch --> Ranker
+    end
+
+    subgraph Output["History → Suspects"]
+        Results["Ranked Suspects List<br/>(Commit OID, Author, Evidence Chip)"]
+        DiffJump["Click Suspect → Jump to Unified/Split Diff"]
+        Ranker --> Results --> DiffJump
+    end
+
+    Input --> Analysis
+```
 
 - **Regression Suspects Finder**: Pinpoints which commit between a known-good ref and a failing commit could have caused a regression or affected a given symbol.
 - **Graph-Ranked Candidates**: Joins blame history with the DevMap code graph (`dc-regress` and `dc-regress-store`), ranking suspects by what the call graph actually reaches from the symptom rather than simple chronological recency.

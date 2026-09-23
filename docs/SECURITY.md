@@ -12,26 +12,35 @@ app needs.
 ```mermaid
 flowchart TD
     subgraph Boundary["Security & Isolation Boundary"]
+        direction TB
         Webview["Tauri Webview<br/>(Strict CSP: default-src 'self')"]
-        IPCBoundary["Tauri IPC Seam<br/>(Policy-Checked Custom cmd_* Handlers)"]
-        LocalEngine["Rust Core<br/>(Validated paths and command gates)"]
+        IPCBoundary["Tauri IPC Seam<br/>(231 Policy-Checked Custom cmd_* Handlers)"]
+        LocalEngine["Rust Core Engine<br/>(Validated paths, git sandbox & policy gates)"]
         
-        Webview -->|IPC Only| IPCBoundary
+        Webview -->|Typed IPC Only| IPCBoundary
         IPCBoundary --> LocalEngine
     end
 
-    subgraph ExternalSurfaces["External Surface Isolation"]
-        LocalGH["Local <code>gh</code> CLI<br/>(Uses existing local keychain)"]
-        LocalFB["Local <code>firebase</code> CLI<br/>(Uses existing local login)"]
-        LocalAI["Local LLM Server<br/>(Loopback 127.0.0.1 / localhost Only)"]
-        PTY["User Shell / Explicit Agent PTYs<br/>(Separate sessions)"]
+    subgraph SidecarIsolation["Local Sidecar & Module Boundaries"]
+        direction TB
+        ManviSidecar["Manvi Sidecar (manvi serve)<br/>(Stdio NDJSON, 5-verdict safety ladder)"]
+        DevMapGate["DevMap Engine<br/>(Local .devmap/ in $GIT_COMMON_DIR/info/exclude)"]
     end
 
+    subgraph ExternalSurfaces["External Surface Isolation"]
+        direction TB
+        LocalGH["Local gh CLI<br/>(Uses existing OS keychain)"]
+        LocalFB["Local firebase CLI<br/>(Uses existing local login)"]
+        LocalAI["Local LLM Server<br/>(Loopback 127.0.0.1 / localhost Only)"]
+        PTY["User Shell / Explicit Agent PTYs<br/>(Separate OS process trees)"]
+    end
+
+    LocalEngine <-->|Stdio Only| ManviSidecar
+    LocalEngine <-->|Local Store & Socket| DevMapGate
     LocalEngine --> LocalGH
     LocalEngine --> LocalFB
     LocalEngine --> LocalAI
     LocalEngine --> PTY
-    LocalEngine --> ProfileManvi["Profile Manvi Host<br/>(Configured provider / managed runs)"]
 ```
 
 ---
