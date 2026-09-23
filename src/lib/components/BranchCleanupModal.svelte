@@ -237,6 +237,7 @@
       onclick={(e) => e.stopPropagation()}
       use:trapFocus
       role="dialog"
+      tabindex="-1"
       aria-modal="true"
       aria-labelledby="deadbranch-title"
     >
