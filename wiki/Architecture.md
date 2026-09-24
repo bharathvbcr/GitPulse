@@ -8,7 +8,7 @@ GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 own
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
         direction TB
-        Views["4 Views · 16 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU Canvas Graph"]
         Dock["Terminal Dock (portable-pty)"]
         Stores["Domain Stores & SWR Cache"]
@@ -27,6 +27,8 @@ flowchart TB
         Git["Git Sandbox & CLI Reader"]
         Graph["Topological Lane Solver"]
         Analyzers["Coverage, Health & LOC Analyzers"]
+        Secrets["Secrets Scanner (Kingfisher)"]
+        AI["AI Phrasing & Commit Brief"]
         Ledger["Event Ledger WAL"]
         MCP["gitpulse-mcp & gitpulsed"]
         DevMapSubsys["DevMap Query & Gate Subsystem"]
@@ -67,9 +69,11 @@ GitPulse/
 │   └── lib/<domain>/     pure logic: files, diff, coverage, health, …
 └── src-tauri/src/        Rust core
     ├── commands/         the only IPC entry points
-    ├── engine/           git reader/writer, worktrees, sandbox
+    ├── engine/           git sandbox, worktrees, routes, hooks, CoW sync
     ├── graph/            lanes, mainline pin, filter simplification
-    ├── analyzer/         languages, LOC, coverage, deps
+    ├── analyzer/         languages, LOC, coverage, deps, supply chain
+    ├── secrets/          Kingfisher secrets scanner
+    ├── ai/               commit briefs & on-device phrasing
     ├── harness/          MANVI policy gate
     ├── mcp/              read-only MCP surface
     ├── ledger/           durable WAL

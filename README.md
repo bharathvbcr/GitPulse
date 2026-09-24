@@ -45,7 +45,7 @@ GitPulse has 4 application views. Each view keeps related sections together.
 | **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
 | **Code** | Browse files, inspect authorship, explore structure | Explorer · Blame · Map |
 | **History** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
-| **Insights** | Inspect activity, coverage, dependencies, and disk usage | Pulse · Coverage · Health · Storage |
+| **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected
 file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace,
@@ -54,16 +54,23 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
 ## From a change to the next step
 
 - **Review and commit.** Canvas commit graph, unified and side-by-side diffs,
-  word highlighting, image comparisons, selective staging, stash previews,
-  and a three-way conflict resolver.
+  word highlighting, symbol-grouped diff hunks, image comparisons, selective staging,
+  stash previews, a three-way conflict resolver, and structured patch-brief commit
+  phrasing with on-device Apple Intelligence fallback.
+- **Manage worktrees and branches.** Dead-branch cleanup with durable tip backups
+  in the ledger and authorized delete commands, copy-on-write build cache sync
+  (`node_modules`, `target`, `.venv`), named localhost routes via portless, and
+  trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
   due date, and notes. Customize board/list layouts, use the Archive dock,
   review drafting suggestions, and hand a task to an agent from its board.
 - **Explore the code.** File navigation and blame are built in. Add DevMap for
-  structural navigation, symbol search, dependencies, impact, and candidate tests.
-- **Inspect the repository.** Coverage reports, dependency audits, storage cleanup
-  previews, and Pulse activity summaries distinguish results from scans that did
-  not run. Capped results identify their limits.
+  structural navigation, symbol search, symbol-level collision detection,
+  dependencies, impact, and candidate tests.
+- **Inspect the repository.** Coverage reports, multi-ecosystem dependency audits
+  with `cargo deny` and `cargo crev` parsers, Kingfisher redacted secrets scanning,
+  storage cleanup previews, and Pulse activity summaries distinguish results from
+  scans that did not run. Capped results identify their limits.
 - **Work from the desktop.** Native menus, a command palette, a docked PTY terminal,
   and an optional macOS menu-bar status popover keep frequent actions close.
 
@@ -107,7 +114,7 @@ for code intelligence. Modules can be updated independently.
 flowchart TB
     subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
         direction LR
-        Views["4 Views · 16 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
         TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end

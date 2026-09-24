@@ -30,6 +30,12 @@ flowchart TD
 
 **Policy fail-closed.** A missing MANVI harness yields **unchecked**, not **allowed**. A check that could not run must never look like a check that passed. See [[Policy and AI]].
 
+**Redacted secret scanning.** Insights → Secrets integrates the Kingfisher scanner. Findings are strictly redacted to rule ID, file path, and line number only; secret-bearing values and context lines are dropped immediately and never stored in memory or persisted. Scanner stdout is unlogged, and incomplete scans fail closed.
+
+**Dead-branch cleanup authorization & backups.** Destructive deletions generate explicit git commands requiring authorization before execution; durable restorable tip backups are written to disk and recorded in the ledger prior to any branch removal.
+
+**Lifecycle hooks require repository trust.** Worktree lifecycle hooks declared in `.gitpulse/hooks.toml` are strictly gated on repository trust; untrusted checkouts refuse execution.
+
 **MCP is read-only.** `gitpulse-mcp` does not checkout, write files, or take leases. See [[MCP and Agents]].
 
 ## Reporting a vulnerability

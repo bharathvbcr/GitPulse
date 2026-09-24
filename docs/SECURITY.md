@@ -264,9 +264,40 @@ flowchart TD
   subcommand binary so an `[alias]` in the checkout's Cargo configuration
   cannot shadow it, and govulncheck with `GOTOOLCHAIN=local` so a module's own
   `toolchain` line cannot choose which Go toolchain is downloaded and run.
+  Supply-chain health parsers (`cargo deny` SARIF and `cargo crev` JSONL)
+  similarly parse static artifact outputs without executing unverified code.
 - A scan that cannot complete is reported as a failed check, never as a clean
   result. These are bounded read-only invocations, not a sandbox: each scanner
   still parses repository-supplied files with the user's account permissions.
+
+### Secrets Scanner Privacy & Fail-Closed Reporting
+- Insights → Secrets integrates the Kingfisher scanner to discover exposed
+  API keys, access tokens, and credentials in repository files.
+- Findings are strictly redacted at the extraction boundary to rule ID,
+  relative file path, and line number only. Secret values, matched strings,
+  and surrounding context lines are dropped completely and never stored in
+  memory, cached, or persisted.
+- Scanner standard output is unlogged in diagnostics to eliminate accidental
+  secret disclosure in application logs or bug reports.
+- Fail-closed reporting: scans that time out, error, abort, or truncate are
+  reported as unverified / not clean, never as an all-clear.
+
+### Dead-Branch Cleanup & Destructive Action Authorization
+- Dead-branch cleanup identifies merged, stale, or squashed branches using
+  `git merge-tree` to verify merge status safely.
+- Before executing any deletion, GitPulse generates explicit git commands
+  (`git branch -d/-D`, `git push --delete`) and requires user authorization.
+  A refusal halts the entire batch before any branch is removed.
+- Durable tip backups: prior to any branch deletion, a restorable tip backup is
+  written to disk and recorded in the event ledger, allowing recovery via the
+  Restore action.
+
+### Worktree Lifecycle Hooks & Trust Gating
+- `.gitpulse/hooks.toml` supports `post_create`, `pre_merge`, and `post_merge`
+  lifecycle commands.
+- Lifecycle commands run with the user's permissions and are strictly gated on
+  explicit repository trust. Untrusted checkouts unconditionally refuse to
+  execute lifecycle hooks.
 
 ### Opt-In Release Checks
 - Automatic application release checks are off by default; GitPulse does not

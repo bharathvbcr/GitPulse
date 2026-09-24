@@ -16,7 +16,7 @@ updatable; this app takes only the subset it needs. See
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        UI["Views & Components (16 Sections)<br/><code>src/lib/components/</code>"]
+        UI["Views & Components (17 Sections)<br/><code>src/lib/components/</code>"]
         Stores["State & Mutation Stores<br/><code>src/lib/stores/</code>"]
         Registry["View Registry & Routerless Nav<br/><code>src/lib/views/</code>"]
         Canvas["Canvas 2D Rendering<br/><code>src/lib/canvas/</code>"]
@@ -43,6 +43,8 @@ flowchart TB
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
             GraphSolver["Graph Solver & Nogap Bounds<br/><code>src-tauri/src/graph/</code>"]
             Analyzers["Analyzers (LOC, Coverage, Health)<br/><code>src-tauri/src/analyzer/</code>"]
+            SecretsScanner["Secrets Scanner (Kingfisher)<br/><code>src-tauri/src/secrets/</code>"]
+            AIEngine["AI Phrasing & Commit Brief<br/><code>src-tauri/src/ai/</code>"]
             StorageAuditor["Storage Auditor & History<br/><code>src-tauri/src/storage/</code>"]
             OpsPlanner["Ops Planner & Releases<br/><code>src-tauri/src/ops.rs</code>"]
             PtyTerminal["PTY Lifecycle & Terminal<br/><code>src-tauri/src/terminal/</code>"]
@@ -324,12 +326,14 @@ Optional tool installation uses this same runner with cancellation and bounded
 progress callbacks. See the [archived subprocess audit](archive/SUBPROCESS_DIAGNOSTICS_AUDIT.md)
 for contracts, regression evidence and platform verification limits.
 
-- **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers.
+- **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers. Also owns dead-branch evaluation and safe deletion planning (`deadbranch.rs`), copy-on-write worktree cache sync via APFS clonefile / Linux FICLONE (`cow_clone.rs`), portless and deterministic worktree route matching (`portless.rs`), and repository-trust-gated lifecycle hooks (`worktree_hooks.rs`).
 - **`graph/`**: Native commit-history lane solver — stable columns by interval allocation, a pinned mainline (the default branch's first-parent chain holds column 0 for the whole window), history simplification for server-side commit filters (a dropped commit hands its lineage to its children, git-style, so a filtered graph stays connected and the mainline re-anchors on the chain's first survivor), parent-child edge layout, and nogap lookback bounds.
 - **`analyzer/`**: 
   - `language.rs`: Multi-language classifier (60+ languages), GitHub Linguist color mappings, and fast line-of-code breakdown.
   - `coverage.rs`: Universal coverage artifact scanner (LCOV, Cobertura, Go cover, Istanbul, JaCoCo, Clover), toolchain installer detection, and file-level metrics.
-  - `health.rs`: Ecosystem vulnerability checkers (`npm audit`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot, GitHub Code Scanning).
+  - `health.rs`: Ecosystem vulnerability checkers (`npm audit`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot, GitHub Code Scanning), plus supply-chain parsers for `cargo deny` SARIF and `cargo crev` JSONL.
+- **`secrets/`**: Kingfisher scanner integration for repository secret discovery. Findings are redacted to rule ID, file path, and line number only; secret-bearing values and matched context lines are completely dropped; scanner stdout is unlogged; scans fail closed.
+- **`ai/`**: Structured commit briefs classified from the patch (`commit_brief.rs`: type, scope, subject), loopback LLM completion transport, and optional on-device Apple Intelligence fallback for commit phrasing.
 - **`storage/`**: Deep disk-usage auditor (packfiles, loose objects, reflogs, LFS, submodules, caches, oversized files) with time-series history tracking. `storage/hygiene/` owns expiring cleanup previews, activity and filesystem revalidation, exact-entry local removal, and native shared-cache maintenance. The existing policy gate judges every mutation; the Storage UI reuses the inventory and never supplies executable commands. See [Repository hygiene](REPOSITORY_HYGIENE.md) for the contract and platform limits.
 - **Global hygiene**: Fleet/Settings invoke the native `storage/hygiene/global.rs` service. Versioned policy, explicit lock release, write-ahead history and cross-process cancellation are shared by the in-app timer and optional macOS headless worker. `devmap-query::hygiene` is the canonical DevCouncil policy; hosts retain mutation and scheduling. See [the hygiene contract](REPOSITORY_HYGIENE.md).
 - **`ops.rs`**: Safe, read-only MANVI operation planners for merged branch cleanups, outgoing commit review, and release publishing.

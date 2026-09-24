@@ -14,10 +14,10 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 
 | Section | Purpose |
 | --- | --- |
-| **Overview** | One row per place work is happening: linked worktrees, PRs, runs, policy verdicts. Blocked operations sort first. Agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. Branch stack hierarchy is embedded directly in Overview as a collapsible card. |
+| **Overview** | One row per place work is happening: linked worktrees, PRs, runs, policy verdicts. Blocked operations sort first. Agent worktrees are detected from `/.<agent>/worktrees/` layout, never from a branch name. Branch stack hierarchy is embedded directly in Overview as a collapsible card. Supports worktree copy-on-write cache sync (APFS clonefile / Linux FICLONE), named localhost routes via portless, and `.gitpulse/hooks.toml` lifecycle hooks. |
 | **Resolve** | 3-way conflict editor: ours / theirs / base, marker jump, accept current / incoming / both. |
 | **Remote** | PRs and issues in the wide column; workflows, runs, and releases in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
-| **Policy** | Manvi wrap of DevCouncil modules: gate status, merged-branch cleanup, outgoing commit review, release preflight. |
+| **Policy** | Manvi wrap of DevCouncil modules: gate status, dead-branch cleanup (with tip backups in the ledger, squash merge detection, and authorized delete commands), outgoing commit review, release preflight. |
 | **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, Manvi suggestions and agent handoff. |
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.
@@ -28,7 +28,7 @@ Explorer and Blame are two lenses on one **file** (selection survives the switch
 
 | Section | Purpose |
 | --- | --- |
-| **Explorer** | File tree with live Git status, dual-backend highlighting (MarkDev tree-sitter for six languages; regex for the rest), virtualized code viewer with proportional row-height zoom scaling (70%–160%), responsive header scroll cues (`ScrollCue`), boundary-aware tooltips, in-file search, go-to-line, inline edit, MarkDev bidirectional scrolling preview / image / hex previews. Status bar language mix toggle (LOC vs percentage). Commit composer shows pre-commit blast radius from `devmap preview`. |
+| **Explorer** | File tree with live Git status, dual-backend highlighting (MarkDev tree-sitter for six languages; regex for the rest), virtualized code viewer with proportional row-height zoom scaling (70%–160%), responsive header scroll cues (`ScrollCue`), boundary-aware tooltips, in-file search, go-to-line, inline edit, MarkDev bidirectional scrolling preview / image / hex previews. Status bar language mix toggle (LOC vs percentage). Commit composer shows pre-commit blast radius from `devmap preview`, drafts structured commit briefs from the patch, and supports on-device Apple Intelligence phrasing fallback. |
 | **Blame** | Per-line author, age, commit and coverage gutter with SWR caching, with consecutive lines of one commit read as a block. A **code-age timeline** above it shows what share of the file was last changed in each period, a **legend** carrying each age band's share filters on it, and an **age rail** down the right edge maps where in the file each age lives (click or drag to navigate; it maps the list actually drawn, so a filter re-maps it). Column, chip and band are one selection model: each selects exactly what it counted. Uncommitted lines render as `uncommitted`, not as a link to a fake commit, and — with clock-skewed and undated lines — ride beside the axis as their own labelled shares rather than being left out of the total. Coverage unavailable is marked separately from uncovered. |
 | **Map** | Subsystems / entry points from the `repo_map` resolved by `devmap paths --json` (default `.devmap/repo_map.json`, legacy `.devcouncil` supported), code and doc graph canvas, docs search and broken links, cross-repo link candidates. Build/Refresh via the `devmap` CLI; watcher refreshes a stale index. Caps, `walk_incomplete`, and schema mismatch are named. |
 
@@ -46,7 +46,7 @@ Four lenses on one **commit** and regression history.
 | Section | Purpose |
 | --- | --- |
 | **Graph** | GPU canvas graph with a topological lane solver. Default branch pinned left. Filters (`author:`, `sha:`, `type:`, `path:`, text) run in Rust before lanes are solved, so the graph stays connected. |
-| **Diff** | Unified or true side-by-side from one row model. Syntax under word-diff, find-in-diff, hunk/line staging, image diffs. Layered blast radius by hop over the change set; rung filter on flat impact; preview markers on the file rail. The header names what the patch actually contains. |
+| **Diff** | Unified or true side-by-side from one row model. Syntax under word-diff, find-in-diff, hunk/line staging, diff symbol groups, symbol-level collision notes, image diffs. Layered blast radius by hop over the change set; rung filter on flat impact; preview markers on the file rail. The header names what the patch actually contains. |
 | **Reflog** | HEAD movements; checkout or branch from an entry to recover discarded commits. |
 | **Suspects** | Regression suspects: identifies which commit since a known-good ref could have caused a symptom. Candidates are ranked by what the code graph reaches rather than by recency, joining blame to the code graph. |
 
@@ -54,13 +54,14 @@ Four lenses on one **commit** and regression history.
 
 ## Insights (`⌘3` / `Ctrl+3`)
 
-Four on-demand scans of **this repository**. Each must say when it was capped rather than presenting a floor as a total.
+Five on-demand scans of **this repository**. Each must say when it was capped rather than presenting a floor as a total.
 
 | Section | Purpose |
 | --- | --- |
 | **Pulse** | Heatmap, rhythm, punch card, LOC trend, commit hygiene, hotspots, bus factor, local DORA, exportable SVG card. Unscanned tiles are an em dash with a reason. |
 | **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, JaCoCo, Clover. Toolchain hints and failure recovery. |
-| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus Dependabot and code scanning via `gh` when a repository opens. Critical and high findings warn. |
+| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, and Dependabot/code scanning via `gh` when a repository opens. Critical and high findings warn. |
+| **Secrets** | Kingfisher scanner for exposed credentials and tokens. Findings keep rule, path, and line only; secret values and context are dropped; stdout is unlogged; incomplete scans fail closed. |
 | **Storage** | Packfiles, loose objects, LFS, submodules, build caches, size history. |
 
 ![Coverage scanner](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-coverage.png)

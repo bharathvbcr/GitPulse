@@ -30,7 +30,7 @@ but execution remains locked until that action settles, and its old completion
 cannot close the newly opened palette.
 
 Navigation to an application view or section belongs in `VIEW_REGISTRY`; do not
-create a parallel view list. All 16 sections across the 4 views (Work: Overview, Resolve, Remote, Policy, Tasks; Code: Explorer, Blame, Map; History: Graph, Diff, Reflog, Suspects; Insights: Pulse, Coverage, Health, Storage) receive navigation commands automatically (such as `Find regression suspects — which commit broke this symbol`). Host-owned dialogs receive callbacks via
+create a parallel view list. All 17 sections across the 4 views (Work: Overview, Resolve, Remote, Policy, Tasks; Code: Explorer, Blame, Map; History: Graph, Diff, Reflog, Suspects; Insights: Pulse, Coverage, Health, Secrets, Storage) receive navigation commands automatically (such as `Find regression suspects — which commit broke this symbol`). Host-owned dialogs receive callbacks via
 `PaletteHostActions`. A host missing a callback gets an unavailable command with
 an explanation.
 

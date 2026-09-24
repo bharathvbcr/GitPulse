@@ -47,6 +47,12 @@ checks beside cargo audit.
   declared in that file.
 - **Supply-chain parsers** for `cargo deny` SARIF and `cargo crev` JSONL,
   reported next to `cargo audit` in dependency health.
+- **On-device commit phrasing from patch brief.** Structured factual commit briefs
+  classified directly from the patch (type, scope, subject), with fallback to
+  on-device Apple Intelligence for subject phrasing, or pure patch-based draft
+  when no model is running.
+- **DevCouncil v0.2.4 sync.** Upgraded vendored DevCouncil crates to v0.2.4 with
+  DevMap store schema 23, `latest_symbols_for_file`, and LSP resolution tiers.
 - **npm dependency updates** for lucide, the Tauri CLI, Svelte, Vitest
   coverage, and `@types/node`.
 

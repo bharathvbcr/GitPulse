@@ -31,7 +31,9 @@ Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI d
 
 ## Local AI
 
-Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go to a **loopback** OpenAI-compatible server: Ollama, LM Studio, llama.cpp, vLLM. Remote URLs are rejected. See [[Security]].
+Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go to a **loopback** OpenAI-compatible server: Ollama, LM Studio, llama.cpp, vLLM. Remote URLs are rejected.
+
+Commit messages are classified in the app directly from the staged patch into a structured brief (type, scope, subject). When no loopback model is active, supported Macs can use on-device Apple Intelligence to phrase the subject from the classified brief (without sending the raw patch). If Apple Intelligence is unavailable or the subject fails validation, GitPulse falls back to the deterministic patch-based draft. See [[Security]].
 
 ```mermaid
 flowchart LR

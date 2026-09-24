@@ -21,7 +21,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 16 sections directly. **View** includes Zoom In,
+and Help**. **Go** opens all 17 sections directly. **View** includes Zoom In,
 Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
 diagnostics, optional-tool setup, release notes and issue reporting. Commands
 reflect repository availability and running work; checkmarks follow selection
@@ -40,7 +40,7 @@ flowchart TD
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Policy · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map — file selection plus the code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog · Suspects — four lenses on commit history"]
-        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository"]
+        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Secrets · Storage — five scans of the repository"]
     end
 
     subgraph NotViews["Not views — available under every view"]
@@ -74,6 +74,9 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 - **Verdict Tally**: Per-row counts of every policy status, with `allowed` folded into the total rather than shown as a chip, so the exceptions are what you see.
 - **Unreadable Is Its Own State**: A verdict this build cannot parse is counted as `unreadable`, never as `allowed` — a check that could not be read must never render as one that ran and passed.
 - **Incomplete Screens Say So**: Each of the five sources can be present, empty, or unreadable, and a row assembled from an unreadable source looks exactly like one assembled from an empty source. A banner above the rows names what could not be read, and distinguishes "this repository has no DevCouncil store" (ordinary) from "its store could not be opened" (a problem). The absence itself is never the headline: a reader who does not run one is told what *is* here, not what is missing.
+- **Worktree Copy-on-Write Cache Sync**: Missing build caches (`node_modules`, `target`, `.venv`, and other standard cache directories) can be cloned from the anchor checkout with APFS `clonefile`, Linux `FICLONE`, or a bounded copy when copy-on-write is unavailable.
+- **Worktree Routes**: When portless is running, a worktree is matched to its named localhost URL. Otherwise the worktree receives a stable, deterministic port derived from its name.
+- **Worktree Lifecycle Hooks**: Trusted repositories can declare `post_create`, `pre_merge`, and `post_merge` commands in `.gitpulse/hooks.toml`. Untrusted checkouts refuse to run lifecycle hooks.
 - **Shortcut**: `F10`.
 
 ### 1.2 Resolve
@@ -183,7 +186,7 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 ### 1.4 Policy (Manvi wrap)
 
 - **Policy Monitor**: Displays real-time status of the Manvi command and file write gates (Manvi's wrap around selected DevCouncil modules).
-- **Merged Branch Cleanup**: Identifies merged local branches and plans safe deletions without touching active or unmerged heads.
+- **Dead-Branch Cleanup**: Scans local and remote branches for age, protection, WIP branch names, ancestry merges, and squash or rebase merges (`git merge-tree`). Cleaning writes a restorable tip backup first and records it in the ledger. Each `git branch -d/-D` and `git push --delete` command is authorized before execution; a refusal aborts the batch before any branch is removed. The Restore action puts backed-up tips back.
 - **Commit Review**: Analyzes outgoing commits before pushing, reporting reviewed vs total counts.
 - **Release Publisher**: Preflight checks (clean worktree, synchronized branch) before pushing SemVer tags.
 
@@ -242,7 +245,7 @@ reading of the same open file. Sections switch from the segmented control
   - **Markdown / MarkDev**: Rendered from MarkDev's Rust flat parse model (UTF-16 offsets). Outline, task lists, callouts, tables, validated math / highlight adjacency, and backlinks from the repo docs vault. Preview panes feature bidirectional scrolling and flex-bound layouts to prevent text clipping on oversized formatted blocks. Commit message bodies and MANVI verdict detail use the same renderer.
   - **Images & Media**: Visual viewer with dimensions, aspect ratios, and format inspection.
   - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters for compiled and binary artifacts.
-- **Live Pulse Dashboard**: Uncommitted churn overview, active branch status, and instant staging accelerators. The commit composer shows a **what this commit breaks** summary from `devmap preview` over staged paths (shared with the Diff file rail).
+- **Live Pulse Dashboard & Commit Composer**: Uncommitted churn overview, active branch status, and instant staging accelerators. The commit composer drafts structured commit briefs classified from the patch (type, scope, subject), falling back to on-device Apple Intelligence for subject phrasing on supported Macs, or pure patch-based phrasing when no model is active. Pre-commit impact shows a **what this commit breaks** summary from `devmap preview` over staged paths (shared with the Diff file rail).
 - **Language Logo Vector Icons**: High-fidelity vector SVG logos for 34+ programming languages, configuration formats, and markup types rendered across the file tree, tab bar, diff toolbar, and dashboard.
 - **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
 - **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. Toggles between lines-of-code (`loc`) and percentage (`percentage`) mode. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
@@ -333,6 +336,8 @@ the commit you had just selected.
 - **Intra-Line Word Highlighting**: Pinpoints exact character and token changes within modified lines.
 - **Selective Patch Staging**: Stage or unstage individual hunks or selected line ranges, from either layout. Only the action that applies to this side of the index is offered, and a selection is cleared when the diff text changes underneath it — indices into a replaced patch would stage lines nobody picked.
 - **Honest Map**: The minimap projects the list actually on screen (unified lines or split rows), marks each file boundary, shows the viewport band, and centres what you click instead of scrolling past it.
+- **Diff Symbol Groups**: Unified-diff hunks can be grouped under the declared symbols in that file, providing semantic organization for changes across complex files.
+- **Symbol-Level Collision Notes**: Overlapping file paths in collision scans leverage DevMap symbol spans to identify whether active worktrees touch the exact same symbol or merely share a file. Missing or stale indexes degrade safely to file-level notices.
 - **Image Diffs**: Side-by-side, 2-up, and swipe comparison modes for image assets, inside the same frame.
 
 ### 3.3 Reflog
@@ -373,7 +378,7 @@ flowchart LR
 
 ## 4. Insights (`insights`)
 
-Four scans of one subject — this repository — behind one segmented control.
+Five scans of one subject — this repository — behind one segmented control.
 They were four separate header entries, and every one of them is empty until
 someone runs it: over half the Inspect menu costing attention every session
 and paying occasionally. They also share a shape, which is the real reason to
@@ -420,11 +425,19 @@ rather than presenting a floor as a total.
   - `composer audit` (PHP)
   - `bundler-audit` (Ruby)
   - GitHub Dependabot and code scanning alerts (via local `gh` CLI), fetched when a repository opens. Critical and high findings raise a warning. Turn off under Settings → Analysis. The Health **Scan local** button still does not call GitHub.
+- **Supply-Chain Security Parsers**: Integrates `cargo deny` (SARIF) and `cargo crev` (JSONL) report parsers alongside `cargo audit` in dependency health for thorough Rust crate vetting.
 - **Code map status & dead symbols**: When a DevMap store is present (schema 20), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
 - **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, and repository health signals into a single explicit verdict with one canonical owner per repeated decision.
 
-### 4.4 Storage
+### 4.4 Secrets
+
+- **Kingfisher Secrets Scanner**: Discovers exposed API keys, private tokens, passwords, and secrets across repository files via an integrated Kingfisher scan.
+- **Strict Privacy Redaction**: Findings are redacted to rule ID, file path, and line number only. Secret values, matches, and surrounding context lines are dropped completely and never stored in memory or persisted.
+- **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
+- **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, or failed due to missing scanner binaries reports explicitly as unverified / not clean, never as an all-clear.
+
+### 4.5 Storage
 
 - **Git Internals Audit**: Analyzes disk usage across packfiles, loose objects, reflogs, LFS assets, and submodules.
 - **Build & Cache Auditor**: Detects build directories (`target/`, `node_modules/`, `dist/`, `.venv/`, `.build/`) and unignored cache artifacts.
@@ -612,10 +625,10 @@ GitPulse provides comprehensive keyboard navigation accelerators across the enti
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
 Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
-Reflog, Insights' Pulse / Coverage / Health / Storage — are switched by that
+Reflog / Suspects, Insights' Pulse / Coverage / Health / Secrets / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette. **Go → view → section** also opens every
-section directly, including all six Work sections.
+section directly, including all five Work sections.
 
 ### 6.3 Inside Fleet
 

@@ -35,7 +35,7 @@ flowchart LR
         Work["Work — Overview · Resolve · Remote · Policy · Tasks"]
         Code["Code — Explorer · Blame · Map"]
         History["History — Graph · Diff · Reflog · Suspects"]
-        Insights["Insights — Pulse · Coverage · Health · Storage"]
+        Insights["Insights — Pulse · Coverage · Health · Secrets · Storage"]
     end
     subgraph Beside["Not views"]
         Tasks["Tasks — global and saved-workspace boards"]

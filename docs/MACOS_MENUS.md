@@ -43,7 +43,7 @@ Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · 
 | Go → Work | Overview, Resolve, Remote, Policy, Tasks. |
 | Go → Code | Explorer, Blame, Map. |
 | Go → History | Graph, Diff, Reflog, Suspects. |
-| Go → Insights | Pulse, Coverage, Health, Storage. |
+| Go → Insights | Pulse, Coverage, Health, Secrets, Storage. |
 | Repository | Fetch, Pull, Push, Stash Working Tree, Pop Stash, Stage All, Unstage All, Quick Commit, Interactive Rebase, Create Branch, Rename Current Branch, Continue/Abort/Skip Operation, Copy Repository Path, Copy Branch, Copy Selected Commit SHA or HEAD SHA, Reveal in Finder, Open Remote Website. |
 | Window | Minimize, maximize/zoom, Close Window. |
 | Help | GitPulse Help, Keyboard Shortcuts, Diagnostics, Set Up Optional Tools, Release Notes, Report an Issue. Opening setup or an issue page does not install tools or submit an issue. |
@@ -61,7 +61,7 @@ Go uses the existing view registry and per-repository section persistence. Navig
 
 ## Ownership
 
-`src-tauri/src/desktop/actions.rs` owns native IDs and the native projection of the 16 sections. `menu.rs` constructs and updates the application menu; `tray.rs` owns the icon and native right-click menu; `popover.rs` owns the lazy status window, positioning, dismissal and restricted action bridge. `state.rs` validates presentation. `desktop/mod.rs` owns event routing, main-thread updates and window/exit behavior.
+`src-tauri/src/desktop/actions.rs` owns native IDs and the native projection of the 17 sections. `menu.rs` constructs and updates the application menu; `tray.rs` owns the icon and native right-click menu; `popover.rs` owns the lazy status window, positioning, dismissal and restricted action bridge. `state.rs` validates presentation. `desktop/mod.rs` owns event routing, main-thread updates and window/exit behavior.
 
 `src/lib/desktop/menuState.ts` derives presentation from repository, interface, theme and mutation state. `menuStateStore.ts` connects those stores, `menuSync.ts` serializes delivery, and `menuCommands.ts` routes actions into existing handlers. `nativeActions.ts` validates dispatch. `repoStore.ts` remains the Git mutation owner. Wire contracts cover the new state structs and event repository identity.
 
