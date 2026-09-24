@@ -304,6 +304,9 @@ public func gitpulseAppleIntelligenceFree(_ pointer: UnsafeMutablePointer<CChar>
     case "extract":
       return shared
         + " The notes are raw and unstructured. Pull out the single piece of work they describe and leave the rest out, keeping that piece in the author's own words."
+    case "commit_subject":
+      return shared
+        + " The notes are a factual brief of a staged git change that the application has already classified. The title is one commit subject: imperative, at most 72 characters, no trailing period. When the current title begins with a type prefix such as docs: or feat(scope):, keep that prefix character for character and rephrase only the words after it. When it has no type prefix, add one only from feat, fix, refactor, perf, style, test, docs, build, ci, chore or revert, and only when the notes support it. Do not add a body, a trailer, or an issue number."
     default:
       return shared
     }

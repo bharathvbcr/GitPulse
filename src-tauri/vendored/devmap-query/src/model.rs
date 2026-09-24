@@ -644,3 +644,58 @@ impl FreshnessInfo {
             .unwrap_or(&self.head_sha)
     }
 }
+
+/// How a file sits in the index for [`crate::StoreQueryEngine::skeleton`].
+///
+/// An empty file and a path the index does not contain are different facts.
+/// Collapsing them into one empty list would let a caller read "nothing here"
+/// for a path that was never examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkeletonPresence {
+    /// The latest generation holds this path and at least one definition.
+    Indexed,
+    /// The path is in the generation, but the extractor recorded no symbols.
+    Empty,
+    /// The latest generation has no row for this path.
+    NotInIndex,
+}
+
+/// One definition as a signature and a span — never the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkeletonSymbol {
+    pub qualified_name: String,
+    pub kind: String,
+    /// One-based inclusive lines in the on-disk file when it could be read;
+    /// otherwise derived from a synthetic line map of the stored spans alone
+    /// and reported with `lines_from_bytes: true`.
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// True when `start_line`/`end_line` were estimated from byte offsets
+    /// without the file's text — a lower bound on the real line numbers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lines_from_bytes: bool,
+    /// Declaration text when the extractor recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Always set when `signature` is absent: the span is still returned, and
+    /// this names that the signature was not extracted rather than leaving a
+    /// silent hole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_note: Option<String>,
+}
+
+/// File signatures without bodies, budgeted like every other query envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkeletonReport {
+    pub file: String,
+    pub presence: SkeletonPresence,
+    pub items: Vec<SkeletonSymbol>,
+    pub shown: u32,
+    pub total: u32,
+    pub truncated: bool,
+    pub source_freshness: SourceFreshness,
+    pub resolution: ResolutionAvailability,
+}

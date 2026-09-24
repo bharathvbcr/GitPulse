@@ -145,8 +145,19 @@ pub enum ResolutionKind {
     SamePackage,
     ImportScoped,
     ReceiverType,
+    /// One target a language server named for an opt-in compiler pass.
+    ///
+    /// Confidence is [`Confidence::HIGH`], strictly below the deterministic
+    /// parse rungs (`ReceiverType` and above), so a compiler claim never
+    /// outranks evidence the resolver itself produced from the syntax.
+    LanguageServer,
     UniqueGlobal,
     AmbiguousGlobal,
+    /// An interface or virtual candidate set a language server returned.
+    ///
+    /// Confidence is [`Confidence::SPECULATIVE`], excluded from default walks
+    /// the same way [`Self::AmbiguousGlobal`] is.
+    LanguageServerDispatch,
     Unresolved,
     Structural,
 }
@@ -154,13 +165,15 @@ pub enum ResolutionKind {
 impl ResolutionKind {
     /// Every kind, in declaration order. What [`Self::from_label`] searches and
     /// what a table generated from the enum (the store's SQL check) iterates.
-    pub const ALL: [ResolutionKind; 8] = [
+    pub const ALL: [ResolutionKind; 10] = [
         ResolutionKind::SameFile,
         ResolutionKind::SamePackage,
         ResolutionKind::ImportScoped,
         ResolutionKind::ReceiverType,
+        ResolutionKind::LanguageServer,
         ResolutionKind::UniqueGlobal,
         ResolutionKind::AmbiguousGlobal,
+        ResolutionKind::LanguageServerDispatch,
         ResolutionKind::Unresolved,
         ResolutionKind::Structural,
     ];
@@ -170,8 +183,12 @@ impl ResolutionKind {
     /// - `SameFile`, `SamePackage`, `ImportScoped`, `ReceiverType` —
     ///   deterministic: the declaration is in this file, or in this file's
     ///   package block, or the import or the receiver's type names it outright.
+    /// - `LanguageServer` — one target a language server named
+    ///   ([`Confidence::HIGH`], below every deterministic parse rung).
     /// - `UniqueGlobal` — exactly one declaration of that name in the family.
     /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
+    /// - `LanguageServerDispatch` — a language-server candidate set, scored
+    ///   like `AmbiguousGlobal` so default walks exclude it.
     /// - `Unresolved` — no edge is ever built from this variant. It scores at
     ///   the floor so that an edge built from it by mistake sorts below every
     ///   honest one rather than above them.
@@ -185,8 +202,10 @@ impl ResolutionKind {
             | ResolutionKind::ImportScoped
             | ResolutionKind::ReceiverType
             | ResolutionKind::Structural => Confidence::DETERMINISTIC,
-            ResolutionKind::UniqueGlobal => Confidence::HIGH,
-            ResolutionKind::AmbiguousGlobal | ResolutionKind::Unresolved => Confidence::SPECULATIVE,
+            ResolutionKind::LanguageServer | ResolutionKind::UniqueGlobal => Confidence::HIGH,
+            ResolutionKind::AmbiguousGlobal
+            | ResolutionKind::LanguageServerDispatch
+            | ResolutionKind::Unresolved => Confidence::SPECULATIVE,
         }
     }
 
@@ -198,8 +217,10 @@ impl ResolutionKind {
             ResolutionKind::SamePackage => "SamePackage",
             ResolutionKind::ImportScoped => "ImportScoped",
             ResolutionKind::ReceiverType => "ReceiverType",
+            ResolutionKind::LanguageServer => "LanguageServer",
             ResolutionKind::UniqueGlobal => "UniqueGlobal",
             ResolutionKind::AmbiguousGlobal => "AmbiguousGlobal",
+            ResolutionKind::LanguageServerDispatch => "LanguageServerDispatch",
             ResolutionKind::Unresolved => "Unresolved",
             ResolutionKind::Structural => "Structural",
         }
@@ -291,6 +312,18 @@ pub enum Resolution {
         target_file: String,
         receiver_type: String,
     },
+    /// One target a language server named under `devmap build --lsp`.
+    ///
+    /// `server` / `server_version` travel on the edge payload (`details` and
+    /// this variant) so a later reader can see which binary claimed the edge.
+    /// Never produced by a bare-name fallback: unresolved sites stay in the
+    /// ledger unless a server actually names a target inside the repository.
+    LanguageServer {
+        target_symbol: String,
+        target_file: String,
+        server: String,
+        server_version: String,
+    },
     UniqueGlobal {
         target_symbol: String,
         target_file: String,
@@ -299,6 +332,14 @@ pub enum Resolution {
     AmbiguousGlobal {
         candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
         family: LangFamily,
+    },
+    /// An interface or virtual candidate set a language server returned.
+    ///
+    /// Speculative, like [`Self::AmbiguousGlobal`]: default walks exclude it.
+    LanguageServerDispatch {
+        candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
+        server: String,
+        server_version: String,
     },
     Unresolved {
         reason: String,
@@ -350,8 +391,10 @@ impl Resolution {
             Resolution::SamePackage { .. } => ResolutionKind::SamePackage,
             Resolution::ImportScoped { .. } => ResolutionKind::ImportScoped,
             Resolution::ReceiverType { .. } => ResolutionKind::ReceiverType,
+            Resolution::LanguageServer { .. } => ResolutionKind::LanguageServer,
             Resolution::UniqueGlobal { .. } => ResolutionKind::UniqueGlobal,
             Resolution::AmbiguousGlobal { .. } => ResolutionKind::AmbiguousGlobal,
+            Resolution::LanguageServerDispatch { .. } => ResolutionKind::LanguageServerDispatch,
             Resolution::Unresolved { .. } => ResolutionKind::Unresolved,
             Resolution::Structural { .. } => ResolutionKind::Structural,
             // The same rung as UniqueGlobal: one declaration of the name in the
@@ -397,6 +440,11 @@ impl Resolution {
                 target_file,
                 ..
             }
+            | Resolution::LanguageServer {
+                target_symbol,
+                target_file,
+                ..
+            }
             | Resolution::UniqueGlobal {
                 target_symbol,
                 target_file,
@@ -411,7 +459,9 @@ impl Resolution {
                 target_file,
             } => Some((target_file.as_str(), target_symbol.as_str())),
             // Several targets, or none: neither can answer "which one".
-            Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => None,
+            Resolution::AmbiguousGlobal { .. }
+            | Resolution::LanguageServerDispatch { .. }
+            | Resolution::Unresolved { .. } => None,
         }
     }
 }

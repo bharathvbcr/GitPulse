@@ -287,9 +287,17 @@ tool config; how many were left out, and why, is in `liveness_meta.unwired.exclu
 empty list means nothing is unwired rather than that the filter swallowed the repository."
             .to_string(),
         "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
-`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) \
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`, \
+`devmap_blast`, `devmap_suspects`) \
 or the matching `devmap` CLI commands: `devmap explore <name>`, `devmap search`, \
-`devmap impact`, `devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. \
+`devmap impact`, `devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`, \
+`devmap blast --since <rev>`, `devmap suspects <symptom> --since <rev>`. \
+`blast` and `suspects` are mirror images: `blast` runs forward from a change to \
+what depends on it (inbound edges), `suspects` runs backward from a symptom to the \
+commits that could have caused it (outbound edges, because a symptom is caused by \
+what it calls and never by its callers). On a `blast` report read `unattributed` \
+before `impacted`: changed lines inside no symbol — imports, top-level constants, \
+attributes — have no inbound edges to walk, so the impact is a lower bound. \
 Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and \
 check `repository.root` in the envelope before trusting the answer — Cursor shares one \
 MCP process across workspace tabs. \
@@ -343,7 +351,7 @@ alwaysApply: true\n\
 \n\
 Use `{map_rel}` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.\n\
 \n\
-Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one MCP process across workspace tabs. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.\n\
+Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`, `devmap_blast`, `devmap_suspects`) or the matching `devmap` CLI commands. `devmap_blast` answers what a change affects and `devmap_suspects` what could have caused a symptom; they walk opposite directions and a `blast` report's `unattributed` list must be read before its `impacted` one, because changed lines inside no symbol make the impact a lower bound. Always pass `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` in the envelope before trusting the answer — Cursor shares one MCP process across workspace tabs. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.\n\
 \n\
 Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.\n\
 \n\

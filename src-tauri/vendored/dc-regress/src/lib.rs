@@ -1,4 +1,20 @@
-//! Which commits could have caused this symptom.
+//! How a change and a symptom relate through the code graph — both ways
+//! round.
+//!
+//! Two questions, one machinery:
+//!
+//! - [`suspects`] runs **backwards**: a symptom names a symbol, and the
+//!   commits that could have caused it are the ones that touched what that
+//!   symbol transitively *calls*.
+//! - [`blast`] runs **forwards**: a change names lines, and what it affects is
+//!   everything that transitively *calls* the symbols those lines sit in.
+//!
+//! They share the blob identity, the span-to-line arithmetic and the rule that
+//! a check which could not run never reports what a check that passed reports.
+//! They differ in exactly one thing — the direction of the walk — which is why
+//! [`CodeGraph`] exposes it as two named methods rather than one with a flag.
+//!
+//! # The backwards direction
 //!
 //! The naive shape of this question is "blame the file and read the names off
 //! the gutter". That answers a different question — *who last touched these
@@ -44,12 +60,19 @@
 use serde::{Deserialize, Serialize};
 
 pub mod blame;
+pub mod blast;
+pub mod change;
 pub mod history;
 pub mod join;
 pub mod rank;
 pub mod suspects;
 
 pub use blame::{BlameLine, BlameRefusal, FileBlame};
+pub use blast::{
+    blast, AffectedTestFile, BlastReport, ImpactedFile, ImpactedModule, ImpactedSymbol, Owner,
+    SeedSymbol, TestSignal, UnattributedChange, UnattributedReason, DEFAULT_BLAST_DEPTH,
+};
+pub use change::{ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange};
 pub use join::{attribute, Attribution, SymbolBlame};
 pub use rank::{rank, EvidenceClass, RankInputs, Suspect, TouchedSymbol};
 pub use suspects::{suspects, DEFAULT_CONE_DEPTH};
@@ -152,6 +175,40 @@ pub enum Unavailable {
     /// The cone walk stopped at its depth cap, so the set of symbols that can
     /// reach the symptom is a lower bound.
     ConeIncomplete { depth: u32, reached: usize },
+
+    // ---- the forward direction ([`blast`]) ----
+    /// The change itself could not be read, so there is nothing to start from.
+    ChangeUnreadable { reason: String },
+    /// Some of the change's lines landed in no symbol, so the walk started
+    /// from fewer places than the change touched.
+    ///
+    /// This is the forward direction's most important refusal and the easiest
+    /// one to have omitted. A change to a module-level constant, an import or
+    /// a macro invocation lands here; without this the report would show an
+    /// empty blast radius and read as "this change affects nothing", which is
+    /// a confident wrong answer rather than a cautious one. Each range is
+    /// listed individually in [`blast::BlastReport::unattributed`] with its
+    /// own reason; this is the one-line summary that flips `complete`.
+    ChangeUnattributed { ranges: usize, lines: u64 },
+    /// The change spanned more files than one analysis reads.
+    ChangedFilesCapped { considered: usize, cap: usize },
+    /// The change touched more symbols than one walk is seeded with, so the
+    /// radius is that of the most-changed symbols rather than of all of them.
+    SeedsCapped {
+        seeded: usize,
+        touched: usize,
+        cap: usize,
+    },
+    /// The inbound walk stopped at a cap, so the impacted set is a lower
+    /// bound.
+    ImpactIncomplete { depth: u32, reached: usize },
+    /// The affected-test walk was trimmed, so the test list is a lower bound.
+    AffectedTestsIncomplete { found: usize },
+    /// Recent owners of the changed paths could not be read — git missing,
+    /// not a repository, a deadline, a commit cap, or an empty author. The
+    /// owners list is then a lower bound (possibly empty), never evidence that
+    /// nobody owns the change.
+    OwnersUnavailable { reason: String },
 }
 
 impl Unavailable {
@@ -191,6 +248,37 @@ impl Unavailable {
                 "the cone walk stopped at depth {depth} having reached {reached} symbols; the \
                  suspect list is a lower bound"
             ),
+            Unavailable::ChangeUnreadable { reason } => {
+                format!("the change could not be read: {reason}")
+            }
+            Unavailable::ChangeUnattributed { ranges, lines } => format!(
+                "{lines} changed line(s) in {ranges} range(s) landed in no symbol the graph \
+                 declares — module-level code has no inbound edges to walk, so the impact \
+                 below is a lower bound"
+            ),
+            Unavailable::ChangedFilesCapped { considered, cap } => format!(
+                "the change spans more than {cap} files ({considered} seen); only the first \
+                 {cap} were read"
+            ),
+            Unavailable::SeedsCapped {
+                seeded,
+                touched,
+                cap,
+            } => format!(
+                "the change touched {touched} symbol(s) but only the {seeded} most-changed \
+                 seeded the walk (cap {cap}); narrow the revision range to cover the rest"
+            ),
+            Unavailable::ImpactIncomplete { depth, reached } => format!(
+                "the inbound walk stopped at depth {depth} having reached {reached} symbols; \
+                 the impacted set is a lower bound"
+            ),
+            Unavailable::AffectedTestsIncomplete { found } => format!(
+                "the affected-test walk was trimmed at {found} test file(s); the test list is \
+                 a lower bound"
+            ),
+            Unavailable::OwnersUnavailable { reason } => {
+                format!("owners of the changed paths could not be fully read: {reason}")
+            }
         }
     }
 }
@@ -222,6 +310,17 @@ pub struct GraphSymbol {
 pub trait CodeGraph {
     /// Symbols declared in `file`, with the basis their spans were taken
     /// against.
+    ///
+    /// **Symbols, not the file.** An index that also holds a node for the file
+    /// itself must not return it here. Such a node spans the whole file, so it
+    /// contains every line of every change — and [`blast`] decides whether a
+    /// changed line landed in *any* symbol by exactly this overlap. Include
+    /// the file node and that question can only ever be answered yes: a
+    /// changed import, a changed top-level constant and a changed license
+    /// header are all credited to "the file", and the report claims to have
+    /// placed lines it has not placed. The whole
+    /// [`Unavailable::ChangeUnattributed`] mechanism is disarmed by one extra
+    /// row.
     fn symbols_in(&self, file: &str) -> (Vec<GraphSymbol>, BlobIdentity);
 
     /// Symbols `symbol` can reach, nearest first, walking **outbound** call
@@ -237,6 +336,38 @@ pub trait CodeGraph {
     /// The returned flag is `true` when the walk was stopped by a cap — a
     /// lower bound, not a complete answer.
     fn cone(&self, symbol: &str, depth: u32) -> (Vec<ConeEntry>, bool);
+
+    /// Symbols that can reach `seeds`, walking **inbound** call edges to
+    /// `depth` — everything that would be affected if the seeds changed.
+    ///
+    /// The exact opposite of [`CodeGraph::cone`], and deliberately a separate
+    /// method rather than a direction flag on one. The two questions look
+    /// symmetric and are routinely confused — this crate shipped `cone` with
+    /// the inbound walk once, which returns the seed and nothing else and
+    /// reads as a confident "no commit touched anything relevant". A boolean
+    /// parameter would have made that a one-character mistake at every call
+    /// site instead of a one-time one in an implementation; two named methods,
+    /// each with its direction in its contract, cannot be passed the wrong
+    /// way round.
+    ///
+    /// Seeds are included at distance zero. The returned flag is `true` when
+    /// the walk was stopped by a cap or a budget, which makes the answer a
+    /// lower bound.
+    ///
+    /// Required rather than defaulted: a default returning an empty list would
+    /// let a graph that cannot answer this produce a report that reads exactly
+    /// like a change affecting nothing.
+    fn impacted(&self, seeds: &[String], depth: u32) -> (Vec<ConeEntry>, bool);
+
+    /// Test files reachable from `seeds` through the same **inbound** walk.
+    ///
+    /// Separate from [`CodeGraph::impacted`] rather than filtered out of it,
+    /// because a store that already computes this applies its own ranking and
+    /// its own budget to it, and re-deriving the list from a budget-trimmed
+    /// symbol set would silently drop the tests whose band the budget cut.
+    ///
+    /// The returned flag is `true` when the list is a lower bound.
+    fn affected_tests(&self, seeds: &[String], depth: u32) -> (Vec<blast::AffectedTestFile>, bool);
 
     /// Resolve a symptom — a symbol name, a qualified name, or a file path —
     /// to the qualified names it could mean.

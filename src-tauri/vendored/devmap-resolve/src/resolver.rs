@@ -19,6 +19,22 @@ type IndexedSymbol = (String, SymbolKind, LangFamily, Arc<str>);
 
 type CandidateSet = Arc<[(String, String)]>;
 
+/// Outcome of the X42 implicit-receiver lookup (`self.m()` / `this.m()` / …).
+///
+/// `VirtualOverride` is distinct from “no answer”: a unique declaration on the
+/// enclosing type (or a unique inherited one) is still the wrong *deterministic*
+/// target when an indexed subtype overrides the same name, because `self` can
+/// be that subtype at runtime. Call-site emission must abstain into the
+/// unresolved ledger rather than fall through to `SameFile`.
+enum ImplicitReceiverAnswer {
+    Unique {
+        target_file: String,
+        target_symbol: String,
+        receiver_type: String,
+    },
+    VirtualOverride,
+}
+
 fn escaped_evidence_bytes(value: &str) -> u64 {
     value.bytes().fold(0u64, |total, byte| {
         // Ordinary printable ASCII is literal in both compact JSON and Rust
@@ -244,6 +260,13 @@ pub struct Resolver {
     /// that reads it refuses to continue through a type name two files declare,
     /// where the chain stops being identifiable.
     supertypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
+    /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
+    ///
+    /// Built from the same heritage rows. X42's virtual-`self` guard walks this
+    /// to see whether an indexed subtype overrides a method the enclosing type
+    /// (or a base) uniquely declares — if so, a `ReceiverType` edge would claim
+    /// a runtime target the subtype can steal.
+    subtypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
     /// Per-file local import name → (target file, exported symbol) for import-scoped calls (G6).
     import_bindings: BTreeMap<String, BTreeMap<String, (String, String)>>,
     /// `file:scope:var` and `file:var` → the *declared* type name of a value,
@@ -420,6 +443,7 @@ impl Resolver {
             poisoned_receiver_keys: BTreeSet::new(),
             type_methods: BTreeMap::new(),
             supertypes: BTreeMap::new(),
+            subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
@@ -665,6 +689,23 @@ impl Resolver {
                 None => break,
             }
         }
+        // A deref-transparent wrapper is not a generic this needs to refuse:
+        // `shared_ptr<Service>` *is* a `Service` as far as member access goes.
+        //
+        // This is the second of the two places that rule is enforced, and it is
+        // not redundant with the extractor's. The extractor unwraps a parse
+        // *node*, which covers a parameter's written type; a C++ local binding
+        // reaches here as the raw text `shared_ptr<Service>` from a different
+        // producer, and hit the `contains('<')` refusal below. Measured: the
+        // type reference `probe -> Service` resolved while the call
+        // `probe -> Service.wait_tick` did not, because the two facts came down
+        // different paths and only one had been taught the rule.
+        //
+        // The *list* is shared — `crate::deref` is the single owner — so the
+        // two enforcement points cannot come to disagree about which wrappers
+        // are transparent. `Vec<Service>` is still refused here, exactly as
+        // before, because `Vec` is not in that list.
+        s = devmap_extract::deref::strip_deref_transparent(s);
         if s.is_empty()
             || s.contains('<')
             || s.contains('>')
@@ -1342,6 +1383,7 @@ impl Resolver {
         self.poisoned_receiver_keys.clear();
         self.type_methods.clear();
         self.supertypes.clear();
+        self.subtypes.clear();
         self.import_bindings.clear();
         self.declared_types.clear();
         self.external_imports.clear();
@@ -1850,6 +1892,10 @@ impl Resolver {
                     .entry((family, subtype.to_string()))
                     .or_default()
                     .insert(supertype.to_string());
+                self.subtypes
+                    .entry((family, supertype.to_string()))
+                    .or_default()
+                    .insert(subtype.to_string());
             }
             for reference in &ext.references {
                 let Some(receiver) = &reference.assigned_to else {
@@ -2500,19 +2546,34 @@ impl Resolver {
                     // of that bare name is not evidence about this call.
                     if resolution.is_none() && implicit_receiver {
                         if let Some(caller) = call.caller_symbol.as_deref() {
-                            if let Some((target_file, target_symbol, receiver_type)) = self
-                                .implicit_receiver_target(
-                                    &ext.file_path,
-                                    family,
-                                    caller,
-                                    &call.callee_name,
-                                )
-                            {
-                                resolution = Some(Arc::new(Resolution::ReceiverType {
-                                    target_symbol,
+                            match self.implicit_receiver_target(
+                                &ext.file_path,
+                                family,
+                                caller,
+                                &call.callee_name,
+                            ) {
+                                Some(ImplicitReceiverAnswer::Unique {
                                     target_file,
+                                    target_symbol,
                                     receiver_type,
-                                }));
+                                }) => {
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol,
+                                        target_file,
+                                        receiver_type,
+                                    }));
+                                }
+                                Some(ImplicitReceiverAnswer::VirtualOverride) => {
+                                    // Block SameFile / other deterministic
+                                    // fallthrough: the declaration is unique on
+                                    // the enclosing type, but an indexed subtype
+                                    // overrides it, so `self` is not a proven
+                                    // single target.
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: "implicit receiver method is overridden by an indexed subtype".to_string(),
+                                    }));
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -2898,11 +2959,14 @@ impl Resolver {
                             source_symbol: caller_sym,
                             callee_name: call.callee_name.clone(),
                             kind: UnresolvedKind::Call,
-                            resolution: Resolution::Unresolved {
-                                reason: format!(
-                                    "no resolution ladder rung matched {:?} in {} family {:?}",
-                                    call.callee_name, ext.file_path, family
-                                ),
+                            resolution: match resolution {
+                                Some(r) => (*r).clone(),
+                                None => Resolution::Unresolved {
+                                    reason: format!(
+                                        "no resolution ladder rung matched {:?} in {} family {:?}",
+                                        call.callee_name, ext.file_path, family
+                                    ),
+                                },
                             },
                             class,
                             receiver: call.receiver_expr.clone(),
@@ -3641,15 +3705,20 @@ impl Resolver {
     ///
     /// Abstains, rather than choosing, on every ambiguity: a type that declares
     /// the name twice, a level of the hierarchy where two supertypes declare
-    /// it, and a type name two files declare. Returns
-    /// `(target file, target symbol, the type that declared it)`.
+    /// it, and a type name two files declare.
+    ///
+    /// Also abstains ([`ImplicitReceiverAnswer::VirtualOverride`]) when an
+    /// indexed subtype of the enclosing type overrides the same method: a
+    /// unique declaration on the enclosing type is still not a unique *runtime*
+    /// target for `self`, and labelling it `ReceiverType` would be a
+    /// confidence-1.0 edge the subtype can steal.
     fn implicit_receiver_target(
         &self,
         file: &str,
         family: LangFamily,
         caller_symbol: &str,
         method: &str,
-    ) -> Option<(String, String, String)> {
+    ) -> Option<ImplicitReceiverAnswer> {
         let enclosing = self.self_type_at(file, family, caller_symbol)?;
         // The caller's declaring type is an exact identity even when another
         // file declares a namesake. Only inherited lookup needs a global name.
@@ -3659,13 +3728,20 @@ impl Resolver {
         {
             let local: Vec<_> = hits.iter().filter(|(path, _)| path == file).collect();
             if local.len() == 1 {
-                return Some((local[0].0.clone(), local[0].1.clone(), enclosing));
+                return Some(self.implicit_receiver_unique(
+                    family,
+                    &enclosing,
+                    method,
+                    local[0].0.clone(),
+                    local[0].1.clone(),
+                    enclosing.clone(),
+                ));
             }
             if local.len() > 1 {
                 return None;
             }
         }
-        let mut frontier = vec![enclosing];
+        let mut frontier = vec![enclosing.clone()];
         let mut visited: BTreeSet<String> = BTreeSet::new();
         for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
             let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -3693,7 +3769,18 @@ impl Resolver {
                 }
             }
             match found.len() {
-                1 => return found.into_iter().next(),
+                1 => {
+                    let (target_file, target_symbol, receiver_type) =
+                        found.into_iter().next().expect("len 1");
+                    return Some(self.implicit_receiver_unique(
+                        family,
+                        &enclosing,
+                        method,
+                        target_file,
+                        target_symbol,
+                        receiver_type,
+                    ));
+                }
                 0 => {}
                 // Two supertypes at one level declare the name. The language's
                 // own MRO might pick one; this resolver has no MRO, and a guess
@@ -3706,6 +3793,69 @@ impl Resolver {
             frontier = next;
         }
         None
+    }
+
+    /// A unique hit on the receiver's type, or [`ImplicitReceiverAnswer::VirtualOverride`]
+    /// when an indexed subtype of `enclosing` also declares `method`.
+    fn implicit_receiver_unique(
+        &self,
+        family: LangFamily,
+        enclosing: &str,
+        method: &str,
+        target_file: String,
+        target_symbol: String,
+        receiver_type: String,
+    ) -> ImplicitReceiverAnswer {
+        if self.method_overridden_by_indexed_subtype(family, enclosing, method) {
+            ImplicitReceiverAnswer::VirtualOverride
+        } else {
+            ImplicitReceiverAnswer::Unique {
+                target_file,
+                target_symbol,
+                receiver_type,
+            }
+        }
+    }
+
+    /// True when some indexed subtype of `enclosing` (transitively) declares
+    /// `method` — evidence that `self.method()` inside `enclosing` is virtual.
+    fn method_overridden_by_indexed_subtype(
+        &self,
+        family: LangFamily,
+        enclosing: &str,
+        method: &str,
+    ) -> bool {
+        let mut frontier: Vec<String> = self
+            .subtypes
+            .get(&(family, enclosing.to_string()))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            if frontier.is_empty() {
+                return false;
+            }
+            let mut next: Vec<String> = Vec::new();
+            for type_name in frontier.drain(..) {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if self
+                    .type_methods
+                    .get(&(family, type_name.clone(), method.to_string()))
+                    .is_some_and(|hits| !hits.is_empty())
+                {
+                    return true;
+                }
+                if let Some(subs) = self.subtypes.get(&(family, type_name)) {
+                    next.extend(subs.iter().cloned());
+                }
+            }
+            frontier = next;
+        }
+        false
     }
 
     /// X45. Where a bare `name` written in `file` goes by Go's package-block
@@ -4294,21 +4444,32 @@ impl Resolver {
         // an implicit receiver outright.
         let implicit = Self::receiver_is_self(receiver);
         if implicit {
-            let (target_file, target_symbol, receiver_type) =
-                reference.enclosing_symbol.as_deref().and_then(|caller| {
-                    self.implicit_receiver_target(&ext.file_path, family, caller, name)
-                })?;
-            return Some(self.reference_edge(
-                ext,
-                &target_file,
-                name,
-                reference,
-                Resolution::ReceiverType {
+            let answer = reference.enclosing_symbol.as_deref().and_then(|caller| {
+                self.implicit_receiver_target(&ext.file_path, family, caller, name)
+            })?;
+            match answer {
+                ImplicitReceiverAnswer::Unique {
+                    target_file,
                     target_symbol,
-                    target_file: target_file.clone(),
                     receiver_type,
-                },
-            ));
+                } => {
+                    return Some(self.reference_edge(
+                        ext,
+                        &target_file,
+                        name,
+                        reference,
+                        Resolution::ReceiverType {
+                            target_symbol,
+                            target_file: target_file.clone(),
+                            receiver_type,
+                        },
+                    ));
+                }
+                // Same rule as the call ladder: an overridden `self.m` is not a
+                // deterministic reference target. Returning `None` here refuses
+                // the import fallthrough for an implicit receiver.
+                ImplicitReceiverAnswer::VirtualOverride => return None,
+            }
         }
 
         if ext

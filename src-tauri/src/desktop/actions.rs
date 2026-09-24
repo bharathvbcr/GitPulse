@@ -324,13 +324,14 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        // 16 is owned by `scripts/view-menu-contract.test.ts`, which compares
+        // 17 is owned by `scripts/view-menu-contract.test.ts`, which compares
         // this catalog against the frontend view registry entry by entry and
         // label by label. This assertion is the cheap smoke check beside it —
-        // it went stale at 16 once when the section count dropped, and again
-        // at 15 when History gained Suspects, and the parity contract is what
-        // proves the number is the right one rather than just the current one.
-        assert_eq!(entries.len(), 16);
+        // it went stale at 16 once when the section count dropped, again at 15
+        // when History gained Suspects, and again at 16 when Insights gained
+        // Secrets, and the parity contract is what proves the number is the
+        // right one rather than just the current one.
+        assert_eq!(entries.len(), 17);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {

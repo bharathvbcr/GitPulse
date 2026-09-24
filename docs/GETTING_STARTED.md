@@ -69,7 +69,9 @@ loaded-page filtering, multi-selection, archive, and run boundaries.
 - **GitHub:** install and authenticate `gh` for pull requests, issues, and Actions.
 - **Code Map:** use **Help → Set Up Optional Tools** for DevMap, the default module.
 - **AI assistance:** configure a local model server for built-in assistance;
-  supported Mac builds also offer Apple Intelligence for task drafting.
+  supported Mac builds also offer Apple Intelligence for task drafting and, for
+  commit messages, to phrase a subject the app has already classified. With no
+  model at all, a commit message is still written from the staged change.
 - **Agents and policy:** configure Manvi and the provider you intend to use.
   Explicit agent sessions have their own permissions and network behavior.
 

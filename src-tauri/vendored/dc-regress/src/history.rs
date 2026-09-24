@@ -105,24 +105,46 @@ pub struct ResolvedBlob {
     pub identity: BlobIdentity,
 }
 
-fn bounds(stdout_cap: usize) -> Bounds {
+fn bounds_with_deadline(stdout_cap: usize, deadline: Duration) -> Bounds {
     Bounds {
-        deadline: HISTORY_DEADLINE,
+        deadline,
         stdout_cap,
         stderr_cap: 8 * 1024,
     }
 }
 
-fn run(
+/// Run one bounded git command, refusing a capped read rather than returning
+/// its prefix.
+///
+/// `pub(crate)` rather than private because [`crate::change`] runs `git diff`
+/// under exactly these bounds and exactly this refusal order. A second copy
+/// there would be a second place for the truncation-before-status rule to be
+/// got wrong, and that rule is the one that decides whether a partial read is
+/// presented as a whole answer.
+pub(crate) fn run_git(
     program: &std::ffi::OsStr,
     repo: &Path,
     args: &[&str],
     what: &str,
     stdout_cap: usize,
 ) -> Result<dc_proc::Captured, HistoryRefusal> {
+    run_git_with_deadline(program, repo, args, what, stdout_cap, HISTORY_DEADLINE)
+}
+
+/// [`run_git`] with an explicit wall-clock budget, so a caller walking several
+/// paths can spend the remainder of a shared deadline on each next path rather
+/// than resetting the clock.
+pub(crate) fn run_git_with_deadline(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    args: &[&str],
+    what: &str,
+    stdout_cap: usize,
+    deadline: Duration,
+) -> Result<dc_proc::Captured, HistoryRefusal> {
     let mut command = git_with_program(program, repo);
     command.args(args);
-    let captured = match run_bounded(&mut command, bounds(stdout_cap)) {
+    let captured = match run_bounded(&mut command, bounds_with_deadline(stdout_cap, deadline)) {
         Ok(captured) => captured,
         Err(Failure::Deadline { .. }) => {
             return Err(HistoryRefusal::Deadline {
@@ -174,7 +196,7 @@ pub fn commit_window_with_program(
     // tell "the range is this long" from "the range is longer".
     let max_count = format!("--max-count={}", COMMIT_CAP + 1);
     let range = format!("{since}..{until}");
-    let captured = run(
+    let captured = run_git(
         program,
         repo,
         &["log", &max_count, "--format=%H", "--no-merges", &range],
@@ -210,7 +232,7 @@ pub fn resolve_blob_with_program(
     path: &str,
 ) -> Result<ResolvedBlob, HistoryRefusal> {
     let spec = format!("{rev}:{path}");
-    let id = run(
+    let id = run_git(
         program,
         repo,
         &["rev-parse", &spec],
@@ -218,7 +240,7 @@ pub fn resolve_blob_with_program(
         4 * 1024,
     )?;
     let oid = id.stdout_lossy().trim().to_string();
-    let shown = run(program, repo, &["show", &spec], "git show", CONTENT_CAP)?;
+    let shown = run_git(program, repo, &["show", &spec], "git show", CONTENT_CAP)?;
     let content = match String::from_utf8(shown.stdout.clone()) {
         Ok(content) => content,
         Err(_) => {
@@ -244,7 +266,7 @@ pub fn files_changed_with_program(
     repo: &Path,
     commit: &str,
 ) -> Result<Vec<String>, HistoryRefusal> {
-    let captured = run(
+    let captured = run_git(
         program,
         repo,
         &[

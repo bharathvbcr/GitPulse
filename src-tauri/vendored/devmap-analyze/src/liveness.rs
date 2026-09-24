@@ -1075,7 +1075,9 @@ fn supertypes_by_type(resolution: &ResolutionResult) -> HashMap<(&str, &str), Ve
         }
         if matches!(
             edge.resolution.as_deref(),
-            Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::Unresolved { .. })
+            Some(Resolution::AmbiguousGlobal { .. })
+                | Some(Resolution::LanguageServerDispatch { .. })
+                | Some(Resolution::Unresolved { .. })
         ) {
             continue;
         }
@@ -1210,7 +1212,12 @@ pub(crate) fn unresolved_namesake_names(resolution: &ResolutionResult) -> HashSe
             ) && matches!(
                 row.class,
                 UnresolvedClass::UninferredReceiver | UnresolvedClass::Unresolved
-            )
+            ) && match &row.resolution {
+                Resolution::Unresolved { reason } => {
+                    reason != "implicit receiver method is overridden by an indexed subtype"
+                }
+                _ => true,
+            }
         })
         .map(|row| row.callee_name.as_str())
         .filter(|name| !name.is_empty())
@@ -1415,6 +1422,7 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         if matches!(
             edge.resolution.as_deref(),
             Some(Resolution::AmbiguousGlobal { .. })
+                | Some(Resolution::LanguageServerDispatch { .. })
         ) {
             ambiguous_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
             if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
@@ -1455,6 +1463,25 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         called_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
         if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
             called_symbols.insert((edge.target_file.clone(), short_name.to_string()));
+        }
+    }
+
+    for u in &resolution.unresolved {
+        if u.kind != UnresolvedKind::Call {
+            continue;
+        }
+        if let Resolution::Unresolved { ref reason } = u.resolution {
+            if reason == "implicit receiver method is overridden by an indexed subtype" {
+                if let Some(short_caller) = u.source_symbol.rsplit("::").next() {
+                    if let Some((type_name, _)) = short_caller.rsplit_once('.') {
+                        called_symbols.insert((
+                            u.source_file.clone(),
+                            format!("{type_name}.{}", u.callee_name),
+                        ));
+                        called_symbols.insert((u.source_file.clone(), u.callee_name.clone()));
+                    }
+                }
+            }
         }
     }
 

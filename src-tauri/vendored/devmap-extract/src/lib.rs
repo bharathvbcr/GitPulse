@@ -4,6 +4,7 @@
 // actually uses.
 pub mod cache;
 pub mod clonesig;
+pub mod deref;
 #[cfg(feature = "parse")]
 pub mod embedded;
 pub mod fallback;

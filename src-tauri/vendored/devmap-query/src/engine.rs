@@ -162,13 +162,19 @@ impl<'a> StoreQueryEngine<'a> {
         // `None` whenever every match was ranked, which on any ordinary query
         // is every time.
         let ranked_over_a_sample = ranking_coverage_gap(total, pool);
-        // Two independent qualifications, composed rather than ranked — the
+        // Three independent qualifications, composed rather than ranked — the
         // same shape `dependencies` and the traversals use. One is about the
-        // *ordering* of what was found; the other is about whether the corpus
-        // searched was the whole repository, and it is the one that decides
-        // whether `total: 0` may be read as "no such symbol".
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(ranked_over_a_sample, coverage_gap);
+        // *ordering* of what was found; one is about whether the corpus
+        // searched was the whole repository; and the third is about what an
+        // empty answer is entitled to mean. The second was documented here as
+        // "the one that decides whether `total: 0` may be read as 'no such
+        // symbol'" — but it is `None` on every healthy index, which left the
+        // most confident-looking answer this API produces as the one carrying
+        // the least justification. See [`empty_result_gap`].
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            ranked_over_a_sample,
+            devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
+        );
         Ok(self.finish(response))
     }
 
@@ -1487,6 +1493,125 @@ impl<'a> StoreQueryEngine<'a> {
         })
     }
 
+    /// Definitions in one file as signature plus span — never the body.
+    ///
+    /// An empty file and a path the index does not contain are different
+    /// envelopes ([`SkeletonPresence`]). When `signature` is absent the span
+    /// is still returned and `signature_note` says so explicitly.
+    pub fn skeleton(&self, path: &str, token_budget: u32) -> anyhow::Result<SkeletonReport> {
+        self.cancel.check()?;
+        let path = resolve_skeleton_path(self.store, path)?;
+        let freshness = SourceFreshness::from_store(self.store.query_source_freshness());
+        let Some(extraction) = self.store.latest_extraction_for_path(&path)? else {
+            // Distinguish "no generation at all" from "this path is absent".
+            // Both look like an empty list; only the latter is a finding about
+            // the path the caller named.
+            if self.store.latest_generation_id()?.is_none() {
+                return Ok(SkeletonReport {
+                    file: path,
+                    presence: SkeletonPresence::NotInIndex,
+                    items: Vec::new(),
+                    shown: 0,
+                    total: 0,
+                    truncated: false,
+                    source_freshness: freshness,
+                    resolution: ResolutionAvailability::Unavailable {
+                        reason: "no persisted generation is available".to_string(),
+                    },
+                });
+            }
+            return Ok(SkeletonReport {
+                file: path,
+                presence: SkeletonPresence::NotInIndex,
+                items: Vec::new(),
+                shown: 0,
+                total: 0,
+                truncated: false,
+                source_freshness: freshness,
+                resolution: ResolutionAvailability::Available,
+            });
+        };
+
+        if extraction.symbols.is_empty() {
+            return Ok(SkeletonReport {
+                file: path,
+                presence: SkeletonPresence::Empty,
+                items: Vec::new(),
+                shown: 0,
+                total: 0,
+                truncated: false,
+                source_freshness: freshness,
+                resolution: ResolutionAvailability::Available,
+            });
+        }
+
+        // Prefer the on-disk file for line conversion so the numbers match what
+        // an editor shows. Spans were recorded against the indexed content; a
+        // dirty buffer can shift them, which is disclosed via lines_from_bytes
+        // only when the file cannot be read at all.
+        let source_root = self.store.latest_repo_root()?;
+        let on_disk = devmap_extract::safe_fs::read_repo_source(
+            source_root.as_deref().map(Path::new),
+            &path,
+            devmap_extract::MAX_SOURCE_BYTES,
+        )
+        .ok();
+        let line_index = on_disk.as_deref().map(LineIndex::new);
+        let lines_from_bytes = line_index.is_none();
+
+        let mut items: Vec<SkeletonSymbol> = extraction
+            .symbols
+            .iter()
+            .map(|sym| {
+                let (start_line, end_line) = match &line_index {
+                    Some(index) => byte_span_to_line_range_in(index, &sym.span),
+                    None => (
+                        (sym.span.start_byte as u32).saturating_add(1),
+                        (sym.span.end_byte as u32).saturating_add(1).max(1),
+                    ),
+                };
+                let (signature, signature_note) = match &sym.signature {
+                    Some(text) if !text.is_empty() => (Some(text.clone()), None),
+                    _ => (None, Some("not extracted".to_string())),
+                };
+                SkeletonSymbol {
+                    qualified_name: sym.qualified_name.clone(),
+                    kind: sym.kind.as_str().to_string(),
+                    start_line,
+                    end_line,
+                    start_byte: sym.span.start_byte,
+                    end_byte: sym.span.end_byte,
+                    lines_from_bytes,
+                    signature,
+                    signature_note,
+                }
+            })
+            .collect();
+        // Stable order: declaration order in the file (by start byte), then name.
+        items.sort_by(|a, b| {
+            a.start_byte
+                .cmp(&b.start_byte)
+                .then(a.qualified_name.cmp(&b.qualified_name))
+        });
+
+        let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let mut packed = budget_take(items, token_budget, skeleton_symbol_tokens);
+        packed.total = total;
+        packed.hidden = total.saturating_sub(packed.shown);
+        packed.truncated = packed.hidden > 0;
+
+        Ok(SkeletonReport {
+            file: path,
+            presence: SkeletonPresence::Indexed,
+            items: packed.items,
+            shown: packed.shown,
+            total: packed.total,
+            truncated: packed.truncated,
+            source_freshness: freshness,
+            resolution: ResolutionAvailability::Available,
+        })
+    }
+
     /// Rank symbols by TF-IDF similarity of their names to `query`.
     ///
     /// Complements `search`, which is FTS5 prefix matching: that finds symbols
@@ -1549,7 +1674,182 @@ impl<'a> StoreQueryEngine<'a> {
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
-        response.walk_incomplete = coverage_gap;
+        // The same disclosure the keyword surface makes, for the same reason.
+        // This function's own doc says "'Nothing matched' is an answer" — it
+        // is, and it is also an answer whose scope the caller cannot see, since
+        // the texts scored here are `name` and `qualified_name` and nothing
+        // else. See [`SEARCH_SCOPE_NOTE`].
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            coverage_gap,
+            empty_semantic_gap(response.total, query),
+        );
+        Ok(self.finish(response))
+    }
+
+    /// Plain-language find: name+docstring TF-IDF seeds, re-ranked by
+    /// personalized PageRank over stored call edges.
+    ///
+    /// Distinct from [`Self::search_semantic`], which ranks names only and
+    /// never walks the graph. Default `min_confidence` is the deterministic
+    /// rung ([`crate::ASK_DEFAULT_MIN_CONFIDENCE`]); edges below it are
+    /// excluded unless the caller lowers the floor. A seed set whose only
+    /// call edges sit below that floor returns empty with an explicit
+    /// withheld line — matches were not absent.
+    pub fn ask(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<Response<SymbolHit>> {
+        self.cancel.check()?;
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some(snapshot) = self.store.all_symbols_page()? else {
+            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+                reason: "no persisted generation is available".to_string(),
+            }));
+        };
+        let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
+        let symbols = snapshot.rows;
+        if symbols.is_empty() || query.trim().is_empty() {
+            let mut response = budget_take(Vec::new(), token_budget, |_| 0);
+            response.walk_incomplete = coverage_gap;
+            return Ok(self.finish(response));
+        }
+
+        let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
+        let texts: Vec<String> = symbols
+            .iter()
+            .map(|symbol| {
+                crate::ask::seed_text(
+                    &symbol.name,
+                    &symbol.qualified_name,
+                    docstrings.get(&symbol.qualified_name).map(String::as_str),
+                )
+            })
+            .collect();
+        let index = crate::semantic::SemanticIndex::build(&texts, &self.cancel)?;
+        let scored = index.score(query, &self.cancel)?;
+        if scored.is_empty() {
+            let mut response = budget_take(Vec::new(), token_budget, |_| 0);
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(coverage_gap, empty_ask_gap(query));
+            return Ok(self.finish(response));
+        }
+
+        let seed_positions: Vec<usize> = scored.iter().map(|(position, _)| *position).collect();
+        let seed_names: std::collections::HashSet<&str> = seed_positions
+            .iter()
+            .map(|&position| symbols[position].qualified_name.as_str())
+            .collect();
+
+        let Some(edges) = self.generation_edges()? else {
+            // Seeds matched, but there is no edge index to re-rank over. Surface
+            // the TF-IDF order rather than inventing a graph walk.
+            return self.ask_hits_from_seeds(
+                &symbols,
+                &scored,
+                snapshot.repo_root.as_deref(),
+                token_budget,
+                coverage_gap,
+                None,
+            );
+        };
+
+        // Node set: every seed, plus every endpoint of an admitted Calls edge.
+        // Seeds that never appear on an edge still keep their personalization
+        // mass; endpoints outside the seed set exist so mass can flow along
+        // the graph before we re-rank the seed set alone.
+        let mut nodes: Vec<String> = seed_positions
+            .iter()
+            .map(|&position| symbols[position].qualified_name.clone())
+            .collect();
+        for id in 0..edges.len() as u32 {
+            self.cancel.check_every(id as usize)?;
+            if edges.kind(id) != EdgeKind::Calls || !edges.admits(id, min_confidence) {
+                continue;
+            }
+            for name in [edges.source_symbol(id), edges.target_symbol(id)] {
+                if !nodes.iter().any(|existing| existing == name) {
+                    nodes.push(name.to_string());
+                }
+            }
+        }
+
+        let (outbound, any_call_touched_seed, admitted_call_touched_seed) =
+            crate::ask::call_adjacency(&edges, &nodes, &seed_names, min_confidence);
+
+        if any_call_touched_seed && !admitted_call_touched_seed {
+            let mut response = budget_take(Vec::new(), token_budget, |_| 0);
+            response.walk_incomplete = devmap_analyze::combine_reasons(
+                coverage_gap,
+                Some(crate::ask::confidence_withheld_reason()),
+            );
+            return Ok(self.finish(response));
+        }
+
+        let mut personalization = vec![0.0; nodes.len()];
+        let mut node_rank: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(nodes.len());
+        for (i, name) in nodes.iter().enumerate() {
+            node_rank.insert(name.as_str(), i);
+        }
+        for &(position, score) in &scored {
+            let name = symbols[position].qualified_name.as_str();
+            if let Some(&i) = node_rank.get(name) {
+                personalization[i] = score;
+            }
+        }
+
+        let ranks = crate::ask::personalized_pagerank(&outbound, &personalization, &self.cancel)?;
+        let mut ordered: Vec<(usize, f32)> = seed_positions
+            .iter()
+            .map(|&position| {
+                let name = symbols[position].qualified_name.as_str();
+                let rank = node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0);
+                (position, rank)
+            })
+            .collect();
+        ordered.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+
+        self.ask_hits_from_seeds(
+            &symbols,
+            &ordered,
+            snapshot.repo_root.as_deref(),
+            token_budget,
+            coverage_gap,
+            None,
+        )
+    }
+
+    fn ask_hits_from_seeds(
+        &self,
+        symbols: &[StoredSymbol],
+        ordered: &[(usize, f32)],
+        repo_root: Option<&str>,
+        token_budget: u32,
+        coverage_gap: Option<String>,
+        extra_gap: Option<String>,
+    ) -> anyhow::Result<Response<SymbolHit>> {
+        let total = u32::try_from(ordered.len()).unwrap_or(u32::MAX);
+        let mut hits = Vec::new();
+        for &(position, score) in ordered.iter().take(budget_page_size(token_budget)) {
+            self.cancel.check()?;
+            hits.push(hit_from_stored(
+                symbols[position].clone(),
+                repo_root,
+                token_budget,
+                score,
+            ));
+        }
+        let mut response = budget_take(hits, token_budget, search_hit_tokens);
+        response.total = total;
+        response.hidden = total.saturating_sub(response.shown);
+        response.truncated = response.hidden > 0;
+        response.walk_incomplete = devmap_analyze::combine_reasons(coverage_gap, extra_gap);
         Ok(self.finish(response))
     }
 
@@ -2858,8 +3158,17 @@ impl<'a> QueryEngine<'a> {
         // page was cut.
         response.walk_incomplete = devmap_analyze::combine_reasons(
             response.walk_incomplete.take(),
-            search_coverage_gap(
-                devmap_analyze::extraction_coverage(self.extractions).degraded_reason(),
+            devmap_analyze::combine_reasons(
+                search_coverage_gap(
+                    devmap_analyze::extraction_coverage(self.extractions).degraded_reason(),
+                ),
+                // Same owner, same sentence: an empty answer from this engine
+                // means exactly what an empty answer from the store-backed one
+                // means, and must say so identically. This engine matches by
+                // substring over names rather than through FTS, so its zero has
+                // a different *cause* — but the same thing is true of it, which
+                // is that it never read a file body.
+                empty_result_gap(response.total, &req.query),
             ),
         );
         response
@@ -3189,12 +3498,19 @@ fn indexed_traversed_edges(
 
 /// Traversal starts, found through the index rather than by scanning.
 ///
-/// Identical to the [`traversal_starts`] scan it replaced — same pairs, same
-/// order and duplicates. The traversal admits distinct seeds before applying
-/// its node cap, so repeated edge endpoints cannot consume that capacity.
-/// What changes is the cost: a symbol query tests the distinct
-/// symbols (41,276 on the ScholarLM corpus) and a path query the distinct
-/// files (4,499), instead of testing every one of 271,543 edges.
+/// For path and `file::symbol` queries this is identical to the
+/// [`traversal_starts`] scan it replaced — same pairs, same order and
+/// duplicates. The traversal admits distinct seeds before applying its node
+/// cap, so repeated edge endpoints cannot consume that capacity. What changes
+/// is the cost: a symbol query tests the distinct symbols and a path query the
+/// distinct files, instead of testing every edge.
+///
+/// A bare **symbol** query is different. Matching more than one definition
+/// (distinct `(symbol, file)` pairs) is refused rather than walked: a union of
+/// every namesake's blast radius is a wrong answer to "what does this change
+/// reach". The error lists candidate `file::symbol` ids so the caller can
+/// disambiguate. Search and explore still return the set; they do not go
+/// through this function for their result lists.
 ///
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
@@ -3206,8 +3522,9 @@ fn indexed_traversal_starts(
     min_confidence: f32,
     cancel: &Cancel,
 ) -> anyhow::Result<Vec<(String, String)>> {
+    let query = crate::query_match::classify(target);
     let mut ids: Vec<u32> = Vec::new();
-    match crate::query_match::classify(target) {
+    match query {
         crate::query_match::StartQuery::Nothing => {}
         crate::query_match::StartQuery::Qualified { file, symbol } => {
             for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
@@ -3246,7 +3563,7 @@ fn indexed_traversal_starts(
     }
     ids.retain(|id| index.admits(*id, min_confidence));
     ids.sort_unstable();
-    Ok(ids
+    let starts: Vec<(String, String)> = ids
         .into_iter()
         .map(|id| {
             if reverse {
@@ -3261,7 +3578,23 @@ fn indexed_traversal_starts(
                 )
             }
         })
-        .collect())
+        .collect();
+    // Bare names only. A file seed expanding to every member, or a qualified
+    // `file::symbol`, is a deliberate scope — unioning those is correct.
+    if matches!(query, crate::query_match::StartQuery::Symbol(_)) {
+        let unique: BTreeSet<&(String, String)> = starts.iter().collect();
+        if unique.len() > 1 {
+            let candidates: Vec<String> = unique
+                .into_iter()
+                .map(|(symbol, file)| node_id_of(file, symbol))
+                .collect();
+            anyhow::bail!(
+                "ambiguous symbol '{target}'; use an exact ID or file::symbol; candidates: {}",
+                candidates.join(", ")
+            );
+        }
+    }
+    Ok(starts)
 }
 
 pub fn traversal_starts(
@@ -4033,6 +4366,98 @@ fn search_coverage_gap(corpus_gap: Option<String>) -> Option<String> {
     })
 }
 
+/// What an empty search result does *not* mean.
+///
+/// `total: 0, hidden: 0, truncated: false` on a fresh, undegraded index is the
+/// most confident shape this API can produce, and for a keyword search it is
+/// also the least informative: it is returned both when the repository has no
+/// such symbol and when the caller asked a question this index does not answer.
+///
+/// Measured, and the reason this exists: an agent asked "where is the optimizer
+/// constructed in this repository?", DevMap returned zero items, `devmap_status`
+/// reported `is_fresh: true` with no coverage gaps and nothing quarantined, and
+/// ripgrep then found **eight** construction sites. None of them is a symbol —
+/// `self.optimizer = torch.optim.AdamW(...)` is an attribute assignment to an
+/// externally-owned class — so the store was not stale and not degraded. It
+/// simply does not index that shape, and it had no way to say so.
+///
+/// The comment on `search` already named this as the qualification "that
+/// decides whether `total: 0` may be read as 'no such symbol'". It only ever
+/// fired on a *partial* analysis, so on a complete one — the overwhelmingly
+/// common case — zero carried no qualification at all.
+///
+/// **Only for a multi-term query**, and that restriction is the whole design.
+///
+/// The first version of this fired on every miss, and
+/// `search_over_a_complete_corpus_claims_nothing` rejected it — correctly. A
+/// one-word miss over a fully read corpus is a *completed check*: "no symbol is
+/// named `no_such_symbol_anywhere`" is a whole, correct answer, and hanging a
+/// caveat on it claims an incompleteness that does not exist. Worse, it would
+/// fire on the overwhelmingly common case, which is how a qualification becomes
+/// noise a caller learns to skip — and `walk_incomplete` is the field that has
+/// to be believed when a corpus really does have holes in it.
+///
+/// A multi-term query is different, and not because the conjunction is
+/// incomplete — it ran fully. It is different because the caller has almost
+/// certainly *described* a symbol rather than named one, so the check that ran
+/// is not the check they think they asked for. That is the same kind of note
+/// `ranking_coverage_gap` carries: not "the corpus had holes" but "this answer
+/// means less than its shape suggests". The audit's query,
+/// `optimizer AdamW step`, is exactly that shape.
+fn empty_result_gap(total: u32, query: &str) -> Option<String> {
+    let terms = query.split_whitespace().count();
+    (total == 0 && terms > 1).then(|| {
+        format!(
+            "no symbol matched all {terms} terms — every term must appear in one symbol's \
+             name, qualified name or path, so a phrase describing a symbol will not match it; \
+             {SEARCH_SCOPE_NOTE}"
+        )
+    })
+}
+
+/// The boundary both search surfaces share, written once.
+///
+/// Keyword search and semantic search reach zero by different mechanisms — a
+/// conjunction that filtered everything out, or a score that never rose above
+/// nothing — but the thing a caller most needs to know about either zero is the
+/// same, and it is not about the mechanism: **no file body was read.** Two
+/// copies of this sentence would let one surface be fixed and the other left to
+/// answer in the old shape, which is the failure this whole pass is about.
+const SEARCH_SCOPE_NOTE: &str =
+    "this search matches symbol names, qualified names and file paths, and does not read file \
+     contents — so \"where is X constructed\", \"where is X assigned\" and any other question \
+     about what a body contains is outside what it can answer, and zero here is not evidence \
+     of absence";
+
+/// [`empty_result_gap`] for the semantic surface.
+///
+/// Separate because the conjunction sentence would be a lie here: semantic
+/// search scores term overlap and has no all-terms-must-match rule to explain.
+/// The scope sentence is shared, and is the half that matters.
+///
+/// Gated on the same multi-term condition, for the same reason: a one-word miss
+/// is a completed check on either surface, and the two must not disagree about
+/// when an empty answer is worth qualifying.
+fn empty_semantic_gap(total: u32, query: &str) -> Option<String> {
+    (total == 0 && query.split_whitespace().count() > 1).then(|| {
+        format!("no symbol name or qualified name scored against this query; {SEARCH_SCOPE_NOTE}")
+    })
+}
+
+/// Empty-result disclosure for [`StoreQueryEngine::ask`].
+///
+/// Ask seeds on names and docstrings, then re-ranks over call edges. A zero
+/// here means no shared terms — not that the behaviour is absent from bodies,
+/// and not that the graph was walked and found nothing.
+fn empty_ask_gap(query: &str) -> Option<String> {
+    (query.split_whitespace().count() > 1).then(|| {
+        "no name or docstring shared a term with this query; ask seeds on names and \
+         docstrings then re-ranks over call edges, and does not read file bodies — \
+         zero here is not evidence of absence"
+            .to_string()
+    })
+}
+
 fn ranking_coverage_gap(total: u32, pool: usize) -> Option<String> {
     (total as usize > pool).then(|| format!(
         "ranked the first {pool} of {total} matches, in the store's relevance order; a closer match may sit outside that page"
@@ -4088,6 +4513,41 @@ fn search_hit_tokens(hit: &SymbolHit) -> u32 {
     u32::try_from(hit.source_span.len() / BYTES_PER_TOKEN as usize)
         .unwrap_or(u32::MAX)
         .saturating_add(SEARCH_HIT_OVERHEAD_TOKENS)
+}
+
+/// Token cost of one skeleton row: the signature text (or the "not extracted"
+/// note) plus a fixed overhead for the name and span fields.
+fn skeleton_symbol_tokens(item: &SkeletonSymbol) -> u32 {
+    let body = item
+        .signature
+        .as_deref()
+        .or(item.signature_note.as_deref())
+        .unwrap_or("");
+    let bytes = item.qualified_name.len() + item.kind.len() + body.len() + 24;
+    u32::try_from(bytes / BYTES_PER_TOKEN as usize)
+        .unwrap_or(u32::MAX)
+        .saturating_add(8)
+}
+
+/// Repository-relative path spelling the store uses as a key.
+///
+/// Absolute paths under the indexed root, Windows separators and a leading
+/// `./` all reach the same row; without this a Cursor absolute `file_path`
+/// would answer "not in index" for a file the generation holds under a
+/// relative key.
+fn resolve_skeleton_path(store: &Store, path: &str) -> anyhow::Result<String> {
+    let unified = path.trim().replace('\\', "/");
+    let stripped = unified.strip_prefix("./").unwrap_or(&unified);
+    let raw = Path::new(stripped);
+    if raw.is_absolute() {
+        if let Some(root) = store.latest_repo_root()? {
+            let root = Path::new(&root);
+            if let Ok(relative) = raw.strip_prefix(root) {
+                return Ok(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    Ok(stripped.to_string())
 }
 
 #[cfg(test)]
@@ -5128,12 +5588,34 @@ mod indexed_start_equivalence_tests {
                     let edges = resolved(&rows, floor);
                     let expected = traversal_starts(&edges, query.trim(), reverse);
                     let actual =
-                        indexed_traversal_starts(&index, query.trim(), reverse, floor, &cancel)
-                            .expect("indexed starts");
-                    assert_eq!(
-                        actual, expected,
-                        "query {query:?} reverse={reverse} floor={floor}"
-                    );
+                        indexed_traversal_starts(&index, query.trim(), reverse, floor, &cancel);
+                    match actual {
+                        Ok(actual) => assert_eq!(
+                            actual, expected,
+                            "query {query:?} reverse={reverse} floor={floor}"
+                        ),
+                        Err(err)
+                            if matches!(
+                                crate::query_match::classify(query.trim()),
+                                crate::query_match::StartQuery::Symbol(_)
+                            ) && err.to_string().contains("ambiguous") =>
+                        {
+                            // Bare-name multi-match is refused by the indexed
+                            // path; the scan still unions. Confirm the scan
+                            // would have produced more than one definition.
+                            let unique: BTreeSet<_> = expected.into_iter().collect();
+                            assert!(
+                                unique.len() > 1,
+                                "indexed refused {query:?} as ambiguous, but \
+                                 the scan had {} unique start(s): {unique:?}",
+                                unique.len()
+                            );
+                        }
+                        Err(err) => panic!(
+                            "indexed starts failed for {query:?} reverse={reverse} \
+                             floor={floor}: {err}"
+                        ),
+                    }
                 }
             }
         }

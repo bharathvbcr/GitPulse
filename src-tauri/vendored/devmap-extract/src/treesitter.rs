@@ -2134,6 +2134,39 @@ fn extracted_reference(
     }
 }
 
+/// The superclass expressions of the Python `class_definition` a node sits in,
+/// exactly as written.
+///
+/// As *written*, deliberately: `crate::wiring::python_base_dispatch_reason`
+/// matches on a qualified tail (`autograd.Function`, `nn.Module`), and the
+/// qualifier is the whole reason that rule is safe to apply. Reducing
+/// `torch.autograd.Function` to the bare `Function` here — which is what every
+/// other type-name path in this file does — would hand that registry a name it
+/// must refuse, and the caller would then be free to inherit torch's dispatch
+/// contract from any local class called `Function`.
+///
+/// Bounded by [`bounded_parent`] like every other ancestor walk here, and stops
+/// at the first enclosing class: a method's dispatch contract comes from the
+/// class it is declared on, never from an outer class it is nested inside.
+fn python_enclosing_superclasses(node: Node, source: &str) -> Vec<String> {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if parent.kind() == "class_definition" {
+            let Some(bases) = parent.child_by_field_name("superclasses") else {
+                return Vec::new();
+            };
+            let mut cursor = bases.walk();
+            return bases
+                .named_children(&mut cursor)
+                .map(|base| get_node_text(base, source))
+                .filter(|text| !text.is_empty())
+                .collect();
+        }
+        ancestor = bounded_parent(parent);
+    }
+    Vec::new()
+}
+
 fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
@@ -2959,6 +2992,23 @@ fn extract_node(
                             details: reason.to_string(),
                         });
                     }
+                    // A dispatch contract inherited from the class's base —
+                    // `torch.autograd.Function.forward` and friends. Gated on
+                    // `is_method` because these are method contracts: a
+                    // module-level `def forward` is an ordinary function and
+                    // shares nothing with them but a name.
+                    if is_method {
+                        if let Some(reason) = python_enclosing_superclasses(node, source)
+                            .iter()
+                            .find_map(|base| crate::wiring::python_base_dispatch_reason(base, &n))
+                        {
+                            wiring.push(WiringAnnotation {
+                                kind: WiringKind::RuntimeEntryPoint,
+                                target_symbol: qualified_name.clone(),
+                                details: reason.to_string(),
+                            });
+                        }
+                    }
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name,
@@ -3714,6 +3764,36 @@ fn extract_node(
                             receiver_expr,
                             span,
                         });
+                    }
+                }
+            }
+            // `let service = Service { n: 0 };` types `service` as `Service`,
+            // exactly as `let service = Service::new();` already did one arm
+            // above — and as Go's `composite_literal` has done since SC17.
+            //
+            // Rust was the one grammar with no arm here at all: measured,
+            // `struct_expression` appeared nowhere in this file, so a binding
+            // initialised by a struct literal arrived at the resolver with
+            // `declared_type: None, initializer: None` and every method called
+            // on it resolved to nothing. The resolver's own `T{..}` branch
+            // (`type_from_initializer_shape`) was therefore **unreachable for
+            // Rust** — it was written for this shape and never fed by it.
+            //
+            // The name is read through `rust_type_name`, so `Wrapper::<T> { … }`
+            // and a scoped `crate::a::Service { … }` reduce to the bare type the
+            // same way every other type position does, rather than recording
+            // path text no symbol can match.
+            "struct_expression" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(constructed) = rust_type_name(name_node, source, 0) {
+                        references.push(extracted_reference(
+                            name_node,
+                            source,
+                            file_symbol_name,
+                            constructed,
+                            ReferenceKind::Constructor,
+                            assignment_binding(node, source),
+                        ));
                     }
                 }
             }
@@ -5693,6 +5773,90 @@ fn scoped_qualified_name(node: Node, source: &str, file_symbol_name: &str, name:
 /// exhausts the stack. A stack overflow aborts the process, so one hostile or
 /// generated file would take the whole build with it. Past the bound the type
 /// is simply not recovered, which costs a receiver binding and guesses nothing.
+/// The single type argument of a deref-transparent wrapper node, or `None`.
+///
+/// The tree-walking half of the rule [`crate::deref`] owns; the list of wrapper
+/// names lives there and is shared with the resolver, which asks the same
+/// question of written text. See that module for why `Vec` must never be in it.
+///
+/// Measured, and the reason this exists:
+/// `Service::run_idle_reaper(service: Arc<Service>, …)` calling
+/// `service.wait_tick(tick)` **22 lines below the definition in the same file**
+/// produced no edge, so `Service.wait_tick` was published as dead at
+/// confidence 0.9 with no exemption — the tier whose contract is "safe to act
+/// on". The type argument was dropped here, at extraction, so the resolver
+/// never had a `Service` to fail to match: it was handed the string `"Arc"`,
+/// which is a perfectly plain identifier and so passed every admissibility
+/// check on the way down.
+///
+/// Requires *exactly one* named type argument, which is what keeps
+/// `Vec<Store>` reducing to `Vec` and `rust_type_names_reduce_to_the_bare_identifier`
+/// passing.
+fn rust_deref_transparent_argument<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let outer = node.child_by_field_name("type")?;
+    let text = get_node_text(outer, source);
+    let bare = text.rsplit("::").next().unwrap_or(&text);
+    let bare = bare.split('<').next().unwrap_or(bare).trim();
+    if !crate::deref::RUST_DEREF_TRANSPARENT.contains(&bare) {
+        return None;
+    }
+    let args = node.child_by_field_name("type_arguments")?;
+    let mut cursor = args.walk();
+    let named: Vec<Node<'tree>> = args.named_children(&mut cursor).collect();
+    match named.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
+/// The node a `generic_type`'s nominal identity is read from.
+///
+/// **One owner for the decision, deliberately**, because the name and the
+/// qualifier are read by two different functions and must agree. They descend
+/// the tree separately, so if this choice were made twice
+/// `std::sync::Arc<Service>` could take the name `Service` down one path and
+/// the qualifier `std` down the other, and the pair would assert that `Service`
+/// is declared in `std` — a *fabricated* qualification, which is worse than the
+/// missing edge this whole change exists to fix.
+///
+/// Falls back to the wrapper itself whenever the inner type yields no name, so
+/// `Box<dyn Error>` still reduces to `Box` exactly as it did before. That makes
+/// this change strictly additive: a shape that resolved before resolves to the
+/// same thing now.
+///
+/// The "yields a name" test is [`rust_type_name_is_reachable`], a constant-time
+/// look at the node's own kind, and **not** a trial call to `rust_type_name`.
+/// The trial call is what the first draft of this function did, and it is
+/// quadratic-shaped in the worst way: the caller recurses into the node this
+/// returns, so every level of `Arc<Arc<…>>` would visit its subtree twice and a
+/// chain at the depth bound costs 2^16 node visits per annotation — before the
+/// qualifier walk doubles it again. Bounded, but for no reason.
+fn rust_generic_identity_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if let Some(inner) = rust_deref_transparent_argument(node, source) {
+        if rust_type_name_is_reachable(inner) {
+            return Some(inner);
+        }
+    }
+    node.child_by_field_name("type")
+}
+
+/// Whether [`rust_type_name`] has an arm for this node kind.
+///
+/// Exactly the kinds that function matches, so the two cannot drift into
+/// disagreeing about whether a node names a type. A shape missing here is
+/// treated as unnamed and the wrapper's own name is used — the direction that
+/// preserves the previous answer rather than inventing a new one.
+fn rust_type_name_is_reachable(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "reference_type"
+            | "pointer_type"
+            | "generic_type"
+            | "type_identifier"
+            | "scoped_type_identifier"
+    )
+}
+
 fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
@@ -5701,8 +5865,7 @@ fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
         "reference_type" | "pointer_type" => node
             .child_by_field_name("type")
             .and_then(|inner| rust_type_name(inner, source, depth + 1)),
-        "generic_type" => node
-            .child_by_field_name("type")
+        "generic_type" => rust_generic_identity_node(node, source)
             .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
@@ -6289,6 +6452,37 @@ fn c_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
                 }
                 None
             }),
+        // The C++ half of the deref-transparent rule `crate::deref`
+        // states. `std::shared_ptr<Service> s; s->compute();` forwards
+        // through `operator->` to `Service::compute`, so the receiver's nominal
+        // type is the argument, not the wrapper — and without this arm the `_`
+        // fallback below finds the `name` field first and answers
+        // `shared_ptr`, leaving every out-of-line member reachable only through
+        // a smart pointer looking dead. That is the same defect the
+        // `parameter_declaration` arm above was added to fix for plain values.
+        //
+        // `weak_ptr` is deliberately absent: it has no `operator->`, and a
+        // caller must `.lock()` it into a `shared_ptr` first, so its methods
+        // really are `weak_ptr`'s own.
+        "template_type" => {
+            let outer = node.child_by_field_name("name");
+            let unwrapped = outer
+                .map(|name| get_node_text(name, source))
+                .map(|text| text.rsplit("::").next().unwrap_or(&text).trim().to_string())
+                .filter(|bare| crate::deref::CPP_DEREF_TRANSPARENT.contains(&bare.as_str()))
+                .and_then(|_| node.child_by_field_name("arguments"))
+                .and_then(|args| {
+                    let mut cursor = args.walk();
+                    let named: Vec<Node> = args.named_children(&mut cursor).collect();
+                    match named.as_slice() {
+                        [only] => c_type_name(*only, source, depth + 1),
+                        _ => None,
+                    }
+                });
+            // Falls back to the wrapper's own name, so a template this rule
+            // does not cover answers exactly what it answered before.
+            unwrapped.or_else(|| outer.and_then(|name| c_type_name(name, source, depth + 1)))
+        }
         _ => {
             // `const S` / elaborated types may put the identifier deeper.
             let mut cursor = node.walk();
@@ -6342,8 +6536,15 @@ fn rust_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String>
         return None;
     }
     match node.kind() {
-        "reference_type" | "pointer_type" | "generic_type" => node
+        "reference_type" | "pointer_type" => node
             .child_by_field_name("type")
+            .and_then(|inner| rust_type_qualifier(inner, source, depth + 1)),
+        // Reads [`rust_generic_identity_node`] rather than the `type` field, so
+        // the qualifier describes whichever node gave the *name*. Taking the
+        // wrapper's qualifier while the name came from the argument is how
+        // `std::sync::Arc<Service>` would come to claim that `Service` lives in
+        // `std`.
+        "generic_type" => rust_generic_identity_node(node, source)
             .and_then(|inner| rust_type_qualifier(inner, source, depth + 1)),
         "scoped_type_identifier" => {
             let text = get_node_text(node, source);

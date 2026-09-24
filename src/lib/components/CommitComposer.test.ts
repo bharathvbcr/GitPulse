@@ -104,6 +104,17 @@ describe("CommitComposer", () => {
     expect((footer.match(/whitespace-nowrap/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
 
+  it("writes a commit message without waiting for a loopback model", () => {
+    // The patch is classified in the app. A missing model server is not a
+    // reason to leave the composer blank, and Apple Intelligence is only the
+    // subject when no loopback model is selected.
+    const button = source.slice(source.indexOf("onclick={generateMessage}"));
+    expect(button.startsWith("onclick={generateMessage}")).toBe(true);
+    expect(button.slice(0, 400)).not.toContain("!aiReady");
+    expect(button).toContain("appleReady(apple)");
+    expect(button).toContain("No model is running");
+  });
+
   it("keeps the impact harness's stand-in commit footer in step with this one", () => {
     // harness/impact.html measures that footer's geometry against a copy.
     const host = readFileSync(

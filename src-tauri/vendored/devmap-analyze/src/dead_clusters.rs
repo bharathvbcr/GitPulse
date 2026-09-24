@@ -206,7 +206,9 @@ fn is_reaching_edge(edge: &ResolvedEdge) -> bool {
     }
     !matches!(
         edge.resolution.as_deref(),
-        Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::Unresolved { .. })
+        Some(Resolution::AmbiguousGlobal { .. })
+            | Some(Resolution::LanguageServerDispatch { .. })
+            | Some(Resolution::Unresolved { .. })
     )
 }
 
@@ -233,7 +235,9 @@ fn qualifying_symbols<'a>(resolution: &'a ResolutionResult) -> BTreeSet<&'a str>
         }
         if matches!(
             edge.resolution.as_deref(),
-            Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::Unresolved { .. })
+            Some(Resolution::AmbiguousGlobal { .. })
+                | Some(Resolution::LanguageServerDispatch { .. })
+                | Some(Resolution::Unresolved { .. })
         ) {
             named.insert(edge.target_symbol.as_str());
         }

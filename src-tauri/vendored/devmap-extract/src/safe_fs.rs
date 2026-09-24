@@ -356,6 +356,60 @@ impl SafeFile {
         String::from_utf8(bytes).map_err(|error| refused(error.to_string()))
     }
 
+    /// Read the prefix of an append-only ledger that was there when it opened.
+    ///
+    /// [`read_text`](Self::read_text) treats any size change as tampering,
+    /// which is right for a file only one process should be writing. A session
+    /// ledger is appended by every daemon at once, so growth under the reader
+    /// is its normal state, not an attack: measured on this tree, one
+    /// concurrent writer had 134 of 400 reads refused. Because the rotation
+    /// that retires the ledger only runs after a successful read, each refusal
+    /// also left the file to grow, widening the window for the next one.
+    ///
+    /// So this reads the bytes present at open and ignores whatever arrived
+    /// after: a prefix of an append-only file is a consistent snapshot of it,
+    /// and because a record is appended in a single write, that prefix always
+    /// ends on a record boundary. Replacement (a different inode) and
+    /// truncation (it shrank) are still refused — those are what tampering
+    /// looks like, and neither is something an appender does.
+    pub fn read_text_prefix(&mut self, limit: u64) -> io::Result<String> {
+        let snapshot = self.initial.len();
+        if snapshot > limit {
+            return Err(refused(format!("file exceeds {limit} byte read limit")));
+        }
+        let mut bytes = Vec::with_capacity(snapshot as usize);
+        Read::by_ref(&mut self.file)
+            .take(snapshot)
+            .read_to_end(&mut bytes)?;
+        self.check_appended_only()?;
+        String::from_utf8(bytes).map_err(|error| refused(error.to_string()))
+    }
+
+    /// Identity check for a file other processes are expected to append to.
+    ///
+    /// The same checks [`check_unchanged`](Self::check_unchanged) makes, minus
+    /// the equal-length requirement: the file may have grown, and may not have
+    /// been swapped or truncated.
+    fn check_appended_only(&self) -> io::Result<()> {
+        let current = check_regular(&self.file, self.access != Access::Read)?;
+        let named = open_regular_child(&self._parent, &self.name, Access::Read, Creation::Never)?;
+        let named_metadata = check_regular(&named, self.access != Access::Read)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if current.dev() != named_metadata.dev() || current.ino() != named_metadata.ino() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "managed file was replaced while being examined",
+                ));
+            }
+        }
+        if current.len() < self.initial.len() {
+            return Err(refused("managed file was truncated while being examined"));
+        }
+        Ok(())
+    }
+
     pub fn matches_contents(&mut self, contents: &[u8]) -> io::Result<bool> {
         if self.initial.len() != contents.len() as u64 {
             return Ok(false);

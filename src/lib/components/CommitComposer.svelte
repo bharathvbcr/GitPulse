@@ -28,11 +28,26 @@
   import { fileGlance, markerForHonesty } from "../codeintel/previewSummary";
   import { formatPathParts } from "../files/formatPath";
   import { capFanout, omittedLayeredImpact } from "../codeintel/fanout";
+  import {
+    appleIntelligenceStatus,
+    appleReady,
+    type AppleIntelligenceStatus,
+  } from "../ai/appleIntelligence";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let dirtyCount = $derived($repoStore.statuses.length);
   let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
+  let apple = $state<AppleIntelligenceStatus | null>(null);
+  $effect(() => {
+    let live = true;
+    void appleIntelligenceStatus().then((status) => {
+      if (live) apple = status;
+    });
+    return () => {
+      live = false;
+    };
+  });
   let commitMessage = $derived($repoStore.commitDraft);
   let isAmending = $derived($repoStore.isAmending);
   let includeUnstaged = $state(false);
@@ -178,10 +193,14 @@
     <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Commit</span>
     <button
       onclick={generateMessage}
-      disabled={isGenerating || stagedFiles.length === 0 || !aiReady}
-      title={aiReady
-        ? "Write a message for the staged diff with the local model"
-        : ($harnessStore.ai?.detail ?? "No local model server is running")}
+      disabled={isGenerating || stagedFiles.length === 0}
+      title={stagedFiles.length === 0
+        ? "Stage a change to describe"
+        : aiReady
+          ? "Write a message for the staged diff with the local model"
+          : appleReady(apple)
+            ? "Write the message on-device. The patch is classified in the app; Apple Intelligence only phrases the subject."
+            : "Write a message from the staged diff. No model is running, so GitPulse assembles it from the change."}
       class="gp-chip bg-accent/15 text-accent border-accent/40 hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
     >
       {#if isGenerating}

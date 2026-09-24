@@ -44,6 +44,13 @@ use serde::{Deserialize, Serialize};
 /// it, and it is generous: a task brief that needs more than this is not a
 /// task brief.
 pub const MAX_INPUT_CHARS: usize = 12_000;
+
+/// Published context window of Apple's on-device system model, in tokens.
+///
+/// This is the limit documented for `SystemLanguageModel`, not a measurement
+/// from the Mac this process is running on. Commit briefs stay far below it
+/// because the instructions and the reply share the same window.
+pub const ON_DEVICE_CONTEXT_TOKENS: i64 = 4_096;
 /// Wall-clock budget for one generation, including model load on first use.
 ///
 /// Only the bridged build has anything to time; without it there is no call to
@@ -163,7 +170,10 @@ impl std::error::Error for AppleIntelligenceError {}
 /// about what GitPulse is willing to ask for, not about what Apple's model can
 /// do. Returns the request's total input size on success.
 pub fn validate(request: &AppleIntelligenceRequest) -> Result<usize, AppleIntelligenceError> {
-    if !matches!(request.kind.as_str(), "draft" | "improve" | "extract") {
+    if !matches!(
+        request.kind.as_str(),
+        "draft" | "improve" | "extract" | "commit_subject"
+    ) {
         return Err(AppleIntelligenceError::new(
             "invalid_input",
             "Unknown generation kind.",
@@ -460,6 +470,18 @@ mod tests {
             assert_eq!(validate(&input).unwrap_err().code, code, "{input:?}");
         }
         assert!(validate(&request()).is_ok());
+    }
+
+    #[test]
+    fn a_commit_subject_asks_only_for_the_title() {
+        let mut input = request();
+        input.kind = "commit_subject".into();
+        input.fields = vec!["title".into()];
+        input.notes = "Classified staged change.".into();
+        input.description.clear();
+        assert!(validate(&input).is_ok());
+        input.fields = vec!["owner".into()];
+        assert_eq!(validate(&input).unwrap_err().code, "invalid_input");
     }
 
     #[test]

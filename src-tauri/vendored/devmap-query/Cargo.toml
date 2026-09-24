@@ -1,6 +1,6 @@
 [package]
 name = "devmap-query"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -212,3 +212,24 @@ required-features = ["parse"]
 [[test]]
 name = "source_read_security"
 required-features = ["parse"]
+
+[[test]]
+name = "search_zero_is_not_absence"
+required-features = ["parse"]
+
+[[test]]
+name = "search_hostile_queries"
+required-features = ["parse"]
+
+[[test]]
+name = "skeleton_envelopes"
+required-features = ["parse"]
+
+[[test]]
+name = "ask_ranking"
+required-features = ["parse"]
+
+[[test]]
+name = "ambiguous_impact_seeds"
+required-features = ["parse"]
+

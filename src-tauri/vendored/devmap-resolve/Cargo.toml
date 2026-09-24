@@ -1,6 +1,6 @@
 [package]
 name = "devmap-resolve"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -12,6 +12,9 @@ description = "Call and import resolution into a defended edge graph"
 rayon = { version = "1.10" }
 devmap-extract = { path = "../devmap-extract", default-features = false }
 serde = { version = "1.0", features = ["derive", "rc"] }
+# Workspace dep already linked by the CLI and store — used here for the opt-in
+# language-server JSON-RPC client (`devmap build --lsp`), not a new crate.
+serde_json = { version = "1.0" }
 
 [features]
 default = ["parse"]
@@ -155,4 +158,12 @@ required-features = ["parse"]
 
 [[test]]
 name = "shell_source_resolves"
+required-features = ["parse"]
+
+[[test]]
+name = "language_server_edges"
+required-features = ["parse"]
+
+[[test]]
+name = "deref_transparent_receivers"
 required-features = ["parse"]

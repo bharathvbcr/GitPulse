@@ -223,6 +223,12 @@ flowchart TD
 - Built-in local AI completions (commit messages, explanations and branch names)
   and local model probes restrict their transport to loopback addresses
   (`127.0.0.1`, `localhost`, `[::1]`); remote base URLs are rejected on that path.
+- Commit messages are classified in the app from the staged patch. When no
+  loopback model is selected, a supported Mac may ask Apple Intelligence only
+  for the subject, and only from that classified brief — the patch itself is
+  not sent. If that model is unavailable or its subject fails those checks, the
+  message is the one the app already wrote. Explanations, branch names, and
+  remediation plans still require a loopback model.
 - Task enhancement and agent execution use the separately configured profile Manvi
   provider or agent CLI. Their network and filesystem access follow that provider
   and the selected run settings. The local-completion transport restriction does

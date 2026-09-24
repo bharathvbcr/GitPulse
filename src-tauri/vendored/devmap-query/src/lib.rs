@@ -29,6 +29,7 @@ pub mod rung;
 pub mod snapshots;
 pub mod stat_memo;
 
+pub mod ask;
 pub mod semantic;
 pub mod viz;
 pub mod workspace;
@@ -70,4 +71,5 @@ pub use map_preview::{
 pub use model::*;
 pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnapshot};
 
+pub use ask::{ASK_DEFAULT_MIN_CONFIDENCE, ASK_MAX_ITERS, ASK_RESTART};
 pub use rung::{filter_by_rung, histogram as rung_histogram, Rung, RungHistogram};

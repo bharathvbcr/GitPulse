@@ -1264,7 +1264,13 @@ VALUES (1, lower(hex(randomblob(16))), 1,
 UPDATE pending_paths SET revision = 1;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 22;
+/// v22 → v23 advances `user_version` only. The bump exists so an older binary
+/// that does not know [`ResolutionKind::LanguageServer`] /
+/// [`LanguageServerDispatch`] refuses the store rather than reconstructing
+/// those rows as neighbouring tiers. No DDL changes.
+pub const MIGRATION_V22_TO_V23: &str = "";
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 23;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1299,6 +1305,9 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     MIGRATION_V19_TO_V20,
     MIGRATION_V20_TO_V21,
     MIGRATION_V21_TO_V22,
+    // Empty: v23 only stamps `user_version`. Listed so a fresh store and a
+    // migrated one land on the same version by the same batch list.
+    MIGRATION_V22_TO_V23,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

@@ -1,6 +1,9 @@
 //! Local AI features: commit messages, commit explanations, branch names.
 //!
-//! Every one of them runs against a model server on this machine. The pieces
+//! Explanations, branch names, health plans and coverage reports run against a
+//! model server on this machine. Commit messages are classified from the staged
+//! patch first (`commit_brief`); a model only phrases that classification, and
+//! the classified text is the message when no model can be reached. The pieces
 //! are split three ways, and the split is the point:
 //!
 //! * `discovery` and `http` find the server and carry the request. Loopback
@@ -15,14 +18,11 @@
 //!
 //! ## What is and is not covered by tests
 //!
-//! The entry points here (`generate_commit_message`, `explain_commit`,
-//! `suggest_branch_name`, `fix_health`, `coverage_report`) resolve their
-//! endpoint through `discovery` rather than taking one, so there is no seam to
-//! point them at a stub and they only run with a model server present —
-//! `tests/local_ai_live.rs`, gated behind `GITPULSE_LIVE_AI=1`. That is why
-//! this file's line coverage is low, and it is a deliberate trade: adding an
-//! endpoint parameter purely so tests could inject one would change the public
-//! surface for testing's sake.
+//! `generate_commit_message` is exercised here against a loopback server, against
+//! a server that refuses the connection, and against a reply that invents an
+//! issue number. The other entry points (`explain_commit`, `suggest_branch_name`,
+//! `fix_health`, `coverage_report`) still need a model server; the live check
+//! for a real one is `tests/local_ai_live.rs`, gated behind `GITPULSE_LIVE_AI=1`.
 //!
 //! What the model server can do to this application is covered without it.
 //! `http` is tested against adversarial servers — including one that dribbles
@@ -36,6 +36,7 @@
 //! was — `AiGeneration::warnings` carries the difference rather than hiding it.
 
 pub mod apple;
+pub mod commit_brief;
 pub mod discovery;
 pub mod http;
 pub mod prompt;
@@ -47,7 +48,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_text, git_text_capped, validate_repo};
 use crate::engine::GitReader;
 use crate::harness::protocol::{
     PrepareResult, ProbeResult, SettleResult, OP_CAPABILITY_PROBE, OP_CHAT_PREPARE, OP_CHAT_SETTLE,
@@ -702,13 +703,68 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect::<String>() + "…"
 }
 
-/// The staged diff, as one patch.
-fn staged_diff(repo_path: &str) -> Result<String, String> {
+/// How much of a staged patch is read for classification.
+///
+/// Past this the patch is cut and the message says so. The cut is what keeps a
+/// multi-megabyte diff from being treated as a complete description of the change.
+const COMMIT_PATCH_CAP: usize = 2 * 1024 * 1024;
+
+/// The staged patch, and whether the read stopped early.
+fn read_staged_patch(repo_path: &str) -> Result<(String, bool), String> {
     let repo = validate_repo(repo_path)?;
-    git_text(
+    let (text, incomplete) = git_text_capped(
         &repo,
         &["diff", "--cached", "--no-color", "--no-ext-diff", "-U3"],
-    )
+        COMMIT_PATCH_CAP,
+    )?;
+    Ok((text, incomplete.is_some()))
+}
+
+/// Which writer phrases the subject. The patch has already been classified.
+#[derive(Debug)]
+enum CommitEngine {
+    Local(AiSelection),
+    OnDevice,
+    Patch,
+}
+
+fn usable_selection(selection: Option<AiSelection>) -> Option<AiSelection> {
+    selection.filter(|item| !item.base_url.is_empty() && !item.model.is_empty())
+}
+
+/// The on-device model is asked only when it has something to decide.
+///
+/// A cut patch is missing files, so a phrase written from it overclaims. A
+/// high-confidence classification already has its type and subject; the
+/// on-device guides are written for task titles and will not keep a frozen
+/// `docs:` prefix reliably. Low-confidence edits are the case where a short
+/// rephrase can choose `feat` or `fix` from the brief.
+fn should_ask_on_device(
+    no_server: bool,
+    ready: bool,
+    patch_truncated: bool,
+    high_confidence: bool,
+) -> bool {
+    no_server && ready && !patch_truncated && !high_confidence
+}
+
+/// A server the caller named wins, then one found on loopback, then the
+/// on-device model, then the message already written from the patch.
+fn choose_commit_engine(
+    explicit: Option<AiSelection>,
+    discovered: Option<AiSelection>,
+    on_device: bool,
+) -> CommitEngine {
+    if let Some(selection) = usable_selection(explicit) {
+        return CommitEngine::Local(selection);
+    }
+    if let Some(selection) = usable_selection(discovered) {
+        return CommitEngine::Local(selection);
+    }
+    if on_device {
+        return CommitEngine::OnDevice;
+    }
+    CommitEngine::Patch
 }
 
 /// The working-tree diff against HEAD, staged or not.
@@ -722,48 +778,251 @@ fn working_diff(repo_path: &str) -> Result<String, String> {
     Ok(format!("{}{}", staged, unstaged))
 }
 
-fn recent_subjects(repo_path: &str) -> Vec<String> {
-    GitReader::read_commit_history(repo_path, 12, None)
-        .map(|commits| commits.into_iter().map(|c| c.summary).collect())
-        .unwrap_or_default()
-}
-
 /// Writes a commit message for the staged changes.
+///
+/// The patch is classified first, and that classification is already a
+/// message. A loopback model, when one is selected or discovered, phrases the
+/// message from the brief plus a budgeted diff. Otherwise Apple Intelligence
+/// may phrase the subject from the brief alone. If neither can, the classified
+/// message is the result — a missing model is not an empty composer.
 pub fn generate_commit_message(
     repo_path: &str,
     selection: Option<AiSelection>,
 ) -> Result<AiGeneration, String> {
-    let diff = staged_diff(repo_path)?;
+    let started = Instant::now();
+    let (diff, patch_truncated) = read_staged_patch(repo_path)?;
     if diff.trim().is_empty() {
+        if patch_truncated {
+            return Err(
+                "The staged patch could not be read, so there is no change to describe.".into(),
+            );
+        }
         return Err("Nothing is staged, so there is no change to describe.".into());
     }
-    let files: Vec<String> = GitReader::get_status(repo_path)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| s.is_staged)
-        .map(|s| s.path)
-        .collect();
-    let branch = GitReader::list_branches(repo_path)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|b| b.is_current)
-        .map(|b| b.name)
-        .unwrap_or_default();
-    let style = prompt::style_hint_from_history(&recent_subjects(repo_path));
 
-    let mut generation = run(Feature::CommitMessage, repo_path, selection, |budget| {
-        let budgeted = prompt::budget_diff(&diff, budget);
-        Ok(Turn {
-            system: prompt::commit_message_system(&style),
-            user: prompt::commit_message_user(&branch, &files, &budgeted.text),
-            diff: budgeted,
-        })
-    })?;
-    generation.text = prompt::clean_commit_message(&generation.text);
-    if generation.text.is_empty() {
-        return Err("The model returned an empty commit message.".into());
+    let (staged_paths, status_error) = match GitReader::get_status(repo_path) {
+        Ok(rows) => (
+            Some(
+                rows.into_iter()
+                    .filter(|status| status.is_staged)
+                    .map(|status| status.path)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ),
+        Err(error) => (None, Some(error)),
+    };
+    let (branch, branch_error) = match GitReader::list_branches(repo_path) {
+        Ok(branches) => (
+            branches
+                .into_iter()
+                .find(|item| item.is_current)
+                .map(|item| item.name)
+                .unwrap_or_default(),
+            None,
+        ),
+        Err(error) => (String::new(), Some(error)),
+    };
+    let (subjects, history_error) = match GitReader::read_commit_history(repo_path, 12, None) {
+        Ok(commits) => (
+            commits
+                .into_iter()
+                .map(|commit| commit.summary)
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let style = prompt::style_hint_from_history(&subjects);
+    let mut draft = commit_brief::draft_change(
+        &diff,
+        staged_paths.as_deref(),
+        status_error.as_deref(),
+        &subjects,
+        &branch,
+        patch_truncated,
+    );
+    if let Some(error) = branch_error {
+        draft
+            .warnings
+            .push(format!("The current branch could not be read ({error})."));
     }
-    Ok(generation)
+    if let Some(error) = history_error {
+        draft.warnings.push(format!(
+            "Recent commit subjects could not be read ({error})."
+        ));
+    }
+
+    let explicit = usable_selection(selection);
+    let (discovered, on_device) = if explicit.is_some() {
+        (None, false)
+    } else {
+        let discovered =
+            discovery::choose(&discovery::sweep(None), None).map(|(endpoint, model)| AiSelection {
+                base_url: endpoint.base_url.clone(),
+                model,
+            });
+        // A cut patch is not something the small model should phrase: the brief
+        // would be missing files and the subject would overclaim.
+        let on_device = discovered.is_none()
+            && should_ask_on_device(
+                true,
+                !patch_truncated && !draft.high_confidence && apple::status().ready(),
+                patch_truncated,
+                draft.high_confidence,
+            );
+        (discovered, on_device)
+    };
+
+    match choose_commit_engine(explicit, discovered, on_device) {
+        CommitEngine::Local(selection) => Ok(finish_with_local_model(
+            repo_path, selection, &draft, &style, &branch, &diff, started,
+        )),
+        CommitEngine::OnDevice => Ok(finish_on_device(&draft, started)),
+        CommitEngine::Patch => Ok(generation_from_patch(&draft, started, None)),
+    }
+}
+
+fn finish_with_local_model(
+    repo_path: &str,
+    selection: AiSelection,
+    draft: &commit_brief::CommitDraft,
+    style: &str,
+    branch: &str,
+    diff: &str,
+    started: Instant,
+) -> AiGeneration {
+    let outcome = run(
+        Feature::CommitMessage,
+        repo_path,
+        Some(selection),
+        |budget| {
+            let budgeted = prompt::budget_diff(diff, budget);
+            Ok(Turn {
+                system: prompt::commit_message_system(style),
+                user: prompt::commit_message_user(branch, &draft.brief, &budgeted.text),
+                diff: budgeted,
+            })
+        },
+    );
+    match outcome {
+        Ok(mut generation) => {
+            match commit_brief::guard_local_message(&generation.text, draft) {
+                Ok(guarded) => {
+                    generation.text = guarded.text;
+                    if guarded.dropped_lines > 0 {
+                        generation.warnings.push(format!(
+                            "Dropped {} line(s) that added an issue number or a trailer the patch does not contain.",
+                            guarded.dropped_lines
+                        ));
+                    }
+                }
+                Err(why) => {
+                    generation.text = draft.message.clone();
+                    generation.warnings.push(format!(
+                        "The model reply was not used ({why}). The message was written from the patch."
+                    ));
+                }
+            }
+            if generation.text.trim().is_empty() {
+                generation.text = draft.message.clone();
+                generation.warnings.push(
+                    "The model returned an empty commit message. The message was written from the patch."
+                        .into(),
+                );
+            }
+            generation.warnings.extend(draft.warnings.iter().cloned());
+            generation
+        }
+        Err(error) => generation_from_patch(
+            draft,
+            started,
+            Some(&format!(
+                "The model could not be reached ({error}). The message was written from the patch."
+            )),
+        ),
+    }
+}
+
+fn finish_on_device(draft: &commit_brief::CommitDraft, started: Instant) -> AiGeneration {
+    let request = apple::AppleIntelligenceRequest {
+        kind: "commit_subject".to_string(),
+        fields: vec!["title".to_string()],
+        notes: draft.brief.clone(),
+        title: draft.subject.clone(),
+        description: String::new(),
+        // The brief already names the branch. A second copy would spend the
+        // small window on a fact the model has.
+        context: String::new(),
+    };
+    match apple::generate(&request) {
+        Ok(result) => {
+            match commit_brief::accept_on_device_subject(
+                result.title.as_deref().unwrap_or(""),
+                draft,
+            ) {
+                Ok(subject) => {
+                    let mut generation = generation_from_patch(draft, started, None);
+                    generation.text = commit_brief::assemble(&subject, &draft.body);
+                    generation.model = "apple-intelligence".to_string();
+                    generation.base_url = "on-device".to_string();
+                    generation.context_window = apple::ON_DEVICE_CONTEXT_TOKENS;
+                    generation.context_source =
+                        "on-device model; the patch was classified in the app and was not sent"
+                            .to_string();
+                    generation.warnings.push(
+                        "The subject was phrased on this Mac. The body was written from the patch."
+                            .into(),
+                    );
+                    generation
+                }
+                Err(why) => generation_from_patch(
+                    draft,
+                    started,
+                    Some(&format!(
+                        "Apple Intelligence replied, but the subject was not used ({why}). The message was written from the patch."
+                    )),
+                ),
+            }
+        }
+        Err(error) => generation_from_patch(
+            draft,
+            started,
+            Some(&format!(
+                "Apple Intelligence did not phrase the subject ({}). The message was written from the patch.",
+                error.message
+            )),
+        ),
+    }
+}
+
+fn generation_from_patch(
+    draft: &commit_brief::CommitDraft,
+    started: Instant,
+    extra: Option<&str>,
+) -> AiGeneration {
+    let mut warnings = draft.warnings.clone();
+    if let Some(extra) = extra {
+        warnings.push(extra.to_string());
+    }
+    let bytes = i64::try_from(draft.patch_bytes).unwrap_or(i64::MAX);
+    AiGeneration {
+        text: draft.message.clone(),
+        reasoning: String::new(),
+        model: "gitpulse".to_string(),
+        base_url: String::new(),
+        context_window: 0,
+        context_source: "written from the patch; no model ran".to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        truncated: false,
+        diff_truncated: draft.patch_truncated,
+        diff_used_bytes: bytes,
+        diff_total_bytes: bytes,
+        budget: BudgetReport::default(),
+        warnings,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }
 }
 
 /// Explains an existing commit.
@@ -1136,6 +1395,10 @@ mod tests {
         // describing nothing.
         let sent = requests.recv_timeout(TEST_WAIT).expect("request captured");
         assert!(sent.contains("README.md"), "diff not sent: {sent}");
+        assert!(
+            sent.contains("Factual brief") || sent.contains("Classified staged change"),
+            "classified brief not sent: {sent}"
+        );
         assert!(sent.contains("test-model"), "model not sent: {sent}");
     }
 
@@ -1164,6 +1427,132 @@ mod tests {
         )
         .expect_err("empty stage must refuse");
         assert!(error.contains("Nothing is staged"), "{error}");
+    }
+
+    #[test]
+    fn commit_engine_prefers_a_named_server_then_discovery_then_on_device() {
+        let named = AiSelection {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "named".into(),
+        };
+        let found = AiSelection {
+            base_url: "http://127.0.0.1:10/v1".into(),
+            model: "found".into(),
+        };
+        match choose_commit_engine(Some(named), Some(found.clone()), true) {
+            CommitEngine::Local(selection) => assert_eq!(selection.model, "named"),
+            other => panic!("a named server must win: {other:?}"),
+        }
+        match choose_commit_engine(None, Some(found), true) {
+            CommitEngine::Local(selection) => assert_eq!(selection.model, "found"),
+            other => panic!("a discovered server must beat the on-device model: {other:?}"),
+        }
+        assert!(matches!(
+            choose_commit_engine(None, None, true),
+            CommitEngine::OnDevice
+        ));
+        assert!(matches!(
+            choose_commit_engine(None, None, false),
+            CommitEngine::Patch
+        ));
+        // An empty selection is "none", not a server with a blank name.
+        assert!(matches!(
+            choose_commit_engine(Some(AiSelection::default()), None, false),
+            CommitEngine::Patch
+        ));
+    }
+
+    #[test]
+    fn the_on_device_model_is_asked_only_when_the_patch_left_the_type_open() {
+        assert!(should_ask_on_device(true, true, false, false));
+        assert!(!should_ask_on_device(false, true, false, false), "a server wins");
+        assert!(!should_ask_on_device(true, false, false, false), "not ready");
+        assert!(
+            !should_ask_on_device(true, true, true, false),
+            "a cut patch must not be phrased"
+        );
+        assert!(
+            !should_ask_on_device(true, true, false, true),
+            "a settled classification must not be rephrased"
+        );
+    }
+
+    /// A staged change is enough to describe. A model server that cannot be
+    /// reached must not be the reason the composer stays empty.
+    #[test]
+    fn a_dead_model_still_describes_the_staged_diff() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+
+        let repo = repo_with_staged_change();
+        let generation = generate_commit_message(
+            &repo.path().to_string_lossy(),
+            Some(AiSelection {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "unused".into(),
+            }),
+        )
+        .expect("a staged change still has a message");
+
+        assert_eq!(generation.text, "docs: add readme");
+        assert!(
+            generation
+                .warnings
+                .iter()
+                .any(|warning| warning.to_ascii_lowercase().contains("patch")),
+            "the fallback must say the message came from the patch: {:?}",
+            generation.warnings
+        );
+        assert_ne!(generation.model, "unused");
+    }
+
+    /// The model may phrase the subject. It may not attach an issue or a
+    /// co-author the patch does not contain.
+    #[test]
+    fn an_invented_issue_number_is_not_kept() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+
+        let repo = repo_with_staged_change();
+        let (base_url, _requests) = fake_model_server(
+            "feat: add a readme\n\nFixes #404\n\nCo-authored-by: Mallory <m@example.com>\n",
+        );
+        let (selection, _hits) = probing_selection(base_url);
+        let generation = generate_commit_message(&repo.path().to_string_lossy(), Some(selection))
+            .expect("generation succeeds");
+
+        assert!(
+            generation.text.starts_with("feat: add a readme"),
+            "subject was discarded: {}",
+            generation.text
+        );
+        assert!(
+            !generation.text.contains("404"),
+            "invented issue survived: {}",
+            generation.text
+        );
+        assert!(
+            !generation
+                .text
+                .to_ascii_lowercase()
+                .contains("co-authored-by"),
+            "invented trailer survived: {}",
+            generation.text
+        );
+        assert!(
+            generation.warnings.iter().any(|warning| {
+                let lower = warning.to_ascii_lowercase();
+                lower.contains("issue") || lower.contains("trailer") || lower.contains("co-author")
+            }),
+            "no warning that a line was dropped: {:?}",
+            generation.warnings
+        );
     }
 
     #[test]

@@ -163,8 +163,10 @@ fn resolved_sites_by_language<'a>(
                 // counting it here as well would double it.
                 continue;
             }
-            if matches!(**resolution, Resolution::AmbiguousGlobal { .. })
-                && !seen_fanouts.insert(std::sync::Arc::as_ptr(resolution))
+            if matches!(
+                **resolution,
+                Resolution::AmbiguousGlobal { .. } | Resolution::LanguageServerDispatch { .. }
+            ) && !seen_fanouts.insert(std::sync::Arc::as_ptr(resolution))
             {
                 continue;
             }

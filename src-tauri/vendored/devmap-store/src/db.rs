@@ -1856,7 +1856,41 @@ fn fts_match_query(query: &str) -> Result<String> {
              can carry one through"
         )));
     }
-    Ok(format!("\"{}\"*", query.replace('"', "\"\"")))
+    // Each *word* is its own quoted prefix term, joined by AND — not the whole
+    // input as one quoted phrase.
+    //
+    // A quoted FTS5 phrase requires its tokens to appear **adjacently and in
+    // order** inside a single indexed column, and the indexed columns are
+    // `name`, `qualified_name` and `path`. So `"optimizer AdamW step"*` asked
+    // for a symbol literally *named* `optimizer AdamW step…`, which nothing is,
+    // and the store answered `total: 0, truncated: false, hidden: 0` — a shape
+    // indistinguishable from "this repository contains no such thing".
+    //
+    // Measured on this repository: `devmap_search "dead_symbols"` returned 8
+    // rows and `devmap_search "dead symbols"` returned 0. Same corpus, same
+    // generation, one space.
+    //
+    // A single-word query still produces exactly `"word"*`, byte for byte, so
+    // every query that worked before produces the identical MATCH expression
+    // and the identical rows.
+    //
+    // The quoting rule this function exists to enforce is untouched: each term
+    // is quoted individually, so FTS5 operators, column filters, parentheses,
+    // wildcards and hyphens inside a term stay data rather than becoming
+    // syntax. `AND` is the only thing this function adds as syntax, and it adds
+    // it *between* quoted terms where no user text can reach.
+    let mut terms = query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .peekable();
+    if terms.peek().is_none() {
+        // Whitespace-only (or empty). No term to join, and an empty MATCH
+        // expression is a syntax error rather than an empty result — so this
+        // keeps the exact expression the single-phrase form produced, and with
+        // it whatever SQLite already did about it.
+        return Ok(format!("\"{}\"*", query.replace('"', "\"\"")));
+    }
+    Ok(terms.collect::<Vec<_>>().join(" AND "))
 }
 
 pub fn checked_min_confidence(value: f32) -> Result<f32> {
@@ -3069,6 +3103,14 @@ impl Store {
                 }
             }
             conn.execute("PRAGMA user_version = 22", [])?;
+            version = 22;
+        }
+        if version == 22 {
+            // Version-only rung: LanguageServer / LanguageServerDispatch kinds
+            // are free TEXT on the existing resolution column. Advancing the
+            // stamp makes an older binary refuse the store rather than
+            // reconstructing those rows as neighbouring tiers.
+            conn.execute("PRAGMA user_version = 23", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
@@ -6026,6 +6068,29 @@ impl Store {
         Ok(sha)
     }
 
+    /// The repository root the latest generation was built from.
+    ///
+    /// The pair to [`Self::latest_generation_head_sha`], and needed by the
+    /// same callers for the same reason: an analysis that joins these spans to
+    /// git has to run against *the* repository they were taken from, and a
+    /// root supplied by the caller is a second opinion that can disagree.
+    /// Where the two differ the generation's own root is the correct one,
+    /// because it is the one the byte offsets describe.
+    ///
+    /// `None` when the generation recorded no root — an older store, or one
+    /// built outside a repository. Never an empty string dressed as a path.
+    pub fn latest_generation_repo_root(&self) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let root: Option<Option<String>> = conn
+            .query_row(
+                "SELECT repo_root FROM generations WHERE id = (SELECT max(id) FROM generations)",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(root.flatten().filter(|root| !root.is_empty()))
+    }
+
     /// Rewrite the latest generation's git identity without writing a new graph.
     ///
     /// Callers that have already proved the working tree matches this
@@ -6757,6 +6822,45 @@ generation {latest}; run `devmap status` to re-verify",
             Some(_) => ResolutionSource::Stored,
             None => ResolutionSource::Reconstructed,
         }))
+    }
+
+    /// The build-time [`devmap_analyze::ResolutionRate`] persisted on the
+    /// latest generation, if any.
+    ///
+    /// Status and the MCP `devmap_status` tool carry this rather than
+    /// recomputing it: the unresolved ledger that forms the denominator is not
+    /// kept on the generation, so a later reader cannot reconstruct the rate
+    /// from edges alone. Extracted with `json_extract` so the dead-symbol and
+    /// community arrays never cross into this process.
+    ///
+    /// `None` when there is no generation, or when the summary was written
+    /// before `resolution_rate` existed. Absence is **not measured**, not a
+    /// rate of zero — the same rule `Permille = Option` and the build readout
+    /// already enforce. A malformed blob is an error, not an invented default.
+    pub fn latest_resolution_rate(&self) -> Result<Option<devmap_analyze::ResolutionRate>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = snapshot
+            .query_row(
+                "SELECT json_extract(analysis_json, '$.resolution_rate')
+                 FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        serde_json::from_str::<devmap_analyze::ResolutionRate>(&raw)
+            .map(Some)
+            .map_err(|error| {
+                refusal(format!(
+                    "stored generation resolution_rate is invalid: {error}"
+                ))
+            })
     }
 
     /// Stored edges of the latest generation whose confidence contradicts the

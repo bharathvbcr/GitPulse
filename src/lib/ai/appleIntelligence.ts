@@ -36,7 +36,7 @@ export interface AppleIntelligenceStatus {
 }
 
 export interface AppleIntelligenceRequest {
-  kind: "draft" | "improve" | "extract";
+  kind: "draft" | "improve" | "extract" | "commit_subject";
   fields: string[];
   notes: string;
   title: string;

@@ -822,6 +822,50 @@ pub fn python_harness_entry_reason(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Python class methods a framework dispatches because of the class's *base*.
+///
+/// Keyed on the base class as written, not on the method name alone, and that
+/// is the whole point. `forward` and `backward` are ordinary method names —
+/// exempting every method called `forward` would hide real dead code in any
+/// repository that happens to use the word. What is not ordinary is
+/// `forward` **on a subclass of `torch.autograd.Function`**, which autograd
+/// invokes through `.apply()` from inside the framework, where no static
+/// analyser can see it.
+///
+/// Measured on `qwen-decision`: `_FusedLinearCE.forward` and
+/// `_FusedLinearCE.backward` were published by `devmap_dead_symbols` at
+/// **confidence 0.9 with no exemption reason** — the tier whose contract is
+/// "safe to act on". Acting on them deletes an autograd backward.
+///
+/// **The first attempt at this was a structural rule** — "exempt every method
+/// of a class whose supertypes are all absent from the corpus" — on the theory
+/// that an unread base means an unread dispatcher. `test_hardening`'s
+/// `test_runtime_entry_points_are_exempt_without_exempting_their_file` rejected
+/// it, correctly: `class Widget extends HTMLElement` made `Widget.unusedMethod`
+/// exempt, and that method is genuinely dead. There is no structural signal
+/// separating the two cases — nothing references either method — so the honest
+/// mechanism is the one this file already uses everywhere else: name the
+/// specific dispatch contracts that are known, and stay silent about the rest.
+///
+/// A qualifier is required on every entry (`autograd.Function`, not
+/// `Function`; `nn.Module`, not `Module`) so a local class that happens to be
+/// called `Module` does not inherit torch's contract.
+pub fn python_base_dispatch_reason(base: &str, method: &str) -> Option<&'static str> {
+    let base = base.trim();
+    if base.ends_with("autograd.Function") {
+        return matches!(
+            method,
+            "forward" | "backward" | "setup_context" | "jvp" | "vmap"
+        )
+        .then_some("torch.autograd.Function method invoked by autograd through `.apply()`");
+    }
+    if base.ends_with("nn.Module") {
+        return matches!(method, "forward")
+            .then_some("torch nn.Module.forward invoked by `Module.__call__`");
+    }
+    None
+}
+
 /// Class methods a JS/TS framework calls on the instance's behalf.
 ///
 /// Restricted to class methods on purpose: `render` and `mounted` are ordinary
