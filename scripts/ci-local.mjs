@@ -174,6 +174,16 @@ export const GATES = [
     ],
   },
   {
+    // ci.yml's Gusset engine job. It needs DevCouncil and gusset checked out
+    // beside this repository, as go/go.mod's replaces do; without them the
+    // script exits 2, "could not run", which fails here rather than passing.
+    id: "gusset-check",
+    name: "Gusset engine check",
+    program: "npm",
+    args: ["run", "gusset:check"],
+    covers: ["npm run gusset:check"],
+  },
+  {
     id: "coverage-floor",
     name: "Coverage floor",
     program: "npm",

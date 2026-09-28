@@ -24,7 +24,9 @@ export function readBrowserVerdict(html) {
   /** @type {unknown[]} */
   const rows = result.results;
   if (rows.length < 24 || rows.some(row => !row || typeof row !== "object" || !("pass" in row) || row.pass !== true)) {
-    throw new Error(`Browser regressions failed: ${JSON.stringify(result)}`);
+    const error = new Error(`Browser regressions failed: ${JSON.stringify(result)}`);
+    /** @type {any} */ (error).failedChecks = failedCheckNames(result, rows);
+    throw error;
   }
   if ("genuineObserverShapes" in result && Array.isArray(result.genuineObserverShapes) && result.genuineObserverShapes.length) {
     console.log("genuineObserverShapes", JSON.stringify(result.genuineObserverShapes[0]));
@@ -114,6 +116,38 @@ async function runHarness(harness, webkit) {
   }
 }
 
+/** The names a failed verdict reports: failing checks, then crashes and
+ * unexpected native commands. What a reader needs from a 300 KiB JSON line.
+ * @param {any} result
+ * @param {unknown[]} rows
+ * @returns {string[]}
+ */
+export function failedCheckNames(result, rows) {
+  const names = rows
+    .filter(row => !row || typeof row !== "object" || /** @type {any} */ (row).pass !== true)
+    .map(row => String(/** @type {any} */ (row)?.name ?? "(unnamed check)"));
+  if (rows.length < 24) names.push(`only ${rows.length} checks reported (at least 24 expected)`);
+  for (const crash of Array.isArray(result?.crashes) ? result.crashes : []) names.push(`crash: ${JSON.stringify(crash)}`);
+  const unexpected = Array.isArray(result?.unexpected) ? [...new Set(result.unexpected)] : [];
+  if (unexpected.length) names.push(`unexpected commands: ${unexpected.join(", ")}`);
+  return names;
+}
+
+/** A GitHub Actions error annotation. Annotations are attached to the check
+ * run, so they can be read without the job log, whose tail is all the API
+ * returns and which the Rust tests fill long after these steps.
+ * @param {string} title
+ * @param {string} message
+ */
+export function annotation(title, message) {
+  const escape = (/** @type {string} */ text, /** @type {boolean} */ property) => {
+    let out = text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+    if (property) out = out.replace(/:/g, "%3A").replace(/,/g, "%2C");
+    return out;
+  };
+  return `::error title=${escape(title, true)}::${escape(message, false)}`;
+}
+
 /** `--all` derives the run from BROWSER_HARNESSES so a new harness is guarded the
  * moment it is registered. Hand-listed subsets are how `palette` went unrun: it
  * was runnable and failing for a release while no caller named it.
@@ -124,10 +158,26 @@ async function main() {
   const harnessIndex = process.argv.indexOf("--harness");
   if (process.argv.includes("--all")) {
     if (harnessIndex !== -1) throw new Error("Use either --all or --harness, not both");
+    // Every harness runs. Stopping at the first failure hid every later one:
+    // a run that failed in `branches` said nothing about `tasks`.
+    /** @type {string[]} */
+    const failed = [];
     for (const harness of BROWSER_HARNESSES) {
       console.log(`--- ${harness} ---`);
-      await runHarness(harness, webkit);
+      try {
+        await runHarness(harness, webkit);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(message);
+        failed.push(harness);
+        if (process.env.GITHUB_ACTIONS) {
+          const checks = /** @type {any} */ (error)?.failedChecks;
+          const detail = Array.isArray(checks) && checks.length ? checks.join("\n") : message.slice(0, 2000);
+          console.log(annotation(`${webkit ? "WebKit" : "Chrome"} ${harness}`, detail));
+        }
+      }
     }
+    if (failed.length) throw new Error(`Browser regressions failed in: ${failed.join(", ")}`);
     return;
   }
   const harness = harnessIndex === -1 ? "diagnostics" : process.argv[harnessIndex + 1];
