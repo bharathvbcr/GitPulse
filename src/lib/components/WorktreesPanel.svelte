@@ -539,7 +539,7 @@
            Branch rows hit this first and answered it the same way; the
            reasoning is written up in `sidebar/metrics.ts`.
          -->
-         <div class="flex items-center gap-1.5 min-w-0">
+         <div class="relative flex items-center gap-1.5 min-w-0">
           <button
             class="flex items-center gap-1.5 min-w-0 flex-1 text-left"
             onclick={() => open(wt)}
@@ -557,7 +557,13 @@
               {/if}
             </span>
           </button>
-          <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 shrink-0">
+          <!-- Overlaid, not in flow. In flow, this invisible rail of six buttons
+               kept ~98px of line one reserved at all times, and the name gave
+               it up: the same truncation the two-line row was built to end.
+               It covers the name's tail only while it is shown, and takes no
+               clicks while hidden; Tab still reaches it, which is what shows
+               it to a keyboard. -->
+          <div class="absolute right-0 top-1/2 -translate-y-1/2 flex items-center gap-0.5 rounded-full bg-surfaceHover pl-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto">
             <button
               onclick={() => open(wt)}
               title="Open in a new tab"
