@@ -32,7 +32,7 @@ func run(out, errOut io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err := gussetcheck.SelfTest(ctx)
-	if closeErr := gussetcheck.Close(); err == nil {
+	if closeErr := gussetcheck.Shutdown(2 * time.Second); err == nil {
 		err = closeErr
 	}
 	switch {

@@ -171,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      DEVCOUNCIL_PIN: 3197897490bff4fe2607d885cfe369ecc53363fb
+      DEVCOUNCIL_PIN: 876ace2913e62233c24b0c32da333744f4b4c88b
       GUSSET_PIN: b6f5200bfff4730e4e5268bead7e743d684cb67e
     steps:
       - name: Checkout Repository
@@ -230,7 +230,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          eval "$(../DevCouncil/rust/gusset-engine/cgo-env.sh --export)"
+          # Captured first: `eval "$(failing)"` evaluates empty output and
+          # succeeds, so a failed engine build would surface as a link error.
+          exports="$(../DevCouncil/rust/gusset-engine/cgo-env.sh --export)"
+          eval "$exports"
           cd go
           go vet -tags gusset ./...
           go test -race -tags gusset -count=1 ./...

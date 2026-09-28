@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gussetfn"
 	"github.com/bharathvbcr/gusset"
@@ -35,9 +36,16 @@ func SelfTest(ctx context.Context) error {
 	return classify(gussetfn.SelfTest(ctx))
 }
 
-// Close releases the engine's shared handle.
+// Close releases the engine's shared handle, joining its workers without a
+// bound. At process exit use Shutdown.
 func Close() error {
 	return gussetfn.Close()
+}
+
+// Shutdown releases the engine within drain: jobs are cancelled and the join
+// happens only if they finished, so a stuck engine cannot hang exit.
+func Shutdown(drain time.Duration) error {
+	return gussetfn.Shutdown(drain)
 }
 
 func classify(err error) error {

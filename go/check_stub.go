@@ -2,7 +2,10 @@
 
 package gussetcheck
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Run stubs the Gusset engine check when built without -tags gusset.
 func Run(_ context.Context) error {
@@ -16,3 +19,6 @@ func SelfTest(_ context.Context) error {
 
 // Close has nothing to release without the engine.
 func Close() error { return nil }
+
+// Shutdown has nothing to release without the engine.
+func Shutdown(time.Duration) error { return nil }
