@@ -122,7 +122,9 @@
       maxlength="4096"
       autocomplete="off"
       spellcheck="false"
-      disabled={disabled || busy}
+      {disabled}
+      readonly={busy}
+      aria-busy={busy}
       onfocus={() => { focused = true; }}
       onblur={() => { focused = false; }}
       onkeydown={onKey}
