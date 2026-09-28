@@ -39,6 +39,32 @@ fn is_sharing_violation(error: &std::io::Error) -> bool {
 }
 
 pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
+    // Every step below is safe to repeat from the top: the comparison reads,
+    // the temporary name is new each time, and the rename is the only write.
+    // On Windows a sharing violation can surface from any of them while
+    // another process holds the same file or directory for a moment, and
+    // retrying only the rename and the comparison still let concurrent
+    // `devmap claude` runs fail with os error 32; the whole write waits it
+    // out instead, within the same deadline.
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + WINDOWS_SHARING_DEADLINE;
+        loop {
+            match write_atomic_once(path, content) {
+                Err(error)
+                    if is_sharing_violation(&error) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    write_atomic_once(path, content)
+}
+
+fn write_atomic_once(path: &Path, content: &[u8]) -> std::io::Result<bool> {
     use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
     devmap_extract::safe_fs::preflight_write(path)?;
     let parent = PinnedDir::open(path.parent().unwrap_or(Path::new(".")), true)?;

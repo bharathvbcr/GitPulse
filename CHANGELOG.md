@@ -18,7 +18,7 @@ before that tag is pushed.
   vendored `devmap-store` carried `latest_symbols_for_file` (behind
   `cmd_codeintel_symbols_for_file`) that DevCouncil did not have. That code
   landed upstream in bharathvbcr/DevCouncil#14 and the crates are re-vendored
-  from it (`485a2a6`). That commit also brings DevCouncil's bounded LSP
+  from it (`975a79b`). That commit also brings DevCouncil's bounded LSP
   client (`devmap-resolve`, with its `dc-proc` session helpers), so every
   wait on a language server has a deadline, and its Windows fixes in
   `devmap-extract`, `devmap-query` and `devmap-store` (file identity checks,

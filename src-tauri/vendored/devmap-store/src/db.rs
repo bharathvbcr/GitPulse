@@ -32,6 +32,15 @@ impl std::fmt::Display for StoreRefusal {
 
 impl std::error::Error for StoreRefusal {}
 
+/// Held while a read-only connection opens and makes its first read, the
+/// moment it maps the WAL index. Concurrent read-only connections in one
+/// process setting that up together livelocked on Windows: every one of them
+/// got SQLITE_PROTOCOL for as long as they kept retrying, and no read-write
+/// connection was there to finish the index for them
+/// (`concurrent_readers_cannot_enqueue_writer_work`). Serialised, the first
+/// sets it up and the rest find it ready. Reads after that run concurrently.
+static READ_ONLY_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
@@ -3174,7 +3183,11 @@ impl Store {
     /// even when the application has write access to the file. A writer must
     /// upgrade an older store explicitly before an advisory reader can use it.
     pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+        Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref()))
+    }
+
+    fn open_read_only_once(db_path: &Path) -> Result<Self> {
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
         let path = resolved.as_path();
         Self::validate_database_file(path)?;
@@ -3191,12 +3204,17 @@ impl Store {
             )));
         }
         let _sidecars = Self::checked_sidecars(path)?;
+        let setup = READ_ONLY_SETUP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
-        let stamped: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+        let first_read = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
+        drop(setup);
+        let stamped: i32 = match first_read {
             Ok(version) => version,
             Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
                 conn = Self::open_immutable(path)?;
@@ -3244,11 +3262,15 @@ impl Store {
         )
     }
 
-    pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+    /// Run an open, retrying `SQLITE_PROTOCOL` within
+    /// [`Store::PROTOCOL_RETRY_DEADLINE`]. Shared by every entry point that
+    /// opens a connection: read-only opens lost the same race on Windows
+    /// (`concurrent_readers_cannot_enqueue_writer_work`).
+    fn retrying_lost_races(open: impl Fn() -> Result<Self>) -> Result<Self> {
         let deadline = std::time::Instant::now() + Self::PROTOCOL_RETRY_DEADLINE;
         let mut pause = std::time::Duration::from_millis(10);
         loop {
-            match Self::open_once(db_path.as_ref()) {
+            match open() {
                 Err(error)
                     if Self::lost_a_locking_race(&error)
                         && std::time::Instant::now() + pause < deadline =>
@@ -3259,6 +3281,10 @@ impl Store {
                 outcome => return outcome,
             }
         }
+    }
+
+    pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+        Self::retrying_lost_races(|| Self::open_once(db_path.as_ref()))
     }
 
     fn open_once(db_path: &Path) -> Result<Self> {
