@@ -1008,10 +1008,16 @@ if (params.has("check")) {
       && Boolean(field("Labels")) && field("Labels").getClientRects().length > 0
       && editor().textContent.includes("ci"));
     confirmAnswer = true; await click("Close task details"); await settle();
-    root.querySelector('[data-task-column="inbox"]')?.focus();
-    document.dispatchEvent(new KeyboardEvent("keydown", {key:"a", bubbles:true}));
+    // A key reaches the board through whatever holds focus. This focused a
+    // column, which is not focusable, and dispatched on `document`, which the
+    // board's handler never accepts — so it passed only when focus happened to
+    // be in quick add already, and never exercised the shortcut.
+    const boardCard = root.querySelector("[data-task-card]");
+    boardCard?.focus();
+    const startedElsewhere = Boolean(boardCard) && document.activeElement === boardCard;
+    boardCard?.dispatchEvent(new KeyboardEvent("keydown", {key:"a", bubbles:true}));
     await settle();
-    check("the a shortcut puts the cursor in quick add", document.activeElement === quickAdd());
+    check("the a shortcut puts the cursor in quick add", startedElsewhere && document.activeElement === quickAdd());
     await change(quickAdd(), "");
 
     // ---- Quick add, with the model ---------------------------------------

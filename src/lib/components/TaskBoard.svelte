@@ -589,6 +589,7 @@
     if (target instanceof HTMLElement && target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
   }
   function onCardPointerDown(e: PointerEvent, card: TaskCard) {
+    if (opening) return;
     if (e.button !== 0 || busy || menu) return;
     press = { card, x: e.clientX, y: e.clientY };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -624,6 +625,10 @@
     } else void moveCard(current.card, over, position);
   }
   function onCardClick(e: MouseEvent, card: TaskCard) {
+    // A card is not `disabled` while a task opens: a disabled button loses
+    // focus, so the editor recorded <body> as its opener and returned focus
+    // there on close. The same refusal is made here instead.
+    if (opening) return;
     if (skipClick) return;
     if (e.metaKey || e.ctrlKey) {
       selected = toggleSelection(selected, card.id);
@@ -654,6 +659,7 @@
     menu = { cards: cardsById(displayColumns, selected), column: status, x, y };
   }
   function onCardContextMenu(e: MouseEvent, card: TaskCard, status: TaskStatus) {
+    if (opening) return;
     e.preventDefault();
     e.stopPropagation();
     skipClick = true;
@@ -666,6 +672,10 @@
     menu = { cards: [], column: status, x: e.clientX, y: e.clientY };
   }
   function onCardKeydown(e: KeyboardEvent, card: TaskCard, status: TaskStatus) {
+    // A card is not `disabled` while a task opens: a disabled button loses
+    // focus, so the editor recorded <body> as its opener and returned focus
+    // there on close. The same refusal is made here instead.
+    if (opening) return;
     if (isContextMenuKey(e)) {
       e.preventDefault();
       e.stopPropagation();
@@ -1316,7 +1326,7 @@
             aria-haspopup="menu"
             aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
             aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"
-            disabled={opening}
+            aria-disabled={opening || undefined}
             onclick={(e) => onCardClick(e, card)}
             oncontextmenu={(e) => onCardContextMenu(e, card, card.status)}
             onkeydown={(e) => onCardKeydown(e, card, card.status)}
@@ -1368,7 +1378,7 @@
                   aria-haspopup="menu"
                   aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
                   aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"
-                  disabled={opening}
+                  aria-disabled={opening || undefined}
                   onpointerdown={(e) => onCardPointerDown(e, card)}
                   onpointermove={onCardPointerMove}
                   onpointerup={onCardPointerUp}
