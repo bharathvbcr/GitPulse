@@ -18,6 +18,13 @@ const worktrees=[root,other].map((path,i)=>({path,name:path.split("/").pop(),bra
 const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
 const fixtures={
  cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
+ // Commands the diff and AI surfaces call that this harness does not exercise.
+ // Each answers the way a build without the feature does: a fixed HEAD, no
+ // code index, no on-device model. Refusing them as unconfigured failed the
+ // whole suite on commands it never meant to test.
+ cmd_get_head_id:()=>"0000000000000000000000000000000000000001",
+ cmd_codeintel_symbols_for_file:a=>({available:false,head_matches:false,file_path:a.filePath,requested_head_sha:a.headSha,items:[],reason:"no code index in this fixture"}),
+ cmd_apple_intelligence_status:()=>({compiled:false,state:"unsupported_os",reason:"not_compiled",detail:"Not built into this fixture."}),
  cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),
  cmd_repo_operation:()=>null,cmd_stash_list: () => ({ entries: stashEntries, truncated: stashTruncated }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
  cmd_list_remotes:()=>({remotes:[],truncated:false}),cmd_list_submodules:()=>({submodules:[],truncated:false}),
