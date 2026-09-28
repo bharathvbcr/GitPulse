@@ -320,6 +320,102 @@ pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Fa
     })
 }
 
+/// A long-lived child the caller converses with over its pipes: a language
+/// server, anything that answers requests rather than running to exit.
+///
+/// [`run_bounded`] cannot hold one — it owns the pipes and waits for EOF — so
+/// before this, such a child was spawned with a bare `Command` and inherited
+/// none of the runner's discipline. A `Session` keeps the part that does not
+/// depend on the protocol: the child leads its own process group, [`kill`]
+/// signals the whole group and reaps it, and dropping the session does the
+/// same, so no path out of a caller leaves the child or its descendants
+/// running.
+///
+/// The deadline stays the caller's, because only the caller knows what one
+/// request is. What it must not do is read the pipe on the thread that
+/// enforces the deadline: a blocking read on a child that has gone quiet never
+/// returns, and the deadline is never checked. Read on a thread, wait on a
+/// channel with `recv_timeout`, and [`kill`] on expiry — the kill closes the
+/// pipe and ends the reader.
+///
+/// [`kill`]: Session::kill
+pub struct Session {
+    child: std::process::Child,
+    program: String,
+    killed: bool,
+}
+
+impl Session {
+    /// The child's stdin, once; `None` after the first call.
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// The child's stdout, once; `None` after the first call.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// The exit status if the child has already exited, without waiting.
+    pub fn try_status(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// The program this session runs, for messages.
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// Signal the child's process group and reap the child. Idempotent.
+    ///
+    /// The group is signalled even when the child has already exited: a
+    /// descendant it left behind is still in the group, and the group id
+    /// cannot be reused while any member lives.
+    pub fn kill(&mut self) {
+        if self.killed {
+            return;
+        }
+        self.killed = true;
+        kill_descendants(&mut self.child);
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// A command for [`spawn_session`], so a session's program is named through
+/// this module like every other child the kernel starts.
+pub fn session_command(program: impl AsRef<OsStr>) -> Command {
+    Command::new(program)
+}
+
+/// Start `command` as a [`Session`]: stdin and stdout piped, stderr discarded
+/// (a conversational child that fills an undrained stderr pipe blocks), and the
+/// child leading its own process group. Spawning retries the same pre-exec
+/// refusal [`run_bounded`] does, within `spawn_deadline`.
+pub fn spawn_session(command: &mut Command, spawn_deadline: Duration) -> Result<Session, Failure> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = spawn_with_retry(|| command.spawn(), &program, Instant::now(), spawn_deadline)?;
+    Ok(Session {
+        child,
+        program,
+        killed: false,
+    })
+}
+
 /// End the child and everything it started, then let the drain threads come
 /// home.
 ///

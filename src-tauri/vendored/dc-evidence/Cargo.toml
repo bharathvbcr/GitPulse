@@ -1,6 +1,6 @@
 [package]
 name = "dc-evidence"
-version = "0.2.4"
+version = "1.3.5"
 edition = "2024"
 license = "Apache-2.0"
 description = "Deterministic acceptance verification over independently bound execution evidence"

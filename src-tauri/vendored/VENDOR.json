@@ -7,20 +7,20 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-evidence",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.license = \"Apache-2.0\"",
         "dependencies.sha2 from the workspace",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "2b22f27e0ab082589ff9f6b2843a60c5c0db2d53a6cde8373431109f8ea82566",
+        "Cargo.toml": "1868e8e3f84c6cde5203ba5cba8ff49b3c686a215b7f7268261ca73afc7515c2",
         "src/lib.rs": "48a0f0ce84cac350ec7f3f5bf0a2573915ae5457994bd166260a538e7a423bd6",
         "src/strict_json.rs": "1e0cc3930c1ae107abed7a866cb69db9196b42dc802d9e05812e614699897043",
         "src/types.rs": "0a688a75bc03c8a17046f59a9bd9d3f4080814dbe1db89ae9e59b35f32a44cad"
@@ -32,19 +32,19 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-glob",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.license = \"Apache-2.0\"",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "1c0df049dca94aaf16c0c2119dafcbde5c6a0c69a70e05c525e580ab7084be0f",
+        "Cargo.toml": "262dd45d3e5449ea861a37be5fa27c2e1256b41bd6699153e501096d9fcd2c6a",
         "src/lib.rs": "47a348f4885c4805e475e78ee3e23ec6f935673f38f3722d8bea4370030781cf"
       }
     },
@@ -54,20 +54,20 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-proc",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.license = \"Apache-2.0\"",
         "dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "7ab1e279a577118e77015caa8a44cb4676d3ba85417ee8e4202140d425857f84",
-        "src/lib.rs": "800cd7e0c0caf92ab9a6332975f2bd736442de6b697f34155ad88160720cee54"
+        "Cargo.toml": "347dcfb4e01abf18800f36ddf74639962c935e8d58b0695d6857ccb1c9fe1f97",
+        "src/lib.rs": "632d833074ac0affaafd5fbdbca1b56340cfe8fac3bfe77369b2ebeaf330a85f"
       }
     },
     {
@@ -76,14 +76,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-regress",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -92,7 +92,7 @@
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "4847e36dbf14496b8c51b0780b1008322b93db6d8552ca240c985b9cf0d526aa",
+        "Cargo.toml": "8c7c50a9d848fd2756c1c573e4a79c0e7f0399fa00b754ddfa661905e2bb9e0c",
         "src/blame.rs": "bf59d3907e5db9e0b05a47062e9f59a8b360f12ee17668da8f327b5db56ab061",
         "src/blast.rs": "9d2a84f5f44a0a93dd881ec69f6ff7de5bd9f7e17e91e67c66cc604c493aedee",
         "src/change.rs": "eb3e7f2ad643d41cc587056c13d41f1804f54a0edde8dc96918a5d2e6b9beadf",
@@ -109,14 +109,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-regress-store",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -124,7 +124,7 @@
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "cbf0d7c7ad098a2c7f7cee3cd6375242a7f84ef3b30c6e6029d7cd560622febd",
+        "Cargo.toml": "33553644c30f4c2d9faa69fdca7e1689da522563a46d8c80ee07f0b93a6210a2",
         "src/lib.rs": "c3d14b817d4e25bcb07a7bdb52723f4b090608650577971efd3278a3278d2c33"
       }
     },
@@ -134,20 +134,20 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.license = \"Apache-2.0\"",
         "dependencies.rusqlite from the workspace",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "30311ece69f83db931cdd36cd589826a3f77e8bf4dd5e2df8622d78b49ba0b2c",
+        "Cargo.toml": "505f8695466077912ce6ab33edf6e07ca6edff72768f84441c5ae0083c13cb8c",
         "src/bin/dcstore.rs": "bc6a76ae3e80b07f525df2870a31f12a1212a32561d24df925e6ffee78b5ec13",
         "src/json.rs": "00fad17a5c902c59eafce74ca45c8bd68859ee898bbeb898854cded0a5d6f2ea",
         "src/lib.rs": "9890c1d6a569277ae92db22e76366b85fa462a04bdf480b0a35839a36c645ce8",
@@ -180,19 +180,19 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-verify",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.license = \"Apache-2.0\"",
         "inlined [lints] from the workspace"
       ],
       "files": {
-        "Cargo.toml": "b2d7a88a9e2a777fc90b32a2201cafd2ca71c11832cadbaa223dfc64aa622e3f",
+        "Cargo.toml": "0a03d4f3dc7c136eeb32c66e8423e6cbf1e827aebc3124e6703fc2065c3098db",
         "src/bin/dcjsoncheck.rs": "ad468d90a4ff9f8cd74ffad1ea9be48773c4c2266754926b11f5203731eabacd",
         "src/bin/dcverify.rs": "d8ee621b464e7f899a4c1f9bb85c8aaad29a8940138f9468660e2b6bcbbb63a4",
         "src/coverage.rs": "2773c0cf1ca0d0c9de00880224ad5034f4f2affabe4109bd4a4988d4577a4cfd",
@@ -209,14 +209,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-analyze",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -227,7 +227,7 @@
         "dependencies.tree-sitter-python from the workspace"
       ],
       "files": {
-        "Cargo.toml": "91def792b4953a06c0e3b7307cc4c179090e9003f863402382923839403c29d2",
+        "Cargo.toml": "7579893995bfa3a5b0494c3609f025ac53cdad378730bc97575367b90cb3b19b",
         "src/clones.rs": "0e57179bd70dc8e40aadc4e9e8b0914202101b2e047381dd54478522a39956f4",
         "src/clustering.rs": "a154f73f80f7b95838207aeaf4f3a903a473bb90cf2330ce0013e53a79b13b6c",
         "src/dead_clusters.rs": "2b011dc5a5d0df88579ca9bc8e8f54dd76fe43dee15fe43669d62e4c2f36b47c",
@@ -247,14 +247,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-extract",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -300,7 +300,7 @@
         "target.'cfg(unix)'.dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "f9b3dddc4a9e2ddfa094dee154fdd20fc41c77beaf1fd6fdafe7337dbfb31461",
+        "Cargo.toml": "e507fb07124b7e4ee1b83c8354e9ee7f59959e3d27ff19d5d1a08b359c1d161f",
         "build.rs": "b0714b359f5862b7cbe8b852a04b2402f85b65f1917f950d136fcca14ed0d5de",
         "src/cache.rs": "5c9fa2720b093a7f4b11ae384302d6ae5b1237f91ab389d61ae102857def933d",
         "src/clonesig.rs": "11afa842f06228636d7cc0271e83925347108ed44a8c70502dfb480e47a0ea43",
@@ -378,14 +378,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-query",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -396,7 +396,7 @@
         "dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "5ff7e1413e9abded95d0249c79720993c0462e894875dbf1996a83db41ae2748",
+        "Cargo.toml": "30de288cb67c20031d911415bec1d01788acc99ffd4b23b3b288b2fda912b29d",
         "assets/force-graph.min.js.bundle": "1008539bb9e171a0dc343453366451a1b3a6ded06028ef4f978608b658ba2d0a",
         "src/api_routes.rs": "161e0b6cffe011ba8e027a28ca47f87c3ab0c41383092f4e5efd8b82fc3af39d",
         "src/artifacts.rs": "290a8b1548fa6d3e7ad3bd936f4067c9615d87a6212dd56d71756bd3f68d44cd",
@@ -436,14 +436,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-resolve",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -452,11 +452,11 @@
         "dependencies.serde_json from the workspace"
       ],
       "files": {
-        "Cargo.toml": "0fb9930b8fb3369ea0f1c41961c55dd1da8f8be4ec23e079eee0d1b57c15ce98",
+        "Cargo.toml": "f41f411a7973bca465c6ccab51f77985a44946362589772a0875a344cdb583ba",
         "src/builtins.rs": "5239e2fcb8a20bcf5d3c96aefec78a551a06e338add2201031a05185009fff47",
         "src/importpath.rs": "e27c28198c50f797032e5cc7a43366fdaca1db55849756f1c9778a97917c72bb",
         "src/lib.rs": "f955dc6e843be8d25865489b56279bc86457ffb503c086c8cd155d37de5afc8b",
-        "src/lsp.rs": "4fab5e23013920efe371d71654178e8301f09dffe3739e1310cf3bbed5a3306a",
+        "src/lsp.rs": "bc5f9ac24090ccbc48443a14fe47381b767f0f7b8fd16448e4d56275c7c2baf9",
         "src/model.rs": "23ee8638523a2583ef8dedf82da1072fa47ee58a83b0a7794fbc8585e0e5ec9f",
         "src/resolver.rs": "4817f76b744e388b72dff6221f2947c7d0a512bd0e5b25b2aa97a3db946e6ff6"
       }
@@ -467,14 +467,14 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-store",
-        "commit": "c55d47945d30b11faba91aa8735acc0df26e7702"
+        "commit": "c3c5f4d2973c3827b08edbb8202c8cca6b9a295f"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "package.version = \"0.2.4\"",
+        "package.version = \"1.3.5\"",
         "package.edition = \"2021\"",
         "package.license = \"Apache-2.0\"",
         "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
@@ -486,13 +486,13 @@
         "dropped [dev-dependencies]"
       ],
       "files": {
-        "Cargo.toml": "464adaaab36888144dec685a118a90c68b1ff6cffd9397503426b95b637bef44",
+        "Cargo.toml": "0bc3eee6e5090ae55a4199eb2ea6c6335b8d68fe5009ca901cfb1dcf62543f2f",
         "src/bin/hold_uncommitted_child.rs": "99d06534e8155f43fcba3291b816a681a1de9de4dab02ca84cbbcc891758a807",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
         "src/db.rs": "8c44c6966d12f641ac6393c17ce4db4395d3e2464bfc44cfd9a40eb2babb7a3d",
         "src/edge_index.rs": "129d2417278f40d051e5582ae880fa1f3965e1c3c09d8a2a40b7da0eeca4524a",
         "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
-        "src/lib.rs": "6c82fc8e17ac61939d722f056b9af61e14cebed6aaba5a07b8177e594308a6a2",
+        "src/lib.rs": "9b8d1891d92a461b13952c35af39cdd83b1a08e177f948df6acf6a23f0492b00",
         "src/schema.rs": "5603ba099bd1eb70a553c6071fb41796b4b06eb9bdb596b4837957c4b830744b"
       }
     },
