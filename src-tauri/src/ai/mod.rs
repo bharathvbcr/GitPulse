@@ -1465,8 +1465,14 @@ mod tests {
     #[test]
     fn the_on_device_model_is_asked_only_when_the_patch_left_the_type_open() {
         assert!(should_ask_on_device(true, true, false, false));
-        assert!(!should_ask_on_device(false, true, false, false), "a server wins");
-        assert!(!should_ask_on_device(true, false, false, false), "not ready");
+        assert!(
+            !should_ask_on_device(false, true, false, false),
+            "a server wins"
+        );
+        assert!(
+            !should_ask_on_device(true, false, false, false),
+            "not ready"
+        );
         assert!(
             !should_ask_on_device(true, true, true, false),
             "a cut patch must not be phrased"

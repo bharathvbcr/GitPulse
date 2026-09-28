@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 pub const HOOK_TIMEOUT_SECS: u64 = 90;
 
@@ -112,6 +112,13 @@ fn parse_simple_toml_hooks(content: &str) -> WorktreeHooksConfig {
     cfg
 }
 
+/// Wall clock allowed one hook command. Generous — a post_create hook may
+/// install dependencies — but finite.
+const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Bytes of stdout kept per hook command; the rest is drained and dropped.
+const HOOK_OUTPUT_CAP: usize = 1024 * 1024;
+
 /// Executes a list of hook commands within `worktree_dir`, enforcing repository trust.
 pub fn execute_worktree_hooks(
     repo_root: &Path,
@@ -119,6 +126,24 @@ pub fn execute_worktree_hooks(
     commands: &[String],
     hook_name: &str,
     extra_env: &[(&str, &str)],
+) -> Result<Vec<HookExecutionResult>, String> {
+    execute_worktree_hooks_within(
+        repo_root,
+        worktree_dir,
+        commands,
+        hook_name,
+        extra_env,
+        HOOK_TIMEOUT,
+    )
+}
+
+fn execute_worktree_hooks_within(
+    repo_root: &Path,
+    worktree_dir: &Path,
+    commands: &[String],
+    hook_name: &str,
+    extra_env: &[(&str, &str)],
+    timeout: std::time::Duration,
 ) -> Result<Vec<HookExecutionResult>, String> {
     if commands.is_empty() {
         return Ok(Vec::new());
@@ -148,24 +173,33 @@ pub fn execute_worktree_hooks(
         child.args(["-c", trimmed]);
 
         child.current_dir(worktree_dir);
-        child.stdout(Stdio::piped());
-        child.stderr(Stdio::piped());
 
         for (k, v) in extra_env {
             child.env(k, v);
         }
 
-        let output = match child.output() {
+        // Through the bounded runner, like every other spawn outside the git
+        // seam: a hook that hangs (a dev server started by mistake, a prompt
+        // waiting on a terminal that is not there) is killed with its process
+        // tree at the deadline instead of hanging worktree creation, and its
+        // output is capped. It was `child.output()`: no deadline, no cap.
+        let output = match crate::engine::git_cli::run_bounded_capped(
+            child,
+            "worktree hook",
+            timeout,
+            None,
+            HOOK_OUTPUT_CAP,
+        ) {
             Ok(out) => out,
             Err(e) => {
                 return Err(format!(
-                    "Failed to spawn hook command '{trimmed}' for {hook_name}: {e}"
+                    "Hook '{hook_name}' command '{trimmed}' did not complete: {e}"
                 ));
             }
         };
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        let success = output.status.success();
+        let success = output.success;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -173,7 +207,7 @@ pub fn execute_worktree_hooks(
             hook_name: hook_name.to_string(),
             command: trimmed.to_string(),
             success,
-            exit_code: output.status.code(),
+            exit_code: Some(output.status_code),
             stdout,
             stderr,
             duration_ms,
@@ -185,7 +219,7 @@ pub fn execute_worktree_hooks(
         if failed {
             return Err(format!(
                 "Hook '{hook_name}' command '{trimmed}' failed with exit code {:?}: {}",
-                output.status.code(),
+                Some(output.status_code),
                 results.last().map(|r| &r.stderr).unwrap_or(&String::new())
             ));
         }
@@ -198,6 +232,59 @@ pub fn execute_worktree_hooks(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A hook that never finishes is killed at the deadline and reported,
+    /// instead of hanging worktree creation: it ran through `output()` with
+    /// no deadline at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_hook_is_killed_at_the_deadline() {
+        let repo = crate::test_support::git_repo();
+        let started = std::time::Instant::now();
+        let result = execute_worktree_hooks_within(
+            repo.path(),
+            repo.path(),
+            &["sleep 30".to_string()],
+            "post_create",
+            &[],
+            std::time::Duration::from_secs(1),
+        );
+        let elapsed = started.elapsed();
+        let err = result.expect_err("a hook past its deadline must fail");
+        assert!(err.contains("did not complete"), "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the hook ran {elapsed:?} against a 1s deadline"
+        );
+    }
+
+    /// A finishing hook still reports its output and status.
+    #[cfg(unix)]
+    #[test]
+    fn a_finishing_hook_reports_output_and_status() {
+        let repo = crate::test_support::git_repo();
+        let results = execute_worktree_hooks(
+            repo.path(),
+            repo.path(),
+            &["echo hello".to_string()],
+            "post_create",
+            &[("GP_HOOK_TEST", "1")],
+        )
+        .expect("hook runs");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(results[0].exit_code, Some(0));
+        assert_eq!(results[0].stdout.trim(), "hello");
+        let failed = execute_worktree_hooks(
+            repo.path(),
+            repo.path(),
+            &["exit 3".to_string()],
+            "pre_merge",
+            &[],
+        )
+        .expect_err("a failing hook fails");
+        assert!(failed.contains("Some(3)"), "{failed}");
+    }
 
     #[test]
     fn test_load_hooks_from_toml() {

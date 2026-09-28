@@ -572,7 +572,7 @@ pub fn measure_main_divergence(repo: &Path, branch: Option<&str>) -> Option<Work
         ],
     )
     .ok()?;
-    let mut parts = stdout.trim().split_whitespace();
+    let mut parts = stdout.split_whitespace();
     let behind = parts.next()?.parse().ok()?;
     let ahead = parts.next()?.parse().ok()?;
     Some(WorktreeDivergence { ahead, behind })

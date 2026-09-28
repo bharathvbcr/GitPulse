@@ -55,7 +55,7 @@ mod tests {
             Some(std::ffi::OsStr::new("secret-token")),
             Some(std::ffi::OsStr::new("aws-key")),
         );
-        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        let keys: Vec<&str> = env.keys().map(|k| k.as_str()).collect();
         assert_eq!(keys, ["HOME", "NO_COLOR", "PATH"]);
         assert_eq!(
             env.get("NO_COLOR").map(|v| v.as_os_str()),

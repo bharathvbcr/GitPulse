@@ -65,6 +65,20 @@ const ALLOWED: &[(&str, &str)] = &[
          repository. Not git, and a gate permit held across a probe of every \
          optional component would starve the git calls behind it",
     ),
+    (
+        "src/engine/worktree_hooks.rs",
+        "repository hook commands (`sh -c` / `cmd /C`) with the repository's \
+         own env, run only after `repository_trust::require`. Each `Command` is \
+         handed to `git_cli::run_bounded_capped` with a 15-minute deadline and a \
+         1 MiB cap; it was `child.output()`, unbounded",
+    ),
+    (
+        "src/secrets/run.rs",
+        "the kingfisher secret scanner: `scrubbed_command` builds a `Command` \
+         with `env_clear()` and a scrubbed environment, which the git seam's \
+         helpers cannot express, then hands it to `git_cli::run_bounded_capped` \
+         with the scan and version deadlines and a stdout cap",
+    ),
 ];
 
 #[test]

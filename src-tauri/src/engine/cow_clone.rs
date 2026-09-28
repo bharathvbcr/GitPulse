@@ -9,6 +9,7 @@
 //! - Windows / Fallback: Bounded recursive copy when CoW is unsupported.
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -204,6 +205,10 @@ fn try_linux_ficlone(src: &Path, dst: &Path) -> Result<bool, ()> {
 }
 
 /// Recursively counts files and byte length of a directory up to bounds.
+///
+/// Only the APFS clone path reports counts; elsewhere the copy tallies as it
+/// goes.
+#[cfg(target_os = "macos")]
 fn count_dir_stats(dir: &Path, depth: usize) -> Result<(usize, u64), String> {
     if depth > MAX_COW_DEPTH {
         return Ok((0, 0));

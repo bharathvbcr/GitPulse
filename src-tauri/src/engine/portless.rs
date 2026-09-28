@@ -152,7 +152,7 @@ pub fn detect_worktree_routes(worktree_path: &str, branch: Option<&str>) -> Vec<
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let branch_clean = branch.map(|b| b.trim().to_lowercase().replace('/', "-").replace('_', "-"));
+    let branch_clean = branch.map(|b| b.trim().to_lowercase().replace(['/', '_'], "-"));
 
     for route in portless_routes {
         let host_lower = route.hostname.to_lowercase();
@@ -197,10 +197,10 @@ mod tests {
         let p1 = hash_port("feat-auth");
         let p2 = hash_port("feat-auth");
         assert_eq!(p1, p2, "hash_port must be deterministic");
-        assert!(p1 >= 3100 && p1 < 4000);
+        assert!((3100..4000).contains(&p1));
 
         let p3 = hash_port("bugfix-123");
-        assert!(p3 >= 3100 && p3 < 4000);
+        assert!((3100..4000).contains(&p3));
     }
 
     #[test]

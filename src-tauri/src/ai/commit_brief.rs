@@ -171,7 +171,7 @@ pub fn draft_change(
     let real = tally.real_files();
     let omitted = real.saturating_sub(files.len());
     let conventional = repo_is_conventional(recent_subjects);
-    let unanimous = patch_truncated == false && tally.unparsed == 0 && real > 0;
+    let unanimous = !patch_truncated && tally.unparsed == 0 && real > 0;
     let (change_type, high) = if unanimous {
         classify(&tally)
     } else {
@@ -578,6 +578,10 @@ fn kind_verb(kind: Kind) -> &'static str {
     }
 }
 
+// One private caller, and each argument is a separate fact the brief
+// reports; a struct built only to be destructured here would add a type
+// and no clarity.
+#[allow(clippy::too_many_arguments)]
 fn build_brief(
     files: &[FileChange],
     tally: &Tally,
@@ -783,10 +787,7 @@ fn scope_from(files: &[FileChange]) -> Option<String> {
         return None;
     }
     let mut len = 0usize;
-    loop {
-        let Some(next) = dirs[0].get(len) else {
-            break;
-        };
+    while let Some(next) = dirs[0].get(len) {
         if dirs.iter().all(|dir| dir.get(len) == Some(next)) {
             len += 1;
         } else {
@@ -1260,9 +1261,7 @@ fn stem(path: &str) -> String {
     };
     let mut words = String::new();
     for ch in base.chars() {
-        if ch.is_control() || prompt::is_line_break(ch) {
-            words.push(' ');
-        } else if ch == '_' || ch == '-' {
+        if ch.is_control() || prompt::is_line_break(ch) || ch == '_' || ch == '-' {
             words.push(' ');
         } else {
             words.push(ch.to_ascii_lowercase());
