@@ -4,6 +4,7 @@ package gussetcheck
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -15,5 +16,11 @@ func TestStubRun(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not linked") {
 		t.Fatalf("unexpected error message: %v", err)
+	}
+	if err := SelfTest(context.Background()); !errors.Is(err, ErrNotLinked) {
+		t.Fatalf("SelfTest() = %v, want ErrNotLinked", err)
+	}
+	if err := Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
 	}
 }

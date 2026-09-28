@@ -22,7 +22,25 @@ func Run(ctx context.Context) error {
 	if gusset.MaxPoolSize < 4 {
 		return fmt.Errorf("gusset: MaxPoolSize %d is below the bridge pool of 4", gusset.MaxPoolSize)
 	}
-	err := gussetfn.Check(ctx)
+	return classify(gussetfn.Check(ctx))
+}
+
+// SelfTest is Run plus a deliberate panic inside the engine archive on a
+// throwaway handle, proving the panic firewall (I2) against the archive this
+// program links. Rust prints the induced panic to stderr; that is the proof.
+func SelfTest(ctx context.Context) error {
+	if gusset.MaxPoolSize < 4 {
+		return fmt.Errorf("gusset: MaxPoolSize %d is below the bridge pool of 4", gusset.MaxPoolSize)
+	}
+	return classify(gussetfn.SelfTest(ctx))
+}
+
+// Close releases the engine's shared handle.
+func Close() error {
+	return gussetfn.Close()
+}
+
+func classify(err error) error {
 	if errors.Is(err, gusset.ErrPanic) || errors.Is(err, gusset.ErrPoisoned) {
 		return fmt.Errorf("gitpulse: gusset engine poisoned the handle: %w", err)
 	}

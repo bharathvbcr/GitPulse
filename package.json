@@ -23,6 +23,7 @@
     "check:vendor-schema": "node scripts/check-vendor-schema.mjs",
     "mcp:install": "cargo install --path src-tauri --bin gitpulse-mcp --bin gitpulse-hook --locked --force && node scripts/record-install.mjs",
     "mcp:doctor": "node scripts/check-mcp-install.mjs",
+    "gusset:check": "node scripts/gusset-check.mjs",
     "vendor": "node scripts/vendor-crates.mjs",
     "vendor:check": "node scripts/vendor-crates.mjs --check",
     "release:notes": "node scripts/release-notes.mjs",
