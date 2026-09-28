@@ -171,8 +171,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      DEVCOUNCIL_PIN: 663b998d7265ca6a14ff72492ed17064df19fe05
-      GUSSET_PIN: 709c2b7b85be0de7c263471d933f395bb3b1b27f
+      DEVCOUNCIL_PIN: 4175fc12e749b164a8f66e6462e8b8b1639b68cb
+      GUSSET_PIN: d73226f0a659bd54cb498c4b2cffef037f52ba5b
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
