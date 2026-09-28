@@ -337,7 +337,11 @@
               .find(node => has(node, "Outdated"));
             const before = scroller().scrollTop;
             chip.click();
-            await wait(400);
+            // A smooth scroll takes as long as the engine makes it. Chrome was
+            // done inside a fixed 400 ms and WebKit was not, so this failed on
+            // the WKWebView leg only; it waits for movement, bounded.
+            const settleBy = Date.now() + 2500;
+            while (scroller().scrollTop <= before && Date.now() < settleBy) await wait(40);
             check("a facet chip scrolls to its section", () => scroller().scrollTop > before);
             check("the jump moves keyboard focus to the section", () =>
               document.activeElement === section("outdated"));
