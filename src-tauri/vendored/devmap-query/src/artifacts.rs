@@ -21,6 +21,23 @@ pub struct ArtifactFingerprint {
 /// Distinguishes concurrent temp files written by one process.
 static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How long a Windows writer waits out another process's hold on the target.
+///
+/// Windows refuses to open or replace a file another handle holds without
+/// `FILE_SHARE_DELETE` (os error 32, or 5 for a pending delete), which every
+/// concurrent writer here does for a moment while it compares or renames. On
+/// unix the same moment is invisible. Bounded, so a file held open for good
+/// still fails.
+#[cfg(windows)]
+const WINDOWS_SHARING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// An error that means "another handle holds this file right now".
+#[cfg(windows)]
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
 pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
     use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
     devmap_extract::safe_fs::preflight_write(path)?;
@@ -32,7 +49,11 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
         // A concurrent atomic publisher can unlink the snapshot between open
         // and comparison. Re-read that snapshot within a finite retry budget;
         // an unsafe live file still refuses publication.
-        for attempt in 0..16 {
+        #[cfg(windows)]
+        let deadline = std::time::Instant::now() + WINDOWS_SHARING_DEADLINE;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             let comparison = (|| -> std::io::Result<bool> {
                 let mut existing = parent.open_file(target, Access::Read, Creation::Never)?;
                 existing.require_owned()?;
@@ -42,8 +63,18 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
                 Ok(true) => return Ok(true),
                 Ok(false) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted && attempt < 15 => {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted && attempt < 16 => {
                     continue
+                }
+                // Another writer is mid-rename onto this name. It failed the
+                // whole emission (concurrent_writers_to_one_artifact_all_succeed
+                // and concurrent `devmap claude` on Windows): wait it out.
+                #[cfg(windows)]
+                Err(error)
+                    if is_sharing_violation(&error) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -83,18 +114,15 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
         }
         #[cfg(windows)]
         {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let mut attempts = 0;
+            // One deadline, not an attempt count as well: under sixteen-way
+            // contention a hundred 5 ms attempts ran out long before the time.
+            let deadline = std::time::Instant::now() + WINDOWS_SHARING_DEADLINE;
             loop {
                 match parent.rename_child(&temporary, target) {
                     Ok(()) => break,
                     Err(error)
-                        if (error.kind() == std::io::ErrorKind::PermissionDenied
-                            || matches!(error.raw_os_error(), Some(32 | 33)))
-                            && attempts < 100
-                            && std::time::Instant::now() < deadline =>
+                        if is_sharing_violation(&error) && std::time::Instant::now() < deadline =>
                     {
-                        attempts += 1;
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     Err(error) => return Err(error),

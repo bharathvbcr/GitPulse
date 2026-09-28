@@ -3224,8 +3224,45 @@ impl Store {
         })
     }
 
+    /// How long [`Store::open`] keeps retrying `SQLITE_PROTOCOL`.
+    ///
+    /// SQLite returns it when a WAL-index lock race outlasts its own internal
+    /// retries, which concurrent openers of one store can provoke; it is a lost
+    /// race, not a damaged file, and the docs' remedy is to try again. On
+    /// Windows eight threads opening one legacy store all lost it
+    /// (`concurrent_openers_of_a_legacy_store_all_reach_the_current_schema`).
+    /// Opening is safe to repeat from the top: `migrate` re-reads the schema
+    /// version under the write lock, so a step another opener finished is not
+    /// run twice.
+    const PROTOCOL_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn lost_a_locking_race(error: &rusqlite::Error) -> bool {
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if failure.code == rusqlite::ErrorCode::FileLockingProtocolFailed
+        )
+    }
+
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+        let deadline = std::time::Instant::now() + Self::PROTOCOL_RETRY_DEADLINE;
+        let mut pause = std::time::Duration::from_millis(10);
+        loop {
+            match Self::open_once(db_path.as_ref()) {
+                Err(error)
+                    if Self::lost_a_locking_race(&error)
+                        && std::time::Instant::now() + pause < deadline =>
+                {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(500));
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    fn open_once(db_path: &Path) -> Result<Self> {
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
         let path = resolved.as_path();
         Self::validate_database_file(path)?;

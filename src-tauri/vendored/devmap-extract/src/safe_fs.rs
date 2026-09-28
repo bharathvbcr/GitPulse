@@ -394,15 +394,11 @@ impl SafeFile {
         let current = check_regular(&self.file, self.access != Access::Read)?;
         let named = open_regular_child(&self._parent, &self.name, Access::Read, Creation::Never)?;
         let named_metadata = check_regular(&named, self.access != Access::Read)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if current.dev() != named_metadata.dev() || current.ino() != named_metadata.ino() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "managed file was replaced while being examined",
-                ));
-            }
+        if !same_identity(&self.file, &current, &named, &named_metadata)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "managed file was replaced while being examined",
+            ));
         }
         if current.len() < self.initial.len() {
             return Err(refused("managed file was truncated while being examined"));
@@ -429,15 +425,11 @@ impl SafeFile {
         let current = check_regular(&self.file, self.access != Access::Read)?;
         let named = open_regular_child(&self._parent, &self.name, Access::Read, Creation::Never)?;
         let named_metadata = check_regular(&named, self.access != Access::Read)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if current.dev() != named_metadata.dev() || current.ino() != named_metadata.ino() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "managed file was replaced while being examined",
-                ));
-            }
+        if !same_identity(&self.file, &current, &named, &named_metadata)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "managed file was replaced while being examined",
+            ));
         }
         if named_metadata.len() != current.len()
             || named_metadata.modified()? != current.modified()?
@@ -665,6 +657,35 @@ fn open_regular_child(
         }
         retries += 1;
     }
+}
+
+/// Whether the handle held and the file now at the name are one file.
+///
+/// unix compares device and inode. Windows compares volume serial and file
+/// index, from the handles: before this the check was unix-only, so on
+/// Windows a managed file swapped for another between open and use was not
+/// noticed, and the name's metadata was computed and then dropped unused.
+#[cfg(unix)]
+fn same_identity(
+    _held_file: &File,
+    held: &std::fs::Metadata,
+    _named_file: &File,
+    named: &std::fs::Metadata,
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(held.dev() == named.dev() && held.ino() == named.ino())
+}
+
+#[cfg(windows)]
+fn same_identity(
+    held_file: &File,
+    _held: &std::fs::Metadata,
+    named_file: &File,
+    _named: &std::fs::Metadata,
+) -> io::Result<bool> {
+    let a = windows_information(held_file)?;
+    let b = windows_information(named_file)?;
+    Ok(a.volume == b.volume && a.index_high == b.index_high && a.index_low == b.index_low)
 }
 
 #[cfg(windows)]

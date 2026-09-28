@@ -18,10 +18,12 @@ before that tag is pushed.
   vendored `devmap-store` carried `latest_symbols_for_file` (behind
   `cmd_codeintel_symbols_for_file`) that DevCouncil did not have. That code
   landed upstream in bharathvbcr/DevCouncil#14 and the crates are re-vendored
-  from it (`c3c5f4d`). That commit also brings DevCouncil's bounded LSP
+  from it (`485a2a6`). That commit also brings DevCouncil's bounded LSP
   client (`devmap-resolve`, with its `dc-proc` session helpers), so every
-  wait on a language server has a deadline. The crates' `package.version` is
-  now DevCouncil's `1.3.5`.
+  wait on a language server has a deadline, and its Windows fixes in
+  `devmap-extract`, `devmap-query` and `devmap-store` (file identity checks,
+  native path validation, sharing-violation retries). The crates'
+  `package.version` is now DevCouncil's `1.3.5`.
 
 ## [1.3.5] - 2026-09-23
 

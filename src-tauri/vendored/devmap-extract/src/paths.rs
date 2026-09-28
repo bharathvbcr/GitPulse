@@ -144,44 +144,51 @@ pub fn resolve_state_dir(
     standalone
 }
 
+/// `base` joined with a `/`-separated relative path, one component at a time,
+/// so the result uses the platform's separator throughout. A plain join kept
+/// the `/` on Windows (`.\.devmap\codeintel/devmap.sqlite` in `doctor`).
+fn join_rel(base: PathBuf, rel: &str) -> PathBuf {
+    rel.split('/').fold(base, |path, part| path.join(part))
+}
+
 /// Absolute-or-relative path to the store for `root`.
 pub fn store_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(STORE_RELPATH)
+    join_rel(state_dir(root), STORE_RELPATH)
 }
 
 /// Path to `repo_map.json` for `root`.
 pub fn repo_map_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(REPO_MAP_RELPATH)
+    join_rel(state_dir(root), REPO_MAP_RELPATH)
 }
 
 /// Path to `code_graph.json` for `root`.
 pub fn code_graph_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(CODE_GRAPH_RELPATH)
+    join_rel(state_dir(root), CODE_GRAPH_RELPATH)
 }
 
 /// Path to the interned `code_graph.compact.json` for `root`.
 pub fn compact_code_graph_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(CODE_GRAPH_COMPACT_RELPATH)
+    join_rel(state_dir(root), CODE_GRAPH_COMPACT_RELPATH)
 }
 
 /// Path to the content-hash memo for `root`.
 pub fn content_cache_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(CONTENT_CACHE_RELPATH)
+    join_rel(state_dir(root), CONTENT_CACHE_RELPATH)
 }
 
 /// Path to the `devmap`-binary digest memo for `root`.
 pub fn binary_digest_cache_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(BINARY_DIGEST_CACHE_RELPATH)
+    join_rel(state_dir(root), BINARY_DIGEST_CACHE_RELPATH)
 }
 
 /// Path to the workspace registry for `root`.
 pub fn workspace_path(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(WORKSPACE_RELPATH)
+    join_rel(state_dir(root), WORKSPACE_RELPATH)
 }
 
 /// Path to the emitted Claude Code plugin bundle for `root`.
 pub fn plugin_dir(root: impl AsRef<Path>) -> PathBuf {
-    state_dir(root).join(PLUGIN_RELPATH)
+    join_rel(state_dir(root), PLUGIN_RELPATH)
 }
 
 /// The repository root a store path belongs to — the inverse of [`store_path`].
