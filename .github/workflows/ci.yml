@@ -5,6 +5,8 @@ on:
     branches: [main, master, develop, codex/gitpulse-schema20-qualification-20260909]
   pull_request:
     branches: [main, master, develop]
+  # Run by hand on a branch, so a fix is verified before its PR exists.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

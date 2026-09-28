@@ -5,6 +5,8 @@ on:
     branches: [main, master, develop]
   pull_request:
     branches: [main, master, develop]
+  # Run by hand on a branch, so a fix is verified before its PR exists.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
