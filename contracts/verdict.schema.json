@@ -88,7 +88,11 @@
         "command.substitution",
         "command.heredoc",
         "command.reparse",
-        "command.too_long"
+        "command.too_long",
+        "command.directory_change",
+        "path.secret_read",
+        "path.engine_unavailable",
+        "command.engine_unavailable"
       ]
     },
     "severityByRule": {
@@ -115,7 +119,11 @@
         "command.substitution": { "const": "hard" },
         "command.heredoc": { "const": "hard" },
         "command.reparse": { "const": "hard" },
-        "command.too_long": { "const": "hard" }
+        "command.too_long": { "const": "hard" },
+        "command.directory_change": { "const": "hard" },
+        "path.secret_read": { "const": "hard" },
+        "path.engine_unavailable": { "const": "hard" },
+        "command.engine_unavailable": { "const": "hard" }
       }
     },
     "classification": {
