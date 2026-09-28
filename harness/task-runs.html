@@ -174,10 +174,14 @@
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();set("Permission mode","bypass");await pause(30);
       check("Bypass requires acknowledgment on this attempt",button("Launch in Claude Code").disabled);
-      document.querySelector('label.ack input').click();await pause(30);
+      // The bypass acknowledgement, by its own words. `label.ack input` also
+      // matches the worktree-provisioning checkbox added beside it, so the
+      // harness ticked that one and Launch stayed disabled.
+      const bypassAck=()=>[...document.querySelectorAll("label.ack")].find(label=>label.textContent.includes("I authorize bypass"))?.querySelector("input")??null;
+      bypassAck().click();await pause(30);
       button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===3);
       await openLaunchForm();
-      check("Bypass never survives the attempt it was authorized for",field("Permission mode").value==="ask"&&!document.querySelector('label.ack input'));
+      check("Bypass never survives the attempt it was authorized for",field("Permission mode").value==="ask"&&!bypassAck());
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();losePreparation=true;button("Launch in Claude Code").click();await wait(()=>button("Retry preparation"));
       const uncertain=preparations.at(-1);
