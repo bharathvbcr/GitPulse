@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gussetfn"
@@ -40,6 +41,12 @@ func SelfTest(ctx context.Context) error {
 // bound. At process exit use Shutdown.
 func Close() error {
 	return gussetfn.Close()
+}
+
+// DrainLogs writes the engine's Rust log ring to w; nothing else reads it,
+// and it evicts its oldest line.
+func DrainLogs(w io.Writer) (int, error) {
+	return gussetfn.DrainLogs(w)
 }
 
 // Shutdown releases the engine within drain: jobs are cancelled and the join

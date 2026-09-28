@@ -4,6 +4,7 @@ package gussetcheck
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -19,6 +20,9 @@ func SelfTest(_ context.Context) error {
 
 // Close has nothing to release without the engine.
 func Close() error { return nil }
+
+// DrainLogs has nothing to drain without the engine.
+func DrainLogs(io.Writer) (int, error) { return 0, nil }
 
 // Shutdown has nothing to release without the engine.
 func Shutdown(time.Duration) error { return nil }

@@ -35,6 +35,7 @@ func run(out, errOut io.Writer) int {
 	if closeErr := gussetcheck.Shutdown(2 * time.Second); err == nil {
 		err = closeErr
 	}
+	_, _ = gussetcheck.DrainLogs(errOut)
 	switch {
 	case errors.Is(err, gussetcheck.ErrNotLinked):
 		fmt.Fprintf(errOut, "gusset-check: %v\n", err)
