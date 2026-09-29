@@ -379,6 +379,7 @@
       return;
     }
     conflictSessions.flush();
+    repoStore.flushPersistedWorkspace();
     exitApproved = true;
     try {
       await invoke("cmd_exit_app");
@@ -410,6 +411,7 @@
     }));
 
     const guardBrowserUnload = (event: BeforeUnloadEvent) => {
+      repoStore.flushPersistedWorkspace();
       if (exitApproved || !hasUnsavedEditorDrafts()) return;
       event.preventDefault();
       // Browsers intentionally ignore custom text but require a value to show

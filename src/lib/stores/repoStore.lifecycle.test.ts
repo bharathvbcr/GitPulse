@@ -12,23 +12,23 @@ const tabBar = readFileSync(
   "utf8"
 );
 
-describe("repoStore status-poll listener symmetry", () => {
-  it("removes the pagehide listener when the poll stops (no duplicate accumulation)", () => {
+describe("repoStore quit flush", () => {
+  it("flushes on pagehide for the life of the store, not only while the poll runs", () => {
     const ensureIdx = repoStore.indexOf("function ensureStatusPoll()");
     const stopIdx = repoStore.indexOf("function stopStatusPoll()");
+    const stopBody = repoStore.slice(stopIdx, repoStore.indexOf("async function runStatusPoll()"));
     expect(ensureIdx).toBeGreaterThan(-1);
     expect(stopIdx).toBeGreaterThan(ensureIdx);
-    const addIdx = repoStore.indexOf('document.addEventListener("pagehide"', ensureIdx);
-    const removeIdx = repoStore.indexOf('document.removeEventListener("pagehide"', stopIdx);
-    expect(addIdx).toBeGreaterThan(-1);
-    expect(removeIdx).toBeGreaterThan(-1);
+    expect(stopBody).not.toContain("pagehide");
+    expect(repoStore).toContain('document.addEventListener("pagehide"');
+    expect(repoStore).toContain("flushPersist(true)");
   });
 
-  it("gates both directions with a wired flag so cycles stay idempotent", () => {
+  it("installs the quit flush once", () => {
     expect(repoStore).toContain("let pagehideWired = false;");
     const adds = repoStore.match(/pagehideWired/g)?.length ?? 0;
-    // Decl + guard on add + guard on remove = at least 3 mentions.
-    expect(adds).toBeGreaterThanOrEqual(3);
+    expect(adds).toBeGreaterThanOrEqual(2);
+    expect(repoStore).not.toContain('document.removeEventListener("pagehide"');
   });
 });
 

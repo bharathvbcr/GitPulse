@@ -6,6 +6,7 @@
   import type { FileSidePane } from "../files/filePaneLayout";
   import type { FileBlob } from "../files/types";
   import { recordEditorDrafts } from "../files/editorDraftRegistry";
+  import { loadPersistedEditorTabs, savePersistedEditorTabs } from "../files/editorTabPersist";
   import {
     createLatestOwnerRegistry,
     editorFileSaveQueue,
@@ -130,7 +131,7 @@
 
   let activeKind = $derived(classifyFileChange(activeStatus));
 
-  function persistTabs(repo: string | null) {
+  function persistTabs(repo: string | null, commit = false) {
     if (!repo) return;
     tabCache.set(repo, {
       tabs: {
@@ -143,6 +144,10 @@
       preferredSidePane,
     });
     recordEditorDrafts(repo, Object.keys(tabState.drafts));
+    savePersistedEditorTabs(repo, {
+      tabs: tabState.tabs.map((tab) => ({ path: tab.path, preview: tab.preview })),
+      active: tabState.active,
+    }, commit);
   }
 
   async function loadFileContent(path: string) {
@@ -235,7 +240,7 @@
     if (!isCurrentViewer(repo)) return;
     tabState = closeEditorTab(tabState, path);
     syncSelectedFilePath();
-    persistTabs(repo);
+    persistTabs(repo, true);
     if (!tabState.active) {
       activeBlob = null;
       prevLoadKey = "";
@@ -250,11 +255,11 @@
     if (!isCurrentViewer(repo)) return;
     tabState = closeEditorTabs(tabState, pathsAtRequest);
     syncSelectedFilePath();
+    persistTabs(repo, true);
     if (!tabState.active) {
       activeBlob = null;
       prevLoadKey = "";
     }
-    persistTabs(repo);
   }
 
   async function closeOtherTabs() {
@@ -269,7 +274,7 @@
     if (!isCurrentViewer(repo)) return;
     tabState = pinEditorTab(closeEditorTabs(tabState, pathsToClose), keepPath);
     syncSelectedFilePath();
-    persistTabs(repo);
+    persistTabs(repo, true);
   }
 
   function handleDraftChange(path: string, newContent: string, sourceContent: string) {
@@ -461,7 +466,19 @@
       prevLoadKey = "";
       return;
     }
-    const cached = tabCache.get(repo);
+    let cached = tabCache.get(repo);
+    if (!cached) {
+      const disk = loadPersistedEditorTabs(repo);
+      if (disk && disk.tabs.length > 0) {
+        cached = {
+          tabs: disk,
+          explorerOpen: true,
+          dashboardOpen: true,
+          preferredSidePane: "explorer",
+        };
+        tabCache.set(repo, cached);
+      }
+    }
     untrack(() => {
       compactPane = null;
       if (cached) {

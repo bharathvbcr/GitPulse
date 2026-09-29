@@ -11,6 +11,18 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Open repository tabs and their groups survive quitting the app.** Restore
+  used to write the workspace once per tab as it came back, and it never put
+  the group or collapsed state back on those tabs. Quitting during that walk
+  replaced the saved list with however many tabs had opened, and the next
+  launch saved the stripped list again. A save that is not a real edit can no
+  longer drop tabs or clear groups; a quit flushes the live workspace even
+  when the status poll is stopped; and an untrusted repository stays in the
+  list without a prompt or a git command. Open editor files come back with
+  the session. Unsaved editor text is still discarded on quit.
+
 ### Changed
 
 - **Vendored DevCouncil crates now name a reachable commit.** `VENDOR.json`

@@ -3576,5 +3576,102 @@ describe("repoStore tab grouping", () => {
 
     for (const tab of get(store).openTabs) await store.closeTab(tab.id);
   });
+
+  it("restores groups and collapsed groups, and a quit mid-restore cannot drop the unsaved half", async () => {
+    const tabs = [
+      { path: "/projects/devtools/alpha", pinned: false, group: "devtools", viewTab: "work", searchQuery: "", selectedBranch: null },
+      { path: "/projects/devtools/beta", pinned: true, group: "devtools", viewTab: "history", searchQuery: "", selectedBranch: null },
+      { path: "/projects/web/gamma", pinned: false, group: "web", viewTab: "work", searchQuery: "", selectedBranch: null },
+      { path: "/projects/web/delta", pinned: false, group: "web", viewTab: "code", searchQuery: "", selectedBranch: null },
+    ];
+    const storage = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        epoch: 5,
+        tabs,
+        activePath: "/projects/devtools/alpha",
+        recents: tabs.map((tab) => tab.path),
+        lastClosed: [],
+        collapsedGroups: ["web"],
+      }),
+    });
+    const gate = deferred<void>();
+    let resolves = 0;
+    const invoke = makeInvoke({
+      cmd_resolve_repo: async (_cmd, args) => {
+        resolves += 1;
+        if (resolves === 3) await gate.promise;
+        const path = String(args?.repoPath ?? "");
+        return { path, name: path.split("/").pop(), is_bare: false } as never;
+      },
+    });
+    const store = createRepoStore({
+      invoke,
+      storage,
+      caseInsensitive: true,
+      graph: makeGraph().api,
+      filter: makeFilter(),
+    });
+    const restoring = store.restoreWorkspace();
+    await vi.waitFor(() => expect(resolves).toBe(3));
+    store.flushPersistedWorkspace();
+    const during = JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
+      tabs?: Array<{ path: string; group?: string }>;
+      collapsedGroups?: string[];
+    };
+    expect(during.tabs?.map((tab) => tab.path)).toEqual(tabs.map((tab) => tab.path));
+    expect(during.tabs?.map((tab) => tab.group)).toEqual(["devtools", "devtools", "web", "web"]);
+    expect(during.collapsedGroups).toEqual(["web"]);
+
+    gate.resolve();
+    await restoring;
+    const state = get(store);
+    expect(state.openTabs.map((tab) => tab.path)).toEqual(tabs.map((tab) => tab.path));
+    expect(state.openTabs.map((tab) => tab.group)).toEqual(["devtools", "devtools", "web", "web"]);
+    expect(state.openTabs.find((tab) => tab.path.endsWith("beta"))?.pinned).toBe(true);
+    expect(state.collapsedGroups).toEqual(["web"]);
+    expect(state.currentPath).toBe("/projects/devtools/alpha");
+  });
+
+  it("keeps an untrusted repository in the restored workspace without prompting", async () => {
+    const storage = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        epoch: 2,
+        tabs: [
+          { path: "/r/one", pinned: false, group: "devtools", viewTab: "work", searchQuery: "", selectedBranch: null },
+          { path: "/r/two", pinned: false, group: "web", viewTab: "work", searchQuery: "", selectedBranch: null },
+        ],
+        activePath: "/r/one",
+        recents: [],
+        lastClosed: [],
+        collapsedGroups: ["web"],
+      }),
+    });
+    const calls: string[] = [];
+    const invoke: InvokeFn = async (command) => {
+      calls.push(command);
+      if (command === "cmd_resolve_repo") {
+        throw new Error("REPOSITORY_TRUST_REQUIRED: explicit approval required");
+      }
+      throw new Error(`unexpected ${command}`);
+    };
+    const store = createRepoStore({
+      invoke,
+      storage,
+      caseInsensitive: true,
+      graph: makeGraph().api,
+      filter: makeFilter(),
+    });
+    await store.restoreWorkspace();
+    expect(get(promptState)).toBeNull();
+    const gitCalls = calls.filter((command) => command !== "cmd_set_recent_menu");
+    expect(gitCalls).toEqual(["cmd_resolve_repo", "cmd_resolve_repo"]);
+    expect(get(store).openTabs.map((tab) => [tab.path, tab.group])).toEqual([
+      ["/r/one", "devtools"],
+      ["/r/two", "web"],
+    ]);
+    expect(get(store).collapsedGroups).toEqual(["web"]);
+  });
 });
 

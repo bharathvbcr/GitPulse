@@ -54,7 +54,6 @@ import {
   loadPersistedWorkspace,
   savePersistedWorkspace,
   workspaceToPersisted,
-  type PersistedWorkspace,
   type StorageLike,
   type ViewTab,
 } from "../repos/persist";
@@ -744,7 +743,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /** Monotonic poll ordering; a superseded tick's result is discarded. */
   let pollSequenceSource = 0;
   const pollRuns = new Map<string, number>();
-  /** Whether the `pagehide` persist-flush listener is currently attached. */
+  /** Whether the quit-time persist flush is attached. It stays for the store's life. */
   let pagehideWired = false;
 
   // Monotonic token source for diff-selection requests. Session `generation`
@@ -803,14 +802,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       () => void runStatusPoll(),
       STATUS_POLL_INTERVAL_MS,
     );
-    // Quitting inside the persist debounce window would drop the newest
-    // search query / view tab; `pagehide` fires on close and navigation.
-    // Added and removed symmetrically with the poll so repeated
-    // stop/start cycles cannot accumulate duplicate listeners.
-    if (typeof document !== "undefined" && !pagehideWired) {
-      document.addEventListener("pagehide", flushPersist);
-      pagehideWired = true;
-    }
   }
 
   /** Stops the workspace poll; the next activation restarts it lazily. */
@@ -818,10 +809,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (pollTimer === null) return;
     clearInterval(pollTimer);
     pollTimer = null;
-    if (pagehideWired && typeof document !== "undefined") {
-      document.removeEventListener("pagehide", flushPersist);
-      pagehideWired = false;
-    }
   }
 
   async function runStatusPoll() {
@@ -910,9 +897,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let lastSentRecentsJson: string | null = null;
   /** Last open-tab set synced into workspace.json — skip no-op publishes. */
   let lastWorkspaceSyncKey: string | null = null;
-  let pendingPersist: { data: PersistedWorkspace; recents: string[] } | null =
-    null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * User edits that may shrink the tab list or clear groups advance this.
+   * Restoring a session does not: a half-finished restore must not be able
+   * to replace the durable copy.
+   */
+  let workspaceEpoch = 0;
+  /** Paths closed since the last successful save. Coalesce honors these drops. */
+  let droppedPaths: string[] = [];
+  /** Non-zero while restore is applying the durable copy. Writes wait. */
+  let persistSuspended = 0;
 
   function beginShortcut(): boolean {
     if (shortcutLocked) return false;
@@ -941,49 +936,70 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   }
 
   /**
-   * Persists workspace state. The write + menu IPC are debounced on a short
-   * trailing delay so per-keystroke state (commit draft, search query) cannot
-   * storm localStorage and the native menu; `flushPersist` runs the pending
-   * side effects immediately whenever a critical mutation lands.
+   * Records a user edit that is allowed to shrink the durable tab list.
+   * Paths named here stay closed; every other tab the snapshot forgot is
+   * put back by coalesce.
    */
-  function persist() {
-    const data = workspaceToPersisted(internal.workspace, internal.sessions);
-    const recents = internal.workspace.recents.slice(0, MENU_RECENT_CAP);
-    const payload = JSON.stringify({ data, recents });
-    if (payload === lastPersistedPayload) return;
-    lastPersistedPayload = payload;
-    pendingPersist = { data, recents };
-    if (persistTimer !== null || typeof setTimeout === "undefined") return;
-    persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+  function commitEdit(closed: readonly string[] = []) {
+    workspaceEpoch += 1;
+    for (const path of closed) {
+      if (path && !droppedPaths.includes(path)) droppedPaths.push(path);
+    }
+    if (droppedPaths.length > MAX_OPEN_TABS * 2) {
+      droppedPaths = droppedPaths.slice(-MAX_OPEN_TABS * 2);
+    }
   }
 
-  function flushPersist() {
+  /**
+   * Persists workspace state. The write + menu IPC are debounced on a short
+   * trailing delay so per-keystroke state (commit draft, search query) cannot
+   * storm localStorage and the native menu; `flushPersist` runs the live
+   * snapshot immediately whenever a critical mutation lands.
+   */
+  function persist() {
+    if (persistSuspended > 0) return;
+    if (persistTimer !== null || typeof setTimeout === "undefined") return;
+    persistTimer = setTimeout(() => flushPersist(), PERSIST_DEBOUNCE_MS);
+  }
+
+  function flushPersist(force = false) {
     if (persistTimer !== null) {
       clearTimeout(persistTimer);
       persistTimer = null;
     }
-    const pending = pendingPersist;
-    if (!pending) return;
-    pendingPersist = null;
-    if (!savePersistedWorkspace(storage, pending.data)) {
-      // The write did not land (quota, private mode). Restore the payload
-      // and roll the dedup marker back so an identical future state retries
-      // instead of being skipped as "already persisted".
-      pendingPersist = pending;
+    if (persistSuspended > 0) return;
+    const data = workspaceToPersisted(internal.workspace, internal.sessions, workspaceEpoch);
+    const recents = internal.workspace.recents.slice(0, MENU_RECENT_CAP);
+    const payload = JSON.stringify({ data, recents, dropped: droppedPaths });
+    if (!force && payload === lastPersistedPayload) return;
+    const closed = droppedPaths.slice();
+    if (!savePersistedWorkspace(storage, data, closed, options)) {
+      // The write did not land (quota, private mode). Leave the dedup marker
+      // clear so the same snapshot is retried instead of being skipped.
       lastPersistedPayload = null;
       if (typeof setTimeout !== "undefined" && persistTimer === null) {
-        persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+        persistTimer = setTimeout(() => flushPersist(), PERSIST_DEBOUNCE_MS);
       }
+    } else {
+      lastPersistedPayload = payload;
+      droppedPaths = [];
     }
-    const recentsJson = JSON.stringify(pending.recents);
+    const recentsJson = JSON.stringify(recents);
     if (recentsJson !== lastSentRecentsJson) {
       lastSentRecentsJson = recentsJson;
-      void invokeFn("cmd_set_recent_menu", { paths: pending.recents }).catch((error) => {
+      void invokeFn("cmd_set_recent_menu", { paths: recents }).catch((error) => {
         if (lastSentRecentsJson === recentsJson) lastSentRecentsJson = null;
         diagnostics.warn("desktop:recent-menu", error);
       });
     }
   }
+
+  function installQuitFlush() {
+    if (pagehideWired || typeof document === "undefined") return;
+    document.addEventListener("pagehide", () => flushPersist(true));
+    pagehideWired = true;
+  }
+  installQuitFlush();
 
   function replaceWorkspace(next: WorkspaceTabs) {
     internal = { ...internal, workspace: next };
@@ -1513,6 +1529,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         onReady?: (canonicalPath: string) => void;
         activate?: boolean;
         pinned?: boolean;
+        /** Set when opening a tab that already belongs to a group. */
+        group?: string | null;
+        /** Restore must not advance the epoch; a partial walk cannot shrink the saved list. */
+        keepEpoch?: boolean;
+        /**
+         * Keep the tab when the repository is not trusted yet, without
+         * prompting. Restore uses this so closing the app cannot drop every
+         * repository that would have asked.
+         */
+        deferTrust?: boolean;
         restore?: {
           viewTab?: ViewTab;
           viewSections?: Record<string, string>;
@@ -1528,7 +1554,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       try {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
-        if (formatError(err).includes("REPOSITORY_TRUST_REQUIRED")) {
+        const trustRequired = formatError(err).includes("REPOSITORY_TRUST_REQUIRED");
+        if (trustRequired && !extras.deferTrust) {
           try {
             const trustedPath = await requestRepositoryTrust(rawPath, "Trust and Open", invokeFn);
             if (!trustedPath) return false;
@@ -1538,7 +1565,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             publish();
             return false;
           }
-        } else if (!extras.allowBroken) {
+        } else if (!trustRequired && !extras.allowBroken) {
           internal = { ...internal, workspaceError: formatError(err) };
           publish();
           return false;
@@ -1601,6 +1628,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const opened = openTab(workspace, path, options, {
         pinned: extras.pinned ?? carriedPinned,
         activate,
+        ...(extras.group !== undefined ? { group: extras.group } : {}),
       });
       if (!opened.ok) {
         internal = {
@@ -1613,6 +1641,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         publish();
         return false;
       }
+      if (!extras.keepEpoch && opened.created) commitEdit();
       replaceWorkspace({
         ...opened.workspace,
         lastClosed: opened.workspace.lastClosed.filter(
@@ -1755,6 +1784,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (session && !(await confirmTerminalLoss([session.path]))) return;
       const result = closeTab(internal.workspace, id);
       if (result.reason === "missing") return;
+      commitEdit(result.closedPath ? [result.closedPath] : []);
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
       internal = { ...internal, sessions: rest };
@@ -1785,6 +1815,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!keep) return;
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
       if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
+      commitEdit(removed.map((tab) => tab.path));
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
       stopStatusPoll();
@@ -1806,6 +1837,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (index < 0) return;
       const removed = internal.workspace.tabs.slice(index + 1);
       if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
+      commitEdit(removed.map((tab) => tab.path));
       replaceWorkspace(closeTabsToTheRight(internal.workspace, id));
       const remaining = new Set(internal.workspace.tabs.map((tab) => tab.id));
       const sessions: Record<string, RepoSession> = {};
@@ -1856,6 +1888,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     moveTab: (id: string, toIndex: number) => {
       const next = moveWorkspaceTabTo(internal.workspace, id, toIndex);
       if (next === internal.workspace) return;
+      commitEdit();
       replaceWorkspace(next);
       publish();
     },
@@ -1866,22 +1899,26 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       publish();
     },
     pinTab: (id: string, pinned: boolean) => {
+      commitEdit();
       replaceWorkspace(pinWorkspaceTab(internal.workspace, id, pinned));
       const session = internal.sessions[id];
       if (session) putSession({ ...session, pinned });
       publish();
     },
     setTabGroup: (id: string, group: string | null) => {
+      commitEdit();
       replaceWorkspace(setWorkspaceTabGroup(internal.workspace, id, group));
       publish();
       flushPersist();
     },
     groupByParentFolder: () => {
+      commitEdit();
       replaceWorkspace(groupWorkspaceByParentFolder(internal.workspace));
       publish();
       flushPersist();
     },
     ungroupTabs: (groupName?: string) => {
+      commitEdit();
       replaceWorkspace(ungroupWorkspaceTabs(internal.workspace, groupName));
       publish();
       flushPersist();
@@ -1891,6 +1928,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (groupTabs.length === 0) return;
       if (!(await confirmTerminalLoss(groupTabs.map((t) => t.path)))) return;
       const { workspace, closedPaths } = closeWorkspaceGroup(internal.workspace, groupName);
+      commitEdit(groupTabs.map((tab) => tab.path));
       replaceWorkspace(workspace);
       const remaining = new Set(internal.workspace.tabs.map((tab) => tab.id));
       const sessions: Record<string, RepoSession> = {};
@@ -1914,16 +1952,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       flushPersist();
     },
     renameGroup: (oldName: string, newName: string) => {
+      commitEdit();
       replaceWorkspace(renameWorkspaceGroup(internal.workspace, oldName, newName));
       publish();
       flushPersist();
     },
     toggleGroupCollapsed: (groupName: string) => {
+      commitEdit();
       replaceWorkspace(toggleWorkspaceGroupCollapsed(internal.workspace, groupName));
       publish();
       flushPersist();
     },
     setGroupCollapsed: (groupName: string, collapsed: boolean) => {
+      commitEdit();
       replaceWorkspace(setWorkspaceGroupCollapsed(internal.workspace, groupName, collapsed));
       publish();
       flushPersist();
@@ -1932,11 +1973,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       return isWorkspaceGroupCollapsed(internal.workspace, groupName);
     },
     collapseAllGroups: () => {
+      commitEdit();
       replaceWorkspace(collapseWorkspaceAllGroups(internal.workspace));
       publish();
       flushPersist();
     },
     expandAllGroups: () => {
+      commitEdit();
       replaceWorkspace(expandWorkspaceAllGroups(internal.workspace));
       publish();
       flushPersist();
@@ -2023,61 +2066,104 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     restoreWorkspace: async () => {
       stopStatusPoll();
-      const persisted = loadPersistedWorkspace(storage, options);
-      replaceWorkspace({
-        ...emptyWorkspace(),
-        recents: persisted.recents,
-        lastClosed: persisted.lastClosed,
-      });
-      internal = { ...internal, sessions: {} };
-      // Preserve persisted tab order, but activate the previously-active
-      // session the moment ITS hydration lands — not after every remaining
-      // tab finishes restoring — so the workspace becomes usable without
-      // changing the user's tab arrangement.
-      const ordered = [...persisted.tabs];
-      let activated = false;
-      const isActive = (path: string) =>
-        !!persisted.activePath && sameRepo(path, persisted.activePath, options);
-
-      for (const tab of ordered) {
-        // Always append (activate: false) so restore cannot shuffle tab
-        // order. Present the previously-active session as soon as that
-        // iteration finishes — remaining tabs keep hydrating behind it.
-        await store.openRepo(tab.path, {
-          allowBroken: true,
-          activate: false,
-          pinned: tab.pinned,
-          restore: {
-            viewTab: tab.viewTab,
-            viewSections: tab.viewSections,
-            searchQuery: tab.searchQuery,
-            selectedBranch: tab.selectedBranch,
-            terminalOpen: tab.terminalOpen,
-          },
+      persistSuspended += 1;
+      try {
+        const persisted = loadPersistedWorkspace(storage, options);
+        workspaceEpoch = persisted.epoch ?? 0;
+        droppedPaths = [];
+        replaceWorkspace({
+          ...emptyWorkspace(),
+          recents: persisted.recents,
+          lastClosed: persisted.lastClosed,
         });
-        if (!activated && isActive(tab.path)) {
-          activated = true;
-          const sessionTab = internal.workspace.tabs.find((item) =>
-            sameRepo(item.path, tab.path, options),
-          );
-          if (sessionTab) {
-            await store.activateTab(sessionTab.id, { force: true });
+        internal = { ...internal, sessions: {} };
+        // Preserve persisted tab order, but activate the previously-active
+        // session the moment ITS hydration lands — not after every remaining
+        // tab finishes restoring — so the workspace becomes usable without
+        // changing the user's tab arrangement.
+        const ordered = [...persisted.tabs];
+        let activated = false;
+        const isActive = (path: string) =>
+          !!persisted.activePath && sameRepo(path, persisted.activePath, options);
+        // A tab that never resolved (not trusted, or missing) must not be
+        // hydrated here. Hydration is a git command, and restore is not the
+        // moment to ask for trust or to run hooks.
+        const presentRestored = async (id: string) => {
+          const session = internal.sessions[id];
+          if (session?.error && !session.hasHydrated) {
+            replaceWorkspace(activateTab(internal.workspace, id));
+            syncFilterFromSession(session);
+            publish();
+            return;
+          }
+          await store.activateTab(id, { force: true });
+        };
+
+        for (const tab of ordered) {
+          // Always append (activate: false) so restore cannot shuffle tab
+          // order. Present the previously-active session as soon as that
+          // iteration finishes — remaining tabs keep hydrating behind it.
+          // keepEpoch + a suspended save: quitting halfway cannot replace
+          // the durable list with the tabs opened so far.
+          await store.openRepo(tab.path, {
+            allowBroken: true,
+            deferTrust: true,
+            keepEpoch: true,
+            activate: false,
+            pinned: tab.pinned,
+            group: tab.group ?? null,
+            restore: {
+              viewTab: tab.viewTab,
+              viewSections: tab.viewSections,
+              searchQuery: tab.searchQuery,
+              selectedBranch: tab.selectedBranch,
+              terminalOpen: tab.terminalOpen,
+            },
+          });
+          if (!activated && isActive(tab.path)) {
+            activated = true;
+            const sessionTab = internal.workspace.tabs.find((item) =>
+              sameRepo(item.path, tab.path, options),
+            );
+            if (sessionTab) {
+              await presentRestored(sessionTab.id);
+            }
           }
         }
-      }
-      if (activated) return;
-      const desired = persisted.activePath
-        ? internal.workspace.tabs.find((tab) =>
-            sameRepo(tab.path, persisted.activePath ?? "", options),
-          )
-        : internal.workspace.tabs[0];
-      if (desired) {
-        await store.activateTab(desired.id, { force: true });
-      } else {
-        syncFilterFromSession(undefined);
-        graph.showRepo(null);
+        // Applied after every tab exists, so a collapsed group is not
+        // discarded for having no members yet. The active tab's group was
+        // expanded when that tab was presented; putting the saved list back
+        // wholesale would collapse it again.
+        const activeGroup = activated
+          ? internal.workspace.tabs.find((tab) => tab.id === internal.workspace.activeId)?.group
+          : null;
+        const collapsedGroups = (persisted.collapsedGroups ?? []).filter(
+          (group) => !activeGroup || group !== activeGroup,
+        );
+        replaceWorkspace({ ...internal.workspace, collapsedGroups });
         publish();
+        if (!activated) {
+          const desired = persisted.activePath
+            ? internal.workspace.tabs.find((tab) =>
+                sameRepo(tab.path, persisted.activePath ?? "", options),
+              )
+            : internal.workspace.tabs[0];
+          if (desired) {
+            await presentRestored(desired.id);
+          } else {
+            syncFilterFromSession(undefined);
+            graph.showRepo(null);
+            publish();
+          }
+        }
+      } finally {
+        persistSuspended -= 1;
+        flushPersist(true);
       }
+    },
+    /** Writes the live workspace immediately. Quit calls this before the process exits. */
+    flushPersistedWorkspace: () => {
+      flushPersist(true);
     },
     /** All uncommitted-change entry points share the existing file/diff view. */
     previewUncommitted: async (repoPath?: string, isStaged?: boolean): Promise<void> => {

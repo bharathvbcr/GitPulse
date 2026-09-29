@@ -11,6 +11,8 @@ import {
 } from "./tabModel";
 
 export const STORAGE_KEY_WORKSPACE = "gitpulse_workspace_v1";
+/** Previous good blob. Used only when the primary value does not parse. */
+export const STORAGE_KEY_WORKSPACE_BACKUP = "gitpulse_workspace_v1.bak";
 export const STORAGE_KEY_RECENT = "gitpulse_recent_repos";
 export const STORAGE_KEY_LAST_PATH = "gitpulse_last_repo";
 
@@ -58,6 +60,12 @@ export interface PersistedTab {
 
 export interface PersistedWorkspace {
   version: 1;
+  /**
+   * Advances on a user edit that is allowed to shrink the tab list or clear
+   * groups (close, ungroup, reorder). A write that does not advance it cannot
+   * discard tabs or groups the durable copy still has.
+   */
+  epoch?: number;
   tabs: PersistedTab[];
   activePath: string | null;
   recents: string[];
@@ -272,12 +280,139 @@ export function loadMigrated(
   return sanitizePersisted(current, options);
 }
 
+export function workspaceEpoch(data: { epoch?: number } | null | undefined): number {
+  const epoch = data?.epoch;
+  return typeof epoch === "number" && Number.isInteger(epoch) && epoch >= 0 && epoch <= 1_000_000_000
+    ? epoch
+    : 0;
+}
+
+function tabIdentity(path: string, options: PathIdentityOptions): string {
+  return identityKey(path, options);
+}
+
+function unionNames(left: readonly string[] | undefined, right: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const name of [...(left ?? []), ...(right ?? [])]) {
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+    if (out.length >= MAX_COLLAPSED_GROUPS) break;
+  }
+  return out;
+}
+
+/**
+ * Combines a durable workspace with a snapshot that may have been taken
+ * before every tab was restored.
+ *
+ * A snapshot whose epoch did not advance cannot drop a tab or a group the
+ * durable copy still has. A newer epoch is a user edit: tabs it names in
+ * `droppedPaths` stay closed, and any other tab it simply forgot is put back.
+ * Groups are kept when the newer snapshot does not carry one, unless the
+ * epoch advanced — ungroup is a newer epoch with the group cleared.
+ */
+export function coalescePersistedWorkspace(
+  existing: PersistedWorkspace | null,
+  incoming: PersistedWorkspace,
+  options: PathIdentityOptions,
+  droppedPaths: readonly string[] = [],
+): PersistedWorkspace {
+  if (!existing) return incoming;
+  if (workspaceEpoch(incoming) < workspaceEpoch(existing)) return existing;
+
+  const epochAdvanced = workspaceEpoch(incoming) > workspaceEpoch(existing);
+  const dropped = new Set(
+    (epochAdvanced ? droppedPaths : [])
+      .map((path) => tabIdentity(path, options))
+      .filter((id) => id.length > 0),
+  );
+  const incomingById = new Map<string, PersistedTab>();
+  for (const tab of incoming.tabs) {
+    const id = tabIdentity(tab.path, options);
+    if (id) incomingById.set(id, tab);
+  }
+  const existingById = new Map<string, PersistedTab>();
+  for (const tab of existing.tabs) {
+    const id = tabIdentity(tab.path, options);
+    if (id) existingById.set(id, tab);
+  }
+
+  const shrunkWithoutAuthority =
+    !epochAdvanced && incoming.tabs.length < existing.tabs.length;
+
+  const merged: PersistedTab[] = [];
+  const seen = new Set<string>();
+  const push = (tab: PersistedTab, prior: PersistedTab | undefined) => {
+    const id = tabIdentity(tab.path, options);
+    if (!id || seen.has(id) || dropped.has(id)) return;
+    if (merged.length >= MAX_OPEN_TABS) return;
+    seen.add(id);
+    const group = epochAdvanced ? tab.group : (tab.group ?? prior?.group);
+    merged.push(group === tab.group ? tab : { ...tab, group });
+  };
+
+  if (shrunkWithoutAuthority) {
+    for (const prior of existing.tabs) {
+      const id = tabIdentity(prior.path, options);
+      const next = incomingById.get(id);
+      push(next ? { ...next, group: next.group ?? prior.group } : prior, prior);
+    }
+  } else {
+    for (const tab of incoming.tabs) {
+      push(tab, existingById.get(tabIdentity(tab.path, options)));
+    }
+    for (const prior of existing.tabs) {
+      const id = tabIdentity(prior.path, options);
+      if (!incomingById.has(id)) push(prior, prior);
+    }
+  }
+
+  const activePath = merged.some((tab) => tabIdentity(tab.path, options) === tabIdentity(incoming.activePath ?? "", options))
+    ? incoming.activePath
+    : merged.some((tab) => tabIdentity(tab.path, options) === tabIdentity(existing.activePath ?? "", options))
+      ? existing.activePath
+      : merged[0]?.path ?? null;
+
+  const forgotTab = existing.tabs.some((tab) => {
+    const id = tabIdentity(tab.path, options);
+    return id.length > 0 && !dropped.has(id) && !incomingById.has(id);
+  });
+  const collapsedGroups = !forgotTab
+    ? (incoming.collapsedGroups ?? existing.collapsedGroups ?? [])
+    : epochAdvanced
+      ? unionNames(existing.collapsedGroups, incoming.collapsedGroups)
+      : (existing.collapsedGroups ?? []);
+
+  return {
+    ...incoming,
+    epoch: Math.max(workspaceEpoch(incoming), workspaceEpoch(existing)),
+    tabs: merged,
+    activePath,
+    collapsedGroups,
+    recents: shrunkWithoutAuthority ? existing.recents : incoming.recents,
+    lastClosed: shrunkWithoutAuthority ? existing.lastClosed : incoming.lastClosed,
+  };
+}
+
+function readStoredWorkspace(
+  storage: StorageLike,
+  key: string,
+  options: PathIdentityOptions,
+): PersistedWorkspace | null {
+  const parsed = readJsonObject(storage.getItem(key));
+  if (!parsed) return null;
+  return loadMigrated(parsed, options);
+}
+
 export function loadPersistedWorkspace(
   storage: StorageLike | null,
   options: PathIdentityOptions,
 ): PersistedWorkspace {
   const empty: PersistedWorkspace = {
     version: WORKSPACE_VERSION,
+    epoch: 0,
     tabs: [],
     activePath: null,
     recents: [],
@@ -286,11 +421,10 @@ export function loadPersistedWorkspace(
   };
   if (!storage) return empty;
 
-  const parsed = readJsonObject(storage.getItem(STORAGE_KEY_WORKSPACE));
-  if (parsed) {
-    const migrated = loadMigrated(parsed, options);
-    if (migrated) return migrated;
-  }
+  const primary = readStoredWorkspace(storage, STORAGE_KEY_WORKSPACE, options);
+  if (primary) return primary;
+  const backup = readStoredWorkspace(storage, STORAGE_KEY_WORKSPACE_BACKUP, options);
+  if (backup) return backup;
 
   const recents = sanitizePathList(readJsonValue(storage.getItem(STORAGE_KEY_RECENT)), options, MAX_RECENT_REPOS);
   const last = normalizeRepoPath(storage.getItem(STORAGE_KEY_LAST_PATH) ?? "");
@@ -299,6 +433,7 @@ export function loadPersistedWorkspace(
     : [];
   return {
     version: WORKSPACE_VERSION,
+    epoch: 0,
     tabs,
     activePath: last,
     recents: last ? [last, ...recents.filter((path) => identityKey(path, options) !== identityKey(last, options))] : recents,
@@ -309,20 +444,34 @@ export function loadPersistedWorkspace(
 
 export function savePersistedWorkspace(
   storage: StorageLike | null,
-  data: PersistedWorkspace
+  data: PersistedWorkspace,
+  droppedPaths: readonly string[] = [],
+  options: PathIdentityOptions = { caseInsensitive: true },
 ): boolean {
   if (!storage) return false;
   try {
+    const existing = readStoredWorkspace(storage, STORAGE_KEY_WORKSPACE, options);
+    const next = existing
+      ? coalescePersistedWorkspace(existing, data, options, droppedPaths)
+      : data;
     // Legacy keys first, workspace blob LAST: the loader prefers the blob, so
     // a quota failure mid-write can leave stale legacy keys but never a
-    // half-written newer blob contradicting them.
-    storage.setItem(STORAGE_KEY_RECENT, JSON.stringify(data.recents.slice(0, MAX_RECENT_REPOS)));
-    if (data.activePath) {
-      storage.setItem(STORAGE_KEY_LAST_PATH, data.activePath);
+    // half-written newer blob contradicting them. The backup is best-effort
+    // and only consulted when the primary does not parse.
+    storage.setItem(STORAGE_KEY_RECENT, JSON.stringify(next.recents.slice(0, MAX_RECENT_REPOS)));
+    if (next.activePath) {
+      storage.setItem(STORAGE_KEY_LAST_PATH, next.activePath);
     } else {
       storage.removeItem(STORAGE_KEY_LAST_PATH);
     }
-    storage.setItem(STORAGE_KEY_WORKSPACE, JSON.stringify(data));
+    if (existing) {
+      try {
+        storage.setItem(STORAGE_KEY_WORKSPACE_BACKUP, JSON.stringify(existing));
+      } catch {
+        /* a failed backup must not block the primary write */
+      }
+    }
+    storage.setItem(STORAGE_KEY_WORKSPACE, JSON.stringify(next));
     return true;
   } catch {
     /* quota / private mode — fail closed, keep in-memory state. The false
@@ -343,10 +492,12 @@ export function workspaceToPersisted(
       terminalOpen?: boolean;
     }
   >,
+  epoch = 0,
 ): PersistedWorkspace {
   const active = ws.tabs.find((tab) => tab.id === ws.activeId);
   return {
     version: WORKSPACE_VERSION,
+    epoch: workspaceEpoch({ epoch }),
     tabs: ws.tabs.map((tab) => {
       const session = sessions[tab.id];
       return {
@@ -402,6 +553,7 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
   const activeExists = activePath && tabs.some((tab) => identityKey(tab.path, options) === identityKey(activePath, options));
   return {
     version: WORKSPACE_VERSION,
+    epoch: workspaceEpoch(raw),
     tabs,
     activePath: activeExists ? activePath : tabs[0]?.path ?? null,
     recents,

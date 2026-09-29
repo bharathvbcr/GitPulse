@@ -3,6 +3,7 @@ import {
   STORAGE_KEY_LAST_PATH,
   STORAGE_KEY_RECENT,
   STORAGE_KEY_WORKSPACE,
+  STORAGE_KEY_WORKSPACE_BACKUP,
   WORKSPACE_VERSION,
   loadMigrated,
   loadPersistedWorkspace,
@@ -158,7 +159,12 @@ describe("persist workspace", () => {
     };
     expect(() => savePersistedWorkspace(storage, persisted)).not.toThrow();
     // Legacy keys were attempted first; the blob write came last and failed.
-    expect(order).toEqual([STORAGE_KEY_RECENT, STORAGE_KEY_LAST_PATH, STORAGE_KEY_WORKSPACE]);
+    expect(order).toEqual([
+      STORAGE_KEY_RECENT,
+      STORAGE_KEY_LAST_PATH,
+      STORAGE_KEY_WORKSPACE_BACKUP,
+      STORAGE_KEY_WORKSPACE,
+    ]);
     // The previous blob survives intact — the loader prefers it, so state
     // stays consistent rather than half-updated.
     expect(loadPersistedWorkspace(storage, opts).tabs).toEqual([]);
