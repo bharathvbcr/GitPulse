@@ -32,14 +32,18 @@ impl std::fmt::Display for StoreRefusal {
 
 impl std::error::Error for StoreRefusal {}
 
-/// Held while a read-only connection opens and makes its first read, the
-/// moment it maps the WAL index. Concurrent read-only connections in one
-/// process setting that up together livelocked on Windows: every one of them
-/// got SQLITE_PROTOCOL for as long as they kept retrying, and no read-write
-/// connection was there to finish the index for them
-/// (`concurrent_readers_cannot_enqueue_writer_work`). Serialised, the first
-/// sets it up and the rest find it ready. Reads after that run concurrently.
-static READ_ONLY_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Held while a connection opens and sets itself up: for a read-only
+/// connection, its open and first read, the moment it maps the WAL index; for
+/// a read-write one, the whole of `open_once`, through `enable_wal` and
+/// `migrate`. Concurrent connections in one process setting the WAL index up
+/// together livelocked on Windows: every one of them got SQLITE_PROTOCOL for
+/// as long as they kept retrying (`concurrent_readers_cannot_enqueue_writer_work`
+/// for readers, `concurrent_v19_openers_keep_pending_work_and_one_durable_identity`
+/// for sixteen writers, which exhausted the 20 s retry deadline). Serialised,
+/// the first sets it up and the rest find it ready. Other processes still
+/// coordinate through SQLite's own locks, and everything after the open runs
+/// concurrently.
+static CONNECTION_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
@@ -3204,7 +3208,7 @@ impl Store {
             )));
         }
         let _sidecars = Self::checked_sidecars(path)?;
-        let setup = READ_ONLY_SETUP
+        let setup = CONNECTION_SETUP
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut conn = Connection::open_with_flags(
@@ -3297,6 +3301,10 @@ impl Store {
         // repair after `Connection::open` is a repair the connection never
         // sees. See `repair_sidecar_modes`.
         Self::repair_sidecar_modes(path)?;
+        // Held to the end of this open; see `CONNECTION_SETUP`.
+        let _setup = CONNECTION_SETUP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut conn = Connection::open(path)?;
         let store = path.display().to_string();
 
