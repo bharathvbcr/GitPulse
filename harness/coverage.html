@@ -11,7 +11,8 @@
       import { agentNotifyArgs, agentPromptArgs } from "../src/lib/terminal/launchRequests";
       import { sessionAlertSettings } from "../src/lib/stores/sessionAlertsStore";
       import "../src/app.css";
-      let mode = "empty";
+      // `?mode=ojas` (or any fixture mode) opens on that fixture, for looking at it.
+      let mode = new URL(location.href).searchParams.get("mode") ?? "empty";
       let sequence = 0;
       const spawned = [], writes = [], errors = [];
       const totals = { lines_found: 10, lines_hit: 7, percentage: 70 };
@@ -66,7 +67,17 @@
       mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
-          case "cmd_scan_coverage": scans += 1; if (mode === "failed") throw new Error("Fixture scan failed"); return mode === "ojas" ? ojasReport() : report(mode === "measured" || mode === "redistributed");
+          case "cmd_scan_coverage": {
+            scans += 1;
+            if (mode === "failed") throw new Error("Fixture scan failed");
+            if (mode === "ojas") return ojasReport();
+            // Measured files beside families that still owe a report: the
+            // state in which the strip, not the wide pane, carries them.
+            const measured = report(true);
+            if (mode === "ojas-mixed") return { ...measured, families: [...measured.families, ...ojasReport().families] };
+            if (mode === "mixed") return { ...measured, families: [...measured.families, ojasReport().families[0]] };
+            return report(mode === "measured" || mode === "redistributed");
+          }
           case "cmd_manvi_run_action": runs.push(args); return new Promise(resolve => setTimeout(() => resolve(runResult(args.args)), runDelay));
           case "cmd_ai_coverage_report": return { text: "1. Regenerate the JavaScript report: `npm run coverage`", reasoning: "", model: "fixture-model", base_url: "", context_window: 0, context_source: "fixture", prompt_tokens: 1, completion_tokens: 1, truncated: false, diff_truncated: false, diff_used_bytes: 0, diff_total_bytes: 0, budget: { planned_by_harness: false, before_tokens: 0, threshold_tokens: 0, insufficient: false, calibration_samples: 0 }, warnings: [] };
           case "cmd_get_file_coverage": return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [...[1, 4, 5, 6, 7, 8, 9].map(line_no => ({ line_no, hits: 1 })), ...(mode === "redistributed" ? [45, 46, 60] : [2, 3, 60]).map(line_no => ({ line_no, hits: 0 }))], totals, truncated: false, lines_truncated: false };
@@ -260,7 +271,9 @@
           // the language bars directly beneath it.
           check("the family strip is silent when every report was found", !document.querySelector("[data-coverage-family-strip]"));
           // …and speaks again the moment one is missing, carrying its Run button.
-          button("Empty coverage").click(); button("Rescan coverage artifacts").click();
+          // Measured files plus one missing family: with no files at all the
+          // wide pane carries the families instead (checked below).
+          mode = "mixed"; button("Rescan coverage artifacts").click();
           await until(() => !!document.querySelector("[data-coverage-family-strip]"));
           check("the family strip returns for a family that owes a report",
             (document.querySelector("[data-coverage-family-strip]")?.textContent ?? "").includes("no report"));
@@ -276,22 +289,48 @@
           // own `finally`, so the pane said "Loading …" for good.
           mode = "slow-detail";
           button("src/full.ts, 100.0%, 0 missed lines").click(); await tick();
+          const scansAtEmpty = scans;
           mode = "ojas"; button("Rescan coverage artifacts").click();
-          await until(() => !!document.querySelector('[data-coverage-family="rust"]'));
+          await until(() => scans > scansAtEmpty && !button("Rescan coverage artifacts").disabled);
           await new Promise(resolve => setTimeout(resolve, 400));
           check("a selection cleared mid-load does not leave the pane loading", !region().textContent.includes("Loading"));
+          // With no files, the wide pane carries every family; the 288px
+          // sidebar used to hold all of it while the wide pane said "Pick a file".
+          const card = family => document.querySelector(`[data-coverage-family-card="${family}"]`);
+          const regionBox = region().getBoundingClientRect();
+          const cardBoxes = ["go", "python", "rust"].map(family => card(family)?.getBoundingClientRect());
+          check("an empty scan lays every family out in the wide pane",
+            cardBoxes.every(box => box && box.width > 300 && box.left >= regionBox.left && box.right <= regionBox.right + 1)
+            && !region().textContent.includes("Pick a file"));
+          check("the sidebar no longer repeats each family's plan",
+            !!document.querySelector("[data-coverage-sidebar-empty]")
+            && !document.querySelector("[data-coverage-sidebar-empty]").textContent.includes("Looked for")
+            && !document.querySelector("[data-coverage-family-strip] [data-coverage-family]"));
+          check("a report found but skipped is named with its reason",
+            card("go").textContent.includes("go/coverage.out") && card("go").textContent.includes("no line records"));
+          check("an artifact age caveat needs an artifact that was read",
+            !document.querySelector("[data-coverage-header]").textContent.includes("Artifact age unknown"));
           // Every family that owes a report stays on screen, however long a
           // neighbour's reason is: the strip scrolled sideways and hid Rust.
+          mode = "ojas-mixed"; button("Rescan coverage artifacts").click();
+          await until(() => document.querySelectorAll("[data-coverage-family]").length === 3);
           button("Toggle narrow layout").click(); await wait();
           const stripBox = document.querySelector("[data-coverage-family-strip]").getBoundingClientRect();
           const familyBoxes = [...document.querySelectorAll("[data-coverage-family]")].map(node => node.getBoundingClientRect());
           check("every family that owes a report is visible inside the strip",
             familyBoxes.length === 3 && familyBoxes.every(box => box.width > 0 && box.left >= stripBox.left - 1 && box.right <= stripBox.right + 1));
           button("Toggle narrow layout").click(); button("Toggle narrow layout").click(); await wait();
-          // A failed run names its cause, not the progress line printed first.
+          mode = "ojas"; button("Rescan coverage artifacts").click();
+          await until(() => !!card("rust"));
+          // A failed run names its cause, not the progress line printed first,
+          // and only the family that is running says so.
           const scansBefore = scans;
-          byText("Run Go coverage").click();
+          runDelay = 300;
+          byText("Run Go coverage").click(); await tick();
+          check("only the family being run says it is running",
+            card("go").textContent.includes("Running…") && !card("rust").textContent.includes("Running…"));
           await until(() => settled() && !!document.querySelector("[data-coverage-run-summary]"));
+          runDelay = 0;
           const goSummary = document.querySelector("[data-coverage-run-summary]");
           check("a failed run's row names the cause, not go's package header",
             goSummary.textContent.trim() === "ld: symbol(s) not found for architecture arm64" && goSummary.title.includes("failed to build"));

@@ -414,6 +414,15 @@
   let unfoundViews = $derived(familyViews.filter((view) => !view.found));
   let foundViews = $derived(familyViews.filter((view) => view.found));
   /**
+   * A scan landed and no artifact contributed a file. The wide pane then
+   * carries the per-family guidance, so the strip and the file sidebar do not
+   * repeat it.
+   */
+  let noCoverageFiles = $derived(((report as CoverageReport | null)?.files.length ?? -1) === 0);
+  let stripFamilies = $derived(noCoverageFiles ? [] : unfoundViews);
+  /** The family whose pipeline is running, so only its button says "Running…". */
+  let activeFamily = $state<string | null>(null);
+  /**
    * Why this scan is partial, from the same owner that decides *that* it is.
    * The header shows the first reason and hovers the rest; a warning the
    * reader cannot resolve to a cause is the shape this panel had before.
@@ -530,6 +539,7 @@
     stepResults = {};
     runningAll = false;
     runningMissing = false;
+    activeFamily = null;
     scriptStatuses = {};
     issueSubmitting = false;
     issueNotice = null;
@@ -1219,9 +1229,11 @@
     runningMissing = true;
     const guard = beginOps();
     try {
+      activeFamily = pipeline.family;
       await runCoveragePipeline(pipeline, { rescan: false, guard });
     } finally {
       runningMissing = false;
+      activeFamily = null;
       // Pass or fail. A failed `go test` still writes an empty coverprofile
       // and a failed setup step can still install a tool; the pipeline's
       // early returns used to skip the rescan, so the panel went on showing
@@ -1246,10 +1258,12 @@
         if (!batchGuard.isLive()) return;
         // One language's failure must not skip the others (JS must still run
         // if Rust's llvm-cov install fails).
+        activeFamily = pipeline.family;
         await runCoveragePipeline(pipeline, { rescan: false, guard: batchGuard });
       }
     } finally {
       runningMissing = false;
+      activeFamily = null;
       if (batchGuard.isLive()) rescan();
     }
   }
@@ -1540,10 +1554,14 @@
       <span class="text-[11px] text-textMuted truncate min-w-0">
         Last scanned: {lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}
       </span>
-      <span
-        class="text-[11px] text-textMuted/70 shrink-0"
-        title="The scanner does not receive artifact generation timestamps or test outcomes, so it cannot say how old a report on disk is."
-      >Artifact age unknown</span>
+      <!-- Qualifies a report that was read. With nothing parsed there is no
+           artifact whose age could be unknown, and the caveat was noise. -->
+      {#if report?.artifacts.some((artifact) => !artifact.skipped)}
+        <span
+          class="text-[11px] text-textMuted/70 shrink-0"
+          title="The scanner does not receive artifact generation timestamps or test outcomes, so it cannot say how old a report on disk is."
+        >Artifact age unknown</span>
+      {/if}
       {#if scanError}<button type="button" class="gp-btn py-0.5! px-2! shrink-0" disabled={isScanning} onclick={rescan}>Retry scan</button>{/if}
     </div>
     <div class="flex flex-wrap items-center gap-2">
@@ -1659,14 +1677,15 @@
        whole strip carried no information and cost a band. The count moved
        into `unfoundViews`'s trailing summary, which keeps the found families
        and their expected paths one hover away. -->
-  {#if report && (unfoundViews.length > 0 || report.truncated || Object.keys(scriptStatuses).length > 0)}
+  {#if report && (stripFamilies.length > 0 || report.truncated || Object.keys(scriptStatuses).length > 0)}
     <div data-coverage-family-strip class="border-b border-border/40 gp-section-edge bg-surface/40 font-sans shrink-0">
       <!-- Wraps; it does not scroll. With `overflow-x-auto` a long reason on
            one family (Python's "No Python tests found …") pushed every family
            after it past the right edge, behind a scrollbar macOS hides, so the
            Rust row and its Run button were simply not on screen. -->
+      {#if stripFamilies.length > 0 || report.truncated}
       <div class="px-4 py-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 min-w-0">
-        {#each unfoundViews as view (view.family)}
+        {#each stripFamilies as view (view.family)}
           <div data-coverage-family={view.family} class="flex flex-wrap items-center gap-x-1.5 gap-y-1 min-w-0 max-w-full" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
             <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {view.status.color_hex}"></span>
             <span class="text-textPrimary/80 shrink-0">{view.status.languages.join(", ") || view.label}</span>
@@ -1703,8 +1722,9 @@
           >scan capped{cappedDetail ? `: ${cappedDetail}` : ""}</span>
         {/if}
       </div>
+      {/if}
       {#if Object.keys(scriptStatuses).length > 0}
-        <div class="px-4 pb-1.5 space-y-0.5 max-h-24 overflow-auto">
+        <div class="px-4 pb-1.5 space-y-0.5 max-h-24 overflow-auto {stripFamilies.length === 0 && !report.truncated ? 'pt-1.5' : ''}">
           {#if unsuccessfulScripts.length > 0}
             <div class="flex items-center justify-between gap-2 pb-0.5">
               <span class="text-[9px] uppercase tracking-wider text-rose-400 font-semibold">Unsuccessful coverage</span>
@@ -1751,7 +1771,7 @@
                 <X size={10} class="text-rose-400 shrink-0" />
                 <span class="text-rose-400/90 shrink-0">failed</span>
               {/if}
-              <span class="font-mono text-textPrimary/80 truncate shrink-0">{status.label}</span>
+              <span class="font-mono text-textPrimary/80 truncate min-w-0 max-w-[45%] shrink-0" title={status.label}>{status.label}</span>
               {#if status.recovery}
                 <span class="text-amber-400/80 truncate" title={status.recovery.note}
                   >{status.recovery.note}</span
@@ -1881,64 +1901,13 @@
           {/snippet}
         </VirtualList>
       {:else if report}
-        <div class="p-3 text-textMuted font-sans space-y-2">
-          <p>No coverage reports for the detected languages.</p>
-          {#each familyViews as view (view.family)}
-            {#if view.pipeline}
-              {#if view.toolDetail}
-                <p class="text-amber-400/90">{view.toolDetail}</p>
-              {/if}
-              {#if view.durationHint}
-                <p>{view.durationHint}</p>
-              {/if}
-              <button
-                type="button"
-                class="gp-btn-primary py-1.5!"
-                title={view.durationHint || "Generate missing coverage artifacts with MANVI"}
-                onclick={() => void runCoverageFamily(view.family)}
-                disabled={runControlsDisabled}
-              >
-                {#if runningMissing}
-                  <LoaderCircle size={12} class="animate-spin" />
-                  Running…
-                {:else}
-                  <Play size={12} />
-                  Run {view.label} coverage with MANVI
-                {/if}
-              </button>
-            {/if}
-          {/each}
-          {#if missingPipelines.length > 1}
-            <button
-              type="button"
-              class="gp-btn py-1.5!"
-              title="Generate each missing language with MANVI. Rust needs cargo-llvm-cov; a full run can take several minutes."
-              onclick={() => void runMissingCoverage()}
-              disabled={runControlsDisabled}
-            >
-              Run all missing coverage
-            </button>
-          {/if}
-          {#each familyViews as view (view.family)}
-            <p>
-              Looked for {view.family} ({view.status.expected_formats.join(", ")}):
-              {view.status.expected_paths.join(", ")}
-            </p>
-            <!-- A family with no runnable plan still owes the reader a reason.
-                 This block used to print only the paths it searched, so the
-                 `native` and `beam` rows read as an unexplained blank. -->
-            {#if !view.found && !view.pipeline && view.toolDetail}
-              <p class="text-amber-400/90">{view.toolDetail}</p>
-            {/if}
-            {#if view.commands.length > 0}
-              <div class="flex flex-wrap gap-1.5">
-                {@render commandChips(view)}
-              </div>
-            {/if}
-          {/each}
-          {#if familyViews.length === 0}
-            <p>No programming languages found to scan.</p>
-          {/if}
+        <!-- The per-family guidance lives in the wide pane now; this column
+             only says why it is empty. -->
+        <div data-coverage-sidebar-empty class="p-3 text-textMuted font-sans space-y-1">
+          <p>No covered files yet.</p>
+          <p class="text-[11px] text-textMuted/80">
+            {familyViews.length === 0 ? "No programming languages were found to scan." : "Generate a report for each language on the right, then they appear here."}
+          </p>
         </div>
       {:else if scanError}
         <div class="p-3 text-rose-400 font-sans space-y-2">
@@ -1982,7 +1951,7 @@
     </div>
 
     <div class="flex-1 min-h-0 min-w-0 font-mono flex flex-col">
-      {#if selectedPath}
+      {#if selectedPath && !noCoverageFiles}
         <!-- One row. The path, the controls that walk it and the legend for
              the gutter beneath all belong to the same pane; the legend in
              particular used to sit in the app header, a pane away from the
@@ -2004,7 +1973,7 @@
           {#if selectedFile}<button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => (selectedScope = true)}>Improve this file’s coverage</button>{/if}
         </div>
       {/if}
-      {#if scanTruncated}
+      {#if scanTruncated && !noCoverageFiles}
         <!-- Cause-neutral on purpose. This flag has three sources — the file
              listing came back a prefix, the entry cap stopped the classifier,
              or a directory window dropped candidates — and only some of them
@@ -2014,12 +1983,94 @@
           The scan did not read every artifact — missing gutters here mean unknown, not uncovered.
         </div>
       {/if}
-      {#if linesTruncated}
+      {#if linesTruncated && !noCoverageFiles}
         <div class="px-4 py-1.5 border-b border-border bg-amber-500/10 text-amber-300 font-sans text-[11px] shrink-0">
           Gutter view capped for display; totals still reflect the full file.
         </div>
       {/if}
-      {#if isLoadingFile && sourceLines.length === 0}
+      {#if noCoverageFiles && report}
+        <!-- The empty state belongs in the wide pane. It used to be packed
+             into the 288px file sidebar — run buttons, every command and every
+             searched path for each family in one column — beside a main pane
+             that offered "Pick a file" for a list with nothing in it. -->
+        <div data-coverage-empty class="h-full min-h-0 overflow-auto p-4 font-sans space-y-3">
+          <div class="space-y-1">
+            <h3 class="text-sm font-medium text-textPrimary">No coverage data yet</h3>
+            <p class="text-[11px] text-textMuted">
+              No report on disk contributed line records{report.truncated ? ", and the scan did not read every artifact" : ""}.
+              That is unmeasured, not 0%. Generate a report for each language below; the panel rescans when a run finishes.
+            </p>
+          </div>
+          {#each familyViews as view (view.family)}
+            {@const skipped = report.artifacts.filter((artifact) => artifact.skipped && artifact.family === view.family)}
+            <section
+              data-coverage-family-card={view.family}
+              aria-label="{view.label} coverage"
+              class="max-w-3xl rounded-xl border border-border/60 bg-surface/40 p-3 space-y-2"
+            >
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {view.status.color_hex}"></span>
+                <span class="text-textPrimary font-medium">{view.status.languages.join(", ") || view.label}</span>
+                <span class="text-[11px] text-textMuted/70">no report</span>
+                {#if view.pipeline}
+                  <button
+                    type="button"
+                    class="gp-btn-primary py-1! px-2.5! text-[11px]! ml-auto"
+                    title={view.durationHint || "Generate missing coverage artifacts with MANVI"}
+                    onclick={() => void runCoverageFamily(view.family)}
+                    disabled={runControlsDisabled}
+                  >
+                    {#if activeFamily === view.family}
+                      <LoaderCircle size={11} class="animate-spin" />
+                      Running…
+                    {:else}
+                      <Play size={11} />
+                      Run {view.label} coverage
+                    {/if}
+                  </button>
+                {/if}
+              </div>
+              {#if view.toolDetail}
+                <p class="text-[11px] text-amber-400/90">{view.toolDetail}</p>
+              {/if}
+              {#each skipped as artifact, i (`${i}:${artifact.path}`)}
+                <!-- Found but unusable is a different fact from not found:
+                     a failed `go test` leaves exactly this empty profile. -->
+                <p class="text-[11px] text-amber-300/90">
+                  Found <span class="font-mono">{artifact.path}</span> but skipped it{artifact.skip_reason ? `: ${artifact.skip_reason}` : ""}.
+                </p>
+              {/each}
+              {#if view.pipeline}
+                {@const setup = view.pipeline.steps.filter((step) => step.kind === "setup")}
+                {#if setup.length > 0}
+                  <p class="text-[11px] text-textMuted">
+                    First installs: {#each setup as step, i (step.command)}<code class="font-mono text-textPrimary/80">{step.command}</code>{i < setup.length - 1 ? ", " : ""}{/each}
+                  </p>
+                {/if}
+                {#if view.commands.length > 0}
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <span class="text-[11px] text-textMuted shrink-0">Runs</span>
+                    {@render commandChips(view)}
+                  </div>
+                {:else}
+                  <p class="text-[11px] text-textMuted">
+                    Then runs: {#each view.pipeline.steps.filter((step) => step.kind === "generate") as step (step.command)}<code class="font-mono text-textPrimary/80">{step.command}</code>{" "}{/each}
+                  </p>
+                {/if}
+                {#if view.durationHint}
+                  <p class="text-[11px] text-textMuted/80">{view.durationHint}</p>
+                {/if}
+              {/if}
+              <p class="text-[10px] text-textMuted/70">
+                Reads {view.status.expected_formats.join(", ")} reports, such as {view.status.expected_paths.join(", ")}.
+              </p>
+            </section>
+          {/each}
+          {#if familyViews.length === 0}
+            <p class="text-textMuted">No programming languages found to scan.</p>
+          {/if}
+        </div>
+      {:else if isLoadingFile && sourceLines.length === 0}
         <div class="h-full flex items-center justify-center text-textMuted font-sans">Loading {selectedPath}…</div>
       {:else if fileError}
         <div class="h-full flex items-center justify-center text-rose-400 font-sans p-4">{fileError}</div>

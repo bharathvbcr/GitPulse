@@ -278,7 +278,8 @@ describe("CoverageViewer flicker contracts", () => {
   });
 
   it("keeps the report visible while fresh file details load without stale gutters", () => {
-    expect(source).toContain("{#if isLoadingFile && sourceLines.length === 0}");
+    // An `{:else if}` now: the empty-scan cards precede it in the same chain.
+    expect(source).toContain("{:else if isLoadingFile && sourceLines.length === 0}");
     const fileLoad = source.slice(source.indexOf("const coverageDetailKey"), source.indexOf("function selectFile("));
     expect(fileLoad).toContain("sourceLines = [];");
     expect(fileLoad).toContain("hitMap = new Map();");
@@ -291,7 +292,8 @@ describe("CoverageViewer flicker contracts", () => {
     // missing gutters mean "unknown", and rendering them as plain misses is
     // the exact dishonesty the backend flag exists to prevent.
     expect(source).toContain("scanTruncated = detail.truncated;");
-    expect(source).toContain("{#if scanTruncated}");
+    // Not shown over the empty-scan cards, which carry no file to qualify.
+    expect(source).toContain("{#if scanTruncated && !noCoverageFiles}");
     expect(source).toContain("missing gutters here mean unknown, not uncovered");
     // The empty-state hint carries the same caveat.
     expect(source).toContain("this file's absence may be incomplete rather than a real zero");
@@ -403,10 +405,17 @@ describe("CoverageViewer honesty contracts (regression)", () => {
     // carries it whether or not anything is runnable, which is the point: a
     // family with no pipeline is exactly the one whose reason matters most.
     expect(source).toContain("{#if view.toolDetail}");
-    // And the empty-state sidebar renders it too. It previously reached the
-    // reason only through a pipeline, so `native` and `beam` — the families
-    // that have none — appeared there as an unexplained blank.
-    expect(source).toContain("{#if !view.found && !view.pipeline && view.toolDetail}");
+    // And the empty-scan family cards render it too, ungated by a pipeline. It
+    // once reached the reason only through a pipeline, so `native` and `beam`
+    // — the families that have none — appeared as an unexplained blank.
+    const cards = source.slice(
+      source.indexOf("data-coverage-family-card"),
+      source.indexOf("No programming languages found to scan."),
+    );
+    expect(cards).toContain("{#if view.toolDetail}");
+    // Every block opened before it is closed, so nothing gates it.
+    const before = cards.slice(0, cards.indexOf("{#if view.toolDetail}"));
+    expect(before.split("{#if ").length).toBe(before.split("{/if}").length);
   });
 
   it("never offers a Run button for a family with no planned command", () => {
