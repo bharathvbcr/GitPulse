@@ -319,7 +319,15 @@
   interface ScriptStatus {
     label: string;
     running: boolean;
-    status?: "passed" | "failed" | "no_data";
+    /**
+     * `cancelled`: another coverage action took over while this one ran, so
+     * its outcome was never recorded. Not a failure — the command may well
+     * have finished — but not a running row either, which is what a
+     * superseded run used to stay as, disabling every run control with it.
+     */
+    status?: "passed" | "failed" | "no_data" | "cancelled";
+    /** Which invocation owns this row, so a superseded one cannot settle a newer one. */
+    runId?: number;
     /** Complete captured output, for the copied diagnostics. */
     detail?: string;
     /** One line naming what happened, for the status row. */
@@ -349,8 +357,11 @@
       detail?: string;
       summary?: string;
       duration_ms?: number;
+      runId?: number;
     }
   > = $state({});
+  /** Issued per command invocation; see `ScriptStatus.runId`. */
+  let nextRunId = 0;
   let runningAll = $state(false);
   let scriptStatuses: Record<string, ScriptStatus> = $state({});
 
@@ -433,14 +444,20 @@
       .join(" · "),
   );
   let anyScriptRunning = $derived(Object.values(scriptStatuses).some((status) => status.running));
+  let anyStepRunning = $derived(Object.values(stepResults).some((result) => result.running));
   /**
    * One predicate for "no coverage command may start right now". It was
    * copy-pasted across five buttons, and one copy already differed from the
    * rest — a set of conditions maintained in five places is a set that will
    * disagree.
+   *
+   * Every command, MANVI plan step or coverage script, takes the one
+   * `opsInflight` guard and cancels whichever run held it. So this must
+   * cover both kinds: the plan steps were gated without the scripts, and
+   * pressing one mid-script cancelled the script into a permanent "running".
    */
   let runControlsDisabled = $derived(
-    runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting,
+    runningMissing || runningAll || anyScriptRunning || anyStepRunning || isScanning || issueSubmitting,
   );
   /**
    * Every run that did not deliver coverage, in the shape the diagnostics
@@ -705,13 +722,31 @@
    * Runs one plan step through the gated terminal runner. Fresh artifacts only
    * matter once the command has settled — pass or fail — so a rescan always
    * follows.
+   *
+   * A run whose guard is cancelled mid-flight returns without writing its
+   * outcome, which used to leave the row `running` for the life of the panel.
+   * The `finally` clears it — only while the row is still this invocation's,
+   * never a newer run's, and never a row in a repository switched to since.
    */
-  /** Appends the tail-truncation note so a clipped log never reads as whole. */
   async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath || issueSubmitting) return false;
-    stepResults[step.id] = { running: true };
+    const runId = ++nextRunId;
+    stepResults[step.id] = { running: true, runId };
+    try {
+      return await runStepOnce(step, repoPath, guard, runId);
+    } finally {
+      const row = stepResults[step.id];
+      if (row?.runId === runId && row.running) stepResults[step.id] = { running: false };
+    }
+  }
 
+  async function runStepOnce(
+    step: RunnableStep,
+    repoPath: string,
+    guard: AsyncGuard,
+    runId: number,
+  ): Promise<boolean> {
     let passed = false;
     let commandCompleted = false;
     const actionLabel = step.command ?? step.text;
@@ -742,6 +777,7 @@
         detail,
         summary,
         duration_ms: res.duration_ms,
+        runId,
       };
 
       if (!passed) {
@@ -766,6 +802,7 @@
         running: false,
         status: "failed",
         detail,
+        runId,
       };
     }
 
@@ -958,10 +995,12 @@
     }
     const guard = options.guard ?? beginOps();
     if (!guard.isLive()) return false;
+    const runId = ++nextRunId;
     scriptStatuses[key] = {
       label,
       running: true,
       detail: options.durationHint || undefined,
+      runId,
     };
 
     let passed = false;
@@ -985,7 +1024,7 @@
           goModulesPartial: report?.go_modules_partial,
         });
         if (plan) {
-          scriptStatuses[key] = { label, running: true, detail: plan.note };
+          scriptStatuses[key] = { label, running: true, detail: plan.note, runId };
           const outcome = await runRecoverySteps(plan, repoPath, guard);
           if (outcome === null) return false;
           if (outcome.passed) {
@@ -1009,6 +1048,7 @@
         status: passed ? "passed" : "failed",
         detail,
         summary,
+        runId,
         ...(recovery
           ? { recovery: { note: recovery.note, limitation: recovery.limitation } }
           : {}),
@@ -1025,7 +1065,22 @@
         running: false,
         status: "failed",
         detail,
+        runId,
       };
+    } finally {
+      // Every early return above is a superseded run leaving its row
+      // `running`, which used to disable every run control until the
+      // repository was switched. Settle it while the row is still ours.
+      const row = scriptStatuses[key];
+      if (row?.runId === runId && row.running) {
+        scriptStatuses[key] = {
+          label,
+          running: false,
+          status: "cancelled",
+          summary: "Another coverage action took over; this run's outcome was not recorded.",
+          runId,
+        };
+      }
     }
 
     if ((options.rescan ?? true) && guard.isLive()) rescan();
@@ -1164,9 +1219,14 @@
     runningMissing = true;
     const guard = beginOps();
     try {
-      await runCoveragePipeline(pipeline, { rescan: true, guard });
+      await runCoveragePipeline(pipeline, { rescan: false, guard });
     } finally {
       runningMissing = false;
+      // Pass or fail. A failed `go test` still writes an empty coverprofile
+      // and a failed setup step can still install a tool; the pipeline's
+      // early returns used to skip the rescan, so the panel went on showing
+      // the tree as it was before the command ran.
+      if (guard.isLive()) rescan();
     }
   }
 
@@ -1323,6 +1383,10 @@
       const repo = coverageRepo;
       const path = selectedPath;
       if (!repo || !path) {
+        // The load this replaces was cancelled, and a cancelled load never
+        // reaches its own `finally`. Without this the pane said "Loading …"
+        // forever after a scan with no files cleared the selection mid-load.
+        isLoadingFile = false;
         sourceLines = [];
         hitMap = new Map();
         contentError = null;
@@ -1418,8 +1482,8 @@
   {#each view.commands as cmd (`${view.family}:${cmd}`)}
     <button
       type="button"
-      class="shrink-0 px-1.5 py-0.5 rounded-full border border-border/70 bg-background/60 font-mono text-[10px] text-textPrimary hover:bg-surfaceHover hover:text-accent transition-colors disabled:opacity-40"
-      title="Generate coverage artifacts with MANVI"
+      class="min-w-0 max-w-full truncate px-1.5 py-0.5 rounded-full border border-border/70 bg-background/60 font-mono text-[10px] text-textPrimary hover:bg-surfaceHover hover:text-accent transition-colors disabled:opacity-40"
+      title="Run with MANVI: {cmd}"
       disabled={runControlsDisabled}
       onclick={() => void runCoverageScript(view.family, cmd, { durationHint: view.durationHint })}
     >{cmd}</button>
@@ -1527,7 +1591,7 @@
           class="gp-btn-primary py-1! px-2.5! text-[11px]!"
           title="Generate each missing language with MANVI. Rust needs cargo-llvm-cov; a full run can take several minutes."
           onclick={() => void runMissingCoverage()}
-          disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
+          disabled={runControlsDisabled}
         >
           {#if runningMissing}
             <LoaderCircle size={11} class="animate-spin" />
@@ -1597,33 +1661,29 @@
        and their expected paths one hover away. -->
   {#if report && (unfoundViews.length > 0 || report.truncated || Object.keys(scriptStatuses).length > 0)}
     <div data-coverage-family-strip class="border-b border-border/40 gp-section-edge bg-surface/40 font-sans shrink-0">
-      <div class="px-4 py-1.5 flex items-center gap-3 overflow-x-auto">
+      <!-- Wraps; it does not scroll. With `overflow-x-auto` a long reason on
+           one family (Python's "No Python tests found …") pushed every family
+           after it past the right edge, behind a scrollbar macOS hides, so the
+           Rust row and its Run button were simply not on screen. -->
+      <div class="px-4 py-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 min-w-0">
         {#each unfoundViews as view (view.family)}
-          <div class="flex items-center gap-1.5 shrink-0" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
-            <span class="w-2 h-2 rounded-full" style="background-color: {view.status.color_hex}"></span>
-            <span class="text-textPrimary/80">{view.status.languages.join(", ")}</span>
-            <span class="text-textMuted/70">{view.family}</span>
-            {#if view.found}
-              <span class="text-emerald-400/80">report found</span>
-            {:else}
-              <span class="text-textMuted/60">no report</span>
-              {#if view.toolDetail}
-                <span class="text-amber-400/90">{view.toolDetail}</span>
-              {/if}
-              {#if view.durationHint}
-                <span class="text-textMuted/50">{view.durationHint}</span>
-              {/if}
-              {#if view.pipeline}
-                <button
-                  type="button"
-                  class="shrink-0 px-1.5 py-0.5 rounded-full border border-accent/40 bg-accent/10 font-sans text-[10px] text-textPrimary hover:bg-accent/20 hover:text-accent transition-colors disabled:opacity-40"
-                  title={view.durationHint || "Generate coverage artifacts with MANVI"}
-                  disabled={runControlsDisabled}
-                  onclick={() => void runCoverageFamily(view.family)}
-                >Run {view.label} coverage</button>
-              {/if}
-              {@render commandChips(view)}
+          <div data-coverage-family={view.family} class="flex flex-wrap items-center gap-x-1.5 gap-y-1 min-w-0 max-w-full" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
+            <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {view.status.color_hex}"></span>
+            <span class="text-textPrimary/80 shrink-0">{view.status.languages.join(", ") || view.label}</span>
+            <span class="text-textMuted/60 shrink-0">no report</span>
+            {#if view.toolDetail}
+              <span class="text-amber-400/90 truncate min-w-0 max-w-[32rem]" title={view.toolDetail}>{view.toolDetail}</span>
             {/if}
+            {#if view.pipeline}
+              <button
+                type="button"
+                class="shrink-0 px-1.5 py-0.5 rounded-full border border-accent/40 bg-accent/10 font-sans text-[10px] text-textPrimary hover:bg-accent/20 hover:text-accent transition-colors disabled:opacity-40"
+                title={view.durationHint || "Generate coverage artifacts with MANVI"}
+                disabled={runControlsDisabled}
+                onclick={() => void runCoverageFamily(view.family)}
+              >Run {view.label} coverage</button>
+            {/if}
+            {@render commandChips(view)}
           </div>
         {/each}
         {#if foundViews.length > 0}
@@ -1684,6 +1744,9 @@
                      checkmark: the command succeeded, the generation did not. -->
                 <X size={10} class="text-amber-400 shrink-0" />
                 <span class="text-amber-400/90 shrink-0 whitespace-nowrap">no coverage produced</span>
+              {:else if status.status === "cancelled"}
+                <X size={10} class="text-textMuted shrink-0" />
+                <span class="text-textMuted shrink-0 whitespace-nowrap">not recorded</span>
               {:else}
                 <X size={10} class="text-rose-400 shrink-0" />
                 <span class="text-rose-400/90 shrink-0">failed</span>
@@ -1694,7 +1757,14 @@
                   >{status.recovery.note}</span
                 >
               {:else if status.summary || briefDetail(status.detail)}
-                <span class="text-textMuted/70 truncate">{status.summary || briefDetail(status.detail)}</span>
+                <!-- The summary is the line that names the cause; the hover
+                     says what kind of failure that is, from the same
+                     classifier the copied diagnostics use. -->
+                <span
+                  data-coverage-run-summary
+                  class="text-textMuted/70 truncate"
+                  title={(status.status === "failed" ? coverageFailureHint(status.label, status.detail) : null) ?? status.summary ?? briefDetail(status.detail)}
+                >{status.summary || briefDetail(status.detail)}</span>
               {/if}
               {#if status.status === "failed" || status.status === "no_data"}
                 <button
@@ -2061,7 +2131,7 @@
                   <button
                     type="button"
                     onclick={runAllSteps}
-                    disabled={runningAll || runningMissing || issueSubmitting || Object.values(stepResults).some((r) => r.running)}
+                    disabled={runControlsDisabled}
                     class="gp-btn-primary py-1! text-[11px]!"
                     title="Execute all executable steps sequentially, stopping at the first failure"
                   >
@@ -2092,7 +2162,7 @@
                         <button
                           type="button"
                           onclick={() => void runStep(step, beginOps())}
-                          disabled={res?.running || runningAll || runningMissing || issueSubmitting}
+                          disabled={runControlsDisabled}
                           class="gp-btn py-1! px-2.5! text-xs shrink-0 disabled:opacity-50"
                           title="Execute this command step directly"
                         >

@@ -142,6 +142,76 @@ describe("formatRunSummary stays a single usable line", () => {
 });
 
 /**
+ * Captured from two real coverage runs on 2026-10-01 (paths shortened). The
+ * status row showed each one's first line — `info: … cfg(coverage)` and
+ * `# <package>` — which name nothing; the cause was further down both times.
+ */
+const CARGO_LLVM_COV_MANIFEST_ERROR = [
+  "info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage",
+  "error: ojas-metal/Cargo.toml: can't find `metal_bench` example at `examples/metal_bench.rs` or `examples/metal_bench/main.rs`. Please specify example.path if you want to use a non-default path.",
+  "error: could not parse `ojas-metal` (manifest) due to 1 previous error",
+  "error: process didn't exit successfully: `cargo test --tests --manifest-path /w/ojas/Cargo.toml --target-dir /w/ojas/target/llvm-cov-target --workspace` (exit status: 101)",
+].join("\n");
+
+const GO_TEST_LINK_FAILURE = [
+  "# github.com/bharathvbcr/ojas/go.test",
+  "/opt/homebrew/Cellar/go/1.27.1/libexec/pkg/tool/darwin_arm64/link: running cc failed: exit status 1",
+  "/usr/bin/cc -arch arm64 -Wl,-S -Wl,-x -o $WORK/b001/go.test -Qunused-arguments /tmp/go-link/go.o /tmp/go-link/000000.o -O2 -g -lgusset -lpthread -lm -ldl",
+  "Undefined symbols for architecture arm64:",
+  '  "_ojas_engine_init", referenced from:',
+  "      __cgo_80c61d759ee3_Cfunc_ojas_engine_init in 000001.o",
+  "ld: symbol(s) not found for architecture arm64",
+  "clang: error: linker command failed with exit code 1 (use -v to see invocation)",
+  "",
+  "FAIL\tgithub.com/bharathvbcr/ojas/go [build failed]",
+  "FAIL",
+].join("\n");
+
+describe("formatRunSummary names the cause of a failed run", () => {
+  it("skips cargo-llvm-cov's info banner for the manifest error beneath it", () => {
+    const summary = formatRunSummary(result({ exit_code: 101, stderr_tail: CARGO_LLVM_COV_MANIFEST_ERROR }));
+    expect(summary).toMatch(/^error: ojas-metal\/Cargo\.toml: can't find `metal_bench` example/);
+  });
+
+  it("skips go's package header and prefers the self-contained linker line", () => {
+    const summary = formatRunSummary(result({ exit_code: 1, stdout_tail: GO_TEST_LINK_FAILURE }));
+    expect(summary).toBe("ld: symbol(s) not found for architecture arm64");
+  });
+
+  it("finds the cause in stdout when stderr holds only noise", () => {
+    expect(
+      formatRunSummary(
+        result({
+          stderr_tail: "warning: unused import\n   Compiling demo v0.1.0",
+          stdout_tail: "running 3 tests\nthread 'main' panicked at src/lib.rs:4:5:\nboom",
+        }),
+      ),
+    ).toBe("thread 'main' panicked at src/lib.rs:4:5:");
+  });
+
+  it("falls back to a verdict line when no cause is printed", () => {
+    expect(formatRunSummary(result({ stdout_tail: "ok  \tpkg/a\nFAIL\tpkg/b\nFAIL" }))).toBe("FAIL\tpkg/b");
+  });
+
+  it("strips terminal colour codes rather than showing them", () => {
+    const summary = formatRunSummary(result({ stderr_tail: "\u001b[1m\u001b[31merror\u001b[0m: boom" }));
+    expect(summary).toBe("error: boom");
+  });
+
+  it("keeps a passed run's first line, so success summaries do not change", () => {
+    expect(
+      formatRunSummary(result({ exit_code: 0, stderr_tail: "info: cargo-llvm-cov currently setting cfg(coverage)" })),
+    ).toBe("info: cargo-llvm-cov currently setting cfg(coverage)");
+  });
+
+  it("stays one bounded line for hostile output", () => {
+    const summary = formatRunSummary(result({ stderr_tail: `error: ${"x".repeat(50_000)}\r\nsecond` }));
+    expect(summary).not.toContain("\n");
+    expect(summary.length).toBeLessThanOrEqual(401);
+  });
+});
+
+/**
  * The payload crosses an IPC boundary. A field that arrives as the wrong type
  * must degrade to "no information", never to a thrown render.
  */

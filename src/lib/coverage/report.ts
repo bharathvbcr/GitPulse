@@ -537,6 +537,28 @@ function pytestAbortingModule(output: string): string | null {
   return found;
 }
 
+/**
+ * The repository did not build, so no test ran and nothing could be measured.
+ *
+ * Both failures that prompted this were the project's own: a Cargo manifest
+ * naming an example file that does not exist, and a cgo link against symbols
+ * the linked library does not export. Neither is fixed by a different
+ * coverage command, and saying "tests failed" or nothing at all sends the
+ * reader to the wrong place.
+ */
+const PROJECT_BUILD_FAILED = [
+  /\[(build|setup) failed\]/,
+  /^error: could not compile `/m,
+  /could not parse `[^`]+` \(manifest\)/,
+  /^error: failed to (load|parse) manifest/m,
+  /^error\[E\d{4}\]/m,
+  /^Undefined symbols for architecture /m,
+  /\blinker command failed\b/,
+  /^ld(\.lld)?: /m,
+  /: fatal error: /,
+  /^make(\[\d+\])?: \*\*\*/m,
+];
+
 const TEST_SUITE_RAN_FAILURE = [
   /Test Files\s+\d+\s+failed/i,
   /Failed Tests/i,
@@ -565,6 +587,7 @@ export type CoverageFailureCause =
   | { kind: "no_gradle_wrapper" }
   /** `module` is `<path>:<line>` of the importing frame, or null if unreadable. */
   | { kind: "pytest_collection_abort"; module: string | null }
+  | { kind: "build_failed" }
   | { kind: "tests_failed"; generatorRan: boolean };
 
 /**
@@ -611,6 +634,9 @@ export function classifyCoverageFailure(
   if (PYTEST_COLLECTION_ABORTED.test(output)) {
     return { kind: "pytest_collection_abort", module: pytestAbortingModule(output) };
   }
+  if (PROJECT_BUILD_FAILED.some((pattern) => pattern.test(output))) {
+    return { kind: "build_failed" };
+  }
   if (TEST_SUITE_RAN_FAILURE.some((pattern) => pattern.test(output))) {
     const cmd = typeof command === "string" ? command : "";
     return { kind: "tests_failed", generatorRan: /\bvitest\b|\bjest\b|npm run/.test(cmd) };
@@ -642,6 +668,8 @@ export function coverageFailureHint(
       const where = cause.module ? ` The module was ${cause.module}.` : "";
       return `pytest never ran a test: importing a collected module called sys.exit(), which aborts the whole session.${where} That file matches pytest's default collection patterns (test_*.py, *_test.py) but is a runnable script, not a test module. Rename it, guard its body with \`if __name__ == "__main__":\`, or exclude it (\`--ignore=<path>\`, or \`norecursedirs\`/\`python_files\` in pytest.ini).`;
     }
+    case "build_failed":
+      return "The project failed to build, so no test ran and no coverage could be recorded. This is a build error in the repository (see the first error line), not a problem with the coverage command.";
     case "tests_failed": {
       const runner = cause.generatorRan
         ? "The coverage generator ran; tests failed."

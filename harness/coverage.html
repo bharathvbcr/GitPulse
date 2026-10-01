@@ -34,12 +34,41 @@
         artifacts: measured ? [{ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped: false, totals }] : [],
         overall: measured ? overall : { lines_found: 0, lines_hit: 0, percentage: 0 }, truncated: false,
       });
+      // A real repository's shape (ojas, 2026-10-01): three families with no
+      // report, one reason long enough to crowd a row, and the empty
+      // coverprofile a failed `go test` leaves behind. The single-family
+      // fixture above never rendered any of this.
+      const ojasReport = () => ({
+        families: [
+          { family: "go", languages: ["Go"], color_hex: "#00ADD8", expected_formats: ["go_cover"], expected_paths: ["coverage.out", "cover.out", "coverage.txt"], found: false, suggested_commands: ["go -C go test ./... -coverprofile=coverage.out"], setup_commands: [], tool_ready: true, tool_detail: "", duration_hint: "Go coverage can take a few minutes." },
+          { family: "python", languages: ["Python"], color_hex: "#3572A5", expected_formats: ["cobertura", "coverage_py_db", "lcov"], expected_paths: ["coverage.xml", "htmlcov/coverage.xml", "coverage/coverage.xml", "lcov.info", "coverage/lcov.info", ".coverage"], found: false, suggested_commands: [], setup_commands: [], tool_ready: false, tool_detail: "No Python tests found (pytest's test_*.py / *_test.py, conftest.py, pytest.ini, or a tests/ directory). Running pytest would collect nothing.", duration_hint: "" },
+          { family: "rust", languages: ["Rust"], color_hex: "#dea584", expected_formats: ["cobertura", "lcov"], expected_paths: ["lcov.info", "coverage/lcov.info", "target/llvm-cov/lcov.info"], found: false, suggested_commands: ["cargo llvm-cov --workspace --lcov --output-path lcov.info"], setup_commands: [], tool_ready: true, tool_detail: "", duration_hint: "Generating Rust coverage can take several minutes." },
+        ],
+        files: [], languages: [],
+        artifacts: [{ path: "go/coverage.out", format: "go_cover", family: "go", skipped: true, skip_reason: "no line records", totals: { lines_found: 0, lines_hit: 0, percentage: 0 } }],
+        overall: { lines_found: 0, lines_hit: 0, percentage: 0 }, truncated: false,
+      });
+      // Captured verbatim (paths shortened) from the two runs that failed on
+      // that repository. The status row showed each one's first line.
+      const GO_LINK_FAILURE = "# github.com/bharathvbcr/ojas/go.test\n/opt/homebrew/Cellar/go/1.27.1/libexec/pkg/tool/darwin_arm64/link: running cc failed: exit status 1\nUndefined symbols for architecture arm64:\n  \"_ojas_engine_init\", referenced from:\nld: symbol(s) not found for architecture arm64\nclang: error: linker command failed with exit code 1 (use -v to see invocation)\n\nFAIL\tgithub.com/bharathvbcr/ojas/go [build failed]\nFAIL";
+      const CARGO_MANIFEST_FAILURE = "info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage\nerror: ojas-metal/Cargo.toml: can't find `metal_bench` example at `examples/metal_bench.rs` or `examples/metal_bench/main.rs`.\nerror: could not parse `ojas-metal` (manifest) due to 1 previous error";
+      let runDelay = 0;
+      let scans = 0;
+      const runs = [];
+      const runResult = argv => {
+        const base = { command: argv.join(" "), gated: true, policy: null, timed_out: false, truncated: false, truncation_reason: null, duration_ms: 1200, stdout_tail: "", stderr_tail: "" };
+        if (argv[0] === "go") return { ...base, exit_code: 1, stdout_tail: GO_LINK_FAILURE };
+        if (argv[0] === "cargo") return { ...base, exit_code: 101, stderr_tail: CARGO_MANIFEST_FAILURE };
+        return { ...base, exit_code: 0, stdout_tail: "fixture run ok" };
+      };
       addEventListener("error", event => errors.push(event.message));
       addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
       mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
-          case "cmd_scan_coverage": if (mode === "failed") throw new Error("Fixture scan failed"); return report(mode === "measured" || mode === "redistributed");
+          case "cmd_scan_coverage": scans += 1; if (mode === "failed") throw new Error("Fixture scan failed"); return mode === "ojas" ? ojasReport() : report(mode === "measured" || mode === "redistributed");
+          case "cmd_manvi_run_action": runs.push(args); return new Promise(resolve => setTimeout(() => resolve(runResult(args.args)), runDelay));
+          case "cmd_ai_coverage_report": return { text: "1. Regenerate the JavaScript report: `npm run coverage`", reasoning: "", model: "fixture-model", base_url: "", context_window: 0, context_source: "fixture", prompt_tokens: 1, completion_tokens: 1, truncated: false, diff_truncated: false, diff_used_bytes: 0, diff_total_bytes: 0, budget: { planned_by_harness: false, before_tokens: 0, threshold_tokens: 0, insufficient: false, calibration_samples: 0 }, warnings: [] };
           case "cmd_get_file_coverage": return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [...[1, 4, 5, 6, 7, 8, 9].map(line_no => ({ line_no, hits: 1 })), ...(mode === "redistributed" ? [45, 46, 60] : [2, 3, 60]).map(line_no => ({ line_no, hits: 0 }))], totals, truncated: false, lines_truncated: false };
           case "cmd_get_file_content": {
             const content = Array.from({ length: 100 }, (_, i) => `export const line${i + 1} = ${i + 1};`).join("\n");
@@ -237,6 +266,58 @@
             (document.querySelector("[data-coverage-family-strip]")?.textContent ?? "").includes("no report"));
           mode = "measured"; button("Measured coverage").click(); button("Rescan coverage artifacts").click();
           await until(() => !document.querySelector("[data-coverage-family-strip]"));
+
+          // ---- A real repository's failure paths (ojas, 2026-10-01) ----
+          const region = () => document.querySelector('[role="region"][aria-label="Test coverage"]');
+          const byText = text => visible("button").find(node => node.textContent.trim() === text);
+          const settled = () => !document.querySelector("[data-coverage-family-strip] .animate-spin");
+          // A scan that empties the file list while a file's source is still
+          // loading clears the selection; the cancelled load never reached its
+          // own `finally`, so the pane said "Loading …" for good.
+          mode = "slow-detail";
+          button("src/full.ts, 100.0%, 0 missed lines").click(); await tick();
+          mode = "ojas"; button("Rescan coverage artifacts").click();
+          await until(() => !!document.querySelector('[data-coverage-family="rust"]'));
+          await new Promise(resolve => setTimeout(resolve, 400));
+          check("a selection cleared mid-load does not leave the pane loading", !region().textContent.includes("Loading"));
+          // Every family that owes a report stays on screen, however long a
+          // neighbour's reason is: the strip scrolled sideways and hid Rust.
+          button("Toggle narrow layout").click(); await wait();
+          const stripBox = document.querySelector("[data-coverage-family-strip]").getBoundingClientRect();
+          const familyBoxes = [...document.querySelectorAll("[data-coverage-family]")].map(node => node.getBoundingClientRect());
+          check("every family that owes a report is visible inside the strip",
+            familyBoxes.length === 3 && familyBoxes.every(box => box.width > 0 && box.left >= stripBox.left - 1 && box.right <= stripBox.right + 1));
+          button("Toggle narrow layout").click(); button("Toggle narrow layout").click(); await wait();
+          // A failed run names its cause, not the progress line printed first.
+          const scansBefore = scans;
+          byText("Run Go coverage").click();
+          await until(() => settled() && !!document.querySelector("[data-coverage-run-summary]"));
+          const goSummary = document.querySelector("[data-coverage-run-summary]");
+          check("a failed run's row names the cause, not go's package header",
+            goSummary.textContent.trim() === "ld: symbol(s) not found for architecture arm64" && goSummary.title.includes("failed to build"));
+          await wait(); await wait();
+          check("a failed family run rescans, so the artifact it left behind is shown", scans > scansBefore);
+          // Plan steps and coverage scripts share one cancellation guard, so
+          // neither may start while the other runs: the one cancelled stayed
+          // "running" forever and disabled every run control with it.
+          button("MANVI: analyze coverage with the local model").click(); await tick();
+          byText("Generate AI report").click();
+          await until(() => !!button("Execute this command step directly"));
+          runDelay = 500;
+          // The single-command chip, not the family button: the family run
+          // also sets `runningMissing`, which the steps were already gated on.
+          byText("cargo llvm-cov --workspace --lcov --output-path lcov.info").click(); await tick();
+          check("a plan step cannot start while a coverage script runs", button("Execute this command step directly").disabled);
+          await until(() => settled() && !button("Execute this command step directly").disabled);
+          button("Execute this command step directly").click(); await tick();
+          check("a coverage script cannot start while a plan step runs", byText("Run Rust coverage").disabled);
+          await until(() => !byText("Run Rust coverage").disabled);
+          check("no run is left running once both finished", settled() && !region().textContent.includes("Running…"));
+          runDelay = 0;
+          button("MANVI: analyze coverage with the local model").click(); await tick();
+          mode = "measured"; button("Measured coverage").click(); button("Rescan coverage artifacts").click();
+          await until(() => !document.querySelector("[data-coverage-family-strip]") || !document.querySelector("[data-coverage-family]"));
+
           button("Hide the terminal dock").click();
           button("Toggle narrow layout").click(); button("Toggle theme").click(); await wait();
           const section = document.querySelector('section[aria-label="Generate coverage with a coding agent"]');

@@ -16,7 +16,7 @@ use crate::engine::git_cli::{
     sandbox_join_canonical, validate_repo,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -1346,13 +1346,309 @@ fn javascript_unready_detail(repo: &Path) -> String {
     }
 }
 
+/// Bound on one `Cargo.toml` read while deciding workspace membership. A
+/// manifest past it is "unknown", which keeps its directory as a candidate:
+/// running one command too many is recoverable, silently dropping a crate is
+/// not.
+const MAX_CARGO_MANIFEST_BYTES: u64 = 256 * 1024;
+/// Manifests read per scan to classify workspace membership. Beyond it the
+/// remaining directories are unknown and treated as above.
+const MAX_CARGO_MANIFESTS_READ: usize = 2_048;
+const MAX_WORKSPACE_EXCLUDES: usize = 256;
+
+/// The parts of a `Cargo.toml` that decide which workspace a crate runs in.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CargoManifestShape {
+    /// A `[workspace]` table (or `[workspace.*]` subtable) is present, so this
+    /// directory is a workspace root.
+    declares_workspace: bool,
+    /// `[workspace] exclude = [...]`, normalised, relative to this manifest.
+    exclude: Vec<String>,
+    /// `[package] workspace = "..."`: an explicit root, relative to this manifest.
+    package_workspace: Option<String>,
+}
+
+/// Cuts a TOML line at its comment, ignoring `#` inside strings.
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '#' => return &line[..index],
+            None => {}
+        }
+    }
+    line
+}
+
+/// True once an array value has reached its closing `]` outside any string.
+fn toml_array_closed(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut opened = false;
+    for ch in text.chars() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '[' => opened = true,
+            None if ch == ']' && opened => return true,
+            None => {}
+        }
+    }
+    false
+}
+
+/// The string items of a TOML value, basic (`"…"`) and literal (`'…'`).
+fn toml_string_items(text: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '"' && ch != '\'' {
+            continue;
+        }
+        let mut item = String::new();
+        let mut closed = false;
+        while let Some(next) = chars.next() {
+            if next == ch {
+                closed = true;
+                break;
+            }
+            if ch == '"' && next == '\\' {
+                if let Some(escaped) = chars.next() {
+                    item.push(escaped);
+                }
+                continue;
+            }
+            item.push(next);
+        }
+        if closed {
+            items.push(item);
+        }
+    }
+    items
+}
+
+/// Reads only what decides workspace membership. Not a TOML parser: it reads
+/// table headers, `[workspace] exclude` and `[package] workspace`, and nothing
+/// it does not understand can promote a directory to a root.
+fn parse_cargo_manifest_shape(text: &str) -> CargoManifestShape {
+    let mut shape = CargoManifestShape::default();
+    let mut table = String::new();
+    let mut lines = text.lines();
+    while let Some(raw) = lines.next() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') {
+            table = line
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                .collect();
+            if table == "workspace" || table.starts_with("workspace.") {
+                shape.declares_workspace = true;
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key: String = key
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect();
+        // `workspace = { … }` and `workspace.members = […]` at the top level
+        // are the same table spelled inline.
+        if table.is_empty() && (key == "workspace" || key.starts_with("workspace.")) {
+            shape.declares_workspace = true;
+        }
+        let exclude_here = (table == "workspace" && key == "exclude")
+            || (table.is_empty() && key == "workspace.exclude");
+        if exclude_here {
+            let mut array = value.to_string();
+            while !toml_array_closed(&array) {
+                let Some(next) = lines.next() else { break };
+                array.push('\n');
+                array.push_str(strip_toml_comment(next));
+            }
+            shape.exclude = toml_string_items(&array)
+                .iter()
+                .filter_map(|item| normalise_manifest_rel(item))
+                .take(MAX_WORKSPACE_EXCLUDES)
+                .collect();
+        } else if table == "package" && key == "workspace" {
+            shape.package_workspace = toml_string_items(value).into_iter().next();
+        }
+    }
+    shape
+}
+
+/// A manifest-relative path in this module's `"a/b"` form, or `None` when it
+/// climbs (`..`) or is absolute — those cannot be compared by prefix.
+fn normalise_manifest_rel(raw: &str) -> Option<String> {
+    let raw = raw.trim().replace('\\', "/");
+    if raw.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// `base` joined with a relative path that may climb, kept inside the repo.
+fn resolve_manifest_rel(base: &str, rel: &str) -> Option<String> {
+    let rel = rel.trim().replace('\\', "/");
+    if rel.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn read_cargo_manifest_shape(repo: &Path, dir: &str) -> Option<CargoManifestShape> {
+    use std::io::Read as _;
+    let rel = if dir.is_empty() {
+        "Cargo.toml".to_string()
+    } else {
+        format!("{dir}/Cargo.toml")
+    };
+    let path = sandbox_join_canonical(repo, &rel).ok()?;
+    // Regular files only: opening a FIFO would block the scan.
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(MAX_CARGO_MANIFEST_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_CARGO_MANIFEST_BYTES {
+        return None;
+    }
+    Some(parse_cargo_manifest_shape(&text))
+}
+
+/// The directories `cargo llvm-cov --workspace` must run from: one per
+/// workspace root or standalone crate, never one per member.
+///
+/// Every `Cargo.toml` directory used to get its own command. For a member
+/// crate that is not a narrower run — Cargo resolves the member's workspace,
+/// so `--manifest-path member/Cargo.toml --workspace` rebuilds and retests the
+/// whole workspace again, and writes the same coverage a second time beside
+/// the member. A sixteen-crate workspace was planned as the root plus its
+/// first three members alphabetically: four full runs, the same data four
+/// times.
+///
+/// Cargo's rule is followed: a crate belongs to the nearest ancestor manifest
+/// declaring `[workspace]` (or the one `package.workspace` names) unless that
+/// workspace `exclude`s it, and a manifest declaring `[workspace]` is its own
+/// root. A manifest that could not be read keeps its directory.
+fn cargo_workspace_roots(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
+    // Sorted input puts every ancestor before its descendants, so the read
+    // cap is spent on the manifests that decide membership first.
+    let present: HashSet<&str> = cargo_dirs.iter().map(String::as_str).collect();
+    let mut shapes: HashMap<&str, Option<CargoManifestShape>> = HashMap::new();
+    for dir in cargo_dirs.iter().take(MAX_CARGO_MANIFESTS_READ) {
+        shapes.insert(dir.as_str(), read_cargo_manifest_shape(repo, dir));
+    }
+    let shape_of = |dir: &str| shapes.get(dir).cloned().flatten();
+    let is_root = |dir: &str| shape_of(dir).is_some_and(|s| s.declares_workspace);
+    let excluded_from = |root: &str, dir: &str| -> bool {
+        let Some(shape) = shape_of(root) else {
+            return false;
+        };
+        let member = if root.is_empty() {
+            dir
+        } else {
+            dir.strip_prefix(root)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .unwrap_or(dir)
+        };
+        shape
+            .exclude
+            .iter()
+            .any(|ex| member == ex || member.starts_with(&format!("{ex}/")))
+    };
+
+    let mut roots = Vec::new();
+    for dir in cargo_dirs {
+        // A crate's own unreadable manifest is not a reason to keep it: what
+        // places it is its ancestor, read below. Keeping every unread member
+        // would bring back one full-workspace run per crate past the read cap.
+        let shape = shape_of(dir).unwrap_or_default();
+        if shape.declares_workspace {
+            roots.push(dir.clone());
+            continue;
+        }
+        if let Some(explicit) = shape.package_workspace.as_deref() {
+            match resolve_manifest_rel(dir, explicit) {
+                Some(root) if root != *dir && is_root(&root) => {}
+                _ => roots.push(dir.clone()),
+            }
+            continue;
+        }
+        // Nearest ancestor that has a manifest decides; one that could not
+        // be read leaves the question open, so the crate is kept.
+        let mut owner: Option<Option<String>> = None;
+        let mut cursor = dir.as_str();
+        while !cursor.is_empty() {
+            cursor = cursor.rfind('/').map_or("", |cut| &cursor[..cut]);
+            if !present.contains(cursor) {
+                continue;
+            }
+            match shape_of(cursor) {
+                None => {
+                    owner = Some(None);
+                    break;
+                }
+                Some(ancestor) if ancestor.declares_workspace => {
+                    owner = Some(Some(cursor.to_string()));
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        match owner {
+            Some(Some(root)) if !excluded_from(&root, dir) => {}
+            _ => roots.push(dir.clone()),
+        }
+    }
+    roots
+}
+
 fn rust_coverage_commands(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
-    let mut dirs: Vec<String> = cargo_dirs
-        .iter()
-        .filter(|d| !rel_is_command_unsafe(d))
-        .cloned()
+    // Someone else's crates are not this repository's tests: Swift's plan
+    // already skips them, and this checkout's own vendored Tauri crates
+    // (WebKitGTK bindings among them) were being planned for coverage runs
+    // that cannot build on macOS.
+    let mut dirs: Vec<String> = cargo_workspace_roots(repo, cargo_dirs)
+        .into_iter()
+        .filter(|d| !rel_is_command_unsafe(d) && !coverage_third_party_dir(d))
         .collect();
-    if dirs.is_empty() {
+    if dirs.is_empty() && cargo_dirs.is_empty() {
         // Listing missed every Cargo.toml (ignored, or only `.rs` files).
         // Same two-path fallback CI:local uses for Tauri checkouts.
         if manifest_is_file(repo, "Cargo.toml") {
@@ -1376,9 +1672,8 @@ fn rust_coverage_commands(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
             commands.push(command);
         }
     }
-    if commands.is_empty() {
-        commands.push("cargo llvm-cov --workspace --lcov --output-path lcov.info".into());
-    }
+    // No invented root command: with no first-party manifest there is no
+    // crate for `cargo` to find, and the run could only fail.
     commands
 }
 
@@ -1713,6 +2008,11 @@ fn rust_coverage_plan(
     llvm_cov_ready: bool,
 ) -> LanguageCoveragePlan {
     let generate = rust_coverage_commands(repo, cargo_dirs);
+    if generate.is_empty() {
+        return LanguageCoveragePlan::unavailable(
+            "No first-party Cargo.toml in this repository, so there is no crate to run cargo llvm-cov against.",
+        );
+    }
     if llvm_cov_ready {
         return LanguageCoveragePlan::ready(
             generate,
@@ -4606,7 +4906,13 @@ src/main.go:4.1,4.8 1 0
 
     #[test]
     fn rust_plan_injects_setup_when_llvm_cov_is_missing() {
-        let plan = rust_coverage_plan(Path::new("."), &[], false);
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        let plan = rust_coverage_plan(repo.path(), &[String::new()], false);
         assert!(!plan.tool_ready);
         assert_eq!(
             plan.setup,
@@ -4624,12 +4930,220 @@ src/main.go:4.1,4.8 1 0
 
     #[test]
     fn rust_plan_skips_setup_when_llvm_cov_is_ready() {
-        let plan = rust_coverage_plan(Path::new("."), &[], true);
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        let plan = rust_coverage_plan(repo.path(), &[String::new()], true);
         assert!(plan.tool_ready);
         assert!(plan.setup.is_empty());
         assert!(plan.tool_detail.is_empty());
         assert!(plan.duration_hint.contains("several minutes"));
         assert!(!plan.generate.is_empty());
+    }
+
+    fn rust_commands_for(repo: &Path) -> Vec<String> {
+        let report = CoverageScanner::scan(repo.to_str().unwrap()).expect("scan");
+        report
+            .families
+            .iter()
+            .find(|f| f.family == "rust")
+            .expect("rust family")
+            .suggested_commands
+            .clone()
+    }
+
+    /// Regression (ojas, 2026-10-01): a sixteen-member workspace was planned
+    /// as four `--workspace` runs — the root, then `ojas-autograd`,
+    /// `ojas-capi` and one more member, because the cap took the first four
+    /// Cargo.toml directories alphabetically. Each member command rebuilt and
+    /// retested the entire workspace. One run per workspace root.
+    #[test]
+    fn a_workspace_is_planned_once_not_once_per_member() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[workspace] # the root\nresolver = \"2\"\nmembers = [\"crate-a\", \"crate-b\", \"crate-c\", \"nested/crate-d\"]\nexclude = [\n  \"tools/standalone\", # built on its own\n  './scratch/',\n]\n\n[workspace.package]\nedition = \"2021\"\n",
+        );
+        for member in ["crate-a", "crate-b", "crate-c", "nested/crate-d"] {
+            write(
+                repo.path(),
+                &format!("{member}/Cargo.toml"),
+                "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+            );
+            write(
+                repo.path(),
+                &format!("{member}/src/lib.rs"),
+                "pub fn f() {}\n",
+            );
+        }
+        // Excluded from the root workspace: it builds alone, so it is its own run.
+        write(
+            repo.path(),
+            "tools/standalone/Cargo.toml",
+            "[package]\nname = \"s\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            repo.path(),
+            "tools/standalone/src/main.rs",
+            "fn main() {}\n",
+        );
+        // Declares its own workspace: a separate root even though it is nested.
+        write(
+            repo.path(),
+            "bench/Cargo.toml",
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[ workspace ]\n",
+        );
+        write(repo.path(), "bench/src/main.rs", "fn main() {}\n");
+        // Names its root explicitly; still a member.
+        write(
+            repo.path(),
+            "deep/x/Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nworkspace = \"../..\"\n",
+        );
+        // Someone else's crate.
+        write(
+            repo.path(),
+            "vendored/dep/Cargo.toml",
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+        );
+
+        assert_eq!(
+            rust_commands_for(repo.path()),
+            vec![
+                "cargo llvm-cov --workspace --lcov --output-path lcov.info".to_string(),
+                "cargo llvm-cov --manifest-path bench/Cargo.toml --workspace --lcov --output-path bench/lcov.info".to_string(),
+                "cargo llvm-cov --manifest-path tools/standalone/Cargo.toml --workspace --lcov --output-path tools/standalone/lcov.info".to_string(),
+            ]
+        );
+    }
+
+    /// This checkout's own layout: `src-tauri` is a plain package and the
+    /// vendored Tauri and WebKitGTK crates are path dependencies with no
+    /// workspace. They used to fill three of the four command slots.
+    #[test]
+    fn vendored_framework_crates_are_not_planned() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "src-tauri/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n",
+        );
+        write(repo.path(), "src-tauri/src/lib.rs", "pub fn x() {}\n");
+        for dep in [
+            "framework/javascriptcore-rs-sys",
+            "framework/tao",
+            "vendored/dc-store",
+        ] {
+            write(
+                repo.path(),
+                &format!("src-tauri/{dep}/Cargo.toml"),
+                "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+            );
+        }
+        assert_eq!(
+            rust_commands_for(repo.path()),
+            vec!["cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path src-tauri/lcov.info".to_string()]
+        );
+    }
+
+    /// A root manifest that cannot be read leaves membership unknown, and an
+    /// unknown member is kept: one command too many is recoverable, a crate
+    /// silently dropped from the plan is not.
+    #[test]
+    fn an_unreadable_workspace_root_keeps_its_members() {
+        let repo = git_repo();
+        let mut huge = String::from("[workspace]\nmembers = [\"a\"]\n");
+        while (huge.len() as u64) <= MAX_CARGO_MANIFEST_BYTES {
+            huge.push_str("# padding padding padding padding padding padding\n");
+        }
+        write(repo.path(), "Cargo.toml", &huge);
+        write(
+            repo.path(),
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        );
+        write(repo.path(), "a/src/lib.rs", "pub fn f() {}\n");
+        assert_eq!(
+            rust_commands_for(repo.path()),
+            vec![
+                "cargo llvm-cov --workspace --lcov --output-path lcov.info".to_string(),
+                "cargo llvm-cov --manifest-path a/Cargo.toml --workspace --lcov --output-path a/lcov.info".to_string(),
+            ]
+        );
+    }
+
+    /// Rust sources with no manifest used to be planned a root `cargo llvm-cov`
+    /// anyway, which can only fail with "could not find Cargo.toml".
+    #[test]
+    fn rust_sources_without_a_first_party_manifest_plan_nothing_and_say_why() {
+        let repo = git_repo();
+        write(repo.path(), "scripts/tool.rs", "fn main() {}\n");
+        write(
+            repo.path(),
+            "vendored/dep/Cargo.toml",
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let rust = report
+            .families
+            .iter()
+            .find(|f| f.family == "rust")
+            .expect("rust family");
+        assert!(
+            rust.suggested_commands.is_empty(),
+            "{:?}",
+            rust.suggested_commands
+        );
+        assert!(
+            rust.setup_commands.is_empty(),
+            "nothing to set up for: {:?}",
+            rust.setup_commands
+        );
+        assert!(!rust.tool_ready);
+        assert!(
+            rust.tool_detail.contains("Cargo.toml"),
+            "{:?}",
+            rust.tool_detail
+        );
+    }
+
+    #[test]
+    fn manifest_shape_reader_handles_toml_spellings_without_being_fooled() {
+        let shape = parse_cargo_manifest_shape(
+            "[package]\nname = \"has # hash\" # [workspace] in a comment\ndescription = '[workspace]'\n[[bin]]\nname = \"x\"\n",
+        );
+        assert!(
+            !shape.declares_workspace,
+            "comments and strings must not declare a workspace"
+        );
+        assert!(
+            parse_cargo_manifest_shape("workspace = { members = [\"a\"] }\n").declares_workspace
+        );
+        assert!(parse_cargo_manifest_shape("workspace.members = [\"a\"]\n").declares_workspace);
+        assert!(
+            parse_cargo_manifest_shape("[workspace.dependencies]\nserde = \"1\"\n")
+                .declares_workspace
+        );
+        let shape = parse_cargo_manifest_shape(
+            "[workspace]\nexclude = [\"a]b\", 'lit/', \"../escape\", \"/abs\", \"./c/./d\"]\nmembers = [\"z\"]\n",
+        );
+        assert_eq!(
+            shape.exclude,
+            vec!["a]b".to_string(), "lit".to_string(), "c/d".to_string()]
+        );
+        let shape = parse_cargo_manifest_shape("[package]\nworkspace = \"..\"\n");
+        assert_eq!(shape.package_workspace.as_deref(), Some(".."));
+        // An unterminated array ends with the file; it does not loop.
+        assert_eq!(
+            parse_cargo_manifest_shape("[workspace]\nexclude = [\"a\",\n").exclude,
+            vec!["a".to_string()]
+        );
+        assert_eq!(resolve_manifest_rel("deep/x", "../.."), Some(String::new()));
+        assert_eq!(resolve_manifest_rel("a", "../../.."), None);
     }
 
     /// Replaces `python_plan_is_unavailable_when_pytest_is_missing`, which

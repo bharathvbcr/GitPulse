@@ -583,4 +583,110 @@ fn oversized_git_stream_errors_for_git_text_but_degrades_for_git_text_partial() 
     assert!(small.contains("src/lib.rs"));
 }
 
+fn rust_commands(report: &gitpulse_lib::analyzer::coverage::CoverageReport) -> Vec<String> {
+    report
+        .families
+        .iter()
+        .find(|f| f.family == "rust")
+        .map(|f| f.suggested_commands.clone())
+        .unwrap_or_default()
+}
+
+// STRESS: a workspace with more members than the planner reads manifests for.
+// Unread members used to be "unknown" and kept, which filled every command
+// slot with another full-workspace run. Their ancestor decides instead.
+#[test]
+fn stress_a_workspace_past_the_manifest_read_cap_is_still_one_run() {
+    let repo = git_repo();
+    let members = 3_000;
+    write(
+        repo.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    for i in 0..members {
+        write(
+            repo.path(),
+            &format!("crates/c{i:05}/Cargo.toml"),
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+        );
+    }
+    write(repo.path(), "crates/c00000/src/lib.rs", "pub fn f() {}\n");
+    let started = Instant::now();
+    let report = scan(repo.path());
+    assert!(
+        started.elapsed().as_secs() < 60,
+        "planning {members} manifests took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        rust_commands(&report),
+        vec!["cargo llvm-cov --workspace --lcov --output-path lcov.info".to_string()]
+    );
+}
+
+// ADVERSARIAL: a member manifest that is a symlink to a FIFO. Opening it would
+// block the scan forever; it must be skipped, and its ancestor still places it.
+#[cfg(unix)]
+#[test]
+fn adversarial_fifo_manifest_does_not_block_planning() {
+    let repo = git_repo();
+    write(
+        repo.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\"]\n",
+    );
+    write(repo.path(), "a/src/lib.rs", "pub fn f() {}\n");
+    let fifo = repo.path().join("pipe");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo")
+        .success());
+    std::os::unix::fs::symlink(&fifo, repo.path().join("a/Cargo.toml")).expect("symlink");
+    let started = Instant::now();
+    let report = scan(repo.path());
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "blocked for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        rust_commands(&report),
+        vec!["cargo llvm-cov --workspace --lcov --output-path lcov.info".to_string()]
+    );
+}
+
+// ADVERSARIAL: a root manifest symlinked out of the repository is never read,
+// so membership is unknown and the member is kept rather than dropped.
+#[cfg(unix)]
+#[test]
+fn adversarial_escaping_root_manifest_is_unknown_not_trusted() {
+    let repo = git_repo();
+    let outside = TempDir::new().expect("outside");
+    write(
+        outside.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\"]\n",
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("Cargo.toml"),
+        repo.path().join("Cargo.toml"),
+    )
+    .expect("symlink");
+    write(
+        repo.path(),
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(repo.path(), "a/src/lib.rs", "pub fn f() {}\n");
+    let commands = rust_commands(&scan(repo.path()));
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.contains("--manifest-path a/Cargo.toml")),
+        "an unreadable root must not drop its member: {commands:?}"
+    );
+}
+
 mod common;

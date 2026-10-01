@@ -675,6 +675,38 @@ describe("formatFailedCoverageDiagnostics", () => {
     ).toContain("@vitest/coverage-v8");
   });
 
+  // Both captured on 2026-10-01 from one repository whose Coverage page showed
+  // a bare "failed" with no hint: the project itself did not build.
+  it("names a project build failure as one, for cargo and for go", () => {
+    const cargo = [
+      "info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage",
+      "error: ojas-metal/Cargo.toml: can't find `metal_bench` example at `examples/metal_bench.rs` or `examples/metal_bench/main.rs`.",
+      "error: could not parse `ojas-metal` (manifest) due to 1 previous error",
+    ].join("\n");
+    const go = [
+      "# github.com/bharathvbcr/ojas/go.test",
+      "Undefined symbols for architecture arm64:",
+      "ld: symbol(s) not found for architecture arm64",
+      "clang: error: linker command failed with exit code 1 (use -v to see invocation)",
+      "FAIL\tgithub.com/bharathvbcr/ojas/go [build failed]",
+    ].join("\n");
+    for (const [command, detail] of [
+      ["cargo llvm-cov --workspace --lcov --output-path lcov.info", cargo],
+      ["go -C go test ./... -coverprofile=coverage.out", go],
+    ]) {
+      expect(classifyCoverageFailure(command, detail)).toEqual({ kind: "build_failed" });
+      expect(coverageFailureHint(command, detail)).toContain("failed to build");
+    }
+    expect(
+      formatFailedCoverageDiagnostics([{ label: "go -C go test ./...", detail: go, status: "failed" }]),
+    ).toContain("Hint: The project failed to build");
+  });
+
+  it("does not call a test failure a build failure", () => {
+    const detail = "--- FAIL: TestAdd (0.00s)\n    add_test.go:9: got 3\nFAIL\tpkg/add\t0.01s";
+    expect(classifyCoverageFailure("go test ./...", detail)).toEqual({ kind: "tests_failed", generatorRan: false });
+  });
+
   it("hints when the Gradle wrapper is not in the repository", () => {
     expect(
       coverageFailureHint(

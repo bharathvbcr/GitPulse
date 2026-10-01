@@ -57,14 +57,83 @@ function formatDuration(ms: unknown): string {
  */
 export function formatRunSummary(res: TerminalRunResult): string {
   if (res.timed_out) return `Timed out after ${formatDuration(res.duration_ms)} and was killed.`;
-  const firstLine = (text: string) => text.split("\n").find((line) => line.trim())?.trim() ?? "";
-  const err = firstLine(stream(res.stderr_tail));
-  if (err) return err;
-  const out = firstLine(stream(res.stdout_tail));
-  if (out) return out;
+  const err = stream(res.stderr_tail);
+  const out = stream(res.stdout_tail);
+  if (!runPassed(res)) {
+    const cause = failureLine(err, out);
+    if (cause) return cause;
+  }
+  const firstLine = (text: string) => lines(text).find((line) => line.trim())?.trim() ?? "";
+  const first = firstLine(err) || firstLine(out);
+  if (first) return clampLine(first);
   return runPassed(res)
     ? "Command completed successfully (exit 0)"
     : `Command failed (exit ${res.exit_code ?? "?"})`;
+}
+
+const MAX_SUMMARY_CHARS = 400;
+const ANSI_ESCAPE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+
+function lines(text: string): string[] {
+  return text.replace(ANSI_ESCAPE, "").split(/\r?\n/);
+}
+
+function clampLine(line: string): string {
+  return line.length <= MAX_SUMMARY_CHARS ? line : `${line.slice(0, MAX_SUMMARY_CHARS)}…`;
+}
+
+/**
+ * Lines a failing build prints that name nothing: progress, advisories, and
+ * the package header Go prints above its real error. The first line of a
+ * failed run's output is very often one of these — `cargo llvm-cov` opens
+ * with `info: … setting cfg(coverage)`, `go test` with `# <package>` — and
+ * the status row used to show exactly that line in place of the cause.
+ */
+const NOISE_LINE = [
+  /^(info|warning|warn|note|help|hint)(\[[^\]]*\])?:/i,
+  /^#\s/,
+  /^(Compiling|Checking|Running|Finished|Downloading|Downloaded|Updating|Locking|Blocking|Fresh|Documenting|Installing|Installed|Resolving|Fetching|Building)\b/,
+  /^(-->|=\s|\|)/,
+  /^\d+\s*\|/,
+];
+
+/** A line stating the cause: compiler, linker, runtime or test-runner error. */
+const CAUSE_LINE = [
+  /^error(\[[A-Z]*\d+\])?:/i,
+  /^fatal( error)?:/i,
+  /^Undefined symbols\b/,
+  /^ld(\.lld)?: /,
+  /^[\w./-]+:\d+(:\d+)?: (fatal )?error\b/i,
+  /^([A-Z][A-Za-z]*)?(Error|Exception): /,
+  /^E\s{2,}\S/,
+  /\bpanicked at\b/,
+  /: command not found$/,
+  /\bcannot find (module|package)\b/i,
+];
+
+/** A line stating that something failed without saying why. */
+const VERDICT_LINE = [/^FAIL\b/, /^--- FAIL\b/, /\[build failed\]/, /\bfailed\b/i, /\berror\b/i];
+
+/**
+ * The line of a failed run's output that says why it failed.
+ *
+ * A cause outranks a verdict ("ld: symbol(s) not found" over "FAIL … [build
+ * failed]"), and a cause that is a complete sentence outranks one that only
+ * introduces a list ("Undefined symbols for architecture arm64:"). Falls back
+ * to the first line that is not progress noise, then to nothing, so the
+ * caller's own fallback still applies.
+ */
+function failureLine(err: string, out: string): string {
+  const candidates = [...lines(err), ...lines(out)].map((line) => line.trim()).filter(Boolean);
+  const signal = candidates.filter((line) => !NOISE_LINE.some((pattern) => pattern.test(line)));
+  const causes = signal.filter((line) => CAUSE_LINE.some((pattern) => pattern.test(line)));
+  const pick =
+    causes.find((line) => !line.endsWith(":")) ??
+    causes[0] ??
+    signal.find((line) => VERDICT_LINE.some((pattern) => pattern.test(line))) ??
+    signal[0] ??
+    "";
+  return pick ? clampLine(pick) : "";
 }
 
 /**
