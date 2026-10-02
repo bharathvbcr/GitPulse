@@ -7,6 +7,8 @@ it.each(["AGENTS.md", "CLAUDE.md"])("%s is DevMap-pivotal and has no GitNexus bl
   const guide = readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
   expect(guide).not.toContain("<!-- gitnexus:start -->");
   expect(guide).not.toContain("<!-- gitnexus:end -->");
+  // GitNexus is retired: the guide must not offer it even as a fallback.
+  expect(guide).not.toMatch(/gitnexus/i);
   expect(guide).not.toContain("MUST run impact analysis before editing");
   expect(guide).toContain("devmap status --json");
   expect(guide).toContain("devmap_search");

@@ -52,9 +52,7 @@ workspace tabs.
   `devmap mcp` server.
 - If DevMap is unavailable or stale, state the reason and use source inspection
   while rebuilding with `devmap build --manifest`. An unavailable query is not
-  evidence that there are no callers or affected tests. A local GitNexus
-  install may remain as a manual fallback only when the user explicitly asks
-  for it; it is not part of product guidance.
+  evidence that there are no callers or affected tests.
 
 ## Tool precedence and skills
 
