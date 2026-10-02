@@ -11,61 +11,13 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Fixed
+## [1.3.5] - 2026-10-02
 
-- **Secrets no longer reports a partial scan as clean.** Kingfisher exits 0
-  when it cannot read a file and records the gap only in its audit block,
-  which was ignored, so an unreadable `.env` produced "No secrets reported".
-  The audit now decides completeness, and an envelope with no findings list,
-  a JSON-lines finding, or an unreadable row can no longer read as clean or
-  vanish. A Dock-launched app also stopped saying Kingfisher was not
-  installed when Homebrew had it: lookup now uses the shared tool resolver.
-- **Secrets runs one scan at a time, once per open.** Its effect re-ran on
-  every repository-store update, so each open fired two full scans; a newer
-  scan now also cancels an older one, so switching repositories runs one
-  scanner instead of a queue. Kingfisher's default deduplication hid repeat
-  locations of a value; every location is now listed.
-
-- **Open repository tabs and their groups survive quitting the app.** Restore
-  used to write the workspace once per tab as it came back, and it never put
-  the group or collapsed state back on those tabs. Quitting during that walk
-  replaced the saved list with however many tabs had opened, and the next
-  launch saved the stripped list again. A save that is not a real edit can no
-  longer drop tabs or clear groups; a quit flushes the live workspace even
-  when the status poll is stopped; and an untrusted repository stays in the
-  list without a prompt or a git command. Open editor files come back with
-  the session. Unsaved editor text is still discarded on quit.
-
-### Added
-
-- **Secrets shows where each finding lives.** Rows are repo-relative and
-  located against Git — `.git` metadata, tracked, untracked, nested
-  repository, ignored — sorted with the actionable ones first, so a token in
-  committed source no longer sits among build output. Location chips filter
-  the list, rows holding the same value are marked, each row can be revealed
-  in the file manager, and the panel states what the scan covers (working
-  tree only, the file-size limit, symlinks, inline ignores). The header shows
-  the scan's age, and a result older than five minutes refreshes on reopen.
-
-### Changed
-
-- **Vendored DevCouncil crates now name a reachable commit.** `VENDOR.json`
-  recorded `c55d479`, a DevCouncil commit that was never pushed, and the
-  vendored `devmap-store` carried `latest_symbols_for_file` (behind
-  `cmd_codeintel_symbols_for_file`) that DevCouncil did not have. That code
-  landed upstream in bharathvbcr/DevCouncil#14 and the crates are re-vendored
-  from it (`4efeecf`). That commit also brings DevCouncil's bounded LSP
-  client (`devmap-resolve`, with its `dc-proc` session helpers), so every
-  wait on a language server has a deadline, and its Windows fixes in
-  `devmap-extract`, `devmap-query` and `devmap-store` (file identity checks,
-  native path validation, sharing-violation retries). The crates'
-  `package.version` is now DevCouncil's `1.3.5`.
-
-## [1.3.5] - 2026-09-23
-
-Stale-branch cleanup with backups, a redacted secret scan, worktree cache
-sync and named local routes, symbol-level collision notes, and supply-chain
-checks beside cargo audit.
+Stale-branch cleanup with backups, a secret scan that never reads a partial
+scan as clean, worktree cache sync and named local routes, symbol-level
+collision notes, Markdown rendered by MarkDev, terminals that report what they
+are running, coloured tabs, timers that stop in the background, and Bun for
+installs and scripts.
 
 ### Added
 
@@ -77,6 +29,14 @@ checks beside cargo audit.
   section. Findings keep rule, path, and line only. Secret-bearing fields are
   dropped, stdout is not logged, and a missed or truncated scan is reported
   as not clean.
+- **Secrets shows where each finding lives.** Rows are repo-relative and
+  located against Git — `.git` metadata, tracked, untracked, nested
+  repository, ignored — sorted with the actionable ones first, so a token in
+  committed source no longer sits among build output. Location chips filter
+  the list, rows holding the same value are marked, each row can be revealed
+  in the file manager, and the panel states what the scan covers (working
+  tree only, the file-size limit, symlinks, inline ignores). The header shows
+  the scan's age, and a result older than five minutes refreshes on reopen.
 - **Worktree copy-on-write cache sync.** Missing build caches (`node_modules`,
   `target`, `.venv`, and the other standard cache directories) can be cloned
   from the anchor checkout with APFS clonefile, Linux `FICLONE`, or a bounded
@@ -99,13 +59,128 @@ checks beside cargo audit.
   classified directly from the patch (type, scope, subject), with fallback to
   on-device Apple Intelligence for subject phrasing, or pure patch-based draft
   when no model is running.
-- **DevCouncil v0.2.4 sync.** Upgraded vendored DevCouncil crates to v0.2.4 with
-  DevMap store schema 23, `latest_symbols_for_file`, and LSP resolution tiers.
-- **npm dependency updates** for lucide, the Tauri CLI, Svelte, Vitest
-  coverage, and `@types/node`.
+- **Coloured repository tabs and tab groups.** A tab can carry its own colour,
+  and a group can carry one that its tabs inherit when they have none.
+  Colours persist with the workspace, survive restore, and are named in the
+  tab bar's accessible labels, including when a colour is inherited.
+- **Notices stack into one pile.** Two or more toasts, or attention-inbox
+  notices, collapse to one card with at most two edges showing behind it,
+  expandable to every loaded card; the toggle says how many unread notices
+  the pile holds. A missing or invalid count draws nothing rather than one
+  notice.
+- **Terminals report what they are running.** A live session's foreground
+  program, whether it is a job under the shell, and its working directory are
+  readable, and a new terminal can start in a chosen directory.
+- **Coverage guidance where there is room for it.** With no coverage files,
+  the wide pane carries one card per language family: why it cannot run, an
+  artifact it found but skipped and why, the setup and generate commands, one
+  Run button, and the report shapes it reads. Only the family actually
+  running says "Running…".
+
+### Changed
+
+- **Markdown is rendered by MarkDev's module crates and HTML renderer.** The
+  single vendored `markdev` crate is replaced by `markdev-md`,
+  `markdev-highlight`, `markdev-html` and `markdev-vault`. Relative pictures
+  are read only from inside the note's repository, rendered ids are
+  namespaced, every link is handled by GitPulse rather than navigating the
+  window, and the content security policy admits `https` pictures (README
+  badges) and nothing else remote.
+- **Bun replaces npm for installs and package scripts** (`packageManager`
+  Bun 1.4.2, `bun.lock` replaces `package-lock.json`). Vite, Vitest and
+  svelte-check still run on Node. A `bun-audit` workflow takes over the npm
+  advisory check, and every workflow, hook, devcontainer and guide names Bun.
+- **Background windows stop their timers.** The status poll, enhancement
+  refresh, task-run polling, hygiene and cleaner refreshes, Manvi operations
+  and the status popover stop entirely while the window is hidden or
+  unfocused, instead of waking the renderer every period to return early, and
+  stretch their next run when the event loop is already behind.
+- **Vendored DevCouncil crates now name a reachable commit.** `VENDOR.json`
+  recorded `c55d479`, a DevCouncil commit that was never pushed, and the
+  vendored `devmap-store` carried `latest_symbols_for_file` (behind
+  `cmd_codeintel_symbols_for_file`) that DevCouncil did not have. That code
+  landed upstream in bharathvbcr/DevCouncil#14 and the crates are re-vendored
+  from it (`4efeecf`), bringing DevMap store schema 23 and LSP resolution
+  tiers. That commit also brings DevCouncil's bounded LSP client
+  (`devmap-resolve`, with its `dc-proc` session helpers), so every wait on a
+  language server has a deadline, and its Windows fixes in `devmap-extract`,
+  `devmap-query` and `devmap-store` (file identity checks, native path
+  validation, sharing-violation retries, and serialised store opens so
+  concurrent opens cannot livelock on the WAL index). The crates'
+  `package.version` is now DevCouncil's `1.3.5`.
+- **Policy decisions go through the Gusset engine.** DevCouncil is pinned at
+  `3b58dd7` and gusset at `92c2056`; an engine that cannot answer denies. The
+  verdict schema is synced from Manvi, adding the hard `command.directory_change`,
+  `path.secret_read` and engine-unavailable rules. A new `gusset-check`
+  command and CI job exercise the linked engine; without it the check exits
+  "could not run", never success.
+- **Dependency updates.** JavaScript: `@tauri-apps/api` and `@tauri-apps/cli`
+  2.12, `@tauri-apps/plugin-autostart` and `plugin-opener` 2.6, lucide,
+  vite-plugin-svelte, Vite, Vitest and its coverage, and `@types/node` (the
+  Rust Tauri crates are unchanged). CI: `actions/setup-go` 7.
+- **CI can run by hand on a branch**, a failing browser harness names its
+  failing checks in a GitHub annotation, and `--all` runs every harness
+  before failing instead of stopping at the first.
 
 ### Fixed
 
+- **Secrets no longer reports a partial scan as clean.** Kingfisher exits 0
+  when it cannot read a file and records the gap only in its audit block,
+  which was ignored, so an unreadable `.env` produced "No secrets reported".
+  The audit now decides completeness, and an envelope with no findings list,
+  a JSON-lines finding, or an unreadable row can no longer read as clean or
+  vanish. A Dock-launched app also stopped saying Kingfisher was not
+  installed when Homebrew had it: lookup now uses the shared tool resolver.
+- **Secrets runs one scan at a time, once per open.** Its effect re-ran on
+  every repository-store update, so each open fired two full scans; a newer
+  scan now also cancels an older one, so switching repositories runs one
+  scanner instead of a queue. Kingfisher's default deduplication hid repeat
+  locations of a value; every location is now listed.
+- **Open repository tabs and their groups survive quitting the app.** Restore
+  used to write the workspace once per tab as it came back, and it never put
+  the group or collapsed state back on those tabs. Quitting during that walk
+  replaced the saved list with however many tabs had opened, and the next
+  launch saved the stripped list again. A save that is not a real edit can no
+  longer drop tabs or clear groups; a quit flushes the live workspace even
+  when the status poll is stopped; and an untrusted repository stays in the
+  list without a prompt or a git command. Open editor files come back with
+  the session. Unsaved editor text is still discarded on quit.
+- **Repository trust survives reboots and toolchain updates.** Stored
+  approvals compared the device number, which macOS reassigns at mount and a
+  reboot renumbers, so a reboot revoked trust; and record filenames came from
+  a hasher a Rust release may change. Approvals now compare canonical path,
+  inode and birth time (Windows: the file identity), records use a stable
+  hash with a one-time migration of the old names, and a damaged record fails
+  closed. *Security impact:* a same-user attacker who mounts a crafted volume
+  over the exact path could match an approval; that user can already edit the
+  0600 trust store. Nothing widens which repositories are trusted.
+- **A tab refused for trust stays quiet.** It is left out of live indexing,
+  DevCouncil init, docs refresh, metrics and status polling, so a refusal is
+  one state rather than a stream of failing calls. A workspace registry sync
+  reports such tabs as skipped.
+- **Terminal input and lifecycle.** Paste and erase guards follow what the
+  terminal actually handled instead of predicting it, output is credited per
+  emitted chunk so the PTY cannot run ahead of the renderer, and a session is
+  hung up before it is killed. Ctrl+K typed into a terminal is the shell's
+  kill-line again; the command palette leaves it alone.
+- **Coverage.** The file pane no longer says "Loading…" forever after a scan
+  with no files. A failed run shows its cause line (a missing example, a link
+  error) instead of the first progress line, and a project that did not build
+  is classified as such. Rust is planned the way Cargo resolves workspaces, so
+  a member no longer reruns the whole workspace and vendored crates are
+  skipped. The family strip wraps instead of pushing Rust off screen, and a
+  run cancelled by another no longer stays "running" and disables every run
+  control.
+- **Worktree hooks are bounded.** A hook that hangs no longer hangs worktree
+  creation: hooks run with a 15-minute deadline and a 1 MiB output cap, and
+  the process tree is killed at the deadline.
+- **Worktree names get line one back.** The hover-only action rail stayed in
+  layout while invisible and took about 98 px of the name's line; it is now
+  overlaid, takes no pointer events while hidden, and is still reachable by
+  Tab.
+- **Tasks keep focus.** Quick add keeps the cursor while a line saves, so
+  rapid entry works and the parse preview shows; closing a task returns focus
+  to its card.
 - **Branch-list health no longer claims a squash-merge flag the list does not
   send.** Squash and rebase detection stays on the dead-branch scan, which is
   the path that runs `git merge-tree`. The fast branch list remains a single
@@ -2653,7 +2728,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.5...HEAD
+[1.3.5]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.3.5
 [1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.2.1
