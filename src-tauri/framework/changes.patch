@@ -1,6 +1,6 @@
 --- a/tauri/Cargo.toml
 +++ b/tauri/Cargo.toml
-@@ -96,7 +96,7 @@
+@@ -95,7 +95,7 @@
  
  # linux
  [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
@@ -20,7 +20,7 @@
 +reorder_imports = true
 +reorder_modules = true
 +remove_nested_parens = true
-+edition = "2021"
++edition = "2024"
 +merge_derives = true
 +use_try_shorthand = false
 +use_field_init_shorthand = false
@@ -29,7 +29,7 @@
 +# wrap_comments = true
 --- a/tauri/src/test/mock_runtime.rs
 +++ b/tauri/src/test/mock_runtime.rs
-@@ -503,7 +503,7 @@
+@@ -501,7 +501,7 @@
      target_os = "netbsd",
      target_os = "openbsd"
    ))]
@@ -62,8 +62,8 @@
    }
 --- a/tauri-runtime/Cargo.toml
 +++ b/tauri-runtime/Cargo.toml
-@@ -43,7 +43,7 @@
- webview2-com = "0.38"
+@@ -42,7 +42,7 @@
+ webview2-com = "0.39"
  
  [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
 -gtk = { version = "0.18", features = ["v3_24"] }
@@ -82,7 +82,7 @@
 +reorder_imports = true
 +reorder_modules = true
 +remove_nested_parens = true
-+edition = "2021"
++edition = "2024"
 +merge_derives = true
 +use_try_shorthand = false
 +use_field_init_shorthand = false
@@ -91,7 +91,7 @@
 +# wrap_comments = true
 --- a/tauri-runtime/src/window.rs
 +++ b/tauri-runtime/src/window.rs
-@@ -455,7 +455,7 @@
+@@ -452,7 +452,7 @@
      target_os = "netbsd",
      target_os = "openbsd"
    ))]
@@ -102,7 +102,7 @@
    #[cfg(windows)]
 --- a/tauri-runtime-wry/Cargo.toml
 +++ b/tauri-runtime-wry/Cargo.toml
-@@ -40,7 +40,7 @@
+@@ -39,7 +39,7 @@
  ]
  
  [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
@@ -122,7 +122,7 @@
 +reorder_imports = true
 +reorder_modules = true
 +remove_nested_parens = true
-+edition = "2021"
++edition = "2024"
 +merge_derives = true
 +use_try_shorthand = false
 +use_field_init_shorthand = false
@@ -131,7 +131,7 @@
 +# wrap_comments = true
 --- a/tauri-runtime-wry/src/lib.rs
 +++ b/tauri-runtime-wry/src/lib.rs
-@@ -1101,7 +1101,7 @@
+@@ -1103,7 +1103,7 @@
      target_os = "netbsd",
      target_os = "openbsd"
    ))]
@@ -143,7 +143,7 @@
 --- a/wry/Cargo.toml
 +++ b/wry/Cargo.toml
 @@ -201,11 +201,11 @@
- version = "6"
+ version = "7"
  
  [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11]
 -version = "0.18"
@@ -165,9 +165,7 @@
  optional = true
  
  [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.webkit2gtk]
---- a/wry/Cargo.toml
-+++ b/wry/Cargo.toml
-@@ -427,4 +427,6 @@
+@@ -428,4 +428,6 @@
  check-cfg = [
      "cfg(linux)",
      "cfg(gtk)",
@@ -226,6 +224,57 @@
  use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Request, Response as HttpResponse};
  use soup::{MessageHeaders, MessageHeadersType};
  use std::{
+--- a/wry/src/wkwebview/download.rs
++++ b/wry/src/wkwebview/download.rs
+@@ -100,6 +100,11 @@
+   }
+ }
+ 
++// `error` is read only by the `debug_assertions` diagnostic below, so a release
++// build sees an unused binding. Scoping the allow to that configuration keeps a
++// genuinely unused parameter here visible in a debug build, which renaming the
++// parameter to `_error` would not.
++#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+ pub(crate) fn download_did_fail(
+   this: &WryDownloadDelegate,
+   download: &WKDownload,
+--- a/wry/src/wkwebview/mod.rs
++++ b/wry/src/wkwebview/mod.rs
+@@ -2,6 +2,16 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-License-Identifier: MIT
+ 
++// The Apple bindings this tree calls move faster than the pinned wry revision.
++// Newer `objc2-app-kit` marks safe what upstream still wraps in `unsafe`, and
++// deprecates the AppKit constants upstream still names. Neither carries a
++// correctness signal, and neither can be "fixed" here without changing
++// behaviour: `NSFilenamesPboardType` and the `NS*KeyMask` constants are the
++// drag-and-drop and modifier contracts this code implements, not style. This is
++// the macOS twin of the allow the GTK half of the port already carries in
++// `webkitgtk/`. Both retire when a published wry adopts the current bindings.
++#![allow(deprecated, unused_unsafe)]
++
+ mod download;
+ #[cfg(target_os = "macos")]
+ mod drag_drop;
+@@ -34,9 +44,16 @@
+ use objc2::runtime::Bool;
+ use objc2::{
+   rc::Retained,
+-  runtime::{AnyObject, NSObject, ProtocolObject},
++  runtime::{AnyObject, ProtocolObject},
+   AllocAnyThread, DeclaredClass, MainThreadOnly, Message,
+ };
++// Named only by the `mac-proxy` proxy-config array and by the
++// `respondsToSelector:` inspectable probe behind `debug_assertions` /
++// `devtools`. A release build with neither feature compiles both away, so the
++// import is unused there and used everywhere else. Split out from the names
++// above so the allow cannot mask an unused import that is genuinely dead.
++#[allow(unused_imports)]
++use objc2::runtime::NSObject;
+ #[cfg(target_os = "macos")]
+ use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTitlebarSeparatorStyle, NSView};
+ #[cfg(target_os = "macos")]
 --- a/tao/Cargo.toml
 +++ b/tao/Cargo.toml
 @@ -266,14 +266,14 @@
@@ -527,15 +576,15 @@
    outer_position: Rc<(AtomicI32, AtomicI32)>,
 --- a/muda/Cargo.toml
 +++ b/muda/Cargo.toml
-@@ -91,7 +91,7 @@
- version = "0.45"
+@@ -94,7 +94,7 @@
+ version = "0.56"
  
  [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk]
 -version = "0.18"
 +version = "0.19"
  optional = true
  
- [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.libxdo]
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk4]
 --- a/webkit2gtk/src/lib.rs
 +++ b/webkit2gtk/src/lib.rs
 @@ -1,4 +1,7 @@
@@ -1299,57 +1348,6 @@
 +        cf::CFRelease(runloop.0);
 +    }
 +}
---- a/wry/src/wkwebview/download.rs
-+++ b/wry/src/wkwebview/download.rs
-@@ -100,6 +100,11 @@
-   }
- }
- 
-+// `error` is read only by the `debug_assertions` diagnostic below, so a release
-+// build sees an unused binding. Scoping the allow to that configuration keeps a
-+// genuinely unused parameter here visible in a debug build, which renaming the
-+// parameter to `_error` would not.
-+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
- pub(crate) fn download_did_fail(
-   this: &WryDownloadDelegate,
-   download: &WKDownload,
---- a/wry/src/wkwebview/mod.rs
-+++ b/wry/src/wkwebview/mod.rs
-@@ -2,6 +2,16 @@
- // SPDX-License-Identifier: Apache-2.0
- // SPDX-License-Identifier: MIT
- 
-+// The Apple bindings this tree calls move faster than the pinned wry revision.
-+// Newer `objc2-app-kit` marks safe what upstream still wraps in `unsafe`, and
-+// deprecates the AppKit constants upstream still names. Neither carries a
-+// correctness signal, and neither can be "fixed" here without changing
-+// behaviour: `NSFilenamesPboardType` and the `NS*KeyMask` constants are the
-+// drag-and-drop and modifier contracts this code implements, not style. This is
-+// the macOS twin of the allow the GTK half of the port already carries in
-+// `webkitgtk/`. Both retire when a published wry adopts the current bindings.
-+#![allow(deprecated, unused_unsafe)]
-+
- mod download;
- #[cfg(target_os = "macos")]
- mod drag_drop;
-@@ -34,9 +44,16 @@
- use objc2::runtime::Bool;
- use objc2::{
-   rc::Retained,
--  runtime::{AnyObject, NSObject, ProtocolObject},
-+  runtime::{AnyObject, ProtocolObject},
-   AllocAnyThread, DeclaredClass, MainThreadOnly, Message,
- };
-+// Named only by the `mac-proxy` proxy-config array and by the
-+// `respondsToSelector:` inspectable probe behind `debug_assertions` /
-+// `devtools`. A release build with neither feature compiles both away, so the
-+// import is unused there and used everywhere else. Split out from the names
-+// above so the allow cannot mask an unused import that is genuinely dead.
-+#[allow(unused_imports)]
-+use objc2::runtime::NSObject;
- #[cfg(target_os = "macos")]
- use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTitlebarSeparatorStyle, NSView};
- #[cfg(target_os = "macos")]
 --- a/tao/src/platform_impl/macos/mod.rs
 +++ b/tao/src/platform_impl/macos/mod.rs
 @@ -2,6 +2,14 @@
@@ -1402,18 +1400,3 @@
  
  use std::os::raw::c_void;
  
---- a/muda/src/platform_impl/macos/mod.rs
-+++ b/muda/src/platform_impl/macos/mod.rs
-@@ -1,6 +1,12 @@
- // Copyright 2022-2022 Tauri Programme within The Commons Conservancy
- // SPDX-License-Identifier: Apache-2.0
- // SPDX-License-Identifier: MIT
-+
-+// Newer `objc2-app-kit` marks safe the `NSMenu` / `NSMenuItem` calls this
-+// revision wraps in `unsafe`. Removing the blocks would bind the port to one
-+// bindings version; allowing the lint works against either. See the note in
-+// wry's `wkwebview/mod.rs`.
-+#![allow(unused_unsafe)]
- 
- mod accelerator;
- mod icon;

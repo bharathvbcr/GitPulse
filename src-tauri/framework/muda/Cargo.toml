@@ -11,12 +11,13 @@
 
 [package]
 edition = "2021"
-rust-version = "1.73"
+rust-version = "1.90"
 name = "muda"
-version = "0.19.3"
-build = false
+version = "0.20.0"
+build = "build.rs"
 include = [
     "README.md",
+    "build.rs",
     "src/**/*.rs",
     "Cargo.toml",
     "LICENSE-APACHE",
@@ -43,15 +44,17 @@ repository = "https://github.com/tauri-apps/muda"
 common-controls-v6 = []
 default = [
     "libxdo",
-    "gtk",
+    "gtk3",
 ]
-gtk = ["dep:gtk"]
+gtk3 = ["dep:gtk"]
+gtk4 = ["dep:gtk4"]
 libxdo = ["dep:libxdo"]
 serde = [
     "dep:serde",
     "dpi/serde",
     "keyboard-types/serde",
 ]
+snapshot = []
 
 [lib]
 name = "muda"
@@ -64,7 +67,7 @@ version = "0.5"
 version = "0.1"
 
 [dependencies.keyboard-types]
-version = "0.7"
+version = "0.8"
 
 [dependencies.once_cell]
 version = "1"
@@ -82,16 +85,21 @@ features = ["png"]
 default-features = false
 
 [dev-dependencies.tao]
-version = "0.33"
+version = "0.36"
 
 [dev-dependencies.winit]
 version = "0.30"
 
 [dev-dependencies.wry]
-version = "0.45"
+version = "0.56"
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk]
 version = "0.19"
+optional = true
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk4]
+version = "0.11"
+features = ["v4_12"]
 optional = true
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.libxdo]
@@ -107,13 +115,17 @@ features = [
     "std",
     "objc2-core-foundation",
     "NSApplication",
+    "NSAttributedString",
     "NSCell",
+    "NSColor",
     "NSEvent",
+    "NSFont",
     "NSImage",
     "NSMenu",
     "NSMenuItem",
     "NSResponder",
     "NSRunningApplication",
+    "NSScreen",
     "NSView",
     "NSWindow",
 ]
@@ -135,6 +147,7 @@ features = [
     "NSData",
     "NSDictionary",
     "NSGeometry",
+    "NSRange",
     "NSString",
     "NSThread",
 ]

@@ -3,18 +3,32 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    accelerator::{Accelerator, KeyAccelerator},
-    CheckMenuItem, MenuId,
+    accelerator::{Accelerator, KeyAccelerator, MenuAccelerator},
+    CheckMenuItem, MenuId, TextStyle,
 };
 
 /// A builder type for [`CheckMenuItem`]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CheckMenuItemBuilder {
     text: String,
     enabled: bool,
     checked: bool,
-    key_accelerator: Option<KeyAccelerator>,
+    accelerator: Option<MenuAccelerator>,
     id: Option<MenuId>,
+    styled_text: Option<Vec<(String, TextStyle)>>,
+}
+
+impl Default for CheckMenuItemBuilder {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            enabled: true,
+            checked: false,
+            accelerator: None,
+            id: None,
+            styled_text: None,
+        }
+    }
 }
 
 impl CheckMenuItemBuilder {
@@ -58,10 +72,9 @@ impl CheckMenuItemBuilder {
     where
         crate::Error: From<<A as TryInto<Accelerator>>::Error>,
     {
-        self.key_accelerator = accelerator
-            .map(|a| a.try_into())
-            .transpose()?
-            .map(KeyAccelerator::from);
+        self.accelerator = accelerator
+            .map(|a| a.try_into().map(MenuAccelerator::Physical))
+            .transpose()?;
         Ok(self)
     }
 
@@ -75,8 +88,29 @@ impl CheckMenuItemBuilder {
     where
         crate::Error: From<<A as TryInto<KeyAccelerator>>::Error>,
     {
-        self.key_accelerator = accelerator.map(|a| a.try_into()).transpose()?;
+        self.accelerator = accelerator
+            .map(|a| a.try_into().map(MenuAccelerator::Logical))
+            .transpose()?;
         Ok(self)
+    }
+
+    /// Set the text for this menu item as a sequence of styled text, so one part of the
+    /// label can be de-emphasized relative to the rest.
+    ///
+    /// Overrides any text set with [`.text()`](Self::text).
+    ///
+    /// See [`CheckMenuItem::set_styled_text`] for more info.
+    pub fn styled_text<S: Into<String>>(
+        mut self,
+        parts: impl IntoIterator<Item = (S, TextStyle)>,
+    ) -> Self {
+        self.styled_text = Some(
+            parts
+                .into_iter()
+                .map(|(text, style)| (text.into(), style))
+                .collect(),
+        );
+        self
     }
 
     /// Build this check menu item.
@@ -86,9 +120,20 @@ impl CheckMenuItemBuilder {
         } else {
             CheckMenuItem::new(self.text, self.enabled, self.checked, None)
         };
-        if let Some(key_accel) = self.key_accelerator {
-            let _ = item.set_key_accelerator(Some(key_accel));
+
+        if let Some(accelerator) = self.accelerator {
+            let _ = match accelerator {
+                MenuAccelerator::Physical(accelerator) => item.set_accelerator(Some(accelerator)),
+                MenuAccelerator::Logical(accelerator) => {
+                    item.set_key_accelerator(Some(accelerator))
+                }
+            };
         }
+
+        if let Some(parts) = self.styled_text {
+            item.set_styled_text(parts);
+        }
+
         item
     }
 }

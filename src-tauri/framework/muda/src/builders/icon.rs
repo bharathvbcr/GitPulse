@@ -3,20 +3,35 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    accelerator::{Accelerator, KeyAccelerator},
+    accelerator::{Accelerator, KeyAccelerator, MenuAccelerator},
     icon::{Icon, NativeIcon},
-    IconMenuItem, MenuId,
+    IconMenuItem, MenuId, TextStyle,
 };
 
 /// A builder type for [`IconMenuItem`]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct IconMenuItemBuilder {
     text: String,
     enabled: bool,
     id: Option<MenuId>,
-    key_accelerator: Option<KeyAccelerator>,
+    accelerator: Option<MenuAccelerator>,
     icon: Option<Icon>,
     native_icon: Option<NativeIcon>,
+    styled_text: Option<Vec<(String, TextStyle)>>,
+}
+
+impl Default for IconMenuItemBuilder {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            enabled: true,
+            id: None,
+            accelerator: None,
+            icon: None,
+            native_icon: None,
+            styled_text: None,
+        }
+    }
 }
 
 impl IconMenuItemBuilder {
@@ -52,6 +67,23 @@ impl IconMenuItemBuilder {
     }
 
     /// Set this icon menu item native icon.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **macOS**: Known variants map to AppKit image names. Use [`NativeIcon::Raw`] or
+    ///   `NativeIcon::from_name` to pass an AppKit [`NSImage.Name`] string.
+    /// - **Windows**: Known variants map to stock shell icons where an equivalent exists. Use
+    ///   [`NativeIcon::Raw`] or `NativeIcon::from_id` to pass a raw [`SHSTOCKICONID`] value.
+    /// - **GTK 3 / GTK 4**: Known variants map to freedesktop-style icon theme names. Use
+    ///   [`NativeIcon::Raw`] or `NativeIcon::from_name` to pass an icon theme name resolved by
+    ///   `GtkIconTheme` ([GTK 3][gtk3-icon-theme], [GTK 4][gtk4-icon-theme]).
+    ///
+    /// [`NSImage.Name`]: https://developer.apple.com/documentation/appkit/nsimage/name-swift.typealias
+    /// [`SHSTOCKICONID`]: https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ne-shellapi-shstockiconid
+    /// [`SHGetStockIconInfo`]: https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shgetstockiconinfo
+    /// [gtk3-icon-theme]: https://docs.gtk.org/gtk3/class.IconTheme.html
+    /// [gtk4-icon-theme]: https://docs.gtk.org/gtk4/class.IconTheme.html
+    /// [Icon Naming Specification]: https://specifications.freedesktop.org/icon-naming-spec/latest/
     pub fn native_icon(mut self, icon: Option<NativeIcon>) -> Self {
         self.native_icon = icon;
         self.icon = None;
@@ -68,10 +100,9 @@ impl IconMenuItemBuilder {
     where
         crate::Error: From<<A as TryInto<Accelerator>>::Error>,
     {
-        self.key_accelerator = accelerator
-            .map(|a| a.try_into())
-            .transpose()?
-            .map(KeyAccelerator::from);
+        self.accelerator = accelerator
+            .map(|a| a.try_into().map(MenuAccelerator::Physical))
+            .transpose()?;
         Ok(self)
     }
 
@@ -85,8 +116,29 @@ impl IconMenuItemBuilder {
     where
         crate::Error: From<<A as TryInto<KeyAccelerator>>::Error>,
     {
-        self.key_accelerator = accelerator.map(|a| a.try_into()).transpose()?;
+        self.accelerator = accelerator
+            .map(|a| a.try_into().map(MenuAccelerator::Logical))
+            .transpose()?;
         Ok(self)
+    }
+
+    /// Set the text for this menu item as a sequence of styled text, so one part of the
+    /// label can be de-emphasized relative to the rest.
+    ///
+    /// Overrides any text set with [`.text()`](Self::text).
+    ///
+    /// See [`IconMenuItem::set_styled_text`] for more info.
+    pub fn styled_text<S: Into<String>>(
+        mut self,
+        parts: impl IntoIterator<Item = (S, TextStyle)>,
+    ) -> Self {
+        self.styled_text = Some(
+            parts
+                .into_iter()
+                .map(|(text, style)| (text.into(), style))
+                .collect(),
+        );
+        self
     }
 
     /// Build this icon menu item.
@@ -108,9 +160,20 @@ impl IconMenuItemBuilder {
         } else {
             IconMenuItem::with_native_icon(self.text, self.enabled, self.native_icon, None)
         };
-        if let Some(key_accel) = self.key_accelerator {
-            let _ = item.set_key_accelerator(Some(key_accel));
+
+        if let Some(accelerator) = self.accelerator {
+            let _ = match accelerator {
+                MenuAccelerator::Physical(accelerator) => item.set_accelerator(Some(accelerator)),
+                MenuAccelerator::Logical(accelerator) => {
+                    item.set_key_accelerator(Some(accelerator))
+                }
+            };
         }
+
+        if let Some(parts) = self.styled_text {
+            item.set_styled_text(parts);
+        }
+
         item
     }
 }

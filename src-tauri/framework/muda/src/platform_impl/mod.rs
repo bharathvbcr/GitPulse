@@ -2,6 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+#![cfg_attr(
+    all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ),
+        not(any(feature = "gtk3", feature = "gtk4"))
+    ),
+    allow(dead_code)
+)]
+
 #[cfg(target_os = "windows")]
 #[path = "windows/mod.rs"]
 mod platform;
@@ -13,107 +27,154 @@ mod platform;
         target_os = "netbsd",
         target_os = "openbsd"
     ),
-    feature = "gtk"
+    feature = "gtk4"
+))]
+#[path = "gtk4/mod.rs"]
+mod platform;
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ),
+    feature = "gtk3",
+    not(feature = "gtk4")
 ))]
 #[path = "gtk/mod.rs"]
+mod platform;
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ),
+    not(any(feature = "gtk3", feature = "gtk4"))
+))]
+#[path = "noop/mod.rs"]
 mod platform;
 #[cfg(target_os = "macos")]
 #[path = "macos/mod.rs"]
 mod platform;
 
-use std::{
-    cell::{Ref, RefCell, RefMut},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 
-use crate::{items::*, IsMenuItem, MenuItemKind, MenuItemType};
+#[cfg(target_os = "macos")]
+use crate::TextStyle;
+use crate::{accelerator::MenuAccelerator, items::IconType, MenuItemKind};
 
 pub(crate) use self::platform::*;
 
-impl dyn IsMenuItem + '_ {
-    fn child(&self) -> Rc<RefCell<MenuChild>> {
-        match self.kind() {
-            MenuItemKind::MenuItem(i) => i.inner,
-            MenuItemKind::Submenu(i) => i.inner,
-            MenuItemKind::Predefined(i) => i.inner,
-            MenuItemKind::Check(i) => i.inner,
-            MenuItemKind::Icon(i) => i.inner,
-        }
-    }
-}
-
-/// Internal utilities
-impl MenuChild {
-    fn kind(&self, c: Rc<RefCell<MenuChild>>) -> MenuItemKind {
-        match self.item_type() {
-            MenuItemType::Submenu => {
-                let id = c.borrow().id().clone();
-                MenuItemKind::Submenu(Submenu {
-                    id: Rc::new(id),
-                    inner: c,
-                })
-            }
-            MenuItemType::MenuItem => {
-                let id = c.borrow().id().clone();
-                MenuItemKind::MenuItem(MenuItem {
-                    id: Rc::new(id),
-                    inner: c,
-                })
-            }
-            MenuItemType::Predefined => {
-                let id = c.borrow().id().clone();
-                MenuItemKind::Predefined(PredefinedMenuItem {
-                    id: Rc::new(id),
-                    inner: c,
-                })
-            }
-            MenuItemType::Check => {
-                let id = c.borrow().id().clone();
-                MenuItemKind::Check(CheckMenuItem {
-                    id: Rc::new(id),
-                    inner: c,
-                })
-            }
-            MenuItemType::Icon => {
-                let id = c.borrow().id().clone();
-                MenuItemKind::Icon(IconMenuItem {
-                    id: Rc::new(id),
-                    inner: c,
-                })
-            }
-        }
-    }
-}
-
-#[allow(unused)]
 impl MenuItemKind {
-    pub(crate) fn as_ref(&self) -> &dyn IsMenuItem {
+    pub(crate) fn platform(&self) -> Rc<RefCell<PlatformMenuItem>> {
         match self {
-            MenuItemKind::MenuItem(i) => i,
-            MenuItemKind::Submenu(i) => i,
-            MenuItemKind::Predefined(i) => i,
-            MenuItemKind::Check(i) => i,
-            MenuItemKind::Icon(i) => i,
+            Self::MenuItem(item) => item.platform.clone(),
+            Self::Submenu(item) => item.platform.clone(),
+            Self::Predefined(item) => item.platform.clone(),
+            Self::Check(item) => item.platform.clone(),
+            Self::Icon(item) => item.platform.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PlatformAttachArgs {
+    pub text: String,
+    pub enabled: bool,
+    pub checked: bool,
+    pub accelerator: Option<MenuAccelerator>,
+    pub icon: Option<IconType>,
+    #[cfg(target_os = "macos")]
+    pub styled_text: Option<Vec<(String, TextStyle)>>,
+}
+
+impl MenuItemKind {
+    pub(crate) fn platform_attach_args(&self) -> PlatformAttachArgs {
+        match self {
+            MenuItemKind::MenuItem(item) => {
+                let state = item.state.borrow();
+                PlatformAttachArgs {
+                    text: state.text.clone(),
+                    enabled: state.enabled,
+                    checked: false,
+                    accelerator: state.accelerator.clone(),
+                    icon: None,
+                    #[cfg(target_os = "macos")]
+                    styled_text: state.styled_text.clone(),
+                }
+            }
+            MenuItemKind::Submenu(item) => {
+                let state = item.state.borrow();
+                PlatformAttachArgs {
+                    text: state.text.clone(),
+                    enabled: state.enabled,
+                    checked: false,
+                    accelerator: None,
+                    icon: state.icon.clone(),
+                    #[cfg(target_os = "macos")]
+                    styled_text: state.styled_text.clone(),
+                }
+            }
+            MenuItemKind::Predefined(item) => {
+                let state = item.state.borrow();
+                PlatformAttachArgs {
+                    text: state.text.clone(),
+                    enabled: state.enabled,
+                    checked: false,
+                    accelerator: state.predefined_item_type.accelerator(),
+                    icon: None,
+                    #[cfg(target_os = "macos")]
+                    styled_text: None,
+                }
+            }
+            MenuItemKind::Check(item) => {
+                let state = item.state.borrow();
+                PlatformAttachArgs {
+                    text: state.text.clone(),
+                    enabled: state.enabled,
+                    checked: state.checked,
+                    accelerator: state.accelerator.clone(),
+                    icon: None,
+                    #[cfg(target_os = "macos")]
+                    styled_text: state.styled_text.clone(),
+                }
+            }
+            MenuItemKind::Icon(item) => {
+                let state = item.state.borrow();
+                PlatformAttachArgs {
+                    text: state.text.clone(),
+                    enabled: state.enabled,
+                    checked: false,
+                    accelerator: state.accelerator.clone(),
+                    icon: state.icon.clone(),
+                    #[cfg(target_os = "macos")]
+                    styled_text: state.styled_text.clone(),
+                }
+            }
         }
     }
 
-    pub(crate) fn child(&self) -> Ref<'_, MenuChild> {
+    #[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
+    pub(crate) fn click_action(&self) -> crate::MenuItemAction {
         match self {
-            MenuItemKind::MenuItem(i) => i.inner.borrow(),
-            MenuItemKind::Submenu(i) => i.inner.borrow(),
-            MenuItemKind::Predefined(i) => i.inner.borrow(),
-            MenuItemKind::Check(i) => i.inner.borrow(),
-            MenuItemKind::Icon(i) => i.inner.borrow(),
+            Self::MenuItem(item) => crate::MenuItemAction::Emit((*item.id).clone()),
+            Self::Submenu(item) => crate::MenuItemAction::Emit((*item.id).clone()),
+            Self::Predefined(item) => crate::MenuItemAction::Predefined(item.state.downgrade()),
+            Self::Check(item) => {
+                crate::MenuItemAction::Toggle((*item.id).clone(), item.state.downgrade())
+            }
+            Self::Icon(item) => crate::MenuItemAction::Emit((*item.id).clone()),
         }
     }
 
-    pub(crate) fn child_mut(&self) -> RefMut<'_, MenuChild> {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) fn items(&self) -> Vec<MenuItemKind> {
         match self {
-            MenuItemKind::MenuItem(i) => i.inner.borrow_mut(),
-            MenuItemKind::Submenu(i) => i.inner.borrow_mut(),
-            MenuItemKind::Predefined(i) => i.inner.borrow_mut(),
-            MenuItemKind::Check(i) => i.inner.borrow_mut(),
-            MenuItemKind::Icon(i) => i.inner.borrow_mut(),
+            Self::Submenu(item) => item.items(),
+            _ => Vec::new(),
         }
     }
 }

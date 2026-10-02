@@ -64,8 +64,9 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
     expect(LOCK).not.toMatch(/^name = "unic-ucd-version"$/m);
   });
 
-  it("locks wry 0.56.x from the unpublished Tauri 2.12 line", () => {
-    expect(packageVersion("wry")).toMatch(/^0\.56\./);
+  it("locks wry 0.56 or later, the line the ported Tauri runtime was moved onto", () => {
+    const wry = packageVersion("wry");
+    expect(atLeast(wry, "0.56.0"), `wry ${wry} is at least 0.56.0`).toBe(true);
   });
 
   it("uses maintained GTK3 bindings and excludes both abandoned macro diagnostic crates", () => {
@@ -156,5 +157,38 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
       timeout: 10_000,
     });
     expect(version.trim()).toBe("Version 7.0.2");
+  });
+});
+
+/** `x.y` of a plain `x.y.z`, or undefined. */
+function majorMinor(version: string | undefined): string | undefined {
+  return /^(\d+\.\d+)\.\d+$/.exec(version ?? "")?.[1];
+}
+
+// `tauri build` refuses to run when an npm package and its Rust crate are on
+// different major/minor releases. A Dependabot npm bump that outran the Rust
+// side (api 2.12 over tauri 2.11) reached main that way and was only found by
+// a release build. The pairs are derived from bun.lock, so a new plugin is
+// covered without editing this list.
+describe("npm Tauri packages and their Rust crates share a major.minor", () => {
+  const pairs: Array<[npm: string, crate: string]> = [
+    ["@tauri-apps/api", "tauri"],
+    ...Object.keys(BUN_LOCK.packages)
+      .filter((key) => /^@tauri-apps\/plugin-[a-z0-9-]+$/.test(key))
+      .map((key): [string, string] => [key, `tauri-plugin-${key.slice("@tauri-apps/plugin-".length)}`]),
+  ];
+
+  it("finds the pairs it checks, so it cannot pass vacuously", () => {
+    expect(pairs.map(([npm]) => npm)).toContain("@tauri-apps/api");
+    expect(pairs.length, "at least one @tauri-apps/plugin-* is installed").toBeGreaterThan(1);
+  });
+
+  it.each(pairs)("%s matches the %s crate", (npm, crate) => {
+    const resolved = locked(npm);
+    expect(resolved, `${npm} is in bun.lock`).toBeDefined();
+    const npmVersion = majorMinor(resolved?.slice(npm.length + 1));
+    const crateVersion = majorMinor(packageVersion(crate));
+    expect(crateVersion, `${crate} is in Cargo.lock as x.y.z`).toBeDefined();
+    expect(npmVersion, `${resolved} vs ${crate} ${packageVersion(crate)}`).toBe(crateVersion);
   });
 });

@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.85"
 name = "wry"
-version = "0.56.1"
+version = "0.57.0"
 authors = ["Tauri Programme within The Commons Conservancy"]
 build = "build.rs"
 exclude = [
@@ -189,7 +189,7 @@ version = "1.0.0"
 version = "0.10"
 
 [dev-dependencies.tao]
-version = "0.36"
+version = "0.37"
 
 [dev-dependencies.wgpu]
 version = "23"
@@ -198,7 +198,7 @@ version = "23"
 version = "0.30"
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.dirs]
-version = "6"
+version = "7"
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11]
 version = "0.19"
@@ -273,6 +273,7 @@ features = [
     "UIApplication",
     "UIEvent",
     "UIColor",
+    "UIInterface",
 ]
 default-features = false
 
@@ -302,10 +303,10 @@ default-features = false
 version = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies.webview2-com]
-version = "0.38"
+version = "0.39"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.61"
+version = "0.62"
 features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -324,7 +325,7 @@ features = [
 ]
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-core]
-version = "0.61"
+version = "0.62"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-version]
 version = "0.1"
@@ -333,7 +334,7 @@ version = "0.1"
 version = "0.6"
 
 [target.'cfg(target_vendor = "apple")'.dependencies.dirs]
-version = "6"
+version = "7"
 
 [target.'cfg(target_vendor = "apple")'.dependencies.objc2]
 version = "0.6.4"

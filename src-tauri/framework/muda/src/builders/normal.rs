@@ -3,17 +3,30 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    accelerator::{Accelerator, KeyAccelerator},
-    MenuId, MenuItem,
+    accelerator::{Accelerator, KeyAccelerator, MenuAccelerator},
+    MenuId, MenuItem, TextStyle,
 };
 
 /// A builder type for [`MenuItem`]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MenuItemBuilder {
     text: String,
     enabled: bool,
     id: Option<MenuId>,
-    key_accelerator: Option<KeyAccelerator>,
+    accelerator: Option<MenuAccelerator>,
+    styled_text: Option<Vec<(String, TextStyle)>>,
+}
+
+impl Default for MenuItemBuilder {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            enabled: true,
+            id: None,
+            accelerator: None,
+            styled_text: None,
+        }
+    }
 }
 
 impl MenuItemBuilder {
@@ -51,10 +64,9 @@ impl MenuItemBuilder {
     where
         crate::Error: From<<A as TryInto<Accelerator>>::Error>,
     {
-        self.key_accelerator = accelerator
-            .map(|a| a.try_into())
-            .transpose()?
-            .map(KeyAccelerator::from);
+        self.accelerator = accelerator
+            .map(|a| a.try_into().map(MenuAccelerator::Physical))
+            .transpose()?;
         Ok(self)
     }
 
@@ -68,8 +80,29 @@ impl MenuItemBuilder {
     where
         crate::Error: From<<A as TryInto<KeyAccelerator>>::Error>,
     {
-        self.key_accelerator = accelerator.map(|a| a.try_into()).transpose()?;
+        self.accelerator = accelerator
+            .map(|a| a.try_into().map(MenuAccelerator::Logical))
+            .transpose()?;
         Ok(self)
+    }
+
+    /// Set the text for this menu item as a sequence of styled text, so one part of the
+    /// label can be de-emphasized relative to the rest.
+    ///
+    /// Overrides any text set with [`.text()`](Self::text).
+    ///
+    /// See [`MenuItem::set_styled_text`] for more info.
+    pub fn styled_text<S: Into<String>>(
+        mut self,
+        parts: impl IntoIterator<Item = (S, TextStyle)>,
+    ) -> Self {
+        self.styled_text = Some(
+            parts
+                .into_iter()
+                .map(|(text, style)| (text.into(), style))
+                .collect(),
+        );
+        self
     }
 
     /// Build this menu item.
@@ -79,9 +112,20 @@ impl MenuItemBuilder {
         } else {
             MenuItem::new(self.text, self.enabled, None)
         };
-        if let Some(key_accel) = self.key_accelerator {
-            let _ = item.set_key_accelerator(Some(key_accel));
+
+        if let Some(accelerator) = self.accelerator {
+            let _ = match accelerator {
+                MenuAccelerator::Physical(accelerator) => item.set_accelerator(Some(accelerator)),
+                MenuAccelerator::Logical(accelerator) => {
+                    item.set_key_accelerator(Some(accelerator))
+                }
+            };
         }
+
+        if let Some(parts) = self.styled_text {
+            item.set_styled_text(parts);
+        }
+
         item
     }
 }

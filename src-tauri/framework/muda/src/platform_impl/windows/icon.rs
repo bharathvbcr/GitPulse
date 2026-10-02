@@ -8,17 +8,7 @@ use std::{fmt, io, mem, path::Path, sync::Arc};
 
 use windows_sys::{
     core::PCWSTR,
-    Win32::{
-        Foundation::RECT,
-        Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, SelectObject,
-            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
-        },
-        UI::WindowsAndMessaging::{
-            CreateIcon, DestroyIcon, DrawIconEx, LoadImageW, DI_NORMAL, HICON, IMAGE_ICON,
-            LR_DEFAULTSIZE, LR_LOADFROMFILE,
-        },
-    },
+    Win32::{Foundation::RECT, Graphics::Gdi::*, UI::WindowsAndMessaging::*},
 };
 
 use crate::icon::*;
@@ -131,7 +121,7 @@ impl WinIcon {
         rgba_icon.into_windows_icon()
     }
 
-    fn from_handle(handle: HICON) -> Self {
+    pub(crate) fn from_handle(handle: HICON) -> Self {
         Self {
             #[allow(clippy::arc_with_non_send_sync)]
             inner: Arc::new(RaiiIcon { handle }),

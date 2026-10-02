@@ -37,16 +37,22 @@ not published upstream releases.
   Dispatch yields every 64 messages; dropping the event loop aborts its
   receiver tasks and closes their channels. The previous unbounded,
   nonblocking, ordered send contract is retained.
-- The five Tauri crates that need no GTK changes remain at the original
-  `406feea75283545496ef7398c5e2f0fb9b306b64` revision. Cargo patches both the
+- The ported Tauri crates are at the `tauri-v2.12.1` tag
+  (`30da1fd6e17de6107ecc850c95dfb16b5729f2dd`), on WRY 0.57.0 and Muda 0.20.0.
+  The five Tauri crates that need no GTK changes use the same revision. Keep the
+  npm `@tauri-apps/*` packages on the same major/minor as their crates: `tauri
+  build` refuses a mismatch, and `scripts/advisory-lockfile-contract.test.ts`
+  checks the pairs from both lockfiles. Cargo patches both the
   registry and Git source so registry plugins share the same runtime types.
 - On macOS, TAO's application and window `sendEvent:` overrides use the
   `C-unwind` ABI so native AppKit exceptions can reach AppKit's event handler.
   `native_event_unwind` exercises both real callbacks with injected Objective-C
   exceptions, normal forwarding, and subsequent dispatch. See
   `../../docs/archive/DIAGNOSTICS_HARDENING.md` for the crash evidence and limits.
-- The macOS platform modules of WRY, TAO and Muda carry the same scoped lint
-  allows the GTK consumers already had. Current `objc2-app-kit` marks safe what
+- The macOS platform modules of WRY and TAO carry the same scoped lint
+  allows the GTK consumers already had. Muda 0.20 adopted the current bindings
+  and builds without warnings in both profiles, so its allow was retired with
+  the 0.20 update. Current `objc2-app-kit` marks safe what
   these revisions wrap in `unsafe`, and deprecates constants they still name;
   neither is a defect, and neither can be "fixed" without changing behaviour,
   because `NSFilenamesPboardType` and the `NS*KeyMask` constants are the
@@ -56,7 +62,7 @@ not published upstream releases.
   roots, so no Linux or Windows lint is suppressed, and the two imports that no
   cfg uses at all were deleted rather than allowed. Removing the `unsafe`
   blocks instead would pin the port to one bindings version; retire the allows
-  when a published WRY, TAO and Muda adopt the current bindings.
+  when a published WRY and TAO adopt the current bindings.
 
 The GTK bindings require Rust 1.92 or later. No new native system library is
 required by this migration. Ubuntu 22.04 is the native build baseline under

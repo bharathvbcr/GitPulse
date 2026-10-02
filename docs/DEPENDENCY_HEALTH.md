@@ -58,19 +58,22 @@ ports those consumers together, including JavaScriptCore and the optional
 AppIndicator chain, so all their native `links` dependencies and Rust types agree.
 The application continues using GTK3 and WebKitGTK 4.1.
 
-`src-tauri/framework/` contains twelve local consumer snapshots, with upstream
+`src-tauri/framework/` contains thirteen local consumer snapshots, with upstream
 revisions/archive checksums, changed-file provenance, licenses and full file
 hashes in `PATCHES.json`. `changes.patch` presents the reviewable port after
-Tauri's workspace inheritance is resolved: **190 lines added / 67 removed**
-across the port, within **574** retained framework files. The nine registry archives were
-verified against the original lockfile checksums and copied source; the three
+Tauri's workspace inheritance is resolved: **590 lines added / 116 removed**
+across the port, within **601** retained framework files. The ten registry archives were
+verified against their crates.io checksums and copied source; the three
 Tauri snapshots were checked against their pinned Git objects.
 
-Five unchanged Tauri family crates retain revision
-`406feea75283545496ef7398c5e2f0fb9b306b64`. Registry plugins and patched crates
-share one Tauri runtime. The existing `urlpattern 0.6.0` migration is retained;
-unmaintained `unic-*` packages have not returned. Crate versions are not spoofed.
-See `src-tauri/framework/README.md` for maintenance and removal criteria.
+The ported Tauri crates are at the `tauri-v2.12.1` tag,
+`30da1fd6e17de6107ecc850c95dfb16b5729f2dd`, on WRY 0.57.0 and Muda 0.20.0, and
+the five unchanged Tauri family crates use the same revision. Registry plugins
+and patched crates share one Tauri runtime, and the npm `@tauri-apps/*` packages
+stay on the same major/minor as their crates, which `tauri build` requires. The
+existing `urlpattern 0.6.0` migration is retained; unmaintained `unic-*`
+packages have not returned. Crate versions are not spoofed. See
+`src-tauri/framework/README.md` for maintenance and removal criteria.
 
 GLib removed its channel API. TAO's replacement uses `async-channel` 2.5,
 already in the dependency graph, with receivers on the owning main context.

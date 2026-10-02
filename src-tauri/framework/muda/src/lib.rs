@@ -10,7 +10,7 @@
 //!
 //! - Windows
 //! - macOS
-//! - Linux (gtk Only)
+//! - Linux/BSD with GTK 3 or GTK 4
 //!
 //! # Platform-specific notes:
 //!
@@ -21,20 +21,56 @@
 //!   [`TranslateAcceleratorW`](https://docs.rs/windows-sys/latest/windows_sys/Win32/UI/WindowsAndMessaging/fn.TranslateAcceleratorW.html).
 //!   See [`Menu::init_for_hwnd`](https://docs.rs/muda/latest/x86_64-pc-windows-msvc/muda/struct.Menu.html#method.init_for_hwnd) for more details
 //!
-//! # Dependencies (Linux Only)
+//! # Cargo features
 //!
-//! `gtk` is used for menus and `libxdo` is used to make the predfined `Copy`, `Cut`, `Paste` and `SelectAll` menu items work. Be sure to install following packages before building:
+//! The Win32 and AppKit backends are always enabled on Windows and macOS, respectively.
+//!
+//! - `gtk3`: Enables the GTK 3 backend on Linux and BSD platforms. This is enabled by default.
+//! - `gtk4`: Enables the GTK 4 backend on Linux and BSD platforms. Disable default features when
+//!   enabling this feature because the defaults include `gtk3`.
+//! - `libxdo`: Enables linking to `libxdo` for the GTK 3 backend. This is used by the predefined
+//!   `Copy`, `Cut`, `Paste` and `SelectAll` menu items, and is enabled by default. It is not used
+//!   by GTK 4.
+//! - `snapshot`: Enables thread-safe menu snapshot types and methods, switching shared menu state
+//!   to thread-safe synchronization.
+//!
+//! When both `gtk3` and `gtk4` features are enabled, Muda uses the GTK 4 backend.
+//!
+//! # Dependencies (Linux/BSD)
+//!
+//! The `gtk3` feature uses GTK 3 for menus. The `gtk4` feature uses GTK 4 for menus. `libxdo` is
+//! only used by the GTK 3 backend to make the predefined `Copy`, `Cut`, `Paste` and `SelectAll`
+//! menu items work when the `libxdo` feature is enabled. Be sure to install the packages for the
+//! GTK backend you enabled before building:
 //!
 //! #### Arch Linux / Manjaro:
 //!
 //! ```sh
+//! # GTK 3 backend
 //! pacman -S gtk3 xdotool
+//!
+//! # GTK 4 backend
+//! pacman -S gtk4
 //! ```
 //!
 //! #### Debian / Ubuntu:
 //!
 //! ```sh
+//! # GTK 3 backend
 //! sudo apt install libgtk-3-dev libxdo-dev
+//!
+//! # GTK 4 backend
+//! sudo apt install libgtk-4-dev
+//! ```
+//!
+//! #### FreeBSD:
+//!
+//! ```sh
+//! # GTK 3 backend
+//! pkg install -y rust glib pkgconf gtk3 xdotool
+//!
+//! # GTK 4 backend
+//! pkg install -y rust glib pkgconf gtk4
 //! ```
 //!
 //! # Example
@@ -52,7 +88,7 @@
 //!         &MenuItem::new(
 //!             "Menu item #1",
 //!             true,
-//!             Some(Accelerator::new(Some(Modifiers::ALT), Code::KeyD)),
+//!             Some(Accelerator::new(Modifiers::ALT, Code::KeyD)),
 //!         ),
 //!         &PredefinedMenuItem::separator(),
 //!         &menu_item2,
@@ -71,10 +107,12 @@
 //! );
 //! ```
 //!
-//! Then add your root menu to a Window on Windows and Linux
+//! Then add your root menu to a window on Windows, GTK 3, or GTK 4
 //! or use it as your global app menu on macOS
 //!
 //! ```no_run
+//! # #[cfg(feature = "gtk4")]
+//! # use gtk4 as gtk;
 //! # let menu = muda::Menu::new();
 //! # let window_hwnd = 0;
 //! # #[cfg(any(
@@ -110,9 +148,11 @@
 //!
 //! # Context menus (Popup menus)
 //!
-//! You can also use a [`Menu`] or a [`Submenu`] show a context menu.
+//! You can also use a [`Menu`] or a [`Submenu`] to show a context menu.
 //!
 //! ```no_run
+//! # #[cfg(feature = "gtk4")]
+//! # use gtk4 as gtk;
 //! use muda::ContextMenu;
 //! # let menu = muda::Menu::new();
 //! # let window_hwnd = 0;
@@ -183,348 +223,43 @@
 //! [winit]: https://docs.rs/winit
 //! [tao]: https://docs.rs/tao
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use once_cell::sync::{Lazy, OnceCell};
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ),
+    feature = "gtk4"
+))]
+extern crate gtk4 as gtk;
 
 pub mod about_metadata;
 pub mod accelerator;
 mod builders;
+mod context_menu;
 mod error;
 mod icon;
 mod items;
-mod menu;
+mod menu_event;
 mod menu_id;
 mod platform_impl;
+mod sealed;
+#[cfg(feature = "snapshot")]
+mod snapshot;
+mod state_cell;
 mod util;
 
 pub use about_metadata::AboutMetadata;
 pub use builders::*;
+pub use context_menu::ContextMenu;
 pub use dpi;
 pub use error::*;
 pub use icon::{BadIcon, Icon, NativeIcon};
 pub use items::*;
-pub use menu::*;
+pub use menu_event::{MenuEvent, MenuEventReceiver};
 pub use menu_id::MenuId;
-
-/// An enumeration of all available menu types, useful to match against
-/// the items returned from [`Menu::items`] or [`Submenu::items`]
-#[derive(Clone)]
-pub enum MenuItemKind {
-    MenuItem(MenuItem),
-    Submenu(Submenu),
-    Predefined(PredefinedMenuItem),
-    Check(CheckMenuItem),
-    Icon(IconMenuItem),
-}
-
-impl MenuItemKind {
-    /// Returns a unique identifier associated with this menu item.
-    pub fn id(&self) -> &MenuId {
-        match self {
-            MenuItemKind::MenuItem(i) => i.id(),
-            MenuItemKind::Submenu(i) => i.id(),
-            MenuItemKind::Predefined(i) => i.id(),
-            MenuItemKind::Check(i) => i.id(),
-            MenuItemKind::Icon(i) => i.id(),
-        }
-    }
-
-    /// Casts this item to a [`MenuItem`], and returns `None` if it wasn't.
-    pub fn as_menuitem(&self) -> Option<&MenuItem> {
-        match self {
-            MenuItemKind::MenuItem(i) => Some(i),
-            _ => None,
-        }
-    }
-
-    /// Casts this item to a [`MenuItem`], and panics if it wasn't.
-    pub fn as_menuitem_unchecked(&self) -> &MenuItem {
-        match self {
-            MenuItemKind::MenuItem(i) => i,
-            _ => panic!("Not a MenuItem"),
-        }
-    }
-
-    /// Casts this item to a [`Submenu`], and returns `None` if it wasn't.
-    pub fn as_submenu(&self) -> Option<&Submenu> {
-        match self {
-            MenuItemKind::Submenu(i) => Some(i),
-            _ => None,
-        }
-    }
-
-    /// Casts this item to a [`Submenu`], and panics if it wasn't.
-    pub fn as_submenu_unchecked(&self) -> &Submenu {
-        match self {
-            MenuItemKind::Submenu(i) => i,
-            _ => panic!("Not a Submenu"),
-        }
-    }
-
-    /// Casts this item to a [`PredefinedMenuItem`], and returns `None` if it wasn't.
-    pub fn as_predefined_menuitem(&self) -> Option<&PredefinedMenuItem> {
-        match self {
-            MenuItemKind::Predefined(i) => Some(i),
-            _ => None,
-        }
-    }
-
-    /// Casts this item to a [`PredefinedMenuItem`], and panics if it wasn't.
-    pub fn as_predefined_menuitem_unchecked(&self) -> &PredefinedMenuItem {
-        match self {
-            MenuItemKind::Predefined(i) => i,
-            _ => panic!("Not a PredefinedMenuItem"),
-        }
-    }
-
-    /// Casts this item to a [`CheckMenuItem`], and returns `None` if it wasn't.
-    pub fn as_check_menuitem(&self) -> Option<&CheckMenuItem> {
-        match self {
-            MenuItemKind::Check(i) => Some(i),
-            _ => None,
-        }
-    }
-
-    /// Casts this item to a [`CheckMenuItem`], and panics if it wasn't.
-    pub fn as_check_menuitem_unchecked(&self) -> &CheckMenuItem {
-        match self {
-            MenuItemKind::Check(i) => i,
-            _ => panic!("Not a CheckMenuItem"),
-        }
-    }
-
-    /// Casts this item to a [`IconMenuItem`], and returns `None` if it wasn't.
-    pub fn as_icon_menuitem(&self) -> Option<&IconMenuItem> {
-        match self {
-            MenuItemKind::Icon(i) => Some(i),
-            _ => None,
-        }
-    }
-
-    /// Casts this item to a [`IconMenuItem`], and panics if it wasn't.
-    pub fn as_icon_menuitem_unchecked(&self) -> &IconMenuItem {
-        match self {
-            MenuItemKind::Icon(i) => i,
-            _ => panic!("Not an IconMenuItem"),
-        }
-    }
-
-    /// Convert this item into its menu ID.
-    pub fn into_id(self) -> MenuId {
-        match self {
-            MenuItemKind::MenuItem(i) => i.into_id(),
-            MenuItemKind::Submenu(i) => i.into_id(),
-            MenuItemKind::Predefined(i) => i.into_id(),
-            MenuItemKind::Check(i) => i.into_id(),
-            MenuItemKind::Icon(i) => i.into_id(),
-        }
-    }
-}
-
-/// A trait that defines a generic item in a menu, which may be one of [`MenuItemKind`]
-pub trait IsMenuItem: sealed::IsMenuItemBase {
-    /// Returns a [`MenuItemKind`] associated with this item.
-    fn kind(&self) -> MenuItemKind;
-    /// Returns a unique identifier associated with this menu item.
-    fn id(&self) -> &MenuId;
-    /// Convert this menu item into its menu ID.
-    fn into_id(self) -> MenuId;
-}
-
-mod sealed {
-    pub trait IsMenuItemBase {}
-}
-
-#[derive(Debug, PartialEq, PartialOrd, Clone, Copy, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub(crate) enum MenuItemType {
-    #[default]
-    MenuItem,
-    Submenu,
-    Predefined,
-    Check,
-    Icon,
-}
-
-/// A helper trait with methods to help creating a context menu.
-pub trait ContextMenu {
-    /// Get the popup [`HMENU`] for this menu.
-    ///
-    /// The returned [`HMENU`] is valid as long as the `ContextMenu` is.
-    ///
-    /// [`HMENU`]: windows_sys::Win32::UI::WindowsAndMessaging::HMENU
-    #[cfg(target_os = "windows")]
-    fn hpopupmenu(&self) -> isize;
-
-    /// Shows this menu as a context menu inside a win32 window.
-    ///
-    /// - `position` is relative to the window top-left corner, if `None`, the cursor position is used.
-    ///
-    /// Returns `true` if menu tracking ended because an item was selected, and `false` if menu tracking was cancelled for any reason.
-    ///
-    /// # Safety
-    ///
-    /// The `hwnd` must be a valid window HWND.
-    #[cfg(target_os = "windows")]
-    unsafe fn show_context_menu_for_hwnd(
-        &self,
-        hwnd: isize,
-        position: Option<dpi::Position>,
-    ) -> bool;
-
-    /// Attach the menu subclass handler to the given hwnd
-    /// so you can recieve events from that window using [MenuEvent::receiver]
-    ///
-    /// This can be used along with [`ContextMenu::hpopupmenu`] when implementing a tray icon menu.
-    ///
-    /// # Safety
-    ///
-    /// The `hwnd` must be a valid window HWND.
-    #[cfg(target_os = "windows")]
-    unsafe fn attach_menu_subclass_for_hwnd(&self, hwnd: isize);
-
-    /// Remove the menu subclass handler from the given hwnd
-    ///
-    /// The view must be a pointer to a valid `NSView`.
-    ///
-    /// # Safety
-    ///
-    /// The `hwnd` must be a valid window HWND.
-    #[cfg(target_os = "windows")]
-    unsafe fn detach_menu_subclass_from_hwnd(&self, hwnd: isize);
-
-    /// Shows this menu as a context menu inside a [`gtk::Window`]
-    ///
-    /// - `position` is relative to the window top-left corner, if `None`, the cursor position is used.
-    ///
-    /// Returns `true` if menu tracking ended because an item was selected or clicked outside the menu to dismiss it.
-    ///
-    /// Returns `false` if menu tracking was cancelled for any reason.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ),
-        feature = "gtk"
-    ))]
-    fn show_context_menu_for_gtk_window(
-        &self,
-        w: &gtk::Window,
-        position: Option<dpi::Position>,
-    ) -> bool;
-
-    /// Get the underlying gtk menu reserved for context menus.
-    ///
-    /// The returned [`gtk::Menu`] is valid as long as the `ContextMenu` is.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ),
-        feature = "gtk"
-    ))]
-    fn gtk_context_menu(&self) -> gtk::Menu;
-
-    /// Shows this menu as a context menu for the specified `NSView`.
-    ///
-    /// - `position` is relative to the window top-left corner, if `None`, the cursor position is used.
-    ///
-    /// Returns `true` if menu tracking ended because an item was selected, and `false` if menu tracking was cancelled for any reason.
-    ///
-    /// # Safety
-    ///
-    /// The view must be a pointer to a valid `NSView`.
-    #[cfg(target_os = "macos")]
-    unsafe fn show_context_menu_for_nsview(
-        &self,
-        view: *const std::ffi::c_void,
-        position: Option<dpi::Position>,
-    ) -> bool;
-
-    /// Get the underlying NSMenu reserved for context menus.
-    ///
-    /// The returned pointer is valid for as long as the `ContextMenu` is. If
-    /// you need it to be alive for longer, retain it.
-    #[cfg(target_os = "macos")]
-    fn ns_menu(&self) -> *mut std::ffi::c_void;
-
-    /// Cast this context menu to a [`Menu`], and returns `None` if it wasn't.
-    fn as_menu(&self) -> Option<&Menu> {
-        None
-    }
-
-    /// Casts this context menu to a [`Menu`], and panics if it wasn't.
-    fn as_menu_unchecked(&self) -> &Menu {
-        self.as_menu().expect("Not a Menu")
-    }
-
-    /// Cast this context menu to a [`Submenu`], and returns `None` if it wasn't.
-    fn as_submenu(&self) -> Option<&Submenu> {
-        None
-    }
-
-    /// Casts this context menu to a [`Submenu`], and panics if it wasn't.
-    fn as_submenu_unchecked(&self) -> &Menu {
-        self.as_menu().expect("Not a Submenu")
-    }
-}
-
-/// Describes a menu event emitted when a menu item is activated
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct MenuEvent {
-    /// Id of the menu item which triggered this event
-    pub id: MenuId,
-}
-
-/// A reciever that could be used to listen to menu events.
-pub type MenuEventReceiver = Receiver<MenuEvent>;
-type MenuEventHandler = Box<dyn Fn(MenuEvent) + Send + Sync + 'static>;
-
-static MENU_CHANNEL: Lazy<(Sender<MenuEvent>, MenuEventReceiver)> = Lazy::new(unbounded);
-static MENU_EVENT_HANDLER: OnceCell<Option<MenuEventHandler>> = OnceCell::new();
-
-impl MenuEvent {
-    /// Returns the id of the menu item which triggered this event
-    pub fn id(&self) -> &MenuId {
-        &self.id
-    }
-
-    /// Gets a reference to the event channel's [`MenuEventReceiver`]
-    /// which can be used to listen for menu events.
-    ///
-    /// ## Note
-    ///
-    /// This will not receive any events if [`MenuEvent::set_event_handler`] has been called with a `Some` value.
-    pub fn receiver<'a>() -> &'a MenuEventReceiver {
-        &MENU_CHANNEL.1
-    }
-
-    /// Set a handler to be called for new events. Useful for implementing custom event sender.
-    ///
-    /// ## Note
-    ///
-    /// Calling this function with a `Some` value,
-    /// will not send new events to the channel associated with [`MenuEvent::receiver`]
-    pub fn set_event_handler<F: Fn(MenuEvent) + Send + Sync + 'static>(f: Option<F>) {
-        if let Some(f) = f {
-            let _ = MENU_EVENT_HANDLER.set(Some(Box::new(f)));
-        } else {
-            let _ = MENU_EVENT_HANDLER.set(None);
-        }
-    }
-
-    pub(crate) fn send(event: MenuEvent) {
-        if let Some(handler) = MENU_EVENT_HANDLER.get_or_init(|| None) {
-            handler(event);
-        } else {
-            let _ = MENU_CHANNEL.0.send(event);
-        }
-    }
-}
+#[cfg(feature = "snapshot")]
+pub use snapshot::*;
+pub(crate) use state_cell::{StateCell, WeakStateCell};
