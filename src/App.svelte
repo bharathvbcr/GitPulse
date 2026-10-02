@@ -4,7 +4,7 @@
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { repoStore } from "./lib/stores/repoStore";
+  import { repoStore, pathsTrustedForBackground } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";
   import { liveIndex } from "./lib/codeintel/liveIndex";
   import { autoInit } from "./lib/codeintel/autoInit";
@@ -403,10 +403,19 @@
       subscribe: repoStore.subscribe,
       target: document,
       apply: (scope) => {
-        liveIndex.setScope(scope);
-        autoInit.setScope(scope);
-        setDocsVaultRefreshScope(scope);
-        repoMetrics.setScope(scope);
+        const trusted = pathsTrustedForBackground(
+          get(repoStore).openTabs,
+          scope.activeKey,
+        );
+        const background = {
+          activeKey: trusted.activeKey,
+          retainedKeys: trusted.retainedKeys,
+          visible: scope.visible,
+        };
+        liveIndex.setScope(background);
+        autoInit.setScope(background);
+        setDocsVaultRefreshScope(background);
+        repoMetrics.setScope(background);
       },
     }));
 
@@ -637,14 +646,14 @@
         syncRecentMenu: () => syncRecentMenu([...get(repoStore).recentRepos]),
         handleRepoChanged: (path) => {
           void repoStore.handleRepoChanged(path);
-          // The same event drives the metric panels. Each metric applies its
-          // own debounce and cost floor, so a checkout storm becomes one
-          // re-measurement per metric rather than one per file event.
-          if (path) repoMetrics.invalidate(path);
+          const blocked = path
+            ? get(repoStore).openTabs.some((tab) => tab.trustRequired === true && tab.path === path)
+            : false;
+          if (path && !blocked) repoMetrics.invalidate(path);
           // Live index: gated incremental `devmap build` when the map is stale
           // (or the watcher dirty signal forces it) and no build is in flight.
-          if (path) liveIndex.onRepoChanged(path);
-          if (path) onDocsRepoChanged(path);
+          if (path && !blocked) liveIndex.onRepoChanged(path);
+          if (path && !blocked) onDocsRepoChanged(path);
         },
         listenRepoChanged: (changed) =>
           listen<RepoChangedPayload>("repo-changed", (event) =>
@@ -791,8 +800,9 @@
   onDestroy(() => graphScheduler.reset());
 
   $effect(() => {
+    const refused = $repoStore.trustRequired;
     graphScheduler.sync({
-      path: $repoStore.currentPath,
+      path: refused ? null : $repoStore.currentPath,
       query: $filterStore.searchQuery,
       revision: $filterStore.selectedBranch,
       // Which refs the graph walks is part of WHICH GRAPH this is, so a
@@ -856,6 +866,7 @@
   let lastCaughtUpPath: string | null = null;
   $effect(() => {
     const path = $repoStore.currentPath;
+    if ($repoStore.trustRequired) return;
     // Status polls rebuild repoStore and re-run this effect. Activating the
     // journal on every emission republishes harnessStore synchronously, which
     // is a second reactive clock on the same tick as every $harnessStore

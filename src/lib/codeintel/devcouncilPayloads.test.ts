@@ -24,6 +24,7 @@ describe("parseInitReport", () => {
     exclude: { status: "added", file: "/a/.git/info/exclude", pattern: "/.devmap/" },
     workspace_registry: "/a/.devmap/workspace.json",
     workspace_reason: null,
+    skipped_untrusted: [],
     devmap_available: true,
   };
 
@@ -45,6 +46,14 @@ describe("parseInitReport", () => {
   it("never reads a missing devmap_available as installed", () => {
     const parsed = parseInitReport({ ...good, devmap_available: undefined });
     expect(parsed.devmap_available).toBe(false);
+  });
+
+  it("keeps omitted untrusted paths and rejects a missing list", () => {
+    const parsed = parseInitReport({ ...good, skipped_untrusted: ["/secret"] });
+    expect(parsed.skipped_untrusted).toEqual(["/secret"]);
+    expect(() => parseInitReport({ ...good, skipped_untrusted: undefined })).toThrow(/skipped_untrusted/);
+    expect(() => parseInitReport({ ...good, skipped_untrusted: null })).toThrow(/skipped_untrusted/);
+    expect(() => parseInitReport({ ...good, skipped_untrusted: [1] })).toThrow(/skipped_untrusted/);
   });
 
   it("normalizes an absent registry to null rather than undefined", () => {

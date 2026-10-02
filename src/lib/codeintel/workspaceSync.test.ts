@@ -12,6 +12,7 @@ vi.mock("./client", () => ({
     registry_root: "/a",
     registry_path: "/a/.devmap/workspace.json",
     repos: [],
+    skipped_untrusted: [],
   }),
 }));
 

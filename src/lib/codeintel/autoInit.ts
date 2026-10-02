@@ -137,6 +137,11 @@ export function createAutoInit(opts?: {
           "devcouncil-init",
           `${activeKey}: cross-repository search has no registry — ${report.workspace_reason}`,
         );
+      } else if (report.skipped_untrusted.length > 0) {
+        warn(
+          "devcouncil-init",
+          `${activeKey}: cross-repository search omitted untrusted repositories — ${report.skipped_untrusted.join(", ")}`,
+        );
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

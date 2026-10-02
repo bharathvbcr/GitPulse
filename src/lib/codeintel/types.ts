@@ -144,6 +144,13 @@ function optionalString(value: unknown): string | null | undefined {
   throw new Error("codeintel: expected a string");
 }
 
+function requiredStringList(value: unknown, command: string, field: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new Error(`${command} returned no ${field} list`);
+  }
+  return value;
+}
+
 export function unverifiedSourceFreshness(
   reason = "this query did not verify whole-tree freshness",
 ): SourceFreshness {
@@ -689,6 +696,7 @@ export function parseInitReport(value: unknown, command = "devcouncil"): InitRep
     exclude: exclude as unknown as ExcludeOutcome,
     workspace_registry: optionalString(value.workspace_registry) ?? null,
     workspace_reason: optionalString(value.workspace_reason) ?? null,
+    skipped_untrusted: requiredStringList(value.skipped_untrusted, command, "skipped_untrusted"),
     devmap_available: value.devmap_available === true,
   };
 }
@@ -874,6 +882,12 @@ export interface InitReport {
   exclude: ExcludeOutcome;
   workspace_registry: string | null;
   workspace_reason: string | null;
+  /**
+   * Open tabs left out of a written registry because trust refused them.
+   * Empty when none were skipped. A refused host is `workspace_reason`
+   * with `workspace_registry` null, not an entry here.
+   */
+  skipped_untrusted: string[];
   devmap_available: boolean;
 }
 
@@ -1013,6 +1027,8 @@ export interface WorkspaceSnapshot {
   registry_root: string;
   registry_path: string;
   repos: WorkspaceRepoEntry[];
+  /** Open-tab paths this sync skipped because trust refused them. Empty on list. */
+  skipped_untrusted: string[];
 }
 
 export interface WorkspaceRegisterResult {

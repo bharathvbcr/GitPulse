@@ -17,7 +17,7 @@ function dependencies() {
     symbols: vi.fn<typeof searchDependencies.symbols>().mockResolvedValue(symbols("test")),
     files: vi.fn<typeof searchDependencies.files>().mockResolvedValue(["README.md"]),
     workspace: vi.fn<typeof searchDependencies.workspace>().mockResolvedValue(workspace),
-    repos: vi.fn<typeof searchDependencies.repos>().mockResolvedValue({ version: 1, registry_root: "/repo", registry_path: "/repo/workspace.json", repos: [] }),
+    repos: vi.fn<typeof searchDependencies.repos>().mockResolvedValue({ version: 1, registry_root: "/repo", registry_path: "/repo/workspace.json", repos: [], skipped_untrusted: [] }),
   };
 }
 afterEach(() => vi.useRealTimers());

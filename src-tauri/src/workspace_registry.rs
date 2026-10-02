@@ -33,6 +33,11 @@ pub struct WorkspaceSnapshot {
     pub registry_root: String,
     pub registry_path: String,
     pub repos: Vec<WorkspaceRepoEntry>,
+    /// Open-tab paths `sync_open_tabs` left out because repository trust
+    /// refused them. Empty on [`list`]: a read does not re-decide who was
+    /// skipped, and the registry file itself does not store that fact.
+    /// Not a grant and not a finding — these paths were not examined.
+    pub skipped_untrusted: Vec<String>,
 }
 
 /// Outcome of registering one repository.
@@ -105,12 +110,17 @@ fn to_entry(repo: &WorkspaceRepo) -> WorkspaceRepoEntry {
     }
 }
 
-fn snapshot_of(root: &Path, workspace: &Workspace) -> WorkspaceSnapshot {
+fn snapshot_of(
+    root: &Path,
+    workspace: &Workspace,
+    skipped_untrusted: Vec<String>,
+) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         version: workspace.version,
         registry_root: root.to_string_lossy().into_owned(),
         registry_path: workspace_path(root).to_string_lossy().into_owned(),
         repos: workspace.repos.iter().map(to_entry).collect(),
+        skipped_untrusted,
     }
 }
 
@@ -210,7 +220,7 @@ fn suffix_label(root: &Path, depth: usize) -> String {
 pub fn list(registry_root: &str) -> Result<WorkspaceSnapshot, String> {
     let root = resolve_registry_root(registry_root)?;
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
-    Ok(snapshot_of(&root, &workspace))
+    Ok(snapshot_of(&root, &workspace, Vec::new()))
 }
 
 /// Register one repository under the registry rooted at `registry_root`.
@@ -261,6 +271,15 @@ pub fn unregister(registry_root: &str, name: &str) -> Result<WorkspaceUnregister
 ///
 /// Uses the same file lock as upstream `Workspace::update`. Names are
 /// disambiguated across colliding basenames.
+///
+/// A member [`crate::repository_trust::refused`] by trust is omitted and
+/// named on [`WorkspaceSnapshot::skipped_untrusted`]. Registering a member
+/// runs no Git, so leaving one out widens nothing. Every other member error
+/// (missing path, not a repository) still fails the call before any write.
+///
+/// The registry host is not a member that can be skipped. The file is written
+/// into that repository, so a refused host returns the trust error and writes
+/// nothing.
 pub fn sync_open_tabs(
     registry_root: &str,
     repo_paths: &[String],
@@ -268,11 +287,23 @@ pub fn sync_open_tabs(
     let root = resolve_registry_root(registry_root)?;
     let mut members = Vec::with_capacity(repo_paths.len());
     let mut seen = HashSet::new();
+    let mut skipped_untrusted = Vec::new();
+    let mut skipped_keys = HashSet::new();
     for path in repo_paths {
-        let member = resolve_member_root(path)?;
-        let key = member.to_string_lossy().to_lowercase();
-        if seen.insert(key) {
-            members.push(member);
+        match resolve_member_root(path) {
+            Ok(member) => {
+                let key = member.to_string_lossy().to_lowercase();
+                if seen.insert(key) {
+                    members.push(member);
+                }
+            }
+            Err(error) if crate::repository_trust::refused(&error) => {
+                let key = path.to_lowercase();
+                if skipped_keys.insert(key) {
+                    skipped_untrusted.push(path.clone());
+                }
+            }
+            Err(error) => return Err(error),
         }
     }
     // Always include the registry host itself so a search from an open tab
@@ -301,7 +332,7 @@ pub fn sync_open_tabs(
     sync_result?;
 
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
-    let mut snap = snapshot_of(&root, &workspace);
+    let mut snap = snapshot_of(&root, &workspace, skipped_untrusted);
     snap.registry_path = written.to_string_lossy().into_owned();
     Ok(snap)
 }
@@ -366,7 +397,7 @@ mod tests {
         dir
     }
 
-    fn init_git_repo(dir: &Path) {
+    fn init_git_checkout(dir: &Path, trust: bool) {
         let _guard = git_env_lock().lock().expect("git env lock");
         let status = Command::new("git")
             .args(["init", "--quiet"])
@@ -376,7 +407,13 @@ mod tests {
             .status()
             .expect("git init");
         assert!(status.success(), "git init failed in {}", dir.display());
-        crate::test_support::trust_repo(dir);
+        if trust {
+            crate::test_support::trust_repo(dir);
+        }
+    }
+
+    fn init_git_repo(dir: &Path) {
+        init_git_checkout(dir, true);
     }
 
     #[test]
@@ -455,6 +492,88 @@ mod tests {
         let _ = fs::remove_dir_all(&host);
         let _ = fs::remove_dir_all(a.parent().unwrap());
         let _ = fs::remove_dir_all(b.parent().unwrap());
+    }
+
+    #[test]
+    fn sync_open_tabs_skips_an_untrusted_member_and_keeps_the_trusted_one() {
+        let host = scratch("skip-host");
+        let trusted = scratch("skip-trusted");
+        let untrusted = scratch("skip-untrusted");
+        init_git_repo(&host);
+        init_git_repo(&trusted);
+        init_git_checkout(&untrusted, false);
+
+        let trusted_path = trusted.to_string_lossy().into_owned();
+        let untrusted_path = untrusted.to_string_lossy().into_owned();
+        let snap = sync_open_tabs(
+            host.to_str().unwrap(),
+            &[trusted_path.clone(), untrusted_path.clone()],
+        )
+        .expect("an untrusted member must not abort the registry write");
+
+        let roots: HashSet<_> = snap
+            .repos
+            .iter()
+            .map(|entry| {
+                Path::new(&entry.root)
+                    .canonicalize()
+                    .expect("registered root")
+            })
+            .collect();
+        assert!(roots.contains(&host.canonicalize().unwrap()));
+        assert!(roots.contains(&trusted.canonicalize().unwrap()));
+        assert!(
+            !roots.contains(&untrusted.canonicalize().unwrap()),
+            "an untrusted member must not be registered: {roots:?}"
+        );
+        assert_eq!(snap.skipped_untrusted, vec![untrusted_path]);
+
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&trusted);
+        let _ = fs::remove_dir_all(&untrusted);
+    }
+
+    #[test]
+    fn sync_open_tabs_still_fails_when_a_member_path_is_missing() {
+        let host = scratch("miss-host");
+        let trusted = scratch("miss-trusted");
+        init_git_repo(&host);
+        init_git_repo(&trusted);
+        let missing = host.join("does-not-exist");
+
+        let err = sync_open_tabs(
+            host.to_str().unwrap(),
+            &[
+                trusted.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+        )
+        .expect_err("a missing path is not a trust refusal");
+        assert!(
+            !crate::repository_trust::refused(&err),
+            "a missing path must stay a hard error: {err}"
+        );
+        assert!(
+            !workspace_path(&host).is_file(),
+            "a non-trust member error must not write the registry"
+        );
+
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&trusted);
+    }
+
+    #[test]
+    fn sync_open_tabs_refuses_an_untrusted_host() {
+        let host = scratch("untrusted-host");
+        init_git_checkout(&host, false);
+        let err =
+            sync_open_tabs(host.to_str().unwrap(), &[]).expect_err("the registry host is required");
+        assert!(
+            crate::repository_trust::refused(&err),
+            "a refused host is not a skipped member: {err}"
+        );
+        assert!(!workspace_path(&host).is_file());
+        let _ = fs::remove_dir_all(&host);
     }
 
     #[test]

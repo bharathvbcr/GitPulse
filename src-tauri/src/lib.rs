@@ -108,6 +108,24 @@ pub fn run() {
         .manage(desktop::DesktopState::default())
         .manage(workbench::WorkbenchState::default())
         .setup(|app| {
+            // Once, off this thread. Dual-read still finds a record this has
+            // not renamed yet, so a failed migration does not block startup.
+            // MCP and gitpulsed do not run this path and stay read-only.
+            if let Err(error) = std::thread::Builder::new()
+                .name("repository-trust-migrate".into())
+                .spawn(|| match repository_trust::persistent_root() {
+                    Ok(root) => {
+                        if let Err(error) = repository_trust::migrate_store(&root) {
+                            log::warn!(target: "trust", "repository trust migration failed: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(target: "trust", "repository trust migration skipped: {error}");
+                    }
+                })
+            {
+                log::warn!(target: "trust", "repository trust migration did not start: {error}");
+            }
             // Installed before anything can mutate, so the first guarded action
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());

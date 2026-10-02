@@ -42,6 +42,9 @@ pub const SHARED_DIRECTORY: &str = "REPOSITORY_DIRECTORY_IS_SHARED";
 const MAX_METADATA: u64 = 16 * 1024;
 const MAX_RECORD: u64 = 128 * 1024;
 const MAX_SESSION_GRANTS: usize = 4096;
+/// How many directory entries one migration pass examines. The rest are left
+/// in place and logged; dual-read still finds them.
+const MAX_MIGRATION_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct DirectoryIdentity {
@@ -61,6 +64,49 @@ struct Identity {
     checkout: DirectoryIdentity,
     git_dir: DirectoryIdentity,
     common_dir: DirectoryIdentity,
+}
+
+impl DirectoryIdentity {
+    /// Whether a stored approval still names this directory.
+    ///
+    /// Unix compares the canonical path, the inode, and the birth time.
+    /// `device` stays in the serialized record so old files still parse, and
+    /// [`pin_and_admit`] still compares `identity.checkout.device` for an
+    /// in-process pin. It is not part of this comparison: macOS assigns
+    /// `st_dev` when a volume is mounted, and a reboot renumbers it.
+    /// Windows compares `file_identity`, whose volume serial stays put across
+    /// boots.
+    ///
+    /// # Security impact
+    ///
+    /// A same-user attacker who can mount a crafted volume over the exact path
+    /// could match an approval. That user can already edit the 0600 trust
+    /// store.
+    fn same_persisted_object(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.created_ns == other.created_ns
+            && self.persisted_object_matches(other)
+    }
+
+    #[cfg(unix)]
+    fn persisted_object_matches(&self, other: &Self) -> bool {
+        self.inode == other.inode
+    }
+
+    #[cfg(windows)]
+    fn persisted_object_matches(&self, other: &Self) -> bool {
+        self.file_identity == other.file_identity
+    }
+}
+
+impl Identity {
+    /// Persisted match for a pre-repository record. `version` stays with the
+    /// caller, because version 1 is what that scheme means.
+    fn same_persisted(&self, other: &Self) -> bool {
+        self.checkout.same_persisted_object(&other.checkout)
+            && self.git_dir.same_persisted_object(&other.git_dir)
+            && self.common_dir.same_persisted_object(&other.common_dir)
+    }
 }
 
 /// What an approval binds.
@@ -313,14 +359,17 @@ fn member_of_repository(current: &Identity) -> bool {
 
 /// Where a repository's approval is stored.
 ///
-/// These hashes are only bounded filenames, never authentication checks. A
-/// collision cannot grant trust: the stored identity must match below. The
-/// suffix keeps this namespace disjoint from [`legacy_record`], so a
-/// pre-repository approval can never be read back as a repository one.
+/// The filename is FNV-1a 64 over the path's OS bytes. These hashes are only
+/// bounded filenames, never authentication checks. A collision cannot grant
+/// trust: the stored identity must match below. The suffix keeps this
+/// namespace disjoint from [`legacy_record`], so a pre-repository approval
+/// can never be read back as a repository one. Lookup also tries the previous
+/// `DefaultHasher` name; [`migrate_store`] moves what it finds.
 fn repository_record(root: &Path, repository: &Path) -> PathBuf {
-    let mut key = DefaultHasher::new();
-    repository.hash(&mut key);
-    root.join(format!("{:016x}.repository.json", key.finish()))
+    root.join(format!(
+        "{:016x}.repository.json",
+        fnv1a64(repository.as_os_str().as_encoded_bytes())
+    ))
 }
 
 /// Where approvals were stored before the unit of trust became the repository:
@@ -331,9 +380,10 @@ fn repository_record(root: &Path, repository: &Path) -> PathBuf {
 /// named and nothing else — the family is only ever extended by a grant made
 /// under the current scheme.
 fn legacy_record(root: &Path, checkout: &Path) -> PathBuf {
-    let mut key = DefaultHasher::new();
-    checkout.hash(&mut key);
-    root.join(format!("{:016x}.json", key.finish()))
+    root.join(format!(
+        "{:016x}.json",
+        fnv1a64(checkout.as_os_str().as_encoded_bytes())
+    ))
 }
 
 /// Reads a stored record, refusing anything that is not a plain regular file.
@@ -355,7 +405,7 @@ fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Stri
 /// — which has not changed; what a record contains carries its own version.
 /// Renaming this would orphan the approvals [`legacy_record`] deliberately
 /// still reads, which is the whole of the upgrade path.
-fn persistent_root() -> Result<PathBuf, String> {
+pub(crate) fn persistent_root() -> Result<PathBuf, String> {
     crate::tool_config::default_config_dir()
         .map(|dir| dir.join("repository-trust-v1"))
         .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
@@ -365,8 +415,9 @@ fn persistent_root() -> Result<PathBuf, String> {
 /// exact checkout that was approved or one that repository vouches for.
 fn covers(grant: &Grant, current: &Identity) -> bool {
     grant.version == GRANT_VERSION
-        && grant.repository == current.common_dir
-        && (grant.approved == current.checkout || member_of_repository(current))
+        && grant.repository.same_persisted_object(&current.common_dir)
+        && (grant.approved.same_persisted_object(&current.checkout)
+            || member_of_repository(current))
 }
 
 /// What the persisted records reach for `current`.
@@ -374,23 +425,136 @@ fn covers(grant: &Grant, current: &Identity) -> bool {
 /// The repository namespace is consulted first and wins outright: once a grant
 /// under the current scheme covers this checkout, an older record for it is
 /// spent history, not a downgrade.
+fn record_candidates(stable: PathBuf, previous: PathBuf) -> Vec<PathBuf> {
+    if stable == previous {
+        vec![stable]
+    } else {
+        vec![stable, previous]
+    }
+}
+
+fn repository_records(root: &Path, repository: &Path) -> Vec<PathBuf> {
+    record_candidates(
+        repository_record(root, repository),
+        root.join(format!(
+            "{:016x}.repository.json",
+            default_hasher_digest(repository)
+        )),
+    )
+}
+
+fn legacy_records(root: &Path, checkout: &Path) -> Vec<PathBuf> {
+    record_candidates(
+        legacy_record(root, checkout),
+        root.join(format!("{:016x}.json", default_hasher_digest(checkout))),
+    )
+}
+
+/// Reads the stable filename first. A damaged stable record fails closed;
+/// the previous `DefaultHasher` name is only used when the stable one is absent.
+fn stored_first<T: serde::de::DeserializeOwned>(paths: &[PathBuf]) -> Result<Option<T>, String> {
+    for path in paths {
+        match stored::<T>(path)? {
+            Some(value) => return Ok(Some(value)),
+            None => continue,
+        }
+    }
+    Ok(None)
+}
+
+fn persisted_difference(saved: &DirectoryIdentity, live: &DirectoryIdentity) -> Option<String> {
+    let mut fields = Vec::new();
+    if saved.path != live.path {
+        fields.push("path");
+    }
+    if saved.created_ns != live.created_ns {
+        fields.push("birth time");
+    }
+    #[cfg(unix)]
+    if saved.inode != live.inode {
+        fields.push("inode");
+    }
+    #[cfg(windows)]
+    if saved.file_identity != live.file_identity {
+        fields.push("file identity");
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields.join(", "))
+    }
+}
+
+fn warn_grant_mismatch(grant: &Grant, current: &Identity) {
+    let mut reasons = Vec::new();
+    if grant.version != GRANT_VERSION {
+        reasons.push("version".to_string());
+    }
+    if let Some(fields) = persisted_difference(&grant.repository, &current.common_dir) {
+        reasons.push(format!("repository {fields}"));
+    }
+    if let Some(fields) = persisted_difference(&grant.approved, &current.checkout) {
+        reasons.push(format!("approved checkout {fields}"));
+    } else if grant.version == GRANT_VERSION
+        && grant.repository.same_persisted_object(&current.common_dir)
+        && !member_of_repository(current)
+    {
+        reasons.push("checkout is not a member of the approved repository".to_string());
+    }
+    if !reasons.is_empty() {
+        log::warn!(
+            target: "trust",
+            "stored repository approval does not match this checkout: {}",
+            reasons.join("; ")
+        );
+    }
+}
+
+fn warn_legacy_mismatch(saved: &Identity, current: &Identity) {
+    let mut reasons = Vec::new();
+    if saved.version != 1 {
+        reasons.push("version".to_string());
+    }
+    for (label, saved_dir, live_dir) in [
+        ("checkout", &saved.checkout, &current.checkout),
+        ("git dir", &saved.git_dir, &current.git_dir),
+        ("repository", &saved.common_dir, &current.common_dir),
+    ] {
+        if let Some(fields) = persisted_difference(saved_dir, live_dir) {
+            reasons.push(format!("{label} {fields}"));
+        }
+    }
+    if !reasons.is_empty() {
+        log::warn!(
+            target: "trust",
+            "stored checkout approval does not match this checkout: {}",
+            reasons.join("; ")
+        );
+    }
+}
+
 fn read_grant(root: &Path, current: &Identity) -> Result<TrustScope, String> {
-    if let Some(grant) = stored::<Grant>(&repository_record(root, &current.common_dir.path))? {
+    if let Some(grant) = stored_first::<Grant>(&repository_records(root, &current.common_dir.path))?
+    {
         if covers(&grant, current) {
             return Ok(TrustScope::Repository);
         }
+        warn_grant_mismatch(&grant, current);
     }
-    let Some(saved) = stored::<Identity>(&legacy_record(root, &current.checkout.path))? else {
+    let Some(saved) = stored_first::<Identity>(&legacy_records(root, &current.checkout.path))?
+    else {
         return Ok(TrustScope::None);
     };
-    // Unchanged: exactly the checkout this record named, proved by whole
-    // identity equality. Reporting it as `Checkout` rather than `true` widens
-    // nothing — it only stops the caller from mistaking it for family-wide.
-    Ok(if saved.version == 1 && saved == *current {
-        TrustScope::Checkout
+    // Exactly the checkout this record named. Reporting it as `Checkout`
+    // widens nothing — it only stops the caller from mistaking a
+    // pre-repository approval for family-wide coverage. Device is ignored;
+    // inode, birth time, and path are not.
+    if saved.version == 1 && saved.same_persisted(current) {
+        Ok(TrustScope::Checkout)
     } else {
-        TrustScope::None
-    })
+        warn_legacy_mismatch(&saved, current);
+        Ok(TrustScope::None)
+    }
 }
 
 fn scope(current: &Identity) -> Result<TrustScope, String> {
@@ -592,7 +756,18 @@ fn save_grant(root: &Path, current: &Grant) -> Result<(), String> {
             .and_then(|_| file.sync_all())
             .map_err(|e| format!("Cannot save repository trust: {e}"))?;
         drop(file);
-        fs::rename(&temporary, &path).map_err(|e| format!("Cannot publish repository trust: {e}"))
+        fs::rename(&temporary, &path)
+            .map_err(|e| format!("Cannot publish repository trust: {e}"))?;
+        // The file was synced above. The directory entry is what a crash
+        // between rename and power loss drops, so the parent has to be synced
+        // too. Windows commits the rename through the file's sync.
+        #[cfg(unix)]
+        {
+            fs::File::open(root)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| format!("Cannot persist repository trust directory: {e}"))?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         if let Err(error) = fs::remove_file(&temporary) {
@@ -634,6 +809,155 @@ pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result
         }
         grants.insert(granted.repository.path.clone(), granted);
         Ok(())
+    }
+}
+
+/// FNV-1a 64 over raw bytes. Record filenames use this so a Rust release that
+/// changes `std::collections::hash_map::DefaultHasher` cannot orphan approvals.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Filename digest written before record names moved to [`fnv1a64`].
+///
+/// Lookup still accepts it. New records and [`migrate_store`] do not.
+fn default_hasher_digest(path: &Path) -> u64 {
+    let mut key = DefaultHasher::new();
+    path.hash(&mut key);
+    key.finish()
+}
+
+/// Moves stored approvals onto the stable filenames [`repository_record`] and
+/// [`legacy_record`] now derive, using the path stored inside each record.
+///
+/// At most [`MAX_MIGRATION_ENTRIES`] directory entries are examined. Symlinks,
+/// fifos, corrupt files, oversized files, and anything that is not a trust
+/// record stay where they are. A stable name that already holds a different
+/// repository's record is not replaced. The desktop calls this once, off the
+/// main thread. MCP and `gitpulsed` stay read-only and must not call it.
+pub fn migrate_store(root: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Cannot migrate repository trust: {error}")),
+    };
+    // Snapshot first. Renaming while `read_dir` is still yielding is
+    // unspecified, and a migrated name would otherwise be visited twice or
+    // push a later record past the cap.
+    let mut paths = Vec::new();
+    let mut stopped_early = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Cannot migrate repository trust: {error}"))?;
+        if paths.len() == MAX_MIGRATION_ENTRIES {
+            stopped_early = true;
+            break;
+        }
+        paths.push(entry.path());
+    }
+    for path in &paths {
+        migrate_entry(root, path);
+    }
+    if stopped_early {
+        log::warn!(
+            target: "trust",
+            "repository trust migration stopped after {MAX_MIGRATION_ENTRIES} entries; later records were left unchanged"
+        );
+    }
+    Ok(())
+}
+
+fn migrate_entry(root: &Path, path: &Path) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        log::warn!(target: "trust", "skipping repository trust entry with a non-UTF-8 name");
+        return;
+    };
+    // `save_grant` publishes through a `.grant-*` temporary. Migration must
+    // not rename that out from under the writer.
+    if name.starts_with('.') {
+        return;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!(
+                target: "trust",
+                "skipping repository trust entry {}: {error}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        log::warn!(
+            target: "trust",
+            "skipping non-regular repository trust entry {}",
+            path.display()
+        );
+        return;
+    }
+    if !name.ends_with(".json") {
+        log::warn!(
+            target: "trust",
+            "skipping foreign repository trust entry {}",
+            path.display()
+        );
+        return;
+    }
+    match stored::<Grant>(path) {
+        Ok(Some(grant)) => {
+            relocate_record(path, &repository_record(root, &grant.repository.path));
+            return;
+        }
+        Ok(None) => return,
+        Err(_) => {}
+    }
+    match stored::<Identity>(path) {
+        Ok(Some(saved)) => relocate_record(path, &legacy_record(root, &saved.checkout.path)),
+        Ok(None) => {}
+        Err(error) => {
+            log::warn!(
+                target: "trust",
+                "skipping unreadable repository trust entry {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn relocate_record(source: &Path, dest: &Path) {
+    if source == dest {
+        return;
+    }
+    match fs::symlink_metadata(dest) {
+        Ok(_) => log::warn!(
+            target: "trust",
+            "leaving {} in place; stable record {} already exists",
+            source.display(),
+            dest.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(error) = fs::rename(source, dest) {
+                log::warn!(
+                    target: "trust",
+                    "cannot rename trust record {} to {}: {error}",
+                    source.display(),
+                    dest.display()
+                );
+            }
+        }
+        Err(error) => log::warn!(
+            target: "trust",
+            "cannot check stable trust record {}: {error}",
+            dest.display()
+        ),
     }
 }
 
@@ -1779,5 +2103,591 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(inspect(repo.path().to_str().unwrap()).is_err());
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    fn rewrite_devices(path: &Path, device: u64) {
+        let mut grant_or_identity = fs::read_to_string(path).unwrap();
+        let needle = "\"device\":";
+        assert!(
+            grant_or_identity.contains(needle),
+            "record {} has no device field",
+            path.display()
+        );
+        let mut rewritten = String::with_capacity(grant_or_identity.len());
+        while let Some(index) = grant_or_identity.find(needle) {
+            let (head, tail) = grant_or_identity.split_at(index + needle.len());
+            rewritten.push_str(head);
+            let tail = tail.trim_start_matches(' ');
+            let digits = tail
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>();
+            assert!(!digits.is_empty(), "device field was not an integer");
+            rewritten.push_str(&device.to_string());
+            grant_or_identity = tail[digits.len()..].to_owned();
+        }
+        rewritten.push_str(&grant_or_identity);
+        fs::write(path, rewritten).unwrap();
+    }
+
+    fn fnv_record_name(path: &Path, suffix: &str) -> String {
+        format!(
+            "{:016x}{suffix}",
+            fnv1a64(path.as_os_str().as_encoded_bytes())
+        )
+    }
+
+    fn default_hasher_record_name(path: &Path, suffix: &str) -> String {
+        format!("{:016x}{suffix}", default_hasher_digest(path))
+    }
+
+    /// macOS renumbers `st_dev` at mount. A saved approval whose device field
+    /// was rewritten — and nothing else — still has to cover the repository,
+    /// and a pre-repository record still has to cover exactly its checkout.
+    #[cfg(unix)]
+    #[test]
+    fn trust_persistence_device_drift_still_reads_repository_and_legacy_checkout() {
+        let repo = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        save_grant(storage.path(), &approval_for(&current)).unwrap();
+        let record = repository_record(storage.path(), &current.common_dir.path);
+        let drifted = current.common_dir.device.wrapping_add(1);
+        rewrite_devices(&record, drifted);
+        let saved: Grant = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_ne!(saved.repository.device, current.common_dir.device);
+        assert_eq!(saved.repository.inode, current.common_dir.inode);
+        assert_eq!(saved.repository.created_ns, current.common_dir.created_ns);
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Repository
+        );
+
+        fs::remove_file(&record).unwrap();
+        let legacy = legacy_record(storage.path(), &current.checkout.path);
+        fs::write(&legacy, serde_json::to_vec(&current).unwrap()).unwrap();
+        rewrite_devices(&legacy, drifted);
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Checkout
+        );
+    }
+
+    /// Device is the field a remount changes. Inode, birth time, path, and
+    /// version each still mean a different object, so none of them may start
+    /// matching just because device no longer does.
+    #[test]
+    fn trust_persistence_inode_birth_path_and_version_do_not_widen() {
+        let repo = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let record = repository_record(storage.path(), &current.common_dir.path);
+
+        let mut changed = approval_for(&current);
+        #[cfg(unix)]
+        {
+            changed.repository.inode = changed.repository.inode.wrapping_add(1);
+        }
+        #[cfg(windows)]
+        {
+            changed.repository.file_identity.1[0] ^= 0x5a;
+        }
+        fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "inode or file identity"
+        );
+
+        let mut changed = approval_for(&current);
+        changed.repository.created_ns = changed.repository.created_ns.wrapping_add(1);
+        fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "birth time"
+        );
+
+        let mut changed = approval_for(&current);
+        changed.repository.path.push("replaced");
+        fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "path"
+        );
+
+        let mut changed = approval_for(&current);
+        changed.version = GRANT_VERSION + 1;
+        fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "version"
+        );
+
+        let legacy = legacy_record(storage.path(), &current.checkout.path);
+        fs::remove_file(&record).unwrap();
+
+        let mut saved = current.clone();
+        #[cfg(unix)]
+        {
+            saved.checkout.inode = saved.checkout.inode.wrapping_add(1);
+        }
+        #[cfg(windows)]
+        {
+            saved.checkout.file_identity.1[0] ^= 0x5a;
+        }
+        fs::write(&legacy, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "legacy inode or file identity"
+        );
+
+        let mut saved = current.clone();
+        saved.checkout.created_ns = saved.checkout.created_ns.wrapping_add(1);
+        fs::write(&legacy, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "legacy birth time"
+        );
+
+        let mut saved = current.clone();
+        saved.checkout.path.push("replaced");
+        fs::write(&legacy, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "legacy path"
+        );
+
+        let mut saved = current.clone();
+        saved.version = GRANT_VERSION;
+        fs::write(&legacy, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None,
+            "legacy version"
+        );
+    }
+
+    /// Published FNV-1a 64 vectors, plus the filename a fixed path must produce.
+    #[test]
+    fn trust_persistence_stable_name_matches_fnv1a64_vector() {
+        assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+        let path = Path::new("/var/empty");
+        assert_eq!(
+            fnv1a64(b"/var/empty"),
+            0x2772b6406d1afbdd,
+            "pinned vector for the bytes of /var/empty"
+        );
+        assert_eq!(
+            fnv1a64(path.as_os_str().as_encoded_bytes()),
+            0x2772b6406d1afbdd
+        );
+        assert_eq!(
+            repository_record(Path::new("store"), path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2772b6406d1afbdd.repository.json"
+        );
+        assert_eq!(
+            legacy_record(Path::new("store"), path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2772b6406d1afbdd.json"
+        );
+    }
+
+    #[test]
+    fn trust_persistence_stable_name_record_is_found() {
+        let repo = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let stable = storage.path().join(fnv_record_name(
+            &current.common_dir.path,
+            ".repository.json",
+        ));
+        let previous = storage.path().join(default_hasher_record_name(
+            &current.common_dir.path,
+            ".repository.json",
+        ));
+        assert_ne!(
+            stable, previous,
+            "this path must distinguish FNV-1a from DefaultHasher"
+        );
+        fs::write(
+            &stable,
+            serde_json::to_vec(&approval_for(&current)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !previous.exists(),
+            "the lookup must find the stable name with no DefaultHasher sibling"
+        );
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Repository
+        );
+    }
+
+    #[test]
+    fn trust_persistence_default_hasher_name_is_still_found() {
+        let repo = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let previous = storage.path().join(default_hasher_record_name(
+            &current.common_dir.path,
+            ".repository.json",
+        ));
+        fs::write(
+            &previous,
+            serde_json::to_vec(&approval_for(&current)).unwrap(),
+        )
+        .unwrap();
+        let stable = repository_record(storage.path(), &current.common_dir.path);
+        assert_ne!(
+            stable, previous,
+            "stable filenames must not stay on DefaultHasher"
+        );
+        assert!(!stable.exists());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Repository
+        );
+
+        fs::remove_file(&previous).unwrap();
+        let previous_legacy = storage
+            .path()
+            .join(default_hasher_record_name(&current.checkout.path, ".json"));
+        fs::write(&previous_legacy, serde_json::to_vec(&current).unwrap()).unwrap();
+        let stable_legacy = legacy_record(storage.path(), &current.checkout.path);
+        assert_ne!(stable_legacy, previous_legacy);
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Checkout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_persistence_migrate_store_is_idempotent_and_skips_unsafe_entries() {
+        use std::os::unix::fs::symlink;
+        let repo = fixture();
+        let other = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let foreign = identity(other.path().to_str().unwrap()).unwrap();
+
+        let previous = storage.path().join(default_hasher_record_name(
+            &current.common_dir.path,
+            ".repository.json",
+        ));
+        fs::write(
+            &previous,
+            serde_json::to_vec(&approval_for(&current)).unwrap(),
+        )
+        .unwrap();
+        let previous_legacy = storage
+            .path()
+            .join(default_hasher_record_name(&current.checkout.path, ".json"));
+        fs::write(&previous_legacy, serde_json::to_vec(&current).unwrap()).unwrap();
+
+        migrate_store(storage.path()).unwrap();
+        let stable = repository_record(storage.path(), &current.common_dir.path);
+        let stable_legacy = legacy_record(storage.path(), &current.checkout.path);
+        assert!(stable.exists());
+        assert!(stable_legacy.exists());
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::Repository,
+            "the repository record outranks the legacy one that migrated beside it"
+        );
+        if previous != stable {
+            assert!(
+                !previous.exists(),
+                "the old repository name was not retired"
+            );
+        }
+        let once = fs::read_dir(storage.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        migrate_store(storage.path()).unwrap();
+        let twice = fs::read_dir(storage.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            once.len(),
+            twice.len(),
+            "a second migration must not move files"
+        );
+        for name in &once {
+            assert!(twice.contains(name), "second migration lost {name:?}");
+        }
+
+        let payload = storage.path().join("payload");
+        fs::write(&payload, b"not-a-record").unwrap();
+        let link = storage.path().join("linked.json");
+        symlink(&payload, &link).unwrap();
+        let corrupt = storage.path().join("corrupt.json");
+        fs::write(&corrupt, b"{").unwrap();
+        let oversized = storage.path().join("oversized.json");
+        fs::write(&oversized, vec![b'x'; MAX_RECORD as usize + 1]).unwrap();
+        let fifo = storage.path().join("pending.json");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        migrate_store(storage.path()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "migration blocked on a fifo"
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&corrupt).unwrap(), b"{");
+        assert_eq!(fs::metadata(&oversized).unwrap().len(), MAX_RECORD + 1);
+        assert!(fifo.exists());
+
+        let occupied = repository_record(storage.path(), &foreign.common_dir.path);
+        fs::write(
+            &occupied,
+            serde_json::to_vec(&approval_for(&current)).unwrap(),
+        )
+        .unwrap();
+        let incoming = storage.path().join(default_hasher_record_name(
+            &foreign.common_dir.path,
+            ".repository.json",
+        ));
+        if incoming != occupied {
+            fs::write(
+                &incoming,
+                serde_json::to_vec(&approval_for(&foreign)).unwrap(),
+            )
+            .unwrap();
+            let kept = fs::read(&occupied).unwrap();
+            migrate_store(storage.path()).unwrap();
+            assert_eq!(
+                fs::read(&occupied).unwrap(),
+                kept,
+                "migration renamed over a different repository's record"
+            );
+            assert!(incoming.exists());
+        }
+    }
+
+    #[test]
+    fn trust_persistence_migrate_store_stops_after_4096_entries() {
+        assert_eq!(MAX_MIGRATION_ENTRIES, 4096);
+        let storage = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let mut grant = approval_for(&current);
+        for n in 0..(MAX_MIGRATION_ENTRIES + 1) {
+            grant.repository.path = PathBuf::from(format!("/synthetic/repo-{n}"));
+            let path = storage.path().join(default_hasher_record_name(
+                &grant.repository.path,
+                ".repository.json",
+            ));
+            fs::write(&path, serde_json::to_vec(&grant).unwrap()).unwrap();
+        }
+        migrate_store(storage.path()).unwrap();
+        let mut renamed = 0usize;
+        let mut left = 0usize;
+        for n in 0..(MAX_MIGRATION_ENTRIES + 1) {
+            let repository = PathBuf::from(format!("/synthetic/repo-{n}"));
+            let previous = storage
+                .path()
+                .join(default_hasher_record_name(&repository, ".repository.json"));
+            let stable = storage
+                .path()
+                .join(fnv_record_name(&repository, ".repository.json"));
+            if previous == stable {
+                continue;
+            }
+            if stable.exists() {
+                renamed += 1;
+            }
+            if previous.exists() {
+                left += 1;
+            }
+        }
+        assert_eq!(renamed, MAX_MIGRATION_ENTRIES);
+        assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn trust_persistence_two_thousand_records_stay_under_budget() {
+        let repo = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let mut grant = approval_for(&current);
+        const RECORDS: usize = 2000;
+        for n in 0..RECORDS {
+            grant.repository.path = PathBuf::from(format!("/mix/{n}"));
+            let (name, bytes) = if n % 3 == 2 {
+                (format!("notes-{n}.txt"), b"{".to_vec())
+            } else if n % 3 == 1 {
+                let mut legacy = current.clone();
+                legacy.checkout.path = grant.repository.path.clone();
+                (
+                    default_hasher_record_name(&legacy.checkout.path, ".json"),
+                    serde_json::to_vec(&legacy).unwrap(),
+                )
+            } else {
+                (
+                    default_hasher_record_name(&grant.repository.path, ".repository.json"),
+                    serde_json::to_vec(&grant).unwrap(),
+                )
+            };
+            fs::write(storage.path().join(name), bytes).unwrap();
+        }
+        fs::write(
+            storage.path().join(default_hasher_record_name(
+                &current.common_dir.path,
+                ".repository.json",
+            )),
+            serde_json::to_vec(&approval_for(&current)).unwrap(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        migrate_store(storage.path()).unwrap();
+        let migrating = started.elapsed();
+        let started = std::time::Instant::now();
+        let scope = read_grant(storage.path(), &current).unwrap();
+        let reading = started.elapsed();
+        assert_eq!(scope, TrustScope::Repository);
+        println!("records={RECORDS} migrate={migrating:?} read_grant={reading:?}");
+        for (label, taken) in [("migrate", migrating), ("read_grant", reading)] {
+            assert!(
+                taken < crate::hooks::BUDGET / 5,
+                "{label} took {taken:?} on {RECORDS} records, which threatens the {:?} hook budget",
+                crate::hooks::BUDGET
+            );
+        }
+    }
+
+    #[test]
+    fn trust_persistence_randomized_mutations_never_cross_authorize() {
+        let repo = fixture();
+        let other = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(repo.path().to_str().unwrap()).unwrap();
+        let foreign = identity(other.path().to_str().unwrap()).unwrap();
+        let record = repository_record(storage.path(), &current.common_dir.path);
+        let foreign_record = repository_record(storage.path(), &foreign.common_dir.path);
+        let original = serde_json::to_vec(&approval_for(&current)).unwrap();
+        fs::write(&record, &original).unwrap();
+
+        #[cfg(unix)]
+        {
+            let mut drifted = approval_for(&current);
+            drifted.repository.device = drifted.repository.device.wrapping_add(1);
+            drifted.approved.device = drifted.approved.device.wrapping_add(1);
+            fs::write(&record, serde_json::to_vec(&drifted).unwrap()).unwrap();
+            assert_eq!(
+                read_grant(storage.path(), &current).unwrap(),
+                TrustScope::Repository,
+                "device drift of the approved repository"
+            );
+            assert!(!read_grant(storage.path(), &foreign).unwrap().admits());
+            fs::write(&record, &original).unwrap();
+        }
+
+        let mut state = 0xdec0_de01_u64;
+        for case in 0..48u64 {
+            let mut bytes = original.clone();
+            let start = (state as usize) % bytes.len();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = (state as usize % 24) + 1;
+            for offset in 0..len {
+                let index = (start + offset) % bytes.len();
+                bytes[index] ^= state.wrapping_add(case).rotate_left((offset as u32) % 8) as u8;
+            }
+            fs::write(&record, &bytes).unwrap();
+            let own = std::panic::catch_unwind(|| read_grant(storage.path(), &current));
+            let theirs = std::panic::catch_unwind(|| read_grant(storage.path(), &foreign));
+            assert!(
+                own.is_ok(),
+                "case {case} panicked reading the mutated record"
+            );
+            assert!(
+                theirs.is_ok(),
+                "case {case} panicked reading the other repository"
+            );
+            let theirs = theirs.unwrap().unwrap_or(TrustScope::None);
+            assert!(
+                !theirs.admits(),
+                "case {case} authorized a different repository: {theirs:?}"
+            );
+        }
+
+        fs::write(&record, &original).unwrap();
+        let mut toward = approval_for(&current);
+        toward.repository.path = foreign.common_dir.path.clone();
+        fs::write(&foreign_record, serde_json::to_vec(&toward).unwrap()).unwrap();
+        assert!(
+            !read_grant(storage.path(), &foreign).unwrap().admits(),
+            "another repository's path with this repository's inode"
+        );
+        #[cfg(unix)]
+        {
+            let mut toward = approval_for(&foreign);
+            toward.repository.inode = current.common_dir.inode;
+            fs::write(&foreign_record, serde_json::to_vec(&toward).unwrap()).unwrap();
+            assert!(!read_grant(storage.path(), &foreign).unwrap().admits());
+            let mut toward = approval_for(&foreign);
+            toward.repository.created_ns = current.common_dir.created_ns;
+            fs::write(&foreign_record, serde_json::to_vec(&toward).unwrap()).unwrap();
+            assert!(!read_grant(storage.path(), &foreign).unwrap().admits());
+        }
+        #[cfg(windows)]
+        {
+            let mut toward = approval_for(&foreign);
+            toward.repository.file_identity = current.common_dir.file_identity;
+            fs::write(&foreign_record, serde_json::to_vec(&toward).unwrap()).unwrap();
+            assert!(
+                !read_grant(storage.path(), &foreign).unwrap().admits(),
+                "another repository's path with this file identity"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_persistence_concurrent_migrate_and_read_never_cross_authorize() {
+        let first = fixture();
+        let second = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let approved = identity(first.path().to_str().unwrap()).unwrap();
+        let other = identity(second.path().to_str().unwrap()).unwrap();
+        save_grant(storage.path(), &approval_for(&approved)).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let storage = storage.path();
+                let approved = approved.clone();
+                let other = other.clone();
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        save_grant(storage, &approval_for(&approved)).unwrap();
+                        migrate_store(storage).unwrap();
+                        let own = read_grant(storage, &approved).unwrap();
+                        let foreign = read_grant(storage, &other).unwrap();
+                        assert_eq!(own, TrustScope::Repository);
+                        assert!(!foreign.admits());
+                    }
+                });
+            }
+        });
     }
 }

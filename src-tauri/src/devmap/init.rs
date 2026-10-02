@@ -237,7 +237,16 @@ pub struct InitReport {
     /// open-tab set was synchronized into it.
     pub workspace_registry: Option<String>,
     /// Why the registry was not written, when it was not.
+    ///
+    /// A partial sync that omitted untrusted tabs still writes the registry,
+    /// so this stays unset and those paths are [`Self::skipped_untrusted`].
     pub workspace_reason: Option<String>,
+    /// Open tabs left out of the registry because trust refused them.
+    ///
+    /// Empty when nothing was skipped, including when the registry was not
+    /// written at all. A refused host is not a skipped member: the file has
+    /// to live in the host, so that failure is [`Self::workspace_reason`].
+    pub skipped_untrusted: Vec<String>,
     /// `devmap` resolved to a binary. Initialization still runs its ignore
     /// hygiene without one — it costs nothing and the directory may already
     /// exist from another host — but it will not create state for a tool that
@@ -259,6 +268,7 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
 
     let mut workspace_registry = None;
     let mut workspace_reason = None;
+    let mut skipped_untrusted = Vec::new();
     if open_repos.is_empty() {
         workspace_reason = Some("no open repositories to register".into());
     } else if !devmap_available && !state_dir.is_dir() {
@@ -274,7 +284,10 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
         );
     } else {
         match crate::workspace_registry::sync_open_tabs(repo_path, open_repos) {
-            Ok(snapshot) => workspace_registry = Some(snapshot.registry_path),
+            Ok(snapshot) => {
+                workspace_registry = Some(snapshot.registry_path);
+                skipped_untrusted = snapshot.skipped_untrusted;
+            }
             Err(reason) => workspace_reason = Some(reason),
         }
     }
@@ -285,6 +298,7 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
         exclude,
         workspace_registry,
         workspace_reason,
+        skipped_untrusted,
         devmap_available,
     })
 }
@@ -569,6 +583,32 @@ mod tests {
             .output()
             .expect("git status");
         assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
+    }
+
+    #[test]
+    fn initialize_keeps_the_registry_when_one_open_tab_is_untrusted() {
+        let _stub = super::super::cli::bind_test_binary("devmap");
+        let repo = init_repo();
+        let other = init_repo();
+        let untrusted = tempfile::TempDir::new().expect("tempdir");
+        git(untrusted.path(), &["init", "-b", "main"]);
+
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let other_path = other.path().to_string_lossy().into_owned();
+        let untrusted_path = untrusted.path().to_string_lossy().into_owned();
+        let report = initialize(
+            &repo_path,
+            &[repo_path.clone(), other_path, untrusted_path.clone()],
+        )
+        .expect("initialize");
+
+        assert!(
+            report.workspace_registry.is_some(),
+            "a skipped member must not erase the registry: {:?}",
+            report.workspace_reason
+        );
+        assert!(report.workspace_reason.is_none());
+        assert_eq!(report.skipped_untrusted, vec![untrusted_path]);
     }
 
     #[test]

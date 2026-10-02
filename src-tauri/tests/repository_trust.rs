@@ -424,7 +424,18 @@ fn metadata_inputs_are_bounded_and_untrusted_repository_records_have_no_authorit
 #[test]
 fn concurrent_grant_revoke_cycles_never_authorize_other_repositories() {
     let blocked = fixture();
+    let migration = tempfile::tempdir().unwrap();
     std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let root = migration.path();
+            let blocked = blocked.path();
+            scope.spawn(move || {
+                for _ in 0..32 {
+                    repository_trust::migrate_store(root).expect("migrate");
+                    assert!(repository_trust::require(blocked).is_err());
+                }
+            });
+        }
         for _ in 0..8 {
             let blocked = blocked.path();
             scope.spawn(move || {
@@ -611,12 +622,15 @@ fn trust_store(home: &Path) -> std::path::PathBuf {
 }
 
 /// The filename `legacy_record` derives. Private there, replicated here for
-/// the same reason and with the same safeguard.
+/// the same reason and with the same safeguard. FNV-1a 64 over the path's OS
+/// bytes — the same function the module uses, not `DefaultHasher`.
 fn legacy_record_name(checkout: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut key = std::collections::hash_map::DefaultHasher::new();
-    checkout.hash(&mut key);
-    format!("{:016x}.json", key.finish())
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in checkout.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}.json")
 }
 
 /// The whole failure, reproduced through the shipping code paths and then
@@ -772,4 +786,186 @@ fn a_pre_repository_approval_subprocess() {
         .expect("a real collision must escalate");
     assert!(decision.contains("\"ask\""), "{decision}");
     assert!(decision.contains("shared.txt"), "{decision}");
+}
+
+fn isolated_profile(command: &mut Command, home: &Path) {
+    command
+        .env("HOME", home)
+        .env("APPDATA", home.join("AppData"))
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+}
+
+fn spawn_exact(test: &str, home: &Path, main: &Path, worktree: Option<&Path>) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", test, "--ignored", "--nocapture"]);
+    isolated_profile(&mut command, home);
+    command
+        .env("GITPULSE_E2E_MAIN", main)
+        .env_remove("GITPULSE_E2E_WORKTREE");
+    if let Some(worktree) = worktree {
+        command.env("GITPULSE_E2E_WORKTREE", worktree);
+    }
+    command
+}
+
+/// Rewrite every persisted `device` number and leave inode, path, and birth
+/// time bytes untouched. A JSON re-parse would round `created_ns` through
+/// f64 and counterfeit a birth-time mismatch.
+fn drift_stored_devices(store: &Path) {
+    let mut rewritten = 0usize;
+    for entry in std::fs::read_dir(store).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let needle = "\"device\":";
+        assert!(
+            text.contains(needle),
+            "grant wrote no device field in {}",
+            path.display()
+        );
+        let mut rest = text.as_str();
+        let mut out = String::with_capacity(text.len() + 8);
+        while let Some(index) = rest.find(needle) {
+            let (head, tail) = rest.split_at(index + needle.len());
+            out.push_str(head);
+            let tail = tail.trim_start_matches(' ');
+            let digits = tail
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>();
+            assert!(!digits.is_empty());
+            let device: u64 = digits.parse().unwrap();
+            out.push_str(&(device.wrapping_add(1)).to_string());
+            rest = &tail[digits.len()..];
+        }
+        out.push_str(rest);
+        assert_ne!(out, text);
+        std::fs::write(&path, out).unwrap();
+        rewritten += 1;
+    }
+    assert!(rewritten >= 1, "the grant process wrote no trust record");
+}
+
+/// Process 1 approves into an isolated profile. The parent then rewrites the
+/// stored device the way a reboot does, and process 2 — a fresh address space,
+/// so no session grant — must still admit the checkout and its worktree.
+#[test]
+fn trust_persistence_restart_with_device_drift_honours_checkout_and_worktree() {
+    let repo = fixture();
+    commit(repo.path());
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("linked");
+    git(
+        repo.path(),
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    let home = tempfile::tempdir().unwrap();
+    let grant = spawn_exact(
+        "trust_persistence_grant_persisted_subprocess",
+        home.path(),
+        repo.path(),
+        Some(&linked),
+    )
+    .status()
+    .unwrap();
+    assert!(grant.success(), "process 1 did not record the approval");
+    drift_stored_devices(&trust_store(home.path()));
+    let restarted = spawn_exact(
+        "trust_persistence_require_persisted_subprocess",
+        home.path(),
+        repo.path(),
+        Some(&linked),
+    )
+    .status()
+    .unwrap();
+    assert!(
+        restarted.success(),
+        "process 2 refused an approval whose only change was the device number"
+    );
+}
+
+#[test]
+#[ignore = "driven by trust_persistence_restart_with_device_drift_honours_checkout_and_worktree"]
+fn trust_persistence_grant_persisted_subprocess() {
+    let main = std::env::var("GITPULSE_E2E_MAIN").unwrap();
+    let preview = repository_trust::inspect(&main).unwrap();
+    assert_eq!(preview.scope, repository_trust::TrustScope::None);
+    repository_trust::grant(&main, &preview.identity, true).unwrap();
+    assert_eq!(
+        repository_trust::inspect(&main).unwrap().scope,
+        repository_trust::TrustScope::Repository
+    );
+}
+
+#[test]
+#[ignore = "driven by trust_persistence_restart_with_device_drift_honours_checkout_and_worktree and the restart loop"]
+fn trust_persistence_require_persisted_subprocess() {
+    let main = Path::new(&std::env::var("GITPULSE_E2E_MAIN").unwrap()).to_path_buf();
+    repository_trust::require(&main).expect("the approved checkout");
+    if let Ok(worktree) = std::env::var("GITPULSE_E2E_WORKTREE") {
+        repository_trust::require(Path::new(&worktree))
+            .expect("a linked worktree of that checkout");
+    }
+}
+
+/// The grant process records the approval and then stays alive so the parent
+/// can kill it. The next process must still see the record. Readiness is a
+/// file, not stdout: a piped test harness block-buffers `println!`, so a
+/// parent waiting on a line waits until the process exits.
+#[test]
+#[ignore = "driven by trust_persistence_repeated_grant_kill_restart_never_loses_an_approval"]
+fn trust_persistence_grant_and_hold_subprocess() {
+    let main = std::env::var("GITPULSE_E2E_MAIN").unwrap();
+    let ready = std::env::var("GITPULSE_E2E_READY").unwrap();
+    let preview = repository_trust::inspect(&main).unwrap();
+    repository_trust::grant(&main, &preview.identity, true).unwrap();
+    std::fs::write(ready, b"granted").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+#[test]
+fn trust_persistence_repeated_grant_kill_restart_never_loses_an_approval() {
+    let repo = fixture();
+    let home = tempfile::tempdir().unwrap();
+    for round in 0..4 {
+        let ready = home.path().join(format!("ready-{round}"));
+        let mut grant = spawn_exact(
+            "trust_persistence_grant_and_hold_subprocess",
+            home.path(),
+            repo.path(),
+            None,
+        )
+        .env("GITPULSE_E2E_READY", &ready)
+        .spawn()
+        .unwrap();
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            if let Some(status) = grant.try_wait().unwrap() {
+                panic!(
+                    "round {round} grant process exited before recording the approval: {status}"
+                );
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "round {round} did not finish the grant"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        grant.kill().unwrap();
+        let _ = grant.wait();
+        let check = spawn_exact(
+            "trust_persistence_require_persisted_subprocess",
+            home.path(),
+            repo.path(),
+            None,
+        )
+        .status()
+        .unwrap();
+        assert!(
+            check.success(),
+            "round {round} lost the approval after the granting process was killed"
+        );
+    }
 }

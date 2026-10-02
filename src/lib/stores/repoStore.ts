@@ -189,6 +189,12 @@ export interface OpenRepoTab {
   isDirty: boolean;
   isLoading: boolean;
   error: string | null;
+  /**
+   * Set when opening or hydrating this tab failed because the repository
+   * is not trusted. Cleared only by a hydrate that succeeds. Background
+   * work skips these paths so a refusal stays one state, not a stream.
+   */
+  trustRequired?: boolean;
   currentBranch: string | null;
   conflictedCount: number;
   changedCount: number;
@@ -289,6 +295,12 @@ export interface RepoSession {
   isAmending: boolean;
   isLoading: boolean;
   error: string | null;
+  /**
+   * True when the last open or hydrate of this session failed with
+   * `REPOSITORY_TRUST_REQUIRED`. A later successful hydrate clears it.
+   * Schedulers treat it as "do not call the backend for this path".
+   */
+  trustRequired: boolean;
   generation: number;
   /** True once this session's first snapshot has landed and rendered. */
   hasHydrated: boolean;
@@ -381,6 +393,8 @@ export interface RepoState {
   terminalOpen: boolean;
   isLoading: boolean;
   error: string | null;
+  /** Active session needs trust before Git or background work may run. */
+  trustRequired: boolean;
   commitDraft: string;
   isAmending: boolean;
   isBare: boolean;
@@ -526,6 +540,7 @@ function emptyProjected(): RepoState {
     terminalOpen: false,
     isLoading: false,
     error: null,
+    trustRequired: false,
     commitDraft: "",
     isAmending: false,
     isBare: false,
@@ -581,6 +596,7 @@ function createSession(
     isAmending: extras.isAmending ?? false,
     isLoading: extras.isLoading ?? false,
     error: extras.error ?? null,
+    trustRequired: extras.trustRequired ?? false,
     generation: extras.generation ?? nextSessionGeneration(),
     hasHydrated: extras.hasHydrated ?? false,
     statsPending: extras.statsPending ?? false,
@@ -615,6 +631,7 @@ function project(internal: InternalState): RepoState {
       isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
       isLoading: session?.isLoading ?? false,
       error: session?.error ?? null,
+      trustRequired: session?.trustRequired === true,
       currentBranch: session?.currentBranch ?? null,
       conflictedCount: statuses.filter((file) => file.is_conflicted).length,
       changedCount: new Set(statuses.map((file) => file.path)).size,
@@ -650,6 +667,7 @@ function project(internal: InternalState): RepoState {
     terminalOpen: active?.terminalOpen ?? false,
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
+    trustRequired: active?.trustRequired === true,
     commitDraft: active?.commitDraft ?? "",
     isAmending: active?.isAmending ?? false,
     isBare: active?.isBare ?? false,
@@ -664,6 +682,35 @@ function project(internal: InternalState): RepoState {
     tagsFailed: active?.tagsFailed ?? false,
     watch: active?.watch ?? WATCH_UNKNOWN,
     fetchedAt: active?.fetchedAt ?? null,
+  };
+}
+
+const REPOSITORY_TRUST_REQUIRED = "REPOSITORY_TRUST_REQUIRED";
+
+export function repositoryTrustRefused(message: string): boolean {
+  return message.includes(REPOSITORY_TRUST_REQUIRED);
+}
+
+/**
+ * Open paths that may receive background work. A session with
+ * `trustRequired` is omitted, and it is not used as the active key.
+ */
+export function pathsTrustedForBackground(
+  tabs: readonly { path: string; trustRequired?: boolean }[],
+  activePath: string | null,
+): { activeKey: string | null; retainedKeys: string[] } {
+  const retainedKeys: string[] = [];
+  let activeBlocked = false;
+  for (const tab of tabs) {
+    if (tab.trustRequired) {
+      if (tab.path === activePath) activeBlocked = true;
+      continue;
+    }
+    retainedKeys.push(tab.path);
+  }
+  return {
+    activeKey: activePath && !activeBlocked ? activePath : null,
+    retainedKeys,
   };
 }
 
@@ -824,6 +871,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     ) {
       return;
     }
+    // A refused repository stays on the one error hydrate already recorded.
+    // Polling it again would re-run Git and re-log the same refusal.
+    if (session!.trustRequired) return;
     const path = session!.path;
     const generation = session!.generation;
     const sessionId = session!.id;
@@ -1300,6 +1350,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         ...snapshot,
         isLoading: false,
         error: null,
+        trustRequired: false,
         hasHydrated: true,
       });
       // Stats re-drain even when the snapshot was a no-op: a previously
@@ -1316,9 +1367,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
+      const message = formatError(err);
       applyToSession(id, generation, {
         isLoading: false,
-        error: formatError(err),
+        error: message,
+        ...(repositoryTrustRefused(message) ? { trustRequired: true } : {}),
       });
     }
   }
@@ -1551,11 +1604,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const requestId = ++openEpoch;
       internal = { ...internal, workspaceError: null };
       let resolved: ResolvedRepo | null = null;
+      let deferredTrustMessage: string | null = null;
       try {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
-        const trustRequired = formatError(err).includes("REPOSITORY_TRUST_REQUIRED");
-        if (trustRequired && !extras.deferTrust) {
+        const message = formatError(err);
+        const refused = repositoryTrustRefused(message);
+        if (refused && !extras.deferTrust) {
           try {
             const trustedPath = await requestRepositoryTrust(rawPath, "Trust and Open", invokeFn);
             if (!trustedPath) return false;
@@ -1565,7 +1620,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             publish();
             return false;
           }
-        } else if (!trustRequired && !extras.allowBroken) {
+        } else if (refused) {
+          deferredTrustMessage = message;
+        } else if (!extras.allowBroken) {
           internal = { ...internal, workspaceError: formatError(err) };
           publish();
           return false;
@@ -1658,10 +1715,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             pinned:
               opened.workspace.tabs.find((tab) => tab.id === opened.id)
                 ?.pinned ?? existing.pinned,
-            isLoading: !existing.hasHydrated,
+            isLoading: resolved ? !existing.hasHydrated : false,
             error: resolved
               ? null
-              : String(internal.workspaceError ?? "Repository is unavailable"),
+              : deferredTrustMessage ??
+                String(internal.workspaceError ?? "Repository is unavailable"),
+            trustRequired: resolved
+              ? false
+              : deferredTrustMessage !== null || existing.trustRequired,
           }
         : createSession(
             {
@@ -1687,7 +1748,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               commitDraft: carriedSession?.commitDraft ?? "",
               isAmending: carriedSession?.isAmending ?? false,
               isLoading: Boolean(resolved),
-              error: resolved ? null : "Repository is unavailable",
+              error: resolved
+                ? null
+                : deferredTrustMessage ?? "Repository is unavailable",
+              trustRequired: deferredTrustMessage !== null,
             },
           );
       putSession(session);
@@ -1753,6 +1817,54 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     activateTab: async (id: string, extras: { force?: boolean } = {}) => {
       openEpoch += 1;
+      const current = internal.sessions[id];
+      // Restore passes force and must not prompt. A click on a tab whose
+      // hydrate or open was refused is the moment the person can approve it,
+      // including when that tab is already the active one.
+      if (!extras.force && current?.trustRequired) {
+        if (internal.workspace.activeId !== id) {
+          const next = activateTab(internal.workspace, id);
+          if (next === internal.workspace) return;
+          replaceWorkspace(next);
+        }
+        syncFilterFromSession(current);
+        publish();
+        const trustedPath = await requestRepositoryTrust(current.path, "Trust and Open", invokeFn);
+        const live = internal.sessions[id];
+        if (!live?.trustRequired) return;
+        if (!trustedPath) return;
+        let path = trustedPath;
+        try {
+          const resolved = await resolvePath(trustedPath);
+          path = resolved.path;
+        } catch (err: unknown) {
+          const message = formatError(err);
+          applyToSession(id, live.generation, {
+            isLoading: false,
+            error: message,
+            trustRequired: repositoryTrustRefused(message) || live.trustRequired,
+          });
+          return;
+        }
+        const latest = internal.sessions[id];
+        if (!latest) return;
+        const activation = bumped({ ...latest, path });
+        putSession({ ...activation, path, isLoading: true });
+        if (internal.workspace.activeId === id) {
+          syncFilterFromSession(activation);
+          revealGraph(activation);
+        }
+        publish();
+        const watchState = await watch(path);
+        applyToSession(id, activation.generation, { watch: watchState });
+        await hydrate(id, path, activation.generation);
+        const after = internal.sessions[id];
+        if (after && after.generation === activation.generation && !after.trustRequired) {
+          ensureStatusPoll();
+          flushPersist();
+        }
+        return;
+      }
       if (!extras.force && internal.workspace.activeId === id) return;
       if (internal.workspace.activeId !== id) {
         const next = activateTab(internal.workspace, id);
@@ -1761,6 +1873,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       const session = internal.sessions[id];
       if (!session) {
+        publish();
+        return;
+      }
+      if (session.trustRequired) {
+        syncFilterFromSession(session);
         publish();
         return;
       }
@@ -2025,7 +2142,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             sameRepo(item.path, repoPath, options),
           )
         : activeSession();
-      if (!session) return;
+      if (!session || session.trustRequired) return;
       const generation = session.generation;
       // Spinner only while nothing is rendered; a rendered error stays until
       // this refresh's own outcome replaces or retires it (hydrate settle).
@@ -2046,13 +2163,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // once. Each changed path collapses onto its own trailing window so a
       // storm becomes one refresh; explicit refresh() calls stay undelayed.
       if (!changedPath) {
+        if (activeSession()?.trustRequired) return;
         scheduleWatcherRefresh("", () => void store.refresh());
         return;
       }
       const session = Object.values(internal.sessions).find((item) =>
         sameRepo(item.path, changedPath, options),
       );
-      if (!session) return;
+      if (!session || session.trustRequired) return;
       // Drop echoes of our own recent writes: the explicit refresh() in
       // runMutating already fetched fresh state, so acting on the echo would
       // refresh the whole session twice per mutation. An unrelated external

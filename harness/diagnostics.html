@@ -44,10 +44,27 @@
     cmd_docs_broken_links: () => Array.from({length:250},()=>({source:"A.md",target:"missing.md"})),
     cmd_docs_search: a => defer("search",a),
     cmd_docs_backlinks: () => Array.from({length:20},(_,i)=>({path:"B.md",line:1,offset:i*20,title:"B",context:`backlink-${i}`})),
-    cmd_markdown_render: () => "<h1>Hello</h1>",
+    cmd_markdown_render: () => ({html:"<h1 id=\"hello\">Hello</h1>",headings:[{level:1,title:"Hello",id:"hello"}],frontmatter:[],omittedBytes:0}),
     cmd_devmap_viz: a => defer("graph",a),
     cmd_workspace_link_candidates: () => ({available:true,links:[],reason:null}),
     cmd_workspace_sync: () => ({repos:[]}),
+    // Opening a trusted tab now asks for DevCouncil init and a live index
+    // refresh. This harness does not exercise either; a quiet decline keeps
+    // the fixture list honest without inventing a build.
+    cmd_devcouncil_init: () => ({
+      repo: "/r/diagnostics",
+      state_dir: "/r/diagnostics/.devmap",
+      exclude: { status: "already_ignored", source: "harness" },
+      workspace_registry: null,
+      workspace_reason: null,
+      skipped_untrusted: [],
+      devmap_available: false,
+    }),
+    cmd_devmap_maybe_refresh: () => ({
+      decision: "skip_unavailable",
+      facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+      reason: null,
+    }),
     cmd_diagnostic_log_tail: () => [],
     cmd_diagnostic_persisted_log: () => ({path:"",lines:[],degraded:"Harness: no backend log"}),
   };

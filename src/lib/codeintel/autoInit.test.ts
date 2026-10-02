@@ -9,6 +9,7 @@ function report(overrides: Partial<InitReport> = {}): InitReport {
     exclude: { status: "added", file: "/a/.git/info/exclude", pattern: "/.devmap/" },
     workspace_registry: "/a/.devmap/workspace.json",
     workspace_reason: null,
+    skipped_untrusted: [],
     devmap_available: true,
     ...overrides,
   };
@@ -115,6 +116,23 @@ describe("autoInit", () => {
     index.setScope(scope("/a", ["/a"]));
     await vi.advanceTimersByTimeAsync(10);
     expect(warn).toHaveBeenCalledTimes(2);
+    index.reset();
+  });
+
+  it("warns when a written registry omitted untrusted repositories", async () => {
+    const warn = vi.fn();
+    const index = createAutoInit({
+      debounceMs: 0,
+      warn,
+      initialize: async () => report({ skipped_untrusted: ["/untrusted"] }),
+    });
+    index.setScope(scope("/a", ["/a", "/untrusted"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/a").report?.workspace_registry).toBe("/a/.devmap/workspace.json");
+    expect(warn).toHaveBeenCalledWith(
+      "devcouncil-init",
+      "/a: cross-repository search omitted untrusted repositories — /untrusted",
+    );
     index.reset();
   });
 

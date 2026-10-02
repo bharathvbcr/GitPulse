@@ -1,12 +1,16 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { get, writable } from "svelte/store";
-import { createRepoStore, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, type BranchInfo, type InvokeFn } from "../repoStore";
+import { createRepoStore, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, pathsTrustedForBackground, type BranchInfo, type InvokeFn } from "../repoStore";
 import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
 import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
+import { noteEventLoopDelay, resetEventLoopDelay } from "../../runtime/loadCadence";
+import { resetForegroundFocus } from "../../runtime/foreground";
 import type { FilterState } from "../filterStore";
 import { interfaceStore } from "../interfaceStore";
 import { diagnostics } from "../../diagnostics/diagnostics";
 import { promptState, completePrompt, cancelPrompt } from "../modalStore";
+import { autoInit } from "../../codeintel/autoInit";
+import * as workspaceSync from "../../codeintel/workspaceSync";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -257,6 +261,186 @@ describe("explicit repository trust", () => {
     expect(await opening).toBe(false);
     expect(get(store).currentPath).toBeNull();
     expect(get(store).error).toContain("Repository changed");
+  });
+});
+
+describe("restored untrusted tabs", () => {
+  afterEach(() => {
+    cancelPrompt();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const REFUSED = "/r/refused";
+  const TRUSTED = "/r/ok";
+  const preview = {
+    path: REFUSED,
+    git_dir: `${REFUSED}/.git`,
+    common_dir: `${REFUSED}/.git`,
+    identity: "opaque-native-identity",
+    scope: "none" as const,
+    worktrees: 1,
+  };
+
+  function persisted(paths: string[], activePath: string) {
+    return memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        epoch: 1,
+        tabs: paths.map((path) => ({
+          path,
+          pinned: false,
+          viewTab: "work",
+          searchQuery: "",
+          selectedBranch: null,
+        })),
+        activePath,
+        recents: [],
+        lastClosed: [],
+        collapsedGroups: [],
+      }),
+    });
+  }
+
+  function refusalCalls() {
+    const calls: string[] = [];
+    const state = { granted: false };
+    const base = makeInvoke({
+      cmd_repository_trust: async () => preview as never,
+      cmd_grant_repository_trust: async () => {
+        state.granted = true;
+        return undefined as never;
+      },
+    });
+    const invoke: InvokeFn = async (command, args) => {
+      calls.push(command);
+      const path = String(args?.repoPath ?? "");
+      if (
+        !state.granted &&
+        path === REFUSED &&
+        command !== "cmd_resolve_repo" &&
+        command !== "cmd_repository_trust" &&
+        command !== "cmd_grant_repository_trust"
+      ) {
+        throw new Error(`REPOSITORY_TRUST_REQUIRED: Open ${REFUSED} in GitPulse and trust it`);
+      }
+      return base(command, args);
+    };
+    return { calls, invoke };
+  }
+
+  function restoredStore(paths: string[], activePath: string, invoke: InvokeFn) {
+    return createRepoStore({
+      invoke,
+      storage: persisted(paths, activePath),
+      caseInsensitive: true,
+      graph: makeGraph().api,
+      filter: makeFilter(),
+    });
+  }
+
+  it("prompts to trust a restored tab whose hydrate was refused, then re-hydrates", async () => {
+    const { calls, invoke } = refusalCalls();
+    const store = restoredStore([REFUSED], REFUSED, invoke);
+    await store.restoreWorkspace();
+    expect(get(promptState)).toBeNull();
+    expect(calls).not.toContain("cmd_repository_trust");
+    expect(get(store).trustRequired).toBe(true);
+    const id = get(store).activeTabId;
+    if (!id) throw new Error("restored tab did not become active");
+
+    const activating = store.activateTab(id);
+    await vi.waitFor(() => expect(get(promptState)?.options.confirmLabel).toBe("Trust and Open"));
+    completePrompt(true);
+    await activating;
+
+    const trustAt = calls.indexOf("cmd_repository_trust");
+    const grantAt = calls.indexOf("cmd_grant_repository_trust");
+    const rehydrateAt = calls.findIndex(
+      (command, index) => index > grantAt && (command === "cmd_list_branches" || command === "cmd_get_status"),
+    );
+    expect(trustAt).toBeGreaterThanOrEqual(0);
+    expect(grantAt).toBeGreaterThan(trustAt);
+    expect(rehydrateAt).toBeGreaterThan(grantAt);
+    expect(get(store).trustRequired).toBe(false);
+    expect(get(store).error).toBeNull();
+    expect(get(store).currentPath).toBe(REFUSED);
+    await store.closeTab(id);
+  });
+
+  it("does not prompt when restore activates the refused tab with force", async () => {
+    const { calls, invoke } = refusalCalls();
+    const store = restoredStore([REFUSED], REFUSED, invoke);
+    await store.restoreWorkspace();
+    const id = get(store).activeTabId;
+    if (!id) throw new Error("restored tab did not become active");
+    const before = calls.length;
+    await store.activateTab(id, { force: true });
+    expect(get(promptState)).toBeNull();
+    expect(calls.slice(before)).not.toContain("cmd_repository_trust");
+    expect(calls.slice(before)).not.toContain("cmd_grant_repository_trust");
+    expect(get(store).trustRequired).toBe(true);
+    expect(get(store).openTabs.map((tab) => tab.path)).toEqual([REFUSED]);
+    await store.closeTab(id);
+  });
+
+  it("leaves the tab and trustRequired set when the prompt is declined", async () => {
+    const { invoke } = refusalCalls();
+    const store = restoredStore([REFUSED], REFUSED, invoke);
+    await store.restoreWorkspace();
+    const id = get(store).activeTabId;
+    if (!id) throw new Error("restored tab did not become active");
+    const activating = store.activateTab(id);
+    await vi.waitFor(() => expect(get(promptState)).not.toBeNull());
+    cancelPrompt();
+    await activating;
+    expect(get(store).openTabs.map((tab) => tab.path)).toEqual([REFUSED]);
+    expect(get(store).trustRequired).toBe(true);
+    expect(get(store).activeTabId).toBe(id);
+    await store.closeTab(id);
+  });
+
+  it("issues no status, auto-init, or workspace-sync calls for a refused path", async () => {
+    vi.useFakeTimers();
+    const sync = vi.spyOn(workspaceSync, "scheduleWorkspaceSync");
+    const init = vi.spyOn(autoInit, "setScope");
+    const { calls, invoke } = refusalCalls();
+    const store = restoredStore([REFUSED, TRUSTED], REFUSED, invoke);
+    await store.restoreWorkspace();
+    expect(get(store).trustRequired).toBe(true);
+    expect(get(promptState)).toBeNull();
+
+    const lastSync = sync.mock.calls.at(-1) as [string | null, readonly string[]] | undefined;
+    const lastInit = init.mock.calls.at(-1)?.[0];
+    expect(sync).toHaveBeenCalled();
+    expect(init).toHaveBeenCalled();
+    expect(lastSync?.[0] ?? null).toBeNull();
+    expect([...(lastSync?.[1] ?? [])]).toEqual([TRUSTED]);
+    expect(lastInit?.activeKey ?? null).toBeNull();
+    expect([...(lastInit?.retainedKeys ?? [])]).toEqual([TRUSTED]);
+    expect(pathsTrustedForBackground(get(store).openTabs, get(store).currentPath)).toEqual({
+      activeKey: null,
+      retainedKeys: [TRUSTED],
+    });
+
+    sync.mockClear();
+    init.mockClear();
+    const mark = calls.length;
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS * 2);
+    const later = calls.slice(mark);
+    expect(later).not.toContain("cmd_get_status");
+    expect(later).not.toContain("cmd_list_branches");
+    expect(later).not.toContain("cmd_watch_repo");
+    expect(later).not.toContain("cmd_branch_stats");
+    expect(later).not.toContain("cmd_devcouncil_init");
+    expect(later).not.toContain("cmd_workspace_sync");
+    const followedUp = sync.mock.calls as [string | null, readonly string[]][];
+    expect(followedUp.some(([root, paths]) => root === REFUSED || paths.includes(REFUSED))).toBe(false);
+    expect(
+      init.mock.calls.some(([scope]) =>
+        scope.activeKey === REFUSED || scope.retainedKeys.includes(REFUSED),
+      ),
+    ).toBe(false);
   });
 });
 

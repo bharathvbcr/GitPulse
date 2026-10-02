@@ -55,6 +55,8 @@ const fixture = {
   cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_list_repo_files: () => [],
   cmd_get_commit_graph: () => ({nodes:[],edges:[],total_commits:0,truncated:false}),
   cmd_set_recent_menu: () => null, cmd_workspace_sync: () => ({repos:[]}),
+  cmd_devcouncil_init: () => ({repo:REPO,state_dir:`${REPO}/.devmap`,exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],devmap_available:false}),
+  cmd_devmap_maybe_refresh: () => ({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
   cmd_provenance_freshness_batch: a => a.revisions.map(commit_sha=>({commit_sha,distance:null,confidence:null,is_fresh:false,unmeasured_reason:"Fixture",notes_readable:true,verification:null,session:null})),
   cmd_branch_stats: () => ({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
   cmd_repo_operation: () => {if(probeFailed)throw Error("Fixture probe failed");return operation;},
