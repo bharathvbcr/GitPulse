@@ -203,6 +203,23 @@ describe("TerminalPanel truncation disclosure", () => {
   });
 });
 
+describe("TerminalPanel agent-session record", () => {
+  const claim = source.slice(
+    source.indexOf("const claimed = terminalLaunchRequests.take("),
+    source.indexOf("claimed.complete(opened ? undefined : capacityTitle);"),
+  );
+
+  it("remembers a prompt launch for every PROMPT_LAUNCHERS value, Grok and Antigravity included", () => {
+    // `AgentTerminal.launcher` is `PromptLauncher`; a handwritten
+    // `claude || codex` filter dropped the session row Coverage and Health
+    // use to reveal a Grok or Antigravity run that did spawn.
+    expect(claim).toContain("isPromptLauncher(claimed.launcher)");
+    expect(claim).not.toMatch(/claimed\.launcher === "(claude|codex|grok|agy)"/);
+    expect(claim).toContain("claimed.prompt !== undefined");
+    expect(source).toMatch(/import \{[^}]*\bisPromptLauncher\b[^}]*\} from "\.\.\/terminal\/launchRequests"/);
+  });
+});
+
 describe("TerminalPanel chrome popovers", () => {
   it("keeps shortcuts, sessions, find, and tab options in the column instead of overlaying the grid", () => {
     // On macOS `bg-surface` is translucent. An absolutely positioned bar at a

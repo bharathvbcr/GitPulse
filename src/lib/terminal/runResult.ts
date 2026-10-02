@@ -93,9 +93,19 @@ const NOISE_LINE = [
   /^(info|warning|warn|note|help|hint)(\[[^\]]*\])?:/i,
   /^#\s/,
   /^(Compiling|Checking|Running|Finished|Downloading|Downloaded|Updating|Locking|Blocking|Fresh|Documenting|Installing|Installed|Resolving|Fetching|Building)\b/,
-  /^(-->|=\s|\|)/,
   /^\d+\s*\|/,
 ];
+
+/**
+ * rustc (and similar) diagnostic chrome: a file pointer, a gutter bar, or a
+ * `= note:` continuation. These are prefix checks rather than one regular
+ * expression, because a pattern written as `-->` is an HTML-comment closer
+ * to a scanner and this filter is only discarding compiler chrome.
+ */
+function isDiagnosticChrome(line: string): boolean {
+  if (line.startsWith("-->") || line.startsWith("|")) return true;
+  return line.startsWith("=") && (line.length === 1 || /\s/.test(line.charAt(1)));
+}
 
 /** A line stating the cause: compiler, linker, runtime or test-runner error. */
 const CAUSE_LINE = [
@@ -125,7 +135,9 @@ const VERDICT_LINE = [/^FAIL\b/, /^--- FAIL\b/, /\[build failed\]/, /\bfailed\b/
  */
 function failureLine(err: string, out: string): string {
   const candidates = [...lines(err), ...lines(out)].map((line) => line.trim()).filter(Boolean);
-  const signal = candidates.filter((line) => !NOISE_LINE.some((pattern) => pattern.test(line)));
+  const signal = candidates.filter(
+    (line) => !isDiagnosticChrome(line) && !NOISE_LINE.some((pattern) => pattern.test(line)),
+  );
   const causes = signal.filter((line) => CAUSE_LINE.some((pattern) => pattern.test(line)));
   const pick =
     causes.find((line) => !line.endsWith(":")) ??

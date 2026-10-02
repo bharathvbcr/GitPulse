@@ -1,5 +1,6 @@
 import { formatAuditCounts } from "./format";
 import { cappedSuffix, observedTotal as observedScanTotal } from "../scan/limits";
+import { safeText } from "../terminal/agentPromptText";
 import type {
   CodeScanningReport,
   DeadCodeFinding,
@@ -70,9 +71,14 @@ export function skippedAudits(report: DepsHealthReport): string[] {
   const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
   const has = (name: string) => files.some((f) => base(f) === name);
   const skipped: string[] = [];
+  const lock = (name: string) => report.manifests.some((manifest) => manifest.lockfile === name);
+  const bunLock = lock("bun.lock") || lock("bun.lockb");
+  const npmLock = lock("package-lock.json") || lock("npm-shrinkwrap.json");
   if (!report.npm_cli_present && report.manifests.length > 0) {
-    skipped.push("npm audit/outdated");
+    // A Bun lockfile is audited with bun. npm is only the outdated check then.
+    skipped.push(bunLock && !npmLock ? "npm outdated" : "npm audit/outdated");
   }
+  if (bunLock && report.bun_cli_present === false) skipped.push("bun audit");
   if (!report.cargo_audit_present && has("Cargo.lock")) skipped.push("cargo-audit");
   if (!report.cargo_deny_present && has("deny.toml")) skipped.push("cargo-deny");
   if (
@@ -103,6 +109,8 @@ export function skippedAudits(report: DepsHealthReport): string[] {
 export const AUDIT_FAILURE_LABELS: Readonly<Record<string, string>> = Object.freeze({
   audit_cwd: "audit path validation",
   audit_failed: "npm audit",
+  bun_audit_failed: "bun audit",
+  js_lockfile_unaudited: "JavaScript lockfile",
   cargo_audit_failed: "cargo-audit",
   cargo_deny_failed: "cargo-deny",
   cargo_crev_failed: "cargo-crev",
@@ -163,6 +171,9 @@ export function coverageGap(report: DepsHealthReport): string | null {
  * into an issue, an agent prompt or a notes file: every finding keeps its
  * severity, fix version and advisory link, capped scans say so, and the
  * dead-code table the Health view shows is included rather than dropped.
+ * Every producer-owned field goes through `safeText`, so a line break or
+ * terminal control inside an advisory title or a path cannot start a new
+ * line of the report.
  */
 export function formatHealthReport(
   report: DepsHealthReport,
@@ -173,10 +184,11 @@ export function formatHealthReport(
 ): string {
   const out: string[] = [];
   out.push("# Dependency health report");
-  if (repoPath) out.push(`Repository: ${repoPath}`);
+  if (repoPath) out.push(`Repository: ${safeText(repoPath)}`);
 
   const scannerLabels: Record<string, string> = {
     npm: "npm audit",
+    bun: "bun audit",
     cargo: "cargo-audit",
     "pip-audit": "pip-audit",
     govulncheck: "govulncheck",
@@ -184,7 +196,7 @@ export function formatHealthReport(
     "bundler-audit": "bundler-audit",
   };
   const localScanners = (report.scanners_ran ?? []).map(
-    (scanner) => scannerLabels[scanner] ?? scanner,
+    (scanner) => scannerLabels[scanner] ?? safeText(scanner),
   );
   const scanners = [
     ...localScanners,
@@ -193,14 +205,14 @@ export function formatHealthReport(
   ].filter(Boolean);
   out.push(
     line([
-      report.node_version ? `node ${report.node_version}` : undefined,
-      report.npm_version ? `npm ${report.npm_version}` : undefined,
+      report.node_version ? `node ${safeText(report.node_version)}` : undefined,
+      report.npm_version ? `npm ${safeText(report.npm_version)}` : undefined,
       scanners.length ? `scanners: ${scanners.join(", ")}` : "no audit scanner available",
       dependabot && !dependabot.available && dependabot.error
-        ? `dependabot unavailable (${dependabot.error})`
+        ? `dependabot unavailable (${safeText(dependabot.error)})`
         : undefined,
       codeScanning && !codeScanning.available && codeScanning.error
-        ? `code scanning unavailable (${codeScanning.error})`
+        ? `code scanning unavailable (${safeText(codeScanning.error)})`
         : undefined,
     ]),
   );
@@ -242,7 +254,7 @@ export function formatHealthReport(
   const incompleteWalk = deadCode?.available ? deadCode.walk_incomplete?.trim() : null;
   if (deadCode && !deadCode.available) {
     out.push(
-      `Dead-code check could not run${deadCode.reason ? `: ${deadCode.reason}` : ""}. That is not the same as finding no unreferenced symbols.`,
+      `Dead-code check could not run${deadCode.reason ? `: ${safeText(deadCode.reason)}` : ""}. That is not the same as finding no unreferenced symbols.`,
     );
   } else if (deadCode?.available && deadItems.length === 0 && deadCode.truncated) {
     out.push(
@@ -256,7 +268,7 @@ export function formatHealthReport(
     );
   }
   if (incompleteWalk) {
-    out.push(`NOTE: dead-code analysis is incomplete: ${incompleteWalk}. Missing callers can produce false positives; this is not an all-clear.`);
+    out.push(`NOTE: dead-code analysis is incomplete: ${safeText(incompleteWalk)}. Missing callers can produce false positives; this is not an all-clear.`);
   }
   if (inventoryOnlyTruncation(report)) {
     out.push("NOTE: Inventory display was capped; audit target coverage is reported separately above.");
@@ -265,14 +277,16 @@ export function formatHealthReport(
     out.push("NOTE: the scan was capped; findings below are not complete coverage.");
   }
   for (const notice of report.limit_notices ?? []) {
-    out.push(`- ${notice.resource}: retained ${notice.kept} of ${notice.total}`);
+    out.push(`- ${safeText(notice.resource)}: retained ${notice.kept} of ${notice.total}`);
   }
 
   if (report.issues.length > 0) {
     const issueTotal = observedTotal(report, "health issues", report.issues.length);
     out.push("", `## Issues (${issueTotal}${cappedSuffix(issueTotal, report.issues.length)})`);
     for (const issue of report.issues) {
-      out.push(`- [${issue.severity}] ${issue.code}${issue.path ? ` (${issue.path})` : ""}: ${issue.message}`);
+      out.push(
+        `- [${safeText(issue.severity)}] ${safeText(issue.code)}${issue.path ? ` (${safeText(issue.path)})` : ""}: ${safeText(issue.message)}`,
+      );
     }
   }
 
@@ -280,12 +294,12 @@ export function formatHealthReport(
     out.push("", `## Vulnerabilities (${report.audit.total}${cappedSuffix(report.audit.total, report.vulnerabilities.length)})`);
     for (const vuln of report.vulnerabilities) {
       out.push(
-        `- [${vuln.severity}] ${vuln.ecosystem}/${vuln.name}${vuln.range ? ` ${vuln.range}` : ""} — ${vuln.title}`,
+        `- [${safeText(vuln.severity)}] ${safeText(vuln.ecosystem)}/${safeText(vuln.name)}${vuln.range ? ` ${safeText(vuln.range)}` : ""} — ${safeText(vuln.title)}`,
       );
       out.push(
-        `  direct: ${vuln.is_direct ? "yes" : "no"} · fix available: ${vuln.fix_available || "none reported"}${
-          vuln.via.length ? ` · via: ${vuln.via.join(", ")}` : ""
-        }${vuln.url ? `\n  advisory: ${vuln.url}` : ""}`,
+        `  direct: ${vuln.is_direct ? "yes" : "no"} · fix available: ${safeText(vuln.fix_available) || "none reported"}${
+          vuln.via.length ? ` · via: ${vuln.via.map(safeText).join(", ")}` : ""
+        }${vuln.url ? `\n  advisory: ${safeText(vuln.url)}` : ""}`,
       );
     }
   }
@@ -293,18 +307,18 @@ export function formatHealthReport(
   if (dependabot?.available && dependabot.alerts.length > 0) {
     out.push("", `## GitHub Dependabot alerts (${dependabot.truncated ? "at least " : ""}${dependabot.alerts.length})`);
     for (const alert of dependabot.alerts) {
-      const ids = [alert.advisory_id, alert.cve_id].filter(Boolean).join(", ");
+      const ids = [alert.advisory_id, alert.cve_id].filter(Boolean).map(safeText).join(", ");
       out.push(
-        `- [${alert.severity}] ${alert.ecosystem}/${alert.package}${alert.vulnerable_range ? ` ${alert.vulnerable_range}` : ""} — ${alert.title}`,
+        `- [${safeText(alert.severity)}] ${safeText(alert.ecosystem)}/${safeText(alert.package)}${alert.vulnerable_range ? ` ${safeText(alert.vulnerable_range)}` : ""} — ${safeText(alert.title)}`,
       );
       out.push(
         line([
           ids ? `ids: ${ids}` : undefined,
-          alert.manifest_path ? `manifest: ${alert.manifest_path}` : undefined,
+          alert.manifest_path ? `manifest: ${safeText(alert.manifest_path)}` : undefined,
           alert.first_patched
-            ? `fix available: ${alert.first_patched}`
+            ? `fix available: ${safeText(alert.first_patched)}`
             : "fix available: none reported",
-          alert.url ? `alert: ${alert.url}` : undefined,
+          alert.url ? `alert: ${safeText(alert.url)}` : undefined,
         ]),
       );
     }
@@ -316,20 +330,20 @@ export function formatHealthReport(
       `## GitHub Code Scanning alerts (${codeScanning.truncated ? "at least " : ""}${codeScanning.alerts.length})`,
     );
     for (const alert of codeScanning.alerts) {
-      const rule = alert.rule_id || alert.rule_name || "rule";
+      const rule = safeText(alert.rule_id || alert.rule_name || "rule");
       const location =
         alert.path && alert.start_line > 0
-          ? `${alert.path}:${alert.start_line}`
-          : alert.path;
+          ? `${safeText(alert.path)}:${alert.start_line}`
+          : safeText(alert.path);
       const tool = alert.tool
-        ? `${alert.tool}${alert.tool_version ? ` ${alert.tool_version}` : ""}`
+        ? `${safeText(alert.tool)}${alert.tool_version ? ` ${safeText(alert.tool_version)}` : ""}`
         : undefined;
-      out.push(`- [${alert.severity}] ${rule} — ${alert.title}`);
+      out.push(`- [${safeText(alert.severity)}] ${rule} — ${safeText(alert.title)}`);
       out.push(
         line([
           tool ? `tool: ${tool}` : undefined,
           location ? `at: ${location}` : undefined,
-          alert.url ? `alert: ${alert.url}` : undefined,
+          alert.url ? `alert: ${safeText(alert.url)}` : undefined,
         ]),
       );
     }
@@ -339,8 +353,8 @@ export function formatHealthReport(
     out.push("", `## Outdated npm packages (${outdatedTotal}${cappedSuffix(outdatedTotal, report.outdated.length)})`);
     for (const pkg of report.outdated) {
       out.push(
-        `- ${pkg.name}: ${pkg.current} -> ${pkg.latest} (wanted ${pkg.wanted}, ${pkg.dep_type || "dep"})${
-          pkg.location ? ` @ ${pkg.location}` : ""
+        `- ${safeText(pkg.name)}: ${safeText(pkg.current)} -> ${safeText(pkg.latest)} (wanted ${safeText(pkg.wanted)}, ${safeText(pkg.dep_type) || "dep"})${
+          pkg.location ? ` @ ${safeText(pkg.location)}` : ""
         }`,
       );
     }
@@ -361,10 +375,10 @@ export function formatHealthReport(
     );
     for (const item of deadItems) {
       if (!item || typeof item !== "object") continue;
-      const name = item.symbol_name || "(unnamed)";
-      const file = item.file_path ? ` (${item.file_path})` : "";
+      const name = safeText(item.symbol_name || "(unnamed)");
+      const file = item.file_path ? ` (${safeText(item.file_path)})` : "";
       out.push(
-        `- ${name}${file} — ${formatDeadCodeConfidence(item.confidence)} — ${formatDeadCodeStatus(item)}`,
+        `- ${name}${file} — ${formatDeadCodeConfidence(item.confidence)} — ${safeText(formatDeadCodeStatus(item))}`,
       );
     }
   }

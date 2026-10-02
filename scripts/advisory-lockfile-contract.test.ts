@@ -107,7 +107,7 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
       expect(range, `${name} is declared as a caret range`).toMatch(/^\^\d+\.\d+\.\d+$/);
       expect(atLeast(range?.slice(1), floor), `${name} range ${range} admits nothing below ${floor}`).toBe(true);
       const resolved = locked(name);
-      expect(resolved, `${name} is in bun.lock`).toMatch(new RegExp(`^${name.replace(/[/.]/g, "\\$&")}@`));
+      expect(resolved?.startsWith(`${name}@`), `${name} is in bun.lock as ${resolved}`).toBe(true);
       expect(atLeast(resolved?.slice(name.length + 1), floor), `${resolved} is at least ${floor}`).toBe(true);
     }
   });

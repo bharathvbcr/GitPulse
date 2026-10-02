@@ -2,10 +2,12 @@ pub mod debouncer;
 
 pub use debouncer::RepoFileWatcher;
 
-use crate::engine::git_cli::{resolve_git_common_dir, resolve_git_dir, validate_repo};
+use crate::engine::git_cli::{
+    git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
+};
 use notify::Event;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +132,175 @@ const DEBOUNCE_QUIET: Duration = Duration::from_millis(400);
 /// keep arriving, so a busy repo never goes stale on screen.
 const DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 
+/// How many ignored directory prefixes one watch will remember. A longer
+/// `ls-files` answer is a partial result: the prefixes that fit still apply,
+/// and [`IgnoreRules::load_error`] says the rest were not recorded.
+const MAX_IGNORE_PREFIXES: usize = 4096;
+/// The watch thread must not sit on `git ls-files` for the full git timeout
+/// while filesystem events queue behind it.
+const IGNORE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// A failed ignore query is retried on this period. Retrying every debounce
+/// tick would itself be a git storm.
+const IGNORE_RETRY: Duration = Duration::from_secs(30);
+
+/// Directory prefixes `git ls-files` confirmed, plus the built-in build-dir
+/// names applied in [`is_build_dir_name`]. An empty prefix list is the
+/// built-in names only — a failed or truncated query must not look like
+/// "nothing is ignored" and must not look like "everything is ignored".
+struct IgnoreRules {
+    /// Folded, `/`-separated directory prefixes (`scratch`, `pkg/generated`).
+    prefixes: HashSet<String>,
+    /// `None` only when the query finished and the prefix list was complete.
+    load_error: Option<String>,
+}
+
+impl IgnoreRules {
+    fn builtin() -> Self {
+        Self {
+            prefixes: HashSet::new(),
+            load_error: None,
+        }
+    }
+
+    /// One bounded `git ls-files` for directories the ignore rules already cover.
+    /// A failed or truncated query keeps the built-in build-dir names and
+    /// records why: it does not pretend the tree was scanned and found clean.
+    fn load(repo: &Path) -> Self {
+        match git_text_with_timeout(
+            repo,
+            &[
+                "ls-files",
+                "-o",
+                "-i",
+                "--directory",
+                "--exclude-standard",
+                "-z",
+            ],
+            IGNORE_QUERY_TIMEOUT,
+        ) {
+            Ok(stdout) => {
+                let (prefixes, truncated) = parse_ignored_directories(&stdout);
+                if truncated {
+                    let error = format!(
+                        "ignore directory list truncated at {MAX_IGNORE_PREFIXES}; further ignored directories were not recorded"
+                    );
+                    log::warn!(target: "watcher", "{}: {error}", repo.display());
+                    Self {
+                        prefixes,
+                        load_error: Some(error),
+                    }
+                } else {
+                    Self {
+                        prefixes,
+                        load_error: None,
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "watcher",
+                    "gitignore query failed for {}: {error}",
+                    repo.display()
+                );
+                Self {
+                    prefixes: HashSet::new(),
+                    load_error: Some(error),
+                }
+            }
+        }
+    }
+}
+
+fn parse_ignored_directories(stdout: &str) -> (HashSet<String>, bool) {
+    let mut prefixes = HashSet::new();
+    let mut truncated = false;
+    for field in stdout.split('\0') {
+        if field.is_empty() || !(field.ends_with('/') || field.ends_with('\\')) {
+            continue;
+        }
+        let folded = field
+            .trim_end_matches(['/', '\\'])
+            .trim_start_matches("./")
+            .to_ascii_lowercase();
+        if folded.is_empty() {
+            continue;
+        }
+        if prefixes.len() >= MAX_IGNORE_PREFIXES {
+            truncated = true;
+            break;
+        }
+        prefixes.insert(folded);
+    }
+    (prefixes, truncated)
+}
+
+/// Directories that are build output by construction. Ordinary source names
+/// (`build`, `out`, `dist`, `coverage`) are not in this list: an un-ignored
+/// tree with those names is source, and gitignore covers them when it should.
+///
+/// Cargo `target`, `target2`, `target-release`, `target_debug`. Not
+/// `target.rs` and not `targeting`.
+fn is_build_dir_name(name: &str) -> bool {
+    let folded = name.to_ascii_lowercase();
+    if matches!(
+        folded.as_str(),
+        "node_modules" | "__pycache__" | ".next" | ".nuxt" | ".turbo" | ".parcel-cache" | ".gradle"
+    ) {
+        return true;
+    }
+    let Some(rest) = folded.strip_prefix("target") else {
+        return false;
+    };
+    rest.is_empty()
+        || rest.starts_with('-')
+        || rest.starts_with('_')
+        || (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_build_or_ignored_path(relative: &Path, rules: &IgnoreRules) -> bool {
+    let mut accumulated = String::new();
+    for component in relative.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if is_build_dir_name(&name) {
+            return true;
+        }
+        if !accumulated.is_empty() {
+            accumulated.push('/');
+        }
+        accumulated.push_str(&name.to_ascii_lowercase());
+        if rules.prefixes.contains(&accumulated) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reload ignore rules after a real `.gitignore` edit, but not on every
+/// keystroke, and retry a failed query on [`IGNORE_RETRY`] rather than on
+/// every debounce tick.
+fn rules_due(
+    rules: &IgnoreRules,
+    last_load: Instant,
+    now: Instant,
+    rule_file_changed: bool,
+) -> bool {
+    let elapsed = now.saturating_duration_since(last_load);
+    if rule_file_changed {
+        return elapsed >= SCAN_COALESCE;
+    }
+    rules.load_error.is_some() && elapsed >= IGNORE_RETRY
+}
+
+fn event_updates_ignore_rules(event: &Event) -> bool {
+    event.paths.iter().any(
+        |path| match path.file_name().and_then(|name| name.to_str()) {
+            Some(".gitignore") => true,
+            Some("exclude") => path.parent().is_some_and(|parent| parent.ends_with("info")),
+            _ => false,
+        },
+    )
+}
+
 /// True when `event` carries at least one path that can move repository state.
 ///
 /// Events whose every path is git-internal refresh noise (see
@@ -154,6 +325,7 @@ fn event_has_signal(
     internal_roots: &[PathBuf],
     worktree: &Path,
     worktree_canonical: Option<&Path>,
+    rules: &IgnoreRules,
 ) -> bool {
     if event.paths.is_empty() {
         return true;
@@ -168,7 +340,16 @@ fn event_has_signal(
         if internal_roots.iter().any(|root| path.starts_with(root)) {
             return true;
         }
-        !is_generated_state_noise_cached(path, worktree, worktree_canonical)
+        if is_generated_state_noise_cached(path, worktree, worktree_canonical) {
+            return false;
+        }
+        match worktree_relative(path, worktree, worktree_canonical) {
+            Some(relative) => !is_build_or_ignored_path(&relative, rules),
+            // The worktree directory itself is what FSEvents reports when a
+            // storm coalesces. It names no file. A `..` path still fails open:
+            // refusing to classify an escape is not the same as calling it noise.
+            None => !is_worktree_root(path, worktree, worktree_canonical),
+        }
     })
 }
 
@@ -212,6 +393,10 @@ fn is_generated_state_noise_cached(
         .is_some_and(|name| is_generated_state_dir(&name))
 }
 
+fn is_worktree_root(path: &Path, worktree: &Path, canonical: Option<&Path>) -> bool {
+    path == worktree || canonical.is_some_and(|root| path == root)
+}
+
 fn path_has_parent_dir(path: &Path) -> bool {
     path.components().any(|c| matches!(c, Component::ParentDir))
 }
@@ -221,21 +406,31 @@ fn first_worktree_relative_component(
     worktree: &Path,
     worktree_canonical: Option<&Path>,
 ) -> Option<OsString> {
+    worktree_relative(path, worktree, worktree_canonical).and_then(|relative| {
+        relative
+            .components()
+            .next()
+            .map(|component| component.as_os_str().to_os_string())
+    })
+}
+
+fn worktree_relative(
+    path: &Path,
+    worktree: &Path,
+    worktree_canonical: Option<&Path>,
+) -> Option<PathBuf> {
     // Resolve no lexical escape as noise, including paths whose prefix matches.
     if path_has_parent_dir(path) || path_has_parent_dir(worktree) {
         return None;
     }
     if let Ok(relative) = path.strip_prefix(worktree) {
-        return relative
-            .components()
-            .next()
-            .map(|c| c.as_os_str().to_os_string());
+        if relative.components().next().is_none() {
+            return None;
+        }
+        return Some(relative.to_path_buf());
     }
     if path.is_relative() && worktree.is_absolute() {
-        return path
-            .components()
-            .next()
-            .map(|c| c.as_os_str().to_os_string());
+        return Some(path.to_path_buf());
     }
     // A shared suffix is not proof of repository identity. Only filesystem
     // identity can establish an alias. Canonicalize the worktree once (caller)
@@ -247,17 +442,17 @@ fn first_worktree_relative_component(
         .ancestors()
         .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.exists())?;
     let existing_canon = existing.canonicalize().ok()?;
-    {
-        let relative_from_wt = existing_canon.strip_prefix(canonical).ok()?;
-        if let Some(component) = relative_from_wt.components().next() {
-            return Some(component.as_os_str().to_os_string());
+    let relative_from_wt = existing_canon.strip_prefix(canonical).ok()?;
+    let mut relative = relative_from_wt.to_path_buf();
+    if let Ok(rest) = path.strip_prefix(existing) {
+        if !rest.as_os_str().is_empty() {
+            relative.push(rest);
         }
     }
-    path.strip_prefix(existing)
-        .ok()?
-        .components()
-        .next()
-        .map(|c| c.as_os_str().to_os_string())
+    if relative.components().next().is_none() {
+        return None;
+    }
+    Some(relative)
 }
 
 /// GitPulse-owned indexer state beside DevMap's [`devmap_query::paths::STATE_DIR_NAMES`].
@@ -362,6 +557,23 @@ fn should_emit(
     quiet || max_wait
 }
 
+/// At most one scan per repo per [`DEBOUNCE_MAX_WAIT`], even when real edits
+/// keep arriving. The quiet period still releases the first scan; the next
+/// one waits out the coalesce window so a busy checkout cannot refresh at
+/// the debounce rate for hours.
+const SCAN_COALESCE: Duration = DEBOUNCE_MAX_WAIT;
+
+fn scan_is_due(
+    pending: bool,
+    last_event: Instant,
+    first_pending: Option<Instant>,
+    last_scan: Option<Instant>,
+    now: Instant,
+) -> bool {
+    should_emit(pending, last_event, first_pending, now)
+        && last_scan.is_none_or(|previous| now.saturating_duration_since(previous) >= SCAN_COALESCE)
+}
+
 /// Everything the debounce loop needs to know about WHERE it is watching and
 /// WHAT to emit. Bundled so [`run_watch_loop`] stays under the argument cap:
 /// `git_dir` is the liveness probe target, `internal_roots` scopes the
@@ -407,6 +619,9 @@ where
     let mut pending = false;
     let mut last_event = Instant::now();
     let mut first_pending: Option<Instant> = None;
+    let mut last_scan: Option<Instant> = None;
+    let mut rules = IgnoreRules::load(Path::new(&path));
+    let mut last_rules_load = Instant::now();
     // When the watched git directory is deleted (repo moved/removed), notify
     // keeps delivering remove/error events forever, and the settle timer would
     // still fire one last `repo-changed` for the corpse. Liveness is therefore
@@ -438,22 +653,32 @@ where
                 let worktree = Path::new(&path);
                 // One canonicalize per batch — never per drained leftover.
                 let worktree_canonical = worktree.canonicalize().ok();
+                let mut reload_rules = event_updates_ignore_rules(&event);
                 let mut significant = event_has_signal(
                     &event,
                     &internal_roots,
                     worktree,
                     worktree_canonical.as_deref(),
+                    &rules,
                 );
                 for leftover in watcher.receiver.try_iter() {
                     significant |= match leftover {
-                        Ok(event) => event_has_signal(
-                            &event,
-                            &internal_roots,
-                            worktree,
-                            worktree_canonical.as_deref(),
-                        ),
+                        Ok(event) => {
+                            reload_rules |= event_updates_ignore_rules(&event);
+                            event_has_signal(
+                                &event,
+                                &internal_roots,
+                                worktree,
+                                worktree_canonical.as_deref(),
+                                &rules,
+                            )
+                        }
                         Err(_) => true,
                     };
+                }
+                if rules_due(&rules, last_rules_load, Instant::now(), reload_rules) {
+                    rules = IgnoreRules::load(worktree);
+                    last_rules_load = Instant::now();
                 }
                 if !significant {
                     continue;
@@ -463,7 +688,13 @@ where
                 }
                 pending = true;
                 last_event = Instant::now();
-                if should_emit(pending, last_event, first_pending, Instant::now()) {
+                if scan_is_due(
+                    pending,
+                    last_event,
+                    first_pending,
+                    last_scan,
+                    Instant::now(),
+                ) {
                     if !git_dir.exists() {
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
@@ -471,6 +702,7 @@ where
                     on_change(path.clone());
                     pending = false;
                     first_pending = None;
+                    last_scan = Some(Instant::now());
                 }
             }
             // A notify backend error carries no classifiable path; per the
@@ -484,7 +716,17 @@ where
                 last_event = Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if should_emit(pending, last_event, first_pending, Instant::now()) {
+                if rules_due(&rules, last_rules_load, Instant::now(), false) {
+                    rules = IgnoreRules::load(Path::new(&path));
+                    last_rules_load = Instant::now();
+                }
+                if scan_is_due(
+                    pending,
+                    last_event,
+                    first_pending,
+                    last_scan,
+                    Instant::now(),
+                ) {
                     if !git_dir.exists() {
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
@@ -492,6 +734,7 @@ where
                     on_change(path.clone());
                     pending = false;
                     first_pending = None;
+                    last_scan = Some(Instant::now());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1822,6 +2065,348 @@ mod tests {
         ));
     }
 
+    /// Build-directory paths must not schedule a scan.
+    ///
+    /// A non-recursive worktree watch does not deliver nested `target/` writes
+    /// (see [`measure_target_directory_event_rate`]). Paths still have to be
+    /// classified: FSEvents can report the `target` directory itself, a
+    /// `target-*` sibling, or a nested path that leaked through. Before this
+    /// filter every one of those was signal, and each signal opens a refresh
+    /// that fans out into many `git` children.
+    #[test]
+    fn build_output_storm_does_not_schedule_a_scan() {
+        let root = Path::new("/repo");
+        let rules = IgnoreRules::builtin();
+        let started = Instant::now();
+        let mut scans = 0u32;
+        for i in 0..4_000 {
+            let paths = [
+                root.join("target")
+                    .join("debug")
+                    .join(format!("lib{i}.rlib")),
+                root.join(format!("target{i}")).join("debug").join("x.o"),
+                root.join("target-release")
+                    .join("deps")
+                    .join(format!("{i}.o")),
+                root.join("pkg").join("target").join("debug").join("x.o"),
+                root.join("node_modules").join("left-pad").join("index.js"),
+            ];
+            // One representative path per iteration keeps the rate comparable
+            // to "events that would each open or extend the debounce window".
+            let path = paths[i as usize % paths.len()].clone();
+            let event = notify::Event::new(notify::EventKind::Any).add_path(path);
+            if event_has_signal(&event, &[], root, Some(root), &rules) {
+                scans += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        let per_sec = scans as f64 / elapsed.as_secs_f64().max(1e-9);
+        eprintln!(
+            "build-storm scheduled_scans={scans} of 4000 in {elapsed:?} ({per_sec:.1}/s of classifier time)"
+        );
+        assert_eq!(
+            scans, 0,
+            "build-directory writes scheduled {scans} refreshes; each refresh spawns git"
+        );
+        let source =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("src").join("main.rs"));
+        assert!(
+            event_has_signal(&source, &[], root, Some(root), &rules),
+            "a source edit must still schedule a scan"
+        );
+        let source_file_named_like_a_dir =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("target.rs"));
+        assert!(
+            event_has_signal(&source_file_named_like_a_dir, &[], root, Some(root), &rules),
+            "target.rs is source, not a build directory"
+        );
+        let targeting = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("targeting").join("lib.rs"));
+        assert!(
+            event_has_signal(&targeting, &[], root, Some(root), &rules),
+            "a directory named targeting is not a Cargo target/ tree"
+        );
+    }
+
+    /// Names that look like build output but are ordinary source trees must
+    /// still refresh. The denylist is only for directories that are build
+    /// output by construction (`target*`, `node_modules`, toolchain caches).
+    #[test]
+    fn source_trees_named_like_build_output_still_scan() {
+        let root = Path::new("/repo");
+        let rules = IgnoreRules::builtin();
+        for relative in [
+            "src/build/lib.rs",
+            "docs/out/notes.md",
+            "coverage/report.md",
+            "dist/readme.md",
+        ] {
+            let event = notify::Event::new(notify::EventKind::Any).add_path(root.join(relative));
+            assert!(
+                event_has_signal(&event, &[], root, Some(root), &rules),
+                "{relative} is source and must schedule a scan"
+            );
+        }
+    }
+
+    /// An event that names the worktree directory itself has no file identity.
+    /// FSEvents delivers that path for a coalesced storm. Treating it as signal
+    /// schedules a full git refresh for every burst that collapsed to the root.
+    #[test]
+    fn worktree_root_event_does_not_schedule_a_scan() {
+        let root = Path::new("/repo");
+        let rules = IgnoreRules::builtin();
+        let event = notify::Event::new(notify::EventKind::Any).add_path(root.to_path_buf());
+        assert!(
+            !event_has_signal(&event, &[], root, Some(root), &rules),
+            "the worktree root carries no path to refresh"
+        );
+        let child = notify::Event::new(notify::EventKind::Any).add_path(root.join("README.md"));
+        assert!(event_has_signal(&child, &[], root, Some(root), &rules));
+    }
+
+    #[test]
+    fn ignore_prefix_matches_the_directory_and_not_a_longer_name() {
+        let mut rules = IgnoreRules::builtin();
+        rules.prefixes.insert("scratch".into());
+        rules.prefixes.insert("foo/bar".into());
+        let root = Path::new("/repo");
+        let hidden =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("scratch").join("a.txt"));
+        assert!(!event_has_signal(&hidden, &[], root, Some(root), &rules));
+        let neighbor = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("scratchpad").join("a.txt"));
+        assert!(
+            event_has_signal(&neighbor, &[], root, Some(root), &rules),
+            "scratch must not swallow scratchpad"
+        );
+        let nested = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("foo").join("bar").join("x"));
+        assert!(!event_has_signal(&nested, &[], root, Some(root), &rules));
+        let lookalike = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("foo").join("barbaz").join("x"));
+        assert!(event_has_signal(&lookalike, &[], root, Some(root), &rules));
+    }
+
+    #[test]
+    fn ignore_prefixes_fold_case_and_a_failed_query_does_not_hide_source() {
+        let (prefixes, truncated) = parse_ignored_directories("Scratch/\0keep.txt\0./Pkg/Gen/\0");
+        assert!(!truncated);
+        assert!(prefixes.contains("scratch"));
+        assert!(prefixes.contains("pkg/gen"));
+        assert!(!prefixes.contains("keep.txt"));
+        let mut rules = IgnoreRules::builtin();
+        rules.prefixes = prefixes;
+        let root = Path::new("/repo");
+        let folded =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("SCRATCH").join("a.txt"));
+        assert!(!event_has_signal(&folded, &[], root, Some(root), &rules));
+
+        let mut failed = IgnoreRules::builtin();
+        failed.load_error = Some("git ls-files timed out".into());
+        let source =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("src").join("main.rs"));
+        assert!(
+            event_has_signal(&source, &[], root, Some(root), &failed),
+            "a failed ignore query must not classify the tree as ignored"
+        );
+        let target = notify::Event::new(notify::EventKind::Any)
+            .add_path(root.join("TARGET").join("debug").join("x.o"));
+        assert!(
+            !event_has_signal(&target, &[], root, Some(root), &failed),
+            "built-in build directories still apply when the query failed"
+        );
+    }
+
+    #[test]
+    fn ignore_directory_list_records_truncation_instead_of_a_complete_scan() {
+        let mut raw = String::new();
+        for i in 0..(MAX_IGNORE_PREFIXES + 3) {
+            raw.push_str(&format!("dir{i}/\0"));
+        }
+        let (prefixes, truncated) = parse_ignored_directories(&raw);
+        assert!(truncated, "a capped list must not look complete");
+        assert_eq!(prefixes.len(), MAX_IGNORE_PREFIXES);
+        assert!(!prefixes.contains(&format!("dir{}", MAX_IGNORE_PREFIXES)));
+    }
+
+    #[test]
+    fn classifier_holds_under_adversarial_paths() {
+        let root = Path::new("/repo");
+        let mut rules = IgnoreRules::builtin();
+        rules.prefixes.insert("scratch".into());
+        let started = Instant::now();
+        for i in 0..20_000u32 {
+            let target = notify::Event::new(notify::EventKind::Any).add_path(
+                root.join(format!("target{}", i % 50))
+                    .join("debug")
+                    .join(format!("{i}.o")),
+            );
+            assert!(!event_has_signal(&target, &[], root, Some(root), &rules));
+            let source = notify::Event::new(notify::EventKind::Any)
+                .add_path(root.join("src").join(format!("file{i}.rs")));
+            assert!(event_has_signal(&source, &[], root, Some(root), &rules));
+        }
+        let escaped = notify::Event::new(notify::EventKind::Any).add_path(
+            root.join("..")
+                .join("elsewhere")
+                .join("src")
+                .join("main.rs"),
+        );
+        assert!(
+            event_has_signal(&escaped, &[], root, Some(root), &rules),
+            "a lexical escape stays signal; failing to classify it is not noise"
+        );
+        let long_name = "n".repeat(8_000);
+        let long =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("src").join(long_name));
+        assert!(event_has_signal(&long, &[], root, Some(root), &rules));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "40k classifications took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn failed_ignore_query_is_not_retried_on_every_tick() {
+        let mut rules = IgnoreRules::builtin();
+        rules.load_error = Some("timed out".into());
+        let now = Instant::now();
+        assert!(!rules_due(&rules, now, now, false));
+        assert!(!rules_due(&rules, now, now + Duration::from_secs(5), false));
+        assert!(rules_due(&rules, now, now + IGNORE_RETRY, false));
+        let clean = IgnoreRules::builtin();
+        assert!(!rules_due(&clean, now, now + IGNORE_RETRY, false));
+        assert!(rules_due(&clean, now, now + SCAN_COALESCE, true));
+        assert!(!rules_due(
+            &clean,
+            now,
+            now + Duration::from_millis(200),
+            true
+        ));
+    }
+
+    /// Raw FSEvents rate for a `target/` write storm, before the debounce
+    /// callback. Prints writes, delivered events, and how many of those name
+    /// `target`, over a fixed 2 second window.
+    #[test]
+    fn measure_target_directory_event_rate() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let git_dir = dir.path().join(".git");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let watcher = RepoFileWatcher::watch_repo(&git_dir, Some(dir.path()), None).expect("watch");
+        std::thread::sleep(Duration::from_millis(400));
+        while watcher.receiver.try_recv().is_ok() {}
+
+        let writes = 400u32;
+        let started = Instant::now();
+        for n in 0..writes {
+            std::fs::write(target.join(format!("obj{n}.o")), "x").unwrap();
+        }
+        let window = started.elapsed();
+        std::fs::write(dir.path().join("sentinel-src.rs"), "fn x() {}").unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        let mut events = 0u32;
+        let mut target_events = 0u32;
+        let mut sentinel_events = 0u32;
+        let mut sample = String::new();
+        while let Ok(item) = watcher.receiver.try_recv() {
+            events += 1;
+            if let Ok(event) = item {
+                let names_target = event.paths.iter().any(|path| {
+                    path.components()
+                        .any(|component| component.as_os_str() == "target")
+                });
+                if names_target {
+                    target_events += 1;
+                }
+                if event.paths.iter().any(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == "sentinel-src.rs")
+                }) {
+                    sentinel_events += 1;
+                }
+                if sample.len() < 400 {
+                    for path in &event.paths {
+                        sample.push_str(&path.display().to_string());
+                        sample.push('\n');
+                    }
+                }
+            }
+        }
+        let per_sec = target_events as f64 / window.as_secs_f64();
+        eprintln!(
+            "target-storm writes={writes} raw_events={events} target_events={target_events} ({per_sec:.1}/s) sentinel_events={sentinel_events} window={window:?}\n{sample}"
+        );
+        assert_eq!(
+            target_events, 0,
+            "nested target/ writes must not reach the non-recursive worktree watch"
+        );
+        assert!(
+            sentinel_events >= 1,
+            "the watch must still deliver a file at the worktree root, else the zero above is a dead stream"
+        );
+    }
+
+    #[test]
+    fn gitignored_directory_does_not_schedule_a_scan() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        std::fs::write(dir.path().join(".gitignore"), "scratch/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("scratch")).unwrap();
+        std::fs::write(dir.path().join("scratch").join("a.txt"), "x").unwrap();
+        let rules = IgnoreRules::load(dir.path());
+        assert!(
+            rules.load_error.is_none(),
+            "ignore query failed: {:?}",
+            rules.load_error
+        );
+        assert!(
+            rules.prefixes.iter().any(|prefix| prefix == "scratch"),
+            "prefixes: {:?}",
+            rules.prefixes
+        );
+        let ignored = notify::Event::new(notify::EventKind::Any)
+            .add_path(dir.path().join("scratch").join("a.txt"));
+        assert!(
+            !event_has_signal(&ignored, &[], dir.path(), None, &rules),
+            "a gitignored directory must not schedule a scan"
+        );
+        let source = notify::Event::new(notify::EventKind::Any)
+            .add_path(dir.path().join("src").join("main.rs"));
+        assert!(event_has_signal(&source, &[], dir.path(), None, &rules));
+    }
+
+    #[test]
+    fn scans_coalesce_to_one_per_max_wait() {
+        let now = Instant::now();
+        let first = now - Duration::from_millis(500);
+        assert!(
+            scan_is_due(true, first, Some(first), None, now),
+            "the first quiet period still scans"
+        );
+        assert!(
+            !scan_is_due(
+                true,
+                first,
+                Some(first),
+                Some(now - Duration::from_millis(500)),
+                now
+            ),
+            "a second scan inside the coalesce window must wait"
+        );
+        assert!(scan_is_due(
+            true,
+            now - SCAN_COALESCE,
+            Some(now - SCAN_COALESCE),
+            Some(now - SCAN_COALESCE),
+            now
+        ));
+    }
+
     /// Under continuous churn the old loop postponed emission forever (the
     /// 400ms quiet window never opened). The max-wait bound must produce at
     /// least one refresh within roughly DEBOUNCE_MAX_WAIT even though writes
@@ -2164,7 +2749,7 @@ mod tests {
             );
             let event = notify::Event::new(notify::EventKind::Any).add_path(path);
             assert!(
-                !event_has_signal(&event, &roots, tmp.path(), None),
+                !event_has_signal(&event, &roots, tmp.path(), None, &IgnoreRules::builtin()),
                 "generated-state-only events must not count as signal"
             );
         }
@@ -2181,7 +2766,7 @@ mod tests {
             );
             let event = notify::Event::new(notify::EventKind::Any).add_path(path);
             assert!(
-                event_has_signal(&event, &roots, tmp.path(), None),
+                event_has_signal(&event, &roots, tmp.path(), None, &IgnoreRules::builtin()),
                 "worktree content must still count as signal"
             );
         }
@@ -2190,13 +2775,13 @@ mod tests {
             .add_path(tmp.path().join(".devcouncil").join("codeintel"))
             .add_path(tmp.path().join("src").join("lib.rs"));
         assert!(
-            event_has_signal(&mixed, &roots, tmp.path(), None),
+            event_has_signal(&mixed, &roots, tmp.path(), None, &IgnoreRules::builtin()),
             "a real worktree path in a mixed event must keep the signal"
         );
 
         let empty = notify::Event::new(notify::EventKind::Any);
         assert!(
-            event_has_signal(&empty, &roots, tmp.path(), None),
+            event_has_signal(&empty, &roots, tmp.path(), None, &IgnoreRules::builtin()),
             "unclassifiable empty-path events must fail open as signal"
         );
 
@@ -2216,7 +2801,13 @@ mod tests {
         );
         let named_source_event = notify::Event::new(notify::EventKind::Any).add_path(named_source);
         assert!(
-            event_has_signal(&named_source_event, &roots, &named, None),
+            event_has_signal(
+                &named_source_event,
+                &roots,
+                &named,
+                None,
+                &IgnoreRules::builtin()
+            ),
             "a worktree named .devcouncil must still refresh on source edits"
         );
 
@@ -2490,6 +3081,7 @@ mod tests {
                 &internal_roots,
                 &worktree,
                 Some(&worktree_canonical),
+                &IgnoreRules::builtin(),
             );
         }
         let elapsed = started.elapsed();
@@ -2506,6 +3098,7 @@ mod tests {
                 &internal_roots,
                 &worktree,
                 Some(&worktree_canonical),
+                &IgnoreRules::builtin(),
             ),
             "refs/heads under the common dir must still emit for a linked worktree"
         );
@@ -2517,6 +3110,7 @@ mod tests {
                 &internal_roots,
                 &worktree,
                 Some(&worktree_canonical),
+                &IgnoreRules::builtin(),
             ),
             "index.lock under the common dir must remain git-internal noise"
         );

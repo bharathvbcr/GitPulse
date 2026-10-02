@@ -1,6 +1,7 @@
 import { formatCoveragePercent } from "./format";
 import { coverageCommandsAreCumulative } from "./scripts";
 import { observedTotal } from "../scan/limits";
+import { boundAgentPrompt, clipUtf8, safeText } from "../terminal/agentPromptText";
 import type {
   CoverageArtifact,
   CoverageFamilyStatus,
@@ -43,24 +44,6 @@ function safePercent(value: unknown): string {
 function safeCount(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0;
   return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.trunc(value)));
-}
-
-function safeText(value: unknown): string {
-  if (typeof value !== "string") return "";
-  // Paths and producer-owned labels are rendered as one report line. Keep
-  // embedded controls visible instead of letting a crafted filename inject a
-  // new heading, runnable command, or terminal control into the model prompt.
-  return Array.from(value, (char) => {
-    const code = char.codePointAt(0) ?? 0;
-    if (char === "\n") return "\\n";
-    if (char === "\r") return "\\r";
-    if (char === "\t") return "\\t";
-    if ([0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].includes(code)) {
-      return `\\u{${code.toString(16)}}`;
-    }
-    if (code < 0x20 || code === 0x7f) return `\\u{${code.toString(16).padStart(4, "0")}}`;
-    return char;
-  }).join("");
 }
 
 function safeList<T>(value: T[] | undefined): T[] {
@@ -339,22 +322,6 @@ function indentBlock(value: string): string {
     .join("\n");
 }
 
-function clipUtf8(value: string, maxBytes: number, note = ISSUE_CLIP_NOTE): { text: string; clipped: boolean } {
-  const encoder = new TextEncoder();
-  if (encoder.encode(value).byteLength <= maxBytes) return { text: value, clipped: false };
-  const noteBytes = encoder.encode(note).byteLength;
-  const contentLimit = Math.max(0, maxBytes - noteBytes);
-  let bytes = 0;
-  let text = "";
-  for (const char of value) {
-    const width = encoder.encode(char).byteLength;
-    if (bytes + width > contentLimit) break;
-    text += char;
-    bytes += width;
-  }
-  return { text: text + note, clipped: true };
-}
-
 /** The same portable task is previewed, copied, and supplied to the agent CLI. */
 export interface CoverageAgentFocus {
   file: FileCoverageSummary;
@@ -404,11 +371,8 @@ export function formatCoverageAgentPrompt(
     "",
     report ? formatCoverageReport(report, repoPath, exclusions) : "No scan snapshot is available. Coverage is unmeasured.",
   ].join("\n");
-  // Below the terminal's argument budget; retain all task instructions and
-  // disclose any bounded context without splitting a Unicode code point.
-  const bounded = clipUtf8(context, 16000 - new TextEncoder().encode(instructions + "\n\n").length,
+  return boundAgentPrompt(instructions, context,
     "\n\n[GitPulse context clipped; inspect the repository for the remaining languages, paths and coverage details.]");
-  return `${instructions}\n\n${bounded.text}`;
 }
 
 /**
@@ -464,7 +428,7 @@ export function buildCoverageIssueDraft(
     "- [ ] Regenerate coverage and attach the verified before/after totals.",
   );
 
-  const clipped = clipUtf8(sections.join("\n"), MAX_ISSUE_BODY_BYTES);
+  const clipped = clipUtf8(sections.join("\n"), MAX_ISSUE_BODY_BYTES, ISSUE_CLIP_NOTE);
   return { title, body: clipped.text, clipped: clipped.clipped };
 }
 

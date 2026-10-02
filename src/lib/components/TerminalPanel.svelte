@@ -6,7 +6,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
   import type { FocusOutcome } from "../terminal/sessionFocus";
-  import { terminalLaunchRequests } from "../terminal/launchRequests";
+  import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
   import { taskTerminalRequests, consumeTaskTerminal } from "../terminal/taskLaunches";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
@@ -426,7 +426,7 @@
       // Only a prompt-carrying launch is an AGENT session; a plain shell
       // started from the palette must not appear in the agent list that
       // Coverage's "View agent session" reads.
-      const agent = claimed.launcher === "claude" || claimed.launcher === "codex" ? claimed.launcher : null;
+      const agent = isPromptLauncher(claimed.launcher) ? claimed.launcher : null;
       if (opened && id && agent && claimed.prompt !== undefined) terminalLaunchRequests.remember({
         id, repoPath: claimed.repoPath, launcher: agent, status: "starting",
         reveal() {

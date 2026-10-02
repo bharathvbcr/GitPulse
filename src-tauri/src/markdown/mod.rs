@@ -206,34 +206,63 @@ mod tests {
             ("$$\nx^2\n$$", "$$"),
         ] {
             let rendered = html(source);
-            assert!(!rendered.contains(leaked), "{source:?} leaked {leaked:?}: {rendered}");
+            assert!(
+                !rendered.contains(leaked),
+                "{source:?} leaked {leaked:?}: {rendered}"
+            );
         }
     }
 
     #[test]
     fn nested_structure_survives() {
         assert!(html("**a *b* c**").contains("<strong>a <em>b</em> c</strong>"));
-        assert!(html("[a **b**](https://x.y)").contains("<a href=\"https://x.y\">a <strong>b</strong></a>"));
+        assert!(html("[a **b**](https://x.y)")
+            .contains("<a href=\"https://x.y\">a <strong>b</strong></a>"));
         let list = html("- one\n  - nested\n- two");
-        assert!(list.contains("<li>one\n<ul>\n<li>nested</li>\n</ul>\n</li>"), "{list}");
+        assert!(
+            list.contains("<li>one\n<ul>\n<li>nested</li>\n</ul>\n</li>"),
+            "{list}"
+        );
         assert!(html("3. three\n4. four").contains("<ol start=\"3\">"));
         let table = html("| a | b |\n|-|-:|\n| 1 | 2 |");
-        assert!(table.contains("<thead><tr><th>a</th><th style=\"text-align: right\">b</th></tr></thead>"), "{table}");
+        assert!(
+            table.contains(
+                "<thead><tr><th>a</th><th style=\"text-align: right\">b</th></tr></thead>"
+            ),
+            "{table}"
+        );
         assert!(html("a  \nb").contains("a<br />"));
-        assert!(html("a &amp; b").contains("a &amp; b") && !html("a &amp; b").contains("&amp;amp;"));
+        assert!(
+            html("a &amp; b").contains("a &amp; b") && !html("a &amp; b").contains("&amp;amp;")
+        );
     }
 
     #[test]
     fn the_outline_names_the_ids_the_page_carries() {
-        let rendered = render("# Intro\n\n## Intro\n\nSetext\n===\n\n```\n# not a heading\n```", None).unwrap();
+        let rendered = render(
+            "# Intro\n\n## Intro\n\nSetext\n===\n\n```\n# not a heading\n```",
+            None,
+        )
+        .unwrap();
         let outline: Vec<(u8, &str, &str)> = rendered
             .headings
             .iter()
             .map(|h| (h.level, h.title.as_str(), h.id.as_str()))
             .collect();
-        assert_eq!(outline, [(1, "Intro", "intro"), (2, "Intro", "intro-1"), (1, "Setext", "setext")]);
+        assert_eq!(
+            outline,
+            [
+                (1, "Intro", "intro"),
+                (2, "Intro", "intro-1"),
+                (1, "Setext", "setext")
+            ]
+        );
         for heading in &rendered.headings {
-            assert!(rendered.html.contains(&format!("id=\"{}\"", heading.id)), "{}", heading.id);
+            assert!(
+                rendered.html.contains(&format!("id=\"{}\"", heading.id)),
+                "{}",
+                heading.id
+            );
         }
     }
 
@@ -243,13 +272,25 @@ mod tests {
         assert_eq!(
             rendered.frontmatter,
             [
-                FrontmatterField { key: "title".into(), value: "Hello".into() },
-                FrontmatterField { key: "tags".into(), value: "[a, b]".into() },
+                FrontmatterField {
+                    key: "title".into(),
+                    value: "Hello".into()
+                },
+                FrontmatterField {
+                    key: "tags".into(),
+                    value: "[a, b]".into()
+                },
             ]
         );
         assert!(!rendered.html.contains("title"), "{}", rendered.html);
         let toml = render("+++\ntitle = \"T\"\n+++\nx", None).unwrap();
-        assert_eq!(toml.frontmatter, [FrontmatterField { key: "title".into(), value: "T".into() }]);
+        assert_eq!(
+            toml.frontmatter,
+            [FrontmatterField {
+                key: "title".into(),
+                value: "T".into()
+            }]
+        );
     }
 
     #[test]
@@ -267,7 +308,11 @@ mod tests {
             let rendered = html(source).to_ascii_lowercase();
             assert!(!rendered.contains("<script"), "{source}: {rendered}");
             assert!(!rendered.contains("<svg"), "{source}: {rendered}");
-            for tag in rendered.split('<').skip(1).filter_map(|rest| rest.split_once('>')) {
+            for tag in rendered
+                .split('<')
+                .skip(1)
+                .filter_map(|rest| rest.split_once('>'))
+            {
                 assert!(!tag.0.contains("onerror"), "{source}: {rendered}");
                 assert!(!tag.0.contains("javascript:"), "{source}: {rendered}");
                 assert!(!tag.0.contains("src=\"x\""), "{source}: {rendered}");
@@ -278,8 +323,14 @@ mod tests {
     #[test]
     fn remote_pictures_load_without_a_referrer() {
         let rendered = html("![shot](https://example.com/s.png)");
-        assert!(rendered.contains("src=\"https://example.com/s.png\""), "{rendered}");
-        assert!(rendered.contains("referrerpolicy=\"no-referrer\""), "{rendered}");
+        assert!(
+            rendered.contains("src=\"https://example.com/s.png\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("referrerpolicy=\"no-referrer\""),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -304,7 +355,8 @@ mod tests {
         let repo = root.path().join("repo");
         std::fs::create_dir_all(repo.join("docs")).unwrap();
         crate::test_support::git_in(&repo, &["init", "-b", "main"]);
-        let png: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89";
+        let png: &[u8] =
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89";
         std::fs::write(repo.join("docs/inside.png"), png).unwrap();
         std::fs::write(root.path().join("secret.png"), png).unwrap();
         let repo_path = repo.to_str().unwrap();
@@ -313,7 +365,12 @@ mod tests {
             Some((repo_path, "docs/README.md")),
         )
         .unwrap();
-        assert_eq!(rendered.html.matches("src=\"data:image/png").count(), 1, "{}", rendered.html);
+        assert_eq!(
+            rendered.html.matches("src=\"data:image/png").count(),
+            1,
+            "{}",
+            rendered.html
+        );
         // No location: nothing is read at all.
         let unplaced = render("![in](inside.png)", None).unwrap();
         assert!(!unplaced.html.contains("data:image"), "{}", unplaced.html);

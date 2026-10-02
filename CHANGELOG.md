@@ -11,29 +11,6 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Documentation
-
-- **Feature reference, terminal, performance and README now cover the 1.3.5
-  behaviour they had skipped:** Secrets locations, scope, age and single-scan
-  rule; coloured tabs and restore; stacked notices; terminal foreground
-  reporting; and background timers that stop.
-- **The HTML entry points describe the app.** `index.html` and `status.html`
-  carry a description, application name and social metadata, and explain in a
-  `<noscript>` block that GitPulse is a desktop app that needs JavaScript.
-- **Docs audit against the code.** Every relative link, `bun run` script and
-  source path named in the maintained docs resolves, and the stated handler,
-  view and section counts match the code. The one live `npm run typecheck`
-  instruction in `DEPENDENCY_HEALTH.md` now names Bun; dated verification
-  records keep the commands they were run with. `SECURITY.md` was checked
-  against the code (file budget, attribute limits, Kingfisher flags and
-  environment, daily release check, dead-branch authorization); its CSP
-  section now states `style-src 'self' 'unsafe-inline'`, `base-uri` and
-  `object-src` instead of calling styles same-origin, and the worktree hook
-  deadline and output cap are documented. The trust section now records the reboot-stable
-  identity check (no device number), the stable record names and startup
-  migration, how refused tabs are treated, and the revocation fallback for a
-  deleted checkout.
-
 ## [1.3.5] - 2026-10-02
 
 Stale-branch cleanup with backups, a secret scan that never reads a partial
@@ -99,6 +76,11 @@ installs and scripts.
   artifact it found but skipped and why, the setup and generate commands, one
   Run button, and the report shapes it reads. Only the family actually
   running says "Running…".
+- **Health can send a coding agent a bounded prompt.** Dependencies,
+  coverage, secrets and storage each have a prompt that states what was
+  measured and what was not, so a missing scan is not described as clean.
+  Paths and report text are escaped, and the prompt stays within the
+  terminal's argument limit.
 
 ### Changed
 
@@ -217,6 +199,39 @@ installs and scripts.
 - **Dead-branch cleanup is judged on the git commands it actually runs.**
   Each `git branch -d/-D` and `git push --delete` is authorized before the
   first delete. A refusal stops the batch before any branch is removed.
+- **A bun.lock is audited with bun, not recorded as a failed npm audit.**
+  `npm audit` exits ENOLOCK on a Bun lockfile. That used to look like the
+  audit ran and failed. `bun audit --json` runs when bun is on PATH and a
+  `bun.lock` is present; an empty or unexpected body is an error, not a
+  clean report.
+- **A build-directory storm no longer fans out into git.** The watcher
+  ignores directories that are build output by construction and directories
+  gitignore already covers, and git spawns are rate-limited after a short
+  burst. A failed or truncated ignore query stays partial; it does not read
+  as "nothing is ignored".
+
+### Documentation
+
+- **Feature reference, terminal, performance and README now cover the 1.3.5
+  behaviour they had skipped:** Secrets locations, scope, age and single-scan
+  rule; coloured tabs and restore; stacked notices; terminal foreground
+  reporting; and background timers that stop.
+- **The HTML entry points describe the app.** `index.html` and `status.html`
+  carry a description, application name and social metadata, and explain in a
+  `<noscript>` block that GitPulse is a desktop app that needs JavaScript.
+- **Docs audit against the code.** Every relative link, `bun run` script and
+  source path named in the maintained docs resolves, and the stated handler,
+  view and section counts match the code. The one live `npm run typecheck`
+  instruction in `DEPENDENCY_HEALTH.md` now names Bun; dated verification
+  records keep the commands they were run with. `SECURITY.md` was checked
+  against the code (file budget, attribute limits, Kingfisher flags and
+  environment, daily release check, dead-branch authorization); its CSP
+  section now states `style-src 'self' 'unsafe-inline'`, `base-uri` and
+  `object-src` instead of calling styles same-origin, and the worktree hook
+  deadline and output cap are documented. The trust section now records the
+  reboot-stable identity check (no device number), the stable record names
+  and startup migration, how refused tabs are treated, and the revocation
+  fallback for a deleted checkout.
 
 ## [1.3.1] - 2026-09-22
 

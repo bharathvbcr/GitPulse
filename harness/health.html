@@ -52,7 +52,7 @@
 
       const healthReport = () => {
         const base = {
-          node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true,
+          node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true, bun_cli_present: false,
           cargo_audit_present: true, cargo_deny_present: false, cargo_crev_present: false, pip_audit_present: false, govulncheck_present: false,
           composer_present: false, bundler_audit_present: false,
           scanners_ran: ["npm", "cargo"], audit_complete: false,
@@ -206,6 +206,7 @@
       const section = id => root.querySelector(`[data-health-section="${id}"]`);
       const scroller = () => root.querySelector(".overflow-auto");
       const header = () => root.querySelector(".gp-section-edge");
+      const agentBar = () => root.querySelector('[aria-label="Send a health task to a coding agent"]');
       const rescan = async next => {
         mode = next;
         button("Scan local").click();
@@ -300,6 +301,29 @@
           });
           check("the page does not scroll sideways", () =>
             scroller().scrollWidth <= scroller().clientWidth + 1);
+
+          // ---- Coding-agent prompt bar --------------------------------------
+          // Controls only. Run is not clicked: this page mounts HealthPanel
+          // without the terminal dock, so a launch would wait out its timeout.
+          check("the agent prompt bar renders below the header, not inside it", () => {
+            const bar = agentBar();
+            return !!bar && !header().contains(bar)
+              && bar.getBoundingClientRect().top >= header().getBoundingClientRect().bottom - 1;
+          });
+          check("the agent select offers every coding agent", () =>
+            [...agentBar().querySelector('select[aria-label="Health coding agent"]').options]
+              .map(option => option.value).join(",") === "claude,codex,grok,agy");
+          check("the task select offers the four health actions", () =>
+            [...agentBar().querySelector('select[aria-label="Health agent task"]').options]
+              .map(option => option.textContent.trim()).join(",")
+              === "Fix dependencies,Improve coverage,Fix secrets,Optimize storage");
+          check("the bar has Run, Copy and Preview, and Fix with MANVI stays in the header", () =>
+            !!agentBar().querySelector('button[aria-label^="Run "]')
+              && !!agentBar().querySelector('button[aria-label="Copy health agent prompt"]')
+              && !!agentBar().querySelector('button[aria-expanded]')
+              && has(header(), "Fix with MANVI"));
+          check("the agent bar does not clip its controls", () =>
+            agentBar().scrollWidth <= agentBar().clientWidth + 1);
 
           // ---- Honesty ------------------------------------------------------
           check("a capped scan is not presented as complete", () =>
@@ -404,6 +428,8 @@
             has(section("vulnerabilities").querySelector("h3"), "showing"));
           check("the header still does not clip under a large report", () =>
             header().scrollWidth <= header().clientWidth + 1);
+          check("the agent bar still renders and does not clip under a large report", () =>
+            !!agentBar() && agentBar().scrollWidth <= agentBar().clientWidth + 1);
 
           // ---- Stress: hostile strings ---------------------------------------
           await rescan("hostile");

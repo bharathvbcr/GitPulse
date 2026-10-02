@@ -362,7 +362,14 @@ pub fn scan_with_binary(
         Ok(run) => run,
         Err(err) => {
             let reason = runner_failure_reason(&err, deadline);
-            let diag = current_diagnostic(version.as_deref(), binary, &jobs, deadline, &started, &ticket);
+            let diag = current_diagnostic(
+                version.as_deref(),
+                binary,
+                &jobs,
+                deadline,
+                &started,
+                &ticket,
+            );
             return failed_with_diagnostic(&reason, &diag);
         }
     };
@@ -389,7 +396,14 @@ pub fn scan_with_binary(
             Incomplete::OverCap(_) => "kingfisher output was truncated",
             Incomplete::Unread(_) => "kingfisher output could not be read to the end",
         };
-        let diag = current_diagnostic(version.as_deref(), binary, &jobs, deadline, &started, &ticket);
+        let diag = current_diagnostic(
+            version.as_deref(),
+            binary,
+            &jobs,
+            deadline,
+            &started,
+            &ticket,
+        );
         return failed_with_diagnostic(reason, &diag);
     }
 
@@ -411,7 +425,14 @@ pub fn scan_with_binary(
             .error
             .clone()
             .unwrap_or_else(|| "kingfisher failed to run".into());
-        let diag = current_diagnostic(version.as_deref(), binary, &jobs, deadline, &started, &ticket);
+        let diag = current_diagnostic(
+            version.as_deref(),
+            binary,
+            &jobs,
+            deadline,
+            &started,
+            &ticket,
+        );
         note_failure(&mut report, &reason, &diag);
     }
     report
@@ -444,10 +465,7 @@ fn current_diagnostic(
     }
 }
 
-fn failed_with_diagnostic(
-    reason: &str,
-    facts: &ScanDiagnostic,
-) -> SecretsReport {
+fn failed_with_diagnostic(reason: &str, facts: &ScanDiagnostic) -> SecretsReport {
     let mut report = failed_report(reason, facts.version.clone());
     note_failure(&mut report, reason, facts);
     report
@@ -455,11 +473,7 @@ fn failed_with_diagnostic(
 
 /// Log the failure and attach the copyable facts. Superseded scans are the
 /// ordinary result of switching repositories, so they stay quiet.
-fn note_failure(
-    report: &mut SecretsReport,
-    reason: &str,
-    facts: &ScanDiagnostic,
-) {
+fn note_failure(report: &mut SecretsReport, reason: &str, facts: &ScanDiagnostic) {
     if reason == SUPERSEDED {
         return;
     }

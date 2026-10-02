@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import type { LauncherKind } from "./tabs";
+import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 
 export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
@@ -63,7 +64,7 @@ export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string
   if (!isPromptLauncher(launcher)) {
     throw new Error("Initial prompts require Claude Code, Codex, Grok, or Antigravity");
   }
-  if (!prompt.trim() || prompt.includes("\0") || new TextEncoder().encode(prompt).length > 16000) {
+  if (!prompt.trim() || prompt.includes("\0") || new TextEncoder().encode(prompt).length > AGENT_PROMPT_MAX_BYTES) {
     throw new Error("Agent prompt must be nonempty, contain no NUL, and fit within 16000 bytes");
   }
   // Antigravity reads prompts only from `--prompt-interactive` / `--print`, never positionally.

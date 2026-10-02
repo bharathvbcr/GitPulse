@@ -154,6 +154,9 @@ describe("formatCoverageAgentPrompt", () => {
     expect(prompt).toContain("context clipped");
     expect(prompt).toContain("Do not fabricate");
     expect(prompt).not.toContain("\ufffd");
+    expect(prompt.endsWith(
+      "\n\n[GitPulse context clipped; inspect the repository for the remaining languages, paths and coverage details.]",
+    )).toBe(true);
   });
 
   it("keeps producer-owned controls literal and separates data from instructions", () => {
@@ -469,6 +472,7 @@ describe("buildCoverageIssueDraft", () => {
     const draft = buildCoverageIssueDraft(representativeReport(), "/repo", "🧪".repeat(40_000));
     expect(draft.clipped).toBe(true);
     expect(draft.body).toContain("GitPulse clipped this draft");
+    expect(draft.body.endsWith("\n\n[GitPulse clipped this draft to stay below GitHub's body limit.]")).toBe(true);
     expect(new TextEncoder().encode(draft.body).byteLength).toBeLessThanOrEqual(60 * 1024);
     expect(draft.body).not.toContain("\uFFFD");
   });

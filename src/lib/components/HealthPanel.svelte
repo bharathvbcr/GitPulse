@@ -63,6 +63,9 @@
     loadGithubAlerts,
   } from "../health/githubAlerts";
   import { buildRunnablePlanSteps } from "../terminal/tokenize";
+  import { PROMPT_LAUNCHERS, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
+  import { PROVIDER_LABELS } from "../workbench/taskHandoff";
+  import { HEALTH_AGENT_ACTIONS, healthAgentPrompt, type HealthAgentAction } from "../health/agentPrompts";
   import {
     parseDepsHealthReport,
     type Vulnerability,
@@ -746,6 +749,83 @@
     }
   }
 
+  let agentLauncher = $state<PromptLauncher>("claude");
+  let agentAction = $state<HealthAgentAction>("deps");
+  let agentLaunching = $state(false);
+  let agentPreviewOpen = $state(false);
+  let agentCopied = $state(false);
+  let agentError = $state<string | null>(null);
+  let agentNotice = $state<string | null>(null);
+  let agentCopyTimer: number | null = null;
+  /**
+   * The one pending launch, cancelled with the repository it was started for.
+   * A prompt built for the previous checkout must never open in the next.
+   */
+  let agentLaunchController: AbortController | null = null;
+
+  const agentActionLabel = $derived(HEALTH_AGENT_ACTIONS.find((action) => action.id === agentAction)?.label ?? "");
+  // Health attaches only the report it is already showing. Coverage, secrets
+  // and storage are scanned by their own pages; their prompts say nothing
+  // was attached instead of Health starting a second, uncancellable scan.
+  const agentPrompt = $derived.by(() => {
+    const repoPath = $repoStore.currentPath;
+    if (!repoPath) return "";
+    return healthAgentPrompt(agentAction, repoPath, agentAction === "deps" ? renderedReport() : null);
+  });
+
+  $effect(() => {
+    void agentPrompt;
+    agentCopied = false;
+    agentError = null;
+  });
+
+  function cancelHealthAgentLaunch() {
+    const controller = agentLaunchController;
+    agentLaunchController = null;
+    controller?.abort();
+  }
+
+  async function runHealthAgent() {
+    const repoPath = $repoStore.currentPath;
+    const text = agentPrompt;
+    if (!repoPath || !text || agentLaunching) return;
+    const launcher = agentLauncher;
+    const controller = new AbortController();
+    agentLaunchController = controller;
+    agentLaunching = true;
+    agentError = null;
+    agentNotice = null;
+    try {
+      const opened = terminalLaunchRequests.request(repoPath, launcher, text, controller.signal);
+      // The dock is lazy and only claims a request while visible.
+      repoStore.setTerminalOpen(true);
+      await opened;
+      if (agentLaunchController !== controller) return;
+      agentNotice = `${PROVIDER_LABELS[launcher]} session opened in the terminal. Rescan Health after it finishes.`;
+    } catch (err) {
+      if (agentLaunchController !== controller) return;
+      agentError = formatError(err);
+    } finally {
+      if (agentLaunchController === controller) agentLaunchController = null;
+      agentLaunching = false;
+    }
+  }
+
+  async function copyHealthAgentPrompt() {
+    const text = agentPrompt;
+    if (!text) return;
+    const ok = await copyText(text);
+    if (agentPrompt !== text) return;
+    if (ok) {
+      agentCopied = true;
+      if (agentCopyTimer !== null) window.clearTimeout(agentCopyTimer);
+      agentCopyTimer = window.setTimeout(() => (agentCopied = false), 1500);
+    } else {
+      agentError = "Could not copy. Open Preview prompt and copy it from there.";
+      agentPreviewOpen = true;
+    }
+  }
+
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
 
   $effect(() => {
@@ -754,8 +834,10 @@
       dependabotInflight?.cancel();
       fixInflight?.cancel();
       stepsInflight?.cancel();
+      cancelHealthAgentLaunch();
       if (copyTimer !== null) window.clearTimeout(copyTimer);
       if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
+      if (agentCopyTimer !== null) window.clearTimeout(agentCopyTimer);
     };
   });
 
@@ -766,7 +848,9 @@
       dependabotInflight?.cancel();
       fixInflight?.cancel();
       stepsInflight?.cancel();
+      cancelHealthAgentLaunch();
       untrack(() => {
+        agentNotice = null;
         scanned.path = "";
         report = null;
         dependabot = null;
@@ -787,6 +871,10 @@
     if (path === scanned.path) return;
     scanned.path = path;
     dependabotInflight?.cancel();
+    cancelHealthAgentLaunch();
+    untrack(() => {
+      agentNotice = null;
+    });
     // Hydrate last-known data synchronously so a revisit renders instantly
     // (the placeholder below only fires when there is no cached report).
     const cached = healthCache.get(path);
@@ -1026,6 +1114,80 @@
       </button>
     </div>
   </div>
+
+  <!-- A row of its own, allowed to wrap: the header above is checked for
+       clipping at 1280px and has no room for two selects and three buttons.
+       No `<details>` and no `overflow-auto` here — the health harness finds
+       the permission disclosure and the scroller by position. -->
+  {#if $repoStore.currentPath}
+    <div
+      role="group"
+      aria-label="Send a health task to a coding agent"
+      class="px-4 py-1.5 border-b border-border/60 bg-surface/40 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-[11px]"
+    >
+      <Terminal size={13} class="shrink-0 text-textMuted" />
+      <span class="shrink-0 text-textMuted">Agent</span>
+      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40 py-1 text-[11px]">
+        {#each PROMPT_LAUNCHERS as kind (kind)}<option value={kind}>{PROVIDER_LABELS[kind]}</option>{/each}
+      </select>
+      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44 py-1 text-[11px]">
+        {#each HEALTH_AGENT_ACTIONS as action (action.id)}<option value={action.id}>{action.label}</option>{/each}
+      </select>
+      <button
+        type="button"
+        class="gp-btn-primary py-1! px-2.5! text-[11px]!"
+        aria-label={`Run ${agentActionLabel} in ${PROVIDER_LABELS[agentLauncher]}`}
+        title="Runs in GitPulse’s terminal with this repository as the working directory"
+        disabled={!agentPrompt || agentLaunching}
+        onclick={() => void runHealthAgent()}
+      >
+        {#if agentLaunching}<LoaderCircle size={12} class="animate-spin" />{:else}<Terminal size={12} />{/if}
+        Run
+      </button>
+      <button
+        type="button"
+        class="gp-btn py-1! px-2.5! text-[11px]!"
+        title="Copy the prompt for an agent session you already have open"
+        aria-label={agentCopied ? "Health agent prompt copied" : "Copy health agent prompt"}
+        disabled={!agentPrompt}
+        onclick={() => void copyHealthAgentPrompt()}
+      >
+        {#if agentCopied}<Check size={12} />{:else}<Clipboard size={12} />{/if}
+        {agentCopied ? "Copied" : "Copy prompt"}
+      </button>
+      <button
+        type="button"
+        class="gp-chip ml-auto shrink-0 border-border/70 text-textMuted hover:text-textPrimary"
+        aria-expanded={agentPreviewOpen}
+        aria-controls="health-agent-prompt-preview"
+        onclick={() => (agentPreviewOpen = !agentPreviewOpen)}
+      >
+        Preview prompt
+      </button>
+      {#if agentPreviewOpen}
+        <div id="health-agent-prompt-preview" class="w-full space-y-1.5">
+          <p class="text-textMuted">
+            {#if agentAction === "deps"}
+              {report ? "Attaches the health report shown below." : "No health report is loaded yet; the prompt tells the agent to audit before changing anything."}
+            {:else}
+              Health attaches no snapshot for this task; the prompt tells the agent to measure first.
+            {/if}
+          </p>
+          <textarea
+            aria-label="Health agent prompt"
+            readonly
+            value={agentPrompt}
+            spellcheck={false}
+            class="gp-field gp-field-multi h-48 w-full resize-y p-3 font-mono text-[11px] leading-relaxed"
+          ></textarea>
+        </div>
+      {/if}
+      {#if agentLaunching}<p role="status" class="w-full text-textMuted">Opening agent terminal…</p>{/if}
+      {#if agentCopied}<p role="status" class="sr-only">Health agent prompt copied</p>{/if}
+      {#if agentError}<p role="alert" class="w-full text-rose-400">{agentError}</p>{/if}
+      {#if agentNotice}<p role="status" class="w-full text-textMuted">{agentNotice}</p>{/if}
+    </div>
+  {/if}
 
   <div class="flex-1 overflow-auto p-4 space-y-5">
     <!-- Four lines of prose about GitHub CLI permissions used to be pinned at

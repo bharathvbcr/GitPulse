@@ -77,6 +77,8 @@ export interface DepsHealthReport {
   node_version?: string | null;
   npm_version?: string | null;
   npm_cli_present: boolean;
+  /** True when a Bun lockfile exists and bun is on PATH. Absent on older reports. */
+  bun_cli_present?: boolean;
   cargo_audit_present: boolean;
   /** True when deny.toml exists and cargo-deny is on PATH. */
   cargo_deny_present?: boolean;
@@ -87,7 +89,7 @@ export interface DepsHealthReport {
   composer_present?: boolean;
   bundler_audit_present?: boolean;
   /**
-   * Scanners that actually dispatched a command this scan ("npm", "cargo",
+   * Scanners that actually dispatched a command this scan ("npm", "bun", "cargo",
    * "cargo-deny", "cargo-crev", "pip-audit", "govulncheck", "composer",
    * "bundler-audit").
    * Empty or absent means nothing ran — zero findings then mean nothing.
@@ -375,6 +377,7 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
     node_version: typeof value.node_version === "string" ? value.node_version : value.node_version === null ? null : undefined,
     npm_version: typeof value.npm_version === "string" ? value.npm_version : value.npm_version === null ? null : undefined,
     npm_cli_present: value.npm_cli_present,
+    bun_cli_present: typeof value.bun_cli_present === "boolean" ? value.bun_cli_present : undefined,
     cargo_audit_present: value.cargo_audit_present,
     cargo_deny_present: typeof value.cargo_deny_present === "boolean" ? value.cargo_deny_present : undefined,
     cargo_crev_present: typeof value.cargo_crev_present === "boolean" ? value.cargo_crev_present : undefined,

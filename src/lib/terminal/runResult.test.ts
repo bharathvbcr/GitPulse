@@ -173,6 +173,17 @@ describe("formatRunSummary names the cause of a failed run", () => {
     expect(summary).toMatch(/^error: ojas-metal\/Cargo\.toml: can't find `metal_bench` example/);
   });
 
+  it("skips rustc's file pointer and gutter instead of summarizing them", () => {
+    const summary = formatRunSummary(
+      result({
+        stderr_tail: [" --> src/lib.rs:10:5", "  |", "10 |     missing", "  |     ^^^^^^^", "error: boom"].join(
+          "\n",
+        ),
+      }),
+    );
+    expect(summary).toBe("error: boom");
+  });
+
   it("skips go's package header and prefers the self-contained linker line", () => {
     const summary = formatRunSummary(result({ exit_code: 1, stdout_tail: GO_TEST_LINK_FAILURE }));
     expect(summary).toBe("ld: symbol(s) not found for architecture arm64");

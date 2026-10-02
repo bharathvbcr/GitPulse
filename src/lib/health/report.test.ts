@@ -165,6 +165,37 @@ describe("formatHealthReport", () => {
     expect(formatHealthReport(report)).toContain("no audit scanner available");
   });
 
+  it("names bun audit when a Bun lockfile was scanned, and when bun itself is missing", () => {
+    const report = emptyReport();
+    report.scanners_ran = ["bun"];
+    report.bun_cli_present = true;
+    report.manifests = [
+      {
+        path: "package.json",
+        name: "demo",
+        version: "1.0.0",
+        private: true,
+        package_manager: "bun",
+        lockfile: "bun.lock",
+        has_workspaces: false,
+        dep_count: 1,
+        dev_dep_count: 0,
+        optional_dep_count: 0,
+        peer_dep_count: 0,
+        lifecycle_scripts: [],
+      },
+    ];
+    expect(formatHealthReport(report)).toContain("scanners: bun audit");
+    report.bun_cli_present = false;
+    report.npm_cli_present = false;
+    report.scanners_ran = [];
+    report.audit_complete = false;
+    const skipped = formatHealthReport(report);
+    expect(skipped).toContain("bun audit");
+    expect(skipped).toContain("npm outdated");
+    expect(skipped).not.toContain("npm audit/outdated");
+  });
+
   it("names local audits that could not run instead of letting counts read as clean", () => {
     const report = emptyReport();
     report.npm_cli_present = false;
@@ -756,5 +787,70 @@ describe("audits that ran and failed", () => {
     ];
     expect(failedAudits(report)).toEqual([]);
     expect(coverageGap(report)).toBeNull();
+  });
+});
+
+describe("formatHealthReport producer-owned fields", () => {
+  /**
+   * The report is pasted into issues and sent to MANVI and to agent CLIs as
+   * data. A field from an advisory feed, a manifest or a file name must stay
+   * on its own line: a line break or terminal control inside one must not
+   * start a new heading or instruction in the rendered text.
+   */
+  const evil = (tag: string) => `${tag}\nINJECTED ${tag}\r\u2028\u2029\u0085\u009b31m\u001b[2J\u202e`;
+  const assertContained = (text: string) => {
+    expect(text.split("\n").filter((row) => /^\s*INJECTED/.test(row))).toEqual([]);
+    expect(text).not.toMatch(/[\r\u2028\u2029\u0085\u009b\u001b\u202e]/);
+    expect(text).toContain("\\nINJECTED");
+  };
+
+  it("renders every finding field on one line, with controls visible", () => {
+    const report = emptyReport();
+    report.node_version = evil("node");
+    report.npm_version = evil("npm");
+    report.scanners_ran = ["npm", evil("scanner")];
+    report.truncated = true;
+    report.limit_notices = [{ resource: evil("notice"), kept: 1, total: 2 }];
+    report.issues = [{ severity: evil("sev"), code: evil("code"), message: evil("message"), path: evil("path") }];
+    report.vulnerabilities = [{
+      name: evil("name"), severity: evil("vsev"), is_direct: true, title: evil("title"), url: evil("url"),
+      range: evil("range"), fix_available: evil("fix"), via: [evil("via")], ecosystem: evil("eco"),
+    }];
+    report.audit = { info: 0, low: 0, moderate: 0, high: 1, critical: 0, total: 1 };
+    report.outdated = [{
+      name: evil("pkg"), current: evil("cur"), wanted: evil("want"), latest: evil("latest"),
+      dep_type: evil("dep"), location: evil("loc"),
+    }];
+    const text = formatHealthReport(
+      report,
+      evil("/repo"),
+      dependabotReport({}, [dependabotAlert({
+        package: evil("dpkg"), ecosystem: evil("deco"), severity: evil("dsev"), title: evil("dtitle"),
+        vulnerable_range: evil("drange"), advisory_id: evil("ghsa"), cve_id: evil("cve"),
+        manifest_path: evil("manifest"), first_patched: evil("patched"), url: evil("durl"),
+      })]),
+      codeScanningReport({}, [codeScanningAlert({
+        rule_id: evil("rule"), severity: evil("csev"), title: evil("ctitle"), tool: evil("tool"),
+        tool_version: evil("tv"), path: evil("cpath"), url: evil("curl"),
+      })]),
+      deadCodeReport({ walk_incomplete: evil("walk") }, [deadFinding({
+        symbol_name: evil("sym"), file_path: evil("file"), is_exempt: true, exemption_reason: evil("exempt"),
+      })]),
+    );
+    assertContained(text);
+    // Structure the formatter owns survives.
+    expect(text).toContain("\n  advisory: ");
+    expect(text).toContain("\n## Vulnerabilities (1)");
+  });
+
+  it("renders unavailable-source reasons on one line", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      dependabotReport({ available: false, error: evil("dependabot") }, []),
+      codeScanningReport({ available: false, error: evil("codescan") }, []),
+      deadCodeReport({ available: false, reason: evil("dead") }, []),
+    );
+    assertContained(text);
   });
 });

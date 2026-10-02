@@ -1459,6 +1459,11 @@ pub(crate) fn with_background_processes<T>(body: impl FnOnce() -> T) -> T {
 /// threads that are already blocking on a subprocess.
 struct SpawnGate {
     limit: usize,
+    /// `u32::MAX` turns the token bucket off. The process-wide gate does that
+    /// under `cfg(test)` so the suite can spawn git freely; production uses
+    /// [`production_spawn_rate`].
+    burst: u32,
+    refill_per_sec: u32,
     state: Mutex<GateState>,
     released: Condvar,
 }
@@ -1471,15 +1476,63 @@ struct GateState {
     /// High-water mark, kept so a test can assert the ceiling actually held
     /// rather than assert on the counter it is trying to prove bounded.
     peak: usize,
+    /// Whole tokens remaining. Integer so a fractional refill cannot admit an
+    /// extra child, and so concurrent waiters cannot share one token via float
+    /// rounding. The mutex makes the decrement atomic with the check.
+    tokens: u32,
+    tokens_at: Option<Instant>,
 }
 
 impl SpawnGate {
     fn new(limit: usize) -> Self {
+        Self::with_rate(limit, u32::MAX, u32::MAX)
+    }
+
+    fn with_rate(limit: usize, burst: u32, refill_per_sec: u32) -> Self {
+        let unlimited = refill_per_sec == u32::MAX;
+        // A zero rate would wait out every deadline and look like a hung git.
+        // Unlimited (`u32::MAX`) is the test-suite gate and must stay unlimited.
+        let burst = if unlimited { burst } else { burst.max(1) };
+        let refill_per_sec = if unlimited {
+            refill_per_sec
+        } else {
+            refill_per_sec.max(1)
+        };
         Self {
             limit: limit.max(1),
-            state: Mutex::new(GateState::default()),
+            burst,
+            refill_per_sec,
+            state: Mutex::new(GateState {
+                tokens: if unlimited { 0 } else { burst },
+                ..GateState::default()
+            }),
             released: Condvar::new(),
         }
+    }
+
+    fn refill(&self, state: &mut GateState, now: Instant) {
+        if self.refill_per_sec == u32::MAX {
+            return;
+        }
+        let Some(at) = state.tokens_at else {
+            state.tokens_at = Some(now);
+            return;
+        };
+        let elapsed_ms = now.saturating_duration_since(at).as_millis();
+        if elapsed_ms == 0 {
+            return;
+        }
+        // Keep the unused remainder on `tokens_at` so 249 ms at 4/s does not
+        // become a token, and the next 1 ms does.
+        let add = elapsed_ms.saturating_mul(u128::from(self.refill_per_sec)) / 1000;
+        if add == 0 {
+            return;
+        }
+        let add_u = u32::try_from(add).unwrap_or(u32::MAX);
+        state.tokens = state.tokens.saturating_add(add_u).min(self.burst);
+        let consumed_ms = add.saturating_mul(1000) / u128::from(self.refill_per_sec);
+        let consumed = Duration::from_millis(u64::try_from(consumed_ms).unwrap_or(u64::MAX));
+        state.tokens_at = Some(at.checked_add(consumed).unwrap_or(now));
     }
 
     #[cfg(test)]
@@ -1503,8 +1556,10 @@ impl SpawnGate {
             state.waiting_background += 1;
             self.released.notify_all();
         }
+        let mut token_wait_started: Option<Instant> = None;
         let admitted = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() || cancelled() {
                 break false;
             }
@@ -1519,7 +1574,19 @@ impl SpawnGate {
                     || state.background > 0
                     || state.in_flight < self.limit.saturating_sub(1)
             };
-            if state.in_flight < self.limit && eligible {
+            self.refill(&mut state, now);
+            let tokens_ok = self.refill_per_sec == u32::MAX || state.tokens >= 1;
+            if !tokens_ok {
+                let started = *token_wait_started.get_or_insert(now);
+                // A storm that has spent the burst must fail the spawn instead
+                // of occupying a blocking-pool thread for the whole git timeout.
+                if now.saturating_duration_since(started) >= SPAWN_QUEUE_BUDGET {
+                    break false;
+                }
+            } else {
+                token_wait_started = None;
+            }
+            if state.in_flight < self.limit && eligible && tokens_ok {
                 break true;
             }
             let (next, _) = self
@@ -1540,6 +1607,9 @@ impl SpawnGate {
         state.in_flight += 1;
         if background {
             state.background += 1;
+        }
+        if self.refill_per_sec != u32::MAX {
+            state.tokens = state.tokens.saturating_sub(1);
         }
         state.peak = state.peak.max(state.in_flight);
         Some(SpawnPermit {
@@ -1591,9 +1661,38 @@ fn spawn_limit() -> usize {
         .clamp(SPAWN_LIMIT_FLOOR, SPAWN_LIMIT_CEILING)
 }
 
+/// Sustained git spawns per second, and the burst that may start immediately.
+///
+/// The measured storm on 2026-10-02 was 40–80 short-lived `git` processes per
+/// second for hours. Concurrency alone does not stop that: 16 children that
+/// each live ~200 ms still start about 80 processes a second. The burst covers
+/// one uncached branch-stat pass (`MAX_BRANCH_STAT_TARGETS` × 2); after that
+/// the refill is the hard cap.
+const SPAWN_BURST: u32 = 192;
+const SPAWN_PER_SEC: u32 = 8;
+/// How long a caller may block once the burst is spent. Longer than one
+/// refill interval, short enough that a saturated storm does not pin the
+/// blocking pool until the 90s git deadline.
+const SPAWN_QUEUE_BUDGET: Duration = Duration::from_secs(2);
+
+pub(crate) fn production_spawn_rate() -> (u32, u32) {
+    (SPAWN_BURST, SPAWN_PER_SEC)
+}
+
+fn configured_spawn_gate(testing: bool) -> SpawnGate {
+    if testing {
+        SpawnGate::new(spawn_limit())
+    } else {
+        let (burst, rate) = production_spawn_rate();
+        SpawnGate::with_rate(spawn_limit(), burst, rate)
+    }
+}
+
 fn spawn_gate() -> &'static SpawnGate {
     static GATE: OnceLock<SpawnGate> = OnceLock::new();
-    GATE.get_or_init(|| SpawnGate::new(spawn_limit()))
+    // Tests share this process-wide gate and spawn far above the storm cap.
+    // Production uses the same constructor with `testing == false`.
+    GATE.get_or_init(|| configured_spawn_gate(cfg!(test)))
 }
 
 /// Shared engine behind `git_timeout` and `capture_command`: spawns `cmd`,
@@ -2181,6 +2280,130 @@ mod tests {
                 .unwrap();
         });
         assert!(!super::BACKGROUND_PROCESSES.get());
+    }
+
+    #[test]
+    fn spawn_rate_cap_stops_a_burst_from_becoming_a_sustained_storm() {
+        let gate = super::SpawnGate::with_rate(8, 4, 4);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(200))
+                    .expect("burst slot"),
+            );
+        }
+        assert!(
+            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+                .is_none(),
+            "the fifth spawn inside the burst must not start"
+        );
+        drop(held);
+        assert!(
+            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+                .is_none(),
+            "a free concurrency slot must not bypass the per-second cap"
+        );
+        let (burst, rate) = super::production_spawn_rate();
+        assert!(
+            rate < 40,
+            "sustained cap {rate}/s is still inside the measured 40-80/s storm"
+        );
+        assert!(burst >= rate);
+        assert_eq!(rate, 8);
+        assert_eq!(burst, 192);
+    }
+
+    #[test]
+    fn production_spawn_gate_spends_its_burst_and_then_stops() {
+        let gate = super::configured_spawn_gate(false);
+        let mut admitted = 0u32;
+        let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < drain_until {
+            match gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(20)) {
+                Some(permit) => {
+                    admitted += 1;
+                    drop(permit);
+                }
+                None => break,
+            }
+        }
+        assert!(
+            (192..192 + 16).contains(&admitted),
+            "production burst admitted {admitted}, want 192 plus at most one refill window"
+        );
+    }
+
+    #[test]
+    fn excess_waiters_fail_at_the_queue_budget_instead_of_the_git_deadline() {
+        use std::sync::Arc;
+        let gate = Arc::new(super::SpawnGate::with_rate(32, 4, 1));
+        let started = std::time::Instant::now();
+        let mut threads = Vec::new();
+        for _ in 0..12 {
+            let gate = Arc::clone(&gate);
+            threads.push(std::thread::spawn(move || {
+                let began = std::time::Instant::now();
+                let admitted = gate
+                    .acquire(std::time::Instant::now() + std::time::Duration::from_secs(30))
+                    .is_some();
+                (admitted, began.elapsed())
+            }));
+        }
+        let mut admitted = 0u32;
+        let mut slowest = std::time::Duration::ZERO;
+        for thread in threads {
+            let (got, waited) = thread.join().unwrap();
+            if got {
+                admitted += 1;
+            }
+            slowest = slowest.max(waited);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "join took {:?}; a refused spawn must not sit until the 90s git deadline",
+            started.elapsed()
+        );
+        assert!(
+            slowest < std::time::Duration::from_secs(3),
+            "slowest acquire waited {slowest:?}"
+        );
+        assert!(
+            (4..=8).contains(&admitted),
+            "admitted {admitted}; burst 4 plus about two refill tokens, not all 12"
+        );
+    }
+
+    #[test]
+    fn spawn_rate_cap_bounds_a_concurrent_storm() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let gate = Arc::new(super::SpawnGate::with_rate(64, 8, 4));
+        let admitted = Arc::new(AtomicU32::new(0));
+        let started = std::time::Instant::now();
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let gate = Arc::clone(&gate);
+            let admitted = Arc::clone(&admitted);
+            threads.push(std::thread::spawn(move || {
+                while started.elapsed() < std::time::Duration::from_millis(500) {
+                    if let Some(permit) = gate
+                        .acquire(std::time::Instant::now() + std::time::Duration::from_millis(15))
+                    {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        drop(permit);
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let n = admitted.load(Ordering::Relaxed);
+        assert!(n >= 8, "burst was not issued: {n}");
+        assert!(
+            n <= 8 + 4 + 4,
+            "concurrent storm admitted {n}; cap is burst 8 plus 4/s"
+        );
     }
 
     #[test]

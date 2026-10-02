@@ -2,7 +2,8 @@
 //!
 //! GitPulse does not install packages or apply fixes. It inventories manifests,
 //! flags lockfile / engine / install-script issues locally, and — when the
-//! matching CLI is on PATH — runs read-only audits: `npm audit` / `npm outdated`,
+//! matching CLI is on PATH — runs read-only audits: `npm audit` for an npm
+//! lockfile, `bun audit` for `bun.lock`, `npm outdated` when npm is on PATH,
 //! `cargo audit`, `cargo deny --offline` when `deny.toml` is present,
 //! `cargo crev verify` when cargo-crev is installed, `cargo audit bin` for
 //! release binaries (the cargo-auditable embed), `pip-audit --no-deps`
@@ -207,6 +208,10 @@ pub struct DepsHealthReport {
     pub node_version: Option<String>,
     pub npm_version: Option<String>,
     pub npm_cli_present: bool,
+    /// `bun` is on PATH and this checkout has a `bun.lock`. Absence is not a
+    /// clean audit of that lockfile. `serde(default)` keeps older reports loadable.
+    #[serde(default)]
+    pub bun_cli_present: bool,
     pub cargo_audit_present: bool,
     /// `cargo-deny` is on PATH and this checkout has at least one `deny.toml`.
     /// Absence is not a clean policy check. `serde(default)` keeps older
@@ -222,7 +227,7 @@ pub struct DepsHealthReport {
     pub composer_present: bool,
     pub bundler_audit_present: bool,
     /// Scanners that issued at least one real CLI command during this scan
-    /// (`npm`, `cargo`, `cargo-deny`, `cargo-crev`, `pip-audit`,
+    /// (`npm`, `bun`, `cargo`, `cargo-deny`, `cargo-crev`, `pip-audit`,
     /// `govulncheck`, `composer`, `bundler-audit`). The `*_present` flags say
     /// what COULD run; this says
     /// what DID. `serde(default)` keeps older serialized reports loadable.
@@ -334,8 +339,12 @@ impl DepsScanner {
             // A scanner is recorded only once it actually dispatched a
             // command — presence flags alone never imply execution.
             let mut ran: Vec<String> = Vec::new();
-            if enrich_npm(&repo, &mut report, &env) {
+            let js = enrich_npm(&repo, &mut report, &env);
+            if js.npm {
                 ran.push("npm".into());
+            }
+            if js.bun {
+                ran.push("bun".into());
             }
             if enrich_cargo(&repo, &targets, &mut report, &env) {
                 ran.push("cargo".into());
@@ -454,14 +463,57 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
     let bundler_audit_present = !targets.gemfile_locks.is_empty()
         && tool_version(bundler_audit_program(), &["--version"], env).is_some();
 
-    if !manifests.is_empty() && !npm_cli_present {
+    let needs_bun = manifests
+        .iter()
+        .any(|manifest| matches!(js_lock_kind(manifest.lockfile.as_deref()), JsLockKind::Bun));
+    let bun_probe =
+        needs_bun.then(|| probe_tool_version(bun_program(), &["--version"], env, VERSION_TIMEOUT));
+    let bun_cli_present = bun_probe
+        .as_ref()
+        .and_then(|probe| probe.version())
+        .is_some();
+    if needs_bun && !bun_cli_present {
+        let detail = match bun_probe.as_ref() {
+            Some(ToolProbe::FoundButFailed(detail)) => {
+                format!(" bun was found but could not be run: {detail}.")
+            }
+            _ => String::new(),
+        };
         push_issue(
             &mut issues,
             "warning",
-            "npm_missing",
-            npm_missing_message(&npm_probe, &node_probe, env),
+            "bun_missing",
+            format!(
+                "bun is not installed or not on PATH; bun.lock was not audited. npm audit cannot read a Bun lockfile.{detail}"
+            ),
             None,
         );
+    }
+
+    if !manifests.is_empty() && !npm_cli_present {
+        let only_bun = manifests
+            .iter()
+            .all(|manifest| matches!(js_lock_kind(manifest.lockfile.as_deref()), JsLockKind::Bun));
+        // A Bun lockfile is audited with `bun audit`. npm is only the outdated
+        // check in that case, so the warning must not say the vulnerability
+        // scan did not run.
+        if only_bun {
+            push_issue(
+                &mut issues,
+                "info",
+                "npm_missing",
+                "npm is not installed or not on PATH; outdated checks did not run. Vulnerabilities in bun.lock are checked with bun audit when bun is on PATH.".into(),
+                None,
+            );
+        } else {
+            push_issue(
+                &mut issues,
+                "warning",
+                "npm_missing",
+                npm_missing_message(&npm_probe, &node_probe, env),
+                None,
+            );
+        }
     }
 
     for m in &manifests {
@@ -545,6 +597,7 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             node_version,
             npm_version,
             npm_cli_present,
+            bun_cli_present,
             cargo_audit_present,
             cargo_deny_present,
             cargo_crev_present,
@@ -707,21 +760,36 @@ fn collect_manifest_issues(manifest: &NpmManifest, issues: &mut Vec<HealthIssue>
     }
 }
 
-/// Runs `npm audit --json` / `npm outdated --json` at every scan root.
+/// Which JavaScript auditors actually dispatched a command.
+struct JsCliDispatch {
+    /// `npm audit` ran. `npm outdated` alone does not count: it is not an audit.
+    npm: bool,
+    /// `bun audit` ran.
+    bun: bool,
+}
+
+/// Runs the JavaScript audit that can read each manifest's lockfile, then
+/// `npm outdated` when npm is on PATH.
 ///
-/// Returns true when at least one real npm command was dispatched — the
-/// caller records that in `scanners_ran`. A root whose working directory
-/// cannot be validated dispatches nothing and does not count.
-fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool {
-    if !report.npm_cli_present || report.manifests.is_empty() {
-        return false;
+/// `npm audit` only reads an npm lockfile. Pointing it at `bun.lock` (or
+/// `yarn.lock` / `pnpm-lock.yaml`) makes npm exit `ENOLOCK`, and recording
+/// that as `audit_failed` pretends the audit ran. Bun lockfiles are audited
+/// with `bun audit --json` instead. A root whose working directory cannot be
+/// validated dispatches nothing and does not count.
+fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCliDispatch {
+    if report.manifests.is_empty() {
+        return JsCliDispatch {
+            npm: false,
+            bun: false,
+        };
     }
     let mut roots = npm_scan_roots(&report.manifests);
     if roots.len() > MAX_NPM_ROOTS {
         record_limit(report, "npm audit roots", MAX_NPM_ROOTS, roots.len());
         roots.truncate(MAX_NPM_ROOTS);
     }
-    let mut ran = false;
+    let mut npm = false;
+    let mut bun = false;
     for rel_dir in roots {
         let cwd = match npm_cwd(repo, &rel_dir) {
             Ok(p) => p,
@@ -730,64 +798,130 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool
                 continue;
             }
         };
-        match run_npm_json(&cwd, &["audit", "--json"], env) {
-            Ok(text) => match parse_npm_audit_json(&text) {
-                Ok((mut vulns, err)) => {
-                    if let Some(err) = err {
-                        push_issue(
-                            &mut report.issues,
-                            "error",
-                            "audit_failed",
-                            err,
-                            Some(package_label(&rel_dir)),
-                        );
-                    }
-                    report.vulnerabilities.append(&mut vulns);
-                }
-                Err(e) => push_issue(
+        let label = package_label(&rel_dir);
+        // Owned before the dispatch: those calls borrow `report` mutably.
+        let lock_name = report
+            .manifests
+            .iter()
+            .find(|manifest| dir_of(&manifest.path) == rel_dir)
+            .and_then(|manifest| manifest.lockfile.clone());
+        match js_lock_kind(lock_name.as_deref()) {
+            JsLockKind::Npm if report.npm_cli_present => {
+                dispatch_npm_audit(&cwd, report, env, &label);
+                npm = true;
+            }
+            JsLockKind::Bun if report.bun_cli_present => {
+                dispatch_bun_audit(&cwd, report, env, &label);
+                bun = true;
+            }
+            JsLockKind::Unsupported => {
+                let name = lock_name.as_deref().unwrap_or("lockfile");
+                push_issue(
                     &mut report.issues,
                     "error",
-                    "audit_failed",
-                    e,
-                    Some(package_label(&rel_dir)),
-                ),
-            },
+                    "js_lockfile_unaudited",
+                    format!(
+                        "npm audit cannot read {name}. This scan does not run a separate auditor for it, so the result is not a clean bill of health."
+                    ),
+                    Some(label.clone()),
+                );
+            }
+            JsLockKind::Npm | JsLockKind::Bun | JsLockKind::Missing => {}
+        }
+        if report.npm_cli_present {
+            dispatch_npm_outdated(&cwd, report, env, &label);
+        }
+    }
+    JsCliDispatch { npm, bun }
+}
+
+fn dispatch_npm_audit(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, label: &str) {
+    match run_npm_json(cwd, &["audit", "--json"], env) {
+        Ok(text) => match parse_npm_audit_json(&text) {
+            Ok((mut vulns, err)) => {
+                if let Some(err) = err {
+                    push_issue(
+                        &mut report.issues,
+                        "error",
+                        "audit_failed",
+                        err,
+                        Some(label.to_string()),
+                    );
+                }
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "error",
                 "audit_failed",
                 e,
-                Some(package_label(&rel_dir)),
+                Some(label.to_string()),
             ),
-        }
-        ran = true;
-        match run_npm_json(&cwd, &["outdated", "--json"], env) {
-            Ok(text) => match parse_npm_outdated_json(&text) {
-                Ok(mut rows) => {
-                    fill_dependency_types(
-                        &mut rows,
-                        &declared_dependency_sections(&cwd.join("package.json")),
-                    );
-                    report.outdated.append(&mut rows);
+        },
+        Err(e) => push_issue(
+            &mut report.issues,
+            "error",
+            "audit_failed",
+            e,
+            Some(label.to_string()),
+        ),
+    }
+}
+
+fn dispatch_bun_audit(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, label: &str) {
+    match run_json_cli(cwd, bun_program(), &["audit", "--json"], env) {
+        Ok(text) => match parse_bun_audit_json(&text) {
+            Ok(mut vulns) => {
+                let sections = declared_dependency_sections(&cwd.join("package.json"));
+                for vuln in &mut vulns {
+                    vuln.is_direct = sections.contains_key(&vuln.name);
                 }
-                Err(e) => push_issue(
-                    &mut report.issues,
-                    "warning",
-                    "outdated_failed",
-                    e,
-                    Some(package_label(&rel_dir)),
-                ),
-            },
+                report.vulnerabilities.append(&mut vulns);
+            }
+            Err(e) => push_issue(
+                &mut report.issues,
+                "error",
+                "bun_audit_failed",
+                e,
+                Some(label.to_string()),
+            ),
+        },
+        Err(e) => push_issue(
+            &mut report.issues,
+            "error",
+            "bun_audit_failed",
+            e,
+            Some(label.to_string()),
+        ),
+    }
+}
+
+fn dispatch_npm_outdated(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, label: &str) {
+    match run_npm_json(cwd, &["outdated", "--json"], env) {
+        Ok(text) => match parse_npm_outdated_json(&text) {
+            Ok(mut rows) => {
+                fill_dependency_types(
+                    &mut rows,
+                    &declared_dependency_sections(&cwd.join("package.json")),
+                );
+                report.outdated.append(&mut rows);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
                 "outdated_failed",
                 e,
-                Some(package_label(&rel_dir)),
+                Some(label.to_string()),
             ),
-        }
+        },
+        Err(e) => push_issue(
+            &mut report.issues,
+            "warning",
+            "outdated_failed",
+            e,
+            Some(label.to_string()),
+        ),
     }
-    ran
 }
 
 /// Runs `cargo audit --json --file <path>` against every bounded Cargo.lock
@@ -1968,14 +2102,14 @@ fn npm_cwd(repo: &Path, rel_dir: &str) -> Result<PathBuf, String> {
 }
 
 fn run_npm_json(cwd: &Path, args: &[&str], env: &ScanEnv) -> Result<String, String> {
-    let out = capture_scanner_command(
-        env,
-        npm_program(),
-        args,
-        Some(cwd),
-        AUDIT_TIMEOUT,
-        NPM_SAFE_ENV,
-    )?;
+    run_json_cli(cwd, npm_program(), args, env)
+}
+
+/// Runs a CLI that prints JSON on stdout. A non-zero exit with a JSON body is
+/// success: `npm audit` and `bun audit` both exit 1 when they find advisories.
+/// Empty stdout on failure is an error, never a clean report.
+fn run_json_cli(cwd: &Path, program: &str, args: &[&str], env: &ScanEnv) -> Result<String, String> {
+    let out = capture_scanner_command(env, program, args, Some(cwd), AUDIT_TIMEOUT, NPM_SAFE_ENV)?;
     let stdout = out.stdout_text();
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -1985,7 +2119,7 @@ fn run_npm_json(cwd: &Path, args: &[&str], env: &ScanEnv) -> Result<String, Stri
         let err = out.stderr_text();
         if err.is_empty() {
             return Err(format!(
-                "npm {} produced no output",
+                "{program} {} produced no output",
                 args.first().unwrap_or(&"")
             ));
         }
@@ -2253,6 +2387,14 @@ pub(crate) fn npm_program() -> &'static str {
     }
 }
 
+fn bun_program() -> &'static str {
+    if cfg!(windows) {
+        "bun.exe"
+    } else {
+        "bun"
+    }
+}
+
 fn node_program() -> &'static str {
     if cfg!(windows) {
         "node.exe"
@@ -2443,6 +2585,35 @@ fn lockfile_to_manager(name: &str) -> &'static str {
     }
 }
 
+/// Which auditor can actually read this lockfile. npm's own audit exits
+/// `ENOLOCK` for every other kind, including a missing lockfile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsLockKind {
+    Npm,
+    Bun,
+    Unsupported,
+    Missing,
+}
+
+fn js_lock_kind(lockfile: Option<&str>) -> JsLockKind {
+    match lockfile {
+        Some("package-lock.json" | "npm-shrinkwrap.json") => JsLockKind::Npm,
+        Some("bun.lock" | "bun.lockb") => JsLockKind::Bun,
+        Some(_) => JsLockKind::Unsupported,
+        None => JsLockKind::Missing,
+    }
+}
+
+fn js_audits_satisfied(report: &DepsHealthReport, ran: &dyn Fn(&str) -> bool) -> bool {
+    report.manifests.iter().all(
+        |manifest| match js_lock_kind(manifest.lockfile.as_deref()) {
+            JsLockKind::Npm => report.npm_cli_present && ran("npm"),
+            JsLockKind::Bun => report.bun_cli_present && ran("bun"),
+            JsLockKind::Unsupported | JsLockKind::Missing => false,
+        },
+    )
+}
+
 fn skip_source(path: &str) -> bool {
     LanguageDetector::is_ignored_source_path(path)
 }
@@ -2523,7 +2694,7 @@ fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: 
     let requirements = [
         (
             !report.manifests.is_empty(),
-            report.npm_cli_present && ran("npm"),
+            js_audits_satisfied(report, &ran),
         ),
         (
             !targets.cargo_locks.is_empty(),
@@ -2561,6 +2732,8 @@ fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: 
     let failure_codes = [
         "audit_cwd",
         "audit_failed",
+        "bun_audit_failed",
+        "js_lockfile_unaudited",
         "cargo_audit_failed",
         "cargo_deny_failed",
         "cargo_crev_failed",
@@ -2633,6 +2806,78 @@ pub(crate) fn parse_npm_audit_json(
         return Ok((Vec::new(), None));
     }
     Err("unrecognised npm audit JSON".into())
+}
+
+/// Parses `bun audit --json`.
+///
+/// A clean audit is `{}`. Findings are an object keyed by package name whose
+/// values are advisory arrays (`id`, `url`, `title`, `severity`,
+/// `vulnerable_versions`), captured from Bun 1.4.2 against the npm advisory
+/// endpoint. Any other shape is an error: an empty list must never be how a
+/// report this parser stopped understanding comes back.
+pub(crate) fn parse_bun_audit_json(text: &str) -> Result<Vec<Vulnerability>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("bun audit produced no output".into());
+    }
+    let value: Value = serde_json::from_str(trimmed).map_err(|e| format!("bun audit JSON: {e}"))?;
+    let Some(map) = value.as_object() else {
+        return Err("bun audit JSON must be an object keyed by package name".into());
+    };
+    let mut out = Vec::new();
+    for (name, advisories) in map {
+        let Some(rows) = advisories.as_array() else {
+            return Err(format!(
+                "bun audit entry for {name} is not an advisory list; treat this as unscanned, not clean"
+            ));
+        };
+        for row in rows {
+            let Some(row) = row.as_object() else {
+                return Err(format!(
+                    "bun audit advisory for {name} is not an object; treat this as unscanned, not clean"
+                ));
+            };
+            let title = row
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{name} is vulnerable"));
+            let severity = row
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .filter(|severity| !severity.is_empty())
+                .unwrap_or(SEVERITY_UNKNOWN)
+                .to_string();
+            let url = row
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let range = row
+                .get("vulnerable_versions")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let id = match row.get("id") {
+                Some(Value::Number(n)) => n.to_string(),
+                Some(Value::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            out.push(Vulnerability {
+                name: name.clone(),
+                severity,
+                is_direct: false,
+                title,
+                url,
+                range,
+                fix_available: "unknown".into(),
+                via: if id.is_empty() { Vec::new() } else { vec![id] },
+                ecosystem: "npm".into(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn npm_error_message(value: &Value) -> Option<String> {
@@ -3638,6 +3883,38 @@ mod tests {
         let err = err.expect("enolock");
         assert!(err.contains("ENOLOCK"));
         assert!(err.contains("lockfile"));
+    }
+
+    /// Captured from `bun audit --json` on Bun 1.4.2. A clean audit is `{}`,
+    /// not an npm-shaped report, and findings are advisory arrays keyed by
+    /// package name.
+    #[test]
+    fn parse_bun_audit_reads_advisories_and_refuses_to_call_a_foreign_shape_clean() {
+        assert!(parse_bun_audit_json("{}").unwrap().is_empty());
+        let json = r#"{
+          "lodash": [{
+            "id": 1106913,
+            "url": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+            "title": "Command Injection in lodash",
+            "severity": "high",
+            "vulnerable_versions": "<4.17.21"
+          }]
+        }"#;
+        let vulns = parse_bun_audit_json(json).unwrap();
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0].name, "lodash");
+        assert_eq!(vulns[0].severity, "high");
+        assert_eq!(vulns[0].title, "Command Injection in lodash");
+        assert_eq!(vulns[0].range, "<4.17.21");
+        assert_eq!(vulns[0].via, vec!["1106913".to_string()]);
+        assert_eq!(vulns[0].ecosystem, "npm");
+        assert!(!vulns[0].is_direct, "the parser does not guess directness");
+
+        let foreign = parse_bun_audit_json(r#"{"error":{"code":"ENOLOCK"}}"#)
+            .expect_err("an error envelope is not a clean audit");
+        assert!(foreign.contains("not an advisory list"), "{foreign}");
+        assert!(parse_bun_audit_json("").is_err());
+        assert!(parse_bun_audit_json("[]").is_err());
     }
 
     #[test]
@@ -5542,6 +5819,191 @@ not-json-at-all
             .any(|issue| issue.code == "audit_failed"));
     }
 
+    /// `bun.lock` is not an npm lockfile. `npm audit` exits ENOLOCK on it, and
+    /// that used to be recorded as a failed audit of a project that had a
+    /// lockfile all along.
+    #[cfg(unix)]
+    #[test]
+    fn bun_lockfile_is_audited_with_bun_not_npm() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0","packageManager":"bun@1.4.2","dependencies":{"lodash":"4.17.15"}}"#,
+        );
+        write(repo.path(), "bun.lock", "{}\n");
+        git_add(repo.path(), "package.json");
+        git_add(repo.path(), "bun.lock");
+
+        let stubs = TempDir::new().unwrap();
+        let npm_log = stubs.path().join("npm-args");
+        let bun_log = stubs.path().join("bun-args");
+        write_exec(
+            stubs.path(),
+            "npm",
+            &format!(
+                "#!/bin/sh\necho \"$1\" >> {}\ncase \"$1\" in\n  --version) echo 11.0.0 ;;\n  audit) echo '{{\"error\":{{\"code\":\"ENOLOCK\",\"summary\":\"This command requires an existing lockfile.\",\"detail\":\"npm i\"}}}}' ;;\n  outdated) echo '{{}}' ;;\nesac\n",
+                npm_log.display()
+            ),
+        );
+        write_exec(
+            stubs.path(),
+            "bun",
+            &format!(
+                "#!/bin/sh\necho \"$1\" >> {}\ncase \"$1\" in\n  --version) echo 1.4.2 ;;\n  audit) echo '{{\"lodash\":[{{\"id\":1106913,\"url\":\"https://github.com/advisories/GHSA-35jh-r3h4-6jhm\",\"title\":\"Command Injection in lodash\",\"severity\":\"high\",\"vulnerable_versions\":\"<4.17.21\"}}]}}'; exit 1 ;;\nesac\n",
+                bun_log.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        let npm_args = fs::read_to_string(&npm_log).unwrap_or_default();
+        assert!(
+            !npm_args.lines().any(|line| line == "audit"),
+            "npm audit must not run against bun.lock: {npm_args}"
+        );
+        assert!(
+            npm_args.lines().any(|line| line == "outdated"),
+            "npm outdated still runs: {npm_args}"
+        );
+        let bun_args = fs::read_to_string(&bun_log).unwrap_or_default();
+        assert!(
+            bun_args.lines().any(|line| line == "audit"),
+            "bun audit must run: {bun_args}"
+        );
+        assert!(report.bun_cli_present, "{:?}", report.issues);
+        assert!(report.scanners_ran.iter().any(|scanner| scanner == "bun"));
+        assert!(
+            !report.scanners_ran.iter().any(|scanner| scanner == "npm"),
+            "outdated is not an audit: {:?}",
+            report.scanners_ran
+        );
+        assert!(
+            report.audit_complete,
+            "a readable bun audit is complete even when it exits 1: {:?}",
+            report.issues
+        );
+        assert!(report
+            .issues
+            .iter()
+            .all(|issue| issue.code != "audit_failed" && issue.code != "bun_audit_failed"));
+        let lodash = report
+            .vulnerabilities
+            .iter()
+            .find(|vuln| vuln.name == "lodash")
+            .expect("lodash advisory");
+        assert_eq!(lodash.severity, "high");
+        assert!(lodash.is_direct);
+        assert_eq!(lodash.title, "Command Injection in lodash");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bun_audit_failure_does_not_mark_the_audit_complete() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0","packageManager":"bun@1.4.2"}"#,
+        );
+        write(repo.path(), "bun.lock", "{}\n");
+        git_add(repo.path(), "package.json");
+        git_add(repo.path(), "bun.lock");
+
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "npm",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 11.0.0 ;;\n  *) echo '{}' ;;\nesac\n",
+        );
+        write_exec(
+            stubs.path(),
+            "bun",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 1.4.2 ;;\n  audit) echo 'audit request failed' >&2; exit 1 ;;\nesac\n",
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert!(!report.audit_complete);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "bun_audit_failed" && issue.message.contains("audit request failed")
+        }));
+        assert!(!report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "audit_failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn yarn_lockfile_is_not_sent_to_npm_audit() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0","packageManager":"yarn@4.0.0"}"#,
+        );
+        write(repo.path(), "yarn.lock", "# yarn lockfile v1\n");
+        git_add(repo.path(), "package.json");
+        git_add(repo.path(), "yarn.lock");
+
+        let stubs = TempDir::new().unwrap();
+        let npm_log = stubs.path().join("npm-args");
+        write_exec(
+            stubs.path(),
+            "npm",
+            &format!(
+                "#!/bin/sh\necho \"$1\" >> {}\ncase \"$1\" in\n  --version) echo 11.0.0 ;;\n  audit) echo '{{\"error\":{{\"code\":\"ENOLOCK\",\"summary\":\"lock\",\"detail\":\"no\"}}}}' ;;\n  *) echo '{{}}' ;;\nesac\n",
+                npm_log.display()
+            ),
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        let npm_args = fs::read_to_string(&npm_log).unwrap_or_default();
+        assert!(
+            !npm_args.lines().any(|line| line == "audit"),
+            "npm audit must not run against yarn.lock: {npm_args}"
+        );
+        assert!(!report.audit_complete);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "js_lockfile_unaudited"
+                && issue.message.contains("yarn.lock")));
+        assert!(!report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "audit_failed"));
+    }
+
     // -- probe diagnosis & GUI-minimal PATH regressions ------------------------
 
     /// Writes an executable stub script (chmod 755, unix shebang) for the
@@ -5863,7 +6325,13 @@ not-json-at-all
             "package.json",
             r#"{"name":"demo","version":"1.0.0"}"#,
         );
+        write(
+            repo.path(),
+            "package-lock.json",
+            r#"{"name":"demo","lockfileVersion":3}"#,
+        );
         git_add(repo.path(), "package.json");
+        git_add(repo.path(), "package-lock.json");
 
         let rounds = 4;
         let ok = Arc::new(AtomicUsize::new(0));

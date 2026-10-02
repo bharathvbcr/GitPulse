@@ -497,17 +497,17 @@ mod tests {
     #[test]
     fn sync_open_tabs_skips_an_untrusted_member_and_keeps_the_trusted_one() {
         let host = scratch("skip-host");
-        let trusted = scratch("skip-trusted");
+        let kept = scratch("skip-trusted");
         let untrusted = scratch("skip-untrusted");
         init_git_repo(&host);
-        init_git_repo(&trusted);
+        init_git_repo(&kept);
         init_git_checkout(&untrusted, false);
 
-        let trusted_path = trusted.to_string_lossy().into_owned();
+        let kept_path = kept.to_string_lossy().into_owned();
         let untrusted_path = untrusted.to_string_lossy().into_owned();
         let snap = sync_open_tabs(
             host.to_str().unwrap(),
-            &[trusted_path.clone(), untrusted_path.clone()],
+            &[kept_path.clone(), untrusted_path.clone()],
         )
         .expect("an untrusted member must not abort the registry write");
 
@@ -521,7 +521,7 @@ mod tests {
             })
             .collect();
         assert!(roots.contains(&host.canonicalize().unwrap()));
-        assert!(roots.contains(&trusted.canonicalize().unwrap()));
+        assert!(roots.contains(&kept.canonicalize().unwrap()));
         assert!(
             !roots.contains(&untrusted.canonicalize().unwrap()),
             "an untrusted member must not be registered: {roots:?}"
@@ -529,22 +529,22 @@ mod tests {
         assert_eq!(snap.skipped_untrusted, vec![untrusted_path]);
 
         let _ = fs::remove_dir_all(&host);
-        let _ = fs::remove_dir_all(&trusted);
+        let _ = fs::remove_dir_all(&kept);
         let _ = fs::remove_dir_all(&untrusted);
     }
 
     #[test]
     fn sync_open_tabs_still_fails_when_a_member_path_is_missing() {
         let host = scratch("miss-host");
-        let trusted = scratch("miss-trusted");
+        let kept = scratch("miss-trusted");
         init_git_repo(&host);
-        init_git_repo(&trusted);
+        init_git_repo(&kept);
         let missing = host.join("does-not-exist");
 
         let err = sync_open_tabs(
             host.to_str().unwrap(),
             &[
-                trusted.to_string_lossy().into_owned(),
+                kept.to_string_lossy().into_owned(),
                 missing.to_string_lossy().into_owned(),
             ],
         )
@@ -559,7 +559,7 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&host);
-        let _ = fs::remove_dir_all(&trusted);
+        let _ = fs::remove_dir_all(&kept);
     }
 
     #[test]

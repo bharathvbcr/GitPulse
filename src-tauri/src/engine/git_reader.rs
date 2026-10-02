@@ -899,23 +899,28 @@ impl GitReader {
         Ok(None)
     }
 
+    /// Porcelain status. This argv does not set `core.fsmonitor=false`.
+    /// Hygiene walks do, because a repository hook must not run there. A
+    /// status refresh should use the fsmonitor daemon when the repository
+    /// already has one, so `status` does not walk `target/` itself.
+    pub const STATUS_ARGV: &'static [&'static str] = &[
+        "-c",
+        "core.quotepath=off",
+        "status",
+        "--porcelain=v1",
+        "-u",
+        "-z",
+    ];
+
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, String> {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
         // belt-and-braces so a future non-z invocation still gets raw UTF-8.
         // -u ensures all untracked files are individually enumerated rather
-        // than collapsed into directory roots.
-        let stdout = git_text(
-            &repo,
-            &[
-                "-c",
-                "core.quotepath=off",
-                "status",
-                "--porcelain=v1",
-                "-u",
-                "-z",
-            ],
-        )?;
+        // than collapsed into directory roots. `GIT_OPTIONAL_LOCKS=0` is set
+        // on every git child, so this status does not rewrite the index and
+        // re-trigger the watcher.
+        let stdout = git_text(&repo, Self::STATUS_ARGV)?;
         // numstat failures are surfaced, not laundered into "zero churn": a
         // broken diff must fail the report rather than fabricate numbers, and
         // records that decode but carry unparseable counts ride their row as
@@ -3836,6 +3841,17 @@ fn b64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_keeps_an_already_running_fsmonitor_daemon() {
+        assert!(
+            !GitReader::STATUS_ARGV
+                .iter()
+                .any(|arg| arg.contains("fsmonitor")),
+            "status must not disable core.fsmonitor: {:?}",
+            GitReader::STATUS_ARGV
+        );
+    }
 
     /// A prefix must carry a reason, and the reason must be the shared one.
     ///

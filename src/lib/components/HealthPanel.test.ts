@@ -231,6 +231,75 @@ describe("HealthPanel rendering", () => {
   });
 });
 
+describe("HealthPanel coding-agent prompt bar", () => {
+  const headerStart = source.indexOf('<div class="px-4 py-2 border-b border-border/60 gp-section-edge');
+  const headerRow = (() => {
+    // The header row is the `gp-section-edge` div up to its matching close.
+    let depth = 0;
+    const tags = /<div\b|<\/div>/g;
+    tags.lastIndex = headerStart;
+    for (let match = tags.exec(source); match; match = tags.exec(source)) {
+      depth += match[0] === "</div>" ? -1 : 1;
+      if (depth === 0) return source.slice(headerStart, tags.lastIndex);
+    }
+    return "";
+  })();
+  const barStart = source.indexOf('aria-label="Send a health task to a coding agent"');
+
+  it("offers every prompt launcher and all four health actions", () => {
+    expect(source).toContain("{#each PROMPT_LAUNCHERS as kind (kind)}");
+    expect(source).toContain("{PROVIDER_LABELS[kind]}");
+    expect(source).toContain("{#each HEALTH_AGENT_ACTIONS as action (action.id)}");
+    expect(source).toContain('aria-label="Health coding agent"');
+    expect(source).toContain('aria-label="Health agent task"');
+  });
+
+  it("keeps Fix with MANVI in the header and puts the bar below it, outside gp-section-edge", () => {
+    expect(headerStart).toBeGreaterThan(-1);
+    expect(headerRow).toContain("Fix with MANVI");
+    expect(barStart, "the prompt bar is missing").toBeGreaterThan(-1);
+    expect(headerRow).not.toContain("Send a health task to a coding agent");
+    expect(barStart).toBeGreaterThan(headerStart + headerRow.length);
+    expect(barStart).toBeLessThan(source.indexOf('<div class="flex-1 overflow-auto'));
+  });
+
+  it("does not use the scroller class or a <details> the health harness probes by position", () => {
+    const bar = source.slice(barStart, source.indexOf('<div class="flex-1 overflow-auto'));
+    expect(bar).not.toContain("overflow-auto");
+    expect(bar).not.toContain("<details");
+  });
+
+  it("sends through the shared launch channel, opening the dock before awaiting", () => {
+    const body = source.slice(
+      source.indexOf("async function runHealthAgent"),
+      source.indexOf("async function copyHealthAgentPrompt"),
+    );
+    const request = body.indexOf("terminalLaunchRequests.request(");
+    const open = body.indexOf("repoStore.setTerminalOpen(true)");
+    const awaited = body.indexOf("await opened");
+    expect(request).toBeGreaterThan(-1);
+    expect(open).toBeGreaterThan(request);
+    expect(awaited).toBeGreaterThan(open);
+    expect(body).toContain("formatError(err)");
+    expect(source).toContain("healthAgentPrompt(");
+  });
+
+  it("does not scan coverage, secrets or storage from Health", () => {
+    for (const command of ["cmd_scan_coverage", "cmd_scan_secrets", "cmd_storage_scan"]) {
+      expect(source).not.toContain(command);
+    }
+  });
+
+  it("aborts a pending launch on repository change and on teardown", () => {
+    const teardownStart = source.indexOf("return () => {");
+    const teardown = source.slice(teardownStart, source.indexOf("};", teardownStart));
+    expect(teardown).toContain("fixInflight?.cancel();");
+    expect(teardown).toContain("cancelHealthAgentLaunch()");
+    const pathEffect = source.slice(source.indexOf("const path = $repoStore.currentPath;"), source.indexOf("async function openExternal"));
+    expect(pathEffect.match(/cancelHealthAgentLaunch\(\)/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
 describe("HealthPanel flicker contracts", () => {
   it("tracks the scanned path with a plain object so the load effect cannot loop", () => {
     expect(source).toMatch(/const scanned = \{ path: "" \}/);
