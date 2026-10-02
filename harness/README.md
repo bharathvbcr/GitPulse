@@ -241,9 +241,35 @@ when selected. The fixtures do not verify
 native IPC, the installed app, or a specific user's repository; run the Rust
 Git integration tests separately for native blame behavior.
 
+## Markdown
+
+Run `bun run test:browser -- --harness markdown` or
+`bun run test:webkit -- --harness markdown`. For interactive inspection, open
+`/harness/markdown.html` on the development server (add `?theme=light` for
+the light theme).
+
+It mounts the explorer's `MarkDevViewer` and the commit-message
+`MarkdownBody` with what `cmd_markdown_render` really returns for
+`markdown-kitchen-sink.md`. The fixture, `markdownRender.fixture.json`, is the
+renderer's own output: the Rust test
+`markdown::tests::the_harness_fixture_is_what_render_returns` fails when the two
+differ, and `GITPULSE_BLESS_FIXTURES=1` on that test rewrites it. Edit the
+kitchen sink, never the JSON.
+
+The checks cover structure (no leaked syntax, nesting, tables, callouts,
+footnotes, frontmatter as fields), that the stylesheet applies (heading sizes,
+list markers by depth, borders, monospace, callout colours), the document
+boundary (namespaced ids — a heading "App" must not shadow `#app` — inert raw
+HTML, no script links, pictures that cannot resolve against the app's origin),
+links (OS opener for https and mailto, middle click claimed, refusals with
+reasons, section and outline scrolling including ids that start with a digit,
+relative links opening repository files), code copy, the over-cap notice, and
+a failed re-render taking the old page down. The fixtures do not verify native
+IPC or the installed app.
+
 ## DevMap canvas
 
-Run `npm run dev -- --port 5191` and open
+Run `bun run dev -- --port 5191` and open
 `http://localhost:5191/harness/devmap.html`. This mounts the production canvas
 with a deterministic 288-node fixture, including sparse connections and a
 truncated-payload warning. The harness controls are outside the production UI.

@@ -5,7 +5,7 @@
 //! the only languages that reach this path; everything else stays on the
 //! TypeScript regex tokenizer behind the same owner in `diff/highlight.ts`.
 
-use markdev::highlight::{highlight_checked, supports_checked, HighlightError, HighlightKind};
+use markdev_highlight::{highlight_checked, supports_checked, HighlightError, HighlightKind};
 use serde::Serialize;
 
 /// One highlighted range, ready for the frontend.
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn oversized_code_is_an_error() {
-        let huge = "a".repeat(markdev::highlight::MAX_HIGHLIGHT_CODE_BYTES + 1);
+        let huge = "a".repeat(markdev_highlight::MAX_HIGHLIGHT_CODE_BYTES + 1);
         let err = highlight("rust", &huge).expect_err("should refuse");
         assert!(err.contains("size limit"), "{err}");
     }

@@ -124,14 +124,15 @@ export function sources(env = process.env, from = REPO) {
       crateDir: (/** @type {string} */ name) => path.join("rust", name),
     },
     {
-      // MarkDev's parse + highlight core. Package name is `markdev`; the
-      // crate lives at `core/` and has no workspace inheritance of its own,
-      // so `workspace` points at that same directory for resolveManifest.
+      // MarkDev's module crates: the parse model, the HTML renderer the
+      // Markdown viewer embeds, the highlighter, and the vault. Not the
+      // `markdev` umbrella at `core/`, which only adds the C ABI MarkDev.app
+      // links and re-exports these. `core/` is their workspace root.
       id: "markdev",
       root: env.GITPULSE_MARKDEV_ROOT ?? findSibling("MarkDev", from),
       workspace: "core",
-      crates: ["markdev"],
-      crateDir: (/** @type {string} */ _name) => "core",
+      crates: ["markdev-md", "markdev-highlight", "markdev-html", "markdev-vault"],
+      crateDir: (/** @type {string} */ name) => path.join("core", "crates", name),
     },
   ];
 }
@@ -619,18 +620,50 @@ function prepareCrate(source, name, to, workspace, commit) {
  * Copy recorded, unrelated crates into a scoped refresh's staging tree.
  * @param {string} staging
  * @param {string} onlyCrate
+ * @param {ReturnType<typeof sources>} configured
  */
-function copyUnselectedSnapshot(staging, onlyCrate) {
+function copyUnselectedSnapshot(staging, onlyCrate, configured) {
   if (!existsSync(MANIFEST)) throw new Error(`${MANIFEST} is missing; run a full vendor refresh first`);
+  const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
+  if (!Array.isArray(manifest.crates)) throw new Error(`${MANIFEST} has no crates array`);
+  const retired = retiredCrates(manifest, configured);
   for (const rel of walk(VENDOR_DIR)) {
-    if (rel.split("/")[0] === onlyCrate) continue;
+    const crate = rel.split("/")[0];
+    if (crate === onlyCrate || retired.has(crate)) continue;
     const output = path.join(staging, rel);
     mkdirSync(path.dirname(output), { recursive: true });
     cpSync(path.join(VENDOR_DIR, rel), output);
   }
-  const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
-  if (!Array.isArray(manifest.crates)) throw new Error(`${MANIFEST} has no crates array`);
-  return manifest.crates.filter((/** @type {{ name: string }} */ crate) => crate.name !== onlyCrate);
+  return manifest.crates.filter(
+    (/** @type {{ name: string }} */ crate) => crate.name !== onlyCrate && !retired.has(crate.name),
+  );
+}
+
+/**
+ * Crates the manifest records from a configured source that no longer lists
+ * them — MarkDev's single `markdev` crate, say, after it split into module
+ * crates.
+ *
+ * A selective refresh copies every crate it was not asked about, so without
+ * this a retired crate was carried forward indefinitely: only a full refresh
+ * could drop it, and that also takes every unrelated upstream drift. Crates
+ * from a source this script does not configure are left alone — whether they
+ * are retired is not this script's to say.
+ *
+ * @param {{ crates: { name: string, origin?: { repo?: string } }[] }} manifest
+ * @param {ReturnType<typeof sources>} configured
+ * @returns {Set<string>}
+ */
+export function retiredCrates(manifest, configured) {
+  const listed = new Map(configured.map((source) => [source.id, source.crates]));
+  return new Set(
+    manifest.crates
+      .filter((crate) => {
+        const crates = listed.get(crate.origin?.repo ?? "");
+        return crates !== undefined && !crates.includes(crate.name);
+      })
+      .map((crate) => crate.name),
+  );
 }
 
 /**
@@ -656,7 +689,7 @@ export function vendor(env = process.env, onlyCrate = null) {
   let staging = "";
   try {
     staging = mkdtempSync(path.join(parent, ".vendor-stage-"));
-    const crates = onlyCrate === null ? [] : copyUnselectedSnapshot(staging, onlyCrate);
+    const crates = onlyCrate === null ? [] : copyUnselectedSnapshot(staging, onlyCrate, configured);
 
     for (const source of configured) {
       if (onlyCrate !== null && !source.crates.includes(onlyCrate)) continue;
@@ -749,7 +782,12 @@ export function check(env = process.env) {
       const result = { name: crate.name, edited, upstream: "unavailable", drifted: [], reason: "" };
 
       const from = source ? path.join(source.root, crate.origin.path) : "";
-      if (!source || !from || !existsSync(from)) {
+      if (source && !source.crates.includes(crate.name)) {
+        // Retired upstream: there is nothing to compare against, and that is
+        // drift a refresh resolves, not a reason for the check to crash.
+        result.upstream = "drifted";
+        result.reason = `${crate.origin.repo} no longer provides ${crate.name}; re-vendor to retire it`;
+      } else if (!source || !from || !existsSync(from)) {
         // The distinction this whole mode exists for: not compared is not clean.
         result.reason = `${crate.origin.repo} is not checked out here`;
       } else {

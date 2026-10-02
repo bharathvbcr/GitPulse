@@ -113,24 +113,35 @@ export function balanced(src: string, open: number, o = "(", c = ")"): string {
 
 const word = (name: string) => escapeRegExp(name);
 
+/**
+ * Where an identifier starts and ends as a binding of its own. `\b` is not
+ * that: it matches between `.` and a letter, so `rendered.html` counted as a
+ * read of a `$state` called `html` and `other.html = x` as a write of it, and
+ * it matches between a letter and `$`, so `foo$bar` held `$bar`. A single `.`
+ * (or `?.`) before the name makes it a member of another object; a spread's
+ * `...rows` is still the binding. The trailing side refuses `html$x`.
+ */
+const OWN = String.raw`(?<![\w$])(?<!(?:^|[^.])\.\s*)`;
+const END = String.raw`(?![\w$])`;
+
 export function countWrites(region: string, name: string): { plain: number; compound: number } {
-  const n = word(name);
+  const n = `${OWN}${word(name)}`;
   const prop = `(?:\\.[A-Za-z_$][\\w$]*|\\[[^\\]]+\\])+`;
-  const plain = [...region.matchAll(new RegExp(`(?<![=!<>+\\-*/%&|^])\\b${n}\\s*=(?!=)`, "g"))].length;
+  const plain = [...region.matchAll(new RegExp(`(?<![=!<>+\\-*/%&|^])${n}\\s*=(?!=)`, "g"))].length;
   const compound =
-    [...region.matchAll(new RegExp(`\\b${n}\\s*(?:\\+\\+|--|(?:\\+|-|\\*|/|%|\\||&|\\^|\\?\\?|\\|\\||&&)=)`, "g"))].length +
-    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*\\b${n}\\b`, "g"))].length +
+    [...region.matchAll(new RegExp(`${n}\\s*(?:\\+\\+|--|(?:\\+|-|\\*|/|%|\\||&|\\^|\\?\\?|\\|\\||&&)=)`, "g"))].length +
+    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*${n}${END}`, "g"))].length +
     // `$state` is a proxy: `scanned.path = x` reads and writes the same
     // binding. Counting only `scanned =` missed the HealthPanel shape.
-    [...region.matchAll(new RegExp(`\\b${n}${prop}\\s*(?:\\+\\+|--|(?:\\+|-|\\*|/|%|\\||&|\\^|\\?\\?|\\|\\||&&)?=(?!=))`, "g"))].length +
-    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*\\b${n}${prop}`, "g"))].length;
+    [...region.matchAll(new RegExp(`${n}${prop}\\s*(?:\\+\\+|--|(?:\\+|-|\\*|/|%|\\||&|\\^|\\?\\?|\\|\\||&&)?=(?!=))`, "g"))].length +
+    [...region.matchAll(new RegExp(`(?:\\+\\+|--)\\s*${n}${prop}`, "g"))].length;
   return { plain, compound };
 }
 
 /** Occurrences that are not a plain assignment target — i.e. tracked reads.
  *  A compound assignment counts as a read, because it is one. */
 export function countReads(region: string, name: string): number {
-  const all = [...region.matchAll(new RegExp(`\\b${word(name)}\\b`, "g"))].length;
+  const all = [...region.matchAll(new RegExp(`${OWN}${word(name)}${END}`, "g"))].length;
   return all - countWrites(region, name).plain;
 }
 
@@ -172,7 +183,10 @@ export const SVELTE_RUNES = new Set([
   "host",
 ]);
 
-const STORE_WRITE = /\b([A-Za-z_$][\w$]*)\.(set|update|setError)\s*\(/g;
+const STORE_WRITE = new RegExp(String.raw`${OWN}([A-Za-z_$][\w$]*)\.(set|update|setError)\s*\(`, "g");
+
+/** `$name` auto-subscriptions, by store name. */
+const STORE_READ = new RegExp(String.raw`${OWN}\$([A-Za-z_$][\w$]*)`, "g");
 
 /**
  * Synchronous-callback APIs: a callback handed to one of these can run while
@@ -266,7 +280,7 @@ function collectFromScript(
       const call = balanced(effectBody, effectBody.indexOf("(", sc.index ?? 0));
       let region = call;
       for (const [name, body] of helpers) {
-        if (new RegExp(`\\b${word(name)}\\s*\\(`).test(call)) region += "\n" + body;
+        if (new RegExp(`${OWN}${word(name)}\\s*\\(`).test(call)) region += "\n" + body;
       }
       region = stripUntracked(region);
       for (const state of stateNames) {
@@ -305,7 +319,7 @@ function collectFromScript(
 
     const storeRegion = stripUntracked(effectBody);
     const storeReads = new Set(
-      [...storeRegion.matchAll(/\$([A-Za-z_$][\w$]*)/g)]
+      [...storeRegion.matchAll(new RegExp(STORE_READ.source, "g"))]
         .map((m) => m[1])
         .filter((name) => !SVELTE_RUNES.has(name)),
     );
@@ -315,7 +329,7 @@ function collectFromScript(
       const name = wm[1];
       const method = wm[2];
       if (!storeReads.has(name)) continue;
-      const reads = [...storeRegion.matchAll(new RegExp(`\\$${word(name)}\\b`, "g"))].length;
+      const reads = [...storeRegion.matchAll(new RegExp(`${OWN}\\$${word(name)}${END}`, "g"))].length;
       violations.push({
         file: fileName,
         line,
@@ -538,6 +552,43 @@ describe("no $effect reads the state it writes through a synchronous callback", 
         scanned.path = path;
       });`);
     expect(plain.violations.filter((v) => v.state === "scanned")).toEqual([]);
+  });
+
+  it("does not count a same-named property of another object as the state", () => {
+    // MarkdownBody shipped `html = rendered.html` and was reported as an
+    // effect that reads the `html` it writes. It reads a field of `rendered`.
+    const markdownBody = scanSnippet(`
+      let html = $state("");
+      $effect(() => {
+        const rendered = render(source);
+        html = rendered.html;
+      });`);
+    expect(markdownBody.violations.filter((v) => v.state === "html")).toEqual([]);
+    // The write side: `other.html = n` is not a write of `html`, so a real
+    // read of `html` beside it is not a loop either.
+    const memberWrite = scanSnippet(`
+      let html = $state("");
+      $effect(() => {
+        const n = html.length;
+        other.html = n;
+        other?.html;
+      });`);
+    expect(memberWrite.violations.filter((v) => v.state === "html")).toEqual([]);
+    expect(countReads("a?.html; a.\n  html; html$x; x$html", "html")).toBe(0);
+    expect(countReads("[...html]; html.length", "html")).toBe(2);
+    const plain = countWrites("other.html = 1; other.html += 1; ++other.html", "html");
+    expect(plain.plain + plain.compound).toBe(0);
+    // A member call on another object is not a call of the local helper.
+    const viaApply = scanSnippet(`
+      let html = $state("");
+      const apply = (snap) => { html = html + snap; };
+      $effect(() => { metric.subscribe(p, (snap) => fn.apply(null, [snap])); });`);
+    expect(viaApply.violations.filter((v) => v.state === "html")).toEqual([]);
+    // Nor is another object's `.items.set` a write of the `items` store, nor
+    // `foo$items` an auto-subscription to it.
+    const store = scanSnippet(`
+      $effect(() => { const v = foo$items; const w = $other; cache.items.set(w); });`);
+    expect(store.violations).toEqual([]);
   });
 
   it("does not treat Svelte runes as store auto-subscriptions", () => {

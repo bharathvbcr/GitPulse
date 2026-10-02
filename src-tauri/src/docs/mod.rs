@@ -9,11 +9,11 @@ use crate::engine::git_cli::{
     git_text, sandbox_join, sandbox_join_canonical, sandbox_write, validate_repo,
 };
 use crate::engine::git_writer::GitWriter;
-use markdev::vault::note::{
+use markdev_vault::note::{
     has_markdown_extension, stem, strip_markdown_extension, MARKDOWN_EXTENSIONS,
 };
-use markdev::vault::rename::{rewrite_links_in, ProtectedRanges};
-use markdev::vault::{Backlink, Graph, GraphQuery, Note, SearchHit, Vault, DEFAULT_MAX_NOTE_BYTES};
+use markdev_vault::rename::{rewrite_links_in, ProtectedRanges};
+use markdev_vault::{Backlink, Graph, GraphQuery, Note, SearchHit, Vault, DEFAULT_MAX_NOTE_BYTES};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -548,7 +548,7 @@ mod tests {
     fn tracked_document_extensions_match_the_parser_including_uppercase() {
         let dir = git_repo();
         let mut expected = Vec::new();
-        for (i, extension) in markdev::vault::note::MARKDOWN_EXTENSIONS.iter().enumerate() {
+        for (i, extension) in markdev_vault::note::MARKDOWN_EXTENSIONS.iter().enumerate() {
             for (j, extension) in [extension.to_string(), extension.to_uppercase()]
                 .iter()
                 .enumerate()

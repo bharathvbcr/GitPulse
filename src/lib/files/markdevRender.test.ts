@@ -2,11 +2,9 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestOf } from "../__tests__/perfBudget";
 import {
   MAX_RENDER_BYTES,
+  EMPTY_RENDER,
   calculateDocumentStats,
-  extractDocumentOutline,
-  parseFrontmatter,
   renderMarkDevMarkdown,
-  parseMarkdown,
 } from "./markdevRender";
 
 const invoke = vi.fn();
@@ -49,75 +47,28 @@ fn hello() {}
       expect(stats.readingTimeMinutes).toBe(1);
     });
   });
-
-  describe("extractDocumentOutline", () => {
-    it("extracts headings while ignoring code blocks", () => {
-      const text = `# Main Header
-Some intro text.
-\`\`\`markdown
-# Not A Real Header
-\`\`\`
-## Sub Header
-### Deep Header
-`;
-      const outline = extractDocumentOutline(text);
-      expect(outline).toHaveLength(3);
-      expect(outline[0]).toEqual({ level: 1, title: "Main Header", id: "main-header" });
-      expect(outline[1]).toEqual({ level: 2, title: "Sub Header", id: "sub-header" });
-      expect(outline[2]).toEqual({ level: 3, title: "Deep Header", id: "deep-header" });
-    });
-  });
-
-  describe("parseFrontmatter", () => {
-    it("extracts frontmatter fields and leaves body intact", () => {
-      const doc = `---
-title: MarkDev Notes
-author: Bharath
-tags: developer, tools
----
-# Real Content
-Here is the real body.`;
-      const { frontmatter, content } = parseFrontmatter(doc);
-      expect(frontmatter).toEqual([
-        { key: "title", value: "MarkDev Notes" },
-        { key: "author", value: "Bharath" },
-        { key: "tags", value: "developer, tools" },
-      ]);
-      expect(content.trim()).toBe("# Real Content\nHere is the real body.");
-    });
-
-    it("returns empty fields when no frontmatter exists", () => {
-      const doc = "# Just Markdown\nWithout frontmatter";
-      const { frontmatter, content } = parseFrontmatter(doc);
-      expect(frontmatter).toEqual([]);
-      expect(content).toBe(doc);
-    });
-  });
 });
 
 describe("markdevRender IPC", () => {
-  it("routes render through cmd_markdown_render", async () => {
-    invoke.mockResolvedValueOnce("<h1>Hello</h1>");
-    const html = await renderMarkDevMarkdown("# Hello");
-    expect(invoke).toHaveBeenCalledWith("cmd_markdown_render", { text: "# Hello" });
-    expect(html).toContain("Hello");
+  it("routes render through cmd_markdown_render, with no location by default", async () => {
+    const answer = { html: "<h1 id=\"hello\">Hello</h1>", headings: [], frontmatter: [], omittedBytes: 0 };
+    invoke.mockResolvedValueOnce(answer);
+    const rendered = await renderMarkDevMarkdown("# Hello");
+    // Both location fields go across, as null: Rust refuses one without the
+    // other, so they must never be sent half-filled.
+    expect(invoke).toHaveBeenCalledWith("cmd_markdown_render", { text: "# Hello", repoPath: null, filePath: null });
+    expect(rendered).toEqual(answer);
   });
 
-  it("routes parse through cmd_markdown_parse", async () => {
-    invoke.mockResolvedValueOnce({
-      source: "x",
-      spans: [],
-      markers: [],
-      blocks: [],
-      truncated: false,
-    });
-    await parseMarkdown("x");
-    expect(invoke).toHaveBeenCalledWith("cmd_markdown_parse", { text: "x" });
+  it("sends a note's repository and path together", async () => {
+    invoke.mockResolvedValueOnce(EMPTY_RENDER);
+    await renderMarkDevMarkdown("x", { repoPath: "/r", filePath: "docs/a.md" });
+    expect(invoke).toHaveBeenCalledWith("cmd_markdown_render", { text: "x", repoPath: "/r", filePath: "docs/a.md" });
   });
 
-  it("returns empty string for empty markdown without IPC", async () => {
-    const html = await renderMarkDevMarkdown("");
-    expect(html).toBe("");
+  it("returns the empty render for empty markdown without IPC", async () => {
+    const rendered = await renderMarkDevMarkdown("");
+    expect(rendered).toEqual({ html: "", headings: [], frontmatter: [], omittedBytes: 0 });
     expect(invoke).not.toHaveBeenCalled();
   });
 });

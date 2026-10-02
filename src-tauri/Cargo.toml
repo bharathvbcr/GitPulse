@@ -138,10 +138,16 @@ devmap-extract = { path = "vendored/devmap-extract", default-features = false }
 dc-regress = { path = "vendored/dc-regress" }
 dc-regress-store = { path = "vendored/dc-regress-store" }
 
-# MarkDev's Markdown parse + tree-sitter highlight core. Default features off
-# so cbindgen / the C ABI stay out of this build; `highlight` pulls the six
-# grammars DiffViewer and CodeViewer dispatch to for rust/js/ts/python/json/shell.
-markdev = { path = "vendored/markdev", default-features = false, features = ["highlight"] }
+# MarkDev's module crates — only the modules GitPulse uses, never MarkDev.app's
+# C ABI. The renderer the Markdown viewer and commit bodies embed
+# (`markdev-html`, without MathML typesetting, so math shows as its LaTeX
+# source), the six grammars DiffViewer and CodeViewer dispatch to
+# (`markdev-highlight`), and the docs vault (`markdev-vault`). The parse model
+# (`markdev-md`) is vendored for the renderer and the vault; nothing here
+# calls it directly.
+markdev-html = { path = "vendored/markdev-html", default-features = false }
+markdev-highlight = { path = "vendored/markdev-highlight" }
+markdev-vault = { path = "vendored/markdev-vault" }
 tauri-plugin-autostart = "2.5.1"
 
 # Process-group control for children we spawn (`src/procguard`).

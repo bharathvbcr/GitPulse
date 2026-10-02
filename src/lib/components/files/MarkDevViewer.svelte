@@ -20,13 +20,16 @@
   import {
     renderMarkDevMarkdown,
     calculateDocumentStats,
-    extractDocumentOutline,
+    EMPTY_RENDER,
+    MAX_RENDER_BYTES,
     type DocumentStats,
-    type MarkdownHeading,
+    type RenderedMarkdown,
   } from "../../files/markdevRender";
+  import { findFragmentTarget, type MarkdownNote } from "../../files/markdownLinks";
   import { docsBacklinks, type DocBacklink } from "../../docs/client";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
+  import MarkdownContent from "../MarkdownContent.svelte";
   import ScrollCue from "../ScrollCue.svelte";
 
   let {
@@ -63,19 +66,49 @@
 
   let sourceContent = $derived(blob.text || "");
   let rawContent = $derived(draftContent ?? sourceContent);
-  let renderedHtml = $state("");
+  let rendered = $state<RenderedMarkdown>(EMPTY_RENDER);
+  let renderError = $state<string | null>(null);
   let stats = $derived<DocumentStats>(calculateDocumentStats(rawContent));
-  let outline = $derived<MarkdownHeading[]>(extractDocumentOutline(rawContent));
+  let outline = $derived(rendered.headings);
   let backlinks = $state<DocBacklink[]>([]);
+  let note = $derived<MarkdownNote | null>(
+    $repoStore.currentPath && filePath ? { repoPath: $repoStore.currentPath, path: filePath } : null,
+  );
+
+  /**
+   * How long typing must pause before the preview re-renders. A render reads
+   * and re-encodes the note's pictures, so one per keystroke would queue
+   * work the next keystroke throws away. A file's first render is immediate.
+   */
+  const RERENDER_DELAY_MS = 150;
+  /** The file the page currently shows; deliberately not reactive. */
+  let shownFile: string | null = null;
 
   $effect(() => {
     const content = rawContent;
+    const file = filePath;
+    const location = note ? { repoPath: note.repoPath, filePath: note.path } : null;
     let cancelled = false;
-    void renderMarkDevMarkdown(content).then((html) => {
-      if (!cancelled) renderedHtml = html;
-    });
+    const run = () => {
+      renderMarkDevMarkdown(content, location)
+        .then((result) => {
+          if (cancelled) return;
+          rendered = result;
+          renderError = null;
+          shownFile = file;
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          // Never leave the previous note's page up under this note's name.
+          rendered = EMPTY_RENDER;
+          renderError = formatError(err);
+        });
+    };
+    const timer = shownFile === file ? setTimeout(run, RERENDER_DELAY_MS) : null;
+    if (!timer) run();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   });
 
@@ -125,43 +158,41 @@
 
   function scrollToHeading(id: string) {
     if (!previewContainerEl) return;
-    const target = previewContainerEl.querySelector(`#${id}`);
-    if (target) {
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
+    // Scoped to this preview and matched by id rather than by `#${id}`
+    // selector: a heading "1. Setup" has an id no selector accepts unescaped.
+    findFragmentTarget(previewContainerEl, id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  // Handle copy button clicks inside rendered code blocks via event delegation
-  async function handlePreviewClick(e: MouseEvent) {
-    const target = (e.target as HTMLElement).closest(".copy-code-btn") as HTMLButtonElement | null;
-    if (target) {
-      const code = target.getAttribute("data-code");
-      if (code) {
-        if (!(await copyText(code))) {
-          repoStore.setError("Could not copy to clipboard");
-          return;
-        }
-        if (!target.isConnected) return;
-        const originalText = target.innerText;
-        target.innerText = "Copied ✓";
-        target.classList.add("text-emerald-400!", "border-emerald-500/50!");
-        setTimeout(() => {
-          target.innerText = originalText;
-          target.classList.remove("text-emerald-400!", "border-emerald-500/50!");
-        }, 1800);
-      }
-    }
+  /** KiB, for the omitted-tail notice. */
+  function kib(bytes: number): string {
+    return `${Math.max(1, Math.round(bytes / 1024))} KiB`;
   }
-
-  $effect(() => {
-    if (!previewContainerEl) return;
-    const el = previewContainerEl;
-    el.addEventListener("click", handlePreviewClick);
-    return () => {
-      el.removeEventListener("click", handlePreviewClick);
-    };
-  });
 </script>
+
+{#snippet page()}
+  {#if renderError}
+    <div class="gp-md-notice" role="status">
+      <span>Could not render this note: {renderError}. The Raw view shows its source.</span>
+    </div>
+  {/if}
+  {#if rendered.omittedBytes > 0}
+    <div class="gp-md-notice" role="status">
+      <span>
+        This note is longer than GitPulse renders at once ({kib(MAX_RENDER_BYTES)}): its last
+        {kib(rendered.omittedBytes)} is not shown here. The Raw view shows all of it.
+      </span>
+    </div>
+  {/if}
+  {#if rendered.frontmatter.length > 0}
+    <dl class="gp-md-frontmatter" aria-label="Frontmatter">
+      {#each keyedList(rendered.frontmatter, (field) => field.key) as { item: field, key: fieldKey } (fieldKey)}
+        <dt>{field.key}</dt>
+        <dd>{field.value}</dd>
+      {/each}
+    </dl>
+  {/if}
+  <MarkdownContent html={rendered.html} {note} />
+{/snippet}
 
 <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text relative">
   <!-- MarkDev Integrated Header Toolbar -->
@@ -319,7 +350,7 @@
         class="flex-1 min-h-0 min-w-0 p-8 overflow-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
       >
         <div class="gp-card p-8 border-border/60 max-w-4xl mx-auto shadow-card">
-          {@html renderedHtml}
+          {@render page()}
           {#if backlinks.length > 0}
             <div class="mt-8 pt-4 border-t border-border/60">
               <div class="text-[10px] font-mono uppercase tracking-wider text-textMuted mb-2 font-bold">
@@ -372,7 +403,7 @@
           class="flex-1 min-w-0 h-full p-6 overflow-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
         >
           <div class="gp-card p-6 border-border/60 max-w-2xl mx-auto shadow-card">
-            {@html renderedHtml}
+            {@render page()}
           </div>
         </div>
       </div>

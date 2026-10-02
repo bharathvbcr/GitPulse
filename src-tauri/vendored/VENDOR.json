@@ -497,37 +497,109 @@
       }
     },
     {
-      "name": "markdev",
+      "name": "markdev-highlight",
       "origin": {
         "repo": "markdev",
         "root_env": "GITPULSE_MARKDEV_ROOT",
-        "path": "core",
-        "commit": "4c4c5b17cfd90769f7ddb705486832f21189a900"
+        "path": "core/crates/markdev-highlight",
+        "commit": "9d3b163fb849024851c4ad83d37cc2cf1036ba84"
       },
       "omitted": [
         "tests/",
         "[dev-dependencies]"
       ],
       "rewrites": [
-        "dropped [dev-dependencies]"
+        "package.version = \"0.1.0\"",
+        "package.edition = \"2021\"",
+        "package.license = \"MIT\"",
+        "dependencies.serde from the workspace"
       ],
       "files": {
-        "Cargo.toml": "7e674e5d0cd630cc47a0591f62beadd9023f9256eadb1454c28fada880efaf9e",
-        "build.rs": "b3da659a31dc522e93c00215c26e88d66476e3fc881d6fbc02298e6c97206a69",
-        "src/ffi.rs": "666fb3a20c7dfa65f2ec1bbebd5f0fce839dbab2e4903779c4e8965990303629",
-        "src/highlight/mod.rs": "280229e609fd6d6001c7fa5b268fc1beee0f3d28479188cda827027daedb1e4e",
-        "src/html.rs": "d92dcd8f5c4f82c8b9d7a8bed05c05e5ec16388094fb0eb65acfa804e1e0ba42",
-        "src/lib.rs": "cb2f3c18efa8f188a8d95ed9b625e852b282a1a213be24550f2983058848b681",
-        "src/md/incremental.rs": "251b970ea10a3fdc48e8d0441f63ec520fb89e926ab4ca10e03ded557b62e844",
-        "src/md/mod.rs": "f3887f3b044279affa7074fef6e563f603fdd6c9effb8f8c366c8bc6e354772d",
-        "src/md/model.rs": "e84a01e57cf30626ecb41e0e72eec56d02c27fa13aa39814a1ef25a29a56c423",
-        "src/md/parse.rs": "c19936995a85e77b841e379e04cf0de392e2b6bfbb2b86fcc118e5f80704b09e",
-        "src/vault/graph.rs": "ff122670715e44db032297881ca0719a5c000d2586ffb9bd0dd24d59b3043d50",
-        "src/vault/index.rs": "9143b1e95d3dbbb8e4505cb9e2bf5db0c0875c3290e0f9630f4b71cc1287910f",
-        "src/vault/mod.rs": "d30dfa9f66336986fbc3a6e51d650107a8b4b9a6dc793109b4482a09574aa19b",
-        "src/vault/note.rs": "bf4c7888a939c5416fdb6f7bca89de2534decd870a7b4809485cfc73eb431b40",
-        "src/vault/rename.rs": "efaac578ed2f921f88952cb9091efa0a01b3fae546e88377566609cdf74bf1bc",
-        "src/vault/search.rs": "d98ad7b98f7176d7116993b51a8f54f38d53153ea8bff41ccc51693872529c5c"
+        "Cargo.toml": "7cacf3be456163005c4042457505e36052895dae63b591fd5b51c6ccaab6dd7e",
+        "src/lib.rs": "280229e609fd6d6001c7fa5b268fc1beee0f3d28479188cda827027daedb1e4e"
+      }
+    },
+    {
+      "name": "markdev-html",
+      "origin": {
+        "repo": "markdev",
+        "root_env": "GITPULSE_MARKDEV_ROOT",
+        "path": "core/crates/markdev-html",
+        "commit": "e3ec3b0550c464e4b2be32420a1463c1c9ee382c"
+      },
+      "omitted": [
+        "tests/",
+        "[dev-dependencies]"
+      ],
+      "rewrites": [
+        "package.version = \"0.1.0\"",
+        "package.edition = \"2021\"",
+        "package.license = \"MIT\"",
+        "dependencies.pulldown-cmark from the workspace",
+        "dependencies.serde from the workspace",
+        "dependencies.serde_json from the workspace"
+      ],
+      "files": {
+        "Cargo.toml": "432d2112a894d80e44b09c5c321337bbd9532a9cbeeae6b4142c347aa1a4e1e2",
+        "src/lib.rs": "81b80fc68cc00b079e6bcec81f3654d4e8fc429087678b15583d011c9711f39c",
+        "src/site.rs": "44d275b3282809817358c9b39042840f96bdd5973211b61d0c5cec20b1943461"
+      }
+    },
+    {
+      "name": "markdev-md",
+      "origin": {
+        "repo": "markdev",
+        "root_env": "GITPULSE_MARKDEV_ROOT",
+        "path": "core/crates/markdev-md",
+        "commit": "9d3b163fb849024851c4ad83d37cc2cf1036ba84"
+      },
+      "omitted": [
+        "tests/",
+        "[dev-dependencies]"
+      ],
+      "rewrites": [
+        "package.version = \"0.1.0\"",
+        "package.edition = \"2021\"",
+        "package.license = \"MIT\"",
+        "dependencies.pulldown-cmark from the workspace",
+        "dependencies.serde from the workspace"
+      ],
+      "files": {
+        "Cargo.toml": "3363c7fff434755d497316823a523f84e4215355f2603c269549f32b9069fea4",
+        "src/incremental.rs": "251b970ea10a3fdc48e8d0441f63ec520fb89e926ab4ca10e03ded557b62e844",
+        "src/lib.rs": "a8bcb15dc849b99c94a6489823ba7e575f4971cdb08b76970a286b97420b9abc",
+        "src/model.rs": "6cf7171fa501a491155898c373d28d27c4969422f83445d69aade44df9dfdf1c",
+        "src/obsidian.rs": "995642d74f88f159c34fb102dacd28389f2e6220f9d02f0d776c055dc342f755",
+        "src/parse.rs": "45b0c73b5a07dec35b16cc23b79eb95309abf9d5b621f2683ef120dacac43026"
+      }
+    },
+    {
+      "name": "markdev-vault",
+      "origin": {
+        "repo": "markdev",
+        "root_env": "GITPULSE_MARKDEV_ROOT",
+        "path": "core/crates/markdev-vault",
+        "commit": "9d3b163fb849024851c4ad83d37cc2cf1036ba84"
+      },
+      "omitted": [
+        "tests/",
+        "[dev-dependencies]"
+      ],
+      "rewrites": [
+        "package.version = \"0.1.0\"",
+        "package.edition = \"2021\"",
+        "package.license = \"MIT\"",
+        "dependencies.pulldown-cmark from the workspace",
+        "dependencies.serde from the workspace"
+      ],
+      "files": {
+        "Cargo.toml": "3753827cb0c88ddc53a41da1d9441b9a0beb7166c5db371cdb28827353cb3e0d",
+        "src/graph.rs": "ff122670715e44db032297881ca0719a5c000d2586ffb9bd0dd24d59b3043d50",
+        "src/index.rs": "66b0e33e2c47db4cda77d1de9b97346b97bbf60375b9278d8e8666c67f2cb295",
+        "src/lib.rs": "d30dfa9f66336986fbc3a6e51d650107a8b4b9a6dc793109b4482a09574aa19b",
+        "src/note.rs": "c2fc179da992d1c9c82a6cad4132e3725e35fcc186d794835019642ca8354873",
+        "src/rename.rs": "3864ef82dcaca7c2b4271c52a865a93342543fce1ba043a611d89b887b35b1ec",
+        "src/search.rs": "d98ad7b98f7176d7116993b51a8f54f38d53153ea8bff41ccc51693872529c5c"
       }
     }
   ]

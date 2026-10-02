@@ -1,0 +1,205 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>GitPulse Markdown checks</title></head>
+<body><div id="app"></div><pre id="result"></pre>
+<script type="module">
+  /*
+   * Drives the explorer's Markdown viewer and the commit-message body with
+   * what `cmd_markdown_render` really returns for a kitchen-sink note: the
+   * fixture is the renderer's own output, held current by the Rust test
+   * `markdown::tests::the_harness_fixture_is_what_render_returns`.
+   */
+  import "../src/app.css";
+  import { mount, tick } from "svelte";
+  import { get } from "svelte/store";
+  import { createChecks } from "./checks.ts";
+  import MarkdownHost from "./MarkdownHost.svelte";
+  import source from "./markdown-kitchen-sink.md?raw";
+  import rendered from "./markdownRender.fixture.json";
+
+  const params = new URLSearchParams(location.search);
+  const { results, check, stopped } = createChecks();
+  const errors = [], unexpected = new Set(), opened = [], copied = [], renders = [];
+  addEventListener("error", e => errors.push(e.message));
+  addEventListener("unhandledrejection", e => errors.push(String(e.reason)));
+
+  let answer = () => rendered;
+  const fixture = {
+    cmd_resolve_repo: a => ({ path: a.path, name: "markdown", is_bare: false }),
+    cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }),
+    cmd_repo_operation: () => null, cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_watch_repo: () => null,
+    cmd_unwatch_repo: () => null, cmd_last_fetch_at: () => null, cmd_set_recent_menu: () => null,
+    cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+    cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+    cmd_workspace_link_candidates: () => ({ available: true, links: [], reason: null }),
+    cmd_workspace_sync: () => ({ repos: [] }),
+    cmd_devcouncil_init: () => ({ repo: "/r/markdown", state_dir: "/r/markdown/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], devmap_available: false }),
+    cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
+    cmd_docs_backlinks: () => [],
+    cmd_markdown_render: args => { renders.push(args); return answer(args); },
+    "plugin:opener|open_url": args => { opened.push(args.url); return null; },
+  };
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      if (fixture[cmd]) return fixture[cmd](args);
+      if (cmd.startsWith("plugin:event|")) return 1;
+      unexpected.add(cmd);
+      throw new Error(`Unconfigured harness command: ${cmd}`);
+    },
+    transformCallback: cb => cb,
+  };
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { copied.push(text); } } });
+
+  const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const settle = async () => { await tick(); await sleep(40); await tick(); };
+  const until = async (predicate, ms = 2000) => { const end = performance.now() + ms; while (performance.now() < end) { if (predicate()) return true; await sleep(25); } return predicate(); };
+  const target = document.getElementById("app");
+  const viewer = () => target.querySelector('[data-host="viewer"]');
+  const page = () => viewer().querySelector(".gp-markdown");
+  const commit = () => target.querySelector('[data-host="commit"] .gp-markdown');
+  const scroller = () => page().closest(".overflow-auto");
+  const css = (el, prop) => getComputedStyle(el).getPropertyValue(prop);
+  const px = (el, prop) => parseFloat(css(el, prop));
+  const linkByText = (root, text) => [...root.querySelectorAll("a")].find(a => a.textContent.trim() === text);
+  const notice = root => root.parentElement.querySelector(".gp-md-notice")?.textContent ?? "";
+  const clickable = el => { const e = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }); el.dispatchEvent(e); return e; };
+
+  if (params.get("theme") === "light") document.documentElement.classList.add("light");
+  await repoStore.openRepo("/r/markdown");
+  const host = mount(MarkdownHost, { target, props: { initial: { filePath: "README.md", text: source, commitBody: source }, width: 900 } });
+  await settle();
+  await until(() => page()?.querySelector("h1"));
+
+  if (params.has("check")) {
+    try {
+      // --- what the renderer was asked -------------------------------------
+      check("the viewer asks for its note's location", () => renders.some(r => r.repoPath === "/r/markdown" && r.filePath === "README.md"));
+      check("a commit body is rendered with no location", () => renders.some(r => r.repoPath === null && r.filePath === null));
+
+      // --- syntax is consumed, structure survives ----------------------------
+      const text = page().textContent;
+      check("no Markdown syntax leaks into the page", () => !["**", "](", "> [!", "```", "==", "~~", "[[", "[^"].some(token => text.includes(token)));
+      check("frontmatter is a field list, not body text", () => {
+        const fields = viewer().querySelector(".gp-md-frontmatter");
+        return fields?.textContent.includes("Kitchen sink") && !text.includes("Kitchen sink") && !text.includes("---");
+      });
+      check("every heading the outline names is on the page", () => rendered.headings.every(h => page().querySelector(`#gp-md-${CSS.escape(h.id)}`)?.tagName === `H${h.level}`));
+      check("nested lists keep their nesting", () => page().querySelector("ul > li > ul > li > ol > li")?.textContent.includes("deep ordered"));
+      check("a quote inside a list item stays inside it", () => page().querySelector("ol > li > blockquote"));
+      check("task items are disabled checkboxes, one checked", () => {
+        const boxes = [...page().querySelectorAll('input[type="checkbox"]')];
+        return boxes.length === 2 && boxes.every(b => b.disabled) && boxes.filter(b => b.checked).length === 1;
+      });
+      check("the table has its header and alignment", () => {
+        const ths = page().querySelectorAll("table th");
+        return ths.length === 3 && css(ths[2], "text-align") === "right";
+      });
+      check("five callouts, each with its title", () => {
+        const callouts = [...page().querySelectorAll(".callout")];
+        return callouts.length === 5 && callouts[1].querySelector(".callout-title").textContent.trim() === "Custom title";
+      });
+      check("a highlight wraps the bold inside it", () => page().querySelector("mark > strong")?.textContent === "strong");
+      check("footnotes are listed with their labels", () => page().querySelectorAll(".footnote-definition").length === 2);
+
+      // --- the stylesheet applies ------------------------------------------
+      const h1 = page().querySelector("h1"), p = page().querySelector("p");
+      check("headings are larger than body text", () => px(h1, "font-size") >= px(p, "font-size") * 1.5 && px(page().querySelector("h2"), "font-size") > px(p, "font-size") * 1.2);
+      check("lists show markers by depth", () => {
+        const ul = page().querySelector("ul"), inner = ul.querySelector("ul"), ol = inner.querySelector("ol");
+        return css(ul, "list-style-type") === "disc" && css(inner, "list-style-type") === "circle" && css(ol, "list-style-type") === "decimal" && px(ul, "padding-left") > 10;
+      });
+      check("table cells have borders", () => px(page().querySelector("td"), "border-top-width") >= 1);
+      check("quotes have their rule", () => px(page().querySelector("blockquote"), "border-left-width") >= 2);
+      check("code is monospace and blocks scroll sideways", () => /mono|Menlo|Consolas/i.test(css(page().querySelector("pre"), "font-family")) && css(page().querySelector("pre"), "overflow-x") === "auto");
+      check("inline code has a chip", () => css(page().querySelector("p code"), "background-color") !== "rgba(0, 0, 0, 0)");
+      check("a highlight is tinted", () => css(page().querySelector("mark"), "background-color") !== "rgba(0, 0, 0, 0)");
+      check("callouts are told apart by colour", () => {
+        const [note, warning] = page().querySelectorAll(".callout");
+        return css(note, "border-left-color") !== css(warning, "border-left-color");
+      });
+      check("heading anchors stay out of the way until hovered", () => css(page().querySelector(".anchor"), "opacity") === "0");
+      check("a long line wraps inside the page instead of widening it", () => page().scrollWidth <= page().clientWidth + 1);
+
+      // --- the app's document is not the note's ------------------------------
+      check("a heading named App cannot shadow the app root", () => document.getElementById("app") === target && page().querySelector("#gp-md-app")?.tagName === "H2");
+      check("every rendered id is namespaced", () => [...page().querySelectorAll("[id]")].every(el => el.id.startsWith("gp-md-")));
+      check("raw HTML in the note is text, never markup", () => text.includes('<div onclick="alert(1)">') && !page().querySelector("[onclick], script, iframe, object, embed, style"));
+      check("no link can run script", () => [...page().querySelectorAll("a")].every(a => !/^\s*javascript:/i.test(a.getAttribute("href"))));
+
+      // --- pictures ------------------------------------------------------
+      check("a remote picture loads without a referrer", () => {
+        const img = page().querySelector("img");
+        return img?.getAttribute("src").startsWith("https://") && img.getAttribute("referrerpolicy") === "no-referrer";
+      });
+      check("a picture that was not embedded never resolves against the app", () =>
+        [...page().querySelectorAll("img")].every(img => /^(data:image\/|https:)/.test(img.getAttribute("src"))) &&
+        page().querySelector(".gp-md-missing-picture")?.textContent === "Missing local picture");
+
+      // --- links -------------------------------------------------------
+      const here = location.href;
+      let click = clickable(linkByText(page(), "external link"));
+      await settle();
+      check("an https link opens in the OS browser and the webview stays put", () => click.defaultPrevented && opened.at(-1) === "https://example.com/path?q=1" && location.href === here);
+      clickable(linkByText(page(), "mail link")); await settle();
+      check("a mail link goes to the OS", () => opened.at(-1) === "mailto:someone@example.com");
+      const middle = new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 });
+      linkByText(page(), "external link").dispatchEvent(middle); await settle();
+      check("a middle click is claimed too", () => middle.defaultPrevented);
+      const before = opened.length;
+      click = clickable(linkByText(page(), "script link")); await settle();
+      check("a refused link says why and opens nothing", () => click.defaultPrevented && opened.length === before && /no destination/.test(notice(page())) && location.href === here);
+      clickable(linkByText(page(), "section link"));
+      await until(() => Math.abs(page().querySelector("#gp-md-tables").getBoundingClientRect().top - scroller().getBoundingClientRect().top) < 40, 2500);
+      check("a section link brings its heading to the top of the pane", () => Math.abs(page().querySelector("#gp-md-tables").getBoundingClientRect().top - scroller().getBoundingClientRect().top) < 40);
+      check("a section link leaves the app's URL alone", () => location.href === here);
+      clickable(linkByText(page(), "relative link")); await settle();
+      check("a relative link opens that repository file in the explorer", () => get(repoStore).selectedFilePath === "docs/guide.md" && get(repoStore).activeTab === "code");
+
+      // --- code copy -----------------------------------------------------
+      const copy = page().querySelector(".gp-md-code[data-language='rust'] .gp-md-copy");
+      clickable(copy); await settle();
+      check("copy takes the code as written, unescaped", () => copied.at(-1) === 'fn main() {\n    println!("hello <world> & \\"friends\\"");\n}\n');
+      check("the copy button says it copied", () => copy.textContent === "Copied");
+
+      // --- the outline -----------------------------------------------------
+      const outlineButton = [...viewer().querySelectorAll("button")].find(b => b.textContent.includes("Outline"));
+      outlineButton.click(); await settle();
+      const entries = [...viewer().querySelectorAll("button")].filter(b => b.title && rendered.headings.some(h => h.title === b.title));
+      check("the outline lists every heading", () => entries.length === rendered.headings.length);
+      entries.find(b => b.title === "1. Lists").click();
+      await until(() => Math.abs(page().querySelector("#gp-md-1-lists").getBoundingClientRect().top - scroller().getBoundingClientRect().top) < 40, 2500);
+      check("an outline entry whose id starts with a digit still scrolls", () => Math.abs(page().querySelector("#gp-md-1-lists").getBoundingClientRect().top - scroller().getBoundingClientRect().top) < 40);
+
+      // --- the commit body -----------------------------------------------
+      clickable(linkByText(commit(), "relative link")); await settle();
+      check("a commit message's relative link is refused, with the reason", () => /nothing to resolve against/.test(notice(commit())));
+      check("a commit message renders compact", () => commit().classList.contains("gp-markdown-compact") && px(commit().querySelector("h1"), "font-size") < px(h1, "font-size"));
+
+      // --- render failures and the cap -------------------------------------
+      // In place, on the same mounted viewer: what a re-render leaves behind
+      // is the point, and a fresh mount has nothing to leave.
+      answer = () => ({ ...rendered, omittedBytes: 5 * 1024 });
+      host.update({ text: source + " " });
+      const capNotice = () => [...viewer().querySelectorAll(".gp-md-notice")].map(n => n.textContent.replace(/\s+/g, " ").trim()).join(" | ");
+      await until(() => /last 5 KiB/.test(capNotice()), 2000);
+      check(`an over-cap note says how much was left out (saw: ${capNotice() || "no notice"})`, () => /last 5 KiB is not shown here/.test(capNotice()));
+      answer = () => Promise.reject(new Error("renderer exploded"));
+      host.update({ text: "# broken", commitBody: "# broken" });
+      await until(() => /renderer exploded/.test(viewer().textContent), 2000); await settle();
+      check("a failed re-render shows the reason and takes the old page down", () => /renderer exploded/.test(viewer().textContent) && !page().querySelector("h1, p, ul"));
+      check("a failed commit render falls back to the escaped source", () => target.querySelector('[data-host="commit"]').textContent.includes("# broken") && /renderer exploded/.test(target.querySelector('[data-host="commit"]').textContent));
+      answer = () => rendered;
+      host.update({ filePath: "OTHER.md", text: source });
+      await until(() => page().querySelector("h1"), 2000);
+      check("a later good render replaces the failure", () => page().querySelector("h1") && !/renderer exploded/.test(viewer().textContent));
+
+      check("no unexpected native commands", () => unexpected.size === 0);
+      check("no runtime errors", () => errors.length === 0);
+      document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
+    } catch (error) {
+      document.getElementById("result").textContent = stopped(error);
+    }
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected: [...unexpected] }));
+    if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+  }
+</script></body></html>

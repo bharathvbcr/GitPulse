@@ -1556,7 +1556,9 @@ dependencies = [
  "gtk",
  "libc",
  "log",
- "markdev",
+ "markdev-highlight",
+ "markdev-html",
+ "markdev-vault",
  "notify",
  "objc2",
  "objc2-foundation",
@@ -2375,12 +2377,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "markdev"
+name = "markdev-highlight"
 version = "0.1.0"
 dependencies = [
- "pulldown-cmark",
  "serde",
- "serde_json",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-highlight",
@@ -2389,6 +2389,33 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-swift",
+]
+
+[[package]]
+name = "markdev-html"
+version = "0.1.0"
+dependencies = [
+ "markdev-md",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "markdev-md"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+ "serde",
+]
+
+[[package]]
+name = "markdev-vault"
+version = "0.1.0"
+dependencies = [
+ "markdev-md",
+ "pulldown-cmark",
+ "serde",
 ]
 
 [[package]]

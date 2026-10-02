@@ -4424,16 +4424,26 @@ pub async fn cmd_fleet_record_metrics(
     .await
 }
 
-/// Parses markdown into MarkDev's flat model with resolved string lookups.
+/// Renders markdown for embedding through MarkDev's renderer. With a note
+/// location (`repo_path` + repo-relative `file_path`) relative pictures are
+/// embedded from that repository; without one nothing is read from disk.
 #[tauri::command(async)]
-pub async fn cmd_markdown_parse(text: String) -> Result<crate::markdown::ParsedMarkdown, String> {
-    off_thread(move || crate::markdown::parse(&text)).await
-}
-
-/// Renders markdown to safe HTML via the MarkDev flat model.
-#[tauri::command(async)]
-pub async fn cmd_markdown_render(text: String) -> Result<String, String> {
-    off_thread(move || crate::markdown::render(&text)).await
+pub async fn cmd_markdown_render(
+    text: String,
+    repo_path: Option<String>,
+    file_path: Option<String>,
+) -> Result<crate::markdown::RenderedMarkdown, String> {
+    off_thread(move || {
+        // A location is both or neither: a path without its repository could
+        // only be resolved against something the caller did not name.
+        let note = match (repo_path.as_deref(), file_path.as_deref()) {
+            (Some(repo), Some(file)) => Some((repo, file)),
+            (None, None) => None,
+            _ => return Err("a note location needs both repo_path and file_path".to_string()),
+        };
+        crate::markdown::render(&text, note)
+    })
+    .await
 }
 
 /// Refreshes tracked documents; watcher work yields subprocess capacity to user actions.
@@ -4462,7 +4472,7 @@ pub async fn cmd_docs_search(
     repo_path: String,
     query: String,
     limit: Option<u32>,
-) -> Result<Vec<markdev::vault::SearchHit>, String> {
+) -> Result<Vec<markdev_vault::SearchHit>, String> {
     off_thread(move || {
         crate::docs::search(
             &repo_path,
@@ -4484,7 +4494,7 @@ pub async fn cmd_docs_broken_links(
 pub async fn cmd_docs_backlinks(
     repo_path: String,
     path: String,
-) -> Result<Vec<markdev::vault::Backlink>, String> {
+) -> Result<Vec<markdev_vault::Backlink>, String> {
     off_thread(move || crate::docs::backlinks(&repo_path, &path)).await
 }
 
@@ -4495,7 +4505,7 @@ pub async fn cmd_docs_graph(
     depth: Option<u32>,
     tag: Option<String>,
     folder: Option<String>,
-) -> Result<markdev::vault::Graph, String> {
+) -> Result<markdev_vault::Graph, String> {
     off_thread(move || {
         crate::docs::graph(
             &repo_path,

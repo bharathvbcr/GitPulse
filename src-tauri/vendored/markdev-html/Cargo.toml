@@ -1,0 +1,20 @@
+[package]
+name = "markdev-html"
+version = "0.1.0"
+edition = "2021"
+description = "Safe HTML rendering of MarkDev's Markdown dialect: browser-ready export, vault sites, and embeddable fragments"
+license = "MIT"
+
+[features]
+default = ["mathml"]
+# Typesets `$…$` / `$$…$$` as MathML so browsers draw real math without
+# script. Without it, math renders as its LaTeX source in a code element.
+mathml = ["dep:pulldown-latex"]
+
+[dependencies]
+markdev-md = { path = "../markdev-md" }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html", "simd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+# LaTeX → MathML. Pure Rust, no dependencies by default.
+pulldown-latex = { version = "0.8", optional = true, default-features = false }

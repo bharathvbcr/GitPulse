@@ -285,6 +285,29 @@ describe("tauri config helpers", () => {
     expect(devCspForPort(PREFERRED_DEV_PORT)).toEqual(conf.app.security.devCsp);
   });
 
+  /**
+   * Rendered repository Markdown shows remote pictures (README badges), so
+   * images may come from any https origin — and only images, and never over
+   * plain http: a page could otherwise be watched or rewritten in transit.
+   * Scripts, styles, connections and media stay same-origin.
+   */
+  it("admits remote https pictures and nothing else remote", () => {
+    const conf = JSON.parse(
+      readFileSync(path.join(repoRoot, "src-tauri/tauri.conf.json"), "utf8"),
+    ) as { app: { security: { csp: Record<string, string>; devCsp: Record<string, string> } } };
+    const policies: Record<string, string>[] = [conf.app.security.csp, conf.app.security.devCsp, devCspForPort(5181)];
+    for (const csp of policies) {
+      const sources = (directive: string) => (csp[directive] ?? "").split(/\s+/).filter(Boolean);
+      expect(sources("img-src")).toEqual(["'self'", "data:", "blob:", "https:"]);
+      for (const [directive, value] of Object.entries(csp)) {
+        if (directive === "img-src") continue;
+        const tokens = value.split(/\s+/);
+        expect(tokens, directive).not.toContain("https:");
+        expect(tokens, directive).not.toContain("*");
+      }
+    }
+  });
+
   it("detects the Tauri beforeDevCommand hook env that disables WKWebView HMR", () => {
     expect(isTauriHookEnv({})).toBe(false);
     expect(isTauriHookEnv({ TAURI_ENV_PLATFORM: "darwin" })).toBe(true);

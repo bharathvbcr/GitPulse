@@ -192,7 +192,7 @@ export function devCspForPort(port) {
     "default-src": `'self' ${http}`,
     "script-src": `'self' ${http}`,
     "style-src": "'self' 'unsafe-inline'",
-    "img-src": "'self' data: blob:",
+    "img-src": "'self' data: blob: https:",
     "font-src": "'self' data:",
     "connect-src": `'self' ipc: http://ipc.localhost ${ws}`,
     "base-uri": "'none'",

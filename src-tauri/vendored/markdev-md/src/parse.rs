@@ -32,10 +32,11 @@ use std::ops::{Deref, DerefMut, Range};
 
 use super::model::{
     BlockDescriptor, BlockKind, CalloutKind, ParseResult, SpanKind, StyleSpan, SyntaxMarker,
-    TableAlignment, Utf16Mapper, MAX_DOCUMENT_BYTES, MAX_INTERNED_STRINGS,
+    TableAlignment, Utf16Mapper, CALLOUT_FOLD_SHIFT, MAX_DOCUMENT_BYTES, MAX_INTERNED_STRINGS,
     MAX_INTERNED_STRING_BYTES, MAX_PARSE_EVENTS, MAX_PARSE_NESTING, MAX_STRUCTURAL_RECORDS,
-    MAX_TOTAL_STRING_BYTES, NO_INFO, TABLE_ALIGNMENT_BITS,
+    MAX_TOTAL_STRING_BYTES, NO_INFO, TABLE_ALIGNMENT_BITS, TASK_STATUS_SHIFT,
 };
+use super::obsidian;
 
 /// Why a Markdown input was refused before a partial model could escape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +511,8 @@ pub fn parse_checked(source: &str) -> Result<ParseResult, ParseError> {
 
     collect_delimited_math(source, &mapper, &mut result)?;
     collect_link_reference_definitions(source, &mapper, &mut result)?;
+    collect_obsidian_extensions(source, &mapper, &mut result)?;
+    collect_cross_run_highlights(source, &mapper, &mut result)?;
 
     result.spans.sort_by_key(|s| (s.start, s.end));
     result.markers.sort_by_key(|m| (m.start, m.end));
@@ -590,11 +593,8 @@ fn open_frame(
                     // line. `> [!NOTE] Custom` is a BlockQuote to it; we still
                     // owe the reader a callout whose strip can show the title.
                     let idx = reserve(result, BlockKind::Callout, alert.kind as u32, NO_INFO)?;
-                    frame.extra_markers.push(alert.tag);
-                    if let Some((title, title_range)) = alert.title {
-                        result.blocks[idx].info = result.intern(title)?;
-                        frame.extra_markers.push(title_range);
-                    }
+                    frame.extra_markers.push(alert.tag.clone());
+                    apply_alert_title(result, &mut frame, idx, alert)?;
                     frame.block = Some(idx);
                 }
                 (None, None) => {
@@ -709,9 +709,27 @@ fn open_frame(
             };
             frame.span = Some((kind, dest));
         }
-        Tag::Image { dest_url, .. } => {
+        Tag::Image {
+            link_type,
+            dest_url,
+            ..
+        } => {
             let dest = result.intern(dest_url)?;
-            frame.span = Some((SpanKind::Image, dest));
+            // `![[Note]]` transcludes a note in Obsidian. It is a link to that
+            // note, not a picture: drawn as one it is a broken image, and the
+            // vault would miss the connection it makes.
+            let kind = if matches!(link_type, LinkType::WikiLink { .. })
+                && !obsidian::is_media_target(dest_url)
+            {
+                SpanKind::WikiLink
+            } else if obsidian::is_audio_target(dest_url) || obsidian::is_video_target(dest_url) {
+                // The editor draws pictures, not players: an audio or video
+                // embed is a link that opens the file in the system player.
+                SpanKind::Link
+            } else {
+                SpanKind::Image
+            };
+            frame.span = Some((kind, dest));
         }
     }
 
@@ -847,7 +865,7 @@ fn delimiter_run(source: &str, range: &Range<usize>, byte: u8) -> usize {
 /// The two pulldown rules — non-space after the opener, non-space before
 /// the closer — are re-checked rather than trusted, so this function stays
 /// correct even if the upstream pairing ever loosens.
-fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+pub fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     let bytes = source.as_bytes();
     // Structural sanity: `$` at both ends with something between, and both
     // ends on character boundaries so the adjacency reads below cannot slice
@@ -930,7 +948,7 @@ fn crosses_link_destination(bytes: &[u8], content: Range<usize>) -> bool {
 /// own lines ends at a newline or the end of the document and passes
 /// untouched; so does inline display math between words (`text $$x$$ more`),
 /// which notes in the wild rely on.
-fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+pub fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     let bytes = source.as_bytes();
     // Structural sanity: `$$` at both ends with something between, on
     // character boundaries, for the same reason the inline check insists.
@@ -1137,9 +1155,15 @@ fn mark_indented_code_prefixes(
 
 struct GfmAlertLine<'a> {
     kind: CalloutKind,
+    /// `CALLOUT_FOLD_*` from a trailing `+` / `-`, or 0.
+    fold: u32,
     /// `[!NOTE]` (and an optional trailing `+` / `-`).
     tag: Range<usize>,
     title: Option<(&'a str, Range<usize>)>,
+    /// Shown when the author wrote no title but used a custom type such as
+    /// `[!recipe]`: the type name is the only thing that tells it apart
+    /// from a plain note.
+    custom_title: Option<String>,
 }
 
 fn apply_alert_title(
@@ -1148,64 +1172,30 @@ fn apply_alert_title(
     idx: usize,
     alert: GfmAlertLine<'_>,
 ) -> Result<(), ParseError> {
+    result.blocks[idx].data |= alert.fold << CALLOUT_FOLD_SHIFT;
     if let Some((title, title_range)) = alert.title {
         result.blocks[idx].info = result.intern(title)?;
         frame.extra_markers.push(title_range);
+    } else if let Some(custom) = alert.custom_title {
+        result.blocks[idx].info = result.intern(&custom)?;
     }
     Ok(())
 }
 
-/// First line of a blockquote that is a GFM alert, including the GitHub
-/// custom-title form pulldown-cmark leaves as a plain quote.
+/// First line of a blockquote that is a callout: a GitHub alert, including
+/// the custom-title form pulldown-cmark leaves as a plain quote, or any
+/// Obsidian callout type with its optional fold sign and title.
 fn gfm_alert_line<'a>(source: &'a str, range: &Range<usize>) -> Option<GfmAlertLine<'a>> {
-    let bytes = source.as_bytes();
-    let end = range.end.min(bytes.len());
-    let mut i = range.start.min(end);
-    while i < end && (bytes[i] == b' ' || bytes[i] == b'\t') {
-        i += 1;
-    }
-    if i < end && bytes[i] == b'>' {
-        i += 1;
-    }
-    if i < end && (bytes[i] == b' ' || bytes[i] == b'\t') {
-        i += 1;
-    }
-    if i + 1 >= end || bytes[i] != b'[' || bytes[i + 1] != b'!' {
-        return None;
-    }
-    let tag_open = i;
-    i += 2;
-    let name_start = i;
-    while i < end && bytes[i].is_ascii_alphabetic() {
-        i += 1;
-    }
-    if i >= end || bytes[i] != b']' || i == name_start {
-        return None;
-    }
-    let kind = match source[name_start..i].to_ascii_uppercase().as_str() {
-        "NOTE" => CalloutKind::Note,
-        "TIP" => CalloutKind::Tip,
-        "IMPORTANT" => CalloutKind::Important,
-        "WARNING" => CalloutKind::Warning,
-        "CAUTION" => CalloutKind::Caution,
-        _ => return None,
-    };
-    i += 1;
-    if i < end && (bytes[i] == b'+' || bytes[i] == b'-') {
-        i += 1;
-    }
-    let tag = tag_open..i;
-    let mut line_end = i;
-    while line_end < end && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
-        line_end += 1;
-    }
-    let title_text = source[i..line_end].trim();
-    let title = if title_text.is_empty() {
-        None
-    } else {
-        Some((title_text, i..line_end))
-    };
-    Some(GfmAlertLine { kind, tag, title })
+    let line = obsidian::callout_line(source, range)?;
+    let custom_title = (line.title.is_none() && !CalloutKind::is_known_type_name(line.type_name))
+        .then(|| obsidian::default_callout_title(line.type_name));
+    Some(GfmAlertLine {
+        kind: line.kind,
+        fold: line.fold,
+        tag: line.tag,
+        title: line.title,
+        custom_title,
+    })
 }
 
 /// `\(...\)`, `\[...\]`, and their Markdown-escaped `\\(…\\)` / `\\[…\\]` forms.
@@ -1225,6 +1215,7 @@ fn collect_delimited_math(
         return Ok(());
     }
     let occupied = occupied_byte_ranges(mapper, result);
+    let mut innermost = InnermostCursor::new(result);
     let mut i = 0;
     let mut added_block = false;
     while i < bytes.len() {
@@ -1238,7 +1229,15 @@ fn collect_delimited_math(
             continue;
         }
 
-        let taken = take_delimited_math(source, mapper, result, &occupied, i, &mut added_block)?;
+        let taken = take_delimited_math(
+            source,
+            mapper,
+            result,
+            &occupied,
+            &mut innermost,
+            i,
+            &mut added_block,
+        )?;
         i = if taken > i { taken } else { i + 1 };
     }
     if added_block {
@@ -1252,6 +1251,7 @@ fn take_delimited_math(
     mapper: &Utf16Mapper,
     result: &mut ParseAccumulator,
     occupied: &[(usize, usize)],
+    innermost: &mut InnermostCursor,
     i: usize,
     added_block: &mut bool,
 ) -> Result<usize, ParseError> {
@@ -1282,11 +1282,32 @@ fn take_delimited_math(
         if crosses_link_destination(bytes, inner_start..inner_end) {
             continue;
         }
+        // A formula lives inside one block. `\[` in a paragraph and `\]`
+        // inside the quote below it claimed a range that overlapped the
+        // quote without containing it, and the block list stopped nesting —
+        // which everything reading it assumes.
+        if innermost.crosses_boundary(result, mapper.to_utf16(i), mapper.to_utf16(full_end)) {
+            continue;
+        }
         if display {
-            emit_delimited_math_block(mapper, result, i..full_end, opener.len(), closer.len())?;
+            emit_delimited_math_block(
+                mapper,
+                result,
+                innermost,
+                i..full_end,
+                opener.len(),
+                closer.len(),
+            )?;
             *added_block = true;
         } else {
-            emit_delimited_math_span(mapper, result, i..full_end, opener.len(), closer.len())?;
+            emit_delimited_math_span(
+                mapper,
+                result,
+                innermost,
+                i..full_end,
+                opener.len(),
+                closer.len(),
+            )?;
         }
         return Ok(full_end);
     }
@@ -1310,13 +1331,14 @@ fn find_math_closer(bytes: &[u8], from: usize, closer: &[u8], display: bool) -> 
 fn emit_delimited_math_span(
     mapper: &Utf16Mapper,
     result: &mut ParseAccumulator,
+    innermost: &mut InnermostCursor,
     range: Range<usize>,
     opener_len: usize,
     closer_len: usize,
 ) -> Result<(), ParseError> {
     let inner = range.start + opener_len..range.end - closer_len;
     let utf = mapper.to_utf16(range.start);
-    let owner = innermost_block(result, utf).unwrap_or(0) as u32;
+    let owner = innermost.at(result, utf).unwrap_or(0) as u32;
     push_span(result, mapper, &inner, SpanKind::InlineMath, 0, 0)?;
     mark(result, mapper, range.start..range.start + opener_len, owner)?;
     mark(result, mapper, range.end - closer_len..range.end, owner)
@@ -1325,12 +1347,13 @@ fn emit_delimited_math_span(
 fn emit_delimited_math_block(
     mapper: &Utf16Mapper,
     result: &mut ParseAccumulator,
+    innermost: &mut InnermostCursor,
     range: Range<usize>,
     opener_len: usize,
     closer_len: usize,
 ) -> Result<(), ParseError> {
     let utf_start = mapper.to_utf16(range.start);
-    let enclosing = innermost_block(result, utf_start);
+    let enclosing = innermost.at(result, utf_start);
     let depth = enclosing
         .map(|i| result.blocks[i].depth.saturating_add(1))
         .unwrap_or(0);
@@ -1353,13 +1376,327 @@ fn emit_delimited_math_block(
     Ok(())
 }
 
+/// Obsidian syntax pulldown-cmark does not model: `%%comments%%`,
+/// `^[inline footnotes]`, `^block-ids`, and `- [/]` task statuses.
+///
+/// Runs after every other pass so the literal regions it must respect —
+/// code, math, frontmatter, raw HTML — are already known.
+fn collect_obsidian_extensions(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseAccumulator,
+) -> Result<(), ParseError> {
+    let has_comment = source.contains("%%");
+    let has_caret = source.contains('^');
+    let has_task = source.contains('[');
+    if result.blocks.is_empty() || !(has_comment || has_caret || has_task) {
+        return Ok(());
+    }
+
+    let verbatim = verbatim_byte_ranges(mapper, result);
+    let comments = if has_comment {
+        obsidian::comment_ranges(source, &verbatim)
+    } else {
+        Vec::new()
+    };
+    let mut excluded = verbatim.clone();
+    excluded.extend(comments.iter().cloned());
+    let excluded = obsidian::normalise(excluded);
+
+    let footnotes = if has_caret {
+        obsidian::inline_footnotes(source, &excluded)
+    } else {
+        Vec::new()
+    };
+    let block_ids = if has_caret {
+        obsidian::block_ids(source, &excluded)
+    } else {
+        Vec::new()
+    };
+
+    // Every marker needs the block that owns it. Resolve all of them in one
+    // sweep: asking per construct is quadratic in a note full of comments.
+    let mut queries: Vec<usize> = Vec::new();
+    let mut comment_segments: Vec<Range<usize>> = Vec::new();
+    for comment in &comments {
+        let mut start = comment.start;
+        while start < comment.end {
+            let end = source[start..comment.end]
+                .find('\n')
+                .map_or(comment.end, |nl| (start + nl + 1).min(comment.end));
+            comment_segments.push(start..end);
+            queries.push(start);
+            start = end;
+        }
+    }
+    for note in &footnotes {
+        queries.push(note.full.start);
+    }
+    for id in &block_ids {
+        queries.push(id.marker.start);
+    }
+    let owners = block_owners(mapper, result, &queries);
+    let mut owner_at = owners.into_iter();
+
+    let mut previous_owner = 0u32;
+    for segment in &comment_segments {
+        let owner = owner_at
+            .next()
+            .flatten()
+            .map_or(previous_owner, |o| o as u32);
+        previous_owner = owner;
+        mark(result, mapper, segment.clone(), owner)?;
+    }
+    for comment in &comments {
+        push_span(result, mapper, comment, SpanKind::Comment, 0, 0)?;
+    }
+    for note in &footnotes {
+        let owner = owner_at.next().flatten().unwrap_or(0) as u32;
+        push_span(result, mapper, &note.inner, SpanKind::InlineFootnote, 0, 0)?;
+        mark(result, mapper, note.full.start..note.inner.start, owner)?;
+        mark(result, mapper, note.inner.end..note.full.end, owner)?;
+    }
+    for id in &block_ids {
+        let owner = owner_at.next().flatten().unwrap_or(0) as u32;
+        mark(result, mapper, id.marker.clone(), owner)?;
+    }
+
+    // What a comment holds is not part of the note: a tag, link or picture
+    // written inside one must not style, navigate, or render.
+    if !comments.is_empty() {
+        let hidden: Vec<(u32, u32)> = comments
+            .iter()
+            .map(|c| (mapper.to_utf16(c.start), mapper.to_utf16(c.end)))
+            .collect();
+        result.spans.retain(|span| {
+            if span.kind == SpanKind::Comment as u16 {
+                return true;
+            }
+            let index = hidden.partition_point(|&(_, end)| end <= span.start);
+            !hidden
+                .get(index)
+                .is_some_and(|&(start, end)| start <= span.start && span.end <= end)
+        });
+    }
+
+    if has_task {
+        collect_custom_tasks(source, mapper, result, &excluded)?;
+    }
+    Ok(())
+}
+
+/// `==highlights==` whose content is not one plain text run — `==**bold**==`,
+/// `==[[link]]==`, `==a *b* c==` — which the per-run scan cannot pair.
+///
+/// Uses the same adjacency rules as the per-run scan, pairs only within one
+/// block and never across a blank line, and refuses a pair that would cut
+/// through another construct (`**a ==b** c==`), so a highlight always nests.
+fn collect_cross_run_highlights(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseAccumulator,
+) -> Result<(), ParseError> {
+    if result.blocks.is_empty() || !source.contains("==") {
+        return Ok(());
+    }
+    // A delimiter cannot sit inside existing syntax (which already covers the
+    // `==` of every per-run highlight), code, math, or a comment.
+    let mut blocked = verbatim_byte_ranges(mapper, result);
+    blocked.extend(
+        result
+            .markers
+            .iter()
+            .map(|m| mapper.to_byte(m.start)..mapper.to_byte(m.end)),
+    );
+    blocked.extend(
+        result
+            .spans
+            .iter()
+            .filter(|s| s.kind == SpanKind::Comment as u16)
+            .map(|s| mapper.to_byte(s.start)..mapper.to_byte(s.end)),
+    );
+    let blocked = obsidian::normalise(blocked);
+
+    let bytes = source.as_bytes();
+    let mut candidates = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'=' && bytes[i + 1] == b'=' && !obsidian::overlaps(&blocked, i, i + 2) {
+            candidates.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if candidates.len() < 2 {
+        return Ok(());
+    }
+    let owners = block_owners(mapper, result, &candidates);
+
+    // Constructs a highlight must not cut through, sorted by start.
+    let mut spans: Vec<(usize, usize)> = result
+        .spans
+        .iter()
+        .filter(|s| s.kind != SpanKind::Heading as u16)
+        .map(|s| (mapper.to_byte(s.start), mapper.to_byte(s.end)))
+        .collect();
+    spans.sort_unstable();
+
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    let mut k = 0;
+    while k + 1 < candidates.len() {
+        let (open, close) = (candidates[k], candidates[k + 1]);
+        let owner = owners[k];
+        let valid = owner.is_some()
+            && owners[k + 1] == owner
+            && highlight_is_valid(source, open, close)
+            && !source[open..close].contains("\n\n")
+            && !source[open..close].contains("\r\n\r\n")
+            && {
+                let block_start = owner.map_or(0, |o| mapper.to_byte(result.blocks[o].start));
+                let (inner_start, inner_end) = (open + 2, close);
+                let from = spans.partition_point(|&(s, _)| s < block_start);
+                let to = spans.partition_point(|&(s, _)| s < inner_end);
+                spans[from..to].iter().all(|&(s, e)| {
+                    let inside = s >= inner_start && e <= inner_end;
+                    let around = s <= open && e >= close + 2;
+                    let apart = e <= inner_start || s >= inner_end;
+                    inside || around || apart
+                })
+            };
+        if valid {
+            found.push((open, close, owner.unwrap_or(0)));
+            k += 2;
+        } else {
+            k += 1;
+        }
+    }
+    for (open, close, owner) in found {
+        push_span(
+            result,
+            mapper,
+            &(open + 2..close),
+            SpanKind::Highlight,
+            0,
+            0,
+        )?;
+        mark(result, mapper, open..open + 2, owner as u32)?;
+        mark(result, mapper, close..close + 2, owner as u32)?;
+    }
+    Ok(())
+}
+
+/// `- [/]`-style list items: a checked task marker pulldown does not see.
+fn collect_custom_tasks(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseAccumulator,
+    excluded: &[Range<usize>],
+) -> Result<(), ParseError> {
+    let items: Vec<(usize, u32)> = result
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.kind == BlockKind::ListItem as u16)
+        .map(|(i, b)| (i, b.start))
+        .collect();
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut existing: Vec<u32> = result
+        .spans
+        .iter()
+        .filter(|s| s.kind == SpanKind::TaskMarker as u16)
+        .map(|s| s.start)
+        .collect();
+    existing.sort_unstable();
+    for (index, start) in items {
+        let byte = mapper.to_byte(start);
+        let Some(task) = obsidian::custom_task_at(source, byte) else {
+            continue;
+        };
+        if obsidian::overlaps(excluded, task.marker.start, task.marker.end) {
+            continue;
+        }
+        let at = mapper.to_utf16(task.marker.start);
+        if existing.binary_search(&at).is_ok() {
+            continue;
+        }
+        // Bit 0 is "done", as for `[x]`; the status character rides above it
+        // so the editor can draw `[/]`, `[-]`, `[>]` distinctly.
+        let data = 1 | (u32::from(task.status) << TASK_STATUS_SHIFT);
+        push_span(result, mapper, &task.marker, SpanKind::TaskMarker, 0, data)?;
+        // The box and the space after it, exactly as pulldown's own `[x]`.
+        let bytes = source.as_bytes();
+        let mut end = task.marker.end;
+        while end < bytes.len() && matches!(bytes[end], b' ' | b'\t') {
+            end += 1;
+        }
+        mark(result, mapper, task.marker.start..end, index as u32)?;
+    }
+    Ok(())
+}
+
+/// Byte ranges whose text is literal: code, math, frontmatter, raw HTML.
+fn verbatim_byte_ranges(mapper: &Utf16Mapper, result: &ParseResult) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    for b in &result.blocks {
+        if b.kind == BlockKind::CodeBlock as u16
+            || b.kind == BlockKind::MermaidBlock as u16
+            || b.kind == BlockKind::MathBlock as u16
+            || b.kind == BlockKind::Frontmatter as u16
+            || b.kind == BlockKind::HtmlBlock as u16
+        {
+            ranges.push(mapper.to_byte(b.start)..mapper.to_byte(b.end));
+        }
+    }
+    for s in &result.spans {
+        if s.kind == SpanKind::InlineCode as u16
+            || s.kind == SpanKind::InlineMath as u16
+            || s.kind == SpanKind::InlineHtml as u16
+        {
+            // Inline spans cover only their content; widen by the
+            // delimiter so a backtick-wrapped `%%` is caught at its edge.
+            let start = mapper.to_byte(s.start).saturating_sub(1);
+            let end = (mapper.to_byte(s.end) + 1).min(mapper.to_byte(u32::MAX));
+            ranges.push(start..end);
+        }
+    }
+    obsidian::normalise(ranges)
+}
+
+/// The innermost block containing each byte position, in one sweep.
+fn block_owners(
+    mapper: &Utf16Mapper,
+    result: &ParseResult,
+    positions: &[usize],
+) -> Vec<Option<usize>> {
+    let mut queries: Vec<(u32, usize)> = positions
+        .iter()
+        .enumerate()
+        .map(|(q, &byte)| (mapper.to_utf16(byte), q))
+        .collect();
+    queries.sort_unstable();
+    let mut owners = vec![None; positions.len()];
+    let mut innermost = InnermostCursor::new(result);
+    for (at, q) in queries {
+        owners[q] = innermost.at(result, at);
+    }
+    owners
+}
+
+/// The innermost block containing a UTF-16 offset, by scanning every block.
+/// The specification [`InnermostCursor`] is tested against: smallest
+/// containing range, and among identical ranges the deepest — the last in
+/// the parser's pre-order.
+#[cfg(test)]
 fn innermost_block(result: &ParseResult, utf16: u32) -> Option<usize> {
     result
         .blocks
         .iter()
         .enumerate()
         .filter(|(_, b)| b.start <= utf16 && utf16 < b.end)
-        .min_by_key(|(_, b)| b.end.saturating_sub(b.start))
+        .min_by_key(|&(i, b)| (b.end.saturating_sub(b.start), std::cmp::Reverse(i)))
         .map(|(i, _)| i)
 }
 
@@ -1412,12 +1749,116 @@ fn occupied_byte_ranges(mapper: &Utf16Mapper, result: &ParseResult) -> Vec<(usiz
     out
 }
 
+/// Whether `pos` lies in one of `occupied`'s intervals.
+///
+/// `occupied` is [`occupied_byte_ranges`]'s output: sorted, merged, and so
+/// disjoint, which is what makes a binary search exact. A linear scan here
+/// ran once per backslash in the document, so a note with many code spans
+/// and many backslashes went quadratic.
 fn range_is_occupied(occupied: &[(usize, usize)], pos: usize) -> bool {
-    occupied.iter().any(|&(s, e)| pos >= s && pos < e)
+    let after = occupied.partition_point(|&(s, _)| s <= pos);
+    after > 0 && pos < occupied[after - 1].1
 }
 
+/// Whether `start..end` overlaps one of `occupied`'s disjoint, sorted
+/// intervals. Only the last interval starting before `end` can: any earlier
+/// one ends before that one starts.
 fn range_overlaps(occupied: &[(usize, usize)], start: usize, end: usize) -> bool {
-    occupied.iter().any(|&(s, e)| start < e && end > s)
+    let before_end = occupied.partition_point(|&(s, _)| s < end);
+    before_end > 0 && occupied[before_end - 1].1 > start
+}
+
+/// The innermost block containing a position, for positions visited in
+/// increasing order — the one sweep both [`block_owners`] and the
+/// delimited-math pass use.
+///
+/// Blocks nest, so after sorting by start a stack of open blocks always has
+/// the innermost one on top: amortised O(1) per query. The math pass used to
+/// scan every block once per formula instead, and since each `\[…\]` adds a
+/// block, a note of N display formulas cost O(N²) — 1.1 s for 128 KiB of
+/// them where pulldown-cmark took 2 ms.
+///
+/// Blocks pushed after the cursor was built (the math blocks that pass adds)
+/// are not seen, which is exact there: each ends where the scan resumes, so
+/// it contains no later position. A query that moves backwards restarts the
+/// sweep rather than answering from a stack that has moved past it.
+struct InnermostCursor {
+    /// Block indices by start, outer before inner; among identical ranges
+    /// the later (deeper, in pre-order) one is pushed last, so it is on top.
+    order: Vec<usize>,
+    next: usize,
+    stack: Vec<usize>,
+    last: u32,
+}
+
+impl InnermostCursor {
+    fn new(result: &ParseResult) -> Self {
+        let mut order: Vec<usize> = (0..result.blocks.len()).collect();
+        order.sort_by_key(|&i| {
+            let b = &result.blocks[i];
+            (b.start, std::cmp::Reverse(b.end), i)
+        });
+        Self {
+            order,
+            next: 0,
+            stack: Vec::new(),
+            last: 0,
+        }
+    }
+
+    fn at(&mut self, result: &ParseResult, utf16: u32) -> Option<usize> {
+        if utf16 < self.last {
+            self.next = 0;
+            self.stack.clear();
+        }
+        self.last = utf16;
+        let blocks = &result.blocks;
+        while let Some(&index) = self
+            .order
+            .get(self.next)
+            .filter(|&&i| blocks[i].start <= utf16)
+        {
+            self.next += 1;
+            while self
+                .stack
+                .last()
+                .is_some_and(|&top| blocks[top].end <= blocks[index].start)
+            {
+                self.stack.pop();
+            }
+            self.stack.push(index);
+        }
+        while self
+            .stack
+            .last()
+            .is_some_and(|&top| blocks[top].end <= utf16)
+        {
+            self.stack.pop();
+        }
+        // The top contains `utf16` whenever blocks nest; searching down
+        // keeps the answer right even for a pair that merely overlaps.
+        self.stack
+            .iter()
+            .rev()
+            .find(|&&i| blocks[i].start <= utf16 && utf16 < blocks[i].end)
+            .copied()
+    }
+
+    /// Whether a construct over `start..end` would cross a block boundary:
+    /// run past the end of the innermost block holding `start`, or contain
+    /// the start of another block.
+    fn crosses_boundary(&mut self, result: &ParseResult, start: u32, end: u32) -> bool {
+        let blocks = &result.blocks;
+        if let Some(owner) = self.at(result, start) {
+            if end > blocks[owner].end {
+                return true;
+            }
+        }
+        let after = self.order.partition_point(|&i| blocks[i].start <= start);
+        self.order
+            .get(after)
+            .is_some_and(|&i| blocks[i].start < end)
+    }
 }
 
 /// pulldown-cmark consumes link reference definitions and emits no event for
@@ -1773,27 +2214,27 @@ fn scan_text_extensions(
     // Without them `x == y == z` swallowed the words between, base64 URL
     // padding paired across two URLs, and `a ==== b` hid four characters
     // and drew nothing — the pure gap this rule exists to refuse.
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'=' && bytes[i + 1] == b'=' {
-            if let Some(close) = find_pair(bytes, i + 2, b'=') {
-                if highlight_is_valid(text, i, close) {
-                    push_span(
-                        result,
-                        mapper,
-                        &(base + i + 2..base + close),
-                        SpanKind::Highlight,
-                        0,
-                        0,
-                    )?;
-                    mark_current(result, mapper, base + i..base + i + 2, block_stack)?;
-                    mark_current(result, mapper, base + close..base + close + 2, block_stack)?;
-                    i = close + 2;
-                    continue;
-                }
-            }
-        }
-        i += 1;
+    for inner in scan_highlights(text) {
+        push_span(
+            result,
+            mapper,
+            &(base + inner.start..base + inner.end),
+            SpanKind::Highlight,
+            0,
+            0,
+        )?;
+        mark_current(
+            result,
+            mapper,
+            base + inner.start - 2..base + inner.start,
+            block_stack,
+        )?;
+        mark_current(
+            result,
+            mapper,
+            base + inner.end..base + inner.end + 2,
+            block_stack,
+        )?;
     }
 
     // #tag — must start a word, and needs at least one non-digit so that
@@ -1815,6 +2256,29 @@ fn scan_text_extensions(
         i += 1;
     }
     Ok(())
+}
+
+/// Byte ranges of `==highlight==` *contents* in `text` (delimiters excluded).
+///
+/// Shared with HTML export so a highlight means the same thing on the page
+/// and in the editor.
+pub fn scan_highlights(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'=' && bytes[i + 1] == b'=' {
+            if let Some(close) = find_pair(bytes, i + 2, b'=') {
+                if highlight_is_valid(text, i, close) {
+                    out.push(i + 2..close);
+                    i = close + 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn find_pair(bytes: &[u8], from: usize, delim: u8) -> Option<usize> {
@@ -1936,5 +2400,185 @@ mod limit_tests {
         }
         assert_eq!(count, MAX_PARSE_EVENTS);
         assert_eq!(charge_event(&mut count), Err(ParseError::TooManyEvents));
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// Deterministic documents over a construct-heavy alphabet, so a failure
+    /// reproduces from its seed alone.
+    fn documents(count: usize) -> Vec<String> {
+        const TOKENS: &[&str] = &[
+            "# ",
+            "> ",
+            ">",
+            "- ",
+            "  - ",
+            "1. ",
+            "\\[x\\]",
+            "\\(y\\)",
+            "\\\\[z\\\\]",
+            "$$w$$",
+            "$v$",
+            "```\n",
+            "~~~\n",
+            "`c`",
+            "| a | b |\n|-|-|\n| 1 | 2 |\n",
+            "[!NOTE]",
+            "**",
+            "_",
+            "[l](u)",
+            "[[w]]",
+            "<div>",
+            "---\n",
+            "\n",
+            "\n\n",
+            " ",
+            "text",
+            "\\",
+            "é",
+            "😀",
+            "[^1]",
+            "[^1]: n\n",
+            "[r]: /x\n",
+            "%%c%%",
+            "^[n]",
+            "- [ ] ",
+            "==h==",
+            "\r\n",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..count)
+            .map(|_| {
+                let len = (next() % 120) as usize;
+                (0..len)
+                    .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_cursor_answers_exactly_what_a_full_scan_does() {
+        let mut checked = 0usize;
+        for (seed, source) in documents(1_500).iter().enumerate() {
+            let Ok(parsed) = parse_checked(source) else {
+                continue;
+            };
+            let len = Utf16Mapper::new(source).len_utf16();
+            let mut cursor = InnermostCursor::new(&parsed);
+            for at in 0..=len {
+                let (swept, scanned) = (cursor.at(&parsed, at), innermost_block(&parsed, at));
+                assert_eq!(
+                    swept,
+                    scanned,
+                    "seed {seed}, offset {at}: swept {:?}, scanned {:?}",
+                    swept.map(|i| parsed.blocks[i]),
+                    scanned.map(|i| parsed.blocks[i]),
+                );
+                checked += 1;
+            }
+            // Backwards and repeated queries restart rather than misanswer.
+            for at in (0..=len).rev().step_by(3) {
+                assert_eq!(cursor.at(&parsed, at), innermost_block(&parsed, at));
+            }
+        }
+        // Guard against a generator that stopped producing parseable input:
+        // a differential test over nothing passes vacuously.
+        assert!(checked > 50_000, "only {checked} positions compared");
+    }
+
+    #[test]
+    fn blocks_always_nest() {
+        // The contract every reader of the block list assumes. Found broken
+        // by the cursor's differential test: a `\[…\]` formula claimed across
+        // a quote's opening line overlapped the quote without containing it.
+        let mut compared = 0usize;
+        for (seed, source) in documents(1_500).iter().enumerate() {
+            let Ok(parsed) = parse_checked(source) else {
+                continue;
+            };
+            for (index, x) in parsed.blocks.iter().enumerate() {
+                for y in &parsed.blocks[index + 1..] {
+                    let disjoint = x.end <= y.start || y.end <= x.start;
+                    let nested = (x.start <= y.start && y.end <= x.end)
+                        || (y.start <= x.start && x.end <= y.end);
+                    assert!(
+                        disjoint || nested,
+                        "seed {seed}: {x:?} overlaps {y:?} in {source:?}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 10_000, "only {compared} block pairs compared");
+    }
+
+    #[test]
+    fn a_delimited_formula_stays_inside_one_block() {
+        let kinds = |source: &str| {
+            let parsed = parse_checked(source).unwrap();
+            (
+                parsed
+                    .blocks
+                    .iter()
+                    .any(|b| b.kind == BlockKind::MathBlock as u16),
+                parsed
+                    .spans
+                    .iter()
+                    .any(|s| s.kind == SpanKind::InlineMath as u16),
+            )
+        };
+        // Across a quote's opening, a list item, a blank line, table cells.
+        assert_eq!(kinds("\\[a\n> b\\]"), (false, false));
+        assert_eq!(kinds("x \\[a\n- b\\]"), (false, false));
+        assert_eq!(kinds("\\[a\n\nb\\]"), (false, false));
+        assert_eq!(kinds("| \\(a | b\\) |\n|-|-|\n"), (false, false));
+        // Within one block it is still a formula.
+        assert_eq!(kinds("\\[a\nb\\]"), (true, false));
+        assert_eq!(kinds("> \\[a\n> b\\]"), (true, false));
+        assert_eq!(kinds("x \\(y\\) z"), (false, true));
+        assert_eq!(kinds("| \\(a\\) | b |\n|-|-|\n"), (false, true));
+    }
+
+    #[test]
+    fn binary_searches_answer_what_linear_scans_do() {
+        let mut nonempty = 0usize;
+        for source in documents(400) {
+            let Ok(parsed) = parse_checked(&source) else {
+                continue;
+            };
+            let mapper = Utf16Mapper::new(&source);
+            let occupied = occupied_byte_ranges(&mapper, &parsed);
+            nonempty += usize::from(!occupied.is_empty());
+            let inside = |p: usize| occupied.iter().any(|&(s, e)| p >= s && p < e);
+            let overlaps = |a: usize, b: usize| occupied.iter().any(|&(s, e)| a < e && b > s);
+            for start in 0..=source.len() {
+                assert_eq!(
+                    range_is_occupied(&occupied, start),
+                    inside(start),
+                    "{source:?} @{start}"
+                );
+                for end in start..=(start + 6).min(source.len()) {
+                    assert_eq!(
+                        range_overlaps(&occupied, start, end),
+                        overlaps(start, end),
+                        "{source:?} {start}..{end}"
+                    );
+                }
+            }
+        }
+        assert!(
+            nonempty > 200,
+            "only {nonempty} documents had occupied ranges"
+        );
     }
 }

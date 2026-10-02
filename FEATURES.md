@@ -135,7 +135,7 @@ flowchart TD
 - **Inline Text Editor**: Instant toggle between syntax viewing and in-memory text editing with `⌘S` save shortcuts and dirty-state indicators.
 - **Responsive Header Controls & Scroll Cues**: Toolbars feature horizontal auto-scrolling with `ScrollCue` visual markers and boundary-aware tooltip placement (`placeTooltipBubble`).
 - **Specialized Preview Modes**:
-  - **Markdown / MarkDev**: Rust flat parse model (UTF-16 offsets), outline navigation, task lists, tables, callout blocks, math rendering, and backlink exploration.
+  - **Markdown / MarkDev**: MarkDev's own HTML renderer, outline navigation, frontmatter, task lists, tables, callout blocks, footnotes, math shown as source, repository-confined pictures, links that open in the OS or the explorer, and backlink exploration.
   - **Media & Images**: High-resolution image preview with dimensions, aspect ratios, and format inspection.
   - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters.
 - **Live Pulse Dashboard & Commit Composer**: Working-tree churn overview, instant staging buttons, and structured commit drafting (type, scope, subject). Features on-device Apple Intelligence fallback on macOS for phrasing suggestions, and pre-commit blast radius markers via `devmap preview`.

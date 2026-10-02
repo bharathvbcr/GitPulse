@@ -51,7 +51,9 @@ pub enum SpanKind {
     InlineMath = 9,
     /// Heading text itself; `data` carries the level (1–6).
     Heading = 10,
-    /// `- [ ]` / `- [x]`; `data` is 1 when checked.
+    /// `- [ ]` / `- [x]`; bit 0 of `data` is set when checked. An Obsidian
+    /// status such as `[/]` also carries its character above
+    /// [`TASK_STATUS_SHIFT`].
     TaskMarker = 11,
     FootnoteReference = 12,
     /// `#tag`, detected by MarkDev rather than pulldown-cmark.
@@ -60,6 +62,12 @@ pub enum SpanKind {
     Highlight = 14,
     /// Raw inline HTML.
     InlineHtml = 15,
+    /// Obsidian `%%comment%%`, inline or spanning lines. The span covers the
+    /// delimiters too; the whole range is also emitted as markers, so it
+    /// collapses like an HTML comment whenever its block is not revealed.
+    Comment = 16,
+    /// Obsidian inline footnote `^[text]`; the span covers `text`.
+    InlineFootnote = 17,
 }
 
 /// Block construct that maps to a custom `NSTextLayoutFragment`.
@@ -105,7 +113,13 @@ pub enum BlockKind {
     LinkReferenceDefinition = 20,
 }
 
-/// GFM alert flavour, carried in [`BlockKind::Callout`]'s `data` field.
+/// Callout flavour, carried in the low byte of [`BlockKind::Callout`]'s
+/// `data` field (see [`CALLOUT_KIND_MASK`]).
+///
+/// The first five are GitHub's alerts; the rest are Obsidian's built-in
+/// callout types. Aliases (`summary`, `hint`, `faq`, `error`, …) map onto
+/// these, and an unknown type renders as [`CalloutKind::Note`], as Obsidian
+/// does. Discriminants are part of the FFI contract — append, never renumber.
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalloutKind {
@@ -114,7 +128,67 @@ pub enum CalloutKind {
     Important = 2,
     Warning = 3,
     Caution = 4,
+    /// `abstract`, `summary`, `tldr`.
+    Abstract = 5,
+    Info = 6,
+    Todo = 7,
+    /// `success`, `check`, `done`.
+    Success = 8,
+    /// `question`, `help`, `faq`.
+    Question = 9,
+    /// `failure`, `fail`, `missing`.
+    Failure = 10,
+    /// `danger`, `error`.
+    Danger = 11,
+    Bug = 12,
+    Example = 13,
+    /// `quote`, `cite`.
+    Quote = 14,
 }
+
+impl CalloutKind {
+    /// The flavour an Obsidian or GitHub callout type name selects.
+    ///
+    /// Case-insensitive. Unknown names fall back to `Note`, matching
+    /// Obsidian, which styles any unrecognised type as a note.
+    pub fn from_type_name(name: &str) -> CalloutKind {
+        match name.to_ascii_lowercase().as_str() {
+            "tip" | "hint" => CalloutKind::Tip,
+            "important" => CalloutKind::Important,
+            "warning" | "attention" => CalloutKind::Warning,
+            "caution" => CalloutKind::Caution,
+            "abstract" | "summary" | "tldr" => CalloutKind::Abstract,
+            "info" => CalloutKind::Info,
+            "todo" => CalloutKind::Todo,
+            "success" | "check" | "done" => CalloutKind::Success,
+            "question" | "help" | "faq" => CalloutKind::Question,
+            "failure" | "fail" | "missing" => CalloutKind::Failure,
+            "danger" | "error" => CalloutKind::Danger,
+            "bug" => CalloutKind::Bug,
+            "example" => CalloutKind::Example,
+            "quote" | "cite" => CalloutKind::Quote,
+            _ => CalloutKind::Note,
+        }
+    }
+
+    /// Whether `name` is one of the type names [`Self::from_type_name`]
+    /// knows, rather than a custom type that falls back to `Note`.
+    pub fn is_known_type_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("note") || Self::from_type_name(name) != CalloutKind::Note
+    }
+}
+
+/// Shift of a custom task status character within a task marker's `data`.
+pub const TASK_STATUS_SHIFT: u32 = 8;
+
+/// Bits of a callout's `data` holding its [`CalloutKind`].
+pub const CALLOUT_KIND_MASK: u32 = 0xFF;
+/// Shift of the callout's fold state within `data`.
+pub const CALLOUT_FOLD_SHIFT: u32 = 8;
+/// Fold state: `> [!note]+` — foldable, shown expanded.
+pub const CALLOUT_FOLD_EXPANDED: u32 = 1;
+/// Fold state: `> [!note]-` — foldable, shown collapsed.
+pub const CALLOUT_FOLD_COLLAPSED: u32 = 2;
 
 /// How a table column's cells sit in their column.
 ///

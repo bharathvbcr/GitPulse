@@ -311,7 +311,22 @@ flowchart TD
 The webview operates under a strict CSP configured in `src-tauri/tauri.conf.json`:
 - `default-src 'self'`
 - `connect-src 'self' ipc: http://ipc.localhost`
+- `img-src 'self' data: blob: https:` — pictures, and only pictures, may load
+  from any https origin, so a README's badges show. Fetching one reveals the
+  viewer's IP address and the time to that host, the same as opening the
+  README on a forge; rendered `<img>` elements carry `referrerpolicy="no-referrer"`,
+  and plain-http pictures are not fetched. Scripts, styles, frames, media and
+  connections stay same-origin (`scripts/dev-port.test.ts` holds the CSP to
+  exactly this).
 - Remote scripts and inline `eval` are strictly disallowed.
+
+Rendered repository Markdown is untrusted content in the app's own document.
+MarkDev's renderer escapes raw HTML and refuses active URL schemes; GitPulse
+then namespaces every rendered id, replaces any picture that would resolve
+against the app's own origin, and handles every link itself — the webview
+never follows one (`src/lib/files/markdownLinks.ts`, guarded by
+`harness/markdown.html`). Pictures beside a note are read only from inside its
+repository, through the same containment check as `cmd_get_file_blob`.
 
 ---
 

@@ -1,0 +1,10 @@
+[package]
+name = "markdev-md"
+version = "0.1.0"
+edition = "2021"
+description = "MarkDev's Markdown dialect: the flat, UTF-16-indexed parse model the editor renders from"
+license = "MIT"
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html", "simd"] }
+serde = { version = "1", features = ["derive"] }

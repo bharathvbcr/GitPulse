@@ -1,19 +1,47 @@
 /**
- * MarkDev markdown client: parse via Rust (`cmd_markdown_parse`), render via
- * Rust (`cmd_markdown_render`) or from a flat model locally.
+ * MarkDev markdown client: render via Rust (`cmd_markdown_render`), which
+ * runs MarkDev's own HTML renderer.
  *
- * Document stats / outline / frontmatter stay pure TypeScript — they are not
- * in the parse model. The old regex renderer in `markDevParser.ts` is gone;
- * callers use `renderMarkDevMarkdown` (async IPC) or the sync helpers below.
+ * The outline and the frontmatter come back with the render — one pass wrote
+ * the heading ids and listed them, so an outline entry always names an id the
+ * page has. Only the reading stats stay TypeScript; they are not rendering.
  */
 
 import { invoke } from "@tauri-apps/api/core";
 
 export interface MarkdownHeading {
   level: number;
+  /** Plain text of the heading, markup removed. */
   title: string;
+  /** The rendered element's id, before {@link prepareRenderedMarkdown} prefixes it. */
   id: string;
 }
+
+/** A rendered note (`markdown::RenderedMarkdown`). */
+export interface RenderedMarkdown {
+  /** Sanitized body HTML; styled by `.gp-markdown`. */
+  html: string;
+  headings: MarkdownHeading[];
+  /** The frontmatter block's `key: value` lines; not part of `html`. */
+  frontmatter: FrontmatterField[];
+  /** UTF-8 bytes past {@link MAX_RENDER_BYTES} that were not rendered. */
+  omittedBytes: number;
+}
+
+/** Where a rendered note lives, so its relative pictures can be read. */
+export interface MarkdownLocation {
+  /** Absolute repository root. */
+  repoPath: string;
+  /** Repository-relative path of the note. */
+  filePath: string;
+}
+
+export const EMPTY_RENDER: RenderedMarkdown = Object.freeze({
+  html: "",
+  headings: [],
+  frontmatter: [],
+  omittedBytes: 0,
+}) as RenderedMarkdown;
 
 export interface DocumentStats {
   wordCount: number;
@@ -29,56 +57,28 @@ export interface FrontmatterField {
   value: string;
 }
 
-export interface ResolvedSpan {
-  start: number;
-  end: number;
-  kind: string;
-  depth: number;
-  data: number;
-  text?: string | null;
-}
-
-export interface ResolvedMarker {
-  start: number;
-  end: number;
-  block: number;
-}
-
-export interface ResolvedBlock {
-  start: number;
-  end: number;
-  kind: string;
-  depth: number;
-  data: number;
-  info?: string | null;
-}
-
-export interface ParsedMarkdown {
-  source: string;
-  spans: ResolvedSpan[];
-  markers: ResolvedMarker[];
-  blocks: ResolvedBlock[];
-  truncated: boolean;
-}
-
 /**
  * Ceiling on how much markdown is rendered in one pass.
  * Mirrored in Rust (`markdown::MAX_RENDER_BYTES`).
  */
 export const MAX_RENDER_BYTES = 128 * 1024;
 
-/** Parse markdown into MarkDev's flat model (UTF-16 offsets). */
-export function parseMarkdown(text: string): Promise<ParsedMarkdown> {
-  return invoke<ParsedMarkdown>("cmd_markdown_parse", { text });
-}
-
 /**
- * Render markdown to safe HTML through the Rust flat-model renderer.
- * Caps oversized input the same way the backend does.
+ * Renders markdown to sanitized HTML with MarkDev's renderer.
+ *
+ * With a `location` the note's relative pictures are read from inside the
+ * repository and embedded; without one (a commit message) nothing is read.
  */
-export async function renderMarkDevMarkdown(markdown: string): Promise<string> {
-  if (!markdown) return "";
-  return invoke<string>("cmd_markdown_render", { text: markdown });
+export async function renderMarkDevMarkdown(
+  markdown: string,
+  location: MarkdownLocation | null = null,
+): Promise<RenderedMarkdown> {
+  if (!markdown) return EMPTY_RENDER;
+  return invoke<RenderedMarkdown>("cmd_markdown_render", {
+    text: markdown,
+    repoPath: location?.repoPath ?? null,
+    filePath: location?.filePath ?? null,
+  });
 }
 
 /** Calculates reading metrics and structural stats for a Markdown document. */
@@ -115,57 +115,4 @@ export function calculateDocumentStats(text: string): DocumentStats {
     headingCount,
     linkCount: mdLinks.length + wikiLinks.length,
   };
-}
-
-/** Extracts a heading outline, ignoring fenced code. */
-export function extractDocumentOutline(text: string): MarkdownHeading[] {
-  if (!text) return [];
-  const outline: MarkdownHeading[] = [];
-  let inFence = false;
-  for (const line of text.split(/\r?\n/)) {
-    if (/^```/.test(line)) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
-    if (!match) continue;
-    const level = match[1].length;
-    const title = match[2].replace(/#+\s*$/, "").trim();
-    if (!title) continue;
-    outline.push({ level, title, id: slugify(title) });
-  }
-  return outline;
-}
-
-export function parseFrontmatter(doc: string): {
-  frontmatter: FrontmatterField[];
-  content: string;
-} {
-  if (!doc.startsWith("---\n") && !doc.startsWith("---\r\n")) {
-    return { frontmatter: [], content: doc };
-  }
-  const end = doc.indexOf("\n---", 4);
-  if (end < 0) return { frontmatter: [], content: doc };
-  const raw = doc.slice(4, end);
-  const content = doc.slice(end + 4).replace(/^\r?\n/, "");
-  const frontmatter: FrontmatterField[] = [];
-  for (const line of raw.split(/\r?\n/)) {
-    const cut = line.indexOf(":");
-    if (cut <= 0) continue;
-    frontmatter.push({
-      key: line.slice(0, cut).trim(),
-      value: line.slice(cut + 1).trim(),
-    });
-  }
-  return { frontmatter, content };
-}
-
-function slugify(text: string): string {
-  return (
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "") || "section"
-  );
 }

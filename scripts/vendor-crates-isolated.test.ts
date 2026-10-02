@@ -1,6 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   cpSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -34,17 +36,15 @@ import { sources } from "./vendor-crates.mjs";
  * The roots are deliberately bogus: `sources()` only consults them to fall back
  * to a sibling-directory search, which must not run from a unit test.
  */
+const CONFIGURED = sources(
+  { GITPULSE_DEVCOUNCIL_ROOT: "/nonexistent", GITPULSE_MARKDEV_ROOT: "/nonexistent" },
+  process.cwd(),
+);
+const crateList = (id: string) => CONFIGURED.find((source) => source.id === id)?.crates ?? [];
+
 const SOURCE_TABLE = [
-  {
-    id: "devcouncil",
-    workspace: "rust",
-    crateBase: "rust",
-    crates:
-      sources(
-        { GITPULSE_DEVCOUNCIL_ROOT: "/nonexistent", GITPULSE_MARKDEV_ROOT: "/nonexistent" },
-        process.cwd(),
-      ).find((source) => source.id === "devcouncil")?.crates ?? [],
-  },
+  { id: "devcouncil", workspace: "rust", crateBase: "rust", crates: crateList("devcouncil") },
+  { id: "markdev", workspace: "core", crateBase: "core/crates", crates: crateList("markdev") },
 ];
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -91,12 +91,6 @@ function fixture() {
     }
   }
 
-  const markdev = path.join(root, "markdev");
-  roots.markdev = markdev;
-  mkdirSync(path.join(markdev, "core", "src"), { recursive: true });
-  writeFileSync(path.join(markdev, "core", "Cargo.toml"), '[package]\nname = "markdev"\nversion = "1.0.0"\n');
-  writeFileSync(path.join(markdev, "core", "src", "lib.rs"), 'pub const NAME: &str = "markdev";\n');
-
   const env = {
     ...process.env,
     GITPULSE_ALLOW_DRIFT: "0",
@@ -130,9 +124,11 @@ describe("vendor refresh integrity", () => {
       const oldManifest = readFileSync(manifestPath, "utf8");
       const oldLibrary = readFileSync(libraryPath, "utf8");
       writeFileSync(path.join(f.roots.devcouncil, "rust", "dc-glob", "src", "lib.rs"), "changed before failure\n");
+      // The last source refreshed, so its failure lands after the first
+      // source's crates have already been staged.
       writeFileSync(
-        path.join(f.roots.markdev, "core", "Cargo.toml"),
-        '[package]\nname = "markdev"\nversion.workspace = true\n',
+        path.join(f.roots.markdev, "core", "crates", "markdev-md", "Cargo.toml"),
+        '[package]\nname = "markdev-md"\nedition.workspace = true\n',
       );
 
       const result = f.run();
@@ -184,7 +180,7 @@ describe("vendor refresh integrity", () => {
   it("updates one crate without requiring or rewriting unrelated upstreams", () => {
     const f = fixture();
     try {
-      const untouched = path.join(f.vendorDir, "markdev", "src", "lib.rs");
+      const untouched = path.join(f.vendorDir, "markdev-md", "src", "lib.rs");
       const oldUntouched = readFileSync(untouched, "utf8");
       writeFileSync(
         path.join(f.roots.devcouncil, "rust", "dc-glob", "src", "lib.rs"),
@@ -205,6 +201,45 @@ describe("vendor refresh integrity", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(readFileSync(path.join(f.vendorDir, "dc-glob", "src", "lib.rs"), "utf8")).toContain("GENERATION");
       expect(readFileSync(untouched, "utf8")).toBe(oldUntouched);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("retires a crate its source no longer lists, and checks report it instead of crashing", () => {
+    const f = fixture();
+    try {
+      // What MarkDev's split left behind: the old single `markdev` crate is
+      // still vendored, but MarkDev now provides module crates instead. A
+      // crate from a source this script does not configure must survive.
+      const manifestPath = path.join(f.vendorDir, "VENDOR.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      const body = "pub const OLD: bool = true;\n";
+      const hash = createHash("sha256").update(body).digest("hex");
+      for (const [name, repo] of [
+        ["markdev", "markdev"],
+        ["foreign", "elsewhere"],
+      ]) {
+        mkdirSync(path.join(f.vendorDir, name, "src"), { recursive: true });
+        writeFileSync(path.join(f.vendorDir, name, "src", "lib.rs"), body);
+        manifest.crates.push({ name, origin: { repo, path: "core", commit: "" }, files: { "src/lib.rs": hash } });
+      }
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      const checked = f.run("--check");
+      expect(checked.status, checked.stderr).toBe(1);
+      const retired = JSON.parse(checked.stdout).crates.find((entry: { name: string }) => entry.name === "markdev");
+      expect(retired.upstream).toBe("drifted");
+      expect(retired.reason).toContain("no longer provides markdev");
+
+      const refreshed = f.run("--crate=markdev-html");
+      expect(refreshed.status, refreshed.stderr).toBe(0);
+      const names = JSON.parse(readFileSync(manifestPath, "utf8")).crates.map((entry: { name: string }) => entry.name);
+      expect(names).not.toContain("markdev");
+      expect(existsSync(path.join(f.vendorDir, "markdev"))).toBe(false);
+      expect(names).toContain("foreign");
+      expect(existsSync(path.join(f.vendorDir, "foreign", "src", "lib.rs"))).toBe(true);
+      for (const crate of crateList("markdev")) expect(names).toContain(crate);
     } finally {
       f.cleanup();
     }

@@ -374,7 +374,6 @@ pub fn run() {
             cmd_collision_risk,
             cmd_fleet_snapshot,
             cmd_fleet_record_metrics,
-            cmd_markdown_parse,
             cmd_markdown_render,
             cmd_docs_refresh,
             cmd_docs_status,

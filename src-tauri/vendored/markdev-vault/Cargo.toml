@@ -1,0 +1,11 @@
+[package]
+name = "markdev-vault"
+version = "0.1.0"
+edition = "2021"
+description = "MarkDev vault indexing: notes, the link graph, tags, rename, and search"
+license = "MIT"
+
+[dependencies]
+markdev-md = { path = "../markdev-md" }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html", "simd"] }
+serde = { version = "1", features = ["derive"] }

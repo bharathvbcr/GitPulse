@@ -22,15 +22,18 @@ describe("MarkDevViewer", () => {
 
   it("calculates document reading stats and outline", () => {
     expect(source).toContain("calculateDocumentStats");
-    expect(source).toContain("extractDocumentOutline");
+    // The outline is the renderer's own list of the ids it wrote, never a
+    // second heading scan that can disagree with the page.
+    expect(source).toContain("rendered.headings");
     expect(source).toContain("showOutline");
     expect(source).toContain("stats.wordCount");
     expect(source).toContain("stats.readingTimeMinutes");
   });
 
-  it("renders markdown through renderMarkDevMarkdown parser", () => {
-    expect(source).toContain("renderMarkDevMarkdown");
-    expect(source).toContain("renderedHtml");
+  it("renders markdown through renderMarkDevMarkdown and inserts it via MarkdownContent", () => {
+    expect(source).toContain("renderMarkDevMarkdown(content, location)");
+    expect(source).toContain("<MarkdownContent");
+    expect(source).not.toContain("{@html");
   });
 
   it("embeds CodeViewer for raw and split modes with onSave support", () => {
@@ -61,13 +64,15 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("repoStore.setError(formatError(err))");
   });
 
-  it("handles copy code block events and source copying", () => {
-    expect(source).toContain("handlePreviewClick");
-    expect(source).toContain("copy-code-btn");
+  it("copies the source and reports a failed copy", () => {
     expect(source).toContain("handleCopySource");
     expect(source).toContain("if (!(await copyText(rawContent)))");
-    expect(source).toContain("if (!(await copyText(code)))");
     expect(source).toContain('repoStore.setError("Could not copy to clipboard")');
+  });
+
+  it("never leaves the previous page up after a failed render", () => {
+    expect(source).toContain("rendered = EMPTY_RENDER;");
+    expect(source).toContain("renderError = formatError(err);");
   });
 
   it("scrolls the rendered page inside the pane", () => {

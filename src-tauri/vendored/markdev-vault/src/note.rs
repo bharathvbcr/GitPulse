@@ -1,9 +1,11 @@
 //! Per-note metadata: title, headings, wikilinks, tags, aliases.
 
 use pulldown_cmark::{Event, LinkType, MetadataBlockKind, Parser, Tag, TagEnd};
+
+use markdev_md::obsidian;
 use serde::{Deserialize, Serialize};
 
-use crate::md::parse::{options, scan_tags};
+use markdev_md::parse::{options, scan_tags};
 
 /// Markdown extensions the vault treats as notes — same set as the scanner.
 pub const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mdx", "mkd"];
@@ -117,8 +119,29 @@ impl Note {
         let mut frontmatter = String::new();
         // Code and raw HTML are literal: a `#` there is not a tag.
         let mut verbatim = 0usize;
+        // `![[Note]]` embeds close on `End(Image)` rather than `End(Link)`.
+        let mut embed_open = false;
+        // Obsidian `%%comments%%` are not part of the note: nothing written
+        // inside one is a tag or a connection.
+        let comments = if source.contains("%%") {
+            let literal = obsidian::verbatim_ranges(source);
+            obsidian::normalise(obsidian::comment_ranges(source, &literal))
+        } else {
+            Vec::new()
+        };
 
         for (event, range) in Parser::new_ext(source, options()).into_offset_iter() {
+            if !comments.is_empty()
+                && obsidian::contains(&comments, range.start)
+                && matches!(
+                    event,
+                    Event::Text(_)
+                        | Event::Start(Tag::Link { .. })
+                        | Event::Start(Tag::Image { .. })
+                )
+            {
+                continue;
+            }
             match event {
                 Event::Start(Tag::Heading { level, .. }) => {
                     heading_level = Some((level as u8, range.start));
@@ -155,6 +178,25 @@ impl Note {
                     if let Some(kind) = kind {
                         link_open = Some((dest_url.to_string(), range.start, kind));
                         link_text.clear();
+                    }
+                }
+                Event::Start(Tag::Image {
+                    link_type: LinkType::WikiLink { .. },
+                    dest_url,
+                    ..
+                }) if !obsidian::is_media_target(&dest_url) => {
+                    link_open = Some((dest_url.to_string(), range.start, NoteLinkKind::Wiki));
+                    link_text.clear();
+                    embed_open = true;
+                }
+                Event::End(TagEnd::Image) if embed_open => {
+                    embed_open = false;
+                    if let Some((dest, start, kind)) = link_open.take() {
+                        // The alias slot of an embed is a size or caption,
+                        // never the note's display name.
+                        if let Some(link) = indexed_link(dest, "", kind, source, start, &lines) {
+                            links.push(link);
+                        }
                     }
                 }
                 Event::End(TagEnd::Link) => {

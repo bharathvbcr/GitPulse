@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::index::{validated_relative_path, Vault, DEFAULT_MAX_NOTE_BYTES};
 use super::note::{has_markdown_extension, stem, strip_markdown_extension};
-use crate::md::model::{BlockKind, SpanKind, Utf16Mapper};
-use crate::md::parse_checked;
+use markdev_md::model::{BlockKind, SpanKind, Utf16Mapper};
+use markdev_md::parse_checked;
 
 /// Byte ranges of a document holding code or machine-read text, not prose.
 ///
@@ -778,8 +778,8 @@ fn trailing_markdown_extension(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod move_tests {
     use super::{move_file_with, rewrite_links_in, ProtectedRanges};
-    use crate::md::MAX_DOCUMENT_BYTES;
-    use crate::vault::Vault;
+    use crate::Vault;
+    use markdev_md::MAX_DOCUMENT_BYTES;
     use std::cell::Cell;
     use std::io;
 

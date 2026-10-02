@@ -1512,3 +1512,363 @@ html[data-motion="reduced"]::view-transition-new(root) {
     transform: translate3d(300%, 0, 0);
   }
 }
+
+/*
+ * Rendered Markdown (`MarkdownContent.svelte`). MarkDev's renderer emits plain
+ * semantic HTML — no utility classes — and Tailwind's preflight strips every
+ * element of its browser styling, so without these rules a heading is body
+ * text, a list has no bullets and a table has no borders. Everything is scoped
+ * under `.gp-markdown`; nothing here can restyle the app around a note.
+ */
+.gp-markdown {
+  --md-note: 96 165 250;
+  --md-tip: 52 211 153;
+  --md-important: 167 139 250;
+  --md-warning: 251 191 36;
+  --md-caution: 251 113 133;
+  --md-mark: 250 204 21;
+  color: rgb(var(--c-text));
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+html.light .gp-markdown {
+  --md-note: 37 99 235;
+  --md-tip: 5 150 105;
+  --md-important: 124 58 237;
+  --md-warning: 180 83 9;
+  --md-caution: 225 29 72;
+  --md-mark: 202 138 4;
+}
+.gp-markdown > :first-child {
+  margin-top: 0;
+}
+.gp-markdown > :last-child {
+  margin-bottom: 0;
+}
+.gp-markdown :is(p, ul, ol, dl, blockquote, table, pre, .gp-md-code, .callout, .footnote-definition, hr) {
+  margin: 0 0 0.85em;
+}
+.gp-markdown :is(h1, h2, h3, h4, h5, h6) {
+  position: relative;
+  margin: 1.4em 0 0.55em;
+  font-weight: 650;
+  line-height: 1.3;
+  scroll-margin-top: 12px;
+}
+.gp-markdown h1 {
+  font-size: 1.75em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid rgb(var(--c-border) / 0.6);
+}
+.gp-markdown h2 {
+  font-size: 1.4em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid rgb(var(--c-border) / 0.4);
+}
+.gp-markdown h3 {
+  font-size: 1.18em;
+}
+.gp-markdown h4 {
+  font-size: 1em;
+}
+.gp-markdown :is(h5, h6) {
+  font-size: 0.9em;
+  color: rgb(var(--c-text-muted));
+}
+.gp-markdown .anchor {
+  margin-left: 0.4em;
+  color: rgb(var(--c-text-muted));
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.gp-markdown :is(h1, h2, h3, h4, h5, h6):hover .anchor,
+.gp-markdown .anchor:focus-visible {
+  opacity: 1;
+}
+.gp-markdown a {
+  color: rgb(var(--c-accent));
+  text-decoration: underline;
+  text-decoration-color: rgb(var(--c-accent) / 0.4);
+  text-underline-offset: 2px;
+}
+.gp-markdown a:hover {
+  text-decoration-color: currentcolor;
+}
+.gp-markdown :is(strong, b) {
+  font-weight: 650;
+}
+.gp-markdown :is(em, i) {
+  font-style: italic;
+}
+.gp-markdown del {
+  text-decoration: line-through;
+  color: rgb(var(--c-text-muted));
+}
+.gp-markdown mark {
+  color: inherit;
+  background: rgb(var(--md-mark) / 0.28);
+  border-radius: 3px;
+  padding: 0 0.15em;
+}
+.gp-markdown :is(ul, ol) {
+  padding-left: 1.6em;
+}
+.gp-markdown ul {
+  list-style: disc;
+}
+.gp-markdown ul ul {
+  list-style: circle;
+}
+.gp-markdown ul ul ul {
+  list-style: square;
+}
+.gp-markdown ol {
+  list-style: decimal;
+}
+.gp-markdown li > :is(ul, ol) {
+  margin: 0.2em 0 0;
+}
+.gp-markdown li + li {
+  margin-top: 0.2em;
+}
+.gp-markdown li > p {
+  margin-bottom: 0.4em;
+}
+.gp-markdown li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.3em;
+}
+.gp-markdown input[type="checkbox"] {
+  margin: 0 0.45em 0 0;
+  vertical-align: -0.1em;
+  accent-color: rgb(var(--c-accent));
+}
+.gp-markdown dt {
+  font-weight: 650;
+}
+.gp-markdown dd {
+  margin: 0 0 0.4em 1.4em;
+  color: rgb(var(--c-text-muted));
+}
+.gp-markdown blockquote {
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid rgb(var(--c-border));
+  color: rgb(var(--c-text-muted));
+}
+.gp-markdown blockquote > :last-child {
+  margin-bottom: 0;
+}
+.gp-markdown :is(code, pre, kbd, samp) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.88em;
+}
+.gp-markdown :not(pre) > code {
+  padding: 0.12em 0.38em;
+  border-radius: 5px;
+  background: rgb(var(--c-surface-hover));
+  border: 1px solid rgb(var(--c-border) / 0.45);
+}
+.gp-markdown pre {
+  overflow-x: auto;
+  padding: 0.85em 1em;
+  border-radius: 8px;
+  background: rgb(var(--c-surface-hover) / 0.7);
+  border: 1px solid rgb(var(--c-border) / 0.5);
+  line-height: 1.5;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.gp-markdown pre code {
+  font-size: inherit;
+}
+.gp-markdown .gp-md-code {
+  position: relative;
+}
+.gp-markdown .gp-md-code > pre {
+  margin: 0;
+}
+.gp-markdown .gp-md-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--c-border) / 0.7);
+  background: rgb(var(--c-surface));
+  color: rgb(var(--c-text-muted));
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.gp-markdown .gp-md-code:hover .gp-md-copy,
+.gp-markdown .gp-md-copy:focus-visible,
+.gp-markdown .gp-md-copy[data-copied] {
+  opacity: 1;
+}
+.gp-markdown .gp-md-copy[data-copied] {
+  color: rgb(var(--md-tip));
+  border-color: rgb(var(--md-tip) / 0.5);
+}
+.gp-markdown table {
+  display: block;
+  max-width: 100%;
+  width: max-content;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.gp-markdown :is(th, td) {
+  padding: 0.35em 0.75em;
+  border: 1px solid rgb(var(--c-border) / 0.6);
+}
+.gp-markdown th {
+  font-weight: 650;
+  background: rgb(var(--c-surface-hover) / 0.6);
+}
+.gp-markdown tbody tr:nth-child(even) {
+  background: rgb(var(--c-surface-hover) / 0.3);
+}
+.gp-markdown hr {
+  border: 0;
+  border-top: 1px solid rgb(var(--c-border) / 0.6);
+  margin: 1.4em 0;
+}
+.gp-markdown img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+.gp-markdown .gp-md-missing-picture {
+  display: inline-block;
+  padding: 0.1em 0.5em;
+  border: 1px dashed rgb(var(--c-border));
+  border-radius: 5px;
+  color: rgb(var(--c-text-muted));
+  font-size: 0.9em;
+}
+.gp-markdown .tag {
+  padding: 0.05em 0.45em;
+  border-radius: 999px;
+  background: rgb(var(--c-accent) / 0.14);
+  color: rgb(var(--c-accent));
+  font-size: 0.9em;
+}
+.gp-markdown .math-source {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+  color: rgb(var(--c-text-muted));
+}
+.gp-markdown .math-display {
+  display: block;
+  overflow-x: auto;
+  padding: 0.5em 0;
+  text-align: center;
+  white-space: pre;
+}
+.gp-markdown sup {
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+}
+.gp-markdown .footnote-definition {
+  display: flex;
+  gap: 0.5em;
+  font-size: 0.9em;
+  color: rgb(var(--c-text-muted));
+}
+.gp-markdown .footnote-definition > p {
+  margin: 0;
+}
+.gp-markdown .callout {
+  --md-callout: var(--md-note);
+  padding: 0.6em 0.9em;
+  border-left: 3px solid rgb(var(--md-callout));
+  border-radius: 6px;
+  background: rgb(var(--md-callout) / 0.08);
+}
+.gp-markdown .callout:is([data-callout-type="tip"], [data-callout-type="success"]) {
+  --md-callout: var(--md-tip);
+}
+.gp-markdown .callout:is([data-callout-type="important"], [data-callout-type="example"]) {
+  --md-callout: var(--md-important);
+}
+.gp-markdown .callout:is([data-callout-type="warning"], [data-callout-type="question"]) {
+  --md-callout: var(--md-warning);
+}
+.gp-markdown .callout:is([data-callout-type="caution"], [data-callout-type="danger"], [data-callout-type="failure"], [data-callout-type="bug"]) {
+  --md-callout: var(--md-caution);
+}
+.gp-markdown .callout-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  margin-bottom: 0.3em;
+  font-weight: 650;
+  color: rgb(var(--md-callout));
+}
+.gp-markdown .callout-icon {
+  width: 1em;
+  height: 1em;
+  flex: none;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.gp-markdown .callout-content > :last-child {
+  margin-bottom: 0;
+}
+/* Commit messages and verdicts: the same structure at the panel's size. */
+.gp-markdown.gp-markdown-compact {
+  font-size: inherit;
+  line-height: 1.5;
+  color: inherit;
+}
+.gp-markdown.gp-markdown-compact :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0.8em 0 0.35em;
+  font-size: 1.05em;
+  border: 0;
+  padding: 0;
+}
+.gp-markdown.gp-markdown-compact :is(p, ul, ol, dl, blockquote, table, pre, .gp-md-code, .callout, hr) {
+  margin-bottom: 0.5em;
+}
+.gp-md-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75em;
+  margin-bottom: 0.75em;
+  padding: 0.4em 0.7em;
+  border: 1px solid rgb(var(--c-border) / 0.7);
+  border-radius: 6px;
+  background: rgb(var(--c-surface-hover) / 0.6);
+  color: rgb(var(--c-text-muted));
+  font-size: 11px;
+}
+.gp-md-notice-dismiss {
+  flex: none;
+  color: rgb(var(--c-text-muted));
+}
+.gp-md-frontmatter {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2em 0.9em;
+  margin-bottom: 1.1em;
+  padding: 0.55em 0.8em;
+  border: 1px solid rgb(var(--c-border) / 0.6);
+  border-radius: 6px;
+  font-size: 11px;
+}
+.gp-md-frontmatter dt {
+  color: rgb(var(--c-text-muted));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.gp-md-frontmatter dd {
+  margin: 0;
+  color: rgb(var(--c-text));
+  overflow-wrap: anywhere;
+}

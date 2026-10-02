@@ -64,7 +64,7 @@ pub const DEFAULT_MAX_VAULT_BYTES: usize = 256 * 1_048_576;
 /// Accepts only a non-empty lexical path made entirely of normal relative
 /// components. Filesystem mutation and in-memory mutation share this owner so
 /// a caller cannot insert a path the rename boundary would later refuse.
-pub(crate) fn validated_relative_path(value: &str) -> Option<&Path> {
+pub fn validated_relative_path(value: &str) -> Option<&Path> {
     if value.is_empty() || value.contains('\0') {
         return None;
     }
@@ -425,10 +425,27 @@ impl Vault {
     fn resolution_at(&self, index: usize, anchor: Option<&str>) -> Option<Resolution> {
         let note = self.notes.get(index)?;
         let offset = anchor.and_then(|anchor| {
-            note.headings
+            let anchor = anchor.trim();
+            // `[[Note#^block-id]]` names a block, not a heading.
+            if let Some(id) = anchor.strip_prefix('^') {
+                return block_offset(&note.text, id);
+            }
+            // Exact text first, then Obsidian's nested `Heading#Subheading`
+            // path and punctuation-insensitive spelling.
+            if let Some(heading) = note
+                .headings
                 .iter()
-                .find(|heading| heading.text.eq_ignore_ascii_case(anchor.trim()))
-                .map(|heading| heading.offset)
+                .find(|heading| heading.text.eq_ignore_ascii_case(anchor))
+            {
+                return Some(heading.offset);
+            }
+            let outline: Vec<(u8, &str)> = note
+                .headings
+                .iter()
+                .map(|heading| (heading.level, heading.text.as_str()))
+                .collect();
+            markdev_md::obsidian::heading_path_index(&outline, anchor)
+                .map(|index| note.headings[index].offset)
         });
         Some(Resolution {
             path: note.path.clone(),
@@ -995,4 +1012,37 @@ fn find_whole_word(haystack: &str, needle: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// UTF-16 offset of the line carrying Obsidian block id `^id`.
+fn block_offset(text: &str, id: &str) -> Option<u32> {
+    if id.is_empty() {
+        return None;
+    }
+    let literal = markdev_md::obsidian::verbatim_ranges(text);
+    markdev_md::obsidian::block_ids(text, &literal)
+        .into_iter()
+        .find(|block| text[block.id.clone()].eq_ignore_ascii_case(id))
+        .map(|block| {
+            let line_start = text[..block.marker.start].rfind('\n').map_or(0, |i| i + 1);
+            // A standalone `^id` line names the block above it, past any
+            // blank line Obsidian asks for after a table or quote.
+            let mut start = line_start;
+            if text[line_start..block.marker.start].trim().is_empty() {
+                while start > 0 {
+                    let previous = text[..start - 1].rfind('\n').map_or(0, |i| i + 1);
+                    start = previous;
+                    if !text[previous..]
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    {
+                        break;
+                    }
+                }
+            }
+            text[..start].encode_utf16().count() as u32
+        })
 }
