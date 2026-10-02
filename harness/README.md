@@ -16,10 +16,37 @@ and absent reads exactly like never written.
 `harness/onboarding.html` and `harness/health.html` use it. The other harnesses
 still carry their own local helper; move them across as they are next edited.
 
+## Secrets
+
+Run `bun run test:browser -- --harness secrets` or
+`bun run test:webkit -- --harness secrets`. For interactive inspection, open
+`/harness/secrets.html` on the development server; `window.__gpSecrets` holds
+the fixture's log of scans and reveals.
+
+`SecretsPanel` is driven through every report shape the backend can send —
+findings across all seven Git locations, a complete empty scan, a partial and
+an unverified empty scan, unreadable rows, a missing scanner, a scan Kingfisher
+marked failed, missing Git status, a payload with no findings list, hostile
+paths, and 2,000 shown of 20,001 — and asserts:
+
+- **Honesty.** "No secrets reported" appears for the complete empty scan and for
+  nothing else; a lossy count reads as a floor and says how many rows it lost;
+  a failed rescan keeps the last report and prints its age.
+- **Order and location.** `.git` metadata and tracked rows lead, ignored build
+  output and outside paths trail, paths are repo-relative, and both locations of
+  one value are marked.
+- **Interaction.** Location chips filter and reset per repository; reveal passes
+  `{repo, relative}` and never an absolute path; a failed reveal is handled.
+- **Lifecycle.** One scan per open (the panel used to fire two, because its
+  effect subscribed to the whole repository store); a fresh cached result is
+  shown without rescanning and a five-minute-old one is refreshed; a scan that
+  finishes after the panel closed, or after a repository switch, is kept for
+  its repository and shown on return.
+
 ## Dependency health
 
-Run `npm run test:browser -- --harness health` or
-`npm run test:webkit -- --harness health`. For interactive inspection, open
+Run `bun run test:browser -- --harness health` or
+`bun run test:webkit -- --harness health`. For interactive inspection, open
 `/harness/health.html` on the development server.
 
 Health had no browser harness at all until this one, which is why a

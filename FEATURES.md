@@ -242,7 +242,8 @@ flowchart TD
 
 ### 4.4 Secrets
 - **Kingfisher Secret Scanner**: Deep scans working tree files for exposed API keys, private tokens, passwords, and certificates.
-- **Strict Privacy Redaction**: Findings record rule ID, file path, and line number only. Secret values, matches, and surrounding code lines are never kept in memory, logged, or saved to disk.
+- **Strict Privacy Redaction**: Findings record rule, repo-relative path, line, confidence, Git location, and which rows share a value. Secret values, matches, and surrounding code lines never reach the UI, the log, or disk.
+- **Actionable Ordering**: Credentials in `.git` metadata and tracked files come first; ignored build output comes last, filterable by location, with reveal-in-file-manager per row.
 - **Fail-Closed Verification**: Cancelled, truncated, or failed scans report as unverified, never as clean.
 
 ### 4.5 Storage

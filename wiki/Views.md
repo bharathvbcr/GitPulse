@@ -61,7 +61,7 @@ Five on-demand scans of **this repository**. Each must say when it was capped ra
 | **Pulse** | Heatmap, rhythm, punch card, LOC trend, commit hygiene, hotspots, bus factor, local DORA, exportable SVG card. Unscanned tiles are an em dash with a reason. |
 | **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, JaCoCo, Clover. Toolchain hints and failure recovery. |
 | **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, and Dependabot/code scanning via `gh` when a repository opens. Critical and high findings warn. |
-| **Secrets** | Kingfisher scanner for exposed credentials and tokens. Findings keep rule, path, and line only; secret values and context are dropped; stdout is unlogged; incomplete scans fail closed. |
+| **Secrets** | Kingfisher scanner for exposed credentials and tokens in the working tree. Each finding shows where it sits in Git (tracked, untracked, ignored, `.git` metadata, nested repo) and which rows share a value; secret values and context are dropped; stdout is unlogged; partial or incomplete scans are never shown as clean. |
 | **Storage** | Packfiles, loose objects, LFS, submodules, build caches, size history. |
 
 ![Coverage scanner](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-coverage.png)

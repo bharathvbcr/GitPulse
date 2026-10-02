@@ -916,19 +916,28 @@ pub(crate) fn external_tool_fallback_dirs() -> Vec<PathBuf> {
 /// resolved path). Single owner of PATH + GUI-fallback resolution semantics;
 /// bare names only — anything with a separator is not searched.
 pub(crate) fn find_external_tool(program: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    find_external_tool_with(program, path_var.as_deref(), home.as_deref())
+}
+
+/// [`find_external_tool`] with the environment passed in, so a caller can
+/// reproduce a GUI launch's PATH without writing to the process environment.
+pub(crate) fn find_external_tool_with(
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<String> {
     if program.is_empty() || program.contains('/') || program.contains('\\') {
         return None;
     }
-    let path_var = std::env::var_os("PATH");
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let mut dirs: Vec<PathBuf> = path_var
-        .as_deref()
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
         .filter(|entry| !entry.as_os_str().is_empty())
         .collect();
-    dirs.extend(gui_launch_fallback_dirs(home.as_deref()));
+    dirs.extend(gui_launch_fallback_dirs(home));
     find_in_dirs(program, &dirs).map(|p| p.to_string_lossy().into_owned())
 }
 

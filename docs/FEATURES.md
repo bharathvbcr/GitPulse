@@ -446,9 +446,9 @@ rather than presenting a floor as a total.
 ### 4.4 Secrets
 
 - **Kingfisher Secrets Scanner**: Discovers exposed API keys, private tokens, passwords, and secrets across repository files via an integrated Kingfisher scan.
-- **Strict Privacy Redaction**: Findings are redacted to rule ID, file path, and line number only. Secret values, matches, and surrounding context lines are dropped completely and never stored in memory or persisted.
+- **Strict Privacy Redaction**: Findings carry rule, repo-relative path, line, confidence, Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal for rows sharing a value. Secret values, matches, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted.
 - **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
-- **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, or failed due to missing scanner binaries reports explicitly as unverified / not clean, never as an all-clear.
+- **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that Kingfisher itself marked partial (an unreadable file) reports explicitly as unverified / not clean, never as an all-clear.
 
 ### 4.5 Storage
 

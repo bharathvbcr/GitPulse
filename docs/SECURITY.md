@@ -273,14 +273,20 @@ flowchart TD
 ### Secrets Scanner Privacy & Fail-Closed Reporting
 - Insights → Secrets integrates the Kingfisher scanner to discover exposed
   API keys, access tokens, and credentials in repository files.
-- Findings are strictly redacted at the extraction boundary to rule ID,
-  relative file path, and line number only. Secret values, matched strings,
-  and surrounding context lines are dropped completely and never stored in
-  memory, cached, or persisted.
+- Kingfisher runs with `--redact` and `--no-validate`, a scrubbed environment
+  (`PATH`, `HOME`, `NO_COLOR` only), and a fixed argv that never loads a
+  repository config. Findings cross IPC as rule ID and name, repo-relative
+  path, line, confidence, Git location, and a per-scan ordinal grouping rows
+  that hold the same value. Secret values, matched strings, context lines,
+  Kingfisher fingerprints and redaction hashes are dropped in the backend and
+  never cached or persisted.
 - Scanner standard output is unlogged in diagnostics to eliminate accidental
   secret disclosure in application logs or bug reports.
 - Fail-closed reporting: scans that time out, error, abort, or truncate are
-  reported as unverified / not clean, never as an all-clear.
+  reported as unverified / not clean, never as an all-clear. Kingfisher exits
+  0 when it cannot read a file, so completeness is taken from its audit
+  record; a scan it marks partial, or one that carries no audit, is never
+  shown as clean.
 
 ### Dead-Branch Cleanup & Destructive Action Authorization
 - Dead-branch cleanup identifies merged, stale, or squashed branches using

@@ -13,6 +13,19 @@ before that tag is pushed.
 
 ### Fixed
 
+- **Secrets no longer reports a partial scan as clean.** Kingfisher exits 0
+  when it cannot read a file and records the gap only in its audit block,
+  which was ignored, so an unreadable `.env` produced "No secrets reported".
+  The audit now decides completeness, and an envelope with no findings list,
+  a JSON-lines finding, or an unreadable row can no longer read as clean or
+  vanish. A Dock-launched app also stopped saying Kingfisher was not
+  installed when Homebrew had it: lookup now uses the shared tool resolver.
+- **Secrets runs one scan at a time, once per open.** Its effect re-ran on
+  every repository-store update, so each open fired two full scans; a newer
+  scan now also cancels an older one, so switching repositories runs one
+  scanner instead of a queue. Kingfisher's default deduplication hid repeat
+  locations of a value; every location is now listed.
+
 - **Open repository tabs and their groups survive quitting the app.** Restore
   used to write the workspace once per tab as it came back, and it never put
   the group or collapsed state back on those tabs. Quitting during that walk
@@ -22,6 +35,17 @@ before that tag is pushed.
   when the status poll is stopped; and an untrusted repository stays in the
   list without a prompt or a git command. Open editor files come back with
   the session. Unsaved editor text is still discarded on quit.
+
+### Added
+
+- **Secrets shows where each finding lives.** Rows are repo-relative and
+  located against Git — `.git` metadata, tracked, untracked, nested
+  repository, ignored — sorted with the actionable ones first, so a token in
+  committed source no longer sits among build output. Location chips filter
+  the list, rows holding the same value are marked, each row can be revealed
+  in the file manager, and the panel states what the scan covers (working
+  tree only, the file-size limit, symlinks, inline ignores). The header shows
+  the scan's age, and a result older than five minutes refreshes on reopen.
 
 ### Changed
 

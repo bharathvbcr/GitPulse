@@ -3,29 +3,81 @@
   import type { SecretsReport } from "../secrets/types";
 
   // Survives the per-tab remount so revisiting Secrets renders the last scan
-  // instantly; the fetch then refreshes it in place.
+  // instantly. Written by every scan that finishes, including one whose
+  // panel was closed before it returned, so leaving mid-scan does not throw
+  // the result away.
   const secretsCache = createRepoPanelCache<SecretsReport>();
 </script>
 
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { KeyRound, RefreshCw, AlertTriangle, LoaderCircle } from "@lucide/svelte";
+  import {
+    KeyRound,
+    RefreshCw,
+    AlertTriangle,
+    LoaderCircle,
+    ShieldCheck,
+    FolderSearch,
+  } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { keyedList } from "../ui/eachKeys";
   import EmptyState from "./EmptyState.svelte";
   import { parseSecretsReport } from "../secrets/types";
+  import {
+    LOCATION_COPY,
+    capNote,
+    distinctSecrets,
+    filterFindings,
+    findingKey,
+    groupSizes,
+    isStale,
+    locationChips,
+    locationLabel,
+    scopeNotes,
+    shouldCache,
+    verdict,
+    type LocationFilter,
+  } from "../secrets/summary";
   import { formatError } from "../ui/formatError";
+  import { formatRelativeTime, plural } from "../format";
+  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { revealInFileManager } from "../desktop/openInShell";
+  import { toastStore } from "../stores/toastStore";
 
   let report = $state<SecretsReport | null>(null);
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
+  let filter = $state<LocationFilter>("all");
+  let nowMs = $state(Date.now());
 
   const scanned = { path: "" };
   let inflight: AsyncGuard | null = null;
 
-  const findingRows = $derived(report?.findings ?? []);
+  // Keeps "scanned 3m ago" true while the panel stays open.
+  const stopTick = createVisibleInterval(() => (nowMs = Date.now()), 30_000);
+  onDestroy(stopTick);
+
+  // The effect below must re-run when the repository changes and at no other
+  // time. Reading `$repoStore.currentPath` inside it subscribes to the whole
+  // store, so every status or branch refresh during the first scan re-ran it
+  // and started a second full Kingfisher scan.
+  const currentPath = $derived($repoStore.currentPath);
+  /** Path of the scan in flight, so a re-run never starts a duplicate. */
+  let inflightPath: string | null = null;
+
+  const findings = $derived(report?.findings ?? []);
+  const chips = $derived(locationChips(findings));
+  const shownRows = $derived(filterFindings(findings, filter));
+  const sizes = $derived(groupSizes(findings));
+  const headline = $derived(report ? verdict(report) : null);
+  const cappedNote = $derived(report ? capNote(report) : null);
+  const scannedAgo = $derived(
+    report && report.scanned_at_ms > 0
+      ? formatRelativeTime(Math.floor(report.scanned_at_ms / 1000), Math.floor(nowMs / 1000))
+      : "",
+  );
 
   async function scan(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
@@ -33,26 +85,34 @@
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
+    inflightPath = repoPath;
     loading = true;
     errorMsg = null;
     try {
-      const raw = await invoke<unknown>("cmd_scan_secrets", { repoPath });
+      const next = parseSecretsReport(await invoke<unknown>("cmd_scan_secrets", { repoPath }));
+      if (shouldCache(secretsCache.get(repoPath), next)) secretsCache.set(repoPath, next);
       if (!guard.isLive()) return;
-      const next = parseSecretsReport(raw);
       report = next;
-      secretsCache.set(repoPath, next);
       scanned.path = repoPath;
+      nowMs = Date.now();
     } catch (err) {
       if (!guard.isLive()) return;
+      // Keep the last report on screen: its age is printed beside it, and
+      // the error says this refresh did not replace it.
       errorMsg = formatError(err);
-      report = null;
     } finally {
-      if (guard.isLive()) loading = false;
+      if (inflight === guard) {
+        inflightPath = null;
+        // A cancelled scan must still release the spinner when nothing newer
+        // has taken over; otherwise a closed-then-reopened path spins forever.
+        loading = false;
+      }
     }
   }
 
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = currentPath;
+    filter = "all";
     if (!path) {
       report = null;
       errorMsg = null;
@@ -61,23 +121,43 @@
       return;
     }
     const cached = secretsCache.get(path);
-    if (cached) {
-      report = cached;
-      scanned.path = path;
-      errorMsg = null;
-    } else if (scanned.path !== path) {
-      report = null;
-    }
-    // Auto-scan on first open of this repo's Secrets section, matching Health.
+    report = cached ?? null;
+    scanned.path = cached ? path : "";
+    errorMsg = null;
+    // First open of this repo, or a cached result old enough that rendering
+    // it as the answer would be stale: scan. A fresh cache is shown as-is,
+    // with its age.
     untrack(() => {
-      if (scanned.path !== path || !cached) {
-        void scan(path);
-      }
+      if (inflightPath === path) return;
+      if (!cached || isStale(cached, Date.now())) void scan(path);
     });
     return () => {
       inflight?.cancel();
+      inflightPath = null;
     };
   });
+
+  async function reveal(path: string) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      await revealInFileManager(repo, path);
+    } catch (err) {
+      toastStore.error(`Could not reveal ${path}: ${formatError(err)}`);
+    }
+  }
+
+  const toneClass = {
+    ok: "border-emerald-500/30 bg-emerald-500/10 text-emerald-100",
+    warn: "border-amber-500/30 bg-amber-500/10 text-amber-100",
+    danger: "border-rose-500/30 bg-rose-500/10 text-rose-100",
+  } as const;
+
+  const badgeClass = {
+    danger: "bg-rose-500/15 text-rose-200 border-rose-500/30",
+    warn: "bg-amber-500/15 text-amber-200 border-amber-500/30",
+    muted: "bg-surface/80 text-textMuted border-border/60",
+  } as const;
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
@@ -87,17 +167,19 @@
     <div class="flex items-center gap-2 min-w-0">
       <KeyRound size={16} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary shrink-0">Secrets</span>
-      {#if report?.ok}
-        <span class="text-[11px] text-textMuted truncate">
-          {report.findings.length}
-          {report.findings.length === 1 ? "finding" : "findings"}
-          {#if report.findings_truncated}+{/if}
-          {#if report.kingfisher_version}
-            · Kingfisher {report.kingfisher_version}
+      {#if report}
+        <span class="text-[11px] text-textMuted truncate" data-testid="secrets-meta">
+          {#if report.ok}
+            {plural(report.findings_total, "finding")}{report.findings_truncated ||
+            report.findings_unreadable > 0
+              ? "+"
+              : ""}
+          {:else}
+            <span class="text-amber-300">Unavailable</span>
           {/if}
+          {#if scannedAgo}· scanned {scannedAgo}{/if}
+          {#if report.kingfisher_version}· Kingfisher {report.kingfisher_version}{/if}
         </span>
-      {:else if report && !report.ok}
-        <span class="text-[11px] text-amber-300 truncate">Unavailable</span>
       {/if}
     </div>
     <button
@@ -109,10 +191,11 @@
     >
       {#if loading}
         <LoaderCircle size={13} class="animate-spin" />
+        {report ? "Rescanning…" : "Scanning…"}
       {:else}
         <RefreshCw size={13} />
+        Rescan
       {/if}
-      Rescan
     </button>
   </div>
 
@@ -136,68 +219,148 @@
         <AlertTriangle size={14} class="shrink-0 mt-0.5" />
         <span>{errorMsg}</span>
       </div>
-    {:else if report && !report.ok}
-      <div
-        class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 flex items-start gap-2"
-        role="status"
-      >
-        <AlertTriangle size={14} class="shrink-0 mt-0.5" />
-        <div class="space-y-1 min-w-0">
-          <p class="font-medium">Secrets scan unavailable</p>
-          <p class="text-amber-100/80">
-            {report.error ?? "The scanner did not complete. This is not a clean result."}
-          </p>
-        </div>
-      </div>
-    {:else if report?.ok}
-      {#if report.findings_truncated}
+    {:else if report && headline}
+      {#if errorMsg}
         <div
-          class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 flex items-start gap-2"
-          role="status"
+          class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-200 flex items-start gap-2"
+          role="alert"
         >
           <AlertTriangle size={14} class="shrink-0 mt-0.5" />
           <span>
-            Kingfisher omitted some findings past its report cap. The list below is a
-            floor, not the complete set.
+            Rescan failed: {errorMsg}
+            {#if scannedAgo}Showing the scan from {scannedAgo}.{/if}
           </span>
         </div>
       {/if}
-      {#if report.nested_repos_scanned}
-        <p class="text-[11px] text-textMuted px-0.5">
-          Nested git repositories inside this tree are also scanned. Scope is not
-          limited to this worktree alone.
-        </p>
-      {/if}
-      {#if findingRows.length === 0}
-        <EmptyState
-          icon={KeyRound}
-          title="No secrets reported"
-          hint="Kingfisher finished with no findings in the working tree at medium confidence and above."
-          compact
-        />
-      {:else}
+
+      <div
+        class="rounded-lg border px-3 py-2 text-xs flex items-start gap-2 {toneClass[headline.tone]}"
+        role={headline.tone === "ok" ? "status" : "alert"}
+        data-testid="secrets-verdict"
+        data-tone={headline.tone}
+      >
+        {#if headline.tone === "ok"}
+          <ShieldCheck size={14} class="shrink-0 mt-0.5" />
+        {:else}
+          <AlertTriangle size={14} class="shrink-0 mt-0.5" />
+        {/if}
+        <div class="space-y-1 min-w-0">
+          <p class="font-medium">
+            {headline.title}{#if findings.length > 0}<span class="font-normal opacity-80"
+                >{` · ${plural(distinctSecrets(findings), "distinct value")} shown`}</span
+              >{/if}
+          </p>
+          {#if headline.detail}<p class="opacity-80">{headline.detail}</p>{/if}
+          {#if cappedNote}<p class="opacity-80">{cappedNote}</p>{/if}
+        </div>
+      </div>
+
+      {#if chips.length > 0}
+        <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter findings by location">
+          <button
+            type="button"
+            class="text-[11px] px-2 py-0.5 rounded-full border {filter === 'all'
+              ? 'border-accent/60 text-textPrimary bg-accent/10'
+              : 'border-border/60 text-textMuted'}"
+            aria-pressed={filter === "all"}
+            onclick={() => (filter = "all")}
+          >
+            All {findings.length}
+          </button>
+          {#each chips as chip (chip.location)}
+            <button
+              type="button"
+              class="text-[11px] px-2 py-0.5 rounded-full border {filter === chip.location
+                ? 'border-accent/60 text-textPrimary bg-accent/10'
+                : badgeClass[LOCATION_COPY[chip.location].tone]}"
+              aria-pressed={filter === chip.location}
+              title={LOCATION_COPY[chip.location].hint}
+              onclick={() => (filter = filter === chip.location ? "all" : chip.location)}
+            >
+              {LOCATION_COPY[chip.location].label} {chip.count}
+            </button>
+          {/each}
+        </div>
+
         <div class="rounded-lg border border-border/60 overflow-hidden">
-          <table class="w-full text-xs">
+          <table class="w-full text-xs table-fixed">
             <thead class="bg-surface/80 text-textMuted text-[10px] uppercase tracking-wide">
               <tr>
-                <th class="text-left font-semibold px-3 py-2">Path</th>
-                <th class="text-left font-semibold px-3 py-2 w-16">Line</th>
-                <th class="text-left font-semibold px-3 py-2">Rule</th>
+                <th class="text-left font-semibold px-3 py-2 w-28">Location</th>
+                <th class="text-left font-semibold px-3 py-2">File</th>
+                <th class="text-left font-semibold px-3 py-2 w-48">Rule</th>
+                <th class="text-left font-semibold px-3 py-2 w-20">Confidence</th>
+                <th class="px-2 py-2 w-10"><span class="sr-only">Actions</span></th>
               </tr>
             </thead>
             <tbody>
-              {#each keyedList(findingRows, (f) => `${f.fingerprint}:${f.path}:${f.line}:${f.rule_id}`) as { item: finding, key } (key)}
-                <tr class="border-t border-border/40 align-top">
-                  <td class="px-3 py-1.5 font-mono text-textPrimary break-all">{finding.path || "—"}</td>
-                  <td class="px-3 py-1.5 font-mono text-textMuted">
-                    {finding.line > 0 ? finding.line : "—"}
+              {#each keyedList(shownRows, findingKey) as { item: finding, key } (key)}
+                {@const copy = LOCATION_COPY[finding.location]}
+                {@const sameValue = sizes.get(finding.secret_group) ?? 0}
+                <tr class="border-t border-border/40 align-top" data-location={finding.location}>
+                  <td class="px-3 py-1.5">
+                    <span
+                      class="inline-block whitespace-nowrap rounded border px-1.5 py-px text-[10px] {badgeClass[copy.tone]}"
+                      title={copy.hint}>{copy.label}</span
+                    >
                   </td>
-                  <td class="px-3 py-1.5 font-mono text-textPrimary">{finding.rule_id}</td>
+                  <td class="px-3 py-1.5 font-mono text-textPrimary break-all">
+                    <span title={finding.path}>{finding.path}</span>{#if finding.line > 0}<span
+                        class="text-textMuted">:{finding.line}</span
+                      >{/if}
+                    {#if sameValue > 1}
+                      <span
+                        class="ml-1 font-sans text-[10px] text-amber-300 whitespace-nowrap"
+                        title="Kingfisher matched the same value in {sameValue} shown locations; rotating it means fixing all of them."
+                        >same value ×{sameValue}</span
+                      >
+                    {/if}
+                  </td>
+                  <td class="px-3 py-1.5 min-w-0">
+                    <div class="text-textPrimary truncate" title={finding.rule_id}>
+                      {finding.rule_name || finding.rule_id}
+                    </div>
+                    {#if finding.rule_name}
+                      <div class="font-mono text-[10px] text-textMuted truncate">{finding.rule_id}</div>
+                    {/if}
+                  </td>
+                  <td class="px-3 py-1.5 text-textMuted capitalize">{finding.confidence || "—"}</td>
+                  <td class="px-2 py-1.5 text-right">
+                    {#if finding.location !== "outside"}
+                      <button
+                        type="button"
+                        class="gp-icon-btn p-1 rounded hover:bg-surface"
+                        aria-label="Reveal {locationLabel(finding)} in file manager"
+                        title="Reveal in file manager"
+                        onclick={() => reveal(finding.path)}
+                      >
+                        <FolderSearch size={13} />
+                      </button>
+                    {/if}
+                  </td>
                 </tr>
               {/each}
             </tbody>
           </table>
         </div>
+      {:else if report.ok && headline.tone === "ok"}
+        <EmptyState
+          icon={ShieldCheck}
+          title="Nothing to rotate"
+          hint="No secret matched in the files Kingfisher could read. The scope below says what that covers."
+          compact
+        />
+      {/if}
+
+      {#if report.kingfisher_present}
+        <details class="text-[11px] text-textMuted px-0.5">
+          <summary class="cursor-pointer select-none">What this scan covers</summary>
+          <ul class="mt-1.5 space-y-0.5 list-disc pl-4">
+            {#each scopeNotes(report) as note (note)}
+              <li>{note}</li>
+            {/each}
+          </ul>
+        </details>
       {/if}
     {/if}
   </div>

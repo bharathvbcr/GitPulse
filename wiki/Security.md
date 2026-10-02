@@ -30,7 +30,7 @@ flowchart TD
 
 **Policy fail-closed.** A missing MANVI harness yields **unchecked**, not **allowed**. A check that could not run must never look like a check that passed. See [[Policy and AI]].
 
-**Redacted secret scanning.** Insights → Secrets integrates the Kingfisher scanner. Findings are strictly redacted to rule ID, file path, and line number only; secret-bearing values and context lines are dropped immediately and never stored in memory or persisted. Scanner stdout is unlogged, and incomplete scans fail closed.
+**Redacted secret scanning.** Insights → Secrets integrates the Kingfisher scanner, run with `--redact` and no validation. Findings keep rule, repo-relative path, line, confidence, Git location and a per-scan grouping ordinal; secret values, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted. Scanner stdout is unlogged, and a partial, truncated or failed scan is never shown as clean.
 
 **Dead-branch cleanup authorization & backups.** Destructive deletions generate explicit git commands requiring authorization before execution; durable restorable tip backups are written to disk and recorded in the ledger prior to any branch removal.
 

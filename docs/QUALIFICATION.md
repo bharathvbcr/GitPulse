@@ -56,6 +56,12 @@ turns that into a desktop banner. The unread marker on the tab is the signal.
   ever been run on macOS. Treat managed runs on Windows as untried.
 - **Terminal handoffs** beyond what the unit tests cover: provider discovery
   through `PATH`, and the launch flags each CLI advertises on that platform.
+- **Insights → Secrets.** The parser and Git-location tests are platform-neutral
+  and run everywhere, but `tests/secrets_stress.rs` drives stub scanners as
+  shell scripts and is `#[cfg(unix)]`. Whether Kingfisher on Windows echoes
+  the scan root in the form `validate_repo` returns (a `\\?\` verbatim prefix
+  would make every row read "outside") has never been checked, and the
+  install hint names Homebrew.
 - **Anything that shells out to `git`** with paths that differ in separator or
   case sensitivity. `portable-paths.contract` catches the one class that has bitten
   CI before (a `file:` URL's `pathname` is `/D:/…` on Windows) but it is a lint,

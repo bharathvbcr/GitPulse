@@ -220,7 +220,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "secrets",
         label: "Secrets",
         summary:
-          "Working-tree secret scan via Kingfisher on PATH. A missed or truncated scan is listed, never implied clean. No secret values are shown.",
+          "Working-tree secret scan via Kingfisher, located against Git: tracked, untracked, ignored. A partial or truncated scan is listed, never implied clean. No secret values are shown.",
         paletteCommand: "Scan working tree for secrets",
       },
       {
