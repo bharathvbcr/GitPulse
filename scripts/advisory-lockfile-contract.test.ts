@@ -28,6 +28,18 @@ function locked(key: string): string | undefined {
   return BUN_LOCK.packages[key]?.[0];
 }
 
+/** `version` is a plain `x.y.z` no lower than `floor`, compared numerically. */
+function atLeast(version: string | undefined, floor: string): boolean {
+  const parse = (v: string) => (/^\d+\.\d+\.\d+$/.test(v) ? v.split(".").map(Number) : undefined);
+  const have = version === undefined ? undefined : parse(version);
+  const need = parse(floor);
+  if (!have || !need) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (have[i] !== need[i]) return have[i] > need[i];
+  }
+  return true;
+}
+
 function packageVersion(name: string): string | undefined {
   const blocks = LOCK.split("[[package]]\n");
   for (const block of blocks) {
@@ -72,13 +84,31 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
     expect(PKG.dependencies?.["lucide-svelte"]).toBeUndefined();
   });
 
+  it("compares versions numerically, so the floor check below cannot pass vacuously", () => {
+    expect(atLeast("1.48.0", "1.47.0")).toBe(true);
+    expect(atLeast("1.47.0", "1.47.0")).toBe(true);
+    expect(atLeast("1.46.9", "1.47.0")).toBe(false);
+    expect(atLeast("8.10.0", "8.3.0")).toBe(true);
+    expect(atLeast("7.9.9", "8.3.0")).toBe(false);
+    expect(atLeast(undefined, "8.3.0")).toBe(false);
+    expect(atLeast("not-a-version", "8.3.0")).toBe(false);
+  });
+
+  // A floor, not a pin: a later Dependabot bump still carries the refresh, and
+  // an exact pin turned every such bump into a red main.
   it("installs the Health-scan npm refreshes", () => {
-    expect(PKG.dependencies?.["@lucide/svelte"]).toBe("^1.47.0");
-    expect(locked("@lucide/svelte")).toBe("@lucide/svelte@1.47.0");
-    expect(PKG.devDependencies?.vite).toBe("^8.3.0");
-    expect(locked("vite")).toBe("vite@8.3.0");
-    expect(PKG.devDependencies?.["@types/node"]).toBe("^26.6.2");
-    expect(locked("@types/node")).toBe("@types/node@26.6.2");
+    const floors: Array<[name: string, range: string | undefined, floor: string]> = [
+      ["@lucide/svelte", PKG.dependencies?.["@lucide/svelte"], "1.47.0"],
+      ["vite", PKG.devDependencies?.vite, "8.3.0"],
+      ["@types/node", PKG.devDependencies?.["@types/node"], "26.6.2"],
+    ];
+    for (const [name, range, floor] of floors) {
+      expect(range, `${name} is declared as a caret range`).toMatch(/^\^\d+\.\d+\.\d+$/);
+      expect(atLeast(range?.slice(1), floor), `${name} range ${range} admits nothing below ${floor}`).toBe(true);
+      const resolved = locked(name);
+      expect(resolved, `${name} is in bun.lock`).toMatch(new RegExp(`^${name.replace(/[/.]/g, "\\$&")}@`));
+      expect(atLeast(resolved?.slice(name.length + 1), floor), `${resolved} is at least ${floor}`).toBe(true);
+    }
   });
 
   it("excludes local framework ports from CodeQL default setup", () => {
