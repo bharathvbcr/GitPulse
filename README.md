@@ -161,30 +161,30 @@ workbench; this does not imply complete feature parity.
 
 ## Build and contribute
 
-Use Node.js 22.x (22.12 or newer), stable Rust, Git, and your platform's native
+Use Bun 1.4.2, Node.js 22.x (22.12 or newer), stable Rust, Git, and your platform's native
 build tools. The [contributor guide](CONTRIBUTING.md) covers setup and platform prerequisites.
 
 ```sh
 git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
-npm ci
+bun install --frozen-lockfile
 git config core.hooksPath .githooks
-npm run tauri dev
+bun run tauri dev
 ```
 
 | Command | Purpose |
 | --- | --- |
-| `npm run check` | Svelte and TypeScript checks |
-| `npm test` | Frontend and contract tests |
-| `npm run check:ipc` | Match frontend calls to the native command registry |
-| `npm run check:types` | Compare Rust and TypeScript wire contracts |
-| `npm run check:release` | Check version manifest consistency |
-| `npm run check:workflows` | Lint the GitHub Actions workflow definitions |
-| `npm run test:browser:all` | Browser regressions under headless Chrome |
-| `npm run test:webkit:all` | The same regressions under WKWebView (macOS only) |
-| `npm run build` | Build the frontend bundle |
-| `npm run tauri build` | Build native bundles for the host |
-| `npm run ci:local` | Every gate CI runs, both renderers, coverage, and the native gates |
+| `bun run check` | Svelte and TypeScript checks |
+| `bun run test` | Frontend and contract tests |
+| `bun run check:ipc` | Match frontend calls to the native command registry |
+| `bun run check:types` | Compare Rust and TypeScript wire contracts |
+| `bun run check:release` | Check version manifest consistency |
+| `bun run check:workflows` | Lint the GitHub Actions workflow definitions |
+| `bun run test:browser:all` | Browser regressions under headless Chrome |
+| `bun run test:webkit:all` | The same regressions under WKWebView (macOS only) |
+| `bun run build` | Build the frontend bundle |
+| `bun run tauri build` | Build native bundles for the host |
+| `bun run ci:local` | Every gate CI runs, both renderers, coverage, and the native gates |
 
 The browser regressions run twice in CI — under Chrome on Linux and under
 WKWebView on macOS — because the two engines disagree often enough to matter: a

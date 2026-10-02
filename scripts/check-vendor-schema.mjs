@@ -42,7 +42,7 @@ function usage() {
 
 export function readVendoredSchema() {
   if (!existsSync(SCHEMA_RS)) {
-    throw new Error(`missing ${SCHEMA_RS}; run npm run vendor`);
+    throw new Error(`missing ${SCHEMA_RS}; run bun run vendor`);
   }
   const text = readFileSync(SCHEMA_RS, "utf8");
   const match = /pub const CURRENT_SCHEMA_VERSION:\s*i32\s*=\s*(\d+)/.exec(text);
@@ -162,7 +162,7 @@ export function main(argv = process.argv.slice(2)) {
     console.error(
       `FAIL: vendored schema ${vendored} != CLI expected ${cli.expected} (${cli.versionLine})`,
     );
-    console.error("Re-vendor from DevCouncil: GITPULSE_DEVCOUNCIL_ROOT=… npm run vendor");
+    console.error("Re-vendor from DevCouncil: GITPULSE_DEVCOUNCIL_ROOT=… bun run vendor");
   }
   return result.ok ? 0 : 1;
 }

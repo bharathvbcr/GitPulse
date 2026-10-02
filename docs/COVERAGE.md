@@ -68,13 +68,13 @@ The launch syntax uses the interactive positional prompt supported by
 
 ## Verification
 
-Run `npm test -- src/lib/coverage src/lib/terminal src/lib/components/CoverageViewer.test.ts`
-for formatter, exploration, handoff, tab and coverage regression tests, and `npm run check`
-for Svelte/TypeScript checks. Run `npm run test:coverage-ui` for the automated
+Run `bun run test -- src/lib/coverage src/lib/terminal src/lib/components/CoverageViewer.test.ts`
+for formatter, exploration, handoff, tab and coverage regression tests, and `bun run check`
+for Svelte/TypeScript checks. Run `bun run test:coverage-ui` for the automated
 browser gate, also included in `ci:local`. Add `-- --webkit` to exercise macOS
 WebKit. Failures and incomplete runs fail the gate.
 
-Run `npm run dev`, open `/harness/coverage.html` on the reported local URL and click
+Run `bun run dev`, open `/harness/coverage.html` on the reported local URL and click
 **Run coverage checks**. The harness mounts the real Coverage page, dock, terminal
 panels and xterm with Tauri's mock transport. It verifies copy/preview, missing and
 failed scans, prompt refresh, both agents' exact program/argv/repository handoff,

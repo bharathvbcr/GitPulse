@@ -426,10 +426,10 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 241 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1248 data fields, over 178 structs, in 72 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
-| **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
-| **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 241 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1284 data fields, over 184 structs, in 74 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
+| **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
 ---
 
@@ -484,14 +484,14 @@ rendering; invalid calendar dates are rejected with an incomplete-history note.
 Entries carry both the app version and a unique bundle ID, so consecutive
 errors from different builds never coalesce. Pane crashes snapshot navigation,
 stack head/tail, and the visible Code subpane's bounded request IDs before a
-deferred store write. `npm run build` saves matching chunks, SHA-256 hashes,
+deferred store write. `bun run build` saves matching chunks, SHA-256 hashes,
 and source maps under `.build-evidence/<build-id>/`; source maps are removed
 from `dist/`. This directory is ignored and stays local. The distributable
 `build-info.json` contains only build ID, version, time, Git revision, and
 dirty-state metadata. Retain the matching evidence directory for any build
 being diagnosed; no remote source-map upload is configured.
 
-`npm run test:browser` and the macOS `npm run test:webkit` mount the actual
+`bun run test:browser` and the macOS `bun run test:webkit` mount the actual
 Code components and Diagnostics window with explicit IPC fixtures. Both
 require the duplicate-key crash canary and every assertion to complete.
 

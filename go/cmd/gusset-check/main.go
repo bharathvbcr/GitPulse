@@ -8,7 +8,7 @@
 //	eval "$(../../DevCouncil/rust/gusset-engine/cgo-env.sh --export)"
 //	go run -tags gusset ./cmd/gusset-check
 //
-// or `npm run gusset:check` from the repository root. Without the tag it
+// or `bun run gusset:check` from the repository root. Without the tag it
 // exits 2 and says the engine is not linked: a check that could not run is
 // not a check that passed.
 package main

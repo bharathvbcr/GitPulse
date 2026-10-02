@@ -12,14 +12,14 @@ Closes #
 
 **Required — every box must be genuinely checked, not assumed:**
 
-- [ ] `npm run ci:local` passes locally.
-      <!-- This runs: npm run check, npm test, npm run build, cargo fmt --check,
+- [ ] `bun run ci:local` passes locally.
+      <!-- This runs: bun run check, bun run test, bun run build, cargo fmt --check,
            cargo clippy -D warnings, cargo test. If you ran the pieces separately,
            say so below rather than ticking this. -->
-- [ ] `npm run check:ipc` reports zero drift.
+- [ ] `bun run check:ipc` reports zero drift.
       <!-- Only meaningful if you added, removed, or renamed a cmd_* handler,
            but it is cheap and it is what CI runs. -->
-- [ ] I manually exercised the change in `npm run tauri dev`.
+- [ ] I manually exercised the change in `bun run tauri dev`.
 
 **If this is a bug fix:**
 
@@ -29,11 +29,11 @@ Closes #
 **If this changes an IPC payload shape:**
 
 - [ ] The Rust struct and the TypeScript interface agree field for field.
-- [ ] `npm run check:types` passes.
+- [ ] `bun run check:types` passes.
 
 **If this changes versioned manifests:**
 
-- [ ] `npm run check:release` passes (`package.json`, `package-lock.json`,
+- [ ] `bun run check:release` passes (`package.json`,
       `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` all name one version).
 
 **Documentation:**

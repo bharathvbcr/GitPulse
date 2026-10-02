@@ -63,8 +63,8 @@ The dock is toggled with `Ctrl+\``. Hiding it does not kill the session. Switchi
 ## `gitpulse-mcp` is missing or stale
 
 ```sh
-npm run mcp:install
-npm run mcp:doctor
+bun run mcp:install
+bun run mcp:doctor
 ```
 
 Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-mcp` and `gitpulse-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `GITPULSE_MCP_PATH` only moves the binary GitPulse's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
@@ -72,11 +72,11 @@ Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-m
 ## Dev app will not start
 
 - Node 22+ and stable Rust with clippy/rustfmt.
-- `npm install` then `npm run tauri dev`.
+- `bun install` then `bun run tauri dev`.
 - Port 5173 busy: GitPulse walks 5174–5193, or set `GITPULSE_DEV_PORT`.
 - Linux: WebKitGTK 4.1 and GTK 3 dev packages (see [[Development]]).
 
-## `npm run ci:local` fails on coverage
+## `bun run ci:local` fails on coverage
 
 Floors: frontend 90% lines / 85% branches, Rust 80% lines. `ci:local` regenerates both LCOV reports; a stale `lcov.info` on disk cannot pass the gate. Need `cargo-llvm-cov` and `actionlint`.
 

@@ -9,9 +9,9 @@ const workflow = readFileSync(new URL("../.github/workflows/release.yml", import
 describe("release workflow contracts", () => {
   it("runs every repository contract gate before building release assets", () => {
     const preflight = workflow.slice(workflow.indexOf("preflight:"), workflow.indexOf("\n  release:"));
-    expect(preflight).toContain("run: npm run check:ipc");
-    expect(preflight).toContain("run: npm run check:types");
-    expect(preflight).toContain("run: npm run check:release");
+    expect(preflight).toContain("run: bun run check:ipc");
+    expect(preflight).toContain("run: bun run check:types");
+    expect(preflight).toContain("run: bun run check:release");
   });
 
   it("uses exact asset-manifest verification after the matrix completes", () => {
@@ -20,7 +20,7 @@ describe("release workflow contracts", () => {
   });
 
   it("takes the release body from the changelog, not a literal block", () => {
-    expect(workflow).toContain("npm run release:notes -- --tag");
+    expect(workflow).toContain("bun run release:notes -- --tag");
     expect(stateScript).toContain('extractNotes(readFileSync("CHANGELOG.md", "utf8"), tag)');
     expect(stateScript).toContain("confirmed.body !== notes");
     // the old block described v0.0.3 whatever tag was being built
@@ -36,7 +36,7 @@ describe("release workflow contracts", () => {
 
   it("fails preflight when the tag has no changelog section", () => {
     const preflight = workflow.slice(workflow.indexOf("preflight:"), workflow.indexOf("\n  release:"));
-    expect(preflight).toContain("run: npm run release:notes -- --tag \"$RELEASE_TAG\"");
+    expect(preflight).toContain("run: bun run release:notes -- --tag \"$RELEASE_TAG\"");
   });
 
   it("uses tauri-action v1's uploadUpdaterJson input, not the v0 name", () => {
@@ -68,9 +68,9 @@ it("uploads into the prepared release id without retargeting the tag", () => {
   expect(action).not.toMatch(/^\s+releaseCommitish:/m);
 });
 
-it("runs the macOS universal build through the npm tauri script so PATH shims are reached", () => {
-  // tauri-action uses `npm run tauri` only when package.json has a tauri script
-  // and the action does not set tauriScript. That script is scripts/tauri.mjs,
+it("runs the macOS universal build through the package tauri script so PATH shims are reached", () => {
+  // tauri-action finds bun.lock and runs `bun tauri`, which resolves to the
+  // package.json tauri script, only when the action does not set tauriScript. That script is scripts/tauri.mjs,
   // which prepends scripts/bin so lipo and codesign wrap the system tools.
   // Override either and the next universal release dies at bundling/signing.
   expect(workflow).not.toMatch(/^\s*tauriScript:/m);
@@ -80,7 +80,7 @@ it("runs the macOS universal build through the npm tauri script so PATH shims ar
 
 
 it("supports hosted runners without an external devmap CLI and reports that absence", () => {
-  const line = workflow.split("\n").find(line => line.includes("run: npm run check:vendor-schema"));
+  const line = workflow.split("\n").find(line => line.includes("run: bun run check:vendor-schema"));
   expect(line).toBeDefined();
   const extra = line?.split(" -- ")[1]?.trim().split(/\s+/) ?? [];
   const result = spawnSync(process.execPath, [fileURLToPath(new URL("./check-vendor-schema.mjs", import.meta.url)), ...extra], {

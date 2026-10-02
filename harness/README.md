@@ -55,8 +55,8 @@ screen.
 
 ## Uncommitted previews
 
-Run `npm run test:browser -- --harness uncommitted` or
-`npm run test:webkit -- --harness uncommitted`. For interactive inspection,
+Run `bun run test:browser -- --harness uncommitted` or
+`bun run test:webkit -- --harness uncommitted`. For interactive inspection,
 open `/harness/uncommitted.html` on the development server.
 
 This mounts the existing status bar, sidebars, view/repository tabs, Workspace
@@ -70,8 +70,8 @@ repository, view, and diff responses.
 
 ## Command palette
 
-Run `npm run test:browser -- --harness palette`, or
-`npm run test:webkit -- --harness palette` on macOS. The palette harness mounts the
+Run `bun run test:browser -- --harness palette`, or
+`bun run test:webkit -- --harness palette` on macOS. The palette harness mounts the
 production palette and prompt components with explicit repository/code-intelligence
 fixtures. It tests help-mode transitions, stale responses, failed and partial
 searches, registry-resolved workspace navigation, file paging, keyboard/IME behavior,
@@ -82,8 +82,8 @@ performed by these fixtures. See `docs/COMMAND_PALETTE.md` for contracts and lim
 
 ## Tasks page and sheets
 
-Run `npm run test:browser -- --harness tasks` or
-`npm run test:webkit -- --harness tasks` on macOS. Both CI browser jobs and
+Run `bun run test:browser -- --harness tasks` or
+`bun run test:webkit -- --harness tasks` on macOS. Both CI browser jobs and
 `ci:local` include this gate. For interactive inspection, open
 `/harness/tasks.html`; `?theme=light` selects light appearance.
 
@@ -173,8 +173,8 @@ installed desktop app or evaluate a live model.
 
 ## Blame and its code-age timeline
 
-Run `npm run test:browser -- --harness blame`, or
-`npm run test:webkit -- --harness blame` on macOS. For interactive inspection,
+Run `bun run test:browser -- --harness blame`, or
+`bun run test:webkit -- --harness blame` on macOS. For interactive inspection,
 open `/harness/blame.html` on the development server; the buttons across the
 top swap the blame fixture and toggle density, timestamp style and theme.
 
@@ -210,8 +210,8 @@ git command executes.
 
 ## Code diagnostics
 
-Run `npm run test:browser` for the automated Chrome gate, or
-`npm run test:webkit` on macOS for the system `WKWebView` gate. Chrome must
+Run `bun run test:browser` for the automated Chrome gate, or
+`bun run test:webkit` on macOS for the system `WKWebView` gate. Chrome must
 already be installed (`CHROME_BIN` can select its executable); WebKit uses
 the installed Xcode command-line tools. Neither command installs dependencies.
 Each run starts an isolated loopback Vite server and temporary browser profile,
@@ -279,7 +279,7 @@ See [docs/QUALIFICATION.md](../docs/QUALIFICATION.md) for open gates and [the ar
 Browser callback verification does
 not verify opening a file inside the installed Tauri application.
 
-`npm test` **cannot** catch a Svelte reactive loop. `vitest.config.ts` sets
+`bun run test` **cannot** catch a Svelte reactive loop. `vitest.config.ts` sets
 `environment: "node"`, where `$effect` compiles out entirely — which is why
 every Svelte test in this repo is source-text or `render()` from
 `svelte/server`, and why `effect_update_depth_exceeded` reached a release.
@@ -289,7 +289,7 @@ harness is how the *behaviour* gets checked, in a real browser with the real
 Svelte client runtime.
 
 ```bash
-npx vite --config vite.harness.config.ts
+bunx vite --config vite.harness.config.ts
 # then open, e.g.:
 #   http://localhost:5188/harness/stress.html?c=PulseView&tabs=5&scenario=chaos&cycles=45
 ```
@@ -335,7 +335,7 @@ style — so the unit tests can only check that the appliers *would* write the
 right thing.
 
 ```bash
-npx vite --config vite.harness.config.ts
+bunx vite --config vite.harness.config.ts
 # then open:
 #   http://localhost:5188/harness/settings.html
 ```

@@ -230,10 +230,10 @@ describe("the app version is never retyped in source", () => {
 
 /**
  * `check-release-version.mjs` owns manifest agreement and runs as its own CI
- * step (`npm run check:release`), but every one of its own tests builds a
+ * step (`bun run check:release`), but every one of its own tests builds a
  * synthetic scratch tree — none of them points it at this repository. So the
  * gate that exists to stop a mismatched release had no coverage over the tree
- * it actually gates. These two run it here, under `npm test`, against the real
+ * it actually gates. These two run it here, under `bun run test`, against the real
  * root, using its own discovery rather than a list of manifest paths.
  */
 describe("every discovered manifest carries package.json's version", () => {

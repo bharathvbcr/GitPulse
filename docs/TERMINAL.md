@@ -160,10 +160,10 @@ in the rest of the application, which use ordinary input fields.
 
 ## Frontend verification
 
-`npm run test:browser -- --harness terminal` runs the harness in headless
+`bun run test:browser -- --harness terminal` runs the harness in headless
 Chrome and fails the run on any failed or missing assertion; `--all` derives
 the list from `BROWSER_HARNESSES`, and `--webkit` runs the same page in
-WKWebView. For local work, `npm run dev` and `/harness/terminal.html` still
+WKWebView. For local work, `bun run dev` and `/harness/terminal.html` still
 offer **Run terminal checks** and **Run input stress checks** as buttons.
 
 The harness mounts the real dock, panels, sessions,

@@ -20,6 +20,7 @@ import {
   isTauriDevArgs,
   isTauriHookEnv,
   killPid,
+  localBinPath,
   parseEtimeToMs,
   parseLsofPids,
   parseNetstatPids,
@@ -35,6 +36,32 @@ import {
 
 const repoRoot = defaultRepoRoot();
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
+
+describe("localBinPath", () => {
+  const bin = (name: string) => path.join("/repo", "node_modules", ".bin", name);
+
+  it("uses the bare shim off Windows", () => {
+    expect(localBinPath("/repo", "tauri", "darwin", () => false)).toBe(bin("tauri"));
+    expect(localBinPath("/repo", "vite", "linux", () => true)).toBe(bin("vite"));
+  });
+
+  it("finds Bun's .exe shim on Windows, where no .cmd is written", () => {
+    // bun install links node_modules/.bin/<name>.exe (+ .bunx); npm wrote
+    // <name>.cmd. Spawning a .cmd that does not exist fails the Windows
+    // release leg at `bun tauri build`.
+    const present = new Set([bin("tauri.exe")]);
+    expect(localBinPath("/repo", "tauri", "win32", (p) => present.has(p))).toBe(bin("tauri.exe"));
+  });
+
+  it("keeps an npm-style .cmd shim on Windows when that is what is installed", () => {
+    const present = new Set([bin("vite.cmd"), bin("vite.exe")]);
+    expect(localBinPath("/repo", "vite", "win32", (p) => present.has(p))).toBe(bin("vite.cmd"));
+  });
+
+  it("names the .exe shim when neither exists, so the spawn error points at Bun's path", () => {
+    expect(localBinPath("/repo", "tauri", "win32", () => false)).toBe(bin("tauri.exe"));
+  });
+});
 const liveChildren: ChildProcess[] = [];
 
 afterEach(() => {

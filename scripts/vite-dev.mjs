@@ -10,7 +10,7 @@ import { wantsHelp } from "./usage.mjs";
 
 const repoRoot = defaultRepoRoot();
 
-// `npm run dev -- --help` wants vite's usage, not a dev server. Resolving a
+// `bun run dev -- --help` wants vite's usage, not a dev server. Resolving a
 // port first would print a port notice and could reclaim a held port as a side
 // effect of asking a question.
 if (wantsHelp(process.argv.slice(2))) {

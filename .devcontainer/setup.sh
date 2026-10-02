@@ -2,7 +2,7 @@
 # System and toolchain setup for the GitPulse dev container.
 #
 # Mirrors the Linux dependency list in ci.yml and CONTRIBUTING.md, plus the two
-# tools `npm run ci:local` requires beyond the language toolchains. Fails on the
+# tools `bun run ci:local` requires beyond the language toolchains. Fails on the
 # first error: a container that came up with half a toolchain is worse than one
 # that refused to build, because the missing half surfaces as a confusing gate
 # failure later.
@@ -34,4 +34,8 @@ curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VER
 
 cargo install cargo-llvm-cov --locked
 
-echo "GitPulse dev container ready. Run 'npm ci' then 'npm run ci:local'."
+# Bun installs and runs the package scripts (packageManager in package.json).
+# The node feature supplies npm; pin to the same version package.json names.
+npm install -g bun@1.4.2
+
+echo "GitPulse dev container ready. Run 'bun install --frozen-lockfile' then 'bun run ci:local'."

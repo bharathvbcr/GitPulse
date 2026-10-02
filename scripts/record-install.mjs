@@ -1,7 +1,7 @@
 /**
- * Record what `npm run mcp:install` just installed, and from which source.
+ * Record what `bun run mcp:install` just installed, and from which source.
  *
- * Runs after `cargo install` in the same npm script, so the record is written
+ * Runs after `cargo install` in the same package script, so the record is written
  * only when the install actually succeeded. What it writes is the one thing
  * the binaries cannot tell the doctor themselves: the digest of the sources
  * they were built from. See `install-identity.mjs` for why that is not simply

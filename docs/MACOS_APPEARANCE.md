@@ -22,7 +22,7 @@ overlap content. Cards do not each create a filter. Scope selection uses the
 shared liquid transition, including reduced-motion preferences. Accessibility
 fallbacks override both dark and light theme tokens.
 
-Open `/harness/task-materials.html` with `npm run dev` for a disposable Tasks
+Open `/harness/task-materials.html` with `bun run dev` for a disposable Tasks
 preview with in-memory transport. **Check all Tasks surfaces** exercises both
 themes, scope selection, editors, enhancements, run controls, automatic settings
 and the inbox. `?repository=1` checks the repository mount. Browser media
@@ -30,8 +30,8 @@ emulation can exercise reduced transparency, increased contrast, forced colors
 and reduced motion; the Platform control previews standard material fills.
 The fixture does not access real task storage or launch agents.
 
-Run `npm run test:browser -- --harness task-materials` for Chromium or
-`npm run test:webkit -- --harness task-materials` for native macOS WKWebView.
+Run `bun run test:browser -- --harness task-materials` for Chromium or
+`bun run test:webkit -- --harness task-materials` for native macOS WKWebView.
 Both run the same surface and interaction checks automatically.
 
 The field sits over the real desktop rather than replacing it: window
@@ -297,7 +297,7 @@ movement after the preference change.
 `transitions.test.ts` explicitly pins the standard platform profile so host
 Node versions exposing `navigator.platform` cannot change its expectations.
 
-Run `npm run ci:local` for the full repository gate. Rendered checks should
+Run `bun run ci:local` for the full repository gate. Rendered checks should
 cover dark/light themes, 900px and 1280px windows, modal reopening, keyboard
 focus, rapid view selection, and supported accessibility preferences. Browser
 emulation can verify CSS fallbacks; it does not prove macOS system preference

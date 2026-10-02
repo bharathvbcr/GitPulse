@@ -141,7 +141,7 @@ describe("install record provenance", () => {
     // Not `ok`: an install nobody recorded looked exactly like one that was
     // checked and matched, which is the whole defect being closed here.
     expect(verdict.status).toBe("unverifiable");
-    expect(verdict.violations.join(" ")).toMatch(/npm run mcp:install/);
+    expect(verdict.violations.join(" ")).toMatch(/bun run mcp:install/);
   });
 
   it("reports unverifiable when no binary is on PATH at all", () => {

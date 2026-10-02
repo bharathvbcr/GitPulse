@@ -14,10 +14,11 @@ Ensure you have the following tools installed on your development machine:
 
 | Tool | Version | Why this floor |
 | --- | --- | --- |
-| **Node.js** | `22.x`, at least `22.12` | CI uses Node 22. The locked Vite/Vitest engines require at least 22.12 on that line; check `package-lock.json` before using another major. |
+| **Bun** | `1.4.2` | Installs dependencies from `bun.lock` and runs the package scripts; `packageManager` in `package.json` names the version CI uses. |
+| **Node.js** | `22.x`, at least `22.12` | CI uses Node 22. Vite, Vitest and svelte-check still run on Node; the locked Vite/Vitest engines require at least 22.12 on that line; check `bun.lock` before using another major. |
 | **Rust** | `stable`, edition 2021 | Needs the `clippy` and `rustfmt` components — CI fails on either. `rustup component add clippy rustfmt` |
-| **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `npm run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
-| **actionlint** | latest | Lints the GitHub Actions workflows in `npm run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
+| **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `bun run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
+| **actionlint** | latest | Lints the GitHub Actions workflows in `bun run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
 | **Git** | any maintained release | Not just for version control: GitPulse shells out to `git` for every repository operation, so the binary on your `PATH` is part of the runtime. |
 | **GitHub CLI** (`gh`) | optional | The GitHub panel (PRs, issues, workflow runs) and Health (Dependabot and code scanning alerts) use it. Everything else works without it. |
 
@@ -42,13 +43,13 @@ git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
 
 # 2. Install frontend dependencies
-npm ci
+bun install --frozen-lockfile
 
 # 3. Point git at the repository's hooks (one-time, per clone)
 git config core.hooksPath .githooks
 
 # 4. Start Tauri in development mode (hot-reloads Rust & Svelte)
-npm run tauri dev
+bun run tauri dev
 ```
 
 > [!IMPORTANT]
@@ -100,13 +101,13 @@ Task organization and handoff helpers have adjacent tests under
 without a native build:
 
 ```sh
-npm test -- scripts/architecture-docs-contract.test.ts scripts/documented-counts-contract.test.ts scripts/agent-guidance.test.ts
+bun run test -- scripts/architecture-docs-contract.test.ts scripts/documented-counts-contract.test.ts scripts/agent-guidance.test.ts
 ```
 
 **The full local contributor gate:**
 
 ```sh
-npm run ci:local
+bun run ci:local
 ```
 
 This validates the current host. Run it before opening a pull request; the
@@ -128,7 +129,7 @@ must still pass on their respective operating systems.
 
 It expands to the full suite — frontend type check, Vitest under V8 coverage, Vite
 build, `cargo fmt`, `cargo clippy -D warnings`, the Rust suites under `cargo llvm-cov`,
-and `npm run check:coverage` to enforce the floors against the two LCOV reports those
+and `bun run check:coverage` to enforce the floors against the two LCOV reports those
 runs just produced. It regenerates both reports rather than trusting whatever is left
 on disk. Run only one full gate per checkout: frontend reports and `dist/` are
 shared outputs. Concurrent native coverage runs also need separate
@@ -144,14 +145,14 @@ While iterating you will usually want the narrower commands instead:
 
 | Command | Scope | Typical runtime |
 | --- | --- | --- |
-| `npm test` | Vitest suite (2,000+ tests across `src/`) | seconds |
-| `npx vitest run src/lib/graph` | One directory | sub-second |
-| `npx vitest watch` | Re-runs on save | continuous |
-| `npm run coverage` | Vitest with V8 coverage into `coverage/` | ~1 min |
+| `bun run test` | Vitest suite (2,000+ tests across `src/`) | seconds |
+| `bunx vitest run src/lib/graph` | One directory | sub-second |
+| `bunx vitest watch` | Re-runs on save | continuous |
+| `bun run coverage` | Vitest with V8 coverage into `coverage/` | ~1 min |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit + integration suites (850+ tests) | ~1 min |
 | `cargo test --manifest-path src-tauri/Cargo.toml updates::` | One Rust module | seconds |
 | `cargo test --manifest-path src-tauri/Cargo.toml --test ipc_bridge_integration` | Commands driven through the real IPC bridge on Tauri's MockRuntime | seconds |
-| `npm run check:coverage` | Validate both LCOV reports and enforce floors (needs a prior `npm run coverage` and `cargo llvm-cov` run) | seconds |
+| `bun run check:coverage` | Validate both LCOV reports and enforce floors (needs a prior `bun run coverage` and `cargo llvm-cov` run) | seconds |
 
 ### Test conventions
 
@@ -178,13 +179,13 @@ These are not style checks — each one catches a class of drift that types alon
 ```mermaid
 flowchart TD
     subgraph PreCommit["Pre-Commit Verification Suite"]
-        FrontendChecks["Frontend: <code>npm run check</code> & <code>npm test</code>"]
+        FrontendChecks["Frontend: <code>bun run check</code> & <code>bun run test</code>"]
         RustChecks["Rust: <code>cargo fmt</code> & <code>cargo clippy</code> & <code>cargo test</code>"]
-        IPCCheck["IPC Contract: <code>npm run check:ipc</code>"]
-        TypeCheck["Type Contract: <code>npm run check:types</code>"]
-        ReleaseCheck["Release Manifests: <code>npm run check:release</code>"]
-        CoverageCheck["Coverage Floors: <code>npm run check:coverage</code>"]
-        WorkflowCheck["Workflow Lint: <code>npm run check:workflows</code>"]
+        IPCCheck["IPC Contract: <code>bun run check:ipc</code>"]
+        TypeCheck["Type Contract: <code>bun run check:types</code>"]
+        ReleaseCheck["Release Manifests: <code>bun run check:release</code>"]
+        CoverageCheck["Coverage Floors: <code>bun run check:coverage</code>"]
+        WorkflowCheck["Workflow Lint: <code>bun run check:workflows</code>"]
     end
 
     FrontendChecks --> AllPass{"All Checks Pass?"}
@@ -201,29 +202,29 @@ flowchart TD
 
 | Command | Purpose |
 | --- | --- |
-| `npm run check` | Runs `svelte-check` (TypeScript 6 compatibility API for Svelte) and stable TypeScript 7 `tsc` type validation on `tsconfig.node.json` |
-| `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (241 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
-| `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `npm run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
-| `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 72 contracts (178 structs, 1248 fields) |
-| `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
-| `npm run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
-| `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
-| `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
-| `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
-| `npm run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
-| `npm run release:ready` | Checks that CI and coverage already succeeded for this commit, without creating or mutating a draft. Requires `RELEASE_TAG`, `RELEASE_COMMIT`, and `GH_REPO`. Run this before moving a `v*` tag; prepare cannot wait out an in-flight matrix |
-| `npm run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
+| `bun run check` | Runs `svelte-check` (TypeScript 6 compatibility API for Svelte) and stable TypeScript 7 `tsc` type validation on `tsconfig.node.json` |
+| `bun run test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
+| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (241 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `bun run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `bun run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
+| `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 74 contracts (184 structs, 1284 fields) |
+| `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
+| `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
+| `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
+| `bun run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
+| `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
+| `bun run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
+| `bun run release:ready` | Checks that CI and coverage already succeeded for this commit, without creating or mutating a draft. Requires `RELEASE_TAG`, `RELEASE_COMMIT`, and `GH_REPO`. Run this before moving a `v*` tag; prepare cannot wait out an in-flight matrix |
+| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 
-For the DevMap watcher/diagnostics boundary, run `npm test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `npm run test:browser` and `npm run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in [docs/QUALIFICATION.md](docs/QUALIFICATION.md); the dated DevMap verification ledger is [docs/archive/DEVMAP_AUDIT.md](docs/archive/DEVMAP_AUDIT.md).
+For the DevMap watcher/diagnostics boundary, run `bun run test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `bun run test:browser` and `bun run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in [docs/QUALIFICATION.md](docs/QUALIFICATION.md); the dated DevMap verification ledger is [docs/archive/DEVMAP_AUDIT.md](docs/archive/DEVMAP_AUDIT.md).
 
 ### Contracts enforced by tests rather than scripts
 
 The `check:*` commands above are the gates you run by name. A second set of
-contracts is enforced by tests under `scripts/`, which run with `npm test`.
+contracts is enforced by tests under `scripts/`, which run with `bun run test`.
 They exist because each guards a class of drift that no type check can see —
 several were added after the drift had already happened.
 
@@ -252,7 +253,7 @@ several were added after the drift had already happened.
 | `apple-bridge-contract` | The Apple Intelligence bridge losing either of two link-time rules that are invisible from the Rust and Swift source. A plain `rustc-link-lib=framework=FoundationModels` is a hard `LC_LOAD_DYLIB`, so a Mac older than 26 fails to launch at all — a symptom that never appears on the machine that built it. And building the Swift at the crate's own floor instead of macOS 26 drags in the back-deployment compatibility shims (two undefined `swiftCompatibility` symbols at target 11.0, none at 26.0), which install global-executor hooks process-wide for code unrelated to drafting. Also pins the on-device provider name against its Rust constant: if they drift, every on-device request is silently forwarded to an unconfigured Manvi sidecar. |
 | `mac-material-contract` | A macOS dialog blurring twice, or an always-on chrome surface regaining a backdrop filter. Both cost frames rather than pixels, so neither is visible in review: a `backdrop-filter` makes its element a backdrop root, which leaves a card inside a blurred scrim paying for a filter whose only input is the scrim's flat wash. The scrim rules are guarded by a discovery assertion because they first shipped passing against zero matches. |
 | `task-materials-contract` | Tasks editors and nested controls covering shared glass with opaque fills, missing blur on overlapping surfaces, or liquid scope selection losing its accessible state. |
-| `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `npm run check` output. |
+| `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `bun run check` output. |
 | `greppable-source-contract` | A raw NUL byte in a source file. ripgrep and `grep` sniff for it, classify the whole file as binary and skip it in silence — so a search for a symbol that IS in the file reports that the file does not use it. `DiffViewer.svelte` carried four (cache keys joined on a literal NUL), `fileRail.ts`, `FleetView.svelte` and `operation.test.ts` one each, and every `rg` over them came back clean. The escape says the same thing in plain text. |
 | `terminal-isolation-contract` | An import that would give the AI or MANVI sidecar a route to the terminal PTY, which SECURITY.md says they cannot reach. |
 | `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |
@@ -279,7 +280,7 @@ several were added after the drift had already happened.
 | `devmap-html` | Embedded DevMap HTML retains keyboard, filtering, focus, and offline behavior. |
 | `vendor-crates-isolated` | Scoped and atomic vendoring, bounded manifest reads, and sibling discovery from linked worktrees. |
 | `version-source-contract` | The app version being retyped anywhere outside a manifest. `codex-plugin-contract` asserted `manifest.version === "0.0.5"` against the real tree: correct the day it was written, which is why it passed review, and broken by the next `chore(release)` bump. The silent half is worse — `release-notes.test.ts` went on calling an 0.0.5 section "the current" one and passing. A hardcoded version is only catchable at the moment it is typed, because at that moment it equals `package.json`'s; the scan therefore looks for the *current* version across `scripts/`, `src/`, `src-tauri/src/` and `.github/`, and points you at `appVersion()`. It also runs `check-release-version.mjs`'s own discovery against this repository — every one of that script's tests builds a synthetic scratch tree, so the gate that stops a mismatched release had no coverage over the tree it gates. |
-| `effect-loop-contract` | A pane that crashes itself with `effect_update_depth_exceeded`. The scan walks `src/` for three shapes: (1) a `$state` read+write inside a synchronous callback registered from `$effect` (`Metric.subscribe` delivers the current snapshot *synchronously*, which is how PulseView's workspace LOC strip and StoragePanel's `historyVersion += 1` froze); (2) a `$state` read+write in the `$effect` body itself, after `untrack(...)` and after stripping those sync-callback arguments so they stay check (1) — PulseView's `loadedPath` load effect; (3) a `$storeName` auto-subscription plus `name.set` / `name.update` / `name.setError` in the same effect after `untrack` (App's `$repoStore.error` → `repoStore.setError(null)` forwarding). Svelte runes (`state`, `derived`, `effect`, `props`, `bindable`, `inspect`, `host`) are not stores. It guards the SHAPE only — `npm test` runs `environment: "node"`, where `$effect` compiles out, so the behaviour is checked in a real browser via `harness/` (see `harness/README.md`). |
+| `effect-loop-contract` | A pane that crashes itself with `effect_update_depth_exceeded`. The scan walks `src/` for three shapes: (1) a `$state` read+write inside a synchronous callback registered from `$effect` (`Metric.subscribe` delivers the current snapshot *synchronously*, which is how PulseView's workspace LOC strip and StoragePanel's `historyVersion += 1` froze); (2) a `$state` read+write in the `$effect` body itself, after `untrack(...)` and after stripping those sync-callback arguments so they stay check (1) — PulseView's `loadedPath` load effect; (3) a `$storeName` auto-subscription plus `name.set` / `name.update` / `name.setError` in the same effect after `untrack` (App's `$repoStore.error` → `repoStore.setError(null)` forwarding). Svelte runes (`state`, `derived`, `effect`, `props`, `bindable`, `inspect`, `host`) are not stores. It guards the SHAPE only — `bun run test` runs `environment: "node"`, where `$effect` compiles out, so the behaviour is checked in a real browser via `harness/` (see `harness/README.md`). |
 | `harness-fixture-contract` | A stress-harness fixture that has drifted from the interface it stands in for. The harness is the only place `$effect` actually runs, so a fixture answering a shape the app no longer reads turns a verification that could not run into one that looks like it ran and passed. `cmd_get_language_stats` sat there returning `{languages, total_code_lines}` long after the command started returning `{stats, truncated, ...}`, and every harness run since had been exercising an empty language bar and reporting it fine. The field list is derived from `src/lib/fleet/types.ts` rather than restated, because a hand-copied list is the same staleness one level up. |
 | `lipo-shim-contract` | A macOS release that builds and then dies at bundling, naming a file instead of a cause. Tauri's `universal-apple-darwin` build lipos only `mainBinaryName`, while its macOS bundler copies every `[[bin]]` in `Cargo.toml` into the `.app`, so `scripts/bin/lipo` stitches the rest by piggy-backing on the main binary's lipo. That made its helper list load-bearing for the release artifact, and the list was written down: `gitpulse-hook`, added after the list, never joined it. Nothing local could catch it, because a plain `tauri build` targets one architecture and never needs the shim — only the release workflow builds universal. The contract drives the shim with a recorder standing in for the real lipo and asserts that every declared `[[bin]]` is stitched from both architectures, so the list must stay derived. |
 | `codesign-shim-contract` | The macOS universal bundle that now *has* every helper still dies at codesign. Tauri copies every `[[bin]]` into `Contents/MacOS` and signs them in manifest order — main binary first. Once `Info.plist` is in the bundle, codesign treats that file as the bundle executable and every other Mach-O in the same directory as nested code that must already be signed. `lipo` produces unsigned helpers, so the main-binary sign fails with `code object is not signed at all / In subcomponent: <helper>`. A thin `tauri build` cannot see it: linker ad-hoc signatures survive a single-arch copy. `scripts/bin/codesign` signs every sibling Cargo.toml declares, with Tauri's own identity and flags, before the main binary. The contract drives that with a recorder, and on Darwin reproduces Apple's nested-code refusal against `/usr/bin/codesign` so a future codesign that stops caring would fail the characterisation rather than leave the shim looking load-bearing. |
@@ -367,13 +368,13 @@ They are copied into `src-tauri/vendored/` instead, with
 upstream commit, every manifest rewrite, and a hash of every file.
 
 ```bash
-npm run vendor:check
+bun run vendor:check
 ```
 
 **Do not edit these copies.** A fix belongs upstream, followed by:
 
 ```bash
-npm run vendor
+bun run vendor
 ```
 
 Three things the tooling is careful about, each of which was a way to get this
@@ -410,7 +411,7 @@ runs a process goes **through** it, not beside it.
 **2. The IPC seam — narrow, typed, and verified.**
 A command is added in four places, in this order: implement in
 `src-tauri/src/commands/`, register in `src-tauri/src/lib.rs`, invoke from a store or
-component, then run `npm run check:ipc`. A handler with no caller and a call with no
+component, then run `bun run check:ipc`. A handler with no caller and a call with no
 handler both fail the build.
 
 **3. Svelte 5 stores — the state machines.**
@@ -448,7 +449,7 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 1. **One canonical owner.** Do not stand up a second registry, utility, or command
    path beside an existing one. Extend the view registry, the command handlers, and
    `git_cli` rather than duplicating them.
-2. **Strict IPC contracts.** See §4 and §5. `npm run check:ipc` must report zero drift.
+2. **Strict IPC contracts.** See §4 and §5. `bun run check:ipc` must report zero drift.
 3. **Async hygiene.** Use `createAsyncGuard` for component-level async work.
 4. **No unchecked casts.** No `any`, no loose casts. Model every IPC payload with a
    strict type; the Rust struct and the TypeScript interface must agree field for
@@ -468,7 +469,7 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 1. Branch from `main`.
 2. Make the change, with tests.
-3. Run `npm run ci:local` until it is green.
+3. Run `bun run ci:local` until it is green.
 4. Open the PR and fill in
    [the template](.github/PULL_REQUEST_TEMPLATE.md) — it is a short checklist, not
    paperwork.

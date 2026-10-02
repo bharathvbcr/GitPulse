@@ -65,11 +65,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
 
+      # Bun installs and runs the package scripts; Vitest, Vite and
+      # svelte-check still execute on Node through their own shebangs.
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,43 +91,43 @@ jobs:
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
       - name: Install Frontend Dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       # Hosted runners build the embedded reader; the optional external CLI
       # is absent there. Validate the vendored schema and report CLI absence.
       - name: Vendored Schema Gate
-        run: npm run check:vendor-schema -- --allow-missing-cli
+        run: bun run check:vendor-schema -- --allow-missing-cli
 
       - name: IPC Command Contract Gate
-        run: npm run check:ipc
+        run: bun run check:ipc
 
       - name: IPC Wire Type Contract Gate
-        run: npm run check:types
+        run: bun run check:types
 
       # The gate that nothing else covers: the tag, tauri.conf.json (which
       # supplies __VERSION__ in the release name and the bundle version),
-      # Cargo.toml/lock, and package.json/lock must all name one version.
+      # Cargo.toml/lock, and package.json must all name one version.
       # Runs before any build minutes are spent.
       - name: Release Version Gate
-        run: npm run check:release -- --tag "$RELEASE_TAG"
+        run: bun run check:release -- --tag "$RELEASE_TAG"
 
       # Fail here, before 90-minute platform builds, if CHANGELOG.md has no
       # section for this tag. The notes themselves are applied after upload:
       # they are 54 KB for v0.0.5, past the 48 KB environment-file variable cap, so
       # they must not travel through an environment variable.
       - name: Changelog Has Notes For This Tag
-        run: npm run release:notes -- --tag "$RELEASE_TAG"
+        run: bun run release:notes -- --tag "$RELEASE_TAG"
 
       # Repeat local build checks on the tag; prepare also requires successful
       # cross-platform CI and coverage runs for this exact commit.
       - name: Frontend Svelte Check
-        run: npm run check
+        run: bun run check
 
       - name: Frontend Unit Tests (Vitest)
-        run: npm test
+        run: bun run test
 
       - name: Frontend Vite Build
-        run: npm run build
+        run: bun run build
 
       - name: Rust Cargo Format Check
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
@@ -206,11 +210,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
 
+      # tauri-action finds bun.lock and runs `bun tauri`, i.e. the package.json
+      # tauri script; that script and the tauri CLI it starts run on Node.
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -228,7 +236,7 @@ jobs:
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
       - name: Install Frontend Dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Confirm Draft And Tag Before Uploads
         env:

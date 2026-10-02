@@ -293,7 +293,7 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    // 241 since deadbranch commands; `npm run check:ipc` prints all three
+    // 241 since cmd_markdown_parse went; `bun run check:ipc` prints all three
     // numbers, so a bump made without re-running it will not agree.
     expect(found.size).toBe(241);
     expect(found.has("cmd_repository_trust")).toBe(true);

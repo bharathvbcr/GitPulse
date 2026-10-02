@@ -90,10 +90,10 @@ The short path, after installing its prerequisites, is:
 ```sh
 git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
-npm ci
+bun install --frozen-lockfile
 git config core.hooksPath .githooks
-npm run tauri dev
+bun run tauri dev
 ```
 
-Use `npm run tauri build` for host-platform bundles. `npm run build` builds only
+Use `bun run tauri build` for host-platform bundles. `bun run build` builds only
 the frontend; it is not an installer or a native qualification run.

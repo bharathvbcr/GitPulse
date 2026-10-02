@@ -91,7 +91,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # Vendored copies, under `vendored/`, so a lone checkout of GitPulse builds.
 # These crates are owned by Manvi and DevCouncil; nothing here edits them.
-# `npm run vendor:check` compares each copy against its upstream when that
+# `bun run vendor:check` compares each copy against its upstream when that
 # repository is present, and says so plainly when it is not.
 #
 # Credential redaction on the ledger write path. `SECRET_PATTERNS` in dc-verify

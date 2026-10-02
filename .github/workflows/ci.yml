@@ -56,14 +56,18 @@ jobs:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
+      # Bun installs and runs the package scripts; Vitest, Vite and
+      # svelte-check still execute on Node through their own shebangs.
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Install Frontend Dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       # The three contract checkers are pure Node and run in well under a
       # second, so they gate the slow steps rather than trailing them: they
@@ -89,34 +93,34 @@ jobs:
       # `--no-fail-fast` below, applied one level up.
       - name: IPC Contract Check
         if: ${{ !cancelled() }}
-        run: npm run check:ipc
+        run: bun run check:ipc
 
       - name: Coverage Type Contract Check
         if: ${{ !cancelled() }}
-        run: npm run check:types
+        run: bun run check:types
 
       # No --tag on a CI build: with the flag absent the gate still requires
       # all five version manifests to agree and simply skips the tag
       # comparison. release.yml passes --tag "$RELEASE_TAG" at tag time.
       - name: Release Version Gate
         if: ${{ !cancelled() }}
-        run: npm run check:release
+        run: bun run check:release
 
       - name: Frontend Svelte Check
         if: ${{ !cancelled() }}
-        run: npm run check
+        run: bun run check
 
       - name: Frontend Unit Tests (Vitest)
         if: ${{ !cancelled() }}
-        run: npm test
+        run: bun run test
 
       - name: Svelte Browser Regressions (Chrome)
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
-        run: npm run test:browser:all
+        run: bun run test:browser:all
 
       - name: Native Renderer Regressions (WKWebView)
         if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
-        run: npm run test:webkit:all
+        run: bun run test:webkit:all
 
       # Backlog B2, investigated and declined. The frontend bundle is
       # platform-independent, so in principle one leg could build it and share
@@ -137,7 +141,7 @@ jobs:
       # Revisit if the bundle grows enough that the build stops being cheap.
       - name: Frontend Vite Build
         if: ${{ !cancelled() }}
-        run: npm run build
+        run: bun run build
 
       - name: Rust Cargo Format Check
         if: ${{ !cancelled() }}
@@ -222,6 +226,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Go vet and test without the engine
         working-directory: go
         run: |
@@ -241,4 +248,4 @@ jobs:
           go test -race -tags gusset -count=1 ./...
 
       - name: gusset-check
-        run: npm run gusset:check
+        run: bun run gusset:check

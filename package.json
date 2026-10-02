@@ -9,11 +9,12 @@
     "url": "git+https://github.com/bharathvbcr/GitPulse.git"
   },
   "type": "module",
+  "packageManager": "bun@1.4.2",
   "scripts": {
     "dev": "node scripts/vite-dev.mjs",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.json && npm run typecheck",
+    "check": "svelte-check --tsconfig ./tsconfig.json && bun run typecheck",
     "typecheck": "node node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit",
     "check:ipc": "node scripts/check-ipc-contract.mjs",
     "check:types": "node scripts/check-coverage-types.mjs",

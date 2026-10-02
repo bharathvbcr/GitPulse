@@ -31,9 +31,9 @@ cargo install cargo-llvm-cov --locked
 ```sh
 git clone https://github.com/bharathvbcr/GitPulse.git
 cd GitPulse
-npm ci
+bun install --frozen-lockfile
 git config core.hooksPath .githooks
-npm run tauri dev
+bun run tauri dev
 ```
 
 The pre-push hook refuses a release tag that would publish the wrong tree. `release.yml` builds whatever commit the `v*` tag points at; only the machine holding both the tag and the work can know which commit you meant. Deliberate re-release of an older commit: `git push --no-verify`.
@@ -51,7 +51,7 @@ checks and incomplete-result handling.
 ## The gate
 
 ```sh
-npm run ci:local
+bun run ci:local
 ```
 
 Run it before opening a PR. It exercises this machine's toolchain; a local pass
@@ -62,16 +62,16 @@ While iterating:
 
 | Command | Scope |
 | --- | --- |
-| `npm test` | Vitest |
-| `npx vitest run src/lib/graph` | One directory |
+| `bun run test` | Vitest |
+| `bunx vitest run src/lib/graph` | One directory |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust suite |
-| `npm run check` | svelte-check (TS 6 compatibility API) + stable TypeScript 7 `tsc` (`tsconfig.node.json`) |
-| `npm run check:ipc` | Rust `cmd_*` registry ↔ frontend `invoke()` |
-| `npm run check:vendor-schema` | Vendored store schema ↔ installed `devmap` CLI |
-| `npm run check:types` | serde structs ↔ TypeScript interfaces |
-| `npm run check:release` | Version manifests agree |
-| `npm run mcp:install` | Put this tree's `gitpulse-mcp` and `gitpulse-hook` on PATH |
-| `npm run mcp:doctor` | PATH binary matches this tree (not in ci:local) |
+| `bun run check` | svelte-check (TS 6 compatibility API) + stable TypeScript 7 `tsc` (`tsconfig.node.json`) |
+| `bun run check:ipc` | Rust `cmd_*` registry ↔ frontend `invoke()` |
+| `bun run check:vendor-schema` | Vendored store schema ↔ installed `devmap` CLI |
+| `bun run check:types` | serde structs ↔ TypeScript interfaces |
+| `bun run check:release` | Version manifests agree |
+| `bun run mcp:install` | Put this tree's `gitpulse-mcp` and `gitpulse-hook` on PATH |
+| `bun run mcp:doctor` | PATH binary matches this tree (not in ci:local) |
 
 Every bug fix ships with a test that fails against the unfixed code.
 
@@ -79,7 +79,7 @@ Every bug fix ships with a test that fails against the unfixed code.
 
 1. Branch from `main`.
 2. One coherent concern.
-3. `npm run ci:local` green.
+3. `bun run ci:local` green.
 4. Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`).
 5. Fill in the PR template.
 

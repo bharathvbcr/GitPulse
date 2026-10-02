@@ -143,7 +143,7 @@ per line, and negotiate `hello` before using advertised operations:
 GitPulse already supports executable overrides:
 
 ```sh
-GITPULSE_DEVMAP_BIN=/absolute/path/devmap GITPULSE_MANVI_BIN=/absolute/path/manvi npm run tauri dev
+GITPULSE_DEVMAP_BIN=/absolute/path/devmap GITPULSE_MANVI_BIN=/absolute/path/manvi bun run tauri dev
 ```
 
 Its saved tool configuration serves GUI launches that do not inherit the
@@ -380,19 +380,19 @@ instead of leaving an unbounded buffer behind an apparently idle connection.
 1. Validate and commit the canonical DevCouncil and Manvi sources first. Their
    own workspaces run their library tests; GitPulse's vendored copies omit
    upstream test targets and development dependencies explicitly.
-2. From GitPulse, synchronize all crates with `npm run vendor`. Roots are
+2. From GitPulse, synchronize all crates with `bun run vendor`. Roots are
    discovered from sibling checkouts, or selected with
    `GITPULSE_DEVCOUNCIL_ROOT`, `GITPULSE_MANVI_ROOT` and
    `GITPULSE_MARKDEV_ROOT`. Use
-   `npm run vendor -- --crate=devmap-query` for one deliberate scoped update.
-3. Run `npm run vendor:check` without allowing drift. This checks local hashes,
+   `bun run vendor -- --crate=devmap-query` for one deliberate scoped update.
+3. Run `bun run vendor:check` without allowing drift. This checks local hashes,
    the full upstream file set (including deleted files), and the resolved Cargo
    manifests. `comparable: false` means an upstream comparison could not run.
 4. Refresh the installed devmap/Manvi binaries from those validated sources.
-   Run `npm run check:vendor-schema`, then `npm run ci:local` against the final
+   Run `bun run check:vendor-schema`, then `bun run ci:local` against the final
    GitPulse snapshot.
-5. Rebuild the native app and refresh MCP with `npm run mcp:install`. Verify
-   `npm run mcp:doctor`, installed file hashes and a real code-intelligence
+5. Rebuild the native app and refresh MCP with `bun run mcp:install`. Verify
+   `bun run mcp:doctor`, installed file hashes and a real code-intelligence
    query. Restart long-lived host processes to load the replacement binaries.
 
 The vendor command prepares all selected crates before touching the current

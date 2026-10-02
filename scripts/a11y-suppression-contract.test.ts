@@ -14,7 +14,7 @@ function svelteFiles(dir: string): string[] {
 }
 
 /**
- * `npm run check` reporting "0 warnings" means zero *unsuppressed* warnings.
+ * `bun run check` reporting "0 warnings" means zero *unsuppressed* warnings.
  * A bare `svelte-ignore` makes a rule that never ran look the same as a rule
  * that ran and passed, so every suppression must say why it is correct.
  */

@@ -17,9 +17,16 @@ const PKG = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
 };
-const NPM_LOCK = JSON.parse(readFileSync(join(REPO, "package-lock.json"), "utf8")) as {
-  packages: Record<string, { name?: string; version?: string }>;
-};
+// bun.lock is JSON with trailing commas. Each `packages` entry is a tuple whose
+// first element is the resolved `name@version` (the real name for an alias).
+const BUN_LOCK = JSON.parse(
+  readFileSync(join(REPO, "bun.lock"), "utf8").replace(/,(\s*[}\]])/g, "$1"),
+) as { packages: Record<string, [string, ...unknown[]]> };
+
+/** The resolved `name@version` bun.lock installs at node_modules/<key>. */
+function locked(key: string): string | undefined {
+  return BUN_LOCK.packages[key]?.[0];
+}
 
 function packageVersion(name: string): string | undefined {
   const blocks = LOCK.split("[[package]]\n");
@@ -67,11 +74,11 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
 
   it("installs the Health-scan npm refreshes", () => {
     expect(PKG.dependencies?.["@lucide/svelte"]).toBe("^1.47.0");
-    expect(NPM_LOCK.packages["node_modules/@lucide/svelte"]?.version).toBe("1.47.0");
+    expect(locked("@lucide/svelte")).toBe("@lucide/svelte@1.47.0");
     expect(PKG.devDependencies?.vite).toBe("^8.3.0");
-    expect(NPM_LOCK.packages["node_modules/vite"]?.version).toBe("8.3.0");
+    expect(locked("vite")).toBe("vite@8.3.0");
     expect(PKG.devDependencies?.["@types/node"]).toBe("^26.6.2");
-    expect(NPM_LOCK.packages["node_modules/@types/node"]?.version).toBe("26.6.2");
+    expect(locked("@types/node")).toBe("@types/node@26.6.2");
   });
 
   it("excludes local framework ports from CodeQL default setup", () => {
@@ -108,8 +115,8 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
 
   it("runs stable TypeScript 7 while preserving the compiler API for Svelte and contracts", () => {
     expect(PKG.devDependencies?.["@typescript/native-preview"]).toBeUndefined();
-    expect(NPM_LOCK.packages["node_modules/@typescript/native"]?.version).toBe("7.0.2");
-    expect(NPM_LOCK.packages["node_modules/typescript"]?.name).toBe("@typescript/typescript6");
+    expect(locked("@typescript/native")).toBe("typescript@7.0.2");
+    expect(locked("typescript")).toMatch(/^@typescript\/typescript6@/);
     expect(PKG.scripts.typecheck).toBe("node node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit");
     // Run the actual installed CLI: a renamed dependency alone does not prove
     // the check command selects the stable compiler instead of the old API.

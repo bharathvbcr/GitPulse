@@ -11,7 +11,7 @@ without a design conversation first.
 > label set in [`.github/labels.yml`](../.github/labels.yml).
 
 Every entry assumes you have read [CONTRIBUTING.md](../CONTRIBUTING.md) and can get
-`npm run ci:local` green.
+`bun run ci:local` green.
 
 **Difficulty:** 🟢 first issue · 🟡 needs orientation · 🔴 needs design discussion
 
@@ -77,7 +77,7 @@ report.
 
 *Implemented in `.github/workflows/ci.yml` (commits `445d096`, `4a5a7ac`).*
 
-`npm run check:ipc`, `npm run check:types`, and `npm run check:release` now run on every push and pull request across all matrix runners (Ubuntu, macOS, Windows) to prevent cross-language drift.
+`bun run check:ipc`, `bun run check:types`, and `bun run check:release` now run on every push and pull request across all matrix runners (Ubuntu, macOS, Windows) to prevent cross-language drift.
 
 ### B2 · Cache the Vite build across CI jobs ✅ *(Investigated — declined)*
 **Labels:** `area: ci`, `performance`
@@ -105,7 +105,7 @@ grows enough that the build stops being cheap.
 **Labels:** `area: ci`, `test`
 
 *Implemented in [`scripts/check-coverage-floor.mjs`](../scripts/check-coverage-floor.mjs),
-wired as `npm run check:coverage`.*
+wired as `bun run check:coverage`.*
 
 The checker parses both LCOV reports, validates them structurally before trusting any
 number (duplicate `SF` records, `LH` above `LF`, `BRH` disagreeing with the `BRDA`
@@ -115,8 +115,8 @@ cannot be parsed exits `2` — distinct from `1` for a missed floor and `0` for 
 so a check that could not run never reports the same result as one that ran and passed.
 
 It runs in two places: the *Enforce Coverage Floors and Validate LCOV* step of
-[`coverage.yml`](../.github/workflows/coverage.yml), and the tail of `npm run ci:local`,
-which regenerates both reports (`npm run coverage` and `cargo llvm-cov`) before checking
+[`coverage.yml`](../.github/workflows/coverage.yml), and the tail of `bun run ci:local`,
+which regenerates both reports (`bun run coverage` and `cargo llvm-cov`) before checking
 them so a stale `lcov.info` cannot be mistaken for a passing run.
 
 Thresholds are overridable per invocation via `--frontend-lines`, `--frontend-branches`,

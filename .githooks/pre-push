@@ -68,7 +68,7 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
   # gates can be reused as-is rather than reimplemented against a git object.
   if ! (cd "$repo_root" && node scripts/check-release-version.mjs --tag "$tag" >/dev/null 2>&1); then
     fail "tag '$tag' does not match the version manifests. Run:
-        npm run check:release -- --tag $tag"
+        bun run check:release -- --tag $tag"
     continue
   fi
 
@@ -96,7 +96,7 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
         green CI the release gate requires. release.yml refuses to prepare a draft unless
         ci.yml AND coverage.yml each have a successful push run for that exact commit, and
         neither runs on tags. Push the branch first, let both finish, then push the tag.
-        See what the gate sees with:  npm run release:ready
+        See what the gate sees with:  bun run release:ready
         This also fails when GitHub could not be reached, because an unverified release is
         not a verified one. Override deliberately with:  git push --no-verify"
     continue

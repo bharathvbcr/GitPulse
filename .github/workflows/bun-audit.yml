@@ -1,0 +1,26 @@
+name: Dependency audit
+
+# GitHub's dependency graph does not read bun.lock, so Dependabot raises no
+# alerts or security PRs for transitive JS dependencies. This gate does.
+on:
+  push:
+    paths: ["package.json", "bun.lock", ".github/workflows/bun-audit.yml"]
+  pull_request:
+    paths: ["package.json", "bun.lock", ".github/workflows/bun-audit.yml"]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Fail closed: the audit only reads the checkout.
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - name: bun audit
+        run: bun audit

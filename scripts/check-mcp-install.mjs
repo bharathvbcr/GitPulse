@@ -35,7 +35,7 @@
  * check above — which is exactly what happened: a `gitpulse-hook` built the day
  * before a repository-trust fix was reported `ok` here while it went on
  * emitting the pre-fix refusal. So a third half asks what source the binaries
- * were actually built from, recorded by `npm run mcp:install` and re-derived
+ * were actually built from, recorded by `bun run mcp:install` and re-derived
  * here; see `install-identity.mjs`. Its verdicts add `unverifiable`, which is
  * never folded into `ok` — an install nobody recorded must not read the same
  * as one that was checked and matched.
@@ -47,7 +47,7 @@
  *
  * Not part of `ci:local`: CI has no reason to install either binary, and a
  * check that cannot run there must not be made to look like one that passed.
- * Refresh with `npm run mcp:install`.
+ * Refresh with `bun run mcp:install`.
  *
  * Exit codes: 0 ok · 1 absent/stale/unresponsive/unverifiable · 2 internal error.
  *
@@ -298,7 +298,7 @@ export function classify({ binPath, version, storeSchema, error, expected, expec
       status: "absent",
       violations: [
         `no ${SERVER_BIN} on PATH — the MCP manifests spawn that bare name, so no client can start the server`,
-        "install it with: npm run mcp:install",
+        "install it with: bun run mcp:install",
       ],
     };
   }
@@ -313,7 +313,7 @@ export function classify({ binPath, version, storeSchema, error, expected, expec
       status: "stale",
       violations: [
         `${binPath} reports version ${JSON.stringify(version)} but this tree is ${JSON.stringify(expected)}`,
-        "refresh it with: npm run mcp:install",
+        "refresh it with: bun run mcp:install",
       ],
     };
   }
@@ -326,7 +326,7 @@ export function classify({ binPath, version, storeSchema, error, expected, expec
   if (storeSchema !== expectedSchema) {
     return {
       status: "stale",
-      violations: [`${binPath} reads store schema ${storeSchema} but this tree reads ${expectedSchema}`, "refresh it with: npm run mcp:install"],
+      violations: [`${binPath} reads store schema ${storeSchema} but this tree reads ${expectedSchema}`, "refresh it with: bun run mcp:install"],
     };
   }
   return { status: "ok", violations: [] };
@@ -481,7 +481,7 @@ export function classifyHook({ binPath, version, subcommands, error, expected, d
       status: "absent",
       violations: [
         `no ${HOOK_BIN} on PATH — ${HOOKS_MANIFEST} spawns that bare name, so every hook it declares is a non-blocking error and the gate is silently disabled`,
-        "install it with: npm run mcp:install",
+        "install it with: bun run mcp:install",
       ],
     };
   }
@@ -496,7 +496,7 @@ export function classifyHook({ binPath, version, subcommands, error, expected, d
       status: "stale",
       violations: [
         `${binPath} reports version ${JSON.stringify(version)} but this tree is ${JSON.stringify(expected)}`,
-        "refresh it with: npm run mcp:install",
+        "refresh it with: bun run mcp:install",
       ],
     };
   }
@@ -506,7 +506,7 @@ export function classifyHook({ binPath, version, subcommands, error, expected, d
       status: "stale",
       violations: [
         `${binPath} does not serve ${missing.join(", ")}, which ${HOOKS_MANIFEST} declares — those hooks would run and decide nothing`,
-        "refresh it with: npm run mcp:install",
+        "refresh it with: bun run mcp:install",
       ],
     };
   }
@@ -551,7 +551,7 @@ export function classifyProvenance({ record, treeDigest, treeFileCount, binPaths
       status: "unverifiable",
       violations: [
         `no usable install record at ${recordPath()} — the binaries on PATH cannot be traced to any source`,
-        "record one with: npm run mcp:install",
+        "record one with: bun run mcp:install",
       ],
     };
   }
@@ -573,8 +573,8 @@ export function classifyProvenance({ record, treeDigest, treeFileCount, binPaths
       status: "unverifiable",
       violations: [
         ...unknown.map((bin) => `${bin} is on PATH but the install record does not describe it`),
-        ...replaced.map((bin) => `${bin} has changed since it was recorded — something other than npm run mcp:install wrote it`),
-        "re-record with: npm run mcp:install",
+        ...replaced.map((bin) => `${bin} has changed since it was recorded — something other than bun run mcp:install wrote it`),
+        "re-record with: bun run mcp:install",
       ],
     };
   }
@@ -585,7 +585,7 @@ export function classifyProvenance({ record, treeDigest, treeFileCount, binPaths
       violations: [
         `the binaries on PATH were built from source that differs from this tree${from} — installed ${record.installedAt}`,
         `recorded digest ${record.sourceDigest.slice(0, 16)}… over ${record.sourceFileCount} files; this tree is ${treeDigest.slice(0, 16)}… over ${treeFileCount}`,
-        "refresh it with: npm run mcp:install",
+        "refresh it with: bun run mcp:install",
       ],
     };
   }

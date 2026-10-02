@@ -15,11 +15,15 @@ import { GATES, commandLine, runGates, skipReason, summarize } from "./ci-local.
 const workflow = (name: string) =>
   readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8");
 
-/** npm script names a workflow (or a command line) invokes: `npm run x` / `npm test`. */
+/**
+ * package.json script names a workflow (or a command line) invokes: `bun run x`.
+ * Bare `bun test` is Bun's own test runner, not the `test` script, so it is
+ * deliberately not matched.
+ */
 function npmScripts(text: string): Set<string> {
   const found = new Set<string>();
-  for (const match of text.matchAll(/\bnpm (?:run ([\w:.-]+)|(test)\b)/g)) {
-    found.add(match[1] ?? match[2]);
+  for (const match of text.matchAll(/\bbun run ([\w:.-]+)/g)) {
+    found.add(match[1]);
   }
   return found;
 }
@@ -31,7 +35,7 @@ const ALL_WORKFLOWS = ["ci.yml", "coverage.yml", "release.yml"];
 function gateScripts(): Set<string> {
   const found = new Set<string>();
   for (const gate of GATES) {
-    if (gate.program === "npm") {
+    if (gate.program === "bun") {
       found.add(gate.args[0] === "run" ? gate.args[1] : gate.args[0]);
     }
     for (const covered of gate.covers ?? []) {
@@ -47,9 +51,8 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     for (const file of PUSH_WORKFLOWS) {
       for (const script of npmScripts(workflow(file))) remote.add(script);
     }
-    // `npm ci` is dependency installation, not a gate; a local checkout has
-    // already done it. Nothing else is exempt.
-    remote.delete("ci");
+    // `bun install` is dependency installation, not a gate, and is not a
+    // `bun run` script, so it never enters this set. Nothing is exempt.
     expect(remote.size).toBeGreaterThan(5);
 
     const local = gateScripts();
@@ -85,7 +88,7 @@ describe("ci:local mirrors the workflows it stands in for", () => {
   });
 
   it("runs the WKWebView sweep CI runs, and only where it can", () => {
-    expect(workflow("ci.yml")).toContain("npm run test:webkit:all");
+    expect(workflow("ci.yml")).toContain("bun run test:webkit:all");
     const webkit = GATES.find((gate) => gate.id === "webkit-regressions");
     expect(webkit).toBeDefined();
     expect(webkit?.onlyOn).toBe("darwin");

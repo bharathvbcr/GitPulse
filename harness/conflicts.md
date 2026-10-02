@@ -23,9 +23,9 @@ layouts were visually inspected.
 Native behavior is checked separately:
 
 ```sh
-npm run test:browser -- --harness conflicts
-npm run test:webkit -- --harness conflicts
-npm test -- src/lib/components/ConflictEditor.test.ts src/lib/diff/conflictSession.test.ts src/lib/diff/conflictPresentation.test.ts src/lib/files/editorDraftRegistry.test.ts
+bun run test:browser -- --harness conflicts
+bun run test:webkit -- --harness conflicts
+bun run test -- src/lib/components/ConflictEditor.test.ts src/lib/diff/conflictSession.test.ts src/lib/diff/conflictPresentation.test.ts src/lib/files/editorDraftRegistry.test.ts
 cargo test --manifest-path src-tauri/Cargo.toml --lib diff::conflict
 cargo test --manifest-path src-tauri/Cargo.toml --test conflict_hardening --test conflict_save_integration --test repo_operation_integration --test stress_test
 ```

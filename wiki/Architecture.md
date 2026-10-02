@@ -55,7 +55,7 @@ flowchart TB
     Backend --> LocalBox
 ```
 
-The 241-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `npm run check:ipc`.
+The 241-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
 
 ## Layout
 
@@ -148,7 +148,7 @@ contracts. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/bl
 
 ## Vendored crates
 
-DevCouncil (`dc-*`, `devmap-*`) and MarkDev (`markdev`) crates are copied into `src-tauri/vendored/` so a lone GitPulse checkout builds. Manvi is the wrap around those components at runtime (`manvi serve`), not a vendor origin. Do not edit those copies. Fix upstream, then `npm run vendor`. `npm run vendor:check` reports an upstream that is not checked out as **unavailable**, never **matches**. `npm run check:vendor-schema` pins the vendored store schema against the installed `devmap` CLI when present.
+DevCouncil (`dc-*`, `devmap-*`) and MarkDev (`markdev`) crates are copied into `src-tauri/vendored/` so a lone GitPulse checkout builds. Manvi is the wrap around those components at runtime (`manvi serve`), not a vendor origin. Do not edit those copies. Fix upstream, then `bun run vendor`. `bun run vendor:check` reports an upstream that is not checked out as **unavailable**, never **matches**. `bun run check:vendor-schema` pins the vendored store schema against the installed `devmap` CLI when present.
 
 ## Contracts
 

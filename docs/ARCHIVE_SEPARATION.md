@@ -117,8 +117,8 @@ is separate, and `{archived:true}` is the archive across every status.
 
 ### 3. Re-vendor
 
-`npm run vendor` from this repository with `GITPULSE_DEVCOUNCIL_ROOT` set,
-then `npm run vendor:check` and `npm run check:vendor-schema`.
+`bun run vendor` from this repository with `GITPULSE_DEVCOUNCIL_ROOT` set,
+then `bun run vendor:check` and `bun run check:vendor-schema`.
 
 ## The GitPulse side
 

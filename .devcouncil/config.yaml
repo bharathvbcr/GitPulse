@@ -13,9 +13,9 @@ commands:
   lint:
   - eslint .
   test:
-  - npm test
+  - bun run test
   typecheck:
-  - npm run check
+  - bun run check
 execution:
   checkpoint_before_each_task: true
   coding_cli_probe_order: []

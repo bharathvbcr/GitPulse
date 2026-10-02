@@ -244,8 +244,8 @@ MANVI workflow for branch cleanup. Git history/reflog pruning is not automated.
 - `harness/hygiene.html`: rendered interaction regressions using controlled IPC
   fixtures; these are UI tests, not proof of real cache deletion.
 
-Run `npm run test:browser -- --harness hygiene` (or add `--webkit` on macOS),
-`npm test -- src/lib/storage`, and the native `storage::hygiene`, `storage_stress`
+Run `bun run test:browser -- --harness hygiene` (or add `--webkit` on macOS),
+`bun run test -- src/lib/storage`, and the native `storage::hygiene`, `storage_stress`
 and `hygiene_regression` tests using `src-tauri/Cargo.toml`. Run the repository's
 IPC/type checks and Clippy after changing the command boundary. The regression
 for untracked environments/agent state was observed failing before the fix.

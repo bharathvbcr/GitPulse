@@ -1,0 +1,4 @@
+# Running a file directly with Bun (`bun scripts/x.mjs`) loads .env and
+# .env.local into it; node never did. `bun run <script>` does not, but keep the
+# two paths alike so a secret can't reach a script by which runner was used.
+env = false

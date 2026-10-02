@@ -27,7 +27,7 @@ import { escapeRegExp } from "../src/lib/text/lineSearch.ts";
  *    this shape. Svelte runes (`state`, `derived`, `effect`, `props`,
  *    `bindable`, `inspect`, `host`) are not stores.
  *
- * Neither is visible in `npm test` on its own: vitest runs
+ * Neither is visible in `bun run test` on its own: vitest runs
  * `environment: "node"`, where `$effect` compiles out entirely.
  *
  * Every roster below is derived from the tree rather than listed here. The

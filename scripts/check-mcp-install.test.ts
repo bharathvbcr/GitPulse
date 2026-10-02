@@ -194,7 +194,7 @@ describe("parseServerManifest", () => {
 
 /**
  * probeServer spawns an executable directly, so these drive it through a
- * shebang script. Windows cannot exec a `.mjs` that way and `npm test` runs on
+ * shebang script. Windows cannot exec a `.mjs` that way and `bun run test` runs on
  * `windows-latest`, so the spawn-backed cases are POSIX-only — following
  * dev-port.test.ts. The parsing and classification above, which is where the
  * decisions live, still runs on every platform.

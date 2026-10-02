@@ -11,8 +11,8 @@ Protocol: [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07
 From a GitPulse checkout:
 
 ```sh
-npm run mcp:install
-npm run mcp:doctor
+bun run mcp:install
+bun run mcp:doctor
 ```
 
 `mcp:install` puts this tree's `gitpulse-mcp` **and** `gitpulse-hook` on `PATH`. `mcp:doctor` reports each separately, distinguishing **absent**, **unresponsive**, and **stale** from **matching**. A missing binary must not look like a current one.

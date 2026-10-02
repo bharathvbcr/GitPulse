@@ -1,6 +1,6 @@
 # Branch copy and merge
 
-Open `/harness/branches.html` using the project's `npm run dev` server for an
+Open `/harness/branches.html` using the project's `bun run dev` server for an
 interactive preview. Add `?theme=light` to inspect the light theme.
 The page mounts the production branch sidebar, merge dialog, and notifications
 with explicit IPC fixtures. Its merges do not modify real repositories.
@@ -8,8 +8,8 @@ with explicit IPC fixtures. Its merges do not modify real repositories.
 Run the interaction regressions with:
 
 ```sh
-npm run test:browser -- --harness branches
-npm run test:webkit -- --harness branches
+bun run test:browser -- --harness branches
+bun run test:webkit -- --harness branches
 ```
 
 The checks open with the two-line branch row, which is geometry and so can

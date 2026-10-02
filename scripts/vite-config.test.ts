@@ -78,7 +78,7 @@ describe("gitpulseTauriFullReload", () => {
 describe("TypeScript 6 ambient types", () => {
   it("names node and vite/client so svelte-check can see process, node:*, and CSS", () => {
     // TS 6 defaults `types` to [] and stops auto-including @types/*. Without
-    // this list, `npm run check` reports 250 missing-name errors that tests
+    // this list, `bun run check` reports 250 missing-name errors that tests
     // never see, because Vitest loads Node types through its own pipeline.
     expect(tsconfig.compilerOptions?.types).toEqual(["node", "vite/client"]);
   });

@@ -53,17 +53,21 @@ jobs:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
+      # Bun installs and runs the package scripts; Vitest still executes on
+      # Node through its own shebang.
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Install Frontend Dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Frontend Coverage (Vitest + v8)
-        run: npm run coverage
+        run: bun run coverage
 
       - name: Verify Frontend LCOV Was Produced
         run: |
@@ -99,7 +103,7 @@ jobs:
           }
 
       - name: Enforce Coverage Floors and Validate LCOV
-        run: npm run check:coverage
+        run: bun run check:coverage
 
       - name: Upload Rust Coverage Artifact
         uses: actions/upload-artifact@v7

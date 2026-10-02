@@ -326,7 +326,7 @@ describe("Claude Code marketplace manifest", () => {
 });
 
 /**
- * Every executable the package spawns must be one `npm run mcp:install` puts
+ * Every executable the package spawns must be one `bun run mcp:install` puts
  * on PATH.
  *
  * This is the half of the contract that lives outside the package. The files
@@ -376,7 +376,7 @@ describe("the package's executables are installable", () => {
     return found;
   }
 
-  /** The `--bin` names `npm run mcp:install` actually installs. */
+  /** The `--bin` names `bun run mcp:install` actually installs. */
   function installedExecutables(): Set<string> {
     const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
       scripts: Record<string, string>;
@@ -396,7 +396,7 @@ describe("the package's executables are installable", () => {
     for (const bin of spawnedExecutables()) {
       expect(
         installed,
-        `the package spawns ${bin} but npm run mcp:install does not install it; a host would get "command not found"`,
+        `the package spawns ${bin} but bun run mcp:install does not install it; a host would get "command not found"`,
       ).toContain(bin);
     }
   });
@@ -417,7 +417,7 @@ describe("the package's executables are installable", () => {
   it("is the install command the docs tell people to run", () => {
     // A second, undocumented install path is how the first one goes stale.
     const contributing = readFileSync(path.join(ROOT, "CONTRIBUTING.md"), "utf8");
-    expect(contributing).toContain("npm run mcp:install");
+    expect(contributing).toContain("bun run mcp:install");
   });
 });
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Release version gate — the seven manifests that carry a version must agree,
+ * Release version gate — every manifest that carries a version must agree,
  * and (when a tag is supplied) the tag must name that same version.
  *
  * Nothing else in the repo owns this invariant, and every part of the release
@@ -11,7 +11,8 @@
  *                                bundle version baked into the .dmg/.msi/.deb
  *   - src-tauri/Cargo.toml    -> the compiled crate version
  *   - src-tauri/Cargo.lock    -> must track Cargo.toml or `--locked` builds fail
- *   - package.json / -lock.json -> `npm ci` fails outright when these disagree
+ *   - package.json            -> the frontend package version (bun.lock records
+ *                                no root version, so it has no copy to drift)
  *   - every plugin manifest   -> the version an agent client reads out of the
  *                                package, and records at install time
  *
@@ -39,7 +40,6 @@
  *   --tag <vX.Y.Z>       also require the tag to match (leading `v` required)
  *   --root <dir>         resolve every default manifest under <dir>
  *   --package <path>     alternate package.json
- *   --package-lock <path> alternate package-lock.json
  *   --tauri-conf <path>  alternate tauri.conf.json
  *   --cargo-toml <path>  alternate Cargo.toml
  *   --cargo-lock <path>  alternate Cargo.lock
@@ -64,7 +64,6 @@ export const CRATE_NAME = "gitpulse";
 export function defaultSources(root) {
   return {
     packagePath: path.join(root, "package.json"),
-    packageLockPath: path.join(root, "package-lock.json"),
     tauriConfPath: path.join(root, "src-tauri", "tauri.conf.json"),
     cargoTomlPath: path.join(root, "src-tauri", "Cargo.toml"),
     cargoLockPath: path.join(root, "src-tauri", "Cargo.lock"),
@@ -222,19 +221,6 @@ export function collectVersions(sources) {
     const pkg = /** @type {{ version?: unknown }} */ (readJson(sources.packagePath));
     return typeof pkg.version === "string" ? pkg.version : null;
   });
-  // package-lock.json carries the version twice; npm ci trusts both, so both
-  // are checked rather than assuming they were written together.
-  add("package-lock.json (root)", sources.packageLockPath, () => {
-    const lock = /** @type {{ version?: unknown }} */ (readJson(sources.packageLockPath));
-    return typeof lock.version === "string" ? lock.version : null;
-  });
-  add('package-lock.json (packages[""])', sources.packageLockPath, () => {
-    const lock = /** @type {{ packages?: Record<string, { version?: unknown }> }} */ (
-      readJson(sources.packageLockPath)
-    );
-    const root = lock.packages?.[""];
-    return root && typeof root.version === "string" ? root.version : null;
-  });
   add("src-tauri/tauri.conf.json", sources.tauriConfPath, () => {
     const conf = /** @type {{ version?: unknown }} */ (readJson(sources.tauriConfPath));
     return typeof conf.version === "string" ? conf.version : null;
@@ -378,7 +364,6 @@ export function parseArgs(argv) {
     else if (arg === "--tag") tag = next(arg);
     else if (arg === "--root") root = path.resolve(next(arg));
     else if (arg === "--package") overrides.packagePath = path.resolve(next(arg));
-    else if (arg === "--package-lock") overrides.packageLockPath = path.resolve(next(arg));
     else if (arg === "--tauri-conf") overrides.tauriConfPath = path.resolve(next(arg));
     else if (arg === "--cargo-toml") overrides.cargoTomlPath = path.resolve(next(arg));
     else if (arg === "--cargo-lock") overrides.cargoLockPath = path.resolve(next(arg));
@@ -403,7 +388,6 @@ export function usage() {
       { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag the manifests must match (omit for branch checks)" },
       { flag: "--root <dir>".replace(/^"|"$/g, ""), description: "repository root to resolve the default manifest paths from" },
       { flag: "--package <path>".replace(/^"|"$/g, ""), description: "override package.json" },
-      { flag: "--package-lock <path>".replace(/^"|"$/g, ""), description: "override package-lock.json" },
       { flag: "--tauri-conf <path>".replace(/^"|"$/g, ""), description: "override tauri.conf.json" },
       { flag: "--cargo-toml <path>".replace(/^"|"$/g, ""), description: "override Cargo.toml" },
       { flag: "--cargo-lock <path>".replace(/^"|"$/g, ""), description: "override Cargo.lock" },

@@ -1,6 +1,6 @@
 # Overview preview
 
-Run `GITPULSE_DEV_PORT=5194 npm run dev -- --host 127.0.0.1`, then open
+Run `GITPULSE_DEV_PORT=5194 bun run dev -- --host 127.0.0.1`, then open
 `http://127.0.0.1:5194/harness/overview.html`.
 
 This mounts production `WorkView` through the real repository store with
@@ -26,11 +26,11 @@ pane to inspect both themes.
 Focused checks:
 
 ```sh
-npm test -- src/lib/work src/lib/components/WorkView.test.ts src/lib/stores/__tests__/repoStore.test.ts
-npm run check
-npm run check:ipc
-npm run check:types
-npm run build
+bun run test -- src/lib/work src/lib/components/WorkView.test.ts src/lib/stores/__tests__/repoStore.test.ts
+bun run check
+bun run check:ipc
+bun run check:types
+bun run build
 cargo test --manifest-path src-tauri/Cargo.toml --lib insights::tests::collision_risk -- --test-threads=2
 ```
 

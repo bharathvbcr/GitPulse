@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile, readlink } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -227,7 +228,7 @@ export function isTauriDevArgs(args) {
 }
 
 /**
- * Forward Ctrl-C / SIGTERM to a spawned bin so Vite cannot outlive `npm run dev`
+ * Forward Ctrl-C / SIGTERM to a spawned bin so Vite cannot outlive `bun run dev`
  * and hold 5173 for the next launch.
  *
  * @param {import("node:child_process").ChildProcess} child
@@ -268,18 +269,30 @@ export function attachChildLifetime(child, hooks = process) {
 }
 
 /**
+ * The installed shim for a local bin. On Windows, Bun links
+ * `node_modules/.bin/<name>.exe` (with a `.bunx` sidecar) and writes no
+ * `.cmd`; npm wrote `<name>.cmd`. Prefer a `.cmd` that exists, else the `.exe`.
+ *
+ * @param {string} repoRoot
+ * @param {string} name
+ * @param {NodeJS.Platform} [platform]
+ * @param {(file: string) => boolean} [exists]
+ */
+export function localBinPath(repoRoot, name, platform = process.platform, exists = existsSync) {
+  const dir = path.join(repoRoot, "node_modules", ".bin");
+  if (platform !== "win32") return path.join(dir, name);
+  const cmd = path.join(dir, `${name}.cmd`);
+  return exists(cmd) ? cmd : path.join(dir, `${name}.exe`);
+}
+
+/**
  * @param {string} repoRoot
  * @param {string} name
  * @param {string[]} args
  * @param {NodeJS.ProcessEnv} [env]
  */
 export function spawnLocalBin(repoRoot, name, args, env = process.env) {
-  const bin = path.join(
-    repoRoot,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? `${name}.cmd` : name,
-  );
+  const bin = localBinPath(repoRoot, name);
   const child = spawn(bin, args, {
     cwd: repoRoot,
     env,
@@ -556,7 +569,7 @@ function formatBlockers(port, blockers, diagnostics = []) {
       lines.push("  (could not identify the process holding the port)");
     }
   }
-  lines.push("Stop that process, or run `npm run tauri dev` to pick a free port.");
+  lines.push("Stop that process, or run `bun run tauri dev` to pick a free port.");
   return lines.join("\n");
 }
 

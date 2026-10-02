@@ -92,14 +92,14 @@ of every view/section, and callback routing to existing stores.
 Run:
 
 ```sh
-npm test -- src/lib/palette src/lib/components/CommandPalette.test.ts src/lib/components/CommandPalette.tools.test.ts src/App.test.ts
-npm run test:browser -- --harness palette
-npm run test:webkit -- --harness palette
-npm run check
-npm run coverage
-npm run check:ipc
-npm run check:types
-npm run build
+bun run test -- src/lib/palette src/lib/components/CommandPalette.test.ts src/lib/components/CommandPalette.tools.test.ts src/App.test.ts
+bun run test:browser -- --harness palette
+bun run test:webkit -- --harness palette
+bun run check
+bun run coverage
+bun run check:ipc
+bun run check:types
+bun run build
 ```
 
 The browser harness mounts production components with explicit IPC fixtures; it

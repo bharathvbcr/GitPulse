@@ -45,8 +45,6 @@ async function scratchTree(
   prefix: string,
   versions: Partial<{
     pkg: string;
-    lockRoot: string;
-    lockPackages: string;
     tauri: string;
     cargoToml: string;
     cargoLock: string;
@@ -58,8 +56,6 @@ async function scratchTree(
   const base = "0.4.2";
   const v = {
     pkg: base,
-    lockRoot: base,
-    lockPackages: base,
     tauri: base,
     cargoToml: base,
     cargoLock: base,
@@ -77,19 +73,6 @@ async function scratchTree(
   await writeFile(
     path.join(dir, "package.json"),
     JSON.stringify({ name: CRATE_NAME, version: v.pkg }, null, 2),
-  );
-  await writeFile(
-    path.join(dir, "package-lock.json"),
-    JSON.stringify(
-      {
-        name: CRATE_NAME,
-        version: v.lockRoot,
-        lockfileVersion: 3,
-        packages: { "": { name: CRATE_NAME, version: v.lockPackages } },
-      },
-      null,
-      2,
-    ),
   );
   await writeFile(
     path.join(dir, "src-tauri", "tauri.conf.json"),
@@ -127,8 +110,6 @@ describe("release version gate", () => {
     expect(stdout).toMatch(/OK: all version sources agree on \d+\.\d+\.\d+/);
     for (const label of [
       "package.json",
-      "package-lock.json (root)",
-      'package-lock.json (packages[""])',
       "src-tauri/tauri.conf.json",
       "src-tauri/Cargo.toml",
       `src-tauri/Cargo.lock (${CRATE_NAME})`,
@@ -165,11 +146,17 @@ describe("release version gate", () => {
     expect(stdout).toMatch(new RegExp(`src-tauri/Cargo\\.lock \\(${CRATE_NAME}\\) = "0\\.4\\.1"`));
   });
 
-  it("fails when package-lock's nested packages[''] entry drifts alone", async () => {
-    const dir = await scratchTree("nested-drift", { lockPackages: "0.4.1" });
+  it("does not gate on a package-lock.json, which Bun neither writes nor reads", async () => {
+    // bun.lock records no root version, so package.json is the only frontend
+    // version source. A stale npm lockfile left on disk must not fail the gate.
+    const dir = await scratchTree("stale-npm-lock");
+    await writeFile(
+      path.join(dir, "package-lock.json"),
+      JSON.stringify({ name: CRATE_NAME, version: "0.4.1", packages: { "": { version: "0.4.1" } } }),
+    );
     const { code, stdout } = await runScript(["--root", dir]);
-    expect(code).toBe(1);
-    expect(stdout).toMatch(/packages\[""\]\) = "0\.4\.1"/);
+    expect(code).toBe(0);
+    expect(stdout).not.toContain("package-lock.json");
   });
 
   it("fails when the Agent Plugins manifest lags the app manifests", async () => {
