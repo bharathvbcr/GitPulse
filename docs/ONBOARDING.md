@@ -61,15 +61,15 @@ and [Downloads folder documentation](https://developer.apple.com/documentation/b
 
 ## Verification
 
-- `npm test -- src/lib/tools/productTour.test.ts src/lib/tools/productTourTarget.test.ts scripts/onboarding-contract.test.ts`
+- `bun run test -- src/lib/tools/productTour.test.ts src/lib/tools/productTourTarget.test.ts scripts/onboarding-contract.test.ts`
   checks persistence, bounded navigation, corrupt state, unavailable storage,
   failed completion/retry, viewport placement, native purpose strings, and App integration.
-- `npm run test:browser -- --harness onboarding` mounts the production component
+- `bun run test:browser -- --harness onboarding` mounts the production component
   and exercises live targets, actual Open-menu interactions, picker cancellation,
   failure and retry, view/Tasks/Settings state, moving and missing targets,
   replay/relaunch, modal focus trapping, live focus handoff, restoration, Escape,
   platform copy, and storage failure recovery.
-- `npm run test:webkit -- --harness onboarding` repeats those checks in native
+- `bun run test:webkit -- --harness onboarding` repeats those checks in native
   WebKit. Both are registered in the repository's all-harness runners.
 - `/harness/onboarding.html` is the manual preview; `?check=1` runs its assertions.
 
