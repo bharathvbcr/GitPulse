@@ -10,6 +10,7 @@ import {
   isStale,
   locationChips,
   scopeNotes,
+  scanFailureCopy,
   shouldCache,
   STALE_AFTER_MS,
   verdict,
@@ -19,6 +20,7 @@ function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
   return {
     ok: true,
     error: null,
+    diagnostic: null,
     kingfisher_present: true,
     kingfisher_version: "2.7.0",
     nested_repos_scanned: true,
@@ -173,7 +175,54 @@ describe("staleness and caching", () => {
   });
 });
 
+describe("scanFailureCopy", () => {
+  it("joins the reason with the diagnostic, and stands alone when there is none", () => {
+    const text = scanFailureCopy(
+      report({
+        ok: false,
+        error: "kingfisher did not finish within 300s",
+        diagnostic: "kingfisher: 2.7.0\nstdout_bytes_captured: 0",
+      }),
+    );
+    expect(text).toBe(
+      "kingfisher did not finish within 300s\nkingfisher: 2.7.0\nstdout_bytes_captured: 0",
+    );
+    expect(scanFailureCopy(report({ ok: false, error: "kingfisher could not be started" }))).toBe(
+      "kingfisher could not be started",
+    );
+    expect(scanFailureCopy(null)).toBe("The scanner did not complete.");
+  });
+});
+
 describe("parseSecretsReport", () => {
+  it("strips a planted token from the error and the diagnostic before the panel can show them", () => {
+    const token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    const parsed = parseSecretsReport({
+      ...report(),
+      ok: false,
+      error: `kingfisher failed near ${token}`,
+      diagnostic: `binary: /tmp/${token}\nstdout_bytes_captured: 0`,
+    });
+    const text = JSON.stringify(parsed);
+    expect(text).not.toContain(token);
+    expect(parsed.error).toContain("kingfisher failed near");
+    expect(parsed.diagnostic).toContain("stdout_bytes_captured: 0");
+  });
+
+  it("redacts a token that crosses the diagnostic length cap before cutting", () => {
+    const token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    const parsed = parseSecretsReport({
+      ...report(),
+      ok: false,
+      // A slash is a token boundary. The 10 characters of the token that fit
+      // under the 4000-character cap are what a cap-first parser would keep.
+      diagnostic: `${"/".repeat(3_990)}${token}`,
+    });
+    const text = parsed.diagnostic ?? "";
+    expect(text).not.toContain(token.slice(0, 10));
+    expect(text.length).toBeLessThanOrEqual(4_000);
+  });
+
   it("keeps only allowlisted finding fields", () => {
     const parsed = parseSecretsReport({
       ...report(),
@@ -188,6 +237,7 @@ describe("parseSecretsReport", () => {
       findings_total: 1,
     });
     expect(parsed.findings).toHaveLength(1);
+    expect(parsed.diagnostic).toBeNull();
     const text = JSON.stringify(parsed);
     for (const leaked of ["ghp_SHOULD_NOT_APPEAR", "snippet", "fingerprint"]) {
       expect(text).not.toContain(leaked);

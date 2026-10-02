@@ -85,6 +85,11 @@ pub struct SecretsReport {
     pub ok: bool,
     /// Fixed reason string only. Never carries Kingfisher stdout or stderr.
     pub error: Option<String>,
+    /// Copyable facts about a failed run: version, binary, jobs, deadline,
+    /// elapsed, and how many bytes were captured. Never Kingfisher's stdout
+    /// or stderr — those can contain secrets. Absent when the scan is fine
+    /// or was only superseded.
+    pub diagnostic: Option<String>,
     pub kingfisher_present: bool,
     pub kingfisher_version: Option<String>,
     /// Kingfisher defaults nested-repo scanning on, and its CLI flag cannot
@@ -118,6 +123,7 @@ impl SecretsReport {
         Self {
             ok: false,
             error: Some(error),
+            diagnostic: None,
             kingfisher_present: present,
             kingfisher_version: version,
             nested_repos_scanned: true,
@@ -238,7 +244,7 @@ pub(crate) fn parse_kingfisher_json(
 
 /// `kingfisher 2.7.0` (the `--version` line) and `2.7.0` (the envelope) name
 /// the same release; the header prints "Kingfisher <version>" itself.
-fn clean_version(raw: &str) -> Option<String> {
+pub(super) fn clean_version(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let bare = trimmed
         .strip_prefix("kingfisher ")
@@ -247,7 +253,13 @@ fn clean_version(raw: &str) -> Option<String> {
     if bare.is_empty() || bare.chars().any(char::is_control) {
         return None;
     }
-    Some(bare.chars().take(MAX_VERSION_CHARS).collect())
+    // Redact before the length cap. Truncating first can split a token so
+    // the redactor no longer recognises it, and the kept prefix is the leak.
+    let redacted = crate::ledger::redact::text(bare);
+    if redacted.is_empty() {
+        return None;
+    }
+    Some(redacted.chars().take(MAX_VERSION_CHARS).collect())
 }
 
 /// Read Kingfisher's repository audit (`kingfisher.repository-audit.v1`).

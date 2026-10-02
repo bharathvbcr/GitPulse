@@ -336,6 +336,105 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_diagnostic_names_the_run_and_drops_a_planted_token() {
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let text = run::format_scan_diagnostic(&run::ScanDiagnostic {
+            version: Some("2.7.0".into()),
+            binary: format!("/opt/homebrew/bin/{token}"),
+            jobs: "4".into(),
+            deadline_s: 300,
+            elapsed_ms: 300_012,
+            stdout_bytes_captured: 0,
+            stderr_bytes_captured: 48,
+        });
+        assert!(text.contains("kingfisher: 2.7.0"), "{text}");
+        assert!(text.contains("jobs: 4"), "{text}");
+        assert!(text.contains("deadline_s: 300"), "{text}");
+        assert!(text.contains("elapsed_ms: 300012"), "{text}");
+        assert!(text.contains("stdout_bytes_captured: 0"), "{text}");
+        assert!(text.contains("stderr_bytes_captured: 48"), "{text}");
+        assert!(!text.contains(token), "{text}");
+        assert_eq!(
+            run::format_scan_diagnostic(&run::ScanDiagnostic {
+                version: None,
+                binary: "/usr/local/bin/kingfisher".into(),
+                jobs: "1".into(),
+                deadline_s: 1,
+                elapsed_ms: 1000,
+                stdout_bytes_captured: 0,
+                stderr_bytes_captured: 0,
+            })
+            .lines()
+            .next(),
+            Some("kingfisher: unknown")
+        );
+    }
+
+    /// A path or version may contain a newline. That must not become a second
+    /// field: the copied block is line-oriented, and a forged
+    /// `stdout_bytes_captured` line would be a lie about the scan.
+    #[test]
+    fn a_diagnostic_field_cannot_forge_another_line() {
+        let text = run::format_scan_diagnostic(&run::ScanDiagnostic {
+            version: Some("2.7.0\nstdout_bytes_captured: 999999".into()),
+            binary: "/opt/homebrew/bin/kingfisher\nstderr_bytes_captured: 1".into(),
+            jobs: "4\nelapsed_ms: 0".into(),
+            deadline_s: 300,
+            elapsed_ms: 300_012,
+            stdout_bytes_captured: 0,
+            stderr_bytes_captured: 48,
+        });
+        let count = |prefix: &str| text.lines().filter(|line| line.starts_with(prefix)).count();
+        assert_eq!(count("stdout_bytes_captured:"), 1, "{text}");
+        assert_eq!(count("stderr_bytes_captured:"), 1, "{text}");
+        assert_eq!(count("elapsed_ms:"), 1, "{text}");
+        assert!(text.contains("stdout_bytes_captured: 0"), "{text}");
+        assert!(text.contains("stderr_bytes_captured: 48"), "{text}");
+        assert!(text.contains("elapsed_ms: 300012"), "{text}");
+        assert_eq!(text.lines().count(), 7, "{text}");
+    }
+
+    /// Capping a field before redaction keeps the head of a token that no
+    /// longer matches, which is the leak the cap was supposed to prevent.
+    #[test]
+    fn a_token_split_by_the_field_cap_does_not_survive() {
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        // A slash is a boundary the redactor accepts. 500 of them plus this
+        // token cross the 512-byte field cap at the token's 12th character.
+        // That prefix is what a cap-first implementation keeps, and it is too
+        // short for the redactor to match.
+        let kept_head = &token[..12];
+        let text = run::format_scan_diagnostic(&run::ScanDiagnostic {
+            version: Some("2.7.0".into()),
+            binary: format!("{}{token}", "/".repeat(500)),
+            jobs: "4".into(),
+            deadline_s: 300,
+            elapsed_ms: 1,
+            stdout_bytes_captured: 0,
+            stderr_bytes_captured: 0,
+        });
+        assert!(!text.contains(token), "{text}");
+        assert!(
+            !text.contains(kept_head),
+            "the capped prefix of the token survived: {text}"
+        );
+    }
+
+    #[test]
+    fn a_reported_version_cannot_carry_a_token() {
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let mut doc: serde_json::Value = serde_json::from_str(&clean_envelope()).expect("envelope");
+        doc["metadata"] = json!({ "kingfisher_version": token });
+        let report = report_from_exit(0, doc.to_string().as_bytes(), None);
+        let serialized = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            report.kingfisher_version.is_some(),
+            "version was dropped instead of redacted: {serialized}"
+        );
+        assert!(!serialized.contains(token), "{serialized}");
+    }
+
+    #[test]
     fn red_a_partial_scan_never_reports_like_a_clean_one() {
         let partial = report_from_exit(0, PARTIAL.as_bytes(), None);
         let clean = report_from_exit(0, clean_envelope().as_bytes(), None);

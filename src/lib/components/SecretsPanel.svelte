@@ -20,6 +20,8 @@
     LoaderCircle,
     ShieldCheck,
     FolderSearch,
+    Clipboard,
+    Check,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { keyedList } from "../ui/eachKeys";
@@ -36,10 +38,12 @@
     locationChips,
     locationLabel,
     scopeNotes,
+    scanFailureCopy,
     shouldCache,
     verdict,
     type LocationFilter,
   } from "../secrets/summary";
+  import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import { formatRelativeTime, plural } from "../format";
   import { createVisibleInterval } from "../dom/visibleInterval";
@@ -51,6 +55,9 @@
   let errorMsg = $state<string | null>(null);
   let filter = $state<LocationFilter>("all");
   let nowMs = $state(Date.now());
+  let failureCopied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(copiedTimer));
 
   const scanned = { path: "" };
   let inflight: AsyncGuard | null = null;
@@ -91,6 +98,7 @@
     try {
       const next = parseSecretsReport(await invoke<unknown>("cmd_scan_secrets", { repoPath }));
       if (shouldCache(secretsCache.get(repoPath), next)) secretsCache.set(repoPath, next);
+      if (!next.ok) recordFailure(scanFailureCopy(next));
       if (!guard.isLive()) return;
       report = next;
       scanned.path = repoPath;
@@ -100,6 +108,7 @@
       // Keep the last report on screen: its age is printed beside it, and
       // the error says this refresh did not replace it.
       errorMsg = formatError(err);
+      recordFailure(errorMsg);
     } finally {
       if (inflight === guard) {
         inflightPath = null;
@@ -136,6 +145,32 @@
       inflightPath = null;
     };
   });
+
+  function recordFailure(text: string) {
+    void import("../diagnostics/diagnostics")
+      .then(({ diagnostics, redactDiagnosticText }) => {
+        diagnostics.warn("secrets", redactDiagnosticText(text));
+      })
+      .catch(() => {
+        // The banner already shows the failure. A diagnostics import that
+        // cannot load must not replace it.
+      });
+  }
+
+  async function copyFailure(text: string) {
+    try {
+      const { redactDiagnosticText } = await import("../diagnostics/diagnostics");
+      if (await copyText(redactDiagnosticText(text))) {
+        failureCopied = true;
+        clearTimeout(copiedTimer);
+        copiedTimer = setTimeout(() => (failureCopied = false), 2_000);
+        return;
+      }
+    } catch {
+      // Fall through to the toast. A failed import must not reject the click.
+    }
+    toastStore.error("Could not copy the secrets scan error");
+  }
 
   async function reveal(path: string) {
     const repo = $repoStore.currentPath;
@@ -217,7 +252,22 @@
         role="alert"
       >
         <AlertTriangle size={14} class="shrink-0 mt-0.5" />
-        <span>{errorMsg}</span>
+        <span class="select-text min-w-0 flex-1">{errorMsg}</span>
+        <button
+          type="button"
+          class="gp-btn py-0.5! px-2! text-[10px]! shrink-0"
+          title="Copy secrets scan error"
+          aria-label="Copy secrets scan error"
+          onclick={() => void copyFailure(errorMsg ?? "")}
+        >
+          {#if failureCopied}
+            <Check size={10} />
+            <span>Copied</span>
+          {:else}
+            <Clipboard size={10} />
+            <span>Copy error</span>
+          {/if}
+        </button>
       </div>
     {:else if report && headline}
       {#if errorMsg}
@@ -226,10 +276,25 @@
           role="alert"
         >
           <AlertTriangle size={14} class="shrink-0 mt-0.5" />
-          <span>
+          <span class="select-text min-w-0 flex-1">
             Rescan failed: {errorMsg}
             {#if scannedAgo}Showing the scan from {scannedAgo}.{/if}
           </span>
+          <button
+            type="button"
+            class="gp-btn py-0.5! px-2! text-[10px]! shrink-0"
+            title="Copy rescan error"
+            aria-label="Copy rescan error"
+            onclick={() => void copyFailure(errorMsg ?? "")}
+          >
+            {#if failureCopied}
+              <Check size={10} />
+              <span>Copied</span>
+            {:else}
+              <Clipboard size={10} />
+              <span>Copy error</span>
+            {/if}
+          </button>
         </div>
       {/if}
 
@@ -244,15 +309,37 @@
         {:else}
           <AlertTriangle size={14} class="shrink-0 mt-0.5" />
         {/if}
-        <div class="space-y-1 min-w-0">
+        <div class="space-y-1 min-w-0 flex-1">
           <p class="font-medium">
             {headline.title}{#if findings.length > 0}<span class="font-normal opacity-80"
                 >{` · ${plural(distinctSecrets(findings), "distinct value")} shown`}</span
               >{/if}
           </p>
-          {#if headline.detail}<p class="opacity-80">{headline.detail}</p>{/if}
+          {#if headline.detail}<p class="opacity-80 select-text">{headline.detail}</p>{/if}
+          {#if report.diagnostic}
+            <pre
+              class="whitespace-pre-wrap wrap-break-word font-mono text-[10px] leading-relaxed select-text opacity-90"
+              data-testid="secrets-diagnostic">{report.diagnostic}</pre>
+          {/if}
           {#if cappedNote}<p class="opacity-80">{cappedNote}</p>{/if}
         </div>
+        {#if !report.ok}
+          <button
+            type="button"
+            class="gp-btn py-0.5! px-2! text-[10px]! shrink-0"
+            title="Copy secrets scan error"
+            aria-label="Copy secrets scan error"
+            onclick={() => void copyFailure(scanFailureCopy(report))}
+          >
+            {#if failureCopied}
+              <Check size={10} />
+              <span>Copied</span>
+            {:else}
+              <Clipboard size={10} />
+              <span>Copy error</span>
+            {/if}
+          </button>
+        {/if}
       </div>
 
       {#if chips.length > 0}

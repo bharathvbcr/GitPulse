@@ -231,6 +231,7 @@ pub(crate) fn assemble(
     SecretsReport {
         ok,
         error,
+        diagnostic: None,
         kingfisher_present: true,
         kingfisher_version: envelope.version,
         nested_repos_scanned: facts.nested_repos_scanned,

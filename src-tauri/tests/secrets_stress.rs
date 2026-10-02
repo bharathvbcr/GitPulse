@@ -72,6 +72,33 @@ fn assert_no_plant(report: &SecretsReport) {
     );
 }
 
+/// A failed scan carries one short, line-oriented diagnostic and nothing the
+/// child wrote. A successful or superseded scan carries none.
+fn assert_failure_diagnostic(report: &SecretsReport) {
+    let diagnostic = report
+        .diagnostic
+        .as_deref()
+        .unwrap_or_else(|| panic!("failed scan has no copyable diagnostic: {report:?}"));
+    assert!(diagnostic.len() < 2_000, "{}", diagnostic.len());
+    assert!(!diagnostic.contains(PLANTED), "{diagnostic}");
+    assert_eq!(
+        diagnostic
+            .lines()
+            .filter(|line| line.starts_with("stdout_bytes_captured:"))
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+    assert_eq!(
+        diagnostic
+            .lines()
+            .filter(|line| line.starts_with("stderr_bytes_captured:"))
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+}
+
 #[test]
 fn findings_are_located_through_real_git() {
     let _serial = serial();
@@ -116,6 +143,7 @@ fn findings_are_located_through_real_git() {
     let report = scan(&root, &stub(tools.path(), &body));
 
     assert!(report.ok, "{:?}", report.error);
+    assert!(report.diagnostic.is_none(), "{:?}", report.diagnostic);
     assert_eq!(report.completeness, ScanCompleteness::Complete);
     assert!(report.git_status_known);
     assert_eq!(report.kingfisher_version.as_deref(), Some("9.9.9"));
@@ -186,6 +214,7 @@ fn malformed_and_failed_runs_fail_closed() {
         assert!(report.findings.is_empty(), "{name}");
         let error = report.error.clone().unwrap_or_default();
         assert!(error.contains(expected), "{name}: {error}");
+        assert_failure_diagnostic(&report);
         assert_no_plant(&report);
     }
 }
@@ -198,6 +227,7 @@ fn a_partial_scan_is_reported_as_partial() {
     let body = r#"echo '{"findings":[],"audit":{"summary":{"scan_partial":1,"scan_failed":0,"pending":0},"repositories":[{"scan":{"status":"partial","error":"one or more repository inputs could not be enumerated"}}]}}'; exit 0"#;
     let report = scan(&root, &stub(tools.path(), body));
     assert!(report.ok);
+    assert!(report.diagnostic.is_none(), "{:?}", report.diagnostic);
     assert_eq!(report.completeness, ScanCompleteness::Partial);
     assert!(report.findings.is_empty());
 }
@@ -216,6 +246,12 @@ fn oversized_output_fails_closed_instead_of_listing_a_prefix() {
     assert_eq!(
         report.error.as_deref(),
         Some("kingfisher output was truncated")
+    );
+    assert_failure_diagnostic(&report);
+    let diagnostic = report.diagnostic.as_deref().unwrap_or("");
+    assert!(
+        !diagnostic.contains("    "),
+        "truncated stdout reached the diagnostic: {diagnostic}"
     );
     assert!(started.elapsed() < Duration::from_secs(30));
 }
@@ -255,6 +291,7 @@ fn twenty_thousand_findings_are_capped_with_both_numbers() {
     let elapsed = started.elapsed();
 
     assert!(report.ok, "{:?}", report.error);
+    assert!(report.diagnostic.is_none(), "{:?}", report.diagnostic);
     assert_eq!(report.findings.len(), MAX_FINDINGS);
     assert_eq!(report.findings_total, 20_001);
     assert_eq!(report.findings[0].path, "real.rs");
@@ -279,9 +316,13 @@ fn a_hung_scanner_is_killed_at_the_deadline() {
     let (_dir, root) = repo();
     let tools = TempDir::new().unwrap();
     let started = Instant::now();
+    let marker = "stderr-marker-not-forwarded";
     let report = scan_with_binary(
         &root,
-        &stub(tools.path(), "sleep 30; echo '{\"findings\":[]}'"),
+        &stub(
+            tools.path(),
+            &format!("echo '{marker}' >&2; sleep 30; echo '{{\"findings\":[]}}'"),
+        ),
         ScanTicket::claim(),
         Duration::from_secs(1),
     );
@@ -290,11 +331,91 @@ fn a_hung_scanner_is_killed_at_the_deadline() {
         report.error.as_deref(),
         Some("kingfisher did not finish within 1s")
     );
+    assert_failure_diagnostic(&report);
+    let diagnostic = report.diagnostic.as_deref().unwrap_or("");
+    assert!(diagnostic.contains("deadline_s: 1"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("stdout_bytes_captured: 0"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic
+            .lines()
+            .any(|line| line.starts_with("stderr_bytes_captured: ") && !line.ends_with(": 0")),
+        "{diagnostic}"
+    );
+    let dumped = format!("{report:?}");
+    assert!(
+        !dumped.contains(marker),
+        "scanner stderr reached the report"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "{:?}",
         started.elapsed()
     );
+}
+
+/// Both streams get noisy before the deadline. Counts stay, the text does not,
+/// and the diagnostic cannot grow with the flood.
+#[test]
+fn a_noisy_timeout_keeps_counts_and_drops_both_streams() {
+    let _serial = serial();
+    let (_dir, root) = repo();
+    let tools = TempDir::new().unwrap();
+    let marker = "stdout-marker-not-forwarded";
+    let report = scan_with_binary(
+        &root,
+        &stub(
+            tools.path(),
+            &format!(
+                "printf '%s' '{marker}'; dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' x >&2; sleep 30"
+            ),
+        ),
+        ScanTicket::claim(),
+        Duration::from_secs(1),
+    );
+    assert!(!report.ok, "{:?}", report.error);
+    assert_failure_diagnostic(&report);
+    let diagnostic = report.diagnostic.as_deref().unwrap_or("");
+    assert!(
+        diagnostic
+            .lines()
+            .any(|line| line.starts_with("stdout_bytes_captured: ") && !line.ends_with(": 0")),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic
+            .lines()
+            .any(|line| line.starts_with("stderr_bytes_captured: ") && !line.ends_with(": 0")),
+        "{diagnostic}"
+    );
+    let serialized = serde_json::to_string(&report).unwrap();
+    assert!(!serialized.contains(marker), "{serialized}");
+    assert!(
+        !serialized.contains(&"x".repeat(40)),
+        "stderr flood reached the report"
+    );
+}
+
+#[test]
+fn a_version_probe_cannot_smuggle_a_token() {
+    let _serial = serial();
+    let (_dir, root) = repo();
+    let tools = TempDir::new().unwrap();
+    let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    let binary = tools.path().join("kingfisher");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{token}'; exit 0; fi\necho '{{\"findings\":[],{COMPLETE_AUDIT}}}'\nexit 0\n"
+    );
+    fs::write(&binary, script).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let report = scan(&root, &binary);
+    assert!(report.ok, "{:?}", report.error);
+    assert!(report.diagnostic.is_none(), "{:?}", report.diagnostic);
+    let serialized = serde_json::to_string(&report).unwrap();
+    assert!(!serialized.contains(token), "{serialized}");
+    assert!(report.kingfisher_version.is_some());
 }
 
 /// Against the real Kingfisher, when one is installed: the shapes the stubs
@@ -340,6 +461,7 @@ fn live_kingfisher_report_holds_end_to_end() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(report.ok, "{:?}", report.error);
+    assert!(report.diagnostic.is_none(), "{:?}", report.diagnostic);
     assert!(report.kingfisher_version.is_some());
     // The unreadable file is the only thing standing between this scan and a
     // complete one, and only Kingfisher's audit says so.
@@ -404,7 +526,9 @@ fn a_superseded_scan_stuck_in_its_version_probe_does_not_delay_the_next() {
         first.error.as_deref(),
         Some("superseded by a newer secrets scan")
     );
+    assert!(first.diagnostic.is_none(), "{:?}", first.diagnostic);
     assert!(second.ok, "{:?}", second.error);
+    assert!(second.diagnostic.is_none(), "{:?}", second.diagnostic);
     assert!(
         waited < Duration::from_secs(2),
         "newest scan waited {waited:?} behind a dead one"
@@ -449,9 +573,15 @@ fn superseded_scans_stop_and_never_overlap() {
             Some("superseded by a newer secrets scan"),
             "scan {i}"
         );
+        assert!(
+            report.diagnostic.is_none(),
+            "scan {i} diagnostic: {:?}",
+            report.diagnostic
+        );
     }
     let last = &reports[SCANS - 1];
     assert!(last.ok, "{:?}", last.error);
+    assert!(last.diagnostic.is_none(), "{:?}", last.diagnostic);
     assert_eq!(last.completeness, ScanCompleteness::Complete);
     assert!(
         !overlap.exists(),

@@ -214,6 +214,17 @@ export function scopeNotes(report: SecretsReport): string[] {
 /** A cached report older than this is refreshed when the panel reopens. */
 export const STALE_AFTER_MS = 5 * 60_000;
 
+/**
+ * The text behind Copy error. Kingfisher's own output is not part of it.
+ * Credential redaction happens at the panel, on the way to the clipboard
+ * and the diagnostics ring — this function only joins the sentences.
+ */
+export function scanFailureCopy(report?: SecretsReport | null): string {
+  const reason = report?.error?.trim() || "The scanner did not complete.";
+  const extra = report?.diagnostic?.trim();
+  return extra ? `${reason}\n${extra}` : reason;
+}
+
 export function isStale(report: SecretsReport, nowMs: number): boolean {
   return report.scanned_at_ms <= 0 || nowMs - report.scanned_at_ms >= STALE_AFTER_MS;
 }

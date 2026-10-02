@@ -2,7 +2,9 @@
 
 use super::parse::{parse_kingfisher_json, SecretsReport};
 use super::report::{assemble, git_view, RunFacts};
-use crate::engine::git_cli::{run_observed, validate_repo, Incomplete, ProcessObserver};
+use crate::engine::git_cli::{
+    run_observed, validate_repo, Incomplete, OutputStream, ProcessObserver,
+};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -207,7 +209,11 @@ static LATEST: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 static RUNNING: Mutex<()> = Mutex::new(());
 
 /// A scan's claim on being the newest request.
-pub struct ScanTicket(Arc<AtomicBool>);
+pub struct ScanTicket {
+    cancel: Arc<AtomicBool>,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+}
 
 impl ScanTicket {
     /// Register a new scan and cancel whichever one was newest before it.
@@ -217,11 +223,22 @@ impl ScanTicket {
         if let Some(previous) = latest.replace(Arc::clone(&flag)) {
             previous.store(true, Ordering::SeqCst);
         }
-        Self(flag)
+        Self {
+            cancel: flag,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        }
     }
 
     pub fn superseded(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// The version probe and the scan share one ticket. Drop the probe's
+    /// bytes so a timed-out scan does not report them as its own output.
+    fn reset_output_counts(&mut self) {
+        self.stdout_bytes = 0;
+        self.stderr_bytes = 0;
     }
 }
 
@@ -229,6 +246,66 @@ impl ProcessObserver for ScanTicket {
     fn cancelled(&self) -> bool {
         self.superseded()
     }
+
+    fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+        let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let slot = match stream {
+            OutputStream::Stdout => &mut self.stdout_bytes,
+            OutputStream::Stderr => &mut self.stderr_bytes,
+        };
+        *slot = slot.saturating_add(n);
+    }
+}
+
+/// Facts a failed scan can name without quoting Kingfisher. Byte counts are
+/// how much was captured, not how much the child produced past the cap.
+pub(super) struct ScanDiagnostic {
+    pub version: Option<String>,
+    pub binary: String,
+    pub jobs: String,
+    pub deadline_s: u64,
+    pub elapsed_ms: u64,
+    pub stdout_bytes_captured: u64,
+    pub stderr_bytes_captured: u64,
+}
+
+/// One diagnostic field.
+///
+/// Control characters become spaces, so a newline in a path or a version
+/// cannot open a forged line. The value is redacted before the byte cap:
+/// cutting first keeps a prefix of a token that is too short for the
+/// redactor to recognise.
+fn one_field(value: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    let collapsed: String = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let redacted = crate::ledger::redact::text(&collapsed);
+    let mut out = String::new();
+    for ch in redacted.chars() {
+        if out.len() + ch.len_utf8() > MAX_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// One copyable block. Credential-shaped text is stripped before this leaves
+/// the process; the streams themselves are never included.
+pub(super) fn format_scan_diagnostic(facts: &ScanDiagnostic) -> String {
+    let version = one_field(facts.version.as_deref().unwrap_or("unknown"));
+    let binary = one_field(&facts.binary);
+    let jobs = one_field(&facts.jobs);
+    let raw = format!(
+        "kingfisher: {version}\nbinary: {binary}\njobs: {jobs}\ndeadline_s: {}\nelapsed_ms: {}\nstdout_bytes_captured: {}\nstderr_bytes_captured: {}",
+        facts.deadline_s,
+        facts.elapsed_ms,
+        facts.stdout_bytes_captured,
+        facts.stderr_bytes_captured,
+    );
+    crate::ledger::redact::text(&raw)
 }
 
 fn now_ms() -> u64 {
@@ -264,11 +341,14 @@ pub fn scan_with_binary(
         return failed_report(SUPERSEDED, None);
     }
     let version = probe_version(binary, &mut ticket);
+    ticket.reset_output_counts();
     if ticket.superseded() {
         return failed_report(SUPERSEDED, version);
     }
+    let argv = build_scan_argv(repo);
+    let jobs = argv_value(&argv, "--jobs");
     let mut cmd = scrubbed_command(binary);
-    cmd.args(build_scan_argv(repo));
+    cmd.args(&argv);
 
     let started = Instant::now();
     let run = match run_observed(
@@ -280,11 +360,16 @@ pub fn scan_with_binary(
         &mut ticket,
     ) {
         Ok(run) => run,
-        Err(err) => return failed_report(&runner_failure_reason(&err, deadline), version),
+        Err(err) => {
+            let reason = runner_failure_reason(&err, deadline);
+            let diag = current_diagnostic(version.as_deref(), binary, &jobs, deadline, &started, &ticket);
+            return failed_with_diagnostic(&reason, &diag);
+        }
     };
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Destructure so stderr is dropped here and never reaches the report.
+    // Byte counts were already taken by the ticket; the bytes stay here.
     let crate::engine::git_cli::BoundedRun {
         stdout,
         stderr: _stderr,
@@ -304,13 +389,14 @@ pub fn scan_with_binary(
             Incomplete::OverCap(_) => "kingfisher output was truncated",
             Incomplete::Unread(_) => "kingfisher output could not be read to the end",
         };
-        return failed_report(reason, version);
+        let diag = current_diagnostic(version.as_deref(), binary, &jobs, deadline, &started, &ticket);
+        return failed_with_diagnostic(reason, &diag);
     }
 
-    report_from_run(
+    let mut report = report_from_run(
         status_code,
         &stdout,
-        version,
+        version.clone(),
         repo,
         || git_view(repo),
         RunFacts {
@@ -319,7 +405,71 @@ pub fn scan_with_binary(
             nested_repos_scanned: nested_repos_scanning_enabled(),
             max_file_size_mb: MAX_FILE_SIZE_MB,
         },
-    )
+    );
+    if !report.ok {
+        let reason = report
+            .error
+            .clone()
+            .unwrap_or_else(|| "kingfisher failed to run".into());
+        let diag = current_diagnostic(version.as_deref(), binary, &jobs, deadline, &started, &ticket);
+        note_failure(&mut report, &reason, &diag);
+    }
+    report
+}
+
+fn argv_value(argv: &[String], flag: &str) -> String {
+    argv.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| argv.get(index + 1))
+        .cloned()
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn current_diagnostic(
+    version: Option<&str>,
+    binary: &Path,
+    jobs: &str,
+    deadline: Duration,
+    started: &Instant,
+    ticket: &ScanTicket,
+) -> ScanDiagnostic {
+    ScanDiagnostic {
+        version: version.map(|s| s.to_string()),
+        binary: binary.display().to_string(),
+        jobs: jobs.to_string(),
+        deadline_s: deadline.as_secs(),
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        stdout_bytes_captured: ticket.stdout_bytes,
+        stderr_bytes_captured: ticket.stderr_bytes,
+    }
+}
+
+fn failed_with_diagnostic(
+    reason: &str,
+    facts: &ScanDiagnostic,
+) -> SecretsReport {
+    let mut report = failed_report(reason, facts.version.clone());
+    note_failure(&mut report, reason, facts);
+    report
+}
+
+/// Log the failure and attach the copyable facts. Superseded scans are the
+/// ordinary result of switching repositories, so they stay quiet.
+fn note_failure(
+    report: &mut SecretsReport,
+    reason: &str,
+    facts: &ScanDiagnostic,
+) {
+    if reason == SUPERSEDED {
+        return;
+    }
+    let diagnostic = format_scan_diagnostic(facts);
+    log::warn!(
+        target: "secrets",
+        "{reason} | {}",
+        diagnostic.replace('\n', " | ")
+    );
+    report.diagnostic = Some(diagnostic);
 }
 
 /// Fixed wording for a runner error. The runner's own message can carry a
@@ -361,5 +511,7 @@ fn probe_version(binary: &Path, ticket: &mut ScanTicket) -> Option<String> {
     if line.is_empty() {
         return None;
     }
-    Some(line.to_string())
+    // Same cleaner the JSON path uses, so a `--version` line cannot carry a
+    // token or a second line onto the report.
+    super::parse::clean_version(line)
 }

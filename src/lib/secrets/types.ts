@@ -4,6 +4,8 @@
  * "secrets").
  */
 
+import { redactDiagnosticText } from "../diagnostics/diagnostics";
+
 /** Where a finding sits relative to the repository's Git state. */
 export type SecretLocation =
   | "git_metadata"
@@ -34,6 +36,11 @@ export interface SecretFinding {
 export interface SecretsReport {
   ok: boolean;
   error?: string | null;
+  /**
+   * Copyable facts about a failed run. Never Kingfisher stdout or stderr.
+   * Absent on a scan that completed.
+   */
+  diagnostic?: string | null;
   kingfisher_present: boolean;
   kingfisher_version?: string | null;
   nested_repos_scanned: boolean;
@@ -62,6 +69,18 @@ const COMPLETENESS: ReadonlySet<string> = new Set<ScanCompleteness>([
   "partial",
   "unverified",
 ]);
+
+/**
+ * A non-string or blank value is absent. Credentials are stripped before the
+ * length cap, so a cut cannot leave the head of a token the redactor would
+ * have matched on the whole string.
+ */
+function boundedText(value: unknown, max: number): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = redactDiagnosticText(value).trim();
+  if (!trimmed) return null;
+  return trimmed.length > max ? trimmed.slice(0, max) : trimmed;
+}
 
 function count(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -119,10 +138,11 @@ export function parseSecretsReport(value: unknown): SecretsReport {
     ok: raw.ok === true && findingsOk,
     error:
       typeof raw.error === "string"
-        ? raw.error
+        ? boundedText(raw.error, 4_000)
         : raw.ok === true && !findingsOk
           ? "The secrets report arrived without a findings list. This is not a clean result."
           : null,
+    diagnostic: boundedText(raw.diagnostic, 4_000),
     kingfisher_present: raw.kingfisher_present === true,
     kingfisher_version:
       typeof raw.kingfisher_version === "string" ? raw.kingfisher_version : null,

@@ -27,6 +27,10 @@ describe("SecretsPanel", () => {
     // The clean/partial/failed wording lives in secrets/summary.ts, where it
     // is unit-tested; a sentence re-typed here would bypass those tests.
     expect(source).toContain("verdict(report)");
+    expect(source).toContain("scanFailureCopy");
+    expect(source).toContain('diagnostics.warn("secrets"');
+    expect(source).toContain("redactDiagnosticText");
+    expect(source).toContain("Copy secrets scan error");
     expect(source).not.toContain("No secrets reported");
     expect(source).not.toContain("This is not a clean result");
   });
