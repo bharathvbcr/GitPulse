@@ -38,6 +38,9 @@ import {
   moveTabBy as moveWorkspaceTabBy,
   moveTabTo as moveWorkspaceTabTo,
   setTabGroup as setWorkspaceTabGroup,
+  setTabColor as setWorkspaceTabColor,
+  setGroupColor as setWorkspaceGroupColor,
+  restoreGroupColors,
   setGroupCollapsed as setWorkspaceGroupCollapsed,
   toggleGroupCollapsed as toggleWorkspaceGroupCollapsed,
   isGroupCollapsed as isWorkspaceGroupCollapsed,
@@ -184,6 +187,8 @@ export interface OpenRepoTab {
   label: string;
   pinned: boolean;
   group?: string | null;
+  /** Own color. Missing and null both inherit the group color, when the group has one. */
+  color?: TabColor | null;
   isActive: boolean;
   isBare: boolean;
   isDirty: boolean;
@@ -349,6 +354,7 @@ export interface RepoState {
   recentRepos: string[];
   lastClosed: string[];
   collapsedGroups: string[];
+  groupColors: GroupColor[];
   currentPath: string | null;
   branches: BranchInfo[];
   tags: TagInfo[];
@@ -521,6 +527,7 @@ function emptyProjected(): RepoState {
     recentRepos: [],
     lastClosed: [],
     collapsedGroups: [],
+    groupColors: [],
     currentPath: null,
     branches: [],
     tags: [],
@@ -626,6 +633,7 @@ function project(internal: InternalState): RepoState {
       label: labels.get(tab.path) ?? displayName(tab.path),
       pinned: tab.pinned,
       group: tab.group ?? null,
+      color: normalizeTabColor(tab.color),
       isActive: tab.id === internal.workspace.activeId,
       isBare: session?.isBare ?? false,
       isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
@@ -648,6 +656,7 @@ function project(internal: InternalState): RepoState {
     recentRepos: internal.workspace.recents,
     lastClosed: internal.workspace.lastClosed,
     collapsedGroups: internal.workspace.collapsedGroups ?? [],
+    groupColors: internal.workspace.groupColors ?? [],
     currentPath: active?.path ?? null,
     branches: active?.branches ?? [],
     tags: active?.tags ?? [],
@@ -1584,6 +1593,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         pinned?: boolean;
         /** Set when opening a tab that already belongs to a group. */
         group?: string | null;
+        /** Own tab color. Omitted leaves whatever the open tab already has. */
+        color?: TabColor | null;
         /** Restore must not advance the epoch; a partial walk cannot shrink the saved list. */
         keepEpoch?: boolean;
         /**
@@ -1686,6 +1697,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         pinned: extras.pinned ?? carriedPinned,
         activate,
         ...(extras.group !== undefined ? { group: extras.group } : {}),
+        ...(extras.color !== undefined ? { color: extras.color } : {}),
       });
       if (!opened.ok) {
         internal = {
@@ -2028,6 +2040,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       publish();
       flushPersist();
     },
+    setTabColor: (id: string, color: TabColor | null) => {
+      const next = setWorkspaceTabColor(internal.workspace, id, color);
+      if (next === internal.workspace) return;
+      commitEdit();
+      replaceWorkspace(next);
+      publish();
+      flushPersist();
+    },
+    setGroupColor: (groupName: string, color: TabColor | null) => {
+      const next = setWorkspaceGroupColor(internal.workspace, groupName, color);
+      if (next === internal.workspace) return;
+      commitEdit();
+      replaceWorkspace(next);
+      publish();
+      flushPersist();
+    },
     groupByParentFolder: () => {
       commitEdit();
       replaceWorkspace(groupWorkspaceByParentFolder(internal.workspace));
@@ -2230,6 +2258,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             activate: false,
             pinned: tab.pinned,
             group: tab.group ?? null,
+            ...(tab.color ? { color: tab.color } : {}),
             restore: {
               viewTab: tab.viewTab,
               viewSections: tab.viewSections,
@@ -2258,7 +2287,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         const collapsedGroups = (persisted.collapsedGroups ?? []).filter(
           (group) => !activeGroup || group !== activeGroup,
         );
-        replaceWorkspace({ ...internal.workspace, collapsedGroups });
+        replaceWorkspace(
+          restoreGroupColors(
+            { ...internal.workspace, collapsedGroups },
+            persisted.groupColors,
+          ),
+        );
         publish();
         if (!activated) {
           const desired = persisted.activePath

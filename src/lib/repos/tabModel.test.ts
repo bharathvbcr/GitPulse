@@ -20,6 +20,8 @@ import {
   moveTabBy,
   moveTabTo,
   setTabGroup,
+  setTabColor,
+  setGroupColor,
   setGroupCollapsed,
   toggleGroupCollapsed,
   isGroupCollapsed,
@@ -298,12 +300,85 @@ describe("tab grouping and folder heads", () => {
   });
 });
 
+describe("tab and group colors", () => {
+  function grouped(): { ws: WorkspaceTabs; first: string; second: string; third: string } {
+    let ws = emptyWorkspace();
+    const first = mustOpen(ws, "/code/devtools/r1");
+    const second = mustOpen(first.workspace, "/code/devtools/r2");
+    const third = mustOpen(second.workspace, "/code/web/r3");
+    ws = setTabGroup(third.workspace, first.id, "devtools");
+    ws = setTabGroup(ws, second.id, "devtools");
+    ws = setTabGroup(ws, third.id, "web");
+    return { ws, first: first.id, second: second.id, third: third.id };
+  }
+
+  it("sets and clears a tab color, and refuses a value outside the palette", () => {
+    const { ws, first } = grouped();
+    const colored = setTabColor(ws, first, " Blue ");
+    expect(colored.tabs.find((tab) => tab.id === first)?.color).toBe("blue");
+    expect(setTabColor(colored, first, "nope")).toBe(colored);
+    expect(setTabColor(colored, "missing", "red")).toBe(colored);
+    const cleared = setTabColor(colored, first, null);
+    expect(cleared.tabs.find((tab) => tab.id === first)?.color).toBeNull();
+    expect(setTabColor(cleared, first, null)).toBe(cleared);
+    assertWorkspaceInvariants(colored, opts);
+  });
+
+  it("colors a live group, carries the color on rename, and keeps the destination when groups fold", () => {
+    const { ws, first } = grouped();
+    const teal = setGroupColor(ws, "devtools", "teal");
+    expect(teal.groupColors).toEqual([{ group: "devtools", color: "teal" }]);
+    expect(setGroupColor(teal, "devtools", "chartreuse")).toBe(teal);
+    expect(setGroupColor(teal, "absent", "red")).toBe(teal);
+
+    const renamed = renameGroup(teal, "devtools", "core");
+    expect(renamed.groupColors).toEqual([{ group: "core", color: "teal" }]);
+
+    const web = setGroupColor(renamed, "web", "violet");
+    const folded = renameGroup(web, "core", "web");
+    expect(folded.tabs.find((tab) => tab.id === first)?.group).toBe("web");
+    expect(folded.groupColors).toEqual([{ group: "web", color: "violet" }]);
+    assertWorkspaceInvariants(folded, opts);
+  });
+
+  it("drops a group color when the group loses its last tab, including a prototype-shaped name", () => {
+    let ws = emptyWorkspace();
+    const opened = mustOpen(ws, "/code/odd/r1");
+    ws = setTabGroup(opened.workspace, opened.id, "__proto__");
+    ws = setGroupColor(ws, "__proto__", "pink");
+    expect(ws.groupColors).toEqual([{ group: "__proto__", color: "pink" }]);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+
+    ws = closeTab(ws, opened.id).workspace;
+    expect(ws.groupColors).toEqual([]);
+
+    const again = mustOpen(emptyWorkspace(), "/code/devtools/r1");
+    ws = setGroupColor(setTabGroup(again.workspace, again.id, "devtools"), "devtools", "green");
+    ws = ungroupTabs(ws, "devtools");
+    expect(ws.groupColors).toEqual([]);
+  });
+
+  it("keeps a color whose group name survives parent-folder grouping", () => {
+    let ws = emptyWorkspace();
+    const dev = mustOpen(ws, "/code/devtools/GitPulse");
+    const web = mustOpen(dev.workspace, "/code/web/frontend");
+    ws = setTabGroup(web.workspace, dev.id, "devtools");
+    ws = setTabGroup(ws, web.id, "custom");
+    ws = setGroupColor(ws, "devtools", "blue");
+    ws = setGroupColor(ws, "custom", "amber");
+    ws = groupByParentFolder(ws);
+    expect(ws.tabs.map((tab) => tab.group)).toEqual(["devtools", "web"]);
+    expect(ws.groupColors).toEqual([{ group: "devtools", color: "blue" }]);
+    assertWorkspaceInvariants(ws, opts);
+  });
+});
+
 describe("adversarial stress", () => {
   it("keeps invariants across 5_000 random open/close/reorder/pin/group operations", () => {
     let ws = emptyWorkspace();
     const rng = mulberry32(0x51f1e7);
     for (let i = 0; i < 5_000; i += 1) {
-      const roll = rng() % 13;
+      const roll = rng() % 16;
       if (roll === 0 || ws.tabs.length === 0) {
         const result = openTab(ws, `/stress/repo-${rng() % 40}`, opts, {
           pinned: rng() % 5 === 0,
@@ -335,6 +410,14 @@ describe("adversarial stress", () => {
         ws = toggleGroupCollapsed(ws, `group-${rng() % 5}`);
       } else if (roll === 11 && ws.tabs.length > 0) {
         ws = closeGroup(ws, `group-${rng() % 5}`).workspace;
+      } else if (roll === 12 && ws.tabs.length > 0) {
+        const tab = ws.tabs[rng() % ws.tabs.length];
+        const palette = ["red", "blue", "teal", "nope", null] as const;
+        ws = setTabColor(ws, tab.id, palette[rng() % palette.length]);
+      } else if (roll === 13) {
+        ws = setGroupColor(ws, `group-${rng() % 5}`, rng() % 3 === 0 ? null : "violet");
+      } else if (roll === 14) {
+        ws = renameGroup(ws, `group-${rng() % 5}`, `group-${rng() % 5}`);
       } else if (ws.lastClosed.length > 0) {
         const reopened = reopenLastClosed(ws, opts);
         if (reopened.ok) ws = reopened.workspace;

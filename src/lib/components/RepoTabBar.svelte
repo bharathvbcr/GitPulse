@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { repoStore, type OpenRepoTab } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
   import { dropReorderIndex } from "../repos/tabModel";
@@ -32,6 +32,14 @@
     normalizeGroupName,
     type GroupHeaderItem,
   } from "../repos/tabGroups";
+  import {
+    lookupGroupColor,
+    normalizeTabColor,
+    TAB_COLORS,
+    TAB_COLOR_INK,
+    TAB_COLOR_LABEL,
+    type TabColor,
+  } from "../repos/tabColors";
   import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
@@ -82,7 +90,12 @@
   );
 
   const tabLayout = $derived(
-    computeTabLayout($repoStore.openTabs, $repoStore.collapsedGroups, terminalCounts),
+    computeTabLayout(
+      $repoStore.openTabs,
+      $repoStore.collapsedGroups,
+      terminalCounts,
+      $repoStore.groupColors,
+    ),
   );
 
   const groupHeadersByName = $derived(
@@ -124,6 +137,25 @@
   function getGroupInfo(rawGroup: string | null | undefined): GroupHeaderItem | undefined {
     const group = normalizeGroupName(rawGroup);
     return group ? groupHeadersByName.get(group) : undefined;
+  }
+
+  function inheritedColorNote(group: string | null | undefined): string | null {
+    const color = lookupGroupColor($repoStore.groupColors, normalizeGroupName(group));
+    return color ? `Using the ${TAB_COLOR_LABEL[color]} group color` : null;
+  }
+
+  function tabColorInfo(tab: OpenRepoTab): { color: TabColor | null; source: "own" | "group" | null } {
+    const own = normalizeTabColor(tab.color);
+    if (own) return { color: own, source: "own" };
+    const inherited = lookupGroupColor($repoStore.groupColors, normalizeGroupName(tab.group));
+    return inherited ? { color: inherited, source: "group" } : { color: null, source: null };
+  }
+
+  function groupAriaLabel(info: GroupHeaderItem): string {
+    const count = `${info.tabCount} ${info.tabCount === 1 ? "repository" : "repositories"}`;
+    const collapsed = info.isCollapsed ? ", collapsed" : "";
+    const color = info.color ? `, ${TAB_COLOR_LABEL[info.color]}` : "";
+    return `Group ${info.label}, ${count}${collapsed}${color}`;
   }
 
   function groupChrome(info: { hasActiveTab: boolean }): string {
@@ -745,7 +777,7 @@
         type="button"
         class="h-7 px-2 flex items-center gap-1.5 rounded-lg border text-xs font-medium cursor-pointer transition-[color,background-color,border-color,box-shadow] duration-150 {groupChrome(info)} {dragHoverGroup === info.group ? 'ring-2 ring-accent border-accent' : ''}"
         aria-expanded={!info.isCollapsed}
-        aria-label={`Group ${info.label}, ${info.tabCount} ${info.tabCount === 1 ? 'repository' : 'repositories'}${info.isCollapsed ? ', collapsed' : ''}`}
+        aria-label={groupAriaLabel(info)}
         title={`Group: ${info.label} (${info.tabCount} ${info.tabCount === 1 ? 'repository' : 'repositories'})\nClick to ${info.isCollapsed ? 'expand' : 'collapse'} · Right-click for options · F2 to rename · Delete to close`}
         data-group-head={info.group}
         tabindex={info.isCollapsed && info.hasActiveTab ? 0 : -1}
@@ -759,12 +791,26 @@
           }
         }}
       >
+        {#if info.color}
+          <span
+            aria-hidden="true"
+            data-group-color={info.color}
+            title="{TAB_COLOR_LABEL[info.color]} group"
+            class="w-[3px] self-stretch my-1 rounded-full shrink-0"
+            style:background-color={TAB_COLOR_INK[info.color]}
+          ></span>
+        {/if}
         {#if info.isCollapsed}
           <ChevronRight size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary transition-transform" />
         {:else}
           <ChevronDown size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary transition-transform" />
         {/if}
-        <Folder size={12} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
+        <span
+          class="inline-flex shrink-0 {info.color ? '' : info.hasActiveTab ? 'text-accent' : 'text-textMuted'}"
+          style:color={info.color ? TAB_COLOR_INK[info.color] : undefined}
+        >
+          <Folder size={12} />
+        </span>
         <span class="whitespace-nowrap font-medium text-[11px]">{info.label}</span>
         <span class="text-[10px] tabular-nums font-mono opacity-70">({info.tabCount})</span>
         {#if info.isDirty}
@@ -846,6 +892,7 @@
         oncontextmenu={onStripContext}
       >
         {#each $repoStore.openTabs as tab, index (tab.id)}
+          {@const colorInfo = tabColorInfo(tab)}
           {#if isFirstInGroup(tab, index)}
             {@render groupHead(getGroupInfo(tab.group))}
           {/if}
@@ -854,7 +901,9 @@
             role="presentation"
             data-tab-id={tab.id}
             data-tab-shell-index={index}
-            title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}`}
+            data-tab-color={colorInfo.color ?? undefined}
+            data-tab-color-source={colorInfo.source ?? undefined}
+            title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}${colorInfo.color ? `\n${colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group`}` : ""}`}
             draggable="true"
             onauxclick={(e) => {
               if (e.button === 1) {
@@ -875,6 +924,13 @@
                 class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
                   ? 'left-[-3px]'
                   : 'right-[-3px]'}"
+              ></span>
+            {/if}
+            {#if colorInfo.color}
+              <span
+                aria-hidden="true"
+                class="ml-1.5 w-[3px] self-stretch my-1.5 rounded-full shrink-0"
+                style:background-color={TAB_COLOR_INK[colorInfo.color]}
               ></span>
             {/if}
             <button
@@ -905,6 +961,9 @@
                 <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
               {/if}
               <span class="whitespace-nowrap font-medium">{tab.label}</span>
+              {#if colorInfo.color}
+                <span class="sr-only">{colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group color`}</span>
+              {/if}
               {#if tab.currentBranch}
                 <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
               {/if}
@@ -1048,6 +1107,45 @@
     <div class="sr-only" role="status" aria-live="polite">{moveAnnouncement}</div>
   </div>
 
+{#snippet colorChoices(
+  label: string,
+  current: TabColor | null,
+  detail: string | null,
+  onPick: (color: TabColor | null) => void,
+)}
+  <div class="px-2 py-1.5" role="group" aria-label={label}>
+    <div class="text-[10px] uppercase tracking-wider text-textMuted font-medium">{label}</div>
+    {#if detail}
+      <div class="pt-0.5 text-[10px] text-textMuted">{detail}</div>
+    {/if}
+    <div class="flex items-center gap-1 pt-1">
+      <button
+        type="button"
+        role="menuitem"
+        aria-label={current === null ? "No color, selected" : "No color"}
+        data-color-choice="none"
+        title="No color"
+        class="relative size-4 rounded-full border border-border bg-surface {current === null ? 'ring-2 ring-textPrimary' : ''}"
+        onclick={() => onPick(null)}
+      >
+        <span class="pointer-events-none absolute left-1/2 top-1/2 h-px w-3 -translate-x-1/2 -translate-y-1/2 rotate-45 bg-textMuted"></span>
+      </button>
+      {#each TAB_COLORS as color (color)}
+        <button
+          type="button"
+          role="menuitem"
+          aria-label={current === color ? `${TAB_COLOR_LABEL[color]}, selected` : TAB_COLOR_LABEL[color]}
+          data-color-choice={color}
+          title={TAB_COLOR_LABEL[color]}
+          class="size-4 rounded-full border border-black/15 {current === color ? 'ring-2 ring-textPrimary' : ''}"
+          style:background-color={TAB_COLOR_INK[color]}
+          onclick={() => onPick(color)}
+        ></button>
+      {/each}
+    </div>
+  </div>
+{/snippet}
+
 {#if menu}
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}
   {#if tab}
@@ -1070,6 +1168,14 @@
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {tab.pinned ? "Unpin" : "Pin"} tab
       </button>
+      {@render colorChoices(
+        "Tab color",
+        normalizeTabColor(tab.color),
+        !normalizeTabColor(tab.color) && tab.group
+          ? inheritedColorNote(tab.group)
+          : null,
+        (color) => repoStore.setTabColor(tab.id, color),
+      )}
       <button
         role="menuitem"
         class="gp-menu-item {canMoveLeft ? '' : 'opacity-40 pointer-events-none'}"
@@ -1254,6 +1360,12 @@
       <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0 font-medium">
         Group: {groupHeader.label} ({groupHeader.tabCount})
       </div>
+      {@render colorChoices(
+        "Group color",
+        groupHeader.color,
+        null,
+        (color) => repoStore.setGroupColor(groupHeader.group, color),
+      )}
       <button
         role="menuitem"
         class="gp-menu-item"

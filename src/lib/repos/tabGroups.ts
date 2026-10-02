@@ -1,5 +1,6 @@
 import { normalizeRepoPath, pathSegments } from "./paths";
 import type { OpenRepoTab } from "../stores/repoStore";
+import { lookupGroupColor, type GroupColor, type TabColor } from "./tabColors";
 
 export const MAX_GROUP_NAME_LENGTH = 40;
 export const MAX_COLLAPSED_GROUPS = 64;
@@ -47,6 +48,7 @@ export interface GroupHeaderItem {
   conflictedCount: number;
   terminalCount: number;
   tabIds: string[];
+  color: TabColor | null;
 }
 
 export interface TabItem {
@@ -81,6 +83,7 @@ export function computeTabLayout(
   tabs: readonly OpenRepoTab[],
   collapsedGroups: Iterable<string> = [],
   terminalCounts?: Map<string, number>,
+  groupColors: readonly GroupColor[] = [],
 ): TabLayoutResult {
   const collapsedSet = new Set(
     Array.from(collapsedGroups).map((g) => normalizeGroupName(g)).filter((g): g is string => g !== null),
@@ -133,6 +136,7 @@ export function computeTabLayout(
       conflictedCount,
       terminalCount,
       tabIds,
+      color: lookupGroupColor(groupColors, group),
     });
   }
 

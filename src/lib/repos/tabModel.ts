@@ -8,6 +8,12 @@ import {
   normalizeGroupName,
   parentFolderName,
 } from "./tabGroups";
+import {
+  lookupGroupColor,
+  normalizeTabColor,
+  type GroupColor,
+  type TabColor,
+} from "./tabColors";
 
 export const MAX_OPEN_TABS = 24;
 export const MAX_RECENT_REPOS = 24;
@@ -20,6 +26,8 @@ export interface TabRecord {
   path: string;
   pinned: boolean;
   group?: string | null;
+  /** Own color. Null means "none", which still inherits a group color when drawn. */
+  color?: TabColor | null;
 }
 
 export interface WorkspaceTabs {
@@ -28,6 +36,8 @@ export interface WorkspaceTabs {
   recents: string[];
   lastClosed: string[];
   collapsedGroups?: string[];
+  /** One entry per live group. Absent and empty mean the same thing. */
+  groupColors?: GroupColor[];
 }
 
 export type OpenTabResult =
@@ -35,7 +45,7 @@ export type OpenTabResult =
   | { ok: false; reason: "invalid" | "capacity"; workspace: WorkspaceTabs };
 
 export function emptyWorkspace(): WorkspaceTabs {
-  return { tabs: [], activeId: null, recents: [], lastClosed: [], collapsedGroups: [] };
+  return { tabs: [], activeId: null, recents: [], lastClosed: [], collapsedGroups: [], groupColors: [] };
 }
 
 export function assertWorkspaceInvariants(ws: WorkspaceTabs, options: PathIdentityOptions): void {
@@ -54,6 +64,9 @@ export function assertWorkspaceInvariants(ws: WorkspaceTabs, options: PathIdenti
     if (tab.group !== undefined && tab.group !== null && typeof tab.group !== "string") {
       throw new Error(`tab ${tab.id} has invalid group type`);
     }
+    if (tab.color != null && normalizeTabColor(tab.color) !== tab.color) {
+      throw new Error(`tab ${tab.id} has invalid color`);
+    }
   }
   if (ws.activeId === null) {
     if (ws.tabs.length !== 0) {
@@ -71,15 +84,107 @@ export function assertWorkspaceInvariants(ws: WorkspaceTabs, options: PathIdenti
   if (ws.collapsedGroups && !Array.isArray(ws.collapsedGroups)) {
     throw new Error("collapsedGroups is not an array");
   }
+  if (ws.groupColors !== undefined) {
+    if (!Array.isArray(ws.groupColors)) {
+      throw new Error("groupColors is not an array");
+    }
+    const live = liveGroupNames(ws.tabs);
+    const seen = new Set<string>();
+    for (const entry of ws.groupColors) {
+      if (!entry || normalizeGroupName(entry.group) !== entry.group) {
+        throw new Error("groupColors has an invalid group");
+      }
+      if (normalizeTabColor(entry.color) !== entry.color) {
+        throw new Error(`group ${entry.group} has an invalid color`);
+      }
+      if (seen.has(entry.group)) {
+        throw new Error(`duplicate group color ${entry.group}`);
+      }
+      if (!live.has(entry.group)) {
+        throw new Error(`orphan group color ${entry.group}`);
+      }
+      seen.add(entry.group);
+    }
+  }
 }
 
-function cleanCollapsedGroups(tabs: TabRecord[], collapsed: string[] = []): string[] {
+function cleanCollapsedGroups(tabs: readonly TabRecord[], collapsed: readonly string[] = []): string[] {
   if (collapsed.length === 0) return [];
-  const activeGroups = new Set<string>();
-  for (const t of tabs) {
-    if (t.group) activeGroups.add(t.group);
-  }
+  const activeGroups = liveGroupNames(tabs);
   return collapsed.filter((g) => activeGroups.has(g));
+}
+
+function liveGroupNames(tabs: readonly TabRecord[]): Set<string> {
+  const activeGroups = new Set<string>();
+  for (const tab of tabs) {
+    const group = normalizeGroupName(tab.group);
+    if (group) activeGroups.add(group);
+  }
+  return activeGroups;
+}
+
+function cleanGroupColors(
+  tabs: readonly TabRecord[],
+  colors: readonly GroupColor[] | undefined,
+): GroupColor[] {
+  if (!colors || colors.length === 0) return [];
+  const live = liveGroupNames(tabs);
+  const out: GroupColor[] = [];
+  const seen = new Set<string>();
+  for (const entry of colors) {
+    if (!entry || typeof entry !== "object") continue;
+    const group = normalizeGroupName(entry.group);
+    const color = normalizeTabColor(entry.color);
+    if (!group || !color || !live.has(group) || seen.has(group)) continue;
+    seen.add(group);
+    out.push({ group, color });
+    if (out.length >= MAX_OPEN_TABS) break;
+  }
+  return out;
+}
+
+function withGroupState(
+  tabs: readonly TabRecord[],
+  collapsed: readonly string[],
+  colors: readonly GroupColor[] | undefined,
+): { collapsedGroups: string[]; groupColors: GroupColor[] } {
+  return {
+    collapsedGroups: cleanCollapsedGroups(tabs, collapsed),
+    groupColors: cleanGroupColors(tabs, colors),
+  };
+}
+
+/**
+ * Null and "" clear. A palette name sets. Anything else is refused so a bad
+ * caller cannot wipe a color it did not mean to clear.
+ */
+function interpretColorEdit(raw: unknown): TabColor | null | undefined {
+  if (raw == null || raw === "") return null;
+  return normalizeTabColor(raw) ?? undefined;
+}
+
+function resolveColor(
+  current: TabColor | null | undefined,
+  extra: unknown,
+  provided: boolean,
+): TabColor | null {
+  const kept = normalizeTabColor(current) ?? null;
+  if (!provided) return kept;
+  const edited = interpretColorEdit(extra);
+  return edited === undefined ? kept : edited;
+}
+
+function renameGroupColors(
+  colors: readonly GroupColor[] | undefined,
+  oldGroup: string,
+  newGroup: string,
+): GroupColor[] {
+  const list = colors ?? [];
+  const source = list.find((entry) => entry.group === oldGroup);
+  const destination = list.find((entry) => entry.group === newGroup);
+  const kept = list.filter((entry) => entry.group !== oldGroup);
+  if (!source || destination) return kept;
+  return [...kept, { group: newGroup, color: source.color }];
 }
 
 function expandGroupForTab(ws: WorkspaceTabs, tabId: string | null): string[] {
@@ -94,7 +199,7 @@ export function openTab(
   ws: WorkspaceTabs,
   rawPath: string,
   options: PathIdentityOptions,
-  extras: { pinned?: boolean; activate?: boolean; group?: string | null } = {},
+  extras: { pinned?: boolean; activate?: boolean; group?: string | null; color?: TabColor | null } = {},
 ): OpenTabResult {
   const normalized = normalizeRepoPath(rawPath);
   if (!normalized) {
@@ -107,6 +212,7 @@ export function openTab(
     const tabGroup = extras.group !== undefined
       ? normalizeGroupName(extras.group)
       : (existing.group ?? null);
+    const colorProvided = extras.color !== undefined;
     const tabs = ws.tabs.map((tab) =>
       tab.id === id
         ? {
@@ -114,6 +220,7 @@ export function openTab(
             path: normalized,
             pinned: extras.pinned ?? tab.pinned,
             group: tabGroup,
+            color: resolveColor(tab.color, extras.color, colorProvided),
           }
         : tab,
     );
@@ -126,7 +233,12 @@ export function openTab(
       created: false,
       id,
       workspace: rememberRecent(
-        { ...ws, tabs, activeId: shouldActivate ? id : ws.activeId, collapsedGroups },
+        {
+          ...ws,
+          tabs,
+          activeId: shouldActivate ? id : ws.activeId,
+          ...withGroupState(tabs, collapsedGroups, ws.groupColors),
+        },
         normalized,
         options,
       ),
@@ -141,8 +253,10 @@ export function openTab(
     path: normalized,
     pinned: extras.pinned === true,
     group: tabGroup,
+    color: resolveColor(null, extras.color, extras.color !== undefined),
   };
-  let collapsedGroups = cleanCollapsedGroups([...ws.tabs, tab], ws.collapsedGroups ?? []);
+  const tabs = [...ws.tabs, tab];
+  let collapsedGroups = cleanCollapsedGroups(tabs, ws.collapsedGroups ?? []);
   if (shouldActivate && tabGroup && collapsedGroups.includes(tabGroup)) {
     collapsedGroups = collapsedGroups.filter((g) => g !== tabGroup);
   }
@@ -153,9 +267,9 @@ export function openTab(
     workspace: rememberRecent(
       {
         ...ws,
-        tabs: [...ws.tabs, tab],
+        tabs,
         activeId: shouldActivate ? id : ws.activeId ?? id,
-        collapsedGroups,
+        ...withGroupState(tabs, collapsedGroups, ws.groupColors),
       },
       normalized,
       options,
@@ -179,11 +293,16 @@ export function closeTab(
     activeId = neighbor?.id ?? null;
   }
   const lastClosed = pushFrontUnique(ws.lastClosed, closed.path, MAX_LAST_CLOSED);
-  const collapsedGroups = cleanCollapsedGroups(tabs, ws.collapsedGroups ?? []);
   return {
     reason: "ok",
     closedPath: closed.path,
-    workspace: { ...ws, tabs, activeId, lastClosed, collapsedGroups },
+    workspace: {
+      ...ws,
+      tabs,
+      activeId,
+      lastClosed,
+      ...withGroupState(tabs, ws.collapsedGroups ?? [], ws.groupColors),
+    },
   };
 }
 
@@ -196,8 +315,13 @@ export function closeOtherTabs(ws: WorkspaceTabs, keepId: string): WorkspaceTabs
   for (const path of closed) {
     lastClosed = pushFrontUnique(lastClosed, path, MAX_LAST_CLOSED);
   }
-  const collapsedGroups = cleanCollapsedGroups([keep], ws.collapsedGroups ?? []);
-  return { ...ws, tabs: [keep], activeId: keep.id, lastClosed, collapsedGroups };
+  return {
+    ...ws,
+    tabs: [keep],
+    activeId: keep.id,
+    lastClosed,
+    ...withGroupState([keep], ws.collapsedGroups ?? [], ws.groupColors),
+  };
 }
 
 export function closeTabsToTheRight(ws: WorkspaceTabs, id: string): WorkspaceTabs {
@@ -211,13 +335,12 @@ export function closeTabsToTheRight(ws: WorkspaceTabs, id: string): WorkspaceTab
     lastClosed = pushFrontUnique(lastClosed, tab.path, MAX_LAST_CLOSED);
   }
   const activeStillOpen = tabs.some((tab) => tab.id === ws.activeId);
-  const collapsedGroups = cleanCollapsedGroups(tabs, ws.collapsedGroups ?? []);
   return {
     ...ws,
     tabs,
     lastClosed,
     activeId: activeStillOpen ? ws.activeId : id,
-    collapsedGroups,
+    ...withGroupState(tabs, ws.collapsedGroups ?? [], ws.groupColors),
   };
 }
 
@@ -366,6 +489,48 @@ function pushFrontUnique(list: string[], value: string, cap: number): string[] {
 /**
  * Assigns or clears a group for the given tab id.
  */
+/**
+ * Sets or clears one tab's own color. An unknown value is refused and the
+ * workspace is returned unchanged. Null clears.
+ */
+export function setTabColor(ws: WorkspaceTabs, id: string, rawColor: unknown): WorkspaceTabs {
+  const tab = ws.tabs.find((item) => item.id === id);
+  if (!tab) return ws;
+  const color = interpretColorEdit(rawColor);
+  if (color === undefined) return ws;
+  if ((normalizeTabColor(tab.color) ?? null) === color) return ws;
+  return {
+    ...ws,
+    tabs: ws.tabs.map((item) => (item.id === id ? { ...item, color } : item)),
+  };
+}
+
+/**
+ * Sets or clears the color of a group that currently has members.
+ * Renaming the group carries the color. The destination keeps its own color
+ * when two groups fold together.
+ */
+export function setGroupColor(ws: WorkspaceTabs, rawGroup: string, rawColor: unknown): WorkspaceTabs {
+  const group = normalizeGroupName(rawGroup);
+  if (!group || !liveGroupNames(ws.tabs).has(group)) return ws;
+  const color = interpretColorEdit(rawColor);
+  if (color === undefined) return ws;
+  if (lookupGroupColor(ws.groupColors, group) === color) return ws;
+  const without = (ws.groupColors ?? []).filter((entry) => entry.group !== group);
+  return {
+    ...ws,
+    groupColors: color ? [...without, { group, color }] : without,
+  };
+}
+
+/** Puts restored group colors back once every tab exists, then drops orphans. */
+export function restoreGroupColors(
+  ws: WorkspaceTabs,
+  colors: readonly GroupColor[] | undefined,
+): WorkspaceTabs {
+  return { ...ws, groupColors: cleanGroupColors(ws.tabs, colors) };
+}
+
 export function setTabGroup(ws: WorkspaceTabs, id: string, rawGroup: string | null): WorkspaceTabs {
   const group = normalizeGroupName(rawGroup);
   if (!ws.tabs.some((t) => t.id === id)) return ws;
@@ -373,7 +538,7 @@ export function setTabGroup(ws: WorkspaceTabs, id: string, rawGroup: string | nu
   return {
     ...ws,
     tabs,
-    collapsedGroups: cleanCollapsedGroups(tabs, ws.collapsedGroups ?? []),
+    ...withGroupState(tabs, ws.collapsedGroups ?? [], ws.groupColors),
   };
 }
 
@@ -431,7 +596,11 @@ export function renameGroup(ws: WorkspaceTabs, rawOld: string, rawNew: string): 
   return {
     ...ws,
     tabs,
-    collapsedGroups: cleanCollapsedGroups(tabs, Array.from(new Set(collapsedGroups))),
+    ...withGroupState(
+      tabs,
+      Array.from(new Set(collapsedGroups)),
+      renameGroupColors(ws.groupColors, oldGroup, newGroup),
+    ),
   };
 }
 
@@ -449,7 +618,7 @@ export function ungroupTabs(ws: WorkspaceTabs, rawGroup?: string): WorkspaceTabs
   return {
     ...ws,
     tabs,
-    collapsedGroups: cleanCollapsedGroups(tabs, ws.collapsedGroups ?? []),
+    ...withGroupState(tabs, ws.collapsedGroups ?? [], ws.groupColors),
   };
 }
 
@@ -505,7 +674,7 @@ export function groupByParentFolder(ws: WorkspaceTabs): WorkspaceTabs {
   return {
     ...ws,
     tabs: clustered,
-    collapsedGroups: cleanCollapsedGroups(clustered, ws.collapsedGroups ?? []),
+    ...withGroupState(clustered, ws.collapsedGroups ?? [], ws.groupColors),
   };
 }
 

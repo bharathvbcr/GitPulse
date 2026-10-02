@@ -20,6 +20,7 @@ export const STORAGE_KEY_LAST_PATH = "gitpulse_last_repo";
 export const WORKSPACE_VERSION = 1 as const;
 
 import { normalizeGroupName, MAX_COLLAPSED_GROUPS } from "./tabGroups";
+import { normalizeTabColor, type GroupColor, type TabColor } from "./tabColors";
 
 export type ViewTab = "work" | "code" | "history" | "insights";
 
@@ -29,6 +30,8 @@ export interface PersistedTab {
   path: string;
   pinned: boolean;
   group?: string | null;
+  /** Own tab color. Omitted when unset so an older build ignores it. */
+  color?: TabColor;
   viewTab: ViewTab;
   /**
    * The section last open in each sectioned view, keyed by view id.
@@ -71,6 +74,13 @@ export interface PersistedWorkspace {
   recents: string[];
   lastClosed: string[];
   collapsedGroups?: string[];
+  /**
+   * Color of each repository group, as pairs rather than a name-keyed object.
+   * Additive, like `collapsedGroups`: an older build ignores the field.
+   * A same-epoch snapshot that omits a pair cannot clear it; clearing is a
+   * newer epoch whose list simply does not contain that group.
+   */
+  groupColors?: GroupColor[];
 }
 
 export interface StorageLike {
@@ -350,7 +360,13 @@ export function coalescePersistedWorkspace(
     if (merged.length >= MAX_OPEN_TABS) return;
     seen.add(id);
     const group = epochAdvanced ? tab.group : (tab.group ?? prior?.group);
-    merged.push(group === tab.group ? tab : { ...tab, group });
+    const color = epochAdvanced
+      ? normalizeTabColor(tab.color) ?? undefined
+      : normalizeTabColor(tab.color) ?? normalizeTabColor(prior?.color) ?? undefined;
+    const next: PersistedTab = { ...tab, group };
+    if (color) next.color = color;
+    else delete next.color;
+    merged.push(next);
   };
 
   if (shrunkWithoutAuthority) {
@@ -385,12 +401,21 @@ export function coalescePersistedWorkspace(
       ? unionNames(existing.collapsedGroups, incoming.collapsedGroups)
       : (existing.collapsedGroups ?? []);
 
+  const liveGroups = groupsOnTabs(merged);
+  const groupColors = retainLiveGroupColors(
+    epochAdvanced
+      ? readGroupColors(incoming.groupColors)
+      : overlayGroupColors(readGroupColors(existing.groupColors), readGroupColors(incoming.groupColors)),
+    liveGroups,
+  );
+
   return {
     ...incoming,
     epoch: Math.max(workspaceEpoch(incoming), workspaceEpoch(existing)),
     tabs: merged,
     activePath,
     collapsedGroups,
+    groupColors,
     recents: shrunkWithoutAuthority ? existing.recents : incoming.recents,
     lastClosed: shrunkWithoutAuthority ? existing.lastClosed : incoming.lastClosed,
   };
@@ -418,6 +443,7 @@ export function loadPersistedWorkspace(
     recents: [],
     lastClosed: [],
     collapsedGroups: [],
+    groupColors: [],
   };
   if (!storage) return empty;
 
@@ -439,6 +465,7 @@ export function loadPersistedWorkspace(
     recents: last ? [last, ...recents.filter((path) => identityKey(path, options) !== identityKey(last, options))] : recents,
     lastClosed: [],
     collapsedGroups: [],
+    groupColors: [],
   };
 }
 
@@ -500,10 +527,12 @@ export function workspaceToPersisted(
     epoch: workspaceEpoch({ epoch }),
     tabs: ws.tabs.map((tab) => {
       const session = sessions[tab.id];
+      const color = normalizeTabColor(tab.color);
       return {
         path: tab.path,
         pinned: tab.pinned,
         group: tab.group ? (normalizeGroupName(tab.group) ?? undefined) : undefined,
+        ...(color ? { color } : {}),
         viewTab: migrateViewTab(session?.activeTab),
         viewSections: sanitizeViewSections(session?.viewSections),
         terminalOpen: session?.terminalOpen === true,
@@ -517,6 +546,7 @@ export function workspaceToPersisted(
     collapsedGroups: (ws.collapsedGroups ?? [])
       .map((g) => normalizeGroupName(g))
       .filter((g): g is string => g !== null),
+    groupColors: retainLiveGroupColors(readGroupColors(ws.groupColors), groupsOnTabs(ws.tabs)),
   };
 }
 
@@ -532,10 +562,12 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
     const id = identityKey(path, options);
     if (seen.has(id)) continue;
     seen.add(id);
+    const color = normalizeTabColor(record.color);
     tabs.push({
       path,
       pinned: record.pinned === true,
       group: normalizeGroupName(record.group) ?? undefined,
+      ...(color ? { color } : {}),
       viewTab: migrateViewTab(record.viewTab),
       viewSections: sanitizeViewSections(record.viewSections, record.viewTab),
       // Strict `=== true`: an absent field, and any non-boolean a hand-edited
@@ -559,7 +591,57 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
     recents,
     lastClosed,
     collapsedGroups: sanitizeGroupList(raw.collapsedGroups),
+    groupColors: retainLiveGroupColors(readGroupColors(raw.groupColors), groupsOnTabs(tabs)),
   };
+}
+
+function groupsOnTabs(tabs: readonly { group?: string | null }[]): Set<string> {
+  const groups = new Set<string>();
+  for (const tab of tabs) {
+    const group = normalizeGroupName(tab.group);
+    if (group) groups.add(group);
+  }
+  return groups;
+}
+
+/** Palette pairs only. Not an object, so a group name cannot be a prototype key. */
+function readGroupColors(raw: unknown): GroupColor[] {
+  if (!Array.isArray(raw)) return [];
+  const out: GroupColor[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const group = normalizeGroupName(record.group);
+    const color = normalizeTabColor(record.color);
+    if (!group || !color || seen.has(group)) continue;
+    seen.add(group);
+    out.push({ group, color });
+    if (out.length >= MAX_OPEN_TABS) break;
+  }
+  return out;
+}
+
+/** Incoming names replace; groups the incoming list forgot stay. */
+function overlayGroupColors(base: readonly GroupColor[], incoming: readonly GroupColor[]): GroupColor[] {
+  const incomingByGroup = new Map(incoming.map((entry) => [entry.group, entry]));
+  const out: GroupColor[] = [];
+  const seen = new Set<string>();
+  for (const entry of base) {
+    if (seen.has(entry.group)) continue;
+    seen.add(entry.group);
+    out.push(incomingByGroup.get(entry.group) ?? entry);
+  }
+  for (const entry of incoming) {
+    if (seen.has(entry.group)) continue;
+    seen.add(entry.group);
+    out.push(entry);
+  }
+  return out;
+}
+
+function retainLiveGroupColors(colors: readonly GroupColor[], live: ReadonlySet<string>): GroupColor[] {
+  return colors.filter((entry) => live.has(entry.group));
 }
 
 function sanitizeGroupList(raw: unknown): string[] {

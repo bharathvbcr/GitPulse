@@ -374,7 +374,40 @@ describe("RepoTabBar", () => {
       expect(source).toContain("Ungroup all repositories");
       expect(source).toContain("Close group repositories…");
       expect(source).toContain("Rename group…");
+      expect(source).toContain("Tab color");
+      expect(source).toContain("Group color");
+      expect(source).toContain("data-color-choice");
+      expect(source).toContain("repoStore.setTabColor");
+      expect(source).toContain("repoStore.setGroupColor");
       expect(source).toContain("[data-tab-index], [data-group-head]");
+    });
+
+    it("paints a tab's own color and inherits the group color when the tab has none", async () => {
+      await repoStore.openRepo("/repo/color-own", { allowBroken: true, activate: true });
+      await repoStore.openRepo("/repo/color-inherit", { allowBroken: true, activate: false });
+      const own = get(repoStore).openTabs.find((tab) => tab.path.endsWith("color-own"));
+      const inherited = get(repoStore).openTabs.find((tab) => tab.path.endsWith("color-inherit"));
+      expect(own).toBeTruthy();
+      expect(inherited).toBeTruthy();
+      if (!own || !inherited) return;
+      repoStore.setTabGroup(own.id, "marked");
+      repoStore.setTabGroup(inherited.id, "marked");
+      repoStore.setTabColor(own.id, "blue");
+      repoStore.setGroupColor("marked", "teal");
+
+      const { body } = render(RepoTabBar);
+      expect(body).toContain('data-tab-color="blue"');
+      expect(body).toContain('data-tab-color-source="own"');
+      expect(body).toContain('data-tab-color="teal"');
+      expect(body).toContain('data-tab-color-source="group"');
+      expect(body).toContain('data-group-color="teal"');
+      expect(body).toContain(">Blue<");
+      expect(body).toContain("Teal group color");
+
+      repoStore.ungroupTabs();
+      while (get(repoStore).openTabs.length > 0) {
+        await repoStore.closeActiveTab();
+      }
     });
 
     it("supports spring-loaded drag auto-expansion and direct drop on group heads", () => {

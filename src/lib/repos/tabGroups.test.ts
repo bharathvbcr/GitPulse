@@ -88,6 +88,7 @@ describe("computeTabLayout", () => {
     expect(layout.groups).toHaveLength(1);
     expect(layout.groups[0].group).toBe("devtools");
     expect(layout.groups[0].tabCount).toBe(2);
+    expect(layout.groups[0].color).toBeNull();
 
     // visible items: 1 group header + 2 devtools tabs + 1 other tab
     expect(layout.visibleItems).toHaveLength(4);
@@ -96,6 +97,9 @@ describe("computeTabLayout", () => {
     expect(layout.visibleItems[1].kind).toBe("tab");
     expect(layout.visibleItems[2].kind).toBe("tab");
     expect(layout.visibleItems[3].kind).toBe("tab");
+
+    const colored = computeTabLayout(tabs, [], undefined, [{ group: "devtools", color: "teal" }]);
+    expect(colored.groups[0].color).toBe("teal");
   });
 
   it("collapses tabs when their group is in collapsedGroups, keeping group head visible", () => {

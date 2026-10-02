@@ -6,6 +6,7 @@ import {
   STORAGE_KEY_WORKSPACE_BACKUP,
   WORKSPACE_VERSION,
   loadMigrated,
+  coalescePersistedWorkspace,
   loadPersistedWorkspace,
   memoryStorage,
   savePersistedWorkspace,
@@ -15,7 +16,7 @@ import {
   retiredViewFor,
   RETIRED_VIEWS,
 } from "./persist";
-import { emptyWorkspace, openTab } from "./tabModel";
+import { emptyWorkspace, openTab, setGroupColor, setTabColor, setTabGroup } from "./tabModel";
 
 const opts = { caseInsensitive: true };
 
@@ -368,5 +369,71 @@ describe("retired views", () => {
     expect(loaded.tabs[1].group).toBe("devtools");
     expect(loaded.tabs[2].group).toBeUndefined();
     expect(loaded.collapsedGroups).toEqual(["devtools"]);
+  });
+
+  it("round-trips tab colors and group colors and drops values outside the palette", () => {
+    let ws = emptyWorkspace();
+    const first = openTab(ws, "/r/one", opts);
+    if (!first.ok) throw new Error("open");
+    const second = openTab(first.workspace, "/r/two", opts, { activate: false });
+    if (!second.ok) throw new Error("open");
+    ws = setTabGroup(second.workspace, first.id, "devtools");
+    ws = setTabGroup(ws, second.id, "devtools");
+    ws = setTabColor(ws, first.id, "blue");
+    ws = setGroupColor(ws, "devtools", "teal");
+
+    const storage = memoryStorage();
+    savePersistedWorkspace(storage, workspaceToPersisted(ws, {}, 2), [], opts);
+    const loaded = loadPersistedWorkspace(storage, opts);
+    expect(loaded.tabs.map((tab) => tab.color ?? null)).toEqual(["blue", null]);
+    expect(loaded.groupColors).toEqual([{ group: "devtools", color: "teal" }]);
+
+    const hostile = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        epoch: 1,
+        tabs: [
+          { path: "/r/one", pinned: false, group: "__proto__", color: "blue;background:url(javascript:alert(1))", viewTab: "work", searchQuery: "" },
+          { path: "/r/two", pinned: false, group: "__proto__", color: "PINK", viewTab: "work", searchQuery: "" },
+        ],
+        activePath: "/r/one",
+        recents: [],
+        lastClosed: [],
+        groupColors: {
+          __proto__: { polluted: 1 },
+        },
+      }),
+    });
+    const sanitized = loadPersistedWorkspace(hostile, opts);
+    expect(sanitized.tabs.map((tab) => tab.color ?? null)).toEqual([null, "pink"]);
+    expect(sanitized.tabs.every((tab) => tab.group === "__proto__")).toBe(true);
+    expect(sanitized.groupColors).toEqual([]);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("keeps colors a same-epoch snapshot forgot and lets a newer epoch clear them", () => {
+    let ws = emptyWorkspace();
+    const first = openTab(ws, "/r/one", opts);
+    if (!first.ok) throw new Error("open");
+    const second = openTab(first.workspace, "/r/two", opts, { activate: false });
+    if (!second.ok) throw new Error("open");
+    ws = setTabGroup(second.workspace, first.id, "devtools");
+    ws = setTabGroup(ws, second.id, "devtools");
+    ws = setTabColor(ws, first.id, "blue");
+    ws = setGroupColor(ws, "devtools", "teal");
+    const saved = workspaceToPersisted(ws, {}, 4);
+
+    const forgotten = workspaceToPersisted(
+      { ...ws, tabs: ws.tabs.map((tab) => ({ ...tab, color: null })), groupColors: [] },
+      {},
+      4,
+    );
+    const kept = coalescePersistedWorkspace(saved, forgotten, opts);
+    expect(kept.tabs.map((tab) => tab.color ?? null)).toEqual(["blue", null]);
+    expect(kept.groupColors).toEqual([{ group: "devtools", color: "teal" }]);
+
+    const cleared = coalescePersistedWorkspace(saved, { ...forgotten, epoch: 5 }, opts);
+    expect(cleared.tabs.every((tab) => tab.color == null)).toBe(true);
+    expect(cleared.groupColors).toEqual([]);
   });
 });

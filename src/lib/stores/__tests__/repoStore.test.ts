@@ -3763,9 +3763,9 @@ describe("repoStore tab grouping", () => {
 
   it("restores groups and collapsed groups, and a quit mid-restore cannot drop the unsaved half", async () => {
     const tabs = [
-      { path: "/projects/devtools/alpha", pinned: false, group: "devtools", viewTab: "work", searchQuery: "", selectedBranch: null },
+      { path: "/projects/devtools/alpha", pinned: false, group: "devtools", color: "blue", viewTab: "work", searchQuery: "", selectedBranch: null },
       { path: "/projects/devtools/beta", pinned: true, group: "devtools", viewTab: "history", searchQuery: "", selectedBranch: null },
-      { path: "/projects/web/gamma", pinned: false, group: "web", viewTab: "work", searchQuery: "", selectedBranch: null },
+      { path: "/projects/web/gamma", pinned: false, group: "web", color: "orange", viewTab: "work", searchQuery: "", selectedBranch: null },
       { path: "/projects/web/delta", pinned: false, group: "web", viewTab: "code", searchQuery: "", selectedBranch: null },
     ];
     const storage = memoryStorage({
@@ -3800,12 +3800,18 @@ describe("repoStore tab grouping", () => {
     await vi.waitFor(() => expect(resolves).toBe(3));
     store.flushPersistedWorkspace();
     const during = JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
-      tabs?: Array<{ path: string; group?: string }>;
+      tabs?: Array<{ path: string; group?: string; color?: string }>;
       collapsedGroups?: string[];
+      groupColors?: Array<{ group: string; color: string }>;
     };
     expect(during.tabs?.map((tab) => tab.path)).toEqual(tabs.map((tab) => tab.path));
     expect(during.tabs?.map((tab) => tab.group)).toEqual(["devtools", "devtools", "web", "web"]);
+    expect(during.tabs?.map((tab) => tab.color ?? null)).toEqual(["blue", null, "orange", null]);
     expect(during.collapsedGroups).toEqual(["web"]);
+    expect(during.groupColors).toEqual([
+      { group: "devtools", color: "teal" },
+      { group: "web", color: "violet" },
+    ]);
 
     gate.resolve();
     await restoring;
@@ -3813,6 +3819,11 @@ describe("repoStore tab grouping", () => {
     expect(state.openTabs.map((tab) => tab.path)).toEqual(tabs.map((tab) => tab.path));
     expect(state.openTabs.map((tab) => tab.group)).toEqual(["devtools", "devtools", "web", "web"]);
     expect(state.openTabs.find((tab) => tab.path.endsWith("beta"))?.pinned).toBe(true);
+    expect(state.openTabs.map((tab) => tab.color ?? null)).toEqual(["blue", null, "orange", null]);
+    expect(state.groupColors).toEqual([
+      { group: "devtools", color: "teal" },
+      { group: "web", color: "violet" },
+    ]);
     expect(state.collapsedGroups).toEqual(["web"]);
     expect(state.currentPath).toBe("/projects/devtools/alpha");
   });
@@ -3830,6 +3841,10 @@ describe("repoStore tab grouping", () => {
         recents: [],
         lastClosed: [],
         collapsedGroups: ["web"],
+        groupColors: [
+          { group: "devtools", color: "teal" },
+          { group: "web", color: "violet" },
+        ],
       }),
     });
     const calls: string[] = [];
