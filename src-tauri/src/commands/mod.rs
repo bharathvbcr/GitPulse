@@ -3602,6 +3602,7 @@ pub async fn cmd_terminal_spawn(
     env: Option<std::collections::HashMap<String, String>>,
     permission_mode: Option<String>,
     acknowledged: Option<bool>,
+    start_dir: Option<String>,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
     let state = state.inner().clone();
     // Expanded here, at the boundary, rather than in the caller: the flags for
@@ -3615,9 +3616,31 @@ pub async fn cmd_terminal_spawn(
         args,
     )?;
     off_thread(move || {
-        crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols, program, args, env)
+        crate::terminal::spawn_session_in(
+            &app,
+            &state,
+            &repo_path,
+            start_dir.as_deref(),
+            rows,
+            cols,
+            program,
+            args,
+            env,
+        )
     })
     .await
+}
+
+/// What a live session is running and where, read once on request: the
+/// foreground program, whether it is a job under the shell, and its working
+/// directory — inside the repository or not.
+#[tauri::command(async)]
+pub async fn cmd_terminal_context(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+) -> Result<crate::terminal::TerminalContext, String> {
+    let state = state.inner().clone();
+    off_thread(move || crate::terminal::session_context(&state, &session_id)).await
 }
 
 /// Feeds keystrokes into a live session's PTY.

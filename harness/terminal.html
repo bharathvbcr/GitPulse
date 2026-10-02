@@ -14,7 +14,18 @@
 
       const params = new URLSearchParams(location.search);
       const sessions = new Map();
+      /** Every `cmd_terminal_ack` the view sent, so a painted chunk that never released its credit fails a check. */
+      const acks = [];
       let written = [];
+      /** The session the visible terminal last wrote to. */
+      let lastWriteId = "";
+      /** Next spawn emits a trimmed backlog and a clean exit before it returns an id. */
+      let earlyLoss = false;
+      /** What `cmd_terminal_context` reports for every session: where it is, and whether a job runs. */
+      let contextDir = "";
+      let contextBusy = false;
+      /** `startDir` of every `cmd_terminal_spawn`, in order. */
+      const startDirs = [];
       /** Every URL handed to the OS opener, so a refused scheme is provably
        * refused rather than merely unobserved. */
       const opened = [];
@@ -25,7 +36,8 @@
       const output = async (id, text) => {
         const bytes = new TextEncoder().encode(text);
         for (let i = 0; i < bytes.length; i += 4096) {
-          await emit("terminal-output", {id, data_b64:btoa(String.fromCharCode(...bytes.subarray(i, i + 4096)))});
+          const slice = bytes.subarray(i, i + 4096);
+          await emit("terminal-output", { id, data_b64: btoa(String.fromCharCode(...slice)), bytes: slice.length });
         }
       };
       /** One line carrying every span class the linkifier must judge: an
@@ -39,6 +51,18 @@
           case "cmd_terminal_spawn": {
             const id = `fixture-${++report.spawned}`;
             sessions.set(id, args.repoPath);
+            startDirs.push(args.startDir ?? null);
+            if (earlyLoss) {
+              earlyLoss = false;
+              // Listeners are already attached. These bytes have to land before
+              // the id returns, which is the only moment the bus can lose them.
+              return (async () => {
+                for (let i = 0; i < 129; i++) await emit("terminal-output", { id, data_b64: "QQ==", bytes: 1 });
+                await emit("terminal-exit", { id, exit_code: 0, signal: "", error: null, reaped: true });
+                showReport();
+                return { id, cwd: args.repoPath, shell: "/bin/zsh" };
+              })();
+            }
             // The bus subscribes after the acknowledgement; emit on the next task.
             setTimeout(() => {
               const lines = Array.from({ length: 80 }, (_, i) => `line ${i + 1}: ${i % 10 === 0 ? "ERROR" : "passed"} · terminal verification`).join("\r\n");
@@ -51,10 +75,13 @@
             showReport();
             return { id, cwd: args.repoPath, shell: "/bin/zsh" };
           }
-          case "cmd_terminal_ack": return null;
+          case "cmd_terminal_ack":
+            acks.push({ sessionId: args.sessionId, bytes: args.bytes });
+            return null;
           case "cmd_terminal_export": return true;
           case "cmd_terminal_write":
             report.writes++;
+            lastWriteId = args.sessionId;
             if (new TextEncoder().encode(args.data).length > 65536) throw new Error("PTY input limit");
             written.push(args.data);
             showReport(); return output(args.sessionId, args.data === "\r" ? "\r\nsimulated $ " : args.data);
@@ -65,12 +92,24 @@
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
           case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          case "cmd_terminal_context": {
+            const root = sessions.get(args.sessionId);
+            if (!root) throw new Error(`Terminal session '${args.sessionId}' not found`);
+            return {
+              process: contextBusy ? "cargo" : "zsh",
+              busy: contextBusy,
+              cwd: contextDir ? `${root}/${contextDir}` : root,
+              repo_dir: contextDir,
+            };
+          }
           case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
           case "cmd_stash_list": return { entries: [], truncated: false };
           case "cmd_list_tags": return { tags: [], truncated: false };
           case "cmd_branch_stats": return {};
           case "cmd_repo_operation": return null;
           case "cmd_workspace_sync": return null;
+          case "cmd_devcouncil_init": return {repo:args?.repoPath??"/fixture/GitPulse",state_dir:"/fixture/GitPulse/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],devmap_available:false};
+          case "cmd_devmap_maybe_refresh": return {decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null};
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       }, { shouldMockEvents: true });
@@ -166,6 +205,16 @@
             target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...modifiers }));
             await wait();
           };
+
+          const ackDeadline = performance.now() + 2000;
+          while (performance.now() < ackDeadline && !acks.some((row) => row.sessionId === "fixture-1" && Number.isInteger(row.bytes) && row.bytes >= 1 && row.bytes <= 4096)) await wait(20);
+          check("painted output is acknowledged to the PTY", () => {
+            const rows = acks.filter((row) => row.sessionId === "fixture-1");
+            if (!rows.length) throw new Error(`cmd_terminal_ack was not called; saw ${JSON.stringify(acks.slice(0, 4))}`);
+            const bad = rows.find((row) => !Number.isInteger(row.bytes) || row.bytes < 1 || row.bytes > 4096);
+            if (bad) throw new Error(JSON.stringify(bad));
+            return true;
+          });
 
           // ---- Linkification, against the real xterm and the real provider.
           // Source assertions can show the provider is registered; only this
@@ -373,6 +422,42 @@
           const tabCount = visible('[role="tab"]').length;
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
           check("close chord kills only its session", () => visible('[role="tab"]').length === tabCount - 1 && report.killed === 1);
+          // A shell tab opened beside another starts where that shell is.
+          contextDir = "src/lib";
+          const spawnsBeforeHere = report.spawned;
+          await press(label("Terminal input"), "T", { ctrlKey: true, shiftKey: true });
+          await wait(300);
+          check("a new shell tab starts in the directory of the shell beside it",
+            () => report.spawned === spawnsBeforeHere + 1 && startDirs[startDirs.length - 1] === "src/lib");
+          check("the status row names where that session started", () => footer().includes("GitPulse/src/lib"));
+          contextDir = "";
+          // A running job is not closed without a question.
+          const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+          const { get } = await import("svelte/store");
+          contextBusy = true;
+          const tabsBeforeBusy = visible('[role="tab"]').length;
+          const killedBeforeBusy = report.killed;
+          await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
+          await wait(200);
+          const asked = get(promptState);
+          check("closing a terminal with a running job asks first, naming the job",
+            () => asked?.options.mode === "confirm" && asked.options.message.includes("cargo") && report.killed === killedBeforeBusy);
+          completePrompt(false);
+          await wait(200);
+          check("declining keeps the session running",
+            () => visible('[role="tab"]').length === tabsBeforeBusy && report.killed === killedBeforeBusy);
+          await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
+          await wait(200);
+          completePrompt(true);
+          await wait(300);
+          check("confirming closes exactly that session",
+            () => visible('[role="tab"]').length === tabsBeforeBusy - 1 && report.killed === killedBeforeBusy + 1);
+          contextBusy = false;
+          const killedBeforeIdle = report.killed;
+          await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
+          await wait(300);
+          check("an idle shell closes without a question",
+            () => !get(promptState) && report.killed === killedBeforeIdle + 1);
           check("expand ceiling is taller than the old 900px cap", () => TERMINAL_DOCK_MAX_HEIGHT > 900);
           check("controls never write to the shell", () => report.writes === writesBefore);
           check("no runtime errors", () => report.errors.length === 0);
@@ -406,6 +491,69 @@
           while (written.join("").length < payload.length && performance.now() < deadline) await wait(50);
           check("a 300 KB Unicode paste arrives byte for byte", () => written.join("") === payload);
           check("every write stays inside the 16 KiB chunk bound", () => written.every((data) => new TextEncoder().encode(data).length <= 16384));
+          // The fixture shell never turns bracketed paste on, so several lines
+          // would each run on arrival. The paste waits for a yes.
+          const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+          const { get } = await import("svelte/store");
+          written = [];
+          paste("make\nmake install\n");
+          await wait(150);
+          const pasteAsk = get(promptState);
+          check("a multi-line paste into a shell without bracketed paste asks first and sends nothing",
+            () => pasteAsk?.options.title === "Paste 2 lines?" && written.join("") === "");
+          completePrompt(true);
+          await wait(200);
+          check("confirming sends those lines exactly as a paste", () => written.join("") === "make\rmake install\r");
+          written = [];
+          paste("echo safe\x1b[201~rm -rf ~");
+          await wait(150);
+          const injectAsk = get(promptState);
+          completePrompt(false);
+          await wait(150);
+          check("a paste carrying a bracket terminator asks, and declining sends nothing",
+            () => Boolean(injectAsk?.options.message.includes("ends a paste early")) && written.join("") === "");
+          // Synthetic Backspace plus the insertText WebKit emits after it.
+          // The guard must write one DEL and must not forward the line.
+          written = [];
+          const echoed = "Session ready";
+          const backspace = new KeyboardEvent("keydown", { key: "Backspace", bubbles: true, cancelable: true });
+          field.dispatchEvent(backspace);
+          field.dispatchEvent(new KeyboardEvent("keypress", { key: "Backspace", bubbles: true, cancelable: true }));
+          field.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertText", data: echoed, bubbles: true, cancelable: true }));
+          field.dispatchEvent(new InputEvent("input", { inputType: "insertReplacementText", data: echoed, bubbles: true, cancelable: true }));
+          const eraseDeadline = performance.now() + 2000;
+          while (written.join("") !== "\x7f" && performance.now() < eraseDeadline) await wait(20);
+          check("backspace writes one DEL and does not reinsert the line", () => written.join("") === "\x7f" && backspace.defaultPrevented);
+          written = [];
+          field.dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", repeat: true, bubbles: true, cancelable: true }));
+          field.dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", repeat: true, bubbles: true, cancelable: true }));
+          field.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: echoed, bubbles: true, cancelable: true }));
+          const repeatDeadline = performance.now() + 2000;
+          while (written.join("") !== "\x7f\x7f" && performance.now() < repeatDeadline) await wait(20);
+          check("a held backspace writes one DEL per keydown and not the line", () => written.join("") === "\x7f\x7f");
+          const letter = new KeyboardEvent("keydown", { key: "c", bubbles: true, cancelable: true });
+          field.dispatchEvent(letter);
+          check("an ordinary letter is not claimed as an erase", () => letter.defaultPrevented === false);
+          field.dispatchEvent(new KeyboardEvent("keyup", { key: "Backspace", bubbles: true, cancelable: true }));
+          await wait(30);
+          check("the helper textarea refuses writing tools", () =>
+            field.getAttribute("autocomplete") === "off" && field.getAttribute("writingsuggestions") === "false");
+          written = [];
+          field.value = echoed;
+          const composition = new KeyboardEvent("keydown", { key: "a", bubbles: true, cancelable: true });
+          Object.defineProperty(composition, "keyCode", { get: () => 229 });
+          field.dispatchEvent(composition);
+          field.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertText", data: echoed + "a", bubbles: true, cancelable: true }));
+          field.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: echoed + "a", bubbles: true, cancelable: true }));
+          field.dispatchEvent(new KeyboardEvent("keypress", { key: "a", bubbles: true, cancelable: true }));
+          const compositionDeadline = performance.now() + 300;
+          while (written.join("") === "" && performance.now() < compositionDeadline) await wait(20);
+          await wait(30);
+          const composed = written.join("");
+          check("keyCode 229 does not resend the helper textarea", () =>
+            composition.defaultPrevented === false && field.value === "" && !composed.includes(echoed) && (composed === "" || composed === "a"));
+          field.dispatchEvent(new KeyboardEvent("keyup", { key: "a", bubbles: true, cancelable: true }));
+          await wait(30);
           const before = report.writes;
           paste("x".repeat(1024 * 1024 + 1));
           await wait(100);
@@ -414,6 +562,98 @@
           field.dispatchEvent(new KeyboardEvent("keydown", {key:"W",ctrlKey:true,shiftKey:true,repeat:true,bubbles:true,cancelable:true}));
           await wait(100);
           check("a held close chord does not repeat", () => report.writes === before);
+          // The letter above used keyCode 0, which arms a delivery. Release it
+          // before the sentence, or its owed keypress swallows the first character.
+          field.dispatchEvent(new KeyboardEvent("keyup", { key: "c", bubbles: true, cancelable: true }));
+          await wait(30);
+          written = [];
+          const sentence = "When I start typing in the gitpulse terminal, the text repeats itself, it's weird.";
+          const codeFor = (ch) => {
+            if (ch === " ") return 32;
+            if (ch === ",") return 188;
+            if (ch === ".") return 190;
+            if (ch === "'") return 222;
+            if (ch >= "a" && ch <= "z") return ch.charCodeAt(0) - 32;
+            if (ch >= "A" && ch <= "Z") return ch.charCodeAt(0);
+            return ch.charCodeAt(0);
+          };
+          const stroke = (type, key, keyCode) => {
+            const event = new KeyboardEvent(type, { key, bubbles: true, cancelable: true });
+            const charCode = type === "keypress" && key.length === 1 ? key.codePointAt(0) : 0;
+            Object.defineProperty(event, "keyCode", { get: () => keyCode });
+            Object.defineProperty(event, "which", { get: () => (type === "keypress" ? charCode : keyCode) });
+            Object.defineProperty(event, "charCode", { get: () => charCode });
+            return event;
+          };
+          for (let i = 0; i < sentence.length; i++) {
+            const ch = sentence[i];
+            const keyCode = i % 2 === 0 ? codeFor(ch) : 229;
+            field.dispatchEvent(stroke("keydown", ch, keyCode));
+            field.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertText", data: sentence.slice(0, i + 1), bubbles: true, cancelable: true }));
+            field.dispatchEvent(new InputEvent("input", { inputType: "insertReplacementText", data: "wired", bubbles: true, cancelable: true }));
+            field.dispatchEvent(stroke("keypress", ch, keyCode));
+            field.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: ch, bubbles: true, cancelable: true }));
+            field.dispatchEvent(stroke("keyup", ch, keyCode));
+          }
+          const typedDeadline = performance.now() + 2000;
+          while (written.join("") !== sentence && performance.now() < typedDeadline) await wait(20);
+          check("typed text is written once", () => {
+            const got = written.join("");
+            if (got !== sentence) throw new Error(JSON.stringify(got));
+            return true;
+          });
+          if (!lastWriteId) throw new Error("no session received the typed text");
+          const ackMark = acks.length;
+          const killedBeforeCorrupt = report.killed;
+          await emit("terminal-output", { id: lastWriteId, data_b64: "!!!!", bytes: 4 });
+          const corruptDeadline = performance.now() + 2000;
+          while (performance.now() < corruptDeadline && !acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4)) await wait(20);
+          check("a corrupt chunk acknowledges its reserved length", () =>
+            acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4) && report.killed === killedBeforeCorrupt);
+          await emit("terminal-output", { id: lastWriteId, data_b64: "A".repeat(8193) });
+          const liveDeadline = performance.now() + 2000;
+          let liveStatus = "";
+          while (performance.now() < liveDeadline) {
+            liveStatus = visible("[data-terminal-status]").map((el) => el.textContent ?? "").join("\n");
+            if (liveStatus.includes("exceeded its limit")) break;
+            await wait(20);
+          }
+          check("a live oversized chunk stays on the status row", () =>
+            liveStatus.includes("exceeded its limit") && !liveStatus.includes("This session ended."));
+          button("All terminal sessions").click();
+          const listDeadline = performance.now() + 2000;
+          let closeSession = null;
+          while (performance.now() < listDeadline) {
+            const list = visible('[aria-label="Sessions across repositories"]')[0];
+            const row = list && [...list.children].find((el) => (el.textContent ?? "").includes("exceeded its limit"));
+            closeSession = row?.querySelectorAll("button")
+              ? [...row.querySelectorAll("button")].find((node) => node.textContent?.trim() === "Close session")
+              : null;
+            if (closeSession) break;
+            await wait(20);
+          }
+          if (!closeSession) throw new Error("session list has no oversized session");
+          closeSession.click();
+          const closedDeadline = performance.now() + 2000;
+          let closedStatus = "";
+          while (performance.now() < closedDeadline) {
+            closedStatus = visible("[data-terminal-status]").map((el) => el.textContent ?? "").join("\n");
+            if (closedStatus.includes("exceeded its limit")) break;
+            await wait(20);
+          }
+          check("closing the session keeps the oversized-chunk notice", () =>
+            closedStatus.includes("exceeded its limit") && !closedStatus.includes("This session ended."));
+          earlyLoss = true;
+          button("New Shell session").click();
+          const earlyDeadline = performance.now() + 2000;
+          let earlyRow = "";
+          while (performance.now() < earlyDeadline) {
+            earlyRow = visible("[data-terminal-status]").map((el) => el.textContent ?? "").find((text) => text.includes("buffer limit")) ?? "";
+            if (earlyRow) break;
+            await wait(20);
+          }
+          check("output lost before subscribe stays on the status row", () =>
+            earlyRow.includes("buffer limit") && !earlyRow.includes("This session ended."));
         } catch (error) {
           stopped(error);
         }

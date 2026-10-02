@@ -341,6 +341,15 @@ mod tests {
             let bytes = STANDARD
                 .decode(value["data_b64"].as_str().unwrap())
                 .unwrap();
+            let reserved = value["bytes"]
+                .as_u64()
+                .expect("terminal output must name its reserved length")
+                as usize;
+            assert_eq!(
+                reserved,
+                bytes.len(),
+                "reserved credit must equal the emitted chunk"
+            );
             captured
                 .lock()
                 .unwrap()

@@ -14,6 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 mod flow;
+mod foreground;
 #[cfg(unix)]
 mod input;
 use flow::OutputFlow;
@@ -95,10 +96,30 @@ pub struct TerminalSpawned {
     pub cwd: String,
 }
 
+/// Bytes one `read` may reserve. The renderer refuses a reserved length
+/// outside `1..=OUTPUT_CHUNK_BYTES` instead of guessing one from base64.
+pub const OUTPUT_CHUNK_BYTES: usize = 4096;
+
 #[derive(Clone, Serialize)]
 pub struct TerminalOutputPayload {
     pub id: String,
     pub data_b64: String,
+    /// Length passed to `OutputFlow::reserve` for this chunk.
+    pub bytes: usize,
+}
+
+#[cfg(test)]
+#[test]
+fn output_payload_names_the_reserved_length() {
+    let payload = TerminalOutputPayload {
+        id: "s".into(),
+        data_b64: "QQ==".into(),
+        bytes: 1,
+    };
+    let value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(value["bytes"], 1);
+    assert_eq!(value["data_b64"], "QQ==");
+    assert_eq!(OUTPUT_CHUNK_BYTES, 4096);
 }
 
 #[derive(Clone, Serialize)]
@@ -128,6 +149,9 @@ struct SessionEntry {
     flow: Arc<OutputFlow>,
     tracked_run: Option<String>,
     spawned: TerminalSpawned,
+    /// Canonical repository root. `spawned.cwd` is where the process started,
+    /// which may be a directory inside it.
+    repo: std::path::PathBuf,
 }
 
 /// Thread-safe registry of live PTY sessions.
@@ -667,7 +691,141 @@ pub fn spawn_session<R: tauri::Runtime>(
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
 ) -> Result<TerminalSpawned, String> {
-    spawn_session_inner(app, state, repo_path, rows, cols, program, args, env, None)
+    spawn_session_in(app, state, repo_path, None, rows, cols, program, args, env)
+}
+
+/// [`spawn_session`], started in `start_dir`: a path relative to the
+/// repository root that must resolve, symlinks included, to a directory inside
+/// it. `None`, `""` and `"."` start at the root. A directory that has gone, or
+/// that escapes the repository, is refused — never silently replaced by the
+/// root, because the caller asked for a place and a shell somewhere else is a
+/// different answer it has to be told about.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_session_in<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    start_dir: Option<&str>,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+) -> Result<TerminalSpawned, String> {
+    spawn_session_inner(
+        app, state, repo_path, start_dir, rows, cols, program, args, env, None,
+    )
+}
+
+/// Longest `start_dir` accepted over IPC, in bytes: PATH_MAX on both Unix hosts.
+const START_DIR_BYTES_CAP: usize = 4096;
+
+/// Resolves a requested start directory against the canonical repository,
+/// through the same containment owner every repository-relative path uses.
+fn resolve_start_dir(
+    repo: &std::path::Path,
+    start_dir: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let Some(relative) = start_dir.filter(|dir| !dir.is_empty() && *dir != ".") else {
+        return Ok(repo.to_path_buf());
+    };
+    if relative.len() > START_DIR_BYTES_CAP || relative.chars().any(char::is_control) {
+        return Err("Invalid terminal start directory".into());
+    }
+    let joined = sandbox_join_canonical(repo, relative)
+        .map_err(|e| format!("Terminal start directory refused: {e}"))?;
+    if !joined.is_dir() {
+        return Err(format!(
+            "Terminal start directory is not a directory: {}",
+            joined.display()
+        ));
+    }
+    Ok(joined)
+}
+
+/// What a live session is doing, read once, on request.
+///
+/// Every field is optional because the OS can decline to describe a process
+/// (a setuid program, a process that exited between two calls). An unknown
+/// is reported as unknown — never as idle, and never as the repository root.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct TerminalContext {
+    /// Name of the program in the terminal's foreground.
+    pub process: Option<String>,
+    /// Whether that program is something other than the session's own
+    /// process: a job running under the shell. `None` when the foreground
+    /// could not be read.
+    pub busy: Option<bool>,
+    /// Absolute working directory of the foreground program.
+    pub cwd: Option<String>,
+    /// `cwd` relative to the repository root (`""` for the root itself), or
+    /// `None` when it is outside the repository or unknown. Only this is a
+    /// valid `start_dir` for a new session.
+    pub repo_dir: Option<String>,
+}
+
+/// Reads [`TerminalContext`] for one session.
+///
+/// The child lock is held across the reads, as `terminate_pty_child` holds it
+/// across its signal: the reader thread cannot reap the shell meanwhile, so
+/// its pid — and the session it leads — cannot be reused under this call.
+pub fn session_context(
+    state: &TerminalSessions,
+    session_id: &str,
+) -> Result<TerminalContext, String> {
+    let (child, master, repo) = state
+        .sessions
+        .lock()
+        .map_err(|e| format!("Lock error: {e}"))?
+        .get(session_id)
+        .map(|s| (s.child.clone(), s.master.clone(), s.repo.clone()))
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    #[cfg(unix)]
+    {
+        let mut child = child
+            .lock()
+            .map_err(|e| format!("Terminal child lock error: {e}"))?;
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok(TerminalContext::default());
+        }
+        let Some(root) = child.process_id().and_then(|p| i32::try_from(p).ok()) else {
+            return Ok(TerminalContext::default());
+        };
+        let group = master
+            .lock()
+            .map_err(|e| format!("Terminal size lock error: {e}"))?
+            .process_group_leader();
+        // Same ownership rule as the kill path: a group counts only when it
+        // belongs to this child's own session.
+        // SAFETY: getsid takes a numeric id and reads nothing else.
+        let leader = group.filter(|g| *g > 1 && unsafe { libc::getsid(*g) } == root);
+        let view = foreground::describe(leader.unwrap_or(root));
+        // A program the OS will not describe (sudo, a setuid tool) still runs
+        // in the shell's directory far more often than not, but "far more
+        // often" is not "is": only the shell's own answer stands in for it.
+        let cwd = view.cwd.or_else(|| {
+            leader
+                .filter(|g| *g != root)
+                .and_then(|_| foreground::describe(root).cwd)
+        });
+        drop(child);
+        let repo_dir = cwd
+            .as_deref()
+            .and_then(|cwd| cwd.strip_prefix(&repo).ok())
+            .and_then(|rel| rel.to_str())
+            .map(str::to_owned);
+        Ok(TerminalContext {
+            process: view.name,
+            busy: leader.map(|g| g != root),
+            cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            repo_dir,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (child, master, repo);
+        Ok(TerminalContext::default())
+    }
 }
 
 /// A live native binding repairs a lost launch response without issuing another
@@ -697,6 +855,7 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
         app,
         state,
         repo_path,
+        None,
         rows,
         cols,
         Some(program),
@@ -711,6 +870,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &TerminalSessions,
     repo_path: &str,
+    start_dir: Option<&str>,
     rows: u16,
     cols: u16,
     program: Option<String>,
@@ -720,6 +880,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
 ) -> Result<TerminalSpawned, String> {
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let repo = validate_repo(repo_path)?;
+    let start = resolve_start_dir(&repo, start_dir)?;
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
     let size = bounded_pty_size(rows, cols);
@@ -742,7 +903,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         is_default_shell,
         args.as_deref(),
         env.as_ref(),
-        &repo,
+        &start,
         &PtyEnv::from_process(),
     );
     if observer.is_some() {
@@ -841,8 +1002,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
         spawned: TerminalSpawned {
             id: session_id.clone(),
             shell: resolved.clone(),
-            cwd: repo.to_string_lossy().into_owned(),
+            cwd: start.to_string_lossy().into_owned(),
         },
+        repo: repo.clone(),
     };
 
     {
@@ -880,7 +1042,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut reservation = Some(reservation);
             let mut failure = None;
             let mut watcher = watcher;
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -895,7 +1057,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         if dead_flag.load(Ordering::Relaxed) { continue; }
                         let delivery = output_flow.reserve(n, Duration::from_secs(30)).and_then(|()| {
                             app_handle.emit("terminal-output", TerminalOutputPayload {
-                                id: sid_for_thread.clone(), data_b64: BASE64_STANDARD.encode(&buf[..n]),
+                                id: sid_for_thread.clone(),
+                                data_b64: BASE64_STANDARD.encode(&buf[..n]),
+                                bytes: n,
                             }).map_err(|e| {
                                 log::warn!(target: "terminal", "failed to emit terminal-output: {e}");
                                 format!("Terminal output delivery failed: {e}")
@@ -914,6 +1078,15 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     #[cfg(unix)]
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Nothing is queued, so everything the session printed
+                        // has been read. A job left running in the background
+                        // (`sleep &`, a dev server) still holds the terminal
+                        // open, and EOF will not come while it lives: the
+                        // session is over when its own process is, the way
+                        // every terminal ends a tab whose shell has exited.
+                        if child_has_exited(&thread_child) {
+                            break;
+                        }
                         // thread_master owns reader_fd until this thread exits.
                         // Readiness wakes interactive output promptly; the wait
                         // remains bounded even if a child stops producing data.
@@ -1050,7 +1223,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
         // the status row and the harness journal are actually asking.
         shell: resolved,
         id: session_id,
-        cwd: repo.to_string_lossy().into_owned(),
+        // Where the process started, the same value the session entry holds.
+        cwd: start.to_string_lossy().into_owned(),
     })
 }
 
@@ -1080,6 +1254,66 @@ pub fn write_binary_to_session(
     )
 }
 
+struct EraseInputCounts {
+    erase: usize,
+    printable: usize,
+    other: usize,
+}
+
+/// Counts BS/DEL against the rest of one PTY write. `None` when the write
+/// contains no erase, so ordinary typing is not logged. The bytes themselves
+/// are never formatted into a log line.
+fn describe_erase_input(data: &[u8]) -> Option<EraseInputCounts> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut erase = 0usize;
+    let mut printable = 0usize;
+    let mut other = 0usize;
+    for &byte in data {
+        if byte == 0x08 || byte == 0x7f {
+            erase += 1;
+        } else if (0x20..0x7f).contains(&byte) || byte >= 0x80 {
+            printable += 1;
+        } else {
+            other += 1;
+        }
+    }
+    if erase == 0 {
+        None
+    } else {
+        Some(EraseInputCounts {
+            erase,
+            printable,
+            other,
+        })
+    }
+}
+
+fn note_erase_input(data: &[u8]) {
+    let Some(counts) = describe_erase_input(data) else {
+        return;
+    };
+    if counts.printable > 0 {
+        log::info!(
+            target: "terminal",
+            "pty write mixed erase with printable bytes: erase={} printable={} other={} bytes={}",
+            counts.erase,
+            counts.printable,
+            counts.other,
+            data.len()
+        );
+    } else {
+        log::debug!(
+            target: "terminal",
+            "pty erase write: erase={} other={} bytes={}",
+            counts.erase,
+            counts.other,
+            data.len()
+        );
+    }
+}
+
 fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> Result<(), String> {
     if data.len() > MAX_PTY_INPUT_BYTES {
         return Err(format!(
@@ -1097,6 +1331,7 @@ fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> R
             .map(|session| (session.writer.clone(), session.dead.clone()))
             .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?
     };
+    note_erase_input(data);
     #[cfg(unix)]
     {
         input::write(&writer, &dead, data)
@@ -1196,26 +1431,33 @@ pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
         .keys()
         .cloned()
         .collect();
-    let mut failures = 0;
-    for id in ids {
-        if kill_session(state, &id).is_err() {
-            failures += 1;
-        }
-    }
-    if failures > 0 {
-        return Err(format!("Could not stop {failures} terminal sessions"));
-    }
+    // Every session at once: each close waits for its own reader (a hangup
+    // grace plus a reap), and quitting with a full dock one session after
+    // another cost that wait 32 times over. At most MAX_PTY_SESSIONS threads.
+    let failures = thread::scope(|scope| {
+        let closes: Vec<_> = ids
+            .iter()
+            .map(|id| scope.spawn(move || kill_session(state, id).is_err()))
+            .collect();
+        closes
+            .into_iter()
+            .map(|close| close.join().unwrap_or(true))
+            .filter(|failed| *failed)
+            .count()
+    });
+    // Drain even after a failure: a session that did close still has to give
+    // its slot back before the runtime goes.
     let deadline = Instant::now() + Duration::from_secs(2);
     while state.active_sessions.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     let remaining = state.active_sessions.load(Ordering::Acquire);
-    if remaining > 0 {
-        Err(format!(
+    match (failures, remaining) {
+        (0, 0) => Ok(()),
+        (0, remaining) => Err(format!(
             "{remaining} terminal processes have not finished cleanup"
-        ))
-    } else {
-        Ok(())
+        )),
+        (failures, _) => Err(format!("Could not stop {failures} terminal sessions")),
     }
 }
 
@@ -1238,6 +1480,19 @@ pub fn acknowledge_output(
     Ok(())
 }
 
+/// Whether the session's own process has exited. Reaping here is safe: the
+/// status is retained, so `finalize_pty_session`'s `try_wait` still reports it.
+#[cfg(unix)]
+fn child_has_exited(child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>) -> bool {
+    matches!(
+        child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_wait(),
+        Ok(Some(_))
+    )
+}
+
 fn terminate_pty_child(
     child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
@@ -1256,7 +1511,10 @@ fn terminate_pty_child(
             .process_group_leader();
         // The tty group must belong to this still-owned child session. Never
         // signal the app's group or a group from a reused, unrelated session.
-        if let Some(group) = foreground.filter(|g| *g > 1) {
+        // The shell's own group is left to `child.kill()` below, which hangs
+        // it up before it kills it: a shell killed outright never passes the
+        // hangup on to its jobs, and an orphaned job keeps the terminal open.
+        if let Some(group) = foreground.filter(|g| *g > 1 && *g != pid) {
             // SAFETY: getsid/kill take numeric ids, and ownership is checked
             // while the child cannot be reaped by the reader thread.
             unsafe {
@@ -2360,6 +2618,7 @@ mod tests {
             app.handle(),
             &state,
             dir.path().to_str().unwrap(),
+            None,
             24,
             80,
             Some("/bin/sh".into()),
@@ -2408,6 +2667,7 @@ mod tests {
             app.handle(),
             &state,
             repo.to_str().unwrap(),
+            None,
             24,
             80,
             Some("/bin/sh".into()),
@@ -4075,6 +4335,23 @@ mod tests {
             Some(&HashMap::from([("A".into(), "x".repeat(16385))]))
         )
         .is_err());
+    }
+
+    #[test]
+    fn erase_input_counts_do_not_retain_the_typed_bytes() {
+        assert!(describe_erase_input(b"").is_none());
+        assert!(describe_erase_input(b"secret").is_none());
+        assert!(describe_erase_input(b"\x1b").is_none());
+        let pure = describe_erase_input(b"\x7f").expect("del");
+        assert_eq!((pure.erase, pure.printable, pure.other), (1, 0, 0));
+        let bs = describe_erase_input(b"\x08").expect("bs");
+        assert_eq!((bs.erase, bs.printable, bs.other), (1, 0, 0));
+        let mixed = describe_erase_input(b"\x7fsecret\x08\x1b").expect("mixed");
+        assert_eq!((mixed.erase, mixed.printable, mixed.other), (2, 6, 1));
+        let high = describe_erase_input(b"\x7f\x80\xc3").expect("high");
+        assert_eq!((high.erase, high.printable, high.other), (1, 2, 0));
+        let rendered = format!("{} {} {}", mixed.erase, mixed.printable, mixed.other);
+        assert!(!rendered.contains("secret"));
     }
 
     #[test]

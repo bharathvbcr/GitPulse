@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampTerminalFontSize, terminalSearchSummary, terminalViewChord } from "./viewControls";
+import { clampTerminalFontSize, macLineEditing, spawnGridSize, terminalSearchSummary, terminalViewChord } from "./viewControls";
 import { initialState, openTab, terminalTabDestination } from "./tabs";
 
 const key = (key: string, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
@@ -18,6 +18,54 @@ describe("terminal view controls", () => {
       for (const minus of ["-", "_"]) expect(terminalViewChord(key(minus, mods))).toBe("zoom-out");
       for (const zero of ["0", ")"]) expect(terminalViewChord(key(zero, mods))).toBe("zoom-reset");
     }
+  });
+
+  it("leaves Control+Shift to the shell on macOS, where Ctrl+Shift+- is readline's undo", () => {
+    for (const k of ["F", "=", "+", "-", "_", "0", ")"]) {
+      expect(terminalViewChord(key(k, { ctrlKey: true, shiftKey: true }), "macos")).toBeNull();
+    }
+    expect(terminalViewChord(key("F", { metaKey: true }), "macos")).toBe("find");
+    expect(terminalViewChord(key("-", { metaKey: true }), "macos")).toBe("zoom-out");
+    for (const os of ["windows", "linux", "unknown"]) {
+      expect(terminalViewChord(key("_", { ctrlKey: true, shiftKey: true }), os)).toBe("zoom-out");
+    }
+  });
+
+  it("maps the Mac line-editing keys at a shell prompt", () => {
+    const at = (k: string, mods = {}) => macLineEditing(key(k, mods), "macos", false);
+    expect(at("ArrowLeft", { metaKey: true })).toBe("\x01");
+    expect(at("ArrowRight", { metaKey: true })).toBe("\x05");
+    expect(at("Backspace", { metaKey: true })).toBe("\x15");
+    expect(at("ArrowLeft", { altKey: true })).toBe("\x1bb");
+    expect(at("ArrowRight", { altKey: true })).toBe("\x1bf");
+  });
+
+  it("leaves every other key, platform, screen and composition alone", () => {
+    const left = key("ArrowLeft", { metaKey: true });
+    expect(macLineEditing(left, "windows", false)).toBeNull();
+    expect(macLineEditing(left, "linux", false)).toBeNull();
+    expect(macLineEditing(left, undefined, false)).toBeNull();
+    expect(macLineEditing(left, "macos", true)).toBeNull();
+    expect(macLineEditing({ ...left, isComposing: true }, "macos", false)).toBeNull();
+    expect(macLineEditing({ ...left, keyCode: 229 }, "macos", false)).toBeNull();
+    for (const mods of [{ metaKey: true, shiftKey: true }, { metaKey: true, ctrlKey: true }, { metaKey: true, altKey: true }, {}]) {
+      expect(macLineEditing(key("ArrowLeft", mods), "macos", false)).toBeNull();
+    }
+    for (const k of ["ArrowUp", "ArrowDown", "a", "Delete", "Enter"]) {
+      expect(macLineEditing(key(k, { metaKey: true }), "macos", false)).toBeNull();
+    }
+    expect(macLineEditing(key("Backspace", { altKey: true }), "macos", false)).toBeNull();
+  });
+
+  it("opens a PTY at a whole, finite size even when a hidden tab measures NaN", () => {
+    expect(spawnGridSize(undefined)).toEqual({ rows: 24, cols: 80 });
+    expect(spawnGridSize(null)).toEqual({ rows: 24, cols: 80 });
+    expect(spawnGridSize({ rows: NaN, cols: NaN })).toEqual({ rows: 24, cols: 80 });
+    expect(spawnGridSize({ rows: Infinity, cols: -Infinity })).toEqual({ rows: 24, cols: 80 });
+    expect(spawnGridSize({ rows: 0, cols: 1 })).toEqual({ rows: 2, cols: 2 });
+    expect(spawnGridSize({ rows: 40.7, cols: 120.2 })).toEqual({ rows: 40, cols: 120 });
+    expect(spawnGridSize({ rows: 1e9, cols: 5000 })).toEqual({ rows: 1000, cols: 1000 });
+    expect(JSON.stringify(spawnGridSize({ rows: NaN, cols: 80 }))).toBe('{"rows":24,"cols":80}');
   });
 
   it("bounds text size, including malformed and fractional requests", () => {

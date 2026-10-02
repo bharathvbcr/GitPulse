@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
-  import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
+  import { platformChord, shortcutKeyLabel, shortcutTextLabel } from "../ui/platformCopy";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
@@ -43,6 +43,8 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import TerminalSession from "./TerminalSession.svelte";
+  import { closeQuestion, startDirFrom } from "../terminal/sessionContext";
+  import { askConfirm } from "../stores/modalStore";
   import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
@@ -55,6 +57,7 @@
     launcherLabel,
     openTab,
     paneOnScreen,
+    setTabStartDir,
     setTabTitle,
     renameTab,
     moveTab,
@@ -375,6 +378,42 @@
     return true;
   }
 
+  /**
+   * A new tab from the toolbar, the chord, or a split. A shell opens where the
+   * shell beside it is working, as every terminal does — but only inside this
+   * repository, which is the only place a session may start. An agent CLI
+   * treats its working directory as the project root, so it keeps the root.
+   */
+  async function openBeside(launcher: LauncherKind): Promise<boolean> {
+    const fromId = tabState.activeId;
+    const context = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : null;
+    const dir = startDirFrom(context ?? null);
+    if (!newTab(launcher)) return false;
+    if (dir && tabState.activeId) tabState = setTabStartDir(tabState, tabState.activeId, dir);
+    return true;
+  }
+
+  /** Ids with a close question already on screen, so a second press does not ask twice. */
+  const closing = new Set<string>();
+
+  /**
+   * Close, asking first when a job is running in the foreground. A terminal
+   * whose foreground cannot be read closes as it always has: an unknown is
+   * not a reason to interrupt.
+   */
+  async function requestClose(id: string) {
+    const tab = tabState.tabs.find((candidate) => candidate.id === id);
+    if (!tab || closing.has(id)) return;
+    closing.add(id);
+    try {
+      const question = closeQuestion((await sessions[id]?.readContext()) ?? null, tabLabel(tab));
+      if (question && !(await askConfirm({ ...question, confirmLabel: "Close", destructive: true }))) return;
+      if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
+    } finally {
+      closing.delete(id);
+    }
+  }
+
   $effect(() => {
     const request = $terminalLaunchRequests;
     if (!request || !visible || request.repoPath !== repoPath) return;
@@ -418,8 +457,9 @@
   function dropTab(id: string) {
     terminalLaunchRequests.forget(id);
     focusTabStrip = false;
+    const partner = splitIds?.includes(id) ? splitIds.find((other) => other !== id) ?? null : null;
     if (splitIds?.includes(id)) splitIds = null;
-    tabState = closeTab(tabState, id);
+    tabState = closeTab(tabState, id, partner);
     const { [id]: _status, ...statuses } = tabStatuses;
     tabStatuses = statuses;
     unread = new Set([...unread].filter((key) => key !== id));
@@ -435,8 +475,8 @@
     event.preventDefault();
     event.stopPropagation();
     focusTabStrip = false;
-    if (chord === "new") newTab("shell");
-    else if (chord === "close" && tabState.activeId) dropTab(tabState.activeId);
+    if (chord === "new") void openBeside("shell");
+    else if (chord === "close" && tabState.activeId) void requestClose(tabState.activeId);
     else if (chord === "next" || chord === "prev") {
       const next = cycleTab(tabState, chord === "next" ? 1 : -1).activeId;
       if (next) selectTab(next);
@@ -508,13 +548,13 @@
     });
   });
 
-  function toggleSplit() {
+  async function toggleSplit() {
     if (splitIds) { splitIds = null; return; }
     const first = activeId;
     if (!first) return;
     let second = tabState.tabs.find((tab) => tab.id !== first)?.id;
-    if (!second) { newTab(nextLauncher); second = activeId ?? undefined; }
-    if (second && second !== first) splitIds = [first, second];
+    if (!second) { await openBeside(nextLauncher); second = activeId ?? undefined; }
+    if (second && second !== first && tabState.tabs.some((tab) => tab.id === first)) splitIds = [first, second];
   }
 
   function showTabOptions() {
@@ -807,6 +847,12 @@
       <span><kbd>Esc</kbd> Close find</span>
       <span><kbd>{platformChord("⌘ + / − / 0", "Ctrl+Shift+ + / − / 0", $hostPlatform.os)}</kbd> Text size</span>
       <span><kbd>← / → / Home / End</kbd> Navigate focused tabs</span>
+      {#if $hostPlatform.os === "macos"}
+        <span><kbd>{shortcutKeyLabel("⌘← / ⌘→", $hostPlatform.os)}</kbd> Start / end of line</span>
+        <span><kbd>{shortcutKeyLabel("⌥← / ⌥→", $hostPlatform.os)}</kbd> Back / forward a word</span>
+        <span><kbd>{shortcutKeyLabel("⌘⌫", $hostPlatform.os)}</kbd> Delete to start of line</span>
+      {/if}
+      <span>A new shell opens in the directory of the shell beside it. Closing a running job, or pasting several lines into a shell that would run each one, asks first.</span>
       <span>Find session searches this repository's tabs. All terminal sessions searches across repositories.</span>
       <span>Shell commands run outside the MANVI gate. Console git commands are MANVI-gated.</span>
     </div>
@@ -856,7 +902,7 @@
           <button
             type="button"
             class="p-0.5 rounded opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surfaceHover text-textMuted hover:text-rose-300"
-            onclick={() => dropTab(tab.id)}
+            onclick={() => void requestClose(tab.id)}
             aria-label={`Close ${tabLabel(tab)}`}
             title="Close this session ({shortcutTextLabel('⌃⇧W', $hostPlatform.os)}) — the process is terminated"
           >
@@ -888,7 +934,7 @@
             <ChevronDown size={11} />
           </button>
         </div>
-        <button type="button" class="gp-icon-btn" disabled={!repoPath || !canCreate} onclick={() => newTab(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!repoPath || !canCreate} onclick={() => void openBeside(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
       </div>
     </div>
 
@@ -1008,6 +1054,7 @@
               tabId={tab.id}
               launcher={tab.launcher}
               initialPrompt={tab.initialPrompt}
+              startDir={tab.startDir}
               active={visible && tab.id === tabState.activeId && mode === "shell"}
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}

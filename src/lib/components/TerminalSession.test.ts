@@ -78,7 +78,7 @@ describe("TerminalSession PTY contracts", () => {
   it("guards ResizeObserver refits with proposeDimensions + shouldRefit", () => {
     const refitBody = source.slice(
       source.indexOf("function refitIfResized"),
-      source.indexOf("function base64ToBytes"),
+      source.indexOf("function launcherConfig"),
     );
     expect(refitBody).toContain("proposeDimensions()");
     expect(refitBody).toContain("shouldRefit(");
@@ -175,6 +175,42 @@ describe("TerminalSession PTY contracts", () => {
     const body = source.slice(handlerIdx, source.indexOf("term = created;"));
     expect(body).toContain('event.type !== "keydown"');
     expect(body).toContain("return !onChord(event);");
+  });
+
+  it("acknowledges output credit when the emulator cannot finish painting", () => {
+    // The ack used to live inside term?.write's callback and return early
+    // once `disposed` was set, so a close during a flood never released the
+    // bytes Rust had already reserved.
+    const outputIdx = source.indexOf("output(b64, sessionId, reserved)");
+    expect(outputIdx).toBeGreaterThan(-1);
+    const body = source.slice(outputIdx, source.indexOf("exit(event)", outputIdx));
+    expect(body).toContain("planTerminalOutput(");
+    expect(body).toContain("lifecycle?.stop(");
+    expect(body).not.toContain("credit.accept(");
+    expect(body).not.toContain("if (disposed) return");
+    expect(body).not.toContain("term?.write(");
+    const cleanupIdx = source.indexOf("disposed = true;");
+    expect(source.indexOf("credit.releaseAll()", cleanupIdx)).toBeGreaterThan(cleanupIdx);
+    expect(source.indexOf("credit.releaseAll()", cleanupIdx)).toBeLessThan(source.indexOf("term?.dispose()", cleanupIdx));
+  });
+
+  it("owns Backspace on the helper textarea before xterm can reinsert the line", () => {
+    const mountIdx = source.indexOf("onMount(() => {");
+    const openIdx = source.indexOf("t?.open(host)", mountIdx);
+    const guardIdx = source.indexOf("addEventListener(type, onEraseCapture, true)", mountIdx);
+    expect(guardIdx).toBeGreaterThan(mountIdx);
+    expect(guardIdx).toBeLessThan(openIdx);
+    expect(source).toContain("xterm-helper-textarea");
+    expect(source).toContain("eraseGuard.decide");
+    expect(source).toContain("applyHelperTextareaHardening");
+    expect(source).toContain("decision.clearTextarea");
+    expect(source).toContain("decision.cancelDefault");
+    expect(source).toContain("webkit229ChordEvent");
+    expect(source).toContain("applicationCursorKeysMode");
+    const capture = source.slice(source.indexOf("const onEraseCapture"), source.indexOf("if (host) {"));
+    expect(capture.indexOf("webkit229ChordEvent")).toBeLessThan(capture.indexOf("eraseGuard.decide"));
+    const cleanup = source.indexOf("removeEventListener(type, onEraseCapture, true)", openIdx);
+    expect(cleanup).toBeGreaterThan(openIdx);
   });
 });
 

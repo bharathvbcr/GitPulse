@@ -42,6 +42,11 @@ export interface TerminalTab {
   name?: string;
   /** Supplied as a literal agent CLI argument when this tab starts. */
   initialPrompt?: string;
+  /**
+   * Repository-relative directory this tab's process starts in, copied from
+   * the session it was opened beside. Absent means the repository root.
+   */
+  startDir?: string;
   taskRunId?: string;
 }
 
@@ -147,13 +152,22 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
  * "start a fresh shell", and inventing a session here would spawn a process
  * nobody asked for.
  */
-export function closeTab(state: TabState, id: string): TabState {
+export function closeTab(state: TabState, id: string, prefer?: string | null): TabState {
   const index = state.tabs.findIndex((tab) => tab.id === id);
   if (index === -1) return state;
   const tabs = state.tabs.filter((tab) => tab.id !== id);
   if (state.activeId !== id) return { tabs, activeId: state.activeId };
-  const next = tabs[index] ?? tabs[index - 1] ?? null;
+  // Closing one half of a split leaves the other half on screen; showing a
+  // neighbour instead would swap the terminal the user was just looking at.
+  const preferred = prefer ? tabs.find((tab) => tab.id === prefer) : undefined;
+  const next = preferred ?? tabs[index] ?? tabs[index - 1] ?? null;
   return { tabs, activeId: next?.id ?? null };
+}
+
+/** Pins where a tab's process starts. Only before it spawns does this mean anything. */
+export function setTabStartDir(state: TabState, id: string, startDir: string | null): TabState {
+  if (startDir === null || !state.tabs.some((tab) => tab.id === id)) return state;
+  return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, startDir } : tab)) };
 }
 
 export function activateTab(state: TabState, id: string): TabState {

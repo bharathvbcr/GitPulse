@@ -62,7 +62,7 @@
 </script>
 
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord } from "../ui/platformCopy";
   import { invoke } from "@tauri-apps/api/core";
@@ -77,6 +77,13 @@
   import { themeStore } from "../stores/themeStore";
   import { formatError } from "../ui/formatError";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
+  import { terminalDeadline } from "../terminal/inputQueue";
+  import { parseTerminalContext, type TerminalContext } from "../terminal/sessionContext";
+  import { isEditingElsewhere } from "../keyboard/terminalFocus";
+  import { planPaste } from "../terminal/pasteGuard";
+  import { askConfirm } from "../stores/modalStore";
+  import { createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
@@ -102,7 +109,7 @@
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
   import { requestReveal } from "../files/revealRequests";
   import {
-    clampTerminalFontSize, terminalViewChord, terminalSearchSummary,
+    clampTerminalFontSize, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
     SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
   } from "../terminal/viewControls";
@@ -126,6 +133,7 @@
     tabId,
     launcher,
     initialPrompt,
+    startDir,
     taskRunId,
     active,
     onscreen = false,
@@ -139,6 +147,8 @@
     tabId: string;
     launcher: LauncherKind;
     initialPrompt?: string;
+    /** Repository-relative directory to start in; absent starts at the root. */
+    startDir?: string;
     taskRunId?: string;
     active: boolean;
     /**
@@ -200,6 +210,8 @@
   let container = $state<HTMLDivElement | null>(null);
   let warning = $state<string | null>(null);
   let shellPath = $state("");
+  /** Absolute directory the current process started in, as the backend reported it. */
+  let startedIn = $state("");
   let exited = $state(false);
   let error = $state<string | null>(null);
   let spawning = $state(false);
@@ -230,6 +242,8 @@
    * into a dead lifecycle.
    */
   let disposed = false;
+  /** Outstanding PTY output credit for this view. Released on paint, or on teardown when paint will not happen. */
+  const credit = createOutputCredit();
 
   function termTheme(): Record<string, string> {
     const css = getComputedStyle(document.documentElement);
@@ -411,6 +425,12 @@
       scrolledBack = created.buffer.active.viewportY < created.buffer.active.baseY;
     });
     created.onData((data) => {
+      const shape = describeTerminalControl(data);
+      if (shape) {
+        const line = `pty-input ${shape.detail}`;
+        if (shape.printable > 0) console.info("[gitpulse-terminal]", line);
+        else console.debug("[gitpulse-terminal]", line);
+      }
       lifecycle?.write(data);
     });
     created.onBinary((data) => { lifecycle?.write(data, true); });
@@ -432,7 +452,33 @@
       return !onChord(event);
     });
     term = created;
+    if (!disposed) {
+      for (const token of credit.flush()) paintOutput(token);
+    }
     return term;
+  }
+
+  function acknowledgeOutput(sessionId: string, bytes: number) {
+    if (bytes <= 0) return;
+    void invoke("cmd_terminal_ack", { sessionId, bytes }).catch((err: unknown) => {
+      if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`, true);
+    });
+  }
+
+  function paintOutput(token: PaintToken) {
+    const termNow = term;
+    if (!termNow || disposed) {
+      acknowledgeOutput(token.sessionId, token.release());
+      return;
+    }
+    try {
+      termNow.write(token.bytes, () => {
+        acknowledgeOutput(token.sessionId, token.release());
+      });
+    } catch (err) {
+      acknowledgeOutput(token.sessionId, token.release());
+      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+    }
   }
 
   function refitIfResized() {
@@ -447,13 +493,6 @@
     } catch {
       /* container collapsed; refit when it has size again */
     }
-  }
-
-  function base64ToBytes(b64: string): Uint8Array {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
   }
 
   function launcherConfig(kind: LauncherKind): { program?: string; args?: string[] } {
@@ -489,14 +528,17 @@
       reveal: revealSelf,
       transport: {
         spawn: () => {
-          const dims = fitAddon?.proposeDimensions();
+          // A tab hidden before its shell starts measures as NaN; NaN becomes
+          // `null` on the wire and the backend's u16 refuses the spawn.
+          const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions());
           const cfg = launcherConfig(launcher);
           if (taskRunId) return invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
-            input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows: Math.max(dims?.rows ?? 24, 2), cols: Math.max(dims?.cols ?? 80, 2) }),
+            input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),
           });
           return invoke<TerminalSpawned>("cmd_terminal_spawn", {
-            repoPath, rows: Math.max(dims?.rows ?? 24, 2), cols: Math.max(dims?.cols ?? 80, 2),
+            repoPath, rows, cols,
             program: cfg.program, args: cfg.args,
+            startDir: startDir ?? null,
             permissionMode,
             // Sent only for the mode that needs it. The backend refuses an
             // acknowledgement attached to any other mode, so a bug that sent
@@ -521,25 +563,38 @@
           // The backend's own id for this PTY, which is what a notification is
           // keyed by. The tab id is a renderer invention and means nothing to
           // the notifier.
+          // A restart is a new process with a new id. The old id is dead, and
+          // left behind it pushes the live one out of the bounded report.
+          if (nativeSessionId && nativeSessionId !== spawned.id) terminalAttendance.forget(nativeSessionId);
           nativeSessionId = spawned.id;
           terminalAttendance.report(nativeSessionId, onscreen);
+          startedIn = spawned.cwd;
           harnessStore.recordAction({
             repoPath,
             kind: "terminal-session",
             label: `${launcherLabel(launcher)} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
             ok: true,
           });
-          if (active) reveal();
+          // Not while the user is typing somewhere else — a rename field, a
+          // search box. The shell can wait for focus; their word cannot.
+          if (active && !isEditingElsewhere(document.activeElement, container)) reveal();
         },
-        output(b64, sessionId) {
-          try {
-            const bytes = base64ToBytes(b64);
-            term?.write(bytes, () => {
-              if (disposed) return;
-              void invoke("cmd_terminal_ack", { sessionId, bytes: bytes.length }).catch((err: unknown) => { if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`); });
-            });
-            if (!active) onActivity();
-          } catch (err) { lifecycle?.fail(`Invalid terminal output: ${formatError(err)}`); }
+        output(b64, sessionId, reserved) {
+          const decision = planTerminalOutput(credit, b64, sessionId, reserved ?? null, {
+            terminal: term !== null && !disposed,
+            disposed,
+          });
+          if (decision.action === "paint") paintOutput(decision.token);
+          else if (decision.action === "ack") {
+            acknowledgeOutput(sessionId, decision.bytes);
+            if (decision.failure) lifecycle?.fail(decision.failure, true);
+          } else if (decision.action === "overflow") {
+            for (const owed of decision.owed) acknowledgeOutput(owed.sessionId, owed.bytes);
+            lifecycle?.fail(decision.failure, true);
+          } else if (decision.action === "stop") {
+            void lifecycle?.stop(decision.failure);
+          }
+          if (decision.action !== "stop" && !disposed && !active) onActivity();
         },
         exit(event) {
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
@@ -674,6 +729,22 @@
     }
   }
 
+  /**
+   * What this session is running and where, or null when it has no live
+   * process or the answer is malformed. Bounded: a stuck query must not hold
+   * up the close or the new tab that asked.
+   */
+  export async function readContext(): Promise<TerminalContext | null> {
+    const sessionId = nativeSessionId;
+    if (!sessionId || !lifecycle?.isCurrent(sessionId)) return null;
+    try {
+      const raw = await terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId }), 1500, "Reading terminal context");
+      return parseTerminalContext(raw);
+    } catch {
+      return null;
+    }
+  }
+
   function setFontSize(size: number) {
     fontSize = clampTerminalFontSize(size);
     interfaceStore.setTerminalFontSize(fontSize);
@@ -684,7 +755,7 @@
 
   export function handleViewChord(event: KeyboardEvent): boolean {
     if (!active || event.defaultPrevented) return false;
-    const chord = terminalViewChord(event);
+    const chord = terminalViewChord(event, $hostPlatform.os);
     if (!chord) return false;
     event.preventDefault();
     event.stopPropagation();
@@ -706,11 +777,137 @@
     term?.focus();
   }
 
+  const ERASE_CAPTURE_EVENTS = ["keydown", "keyup", "keypress", "beforeinput", "input", "compositionstart", "compositionupdate", "compositionend"] as const;
+
+  function eraseInputFromDom(event: Event): TerminalInputEvent {
+    const source = event as KeyboardEvent & InputEvent;
+    return {
+      type: event.type,
+      key: typeof source.key === "string" ? source.key : undefined,
+      keyCode: typeof source.keyCode === "number" ? source.keyCode : undefined,
+      ctrlKey: source.ctrlKey === true,
+      altKey: source.altKey === true,
+      metaKey: source.metaKey === true,
+      shiftKey: source.shiftKey === true,
+      repeat: source.repeat === true,
+      isComposing: source.isComposing === true,
+      inputType: typeof source.inputType === "string" ? source.inputType : undefined,
+      data: typeof source.data === "string" ? source.data : null,
+      applicationCursor: term?.modes?.applicationCursorKeysMode === true,
+      code: typeof source.code === "string" ? source.code : undefined,
+      screenReader: term?.options.screenReaderMode === true,
+      timeStamp: Number.isFinite(event.timeStamp) ? event.timeStamp : undefined,
+    };
+  }
+
+  const hardenedHelpers = new WeakSet<HTMLTextAreaElement>();
+  function hardenHelper(textarea: HTMLTextAreaElement) {
+    if (hardenedHelpers.has(textarea)) return;
+    applyHelperTextareaHardening(textarea);
+    hardenedHelpers.add(textarea);
+  }
+
   onMount(() => {
     const host = container;
+    const eraseGuard = createEraseGuard();
+    /** Pending arm expiries, cleared with the view so none outlives it. */
+    const armTimers = new Set<ReturnType<typeof setTimeout>>();
+    const expireLater = (gen: number, ms: number) => {
+      const timer = setTimeout(() => { armTimers.delete(timer); eraseGuard.expire(gen); }, ms);
+      armTimers.add(timer);
+    };
+    // After xterm's own keydown (a capture listener on the same textarea,
+    // registered later, runs after it): what xterm actually did, not a guess.
+    const onXtermKeydown = (event: Event) => eraseGuard.observe(event.defaultPrevented);
+    // No keyup arrives for a key held while focus leaves.
+    const onHelperBlur = () => eraseGuard.reset();
+    let observedHelper: HTMLTextAreaElement | null = null;
+    /**
+     * Every paste goes through `planPaste`: bracketed-paste markers inside the
+     * clipboard are removed, and a paste that would run before it is read asks
+     * first. Ahead of xterm's own listeners, which never strip the markers.
+     */
+    const onPasteCapture = (event: Event) => {
+      if (!(event instanceof ClipboardEvent) || !host || !(event.target instanceof Node) || !host.contains(event.target)) return;
+      const raw = event.clipboardData?.getData("text/plain");
+      const current = term;
+      if (raw === undefined || !current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const plan = planPaste(raw, current.modes.bracketedPasteMode);
+      if (!plan.question) { current.paste(plan.text); return; }
+      void askConfirm({ ...plan.question, confirmLabel: "Paste" }).then((confirmed) => {
+        if (disposed || term !== current) return;
+        if (confirmed) current.paste(plan.text);
+        current.focus();
+      });
+    };
+    const onEraseCapture = (event: Event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLTextAreaElement) || !target.classList.contains("xterm-helper-textarea")) return;
+      if (host && !host.contains(target)) return;
+      hardenHelper(target);
+      if (event instanceof KeyboardEvent) {
+        const asChord = webkit229ChordEvent(event);
+        if (asChord && (handleViewChord(asChord) || onChord(asChord))) {
+          target.value = "";
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        // Before the erase guard: ⌘⌫ is a Backspace keydown, and the guard
+        // would send it as a single DEL.
+        const edit = event.type === "keydown"
+          ? macLineEditing(event, $hostPlatform.os, term?.buffer.active.type === "alternate")
+          : null;
+        if (edit !== null) {
+          target.value = "";
+          event.preventDefault();
+          event.stopPropagation();
+          eraseGuard.reset();
+          if (term) term.input(edit, true);
+          else lifecycle?.write(edit);
+          return;
+        }
+      }
+      const decision = eraseGuard.decide(eraseInputFromDom(event));
+      if (decision.clearTextarea && !(event as KeyboardEvent).isComposing) target.value = "";
+      const swallowed = /len=(\d+)/.exec(decision.detail);
+      const dump = swallowed !== null && Number(swallowed[1]) > 1;
+      if (decision.trace === "suppress" && dump) console.info("[gitpulse-terminal]", decision.detail);
+      else if (decision.trace) console.debug("[gitpulse-terminal]", decision.detail);
+      if (decision.releaseAfterTail) {
+        const gen = decision.generation;
+        queueMicrotask(() => expireLater(gen, 0));
+      }
+      if (decision.armTtlMs !== null) expireLater(decision.generation, decision.armTtlMs);
+      // Through xterm, as if typed: it scrolls to the prompt, honours
+      // disableStdin, and fires onData, which is the one path to the PTY.
+      if (decision.send) {
+        if (term) term.input(decision.send, true);
+        else lifecycle?.write(decision.send);
+      }
+      if (decision.cancelDefault) event.preventDefault();
+      if (decision.suppress) event.stopPropagation();
+    };
     if (host) {
+      // Parent capture is registered before open(), so it runs before xterm
+      // binds the helper textarea. One Backspace is one erase; the WebKit
+      // keypress / insertText that would type the deleted line back never
+      // reaches xterm, including the keyCode 229 path that resends the textarea.
+      for (const type of ERASE_CAPTURE_EVENTS) host.addEventListener(type, onEraseCapture, true);
+      host.addEventListener("paste", onPasteCapture, true);
       const t = ensureTerm();
       t?.open(host);
+      host.querySelectorAll("textarea.xterm-helper-textarea").forEach((node) => {
+        if (node instanceof HTMLTextAreaElement) hardenHelper(node);
+      });
+      const helper = t?.textarea ?? null;
+      if (helper) {
+        observedHelper = helper;
+        helper.addEventListener("keydown", onXtermKeydown, true);
+        helper.addEventListener("blur", onHelperBlur);
+      }
       stopResize = observeResize(host, () => {
         if (!disposed) refitIfResized();
       });
@@ -745,7 +942,17 @@
         void spawnPty();
       });
     return () => {
+      if (host) {
+        for (const type of ERASE_CAPTURE_EVENTS) host.removeEventListener(type, onEraseCapture, true);
+        host.removeEventListener("paste", onPasteCapture, true);
+      }
+      observedHelper?.removeEventListener("keydown", onXtermKeydown, true);
+      observedHelper?.removeEventListener("blur", onHelperBlur);
+      observedHelper = null;
+      for (const timer of armTimers) clearTimeout(timer);
+      armTimers.clear();
       disposed = true;
+      for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
       if (nativeSessionId) terminalAttendance.forget(nativeSessionId);
       lifecycle?.dispose();
       lifecycle = null;
@@ -770,6 +977,20 @@
   $effect(() => {
     const on = $interfaceStore.terminalScreenReader;
     if (term) term.options.screenReaderMode = on;
+  });
+
+  /**
+   * Text size is one setting, so every open terminal follows it — not only
+   * the tab that changed it and the tabs opened afterwards.
+   */
+  $effect(() => {
+    const size = clampTerminalFontSize($interfaceStore.terminalFontSize);
+    untrack(() => {
+      if (size === fontSize) return;
+      fontSize = size;
+      if (term) term.options.fontSize = size;
+      void tick().then(() => { if (!disposed && active) refitIfResized(); });
+    });
   });
 
   /** Theme flips re-resolve the palette from CSS variables. */
@@ -910,7 +1131,7 @@
         <span class="text-[10px] text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
       {:else}
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
-        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${repoPath}`}>{shellPath.split(/[\\/]/).pop()} · {repoPath.split(/[\\/]/).pop()}</span>
+        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || repoPath}`}>{shellPath.split(/[\\/]/).pop()} · {repoPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
       {/if}
       <div class="ml-auto flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
 

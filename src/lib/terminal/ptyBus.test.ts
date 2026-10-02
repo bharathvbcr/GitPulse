@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { createPtyBus, type EventListen, type TerminalExitEvent } from "./ptyBus";
+import { createSessionLifecycle } from "./sessionLifecycle";
+import { createSessionRegistry } from "./sessionRegistry";
+import { createPtyBus, MAX_FORGOTTEN_SESSIONS, MAX_PENDING_IDS, MAX_PTY_TOMBSTONES, type EventListen, type TerminalExitEvent } from "./ptyBus";
 
 /** A controllable stand-in for Tauri's event transport. */
 function fakeTransport() {
@@ -194,6 +196,430 @@ describe("ptyBus early output", () => {
     expect(bus.pendingCount("orphan-0")).toBe(0);
     expect(bus.pendingCount("orphan-39")).toBe(1);
   });
+
+  it("reports an oversized chunk that arrived before subscribe instead of dropping it silently", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    const onError = vi.fn();
+    const onOutput = vi.fn();
+    transport.emit("terminal-output", output("late", "A".repeat(8193)));
+    transport.emit("terminal-output", output("late", "QQ=="));
+    bus.subscribe("late", { onOutput, onExit: vi.fn(), onError });
+    expect(onOutput).toHaveBeenCalledTimes(1);
+    expect(onOutput).toHaveBeenCalledWith("QQ==");
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("exceeded"));
+  });
+
+  it("still delivers an exit after that session's early output was discarded", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    transport.emit("terminal-output", output("victim", "QQ=="));
+    transport.emit("terminal-exit", exit("victim"));
+    for (let i = 0; i < 80; i++) transport.emit("terminal-output", output(`later-${i}`, "QQ=="));
+    const onOutput = vi.fn();
+    const onError = vi.fn();
+    const onExit = vi.fn();
+    bus.subscribe("victim", { onOutput, onExit, onError });
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("incomplete"));
+    expect(onExit).toHaveBeenCalledWith(expect.objectContaining({ id: "victim", exit_code: 0, reaped: true }));
+  });
+
+  it("keeps an evicted exit that had no output, without calling it incomplete", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    for (let i = 0; i < 40; i++) transport.emit("terminal-exit", exit(`gone-${i}`));
+    const onError = vi.fn();
+    const onExit = vi.fn();
+    bus.subscribe("gone-0", { onOutput: vi.fn(), onExit, onError });
+    expect(onExit).toHaveBeenCalledWith(expect.objectContaining({ id: "gone-0" }));
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("stays bounded across a flood of unclaimed sessions", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    for (let i = 0; i < 5000; i++) transport.emit("terminal-output", output(`s-${i % 64}`, "QQ=="));
+    for (let i = 0; i < 64; i++) expect(bus.pendingCount(`s-${i}`)).toBeLessThanOrEqual(128);
+    const onError = vi.fn();
+    const onOutput = vi.fn();
+    bus.subscribe("s-0", { onOutput, onExit: vi.fn(), onError });
+    expect(onOutput.mock.calls.length).toBeLessThanOrEqual(128);
+    expect(onError).toHaveBeenCalled();
+  });
+
+  it("reports an oversized chunk to a live session and keeps the following chunk", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const onError = vi.fn();
+    const onOutput = vi.fn();
+    bus.subscribe("live", { onOutput, onExit: vi.fn(), onError });
+    transport.emit("terminal-output", output("live", "A".repeat(8193)));
+    transport.emit("terminal-output", output("live", "QQ=="));
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("exceeded"));
+    expect(onOutput).toHaveBeenCalledTimes(1);
+    expect(onOutput).toHaveBeenCalledWith("QQ==");
+  });
+
+  it("keeps a real exit error when early output was also discarded", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    transport.emit("terminal-output", output("victim", "QQ=="));
+    const failed = { ...exit("victim"), reaped: false, exit_code: null, error: "wait failed" };
+    transport.emit("terminal-exit", failed);
+    for (let i = 0; i < 80; i++) transport.emit("terminal-output", output(`later-${i}`, "QQ=="));
+    const onError = vi.fn();
+    const onExit = vi.fn();
+    bus.subscribe("victim", { onOutput: vi.fn(), onExit, onError });
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("incomplete"));
+    const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.error).toContain("wait failed");
+    expect(delivered.error).toContain("incomplete");
+    expect(delivered.reaped).toBe(false);
+  });
+
+  it("still reports an exit notice that fell off the tombstone list", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    const remembered = MAX_PENDING_IDS + MAX_PTY_TOMBSTONES;
+    for (let i = 0; i < remembered + 1; i++) transport.emit("terminal-exit", exit(`gone-${i}`));
+    const dropped = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe("gone-0", dropped);
+    expect(dropped.onExit).toHaveBeenCalledWith(expect.objectContaining({
+      id: "gone-0",
+      exit_code: null,
+      reaped: false,
+      error: expect.stringContaining("discarded"),
+    }));
+    expect(dropped.onError).toHaveBeenCalledWith(expect.stringContaining("discarded"));
+    const recent = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe(`gone-${remembered}`, recent);
+    expect(recent.onExit).toHaveBeenCalledWith(expect.objectContaining({ id: `gone-${remembered}` }));
+    expect(recent.onError).not.toHaveBeenCalled();
+  });
+
+  it("stops naming sessions once the forgotten-id bound is passed", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    const extra = 3;
+    const total = MAX_PENDING_IDS + MAX_PTY_TOMBSTONES + MAX_FORGOTTEN_SESSIONS + extra;
+    for (let i = 0; i < total; i++) transport.emit("terminal-exit", exit(`gone-${i}`));
+    const oldest = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe("gone-0", oldest);
+    expect(oldest.onExit).not.toHaveBeenCalled();
+    expect(oldest.onError).not.toHaveBeenCalled();
+    const edge = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe(`gone-${extra}`, edge);
+    expect(edge.onExit).toHaveBeenCalledWith(expect.objectContaining({
+      id: `gone-${extra}`,
+      exit_code: null,
+      reaped: false,
+      error: expect.stringContaining("discarded"),
+    }));
+    expect(edge.onError).toHaveBeenCalledWith(expect.stringContaining("discarded"));
+    const newest = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe(`gone-${total - 1}`, newest);
+    expect(newest.onExit).toHaveBeenCalledWith(expect.objectContaining({ id: `gone-${total - 1}` }));
+    expect(newest.onError).not.toHaveBeenCalled();
+  });
+
+  it("names both the discarded output and the discarded exit after the id falls off the tombstone list", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    transport.emit("terminal-output", output("both-facts", "QQ=="));
+    transport.emit("terminal-exit", exit("both-facts"));
+    // Fill the pending map, then the tombstone list, so this id is forgotten
+    // while it is still inside the forgotten-id cap.
+    const others = MAX_PENDING_IDS + MAX_PTY_TOMBSTONES;
+    for (let i = 0; i < others; i++) transport.emit("terminal-exit", exit(`other-${i}`));
+    const onOutput = vi.fn();
+    const onExit = vi.fn();
+    bus.subscribe("both-facts", { onOutput, onExit, onError: vi.fn() });
+    expect(onOutput).not.toHaveBeenCalled();
+    const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.reaped).toBe(false);
+    expect(delivered.exit_code).toBeNull();
+    expect(delivered.error).toContain("early output was discarded");
+    expect(delivered.error).toContain("exit was discarded");
+  });
+
+  it("forgets unclaimed exits when the last listener detaches", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const release = bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    for (let i = 0; i < 40; i++) transport.emit("terminal-exit", exit(`gone-${i}`));
+    release();
+    await settle();
+    const onExit = vi.fn();
+    const onError = vi.fn();
+    bus.subscribe("gone-0", { onOutput: vi.fn(), onExit, onError });
+    await settle();
+    expect(onExit).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps the discarded-output notice after the exit reaches the session", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const ready = await bus.prepare();
+    transport.emit("terminal-output", output("native-a", "QQ=="));
+    transport.emit("terminal-exit", exit("native-a"));
+    for (let i = 0; i < 80; i++) transport.emit("terminal-output", output(`later-${i}`, "QQ=="));
+    const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
+    const owner = createSessionLifecycle({
+      key: "tab",
+      repoPath: "/repo",
+      label: "Shell",
+      registry: createSessionRegistry(),
+      transport: {
+        spawn: async () => ({ id: "native-a", shell: "/bin/sh", cwd: "/repo" }),
+        write: async () => {},
+        resize: async () => {},
+        kill: async () => {},
+      },
+      hooks,
+      bus,
+    });
+    await owner.start();
+    ready();
+    expect(hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("incomplete"));
+    owner.dispose();
+  });
+
+  it("keeps a trimmed early buffer on the clean exit that would clear the banner", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    for (let i = 0; i < 128; i++) transport.emit("terminal-output", output("exact", "QQ=="));
+    transport.emit("terminal-exit", exit("exact"));
+    const exact = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe("exact", exact);
+    expect(exact.onError).not.toHaveBeenCalled();
+    expect(exact.onOutput).toHaveBeenCalledTimes(128);
+    expect(exact.onExit).toHaveBeenCalledWith(exit("exact"));
+
+    // Exit first, then the flood: the exit is already stored when the cap trims.
+    transport.emit("terminal-exit", exit("trimmed"));
+    for (let i = 0; i < 129; i++) transport.emit("terminal-output", output("trimmed", "QQ=="));
+    const trimmed = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe("trimmed", trimmed);
+    expect(trimmed.onOutput).toHaveBeenCalledTimes(128);
+    expect(trimmed.onError).toHaveBeenCalledWith(expect.stringContaining("buffer limit"));
+    expect(trimmed.onExit).toHaveBeenCalledWith(expect.objectContaining({
+      id: "trimmed",
+      exit_code: 0,
+      reaped: true,
+      error: expect.stringContaining("buffer limit"),
+    }));
+
+    transport.emit("terminal-output", output("both", "A".repeat(8193)));
+    for (let i = 0; i < 129; i++) transport.emit("terminal-output", output("both", "QQ=="));
+    transport.emit("terminal-exit", exit("both"));
+    const both = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe("both", both);
+    const bothExit = both.onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(bothExit.error).toEqual(expect.stringContaining("buffer limit"));
+    expect(bothExit.error).toEqual(expect.stringContaining("exceeded"));
+    expect(bothExit.exit_code).toBe(0);
+
+    for (let n = 0; n < 200; n++) {
+      const id = `burst-${n}`;
+      for (let i = 0; i < 129; i++) transport.emit("terminal-output", output(id, "QQ=="));
+      transport.emit("terminal-exit", exit(id));
+      const burst = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+      bus.subscribe(id, burst)();
+      expect(burst.onOutput).toHaveBeenCalledTimes(128);
+      expect(burst.onExit).toHaveBeenCalledWith(expect.objectContaining({
+        error: expect.stringContaining("buffer limit"),
+      }));
+    }
+  });
+
+  it("keeps the trimmed-buffer notice after a clean exit reaches the session", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const ready = await bus.prepare();
+    for (let i = 0; i < 129; i++) transport.emit("terminal-output", output("native-trim", "QQ=="));
+    transport.emit("terminal-exit", exit("native-trim"));
+    const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
+    const owner = createSessionLifecycle({
+      key: "tab",
+      repoPath: "/repo",
+      label: "Shell",
+      registry: createSessionRegistry(),
+      transport: {
+        spawn: async () => ({ id: "native-trim", shell: "/bin/sh", cwd: "/repo" }),
+        write: async () => {},
+        resize: async () => {},
+        kill: async () => {},
+      },
+      hooks,
+      bus,
+    });
+    await owner.start();
+    ready();
+    expect(hooks.output).toHaveBeenCalledTimes(128);
+    expect(hooks.exit).toHaveBeenCalledWith(expect.objectContaining({
+      id: "native-trim",
+      exit_code: 0,
+      error: expect.stringContaining("buffer limit"),
+    }));
+    expect(hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("buffer limit"));
+    owner.dispose();
+  });
+
+  it("keeps a native exit error and the trimmed buffer together", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    for (let i = 0; i < 129; i++) transport.emit("terminal-output", output("kept", "QQ=="));
+    transport.emit("terminal-exit", { ...exit("kept"), reaped: false, exit_code: null, error: "wait failed" });
+    const onExit = vi.fn();
+    bus.subscribe("kept", { onOutput: vi.fn(), onExit, onError: vi.fn() });
+    const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.error).toContain("wait failed");
+    expect(delivered.error).toContain("buffer limit");
+    expect(delivered.exit_code).toBeNull();
+  });
+
+  it("keeps a live oversized chunk on the clean exit and still accepts typing until then", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const ready = await bus.prepare();
+    const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
+    const owner = createSessionLifecycle({
+      key: "tab",
+      repoPath: "/repo",
+      label: "Shell",
+      registry: createSessionRegistry(),
+      transport: {
+        spawn: async () => ({ id: "native-live", shell: "/bin/sh", cwd: "/repo" }),
+        write: async () => {},
+        resize: async () => {},
+        kill: async () => {},
+      },
+      hooks,
+      bus,
+    });
+    await owner.start();
+    transport.emit("terminal-output", output("native-live", "A".repeat(8193)));
+    transport.emit("terminal-output", output("native-live", "QQ=="));
+    expect(owner.write("still-alive")).toBe(true);
+    expect(hooks.output).toHaveBeenCalledWith("QQ==", "native-live");
+    transport.emit("terminal-exit", exit("native-live"));
+    expect(owner.write("after-exit")).toBe(false);
+    expect(hooks.exit).toHaveBeenCalledWith(expect.objectContaining({
+      exit_code: 0,
+      error: expect.stringContaining("exceeded"),
+    }));
+    expect(hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("exceeded"));
+    ready();
+    owner.dispose();
+  });
+
+  it("keeps an invalid-event notice on the next clean exit of every live session", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const first = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    const second = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
+    bus.subscribe("a", first);
+    bus.subscribe("b", second);
+    transport.emit("terminal-output", null);
+    transport.emit("terminal-exit", exit("a"));
+    transport.emit("terminal-exit", exit("b"));
+    expect(first.onExit.mock.calls[0]?.[0].error).toContain("Invalid");
+    expect(second.onExit.mock.calls[0]?.[0].error).toContain("Invalid");
+    expect(first.onExit.mock.calls[0]?.[0].exit_code).toBe(0);
+  });
+
+  it("replays bytes that arrived after an evicted exit, with both losses", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    transport.emit("terminal-output", output("mixed", "QQ=="));
+    transport.emit("terminal-exit", exit("mixed"));
+    for (let i = 0; i < 80; i++) transport.emit("terminal-output", output(`later-${i}`, "QQ=="));
+    for (let i = 0; i < 129; i++) transport.emit("terminal-output", output("mixed", "QQ=="));
+    const onOutput = vi.fn();
+    const onExit = vi.fn();
+    bus.subscribe("mixed", { onOutput, onExit, onError: vi.fn() });
+    expect(onOutput).toHaveBeenCalledTimes(128);
+    const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.exit_code).toBe(0);
+    expect(delivered.error).toContain("buffer limit");
+    expect(delivered.error).toContain("discarded");
+  });
+
+  it("keeps the first exit's error when a second clean exit arrives before subscribe", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    transport.emit("terminal-exit", { ...exit("twice"), reaped: false, exit_code: null, error: "wait failed" });
+    transport.emit("terminal-exit", exit("twice"));
+    const onExit = vi.fn();
+    bus.subscribe("twice", { onOutput: vi.fn(), onExit, onError: vi.fn() });
+    const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.error).toContain("wait failed");
+    expect(delivered.reaped).toBe(false);
+    expect(delivered.exit_code).toBeNull();
+  });
+
+  it("keeps a live oversized chunk when the exit already names its own error", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const onExit = vi.fn();
+    bus.subscribe("live-native", { onOutput: vi.fn(), onExit, onError: vi.fn() });
+    transport.emit("terminal-output", output("live-native", "A".repeat(8193)));
+    transport.emit("terminal-exit", { ...exit("live-native"), reaped: false, exit_code: null, error: "wait failed" });
+    const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.error).toContain("wait failed");
+    expect(delivered.error).toContain("exceeded");
+    expect(delivered.reaped).toBe(false);
+    expect(delivered.exit_code).toBeNull();
+  });
+
+  it("keeps a live oversized chunk on a native exit error after it reaches the session", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const ready = await bus.prepare();
+    const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
+    const owner = createSessionLifecycle({
+      key: "tab",
+      repoPath: "/repo",
+      label: "Shell",
+      registry: createSessionRegistry(),
+      transport: {
+        spawn: async () => ({ id: "native-both", shell: "/bin/sh", cwd: "/repo" }),
+        write: async () => {},
+        resize: async () => {},
+        kill: async () => {},
+      },
+      hooks,
+      bus,
+    });
+    await owner.start();
+    transport.emit("terminal-output", output("native-both", "A".repeat(8193)));
+    expect(owner.write("still-alive")).toBe(true);
+    transport.emit("terminal-exit", { ...exit("native-both"), reaped: false, exit_code: null, error: "wait failed" });
+    expect(owner.write("after-exit")).toBe(false);
+    const delivered = hooks.exit.mock.calls[0]?.[0] as TerminalExitEvent;
+    expect(delivered.error).toContain("wait failed");
+    expect(delivered.error).toContain("exceeded");
+    expect(delivered.reaped).toBe(false);
+    expect(hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("wait failed"));
+    expect(hooks.state.mock.calls.at(-1)?.[1]).toContain("exceeded");
+    ready();
+    owner.dispose();
+  });
 });
 
 describe("ptyBus attachment race", () => {
@@ -274,6 +700,37 @@ describe("ptyBus failure recovery", () => {
   });
 });
 
+it("forwards a reserved length live and when the chunk is replayed", () => {
+  const transport = fakeTransport();
+  const bus = createPtyBus(transport.listen);
+  // A listener has to be attached before the chunk exists. Emitting first
+  // never reaches the bus: nothing is subscribed to the transport yet.
+  const anchor = bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+  transport.emit("terminal-output", { id: "early", data_b64: "QQ==", bytes: 1 });
+  const early = { onOutput: vi.fn(), onExit: vi.fn() };
+  bus.subscribe("early", early);
+  expect(early.onOutput).toHaveBeenCalledTimes(1);
+  expect(early.onOutput).toHaveBeenCalledWith("QQ==", 1);
+  anchor();
+
+  const live = { onOutput: vi.fn(), onExit: vi.fn() };
+  bus.subscribe("live", live);
+  transport.emit("terminal-output", { id: "live", data_b64: "Qg==", bytes: 1 });
+  expect(live.onOutput).toHaveBeenCalledWith("Qg==", 1);
+});
+
+it("does not invent a reserved length for an event that cannot name one", () => {
+  const transport = fakeTransport();
+  const bus = createPtyBus(transport.listen);
+  const live = { onOutput: vi.fn(), onExit: vi.fn() };
+  bus.subscribe("live", live);
+  for (const bytes of [undefined, 0, 1.5, 4097, -1]) {
+    transport.emit("terminal-output", { id: "live", data_b64: "QQ==", bytes });
+  }
+  expect(live.onOutput).toHaveBeenCalledTimes(5);
+  for (const call of live.onOutput.mock.calls) expect(call).toEqual(["QQ=="]);
+});
+
 it("rejects malformed exit events without breaking other terminal sessions", () => {
   const transport = fakeTransport(), bus = createPtyBus(transport.listen), onError = vi.fn(), onExit = vi.fn();
   bus.subscribe("a", { onOutput: vi.fn(), onExit, onError });
@@ -292,7 +749,12 @@ it("refuses unknown reaping evidence and preserves a reported wait failure", () 
   expect(onError).toHaveBeenCalledTimes(2);
   const failed = { ...exit("a"), reaped: false, exit_code: null, error: "Could not confirm process exit: wait failed" };
   transport.emit("terminal-exit", failed);
-  expect(onExit).toHaveBeenCalledWith(failed);
+  expect(onExit).toHaveBeenCalledTimes(1);
+  const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
+  expect(delivered.reaped).toBe(false);
+  expect(delivered.exit_code).toBeNull();
+  expect(delivered.error).toContain("Could not confirm process exit: wait failed");
+  expect(delivered.error).toContain("Invalid terminal exit event");
 });
 
 it("bounds listener setup time and releases listeners that arrive after timeout", async () => {

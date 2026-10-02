@@ -126,7 +126,9 @@ describe("TerminalPanel tab strip", () => {
     // start the chosen CLI in its place — switching cost you your session.
     expect(source).not.toContain("selectLauncher");
     expect(source).toContain("{#each filteredLaunchers as launcher, index (launcher.kind)}");
-    expect(source).toContain("onclick={() => newTab(nextLauncher)}");
+    // A shell opens beside the active one, in its directory — still a new tab.
+    expect(source).toContain("onclick={() => void openBeside(nextLauncher)}");
+    expect(source).toMatch(/async function openBeside[\s\S]*?if \(!newTab\(launcher\)\) return false;/);
     expect(source).toContain("openLauncherMenu");
   });
 

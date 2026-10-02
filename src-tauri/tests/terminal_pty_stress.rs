@@ -20,6 +20,27 @@ impl Drop for TerminalCleanup {
     }
 }
 
+/// Decode one production output event and require its reserved length.
+fn take_output(payload: &str) -> (String, Vec<u8>) {
+    let data: serde_json::Value = serde_json::from_str(payload).unwrap();
+    let bytes = STANDARD
+        .decode(data["data_b64"].as_str().expect("data_b64"))
+        .unwrap();
+    let reserved = data["bytes"]
+        .as_u64()
+        .expect("terminal output must name its reserved length") as usize;
+    assert_eq!(
+        reserved,
+        bytes.len(),
+        "reserved credit must equal the emitted chunk"
+    );
+    assert!(
+        (1..=gitpulse_lib::terminal::OUTPUT_CHUNK_BYTES).contains(&reserved),
+        "reserved length {reserved} is outside one read"
+    );
+    (data["id"].as_str().unwrap().to_owned(), bytes)
+}
+
 fn repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
@@ -43,10 +64,9 @@ fn immediate_output_and_exit_status_survive_spawn() {
     let captured = output.clone();
     let ack = state.clone();
     app.listen("terminal-output", move |event| {
-        let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
-        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+        let (id, bytes) = take_output(event.payload());
         captured.lock().unwrap().extend(&bytes);
-        acknowledge_output(&ack, data["id"].as_str().unwrap(), bytes.len()).unwrap();
+        acknowledge_output(&ack, &id, bytes.len()).unwrap();
     });
     let (send, receive) = mpsc::channel();
     app.listen("terminal-exit", move |event| {
@@ -100,9 +120,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
     let mut total = 0usize;
     let deadline = Instant::now() + Duration::from_secs(15);
     while total < 1024 * 1024 && Instant::now() < deadline {
-        let data: serde_json::Value =
-            serde_json::from_str(&receive.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
-        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+        let (_id, bytes) = take_output(&receive.recv_timeout(Duration::from_secs(3)).unwrap());
         for (offset, byte) in bytes.iter().enumerate() {
             assert_eq!(*byte, b"0123456789abcdef"[(total + offset) % 16]);
         }
@@ -137,9 +155,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
     ).unwrap();
     let started = Instant::now();
     for round in 0..512 {
-        let data: serde_json::Value =
-            serde_json::from_str(&receive.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
-        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+        let (_id, bytes) = take_output(&receive.recv_timeout(Duration::from_secs(3)).unwrap());
         assert_eq!(bytes, b".");
         acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
         write_to_session(&state, &spawned.id, "\n").unwrap();
@@ -367,9 +383,8 @@ fn binary_mouse_input_reaches_the_pty_without_utf8_reencoding() {
     let (send, receive) = mpsc::channel();
     let ack = state.clone();
     app.listen("terminal-output", move |event| {
-        let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
-        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
-        acknowledge_output(&ack, data["id"].as_str().unwrap(), bytes.len()).unwrap();
+        let (id, bytes) = take_output(event.payload());
+        acknowledge_output(&ack, &id, bytes.len()).unwrap();
         let _ = send.send(bytes);
     });
     let session = spawn_session(
@@ -427,8 +442,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     let received = total.clone();
     let (send, receive) = mpsc::channel();
     app.listen("terminal-output", move |event| {
-        let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
-        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+        let (_id, bytes) = take_output(event.payload());
         if received.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst) + bytes.len()
             >= 256 * 1024 - 4096
         {

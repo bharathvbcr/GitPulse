@@ -19,7 +19,10 @@ function fixture(overrides: Partial<SessionTransport> = {}, registry = createSes
   const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks, singleAttempt,
     bus: { prepare, pendingCount: () => 0, subscribe(_id, h) { handlers = h; return unsubscribe; } },
   });
-  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string) => handlers?.onOutput(s), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
+  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string, reserved?: number) => {
+    if (typeof reserved === "number") handlers?.onOutput(s, reserved);
+    else handlers?.onOutput(s);
+  }, error: (message: string) => handlers?.onError?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
 }
 
 describe("terminal lifecycle races", () => {
@@ -35,6 +38,88 @@ describe("terminal lifecycle races", () => {
     expect(f.owner.write("continue\n")).toBe(true);
     expect(get(f.registry)).toHaveLength(1);
     f.owner.dispose(); await flush();
+  });
+  it("keeps an acknowledgement failure on the clean exit that follows it", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.owner.fail("Output acknowledgement failed: denied");
+    f.exit();
+    expect(f.hooks.exit).toHaveBeenCalledWith(expect.objectContaining({
+      exit_code: 0,
+      error: expect.stringContaining("acknowledgement"),
+    }));
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("acknowledgement"));
+    f.owner.dispose(); await flush();
+  });
+  it("shows every live loss together while the shell is still accepting input", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.error("Terminal output chunk exceeded its limit");
+    f.error("Invalid terminal output event");
+    f.error("Terminal output chunk exceeded its limit");
+    expect(f.owner.write("still-alive")).toBe(true);
+    const message = f.hooks.state.mock.calls.at(-1)?.[1] as string;
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("exceeded"));
+    expect(message).toContain("Invalid");
+    expect(message).toBe("Terminal output chunk exceeded its limit Invalid terminal output event");
+    f.owner.dispose(); await flush();
+  });
+  it("keeps a loss notice when the session is closed without an exit event", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.error("Terminal output chunk exceeded its limit");
+    await get(f.registry)[0].close();
+    expect(f.owner.write("after-close")).toBe(false);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("exceeded"));
+    const message = f.hooks.state.mock.calls.at(-1)?.[1] as string;
+    expect(message).not.toContain("This session ended");
+  });
+  it("keeps an acknowledgement failure when the session is closed without an exit event", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.owner.fail("Output acknowledgement failed: denied");
+    await get(f.registry)[0].close();
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("acknowledgement"));
+  });
+  it("marks a close with no loss as exited", async () => {
+    const f = fixture();
+    await f.owner.start();
+    await get(f.registry)[0].close();
+    expect(f.hooks.state).toHaveBeenLastCalledWith("exited");
+  });
+  it("keeps a live loss when a task reconnects the same process", async () => {
+    const f = fixture({}, createSessionRegistry(), "task", true);
+    await f.owner.start();
+    f.error("Terminal output chunk exceeded its limit");
+    await f.owner.restart();
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(f.owner.write("continue\n")).toBe(true);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("exceeded"));
+  });
+  it("starts a replacement shell without the previous process's loss", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.error("Terminal output chunk exceeded its limit");
+    await f.owner.restart();
+    expect(f.transport.spawn).toHaveBeenCalledTimes(2);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("running", undefined);
+  });
+  it("keeps a retained output failure when a task reconnects the same process", async () => {
+    const f = fixture({}, createSessionRegistry(), "task", true);
+    await f.owner.start();
+    f.owner.fail("Terminal output was dropped: the view was not open", true);
+    await f.owner.restart();
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(f.owner.write("continue\n")).toBe(true);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("dropped"));
+  });
+  it("clears a transport failure once the same task process is connected again", async () => {
+    const f = fixture({}, createSessionRegistry(), "task", true);
+    await f.owner.start();
+    f.owner.fail("Transport disconnected");
+    await f.owner.restart();
+    expect(f.owner.write("continue\n")).toBe(true);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("running", undefined);
   });
   it("keeps a slow task launch attached to the same attempt without cancelling a late success", async () => {
     vi.useFakeTimers();
@@ -166,6 +251,44 @@ describe("terminal lifecycle races", () => {
     expect(get(f.registry)).toHaveLength(0); expect(f.hooks.output).not.toHaveBeenCalled();
     expect(f.owner.write("should not send")).toBe(false);
     f.owner.dispose(); await flush(); expect(f.transport.kill).not.toHaveBeenCalled();
+  });
+  it("forwards a reserved length and omits it when the event has none", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.output("QQ==", 1);
+    expect(f.hooks.output).toHaveBeenCalledWith("QQ==", "native-a", 1);
+    f.output("Qg==");
+    expect(f.hooks.output).toHaveBeenLastCalledWith("Qg==", "native-a");
+    f.owner.dispose(); await flush();
+  });
+  it("kills a session whose output credit cannot be measured and keeps the error", async () => {
+    const f = fixture();
+    await f.owner.start();
+    await f.owner.stop("Invalid terminal output");
+    expect(f.transport.kill).toHaveBeenCalledWith("native-a");
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("Invalid"));
+    expect(f.owner.write("after-stop")).toBe(false);
+    f.owner.dispose(); await flush();
+  });
+  it("keeps delivering output after dispose until the process is released", async () => {
+    // Native reserve() already counted these bytes. Dropping them here leaves
+    // the reader blocked until the stall timeout kills the child, because
+    // kill's flow.stop() has not run yet. The view acks; this layer must not
+    // swallow the chunk. After release, the session is gone and a late chunk
+    // is not a credit the reader is still waiting on.
+    const pending = deferred<void>();
+    const f = fixture({ kill: () => pending.promise });
+    await f.owner.start();
+    f.owner.dispose();
+    f.output("still-reserved");
+    expect(f.hooks.output).toHaveBeenCalledWith("still-reserved", "native-a");
+    for (let i = 0; i < 1000; i++) f.output(`c${i}`);
+    expect(f.hooks.output).toHaveBeenCalledTimes(1001);
+    pending.resolve();
+    await flush();
+    f.hooks.output.mockClear();
+    f.output("after-release");
+    expect(f.hooks.output).not.toHaveBeenCalled();
   });
   it("coalesces 10000 resize requests, preserving the final size", async () => {
     const pending = deferred<void>(), resize = vi.fn(() => pending.promise), f = fixture({ resize });

@@ -306,6 +306,7 @@ pub fn run() {
             cmd_terminal_export,
             cmd_terminal_resize,
             cmd_terminal_kill,
+            cmd_terminal_context,
             cmd_terminal_run,
             cmd_manvi_run_action,
             cmd_take_pending_open,

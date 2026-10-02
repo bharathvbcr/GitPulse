@@ -71,6 +71,17 @@ describe("terminal input transport", () => {
     await queue.idle();
     expect(send).toHaveBeenCalledTimes(1);
   });
+  it("keeps a character and the erases that follow it once each and in order", async () => {
+    const chunks: string[] = [];
+    const queue = createTerminalInput(async (chunk) => { chunks.push(chunk); }, vi.fn());
+    expect(queue.write("ab")).toBe(true);
+    expect(queue.write("\x7f")).toBe(true);
+    expect(queue.write("\x7f")).toBe(true);
+    await queue.idle();
+    const joined = chunks.join("");
+    expect(joined).toBe("ab\x7f\x7f");
+    expect(joined.split("\x7f").length - 1).toBe(2);
+  });
   it("bounds a hung write without sending subsequent data", async () => {
     vi.useFakeTimers();
     try {

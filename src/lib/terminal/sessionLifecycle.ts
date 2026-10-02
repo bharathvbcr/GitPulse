@@ -1,4 +1,4 @@
-import type { PtyBus, TerminalExitEvent } from "./ptyBus";
+import { mergeTerminalNotice, type PtyBus, type TerminalExitEvent } from "./ptyBus";
 import type { TerminalSpawned } from "./runResult";
 import { createTerminalInput, terminalDeadline } from "./inputQueue";
 import type { createSessionRegistry } from "./sessionRegistry";
@@ -12,7 +12,7 @@ export interface SessionTransport {
 export interface SessionHooks {
   state(status: "starting" | "running" | "exited" | "error", message?: string): void;
   started(session: TerminalSpawned): void;
-  output(data: string, id: string): void;
+  output(data: string, id: string, reservedBytes?: number): void;
   exit(event: TerminalExitEvent): void;
   reset(): void | Promise<void>;
   warning(message: string): void;
@@ -44,10 +44,22 @@ export function createSessionLifecycle(options: {
   let pendingSize: { rows: number; cols: number } | null = null;
   let resizing = false;
   let attemptEnded = false;
+  /** Banner text already shown. A later clean exit must not drop it. */
+  let shownError: string | null = null;
+  /**
+   * Output that was lost on this process. A new process clears it. Closing,
+   * or reconnecting this same process, must not.
+   */
+  let lossNotice: string | null = null;
 
   function state(status: "starting" | "running" | "exited" | "error", message?: string) {
-    slot?.update(message ?? status);
-    if (!disposed) hooks.state(status, message);
+    if (status === "starting" || status === "running") shownError = null;
+    else if (status === "error") shownError = mergeTerminalNotice(shownError, message ?? null);
+    // Publish the whole notice. A second loss must not hide the one already shown,
+    // and a transport failure must not hide output that was already lost.
+    const published = status === "error" ? mergeTerminalNotice(shownError, lossNotice) : message;
+    slot?.update(published ?? status);
+    if (!disposed) hooks.state(status, published ?? undefined);
   }
   function release() {
     input?.dispose(); input = null;
@@ -55,21 +67,41 @@ export function createSessionLifecycle(options: {
     slot?.release(); slot = null;
     id = null;
   }
-  function fail(message: string) {
+  function fail(message: string, retain = false) {
     input?.dispose();
+    // Retained failures describe bytes that are already gone. Reconnecting
+    // this process does not bring them back.
+    if (retain) lossNotice = mergeTerminalNotice(lossNotice, message);
     state("error", message);
+  }
+  /**
+   * End the process, not only the keyboard. A chunk whose reserved length
+   * cannot be known still sits in `OutputFlow.reserve`; `kill` calls
+   * `flow.stop`, which is what wakes that wait. The banner stays on the
+   * failure: a kill that finishes without an exit event must not say the
+   * session exited cleanly.
+   */
+  function stop(message: string): Promise<void> {
+    fail(message, true);
+    return closeCurrent();
   }
   async function closeCurrent() {
     if (closing) return closing;
     const target = id;
     if (!target) { release(); return; }
     input?.dispose();
-    slot?.update("closing");
+    const notice = mergeTerminalNotice(shownError, lossNotice);
+    slot?.update(notice ?? "closing");
     closing = terminalDeadline(transport.kill(target), 5000, "Closing terminal").then(() => {
       if (id === target) {
         attemptEnded = true;
         release();
-        if (!disposed) hooks.state("exited");
+        // Kill can finish without a terminal-exit event. A bare "exited"
+        // would replace the loss the reader already saw.
+        if (!disposed) {
+          if (notice) state("error", notice);
+          else hooks.state("exited");
+        }
       }
     }).catch((error: unknown) => {
       // Keep the slot and process id: a failed kill is not a closed process.
@@ -120,15 +152,38 @@ export function createSessionLifecycle(options: {
         else if (!disposed) hooks.warning(message);
       });
       state("running");
-      if (!reattached) hooks.started(spawned);
+      if (!reattached) {
+        // This id belongs to a new process. Its predecessor's loss does not.
+        lossNotice = null;
+        hooks.started(spawned);
+      } else if (lossNotice) state("error", lossNotice);
       subscription = bus.subscribe(spawned.id, {
-        onOutput(data) { if (!disposed && id === spawned.id) hooks.output(data, spawned.id); },
-        onError(message) { if (id === spawned.id) fail(message); },
+        // Dispose must not swallow output. Rust already reserved these bytes,
+        // and kill has not stopped the reader yet — dropping the chunk here
+        // leaves that credit outstanding until the stall timeout. The view
+        // acknowledges what it can no longer paint. After release(), `id` is
+        // null and a late chunk belongs to a session the reader has finished.
+        onOutput(data, reserved) {
+          if (id !== spawned.id) return;
+          // Omit the argument when it is absent. An explicit `undefined`
+          // would fail callers that assert the two-argument delivery.
+          if (typeof reserved === "number") hooks.output(data, spawned.id, reserved);
+          else hooks.output(data, spawned.id);
+        },
+        // A lost chunk is not a dead shell. The notice stays up, and the
+        // keyboard stays up, until the process itself exits.
+        onError(message) {
+          if (id !== spawned.id) return;
+          lossNotice = mergeTerminalNotice(lossNotice, message);
+          state("error", message);
+        },
         onExit(event) {
           if (id !== spawned.id) return;
           attemptEnded = true;
+          const error = mergeTerminalNotice(mergeTerminalNotice(event.error, shownError), lossNotice);
+          const delivered = error && error !== event.error ? { ...event, error } : event;
           release();
-          if (!disposed) { hooks.exit(event); hooks.state(event.error ? "error" : "exited", event.error ?? undefined); }
+          if (!disposed) { hooks.exit(delivered); hooks.state(error ? "error" : "exited", error ?? undefined); }
         },
       });
       // An exit may have been replayed synchronously by subscribe().
@@ -185,6 +240,7 @@ export function createSessionLifecycle(options: {
       void resizeLatest();
     },
     fail,
+    stop,
     isCurrent: (sessionId: string) => !disposed && id === sessionId,
     dispose() {
       disposed = true;

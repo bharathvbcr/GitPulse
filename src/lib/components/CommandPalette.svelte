@@ -11,6 +11,7 @@
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { shellOwnsKey } from "../keyboard/terminalFocus";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { highlightMatches } from "../branches/groupBranches";
@@ -181,6 +182,8 @@
   function handleKeyDown(event: KeyboardEvent) {
     if (isImeComposition(event)) return;
     if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+      // Ctrl+K typed into a terminal is readline's kill-line, not the palette.
+      if (shellOwnsKey(event)) return;
       if (modalOccupied()) return;
       event.preventDefault(); event.stopImmediatePropagation();
       if (isOpen) close(); else requestOpen();

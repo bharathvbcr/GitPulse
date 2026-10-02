@@ -1,0 +1,194 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import {
+  createOutputCredit,
+  decodeTerminalOutput,
+  MAX_TERMINAL_OUTPUT_CHUNK,
+  OUTPUT_CREDIT_WINDOW,
+  planTerminalOutput,
+  reservedTerminalBytes,
+} from "./outputCredit";
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+const flowRs = readFileSync(join(repoRoot, "src-tauri", "src", "terminal", "flow.rs"), "utf8");
+
+const open = { terminal: true, disposed: false };
+const gone = { terminal: true, disposed: true };
+const waiting = { terminal: false, disposed: false };
+
+function chunk(n: number, fill = 1): Uint8Array {
+  return new Uint8Array(n).fill(fill);
+}
+
+describe("terminal output credit", () => {
+  it("matches the Rust output window", () => {
+    const match = flowRs.match(/const OUTPUT_WINDOW:\s*usize\s*=\s*([^;]+);/);
+    expect(match, "OUTPUT_WINDOW declaration not found").not.toBeNull();
+    expect(OUTPUT_CREDIT_WINDOW).toBe(Function(`"use strict"; return (${match?.[1]});`)());
+  });
+
+  it("decodes standard base64 and refuses anything else", () => {
+    const bytes = chunk(5, 65);
+    expect(decodeTerminalOutput(btoa(String.fromCharCode(...bytes)))).toEqual(bytes);
+    expect(decodeTerminalOutput("")).toEqual(new Uint8Array());
+    expect(() => decodeTerminalOutput("!!!!")).toThrow();
+    expect(() => decodeTerminalOutput("a")).toThrow();
+  });
+
+  it("paints when the emulator is open and acknowledges that chunk once", () => {
+    const credit = createOutputCredit();
+    const decision = credit.accept(chunk(4), "native-a", open);
+    expect(decision.action).toBe("paint");
+    if (decision.action !== "paint") return;
+    expect(decision.token.bytes).toHaveLength(4);
+    expect(decision.token.release()).toBe(4);
+    expect(decision.token.release()).toBe(0);
+    expect(credit.pending()).toBe(0);
+    expect(credit.releaseAll()).toEqual([]);
+  });
+
+  it("acknowledges immediately when the view is already gone, without painting", () => {
+    const credit = createOutputCredit();
+    expect(credit.accept(chunk(3), "native-a", gone)).toEqual({ action: "ack", sessionId: "native-a", bytes: 3 });
+    expect(credit.pending()).toBe(0);
+    expect(credit.flush()).toEqual([]);
+  });
+
+  it("holds output until an emulator exists, then paints the same bytes", () => {
+    const credit = createOutputCredit();
+    const bytes = chunk(8, 90);
+    expect(credit.accept(bytes, "native-a", waiting).action).toBe("held");
+    expect(credit.pending()).toBe(8);
+    const tokens = credit.flush();
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0].bytes).toBe(bytes);
+    expect(tokens[0].release()).toBe(8);
+    expect(credit.pending()).toBe(0);
+  });
+
+  it("does not acknowledge an empty chunk", () => {
+    const credit = createOutputCredit();
+    expect(credit.accept(new Uint8Array(), "native-a", open)).toEqual({ action: "ack", sessionId: "native-a", bytes: 0 });
+    expect(credit.pending()).toBe(0);
+  });
+
+  it("releases a full window of unpainted output exactly once when the view never opens", () => {
+    const credit = createOutputCredit();
+    const piece = chunk(4096);
+    const pieces = OUTPUT_CREDIT_WINDOW / piece.length;
+    for (let i = 0; i < pieces; i++) {
+      expect(credit.accept(piece, "native-a", waiting).action).toBe("held");
+    }
+    expect(credit.pending()).toBe(OUTPUT_CREDIT_WINDOW);
+    const overflow = credit.accept(piece, "native-a", waiting);
+    expect(overflow.action).toBe("overflow");
+    if (overflow.action !== "overflow") return;
+    expect(overflow.owed).toEqual([{ sessionId: "native-a", bytes: OUTPUT_CREDIT_WINDOW + piece.length }]);
+    expect(credit.pending()).toBe(0);
+    expect(credit.releaseAll()).toEqual([]);
+  });
+
+  it("keeps two sessions' credit apart and does not ack a released generation twice", () => {
+    const credit = createOutputCredit();
+    const first = credit.accept(chunk(2), "a", open);
+    const second = credit.accept(chunk(5), "b", open);
+    expect(first.action).toBe("paint");
+    expect(second.action).toBe("paint");
+    if (first.action !== "paint" || second.action !== "paint") return;
+    expect(first.token.release()).toBe(2);
+    const owed = credit.releaseAll();
+    expect(owed).toEqual([{ sessionId: "b", bytes: 5 }]);
+    expect(second.token.release()).toBe(0);
+    expect(credit.pending()).toBe(0);
+  });
+
+  it("accounts for 10000 chunks with a single release of whatever is still outstanding", () => {
+    const credit = createOutputCredit();
+    const one = chunk(1);
+    const tokens = [];
+    for (let i = 0; i < 10000; i++) {
+      const decision = credit.accept(one, i % 2 === 0 ? "a" : "b", open);
+      expect(decision.action).toBe("paint");
+      if (decision.action === "paint") tokens.push(decision.token);
+    }
+    let acked = 0;
+    for (let i = 0; i < 5000; i++) acked += tokens[i].release();
+    for (const item of credit.releaseAll()) acked += item.bytes;
+    for (const token of tokens) acked += token.release();
+    expect(acked).toBe(10000);
+    expect(credit.pending()).toBe(0);
+  });
+});
+
+describe("reserved output length", () => {
+  const modRs = readFileSync(join(repoRoot, "src-tauri", "src", "terminal", "mod.rs"), "utf8");
+
+  it("matches the Rust read size", () => {
+    const match = modRs.match(/const OUTPUT_CHUNK_BYTES:\s*usize\s*=\s*(\d+)\s*;/);
+    expect(match, "OUTPUT_CHUNK_BYTES declaration not found").not.toBeNull();
+    expect(MAX_TERMINAL_OUTPUT_CHUNK).toBe(Number(match?.[1]));
+    expect(reservedTerminalBytes(MAX_TERMINAL_OUTPUT_CHUNK)).toBe(MAX_TERMINAL_OUTPUT_CHUNK);
+    for (const value of [undefined, null, 0, -1, 1.5, MAX_TERMINAL_OUTPUT_CHUNK + 1, Number.NaN]) {
+      expect(reservedTerminalBytes(value)).toBeNull();
+    }
+  });
+
+  it("acknowledges a corrupt chunk by the length the reader reserved", () => {
+    const credit = createOutputCredit();
+    const plan = planTerminalOutput(credit, "!!!!", "native-a", 4, open);
+    expect(plan).toMatchObject({ action: "ack", bytes: 4 });
+    if (plan.action !== "ack") return;
+    expect(plan.failure).toContain("Invalid terminal output");
+    expect(credit.pending()).toBe(0);
+    expect(credit.flush()).toEqual([]);
+  });
+
+  it("releases a thousand corrupt chunks and nothing more", () => {
+    const credit = createOutputCredit();
+    let acked = 0;
+    for (let i = 0; i < 1000; i++) {
+      const plan = planTerminalOutput(credit, "!!!!", i % 2 === 0 ? "a" : "b", 3, open);
+      expect(plan.action).toBe("ack");
+      if (plan.action === "ack") acked += plan.bytes;
+    }
+    expect(acked).toBe(3000);
+    expect(credit.pending()).toBe(0);
+  });
+
+  it("acknowledges the reserved length when the decoded size disagrees, and does not paint", () => {
+    const credit = createOutputCredit();
+    const plan = planTerminalOutput(credit, "QQ==", "native-a", 4, open);
+    expect(plan).toMatchObject({ action: "ack", bytes: 4 });
+    if (plan.action !== "ack") return;
+    expect(plan.failure).toContain("reserved credit");
+    expect(credit.pending()).toBe(0);
+  });
+
+  it("stops when a corrupt chunk does not name a length that can be acknowledged", () => {
+    const credit = createOutputCredit();
+    for (const reserved of [null, 0, 1.5, MAX_TERMINAL_OUTPUT_CHUNK + 1]) {
+      const plan = planTerminalOutput(credit, "!!!!", "native-a", reserved, open);
+      expect(plan.action).toBe("stop");
+      if (plan.action === "stop") expect(plan.failure).toContain("Invalid terminal output");
+    }
+    const full = planTerminalOutput(credit, "!!!!", "native-a", MAX_TERMINAL_OUTPUT_CHUNK, open);
+    expect(full).toMatchObject({ action: "ack", bytes: MAX_TERMINAL_OUTPUT_CHUNK });
+    expect(credit.pending()).toBe(0);
+  });
+
+  it("paints a valid chunk when the reserved length matches, and when an older event omitted it", () => {
+    const credit = createOutputCredit();
+    const matched = planTerminalOutput(credit, "QQ==", "native-a", 1, open);
+    expect(matched.action).toBe("paint");
+    if (matched.action !== "paint") return;
+    expect(matched.token.release()).toBe(1);
+    const omitted = planTerminalOutput(credit, "Qg==", "native-a", null, open);
+    expect(omitted.action).toBe("paint");
+    if (omitted.action !== "paint") return;
+    expect(omitted.token.bytes).toEqual(new Uint8Array([66]));
+    expect(omitted.token.release()).toBe(1);
+    expect(credit.pending()).toBe(0);
+  });
+});

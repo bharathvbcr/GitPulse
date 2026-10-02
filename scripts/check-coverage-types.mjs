@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 72 contracts over
- * 178 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 74 contracts over
+ * 184 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -62,6 +62,7 @@ export const TERMINAL_STRUCTS = Object.freeze([
   "TerminalSpawned",
   "TerminalOutputPayload",
   "TerminalExitPayload",
+  "TerminalContext",
 ]);
 
 /**
@@ -137,6 +138,7 @@ export const CONTRACTS = Object.freeze([
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
   { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
+  { label: "markdown-render", rustPath: rust("markdown", "mod.rs"), tsPath: ts("files", "markdevRender.ts"), structs: ["RenderedMarkdown", "MarkdownHeading", "FrontmatterField"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry"] },
   { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo"] },
@@ -173,6 +175,10 @@ export const CONTRACTS = Object.freeze([
   { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
   { label: "code-scanning", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["CodeScanningReport", "CodeScanningAlertInfo"] },
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },
+  // The Secrets panel. `completeness` and `findings_unreadable` are what keep
+  // a partial or lossy scan from rendering as clean; a rename on either side
+  // would read as `undefined`, which the parser maps to "unverified" / 0.
+  { label: "secrets", rustPath: rust("secrets", "parse.rs"), tsPath: ts("secrets", "types.ts"), structs: ["SecretsReport", "SecretFinding"] },
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "conflict-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictSnapshot", "ConflictStage", "ConflictSaveRequest", "ConflictSaveOutcome"] },
