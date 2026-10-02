@@ -113,6 +113,12 @@ deadlines. A spawn still unresolved after 15 seconds retains its capacity slot;
 a late process is closed before another can start. Restart waits for confirmed
 native cleanup and drains the old renderer before showing the replacement.
 
+A live session reports what it is running: its foreground program, whether that
+program is a job under the shell, and its working directory. Paste and erase guards
+use that report instead of predicting what the terminal handled, and a new terminal
+can start in a chosen directory. Ctrl+K typed into a terminal is the shell's
+kill-line; the command palette leaves it alone there.
+
 Interactive shells remain user-controlled and run outside the Manvi wrap.
 Console uses the existing direct-command execution path, with bounded output,
 timeouts, and Manvi gating for Git commands. It retains up to 100 commands and

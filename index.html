@@ -6,10 +6,38 @@
     <link rel="icon" type="image/svg+xml" href="/gitpulse-mark.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark light" />
+    <meta name="application-name" content="GitPulse" />
+    <meta
+      name="description"
+      content="GitPulse is a local-first desktop workspace for Git, code, and tasks. Review changes, follow branch history, organize tasks, and inspect repository health from a native Rust and Tauri 2 app with a Svelte 5 frontend."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="GitPulse" />
+    <meta property="og:title" content="GitPulse: Git, code, and tasks in one local-first workspace" />
+    <meta
+      property="og:description"
+      content="Four views (Work, Code, History, Insights) for reviewing diffs, resolving conflicts, exploring code, organizing tasks, and checking coverage, dependencies, and secrets. Repository and task state stay on your machine."
+    />
+    <meta property="og:url" content="https://gitpulse.vbcr.dev/" />
     <title>GitPulse</title>
   </head>
   <body class="bg-background text-textPrimary overflow-hidden select-none font-sans antialiased">
     <div id="app"></div>
+    <noscript>
+      <main style="max-width: 36rem; margin: 4rem auto; padding: 0 1.5rem; font-family: system-ui, sans-serif; line-height: 1.5">
+        <h1>GitPulse</h1>
+        <p>
+          GitPulse is a local-first desktop app for Git, code, and tasks. Its interface is rendered
+          with JavaScript, so this page stays blank when scripting is disabled.
+        </p>
+        <p>
+          Enable JavaScript for this window and reload. If you opened this file in a browser, note
+          that GitPulse runs as a native Tauri application: download it from the
+          <a href="https://github.com/bharathvbcr/GitPulse/releases/latest">releases page</a> or read
+          the <a href="https://gitpulse.vbcr.dev/">project website</a>.
+        </p>
+      </main>
+    </noscript>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

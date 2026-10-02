@@ -1,2 +1,19 @@
 <!doctype html>
-<html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="color-scheme" content="light dark" /><title>GitPulse Status</title></head><body><div id="status-root"></div><script type="module" src="/src/status.ts"></script></body></html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="application-name" content="GitPulse" />
+    <meta
+      name="description"
+      content="The GitPulse menu-bar status popover: a compact summary of the current repository's branch, changed, staged and conflict counts and upstream state, with a repository switcher and shortcuts into the main window. It cannot run Git mutations."
+    />
+    <title>GitPulse Status</title>
+  </head>
+  <body>
+    <div id="status-root"></div>
+    <noscript>GitPulse Status needs JavaScript. It is the menu-bar popover of the GitPulse desktop app.</noscript>
+    <script type="module" src="/src/status.ts"></script>
+  </body>
+</html>

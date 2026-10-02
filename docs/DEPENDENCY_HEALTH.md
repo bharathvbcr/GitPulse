@@ -35,9 +35,11 @@ false positives / used-in-tests so they do not return on an unchanged tree.
 - `typescript` resolves to Microsoft's `@typescript/typescript6` **6.0.2**
   compatibility package, which delegates to classic TypeScript **6.0.3**.
   `svelte-check` 4.7.6 and the enum contract tests need that JavaScript API.
-- `npm run typecheck` invokes the native package's CLI explicitly. With npm
-  11.17.0, the compatibility package's hoisted `@typescript/old` can own
-  `node_modules/.bin/tsc`; bare `tsc` selected 6.0.3 during testing.
+- `bun run typecheck` invokes the native package's CLI explicitly
+  (`node node_modules/@typescript/native/bin/tsc`) rather than bare `tsc`. When
+  tested with npm 11.17.0, the compatibility package's hoisted `@typescript/old`
+  could own `node_modules/.bin/tsc`, and bare `tsc` selected 6.0.3; the explicit
+  path avoids depending on which package manager laid out `.bin`.
 
 This follows Microsoft's [TypeScript 6/7 compatibility setup](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/#running-side-by-side-with-typescript-6-0)
 and Svelte's [native compiler alias support](https://github.com/sveltejs/language-tools/pull/3073).

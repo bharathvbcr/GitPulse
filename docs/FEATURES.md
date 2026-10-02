@@ -447,6 +447,9 @@ rather than presenting a floor as a total.
 
 - **Kingfisher Secrets Scanner**: Discovers exposed API keys, private tokens, passwords, and secrets across repository files via an integrated Kingfisher scan.
 - **Strict Privacy Redaction**: Findings carry rule, repo-relative path, line, confidence, Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal for rows sharing a value. Secret values, matches, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted.
+- **Located Findings**: Rows are sorted with the actionable ones first, so a token in committed source does not sit among build output. Location chips (tracked, untracked, ignored, `.git` metadata, nested repository) filter the list, rows that hold the same value are marked, and each row can be revealed in the file manager.
+- **Stated Scope and Age**: The panel says what a scan covers — the working tree only, the file-size limit, symlinks, and inline ignores — and the header shows the scan's age. A result older than five minutes refreshes when the section is reopened.
+- **One Scan at a Time**: Opening the section runs one scan, and a newer scan cancels an older one, so switching repositories never queues scanners. Every location of a repeated value is listed rather than deduplicated away.
 - **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
 - **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that Kingfisher itself marked partial (an unreadable file) reports explicitly as unverified / not clean, never as an all-clear.
 
@@ -606,6 +609,15 @@ sessions survive and nothing re-hydrates on the way back.
 - **Repository Tab Groups.** Open repository tabs can be organized into named,
   color-coded tab groups with collapse/expand and bulk close/reload controls,
   simplifying navigation across multi-repository workspaces.
+- **Coloured Tabs.** A tab can carry its own colour, and a group can carry one
+  that its tabs inherit when they have none. Colours persist with the workspace,
+  survive restore, and are named in the tab bar's accessible labels, including
+  when a colour is inherited. Quitting the app keeps open tabs, their groups,
+  and their collapsed state; an untrusted repository stays in the list without
+  a prompt or a Git command. Unsaved editor text is still discarded on quit.
+- **Stacked Notices.** Two or more toasts, or attention-inbox notices, collapse
+  into one card with at most two edges showing behind it. The pile expands to
+  every loaded card, and its toggle says how many unread notices it holds.
 
 ---
 

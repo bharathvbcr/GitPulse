@@ -68,11 +68,14 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   structural navigation, symbol search, symbol-level collision detection,
   dependencies, impact, and candidate tests.
 - **Inspect the repository.** Coverage reports, multi-ecosystem dependency audits
-  with `cargo deny` and `cargo crev` parsers, Kingfisher redacted secrets scanning,
-  storage cleanup previews, and Pulse activity summaries distinguish results from
-  scans that did not run. Capped results identify their limits.
-- **Work from the desktop.** Native menus, a command palette, a docked PTY terminal,
-  and an optional macOS menu-bar status popover keep frequent actions close.
+  with `cargo deny` and `cargo crev` parsers, Kingfisher redacted secrets scanning
+  that locates each finding against Git, storage cleanup previews, and Pulse
+  activity summaries distinguish results from scans that did not run. Capped
+  results identify their limits.
+- **Work from the desktop.** Native menus, a command palette, a docked PTY terminal
+  that reports what each session is running, colour-coded repository tabs and groups
+  that survive a restart, and an optional macOS menu-bar status popover keep
+  frequent actions close. Background windows stop their timers instead of polling.
 
 The [feature reference](docs/FEATURES.md) describes each surface and its limits.
 The [changelog](CHANGELOG.md) records release changes; [open qualification](docs/QUALIFICATION.md)

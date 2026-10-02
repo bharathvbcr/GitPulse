@@ -111,6 +111,13 @@ Closed repositories lose their queued work and cannot publish late index
 results after reopening. The app's 24-tab cap remains below each queue's
 64-key bound. Explicit document queries keep their immediate path.
 
+Renderer timers follow the same rule. While the window is hidden or unfocused,
+the status poll, enhancement refresh, task-run polling, hygiene and cleaner
+refreshes, Manvi operations, and the status popover stop entirely instead of
+waking the renderer every period to return early. Their next run is stretched
+when the event loop is already late, so a busy renderer is not given more work
+to be late for.
+
 Automatic index builds and watcher document refreshes also carry background
 subprocess priority. They can occupy at most one quarter of the process slots
 (at least one); interactive operations retain the rest. When no background

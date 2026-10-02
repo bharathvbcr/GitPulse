@@ -61,7 +61,12 @@ flowchart TD
 ### Explicit Repository Trust
 - Opening a checkout first requires an explicit **Trust and Open** decision.
   Path inspection does not run Git; canceled or failed approval does not start
-  watchers, status hydration, dependency scans, or code indexing.
+  watchers, status hydration, dependency scans, or code indexing. A tab whose
+  open was refused for trust is marked as needing trust and is left out of live
+  indexing, DevCouncil initialization, documentation refresh, metrics and status
+  polling, so a refusal stays one state instead of a stream of failing calls. A
+  workspace registry sync still writes the registry and reports such tabs as
+  skipped for being untrusted.
 - Trust permits the repository's Git hooks, helpers, and project tools to run
   with the user's account permissions, including code in submodules. It is an
   execution decision, not an OS sandbox or a claim that the project is safe.
@@ -70,6 +75,21 @@ flowchart TD
   common Git directory, by canonical path and filesystem identity — together
   with the checkout that was approved. Replacing either, or redirecting a
   gitfile at a different repository, requires fresh approval.
+- Identity is compared in a way that survives a reboot. On Unix it is the
+  canonical path, the inode and the birth time; on Windows, the file identity.
+  The device number is deliberately not compared, because macOS reassigns it at
+  mount and a reboot renumbers it, which used to revoke every approval. The
+  birth time still tells a replacement from the original when an inode is
+  recycled. The trade-off is stated plainly: a same-user attacker who mounts a
+  crafted volume over the exact approved path could match an approval, but that
+  user can already edit the owner-only trust store, and nothing widens which
+  repositories are trusted.
+- Grant records are named by an FNV-1a hash of the path, which a Rust release
+  cannot change (the earlier `DefaultHasher` names could). Lookup still reads
+  the old names, and a bounded startup pass (at most 4,096 directory entries)
+  renames what it finds, skipping symlinks, fifos, corrupt and oversized files.
+  A damaged record under the stable name fails closed rather than falling back
+  to an older one.
 - One approval covers the repository, so a linked worktree is not a second
   decision. Every working tree shares one configuration, one hook directory and
   one object database, and that shared surface is the whole of what the
@@ -89,7 +109,10 @@ flowchart TD
   target in the approved repository is answered by that same grant; a target in
   a repository nobody approved is refused before Git starts.
 - Revocation reaches the whole repository, including approvals recorded
-  separately for its other working trees, so it is never partial.
+  separately for its other working trees, so it is never partial. If the
+  checkout has already been deleted it can no longer name its repository, so
+  revocation falls back to the checkout's own path, which is all that remains
+  to identify.
 - Approvals stored before the repository became the unit are still honoured and
   are not widened by the change: each authorizes only the checkout it named,
   read from its own filename namespace so it cannot be replayed as a
@@ -304,6 +327,10 @@ flowchart TD
 - Lifecycle commands run with the user's permissions and are strictly gated on
   explicit repository trust. Untrusted checkouts unconditionally refuse to
   execute lifecycle hooks.
+- Hooks are bounded: each command has a 15-minute wall-clock deadline, keeps at
+  most 1 MiB of its output, and has its whole process tree killed at the
+  deadline, so a hung hook cannot hang worktree creation. The deadline limits
+  duration, not authority: a trusted hook still runs with the user's rights.
 
 ### Opt-In Release Checks
 - Automatic application release checks are off by default; GitPulse does not
@@ -321,10 +348,18 @@ The webview operates under a strict CSP configured in `src-tauri/tauri.conf.json
   from any https origin, so a README's badges show. Fetching one reveals the
   viewer's IP address and the time to that host, the same as opening the
   README on a forge; rendered `<img>` elements carry `referrerpolicy="no-referrer"`,
-  and plain-http pictures are not fetched. Scripts, styles, frames, media and
-  connections stay same-origin (`scripts/dev-port.test.ts` holds the CSP to
-  exactly this).
-- Remote scripts and inline `eval` are strictly disallowed.
+  and plain-http pictures are not fetched. No directive other than `img-src`
+  admits an `https:` source or a wildcard (`scripts/dev-port.test.ts` holds the
+  CSP to exactly this).
+- `script-src 'self'` — remote scripts, inline scripts and `eval` are disallowed.
+- `style-src 'self' 'unsafe-inline'` — stylesheets load only from the app itself;
+  inline styles are allowed.
+  This is the only directive that permits inline content, and it still admits
+  no remote stylesheet.
+- `font-src 'self' data:`, `base-uri 'none'` and `object-src 'none'` — no remote
+  fonts, no `<base>` rewriting of relative URLs, and no plugin embeds.
+- The development policy (`devCsp`) adds only the local Vite server's `http` and
+  `ws` origins on loopback; release builds never carry them.
 
 Rendered repository Markdown is untrusted content in the app's own document.
 MarkDev's renderer escapes raw HTML and refuses active URL schemes; GitPulse
