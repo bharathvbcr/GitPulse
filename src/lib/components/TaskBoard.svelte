@@ -7,6 +7,8 @@
   import { Archive, Bot, Clipboard, EyeOff, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
+  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
@@ -295,7 +297,13 @@
   function scheduleRefresh() {
     if (!active || disposed) return;
     clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { void refresh(); }, 200);
+    refreshTimer = undefined;
+    if (readBackgroundDocument()) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
+      if (readBackgroundDocument() || !active || disposed) return;
+      void refresh();
+    }, 200);
   }
   async function initialize(path: string | null = repositoryPath) {
     const ticket = ++initializationRevision;
@@ -312,10 +320,17 @@
   onMount(() => {
     const listeners = createListenerTracker();
     if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
-    const clock = window.setInterval(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
-    window.addEventListener("focus", scheduleRefresh);
-    listeners.track(() => window.clearInterval(clock));
-    listeners.track(() => window.removeEventListener("focus", scheduleRefresh));
+    const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
+    const onForeground = () => {
+      if (readBackgroundDocument()) {
+        clearTimeout(refreshTimer);
+        refreshTimer = undefined;
+        return;
+      }
+      scheduleRefresh();
+    };
+    listeners.track(stopClock);
+    listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
       disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); listeners.dispose();
     };

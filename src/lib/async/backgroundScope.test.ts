@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { writable } from "svelte/store";
+import { resetForegroundFocus } from "../runtime/foreground";
 import { installBackgroundScope } from "./backgroundScope";
 import { createPacedQueue, type BackgroundScope } from "./pacedQueue";
 
@@ -11,8 +12,8 @@ class Visibility extends EventTarget {
   }
 }
 
-beforeEach(() => vi.useFakeTimers());
-afterEach(() => vi.useRealTimers());
+beforeEach(() => { resetForegroundFocus(); vi.useFakeTimers(); });
+afterEach(() => { resetForegroundFocus(); vi.useRealTimers(); });
 
 it("updates both queue consumers on workspace/visibility changes and unwires on teardown", () => {
   const workspace = writable({ currentPath: "/a", openTabs: [{ path: "/a" }, { path: "/b" }] });
@@ -62,4 +63,24 @@ it("keeps two independent queues dormant through a 50,000-event background storm
   await vi.advanceTimersByTimeAsync(120_000);
   expect(calls).toHaveBeenCalledTimes(2);
   expect(queues.every((queue) => !queue.isPending("/b"))).toBe(true);
+});
+
+it("keeps queues paused when the window blurs while visibility stays visible", () => {
+  const workspace = writable({ currentPath: "/a", openTabs: [{ path: "/a" }] });
+  const target = new Visibility();
+  const frame = new EventTarget();
+  const apply = vi.fn<(scope: BackgroundScope) => void>();
+  const dispose = installBackgroundScope({ subscribe: workspace.subscribe, target, frame, apply });
+  expect(target.visibilityState).toBe("visible");
+  expect(apply).toHaveBeenLastCalledWith({ activeKey: "/a", retainedKeys: ["/a"], visible: true });
+  frame.dispatchEvent(new Event("blur"));
+  expect(target.visibilityState).toBe("visible");
+  expect(apply).toHaveBeenLastCalledWith({ activeKey: "/a", retainedKeys: ["/a"], visible: false });
+  workspace.update((state) => ({ ...state, currentPath: "/c", openTabs: [{ path: "/c" }] }));
+  expect(apply).toHaveBeenLastCalledWith({ activeKey: "/c", retainedKeys: ["/c"], visible: false });
+  frame.dispatchEvent(new Event("focus"));
+  expect(apply).toHaveBeenLastCalledWith({ activeKey: "/c", retainedKeys: ["/c"], visible: true });
+  dispose();
+  frame.dispatchEvent(new Event("blur"));
+  expect(apply).toHaveBeenLastCalledWith({ activeKey: null, retainedKeys: [], visible: false });
 });

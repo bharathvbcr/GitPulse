@@ -1,4 +1,5 @@
 import type { DiagnosticsStore } from "./diagnostics";
+import { noteEventLoopDelay, resetEventLoopDelay } from "../runtime/loadCadence";
 
 const INTERVAL_MS = 500;
 const LAG_MS = 250;
@@ -89,6 +90,10 @@ export function installResponsivenessDiagnostics(
     if (!observing()) return;
     const at = now();
     const delay = at - expected;
+    // The probe used to drop this number into a log. Schedulers read the
+    // same sample so a late loop slows background work instead of only
+    // being described after the fact.
+    noteEventLoopDelay(delay);
     if (Number.isFinite(delay) && delay >= LAG_MS) {
       if (delay >= SUSPEND_GAP_MS) {
         suspended += 1;
@@ -109,8 +114,11 @@ export function installResponsivenessDiagnostics(
     if (!observing()) {
       // Samples collected while leaving the foreground include timer
       // coalescing, not a freeze the user can see. Drop them rather than
-      // flushing them on the next healthy tick after return.
+      // flushing them on the next healthy tick after return. The load
+      // sample is dropped with them: a hidden-window gap is not pressure
+      // the next visible poll should inherit.
       discardSamples();
+      resetEventLoopDelay();
       return;
     }
     arm();

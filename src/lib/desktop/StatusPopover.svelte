@@ -3,6 +3,7 @@
   import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
   import type { MenuState } from "./menuState";
   import { formatFetchAge, statusDetailRows, statusInsights, statusKeyAction, statusShortcuts } from "./menuState";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   let { snapshot, error = null, pending = false, material = "opaque", onaction }: {
     snapshot: MenuState | null; error?: string | null; pending?: boolean;
     material?: "opaque" | "preview" | "native";
@@ -14,8 +15,7 @@
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
   let clock = $state(Date.now());
   $effect(() => {
-    const timer = setInterval(() => { clock = Date.now(); }, 30_000);
-    return () => clearInterval(timer);
+    return createAdaptiveTimer(() => { clock = Date.now(); }, 30_000);
   });
   const card = $derived(snapshot?.status);
   const hasRepo = $derived(!!snapshot?.activePath);

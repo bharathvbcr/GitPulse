@@ -16,13 +16,21 @@
  *
  * Dependency-injected so the scheduling and the visibility source are testable
  * without a DOM.
+ *
+ * The period is not fixed. Each start asks `decideCadence`, so a timer that
+ * is already visibility-aware also slows down when the event loop is late
+ * and returns to its base period as that pressure decays. A non-positive
+ * period is refused rather than handed to `setInterval` as a spin.
  */
+import { addForegroundListener, readBackgroundDocument, removeForegroundListener } from "../runtime/foreground";
+import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
+
 export interface IntervalHost {
   setInterval(handler: () => void, ms: number): unknown;
   clearInterval(handle: unknown): void;
   addEventListener(type: string, listener: () => void): void;
   removeEventListener(type: string, listener: () => void): void;
-  /** True while the document is hidden. */
+  /** True while background work should stop. */
   isHidden(): boolean;
 }
 
@@ -32,9 +40,9 @@ export function browserIntervalHost(): IntervalHost | null {
   return {
     setInterval: (handler, ms) => window.setInterval(handler, ms),
     clearInterval: (handle) => window.clearInterval(handle as number),
-    addEventListener: (type, listener) => document.addEventListener(type, listener),
-    removeEventListener: (type, listener) => document.removeEventListener(type, listener),
-    isHidden: () => document.hidden,
+    addEventListener: (type, listener) => addForegroundListener(document, window, type, listener),
+    removeEventListener: (type, listener) => removeForegroundListener(type, listener),
+    isHidden: () => readBackgroundDocument(),
   };
 }
 
@@ -53,6 +61,7 @@ export function createVisibleInterval(
   if (!host) return () => {};
 
   let handle: unknown = null;
+  let period = 0;
   /**
    * Set by the disposer, and checked by everything that could start a timer.
    *
@@ -72,29 +81,62 @@ export function createVisibleInterval(
     handle = null;
   };
 
-  const start = () => {
-    if (disposed || handle !== null) return;
-    handle = host.setInterval(tick, ms);
+  const fire = () => {
+    if (disposed) return;
+    tick();
+    // Re-read pressure after the tick. A quiet sample returns the interval
+    // to `ms`; a late sample replaces it. The disposed flag is re-checked
+    // because the tick is allowed to tear this interval down.
+    if (!disposed) start();
   };
 
-  const onVisibilityChange = () => {
+  const start = () => {
     if (disposed) return;
     if (host.isHidden()) {
       stop();
       return;
     }
+    const decision = decideCadence({
+      baseMs: ms,
+      lagMs: readEventLoopDelay(),
+      paused: false,
+    });
+    if (!decision.run || decision.delayMs <= 0) {
+      stop();
+      return;
+    }
+    if (handle !== null && decision.delayMs === period) return;
+    stop();
+    period = decision.delayMs;
+    handle = host.setInterval(fire, period);
+  };
+
+  const onForeground = () => {
+    if (disposed) return;
+    if (host.isHidden()) {
+      stop();
+      return;
+    }
+    // Hide clears the handle, so the show or focus that follows still ticks
+    // once. A second foreground event while the interval is already running
+    // must not catch up again.
+    if (handle !== null) return;
     // Catch up before resuming: whatever the tick renders is stale by however
-    // long the window was hidden, and the user is looking at it now.
+    // long the window was in the background, and the user is looking at it now.
     tick();
     start();
   };
 
   if (!host.isHidden()) start();
-  host.addEventListener("visibilitychange", onVisibilityChange);
+  host.addEventListener("visibilitychange", onForeground);
+  host.addEventListener("focus", onForeground);
+  host.addEventListener("blur", onForeground);
 
   return () => {
     disposed = true;
     stop();
-    host.removeEventListener("visibilitychange", onVisibilityChange);
+    host.removeEventListener("visibilitychange", onForeground);
+    host.removeEventListener("focus", onForeground);
+    host.removeEventListener("blur", onForeground);
   };
 }

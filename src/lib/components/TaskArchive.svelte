@@ -48,6 +48,8 @@
   import { Archive, ExternalLink } from "@lucide/svelte";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
+  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { formatRelativeTime } from "../format";
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { ARCHIVE_RULE, ARCHIVE_STATUS, RESTORE_STATUSES, archiveSummary, boardPresence, restoreAction } from "../workbench/taskArchive";
@@ -82,7 +84,7 @@
   let query = $state("");
   let restoreTo = $state<TaskStatus>(RESTORE_STATUSES[RESTORE_STATUSES.length - 1]);
   let selected = $state<Set<string>>(new Set());
-  let error = $state(""), notice = $state(""), visible = $state(true), working = $state(false);
+  let error = $state(""), notice = $state(""), visible = $state(!readBackgroundDocument()), working = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
   let generation = 0, disposed = false, loading = false, again = false;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -136,14 +138,13 @@
         .then((stop) => listeners.track(stop))
         .catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Use Refresh.`; });
     }
-    const visibility = () => { visible = !document.hidden; };
-    const clock = window.setInterval(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
-    visibility();
-    document.addEventListener("visibilitychange", visibility);
-    window.addEventListener("focus", schedule);
-    listeners.track(() => window.clearInterval(clock));
-    listeners.track(() => document.removeEventListener("visibilitychange", visibility));
-    listeners.track(() => window.removeEventListener("focus", schedule));
+    const onForeground = () => {
+      visible = !readBackgroundDocument();
+      if (visible) schedule();
+    };
+    const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
+    listeners.track(stopClock);
+    listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => { disposed = true; generation++; clearTimeout(refreshTimer); listeners.dispose(); };
   });
 

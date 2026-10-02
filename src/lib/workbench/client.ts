@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";
 import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
@@ -581,11 +583,42 @@ export async function automaticQueueCount(): Promise<number> {
 type AutomaticUpdate = { status: AutomaticStatus | null; error: string };
 let automaticUpdate: AutomaticUpdate = { status: null, error: "" };
 const automaticListeners = new Set<(value: AutomaticUpdate) => void>();
-let automaticWatchers = 0, automaticTimer: ReturnType<typeof setInterval> | null = null;
+const AUTOMATIC_REFRESH_MS = 2_000;
+let automaticWatchers = 0, automaticTimer: ReturnType<typeof setTimeout> | null = null;
+let unbindAutomaticForeground: (() => void) | null = null;
+function automaticBusy(): boolean {
+  return Boolean(automaticUpdate.status && ["checking", "waiting", "generating", "stopping"].includes(automaticUpdate.status.state));
+}
+function clearAutomaticTimer(): void {
+  if (automaticTimer !== null) { clearTimeout(automaticTimer); automaticTimer = null; }
+}
+function unbindAutomaticVisibility(): void {
+  unbindAutomaticForeground?.();
+  unbindAutomaticForeground = null;
+}
+function bindAutomaticVisibility(): void {
+  if (unbindAutomaticForeground !== null || typeof document === "undefined") return;
+  unbindAutomaticForeground = bindForegroundChanges(
+    document,
+    typeof window === "undefined" ? null : window,
+    onAutomaticVisibility,
+  );
+}
+function onAutomaticVisibility(): void { scheduleAutomaticRefresh(); }
 function scheduleAutomaticRefresh() {
-  const busy = automaticUpdate.status && ["checking", "waiting", "generating", "stopping"].includes(automaticUpdate.status.state);
-  if (automaticWatchers > 0 && busy && automaticTimer === null) automaticTimer = setInterval(() => { void refreshAutomatic(); }, 2000);
-  else if ((!automaticWatchers || !busy) && automaticTimer !== null) { clearInterval(automaticTimer); automaticTimer = null; }
+  const wanted = automaticWatchers > 0 && automaticBusy();
+  if (!wanted) { clearAutomaticTimer(); unbindAutomaticVisibility(); return; }
+  bindAutomaticVisibility();
+  // A background window drops the timer. Focus or visibility arms it again;
+  // leaving the interval in place would wake a coordinator nobody is watching.
+  if (readBackgroundDocument()) { clearAutomaticTimer(); return; }
+  if (automaticTimer !== null) return;
+  const decision = decideCadence({ baseMs: AUTOMATIC_REFRESH_MS, lagMs: readEventLoopDelay(), paused: false });
+  if (!decision.run) return;
+  automaticTimer = setTimeout(() => {
+    automaticTimer = null;
+    void refreshAutomatic().finally(() => scheduleAutomaticRefresh());
+  }, decision.delayMs);
 }
 // Visible boards share one status timer. Idle, paused and hidden boards use none.
 export function watchAutomatic(): () => void {

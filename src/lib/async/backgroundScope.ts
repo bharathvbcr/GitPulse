@@ -1,3 +1,4 @@
+import { bindForegroundChanges, isBackgroundDocument, type ForegroundDocument } from "../runtime/foreground";
 import type { BackgroundScope } from "./pacedQueue";
 
 interface WorkspaceScope {
@@ -8,7 +9,9 @@ interface WorkspaceScope {
 /** One lifecycle adapter for all background queues, with no idle timer. */
 export function installBackgroundScope(options: {
   subscribe: (listener: (workspace: WorkspaceScope) => void) => () => void;
-  target: Pick<Document, "visibilityState" | "addEventListener" | "removeEventListener">;
+  target: ForegroundDocument & EventTarget;
+  /** Focus and blur land here. Omitted uses `window` only when `target` is `document`. */
+  frame?: EventTarget | null;
   apply: (scope: BackgroundScope) => void;
 }): () => void {
   let workspace: WorkspaceScope = { currentPath: null, openTabs: [] };
@@ -19,7 +22,7 @@ export function installBackgroundScope(options: {
     const next: BackgroundScope = {
       activeKey: workspace.currentPath,
       retainedKeys: workspace.openTabs.map((tab) => tab.path),
-      visible: options.target.visibilityState === "visible",
+      visible: !isBackgroundDocument(options.target),
     };
     if (previous && previous.activeKey === next.activeKey && previous.visible === next.visible &&
       previous.retainedKeys.length === next.retainedKeys.length &&
@@ -27,14 +30,19 @@ export function installBackgroundScope(options: {
     previous = next;
     options.apply(next);
   }
+  const frame = options.frame !== undefined
+    ? options.frame
+    : options.target === (typeof document === "undefined" ? null : document) && typeof window !== "undefined"
+      ? window
+      : null;
   const unsubscribe = options.subscribe((next) => { workspace = next; update(); });
-  options.target.addEventListener("visibilitychange", update);
+  const unbind = bindForegroundChanges(options.target, frame, update);
   update();
   return () => {
     if (disposed) return;
     disposed = true;
     unsubscribe();
-    options.target.removeEventListener("visibilitychange", update);
+    unbind();
     options.apply({ activeKey: null, retainedKeys: [], visible: false });
   };
 }

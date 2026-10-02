@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createVisibleInterval, type IntervalHost } from "./visibleInterval";
+import { resetForegroundFocus } from "../runtime/foreground";
+import { LAG_HARD_MS, noteEventLoopDelay, resetEventLoopDelay } from "../runtime/loadCadence";
 
 function fakeHost(startHidden = false) {
   let hidden = startHidden;
@@ -36,6 +38,9 @@ function fakeHost(startHidden = false) {
     },
     fireAll() {
       for (const timer of [...timers.values()]) timer.handler();
+    },
+    periods() {
+      return [...timers.values()].map((timer) => timer.ms);
     },
     setHidden(value: boolean) {
       hidden = value;
@@ -152,6 +157,23 @@ describe("createVisibleInterval", () => {
     // Components call this unconditionally; a DOM-free context must not crash.
     expect(() => createVisibleInterval(() => {}, 1000, null)()).not.toThrow();
   });
+
+  it("refuses a non-positive period instead of spinning", () => {
+    const env = fakeHost();
+    createVisibleInterval(() => {}, 0, env.host);
+    expect(env.live).toBe(0);
+  });
+
+  it("lengthens the interval while the event loop is late and shortens it again when the loop recovers", () => {
+    noteEventLoopDelay(LAG_HARD_MS);
+    const env = fakeHost();
+    createVisibleInterval(() => {}, 1000, env.host);
+    expect(env.periods()).toEqual([4000]);
+    resetEventLoopDelay();
+    env.fireAll();
+    expect(env.periods()).toEqual([1000]);
+    resetEventLoopDelay();
+  });
 });
 
 describe("every recurring UI timer is visibility-aware", () => {
@@ -171,5 +193,45 @@ describe("every recurring UI timer is visibility-aware", () => {
     // A bare window.setInterval here is the shape this replaced.
     expect(source).not.toMatch(/window\.setInterval\(/);
     expect(source).not.toMatch(/[^.\w]setInterval\(\(\) =>/);
+  });
+});
+
+describe("browser interval host", () => {
+  afterEach(() => {
+    resetEventLoopDelay();
+    resetForegroundFocus();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("drops the interval on window blur and catches up once on focus", () => {
+    vi.useFakeTimers();
+    const doc = new EventTarget() as EventTarget & {
+      hidden: boolean;
+      visibilityState: string;
+      hasFocus: () => boolean;
+    };
+    doc.hidden = false;
+    doc.visibilityState = "visible";
+    doc.hasFocus = () => true;
+    const frame = Object.assign(new EventTarget(), {
+      setInterval: (handler: TimerHandler, ms?: number) => globalThis.setInterval(handler, ms),
+      clearInterval: (handle: ReturnType<typeof setInterval>) => globalThis.clearInterval(handle),
+    });
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("window", frame);
+    let ticks = 0;
+    const dispose = createVisibleInterval(() => { ticks += 1; }, 1_000);
+    expect(vi.getTimerCount()).toBe(1);
+    frame.dispatchEvent(new Event("blur"));
+    expect(vi.getTimerCount()).toBe(0);
+    expect(ticks).toBe(0);
+    frame.dispatchEvent(new Event("focus"));
+    expect(ticks).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+    frame.dispatchEvent(new Event("focus"));
+    expect(ticks).toBe(1);
+    dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

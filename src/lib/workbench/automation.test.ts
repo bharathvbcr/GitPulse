@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { resetForegroundFocus } from "../runtime/foreground";
+import { noteEventLoopDelay, resetEventLoopDelay } from "../runtime/loadCadence";
 import { automaticQueueCount, automaticStatus, automaticUpdates, automationSettings, getAutomation, putAutomation, refreshAutomatic, wakeAutomatic, watchAutomatic } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
 const settings = { id: "profile", revision: 1, updated_at: 0, enabled: true, provider: null, model: null };
 const status = { ok: true, state: "idle", reason: "", task_id: "", proposal_id: "", next_check_at: 0 };
-beforeEach(() => { native.mockReset(); });
+beforeEach(() => { native.mockReset(); resetEventLoopDelay(); resetForegroundFocus(); vi.unstubAllGlobals(); });
 
 describe("automatic enhancement controls", () => {
   it("requires explicit settings and refuses incomplete or mismatched overrides", () => {
@@ -105,5 +107,47 @@ describe("automatic enhancement controls", () => {
       await vi.advanceTimersByTimeAsync(6000);
       expect(native).toHaveBeenCalledTimes(3);
     } finally { first(); second(); vi.useRealTimers(); }
+  });
+
+  it("stretches the coordinator poll while the event loop is hard-late", async () => {
+    vi.useFakeTimers();
+    noteEventLoopDelay(800);
+    const stop = watchAutomatic();
+    try {
+      native.mockResolvedValueOnce(JSON.stringify({ ...status, state: "generating", task_id: "task", proposal_id: "proposal" }));
+      await wakeAutomatic();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(native).toHaveBeenCalledTimes(1);
+      native.mockResolvedValueOnce(JSON.stringify(status));
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(native).toHaveBeenCalledTimes(2);
+    } finally { stop(); vi.useRealTimers(); }
+  });
+
+  it("drops the coordinator timer while the document is hidden and arms it on return", async () => {
+    vi.useFakeTimers();
+    const listeners = new Set<() => void>();
+    const doc = {
+      hidden: true,
+      visibilityState: "hidden" as DocumentVisibilityState,
+      addEventListener(_type: string, listener: () => void) { listeners.add(listener); },
+      removeEventListener(_type: string, listener: () => void) { listeners.delete(listener); },
+    };
+    vi.stubGlobal("document", doc);
+    const stop = watchAutomatic();
+    try {
+      native.mockResolvedValueOnce(JSON.stringify({ ...status, state: "waiting", task_id: "task", proposal_id: "proposal" }));
+      await wakeAutomatic();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(native).toHaveBeenCalledTimes(1);
+      doc.hidden = false;
+      doc.visibilityState = "visible";
+      for (const listener of [...listeners]) listener();
+      expect(vi.getTimerCount()).toBe(1);
+      native.mockResolvedValueOnce(JSON.stringify(status));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(native).toHaveBeenCalledTimes(2);
+    } finally { stop(); vi.useRealTimers(); }
   });
 });

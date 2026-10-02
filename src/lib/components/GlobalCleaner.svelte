@@ -5,6 +5,7 @@
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
   import type { CleanerConfig, CleanerInventory, CleanerState } from "../storage/hygiene/globalTypes";
   import { humanBytes } from "../storage/format";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   let { active = true }: { active?: boolean } = $props();
   let cleaner = $state<CleanerState | null>(null);
   let draft = $state<CleanerConfig | null>(null);
@@ -82,8 +83,8 @@
   $effect(() => {
     if (!active) return;
     live = true; epoch++; busy = false; inspecting = false; loading = false; void refresh();
-    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 3000);
-    return () => { live = false; epoch++; window.clearInterval(timer); };
+    const stopTimer = createAdaptiveTimer(() => { void refresh(); }, 3000);
+    return () => { live = false; epoch++; stopTimer(); };
   });
 </script>
 

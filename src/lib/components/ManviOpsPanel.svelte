@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { createVisibleInterval } from "../dom/visibleInterval";
+  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { isTauri } from "../platform";
@@ -446,8 +447,11 @@
 
   function scheduleRefreshRepoTasks() {
     if (refreshTasksTimer !== null) window.clearTimeout(refreshTasksTimer);
+    refreshTasksTimer = null;
+    if (readBackgroundDocument()) return;
     refreshTasksTimer = window.setTimeout(() => {
       refreshTasksTimer = null;
+      if (readBackgroundDocument()) return;
       const repo = $repoStore.currentPath;
       if (repo) void loadRepoTasks(repo);
     }, 200);
@@ -644,6 +648,17 @@
           // Live updates unavailable in non-Tauri preview mode
         });
     }
+    const onForeground = () => {
+      if (readBackgroundDocument()) {
+        if (refreshTasksTimer !== null) {
+          window.clearTimeout(refreshTasksTimer);
+          refreshTasksTimer = null;
+        }
+        return;
+      }
+      scheduleRefreshRepoTasks();
+    };
+    listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
 
     return () => {
       stopInterval();

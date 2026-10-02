@@ -41,6 +41,9 @@
     type HandoffGate,
     type HandoffSettings,
   } from "../workbench/taskHandoff";
+  import { TASK_RUN_POLL_MS, nextTaskRunPollDelay } from "../workbench/runPoll";
+  import { readEventLoopDelay } from "../runtime/loadCadence";
+  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import type { OpenTabRef } from "../workbench/openMembership";
 
   let { task, repositories, openTabs = [], disabled = false, dirty = false, active = true, onCount }: {
@@ -106,14 +109,20 @@
   function schedule() {
     if (timer) clearTimeout(timer);
     timer = null;
-    if (disposed || !active || document.visibilityState === "hidden") return;
+    if (disposed || !active) return;
     // Advanced before the decision below, so "keep polling" and "still live"
     // are answered against one instant. The final tick after an expiry is what
     // flips the row from Prepared to expired and then stops the loop.
     clock = Date.now();
-    if (runs.some((run) => ["starting", "running"].includes(run.state) || (run.state === "prepared" && run.expires_at * 1000 > clock))) {
-      timer = setTimeout(() => { timer = null; void refresh(); }, 1500);
-    }
+    const delay = nextTaskRunPollDelay({
+      baseMs: TASK_RUN_POLL_MS,
+      lagMs: readEventLoopDelay(),
+      background: readBackgroundDocument(),
+      live: runs.some((run) => ["starting", "running"].includes(run.state) || (run.state === "prepared" && run.expires_at * 1000 > clock)),
+      active: true,
+    });
+    if (delay === null) return;
+    timer = setTimeout(() => { timer = null; void refresh(); }, delay);
   }
   async function refresh(more = false) {
     if (loading || disposed || !active) return;
@@ -132,9 +141,12 @@
   $effect(() => {
     if (!active) { if (timer) clearTimeout(timer); timer = null; return; }
     untrack(() => { void refresh(); });
-    const wake = () => { if (document.visibilityState !== "hidden") void refresh(); else if (timer) { clearTimeout(timer); timer = null; } };
-    document.addEventListener("visibilitychange", wake);
-    return () => { document.removeEventListener("visibilitychange", wake); if (timer) clearTimeout(timer); timer = null; };
+    const wake = () => {
+      if (readBackgroundDocument()) { if (timer) { clearTimeout(timer); timer = null; } return; }
+      void refresh();
+    };
+    const unbind = bindForegroundChanges(document, typeof window === "undefined" ? null : window, wake);
+    return () => { unbind(); if (timer) clearTimeout(timer); timer = null; };
   });
   onDestroy(() => { disposed = true; generation += 1; if (timer) clearTimeout(timer); });
 

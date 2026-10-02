@@ -9,6 +9,8 @@
   import { copyText } from "../desktop/clipboard";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
+  import { readBackgroundDocument } from "../runtime/foreground";
 
   let { report, onchanged }: { report: StorageReport; onchanged: () => Promise<void> } = $props();
   let defaults = $state<HygieneDefaults>({ ...DEFAULT_HYGIENE_DEFAULTS });
@@ -122,14 +124,14 @@
     // preview and the user's explicit click, with backend revalidation.
     const tick = () => {
       clock = Date.now();
-      if (document.visibilityState === "visible" && clock >= retryAfter && reviewDue(defaults, clock) && !busy && !executing && !scanning) void scanCaches();
+      if (!readBackgroundDocument() && clock >= retryAfter && reviewDue(defaults, clock) && !busy && !executing && !scanning) void scanCaches();
     };
     tick();
-    const timer = window.setInterval(tick, 30_000);
+    const stopTimer = createAdaptiveTimer(tick, 30_000);
     return () => {
       alive = false;
       epoch++;
-      window.clearInterval(timer);
+      stopTimer();
       if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", String(e)));
     };
   });

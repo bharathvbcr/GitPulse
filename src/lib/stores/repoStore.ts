@@ -60,7 +60,10 @@ import {
   type StorageLike,
   type ViewTab,
 } from "../repos/persist";
-import { scheduleWorkspaceSync } from "../codeintel/workspaceSync";
+import * as workspaceSync from "../codeintel/workspaceSync";
+import { autoInit } from "../codeintel/autoInit";
+import { liveIndex } from "../codeintel/liveIndex";
+import { normalizeTabColor, type GroupColor, type TabColor } from "../repos/tabColors";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
 import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
 import { hasUnstagedChanges } from "../files/fileStatus";
@@ -102,6 +105,8 @@ import {
   shouldRunStatusPoll,
   statusesEqual,
 } from "../repos/statusPoll";
+import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
 import { beginGeneration } from "../async/guard";
 import type { FilePatch } from "../diff/patchBuilder";
@@ -792,9 +797,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let shortcutLocked = false;
 
   // --- work-tree status poll ---------------------------------------------
-  // One lazy interval for the whole workspace; ticks are no-ops unless an
-  // active session could plausibly have drifted.
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // One lazy timer for the whole workspace. While the window is in the
+  // background the timer is gone, not merely ignored: a callback that returns
+  // still woke the renderer every period. When the event loop is late the next
+  // arm stretches instead of spending another git status on a machine that is
+  // already behind. Background includes a blurred webview, not only a hidden one.
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollWanted = false;
+  let unbindPollForeground: (() => void) | null = null;
   let pollInflight = false;
   /** Monotonic poll ordering; a superseded tick's result is discarded. */
   let pollSequenceSource = 0;
@@ -852,24 +862,68 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const WATCH_REASSERT_EVERY_TICKS = 10;
   let pollTickCount = 0;
 
-  function ensureStatusPoll() {
-    if (pollTimer !== null || typeof setInterval === "undefined") return;
-    pollTimer = setInterval(
-      () => void runStatusPoll(),
-      STATUS_POLL_INTERVAL_MS,
+  function onStatusPollVisibility(): void {
+    if (!pollWanted) return;
+    if (readBackgroundDocument()) {
+      if (pollTimer !== null) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      return;
+    }
+    armStatusPoll();
+  }
+
+  function bindStatusPollVisibility(): void {
+    if (unbindPollForeground !== null || typeof document === "undefined") return;
+    unbindPollForeground = bindForegroundChanges(
+      document,
+      typeof window === "undefined" ? null : window,
+      onStatusPollVisibility,
     );
+  }
+
+  function unbindStatusPollVisibility(): void {
+    unbindPollForeground?.();
+    unbindPollForeground = null;
+  }
+
+  function armStatusPoll(): void {
+    if (!pollWanted || pollTimer !== null || typeof setTimeout === "undefined") return;
+    const decision = decideCadence({
+      baseMs: STATUS_POLL_INTERVAL_MS,
+      lagMs: readEventLoopDelay(),
+      paused: readBackgroundDocument(),
+    });
+    if (!decision.run) return;
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      void runStatusPoll().finally(() => {
+        if (pollWanted) armStatusPoll();
+      });
+    }, decision.delayMs);
+  }
+
+  function ensureStatusPoll() {
+    if (pollWanted || typeof setTimeout === "undefined") return;
+    pollWanted = true;
+    bindStatusPollVisibility();
+    armStatusPoll();
   }
 
   /** Stops the workspace poll; the next activation restarts it lazily. */
   function stopStatusPoll() {
-    if (pollTimer === null) return;
-    clearInterval(pollTimer);
-    pollTimer = null;
+    pollWanted = false;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    unbindStatusPollVisibility();
   }
 
   async function runStatusPoll() {
     const session = activeSession();
-    const hidden = typeof document !== "undefined" && document.hidden;
+    const hidden = readBackgroundDocument();
     if (
       !shouldRunStatusPoll({
         hidden,
@@ -983,14 +1037,25 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const active = internal.workspace.activeId
       ? internal.sessions[internal.workspace.activeId]
       : undefined;
-    const paths = internal.workspace.tabs.map((tab) => tab.path);
-    const syncKey = JSON.stringify({
-      root: active?.path ?? null,
-      paths,
-    });
+    const trusted = pathsTrustedForBackground(
+      internal.workspace.tabs.map((tab) => ({
+        path: tab.path,
+        trustRequired: internal.sessions[tab.id]?.trustRequired === true,
+      })),
+      active?.path ?? null,
+    );
+    const syncKey = JSON.stringify(trusted);
     if (syncKey !== lastWorkspaceSyncKey) {
       lastWorkspaceSyncKey = syncKey;
-      scheduleWorkspaceSync(active?.path ?? null, paths);
+      workspaceSync.scheduleWorkspaceSync(trusted.activeKey, trusted.retainedKeys);
+      const visible = !readBackgroundDocument();
+      const scope = {
+        activeKey: trusted.activeKey,
+        retainedKeys: trusted.retainedKeys,
+        visible,
+      };
+      autoInit.setScope(scope);
+      liveIndex.setScope(scope);
     }
   }
 

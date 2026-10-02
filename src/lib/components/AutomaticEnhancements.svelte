@@ -4,9 +4,10 @@
   import { cardScale, cardScaleOut } from "../ui/transitions";
   import { LAYERS } from "../ui/layers";
   import { automaticQueueCount, automaticUpdates, enhancementConfiguration, explainError, getAutomation, newID, putAutomation, wakeAutomatic, watchAutomatic, WorkbenchError, type AutomationSettings } from "../workbench/client";
+  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 
   let { active = true, compact = false }: { active?: boolean; compact?: boolean } = $props();
-  let opened = $state(false), loading = $state(false), saving = $state(false), visible = $state(true);
+  let opened = $state(false), loading = $state(false), saving = $state(false), visible = $state(!readBackgroundDocument());
   let settings = $state<AutomationSettings | null>(null), error = $state(""), note = $state("");
   let enabled = $state(true), override = $state(false), provider = $state(""), model = $state("");
   let configured = $state(""), queued = $state<number | null>(null);
@@ -19,8 +20,8 @@
   const status = $derived($automaticUpdates.status);
 
   onMount(() => {
-    const update = () => { visible = document.visibilityState === "visible"; };
-    update(); document.addEventListener("visibilitychange", update);
+    const update = () => { visible = !readBackgroundDocument(); };
+    const unbindForeground = bindForegroundChanges(document, typeof window === "undefined" ? null : window, update);
     const outside = (event: PointerEvent) => {
       if (compact && active && opened && event.target instanceof Node && !container?.contains(event.target)) dismiss(false);
     };
@@ -33,7 +34,7 @@
     document.addEventListener("keydown", escape, true);
     return () => {
       disposed = true;
-      document.removeEventListener("visibilitychange", update);
+      unbindForeground();
       document.removeEventListener("pointerdown", outside);
       document.removeEventListener("keydown", escape, true);
     };

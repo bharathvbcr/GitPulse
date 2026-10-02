@@ -39,6 +39,8 @@
     explainEnhancementFailure,
   } from "../workbench/taskModel";
   import { harnessStore } from "../stores/harnessStore";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
+  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { requestManviFocus } from "../ui/manviFocus";
   import { askConfirm } from "../stores/modalStore";
   import SettingToggle from "./SettingToggle.svelte";
@@ -156,7 +158,7 @@
   let configLoad: Promise<void> | null = null;
   let flash = $state<EnhancementField[]>([]);
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
-  let visible = $state(true);
+  let visible = $state(!readBackgroundDocument());
   /**
    * Which engine writes the text.
    *
@@ -283,19 +285,19 @@
 
   onMount(() => {
     const unsub = harnessStore.subscribe(() => { harnessTick += 1; });
-    const update = () => { visible = document.visibilityState === "visible"; now = Date.now() / 1000; };
+    const update = () => { visible = !readBackgroundDocument(); now = Date.now() / 1000; };
     update();
-    document.addEventListener("visibilitychange", update);
+    const unbindForeground = bindForegroundChanges(document, typeof window === "undefined" ? null : window, update);
     void loadConfig();
     void appleIntelligenceStatus().then((status) => { if (!disposed) apple = status; });
     if (task) void history();
-    const tick = window.setInterval(() => { now = Date.now() / 1000; }, 1000);
+    const stopClock = createAdaptiveTimer(() => { now = Date.now() / 1000; }, 1000);
     return () => {
       disposed = true;
       unsub();
       selecting++;
-      document.removeEventListener("visibilitychange", update);
-      window.clearInterval(tick);
+      unbindForeground();
+      stopClock();
       if (flashTimer) clearTimeout(flashTimer);
     };
   });
@@ -337,8 +339,7 @@
   $effect(() => {
     if (!active || !proposal || !liveEnhancement(proposal)) return;
     const id = proposal.id;
-    const timer = window.setInterval(() => { void poll(id); }, 1000);
-    return () => window.clearInterval(timer);
+    return createAdaptiveTimer(() => { void poll(id); }, 1000);
   });
   /**
    * Read the model configuration, sharing one request between callers.
@@ -426,7 +427,7 @@
   }
 
   async function poll(id: string) {
-    if (polling || acting || disposed || !active || document.visibilityState === "hidden") return;
+    if (polling || acting || disposed || !active || readBackgroundDocument()) return;
     polling = true;
     const ticket = epoch;
     try {

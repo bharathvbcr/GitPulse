@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installResponsivenessDiagnostics } from "./responsiveness";
+import { readEventLoopDelay, resetEventLoopDelay } from "../runtime/loadCadence";
 
 describe("UI responsiveness diagnostics", () => {
   let stop = () => {};
   beforeEach(() => vi.useFakeTimers());
-  afterEach(() => { stop(); vi.useRealTimers(); });
+  afterEach(() => { stop(); resetEventLoopDelay(); vi.useRealTimers(); });
 
   function probe(initial: DocumentVisibilityState = "visible") {
     const target = Object.assign(new EventTarget(), { visibilityState: initial });
@@ -128,6 +129,22 @@ describe("UI responsiveness diagnostics", () => {
     await p.tick(10_000);
     expect(vi.getTimerCount()).toBe(0);
     expect(p.warn).not.toHaveBeenCalled();
+  });
+
+  it("publishes event-loop delay for schedulers and drops it when the window blurs", async () => {
+    const p = probe();
+    await p.tick(750);
+    expect(readEventLoopDelay()).toBeGreaterThanOrEqual(250);
+    p.frame.dispatchEvent(new Event("blur"));
+    expect(readEventLoopDelay()).toBe(0);
+  });
+
+  it("lets healthy ticks decay a stall instead of keeping the stretched period forever", async () => {
+    const p = probe();
+    await p.tick(750);
+    expect(readEventLoopDelay()).toBeGreaterThanOrEqual(250);
+    for (let i = 0; i < 8; i++) await p.tick();
+    expect(readEventLoopDelay()).toBeLessThan(250);
   });
 
   it("is inert without a document", () => {

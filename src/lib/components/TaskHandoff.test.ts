@@ -91,7 +91,8 @@ describe("the agent handoff has one implementation", () => {
   it("keeps polling scoped to runs that can still change", () => {
     expect(panel).toContain('["starting", "running"].includes(run.state)');
     expect(panel).toContain("run.expires_at * 1000 > clock");
-    expect(panel).toContain('document.visibilityState !== "hidden"');
+    expect(panel).toContain("readBackgroundDocument");
+    expect(panel).toContain("nextTaskRunPollDelay");
     expect(panel).toContain("if (!active)");
     expect(panel).toContain("runs.length >= 180");
   });

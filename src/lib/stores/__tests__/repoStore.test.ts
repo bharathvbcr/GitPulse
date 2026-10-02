@@ -1753,55 +1753,148 @@ describe("repoStore branch stats", () => {
 describe("repoStore status poll lifecycle", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    resetEventLoopDelay();
+    resetForegroundFocus();
     vi.useRealTimers();
   });
 
   function pollSpies() {
-    const setSpy = vi.spyOn(globalThis, "setInterval");
-    const clearSpy = vi.spyOn(globalThis, "clearInterval");
-    return { setSpy, clearSpy };
+    const setSpy = vi.spyOn(globalThis, "setTimeout");
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+    const arms = () => setSpy.mock.calls
+      .map((call, index) => ({ delay: call[1], handle: setSpy.mock.results[index]?.value }))
+      .filter((row) => row.delay === STATUS_POLL_INTERVAL_MS || row.delay === STATUS_POLL_INTERVAL_MS * 4);
+    return { setSpy, clearSpy, arms };
   }
 
   it("schedules one interval per workspace, clears it on tab close, restarts lazily", async () => {
-    const { setSpy, clearSpy } = pollSpies();
+    const { clearSpy, arms } = pollSpies();
     const { store } = makeStore();
     await store.openRepo("/r/poll-a");
     // Re-opening the same workspace must not stack a second interval.
     await store.openRepo("/r/poll-b");
-    expect(setSpy).toHaveBeenCalledTimes(1);
-    const handle = setSpy.mock.results[0]?.value;
+    expect(arms()).toHaveLength(1);
+    const handle = arms()[0]?.handle;
 
     await store.closeTab(get(store).openTabs[0].id);
     expect(clearSpy.mock.calls.some(([timer]) => timer === handle)).toBe(true);
 
     await store.openRepo("/r/poll-c");
-    expect(setSpy).toHaveBeenCalledTimes(2);
+    expect(arms()).toHaveLength(2);
   });
 
   it("restarts polling when a tab closes and another remains", async () => {
-    const { setSpy, clearSpy } = pollSpies();
+    const { clearSpy, arms } = pollSpies();
     const { store } = makeStore();
     await store.openRepo("/r/keep-a");
     await store.openRepo("/r/keep-b");
-    expect(setSpy).toHaveBeenCalledTimes(1);
-    const firstHandle = setSpy.mock.results[0]?.value;
+    expect(arms()).toHaveLength(1);
+    const firstHandle = arms()[0]?.handle;
 
     await store.closeTab(get(store).openTabs[0].id);
     expect(clearSpy.mock.calls.some(([timer]) => timer === firstHandle)).toBe(true);
     expect(get(store).openTabs).toHaveLength(1);
-    expect(setSpy).toHaveBeenCalledTimes(2);
+    expect(arms()).toHaveLength(2);
   });
 
   it("clears the interval when the workspace is restored", async () => {
-    const { setSpy, clearSpy } = pollSpies();
+    const { clearSpy, arms } = pollSpies();
     const { store } = makeStore();
     await store.openRepo("/r/poll-reset");
-    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect(arms()).toHaveLength(1);
 
     await store.restoreWorkspace();
     // Reset stops the old interval; reopening the persisted tab restarts one.
     expect(clearSpy).toHaveBeenCalled();
-    expect(setSpy).toHaveBeenCalledTimes(2);
+    expect(arms()).toHaveLength(2);
+  });
+
+  it("arms a stretched status poll when the event loop is hard-late", async () => {
+    noteEventLoopDelay(800);
+    const setSpy = vi.spyOn(globalThis, "setTimeout");
+    const { store } = makeStore();
+    await store.openRepo("/r/poll-late");
+    const delays = setSpy.mock.calls.map((call) => call[1]);
+    expect(delays).toContain(STATUS_POLL_INTERVAL_MS * 4);
+    expect(delays).not.toContain(STATUS_POLL_INTERVAL_MS);
+  });
+
+  it("does not arm a status poll while the document is hidden, and arms one when it returns", async () => {
+    const listeners = new Set<() => void>();
+    const doc = {
+      hidden: true,
+      visibilityState: "hidden" as DocumentVisibilityState,
+      addEventListener(_type: string, listener: () => void) { listeners.add(listener); },
+      removeEventListener(_type: string, listener: () => void) { listeners.delete(listener); },
+    };
+    vi.stubGlobal("document", doc);
+    const setSpy = vi.spyOn(globalThis, "setTimeout");
+    const { store } = makeStore();
+    await store.openRepo("/r/poll-hidden");
+    const pollDelays = () => setSpy.mock.calls.map((call) => call[1]).filter((delay) => delay === STATUS_POLL_INTERVAL_MS);
+    expect(pollDelays()).toHaveLength(0);
+
+    doc.hidden = false;
+    doc.visibilityState = "visible";
+    for (const listener of [...listeners]) listener();
+    expect(pollDelays()).toHaveLength(1);
+  });
+
+  it("does not arm a status poll while the window is blurred but still visible", async () => {
+    // WKWebView leaves visibilityState "visible" when another app is in front.
+    // The terminal lives in this document, so hasFocus stays true while it is
+    // the focused control. hasFocus false is the window itself losing focus.
+    // Focus is registered before blur. Firing every frame listener would arm
+    // and then clear, so this test fires one type at a time.
+    const frameListeners: { type: string; listener: () => void }[] = [];
+    let focused = false;
+    const doc = {
+      hidden: false,
+      visibilityState: "visible" as DocumentVisibilityState,
+      hasFocus: () => focused,
+      addEventListener(_type: string, _listener: () => void) {},
+      removeEventListener(_type: string, _listener: () => void) {},
+    };
+    const frame = {
+      addEventListener(type: string, listener: () => void) { frameListeners.push({ type, listener }); },
+      removeEventListener(type: string, listener: () => void) {
+        const index = frameListeners.findIndex((entry) => entry.type === type && entry.listener === listener);
+        if (index >= 0) frameListeners.splice(index, 1);
+      },
+    };
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("window", frame);
+    const setSpy = vi.spyOn(globalThis, "setTimeout");
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+    const scopes = vi.spyOn(autoInit, "setScope");
+    const { store } = makeStore();
+    await store.openRepo("/r/poll-blur");
+    const pollArms = () => setSpy.mock.calls
+      .map((call, index) => ({ delay: call[1], handle: setSpy.mock.results[index]?.value }))
+      .filter((row) => row.delay === STATUS_POLL_INTERVAL_MS);
+    const fire = (type: string) => {
+      for (const entry of frameListeners) if (entry.type === type) entry.listener();
+    };
+    expect(pollArms()).toHaveLength(0);
+    expect(scopes.mock.calls.at(-1)?.[0]).toMatchObject({ visible: false });
+
+    focused = true;
+    fire("focus");
+    expect(pollArms()).toHaveLength(1);
+    const handle = pollArms()[0]?.handle;
+    fire("focus");
+    expect(pollArms()).toHaveLength(1);
+    expect(clearSpy.mock.calls.some(([timer]) => timer === handle)).toBe(false);
+
+    focused = false;
+    fire("blur");
+    expect(clearSpy.mock.calls.some(([timer]) => timer === handle)).toBe(true);
+    expect(pollArms()).toHaveLength(1);
+
+    focused = true;
+    fire("focus");
+    expect(pollArms()).toHaveLength(2);
   });
 });
 
@@ -3777,6 +3870,10 @@ describe("repoStore tab grouping", () => {
         recents: tabs.map((tab) => tab.path),
         lastClosed: [],
         collapsedGroups: ["web"],
+        groupColors: [
+          { group: "devtools", color: "teal" },
+          { group: "web", color: "violet" },
+        ],
       }),
     });
     const gate = deferred<void>();
@@ -3841,10 +3938,6 @@ describe("repoStore tab grouping", () => {
         recents: [],
         lastClosed: [],
         collapsedGroups: ["web"],
-        groupColors: [
-          { group: "devtools", color: "teal" },
-          { group: "web", color: "violet" },
-        ],
       }),
     });
     const calls: string[] = [];
