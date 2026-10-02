@@ -3,6 +3,7 @@
   import { CheckCircle2, Info, AlertTriangle, AlertCircle, X } from "@lucide/svelte";
   import { fly, fade } from "svelte/transition";
   import { LAYERS } from "../ui/layers";
+  import { focusStayedInside, notificationPile } from "../ui/notificationPile";
 
   const KIND_CONFIG: Record<
     ToastKind,
@@ -42,6 +43,27 @@
       toastStore.dismiss(toast.id);
     }
   }
+
+  let expanded = $state(false);
+  let pile = $state<HTMLDivElement | undefined>();
+  const toasts = $derived($toastStore);
+  const stack = $derived(notificationPile(toasts.length, expanded));
+  // slice(-0) is slice(0) and would return every toast. An empty store stays empty.
+  const shown = $derived(toasts.length === 0 ? [] : toasts.slice(-stack.shown));
+  const lips = $derived(Array.from({ length: stack.peeks }, (_, index) => stack.peeks - index));
+
+  function engage() {
+    expanded = true;
+    toastStore.pauseAll();
+  }
+
+  function release(event: MouseEvent | FocusEvent) {
+    const active = document.activeElement;
+    if (event.type === "focusout" && focusStayedInside(pile, event.relatedTarget)) return;
+    if (event.type === "mouseleave" && focusStayedInside(pile, active)) return;
+    expanded = false;
+    toastStore.resumeAll();
+  }
 </script>
 
 <!--
@@ -74,55 +96,77 @@
     {/each}
   </div>
 
-  {#each $toastStore as toast (toast.id)}
-    {@const config = KIND_CONFIG[toast.kind]}
-    {@const Icon = config.icon}
-    <!-- Countdowns freeze while the pointer or focus is on a toast: an "Undo"
-         that expires while you reach for it is not an offer. The container is
-         pointer-events-none, so the card is the element that can see this.
-         `aria-hidden` because the announcement is made by the live regions
-         above — without it every toast is read twice. -->
+  {#if toasts.length > 0}
+    <!-- Newest toast in front. Lips above it are only edges. Hover or focus
+         opens every toast so dismiss and actions stay reachable, and freezes
+         the countdown while the pointer or focus is here. The container is
+         pointer-events-none, so this pile is what can see that. Cards stay
+         aria-hidden because the live regions above already announced them. -->
     <div
+      class="pile pointer-events-auto"
+      class:open={stack.peeks === 0}
+      role="group"
       aria-hidden="true"
-      role="presentation"
-      onmouseenter={() => toastStore.pauseAll()}
-      onmouseleave={() => toastStore.resumeAll()}
-      onfocusin={() => toastStore.pauseAll()}
-      onfocusout={() => toastStore.resumeAll()}
-      in:fly={{ y: 12, duration: 160 }}
-      out:fade={{ duration: 120 }}
-      class="pointer-events-auto gp-pop gp-card rounded-2xl p-3 border shadow-float flex items-start gap-2.5 bg-surface {config.border}"
+      data-testid="toast-pile"
+      bind:this={pile}
+      onmouseenter={engage}
+      onmouseleave={release}
+      onfocusin={engage}
+      onfocusout={release}
     >
-      <div class="shrink-0 mt-0.5 {config.iconColor}">
-        <Icon size={16} />
-      </div>
-
-      <div class="flex-1 min-w-0">
-        <p class="text-xs font-medium leading-snug {config.text} wrap-break-word">
-          {toast.message}
-        </p>
-
-        {#if toast.action}
-          <div class="mt-2">
-            <button
-              type="button"
-              onclick={() => handleAction(toast)}
-              class="gp-btn py-0.5! px-2.5! text-[11px] font-semibold hover:border-accent/60"
-            >
-              {toast.action.label}
-            </button>
+      {#each lips as depth (depth)}
+        <div class="peek gp-card" style:--depth={depth} aria-hidden="true"></div>
+      {/each}
+      {#each shown as toast (toast.id)}
+        {@const config = KIND_CONFIG[toast.kind]}
+        {@const Icon = config.icon}
+        <div
+          aria-hidden="true"
+          role="presentation"
+          in:fly={{ y: 12, duration: 160 }}
+          out:fade={{ duration: 120 }}
+          class="toast pointer-events-auto gp-pop gp-card rounded-2xl p-3 border shadow-float flex items-start gap-2.5 bg-surface {config.border}"
+        >
+          <div class="shrink-0 mt-0.5 {config.iconColor}">
+            <Icon size={16} />
           </div>
-        {/if}
-      </div>
 
-      <button
-        type="button"
-        onclick={() => toastStore.dismiss(toast.id)}
-        aria-label="Dismiss notification"
-        class="shrink-0 p-1 rounded-full text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
-      >
-        <X size={13} />
-      </button>
+          <div class="flex-1 min-w-0">
+            <p class="text-xs font-medium leading-snug {config.text} wrap-break-word">
+              {toast.message}
+            </p>
+
+            {#if toast.action}
+              <div class="mt-2">
+                <button
+                  type="button"
+                  onclick={() => handleAction(toast)}
+                  class="gp-btn py-0.5! px-2.5! text-[11px] font-semibold hover:border-accent/60"
+                >
+                  {toast.action.label}
+                </button>
+              </div>
+            {/if}
+          </div>
+
+          <button
+            type="button"
+            onclick={() => toastStore.dismiss(toast.id)}
+            aria-label="Dismiss notification"
+            class="shrink-0 p-1 rounded-full text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      {/each}
     </div>
-  {/each}
+  {/if}
 </div>
+
+<style>
+  /* Lips sit above the card and tuck under it by about its padding, so the message stays clear. */
+  .pile{position:relative;display:flex;flex-direction:column;gap:8px}
+  .pile:not(.open){padding-top:16px}
+  .toast{position:relative;z-index:1}
+  .peek{position:absolute;z-index:0;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);top:calc((2 - var(--depth)) * 8px)}
+</style>

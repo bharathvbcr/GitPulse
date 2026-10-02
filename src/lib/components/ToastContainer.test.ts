@@ -29,6 +29,31 @@ describe("ToastContainer", () => {
     expect(body).toContain("Failed to push to remote");
     expect(body).toContain("Retry");
   });
+
+  it("collapses several toasts onto the newest card", () => {
+    toastStore.info("Oldest notice");
+    toastStore.warning("Middle notice");
+    toastStore.success("Newest notice");
+
+    const { body } = render(ToastContainer);
+    const pile = body.slice(body.indexOf('data-testid="toast-pile"'));
+    expect(pile.match(/role="presentation"/g)).toHaveLength(1);
+    expect(pile.match(/class="[^"]*\bpeek\b/g)).toHaveLength(2);
+    expect(pile).toContain("Newest notice");
+    expect(pile).not.toContain("Oldest notice");
+    expect(pile).not.toContain("Middle notice");
+    expect(body).toContain("Oldest notice");
+    expect(body).toContain("Middle notice");
+  });
+
+  it("draws a single toast as one card", () => {
+    toastStore.info("Only notice");
+    const { body } = render(ToastContainer);
+    const pile = body.slice(body.indexOf('data-testid="toast-pile"'));
+    expect(pile.match(/role="presentation"/g)).toHaveLength(1);
+    expect(pile).not.toContain("peek");
+    expect(pile).toContain("Only notice");
+  });
 });
 
 describe("the live region exists before the content lands in it", () => {
@@ -37,10 +62,11 @@ describe("the live region exists before the content lands in it", () => {
   it("puts aria-live on a persistent wrapper, not on each inserted toast", () => {
     // A live region has to be in the DOM before content arrives to be watched;
     // a region inserted together with its content is mostly not announced.
-    const cards = source.slice(source.indexOf("{#each $toastStore as toast"));
+    const cards = source.slice(source.indexOf('data-testid="toast-pile"'));
     expect(cards).not.toContain("aria-live");
     expect(source).toContain('aria-live="assertive"');
     expect(source).toContain('aria-live="polite"');
+    expect(source.indexOf('aria-live="assertive"')).toBeLessThan(source.indexOf('data-testid="toast-pile"'));
   });
 
   it("announces errors assertively and everything else politely", () => {
@@ -54,10 +80,17 @@ describe("the live region exists before the content lands in it", () => {
     expect(source).toContain('aria-hidden="true"');
   });
 
-  it("pauses countdowns on hover and focus", () => {
-    expect(source).toContain("onmouseenter={() => toastStore.pauseAll()}");
-    expect(source).toContain("onmouseleave={() => toastStore.resumeAll()}");
-    expect(source).toContain("onfocusin={() => toastStore.pauseAll()}");
-    expect(source).toContain("onfocusout={() => toastStore.resumeAll()}");
+  it("pauses countdowns on hover and focus, and stays paused while focus remains inside", () => {
+    expect(source).toContain("onmouseenter={engage}");
+    expect(source).toContain("onmouseleave={release}");
+    expect(source).toContain("onfocusin={engage}");
+    expect(source).toContain("onfocusout={release}");
+    expect(source).toContain("toastStore.pauseAll()");
+    expect(source).toContain("toastStore.resumeAll()");
+    expect(source).toContain('event.type === "focusout" && focusStayedInside(pile, event.relatedTarget)');
+    expect(source).toContain('event.type === "mouseleave" && focusStayedInside(pile, active)');
+    expect(source).toContain("toasts.slice(-stack.shown)");
+    const style = source.slice(source.indexOf("<style>"));
+    expect(style).not.toMatch(/background(?:-color)?:\s*rgb\(var\(--c-(?:bg|surface|surface-hover)\)\)/);
   });
 });

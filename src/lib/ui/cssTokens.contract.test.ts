@@ -66,9 +66,17 @@ function collect(pattern: RegExp, from: typeof files): Map<string, string> {
  */
 const DECLARATION = /(?:^|[{;])[ \t]*(--[A-Za-z0-9_-]+)[ \t]*:/gm;
 
-/** Declared in a stylesheet or a component `<style>` block, or set from JS. */
+/**
+ * Svelte's `style:--token={value}` directive, which sets the property on the
+ * element it sits on. Only in `.svelte` markup, and only with its `=`, so a
+ * comment that names the directive still declares nothing.
+ */
+const STYLE_DIRECTIVE = /\bstyle:(--[A-Za-z0-9_-]+)\s*=/g;
+
+/** Declared in a stylesheet or a component `<style>` block, set on an element, or set from JS. */
 const defined = new Set([
   ...collect(DECLARATION, files).keys(),
+  ...collect(STYLE_DIRECTIVE, files.filter((file) => file.path.endsWith(".svelte"))).keys(),
   ...collect(/setProperty\(\s*["'`](--[A-Za-z0-9_-]+)/g, files).keys(),
 ]);
 
@@ -108,6 +116,13 @@ describe("custom properties resolve to something that defines them", () => {
     // whole value is that a misspelt token has nothing to hide behind.
     const prose = "/**\n * --probe-documented: described here, declared nowhere.\n */\n";
     expect([...prose.matchAll(DECLARATION)]).toEqual([]);
+  });
+
+  it("counts a Svelte style: directive as a declaration, and only with its value", () => {
+    // The toast and inbox stacks give each peek lip its own `--depth` this way;
+    // the rule that reads it is shared, so no stylesheet ever declares it.
+    const markup = '<div class="peek" style:--probe-depth={depth}></div>\n<!-- style:--probe-named -->\n';
+    expect([...markup.matchAll(STYLE_DIRECTIVE)].map((match) => match[1])).toEqual(["--probe-depth"]);
   });
 
   it("defines every token reached through var()", () => {
