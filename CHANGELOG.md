@@ -114,10 +114,16 @@ installs and scripts.
   `path.secret_read` and engine-unavailable rules. A new `gusset-check`
   command and CI job exercise the linked engine; without it the check exits
   "could not run", never success.
-- **Dependency updates.** JavaScript: `@tauri-apps/api` and `@tauri-apps/cli`
-  2.12, `@tauri-apps/plugin-autostart` and `plugin-opener` 2.6, lucide,
-  vite-plugin-svelte, Vite, Vitest and its coverage, and `@types/node` (the
-  Rust Tauri crates are unchanged). CI: `actions/setup-go` 7.
+- **Tauri 2.12.1.** The ported Tauri crates move to the `tauri-v2.12.1` tag
+  with WRY 0.57, Muda 0.20 and tray-icon 0.25, and the opener and autostart
+  plugins to 2.7, matching the JavaScript packages: `@tauri-apps/api` and
+  `@tauri-apps/cli` 2.12, `@tauri-apps/plugin-autostart` and `plugin-opener`
+  2.7. `tauri build` refuses an npm package and its crate on different minor
+  releases, so a test now checks every such pair from both lockfiles. The
+  GTK 3 port carries over unchanged, and Muda's local lint allow is retired
+  because 0.20 no longer needs it.
+- **Dependency updates.** JavaScript: lucide, vite-plugin-svelte, Vite,
+  Vitest and its coverage, and `@types/node`. CI: `actions/setup-go` 7.
 - **CI can run by hand on a branch**, a failing browser harness names its
   failing checks in a GitHub annotation, and `--all` runs every harness
   before failing instead of stopping at the first.
