@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { copyText } from "../desktop/clipboard";
 import { APP_BUILD_ID, APP_VERSION, formatDiagnosticFailure, redactDiagnosticText } from "../diagnostics/diagnostics";
 import type { PersistedLog } from "../diagnostics/types";

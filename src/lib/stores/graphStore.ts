@@ -1,5 +1,5 @@
 import { get, writable } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics, type DiagnosticsStore } from "../diagnostics/diagnostics";
 import type { VisualCommitRow, LaneConnection } from "../canvas/GraphRenderer";

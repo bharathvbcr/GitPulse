@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";

@@ -3,6 +3,7 @@ import { formatError } from "../ui/formatError";
 import { browserStorage, type StorageLike } from "../repos/persist";
 import { escapeRegExp } from "../text/lineSearch";
 import { isProductDisabledMessage } from "../health/githubAlerts";
+import { isDeferredUnderLoad } from "../async/deferral";
 
 /**
  * Central capture of everything that goes wrong while the app runs: uncaught
@@ -1110,9 +1111,14 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
 
   if (restored.rewritten) persist();
 
-  function record(severity: DiagnosticSeverity, source: string, detail: unknown) {
+  function record(requested: DiagnosticSeverity, source: string, detail: unknown) {
     const safeSource = clampMessage(redactDiagnosticText(source));
     const message = namedObserverMessage(detail, clampMessage(formatDiagnosticFailure(detail)));
+    // Every surface reports backend failures through here. A deferral under
+    // load is the spawn gate declining to start git: nothing failed, so it
+    // is a warning whichever severity the caller reached for.
+    const severity: DiagnosticSeverity =
+      requested === "error" && isDeferredUnderLoad(message) ? "warning" : requested;
     if (
       isHostRuntimeNoise(message, development) ||
       isSuppressedObserverRecord(severity, safeSource, message, detail)

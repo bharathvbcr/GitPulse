@@ -27,7 +27,7 @@
 //!   not silently treated as missing. A detection that could not run must not
 //!   be indistinguishable from one that ran and found nothing.
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_text, git_text_shared, validate_repo};
 use crate::engine::git_writer::repo_mutation_lock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -219,7 +219,7 @@ fn resolve_control_paths(repo: &Path) -> Result<Vec<PathBuf>, String> {
         args.push("--git-path");
         args.push(probe);
     }
-    let raw = git_text(repo, &args)?;
+    let raw = git_text_shared(repo, &args)?;
     let mut resolved: Vec<PathBuf> = raw
         .lines()
         .map(str::trim)

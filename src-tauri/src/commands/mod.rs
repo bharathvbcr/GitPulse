@@ -260,7 +260,11 @@ where
     tauri::async_runtime::spawn_blocking(move || {
         let mut timing =
             crate::logging::performance::CommandTiming::start(std::any::type_name::<F>(), queued);
-        let result = body();
+        // Every command starts as a deferrable read. `guard` promotes the
+        // rest of a mutation's body to a user action, and this scope is what
+        // ends that promotion before the pool thread runs anything else — and
+        // keeps a mutation's deferral from reading as safe to retry.
+        let result = crate::engine::git_cli::run_command_scope(body);
         timing.finish(&result);
         result
     })
@@ -2369,47 +2373,62 @@ pub async fn cmd_worktree_ai_summary(
     worktree_path: String,
     branch: Option<String>,
 ) -> Result<String, String> {
-    off_thread(move || {
-        let wt = std::path::Path::new(&worktree_path);
-        if !wt.exists() {
-            return Err("Worktree path does not exist".to_string());
-        }
-        let diff_stat = crate::engine::worktree::measure_diff_stat(wt);
-        let repo = crate::engine::validate_repo(&repo_path).ok();
-        let divergence = repo
-            .as_ref()
-            .and_then(|r| crate::engine::worktree::measure_main_divergence(r, branch.as_deref()));
-        let log_out = git_text(wt, &["log", "-1", "--pretty=%s"]).unwrap_or_default();
-        let last_msg = log_out.trim();
+    off_thread(move || worktree_ai_summary(&repo_path, &worktree_path, branch.as_deref())).await
+}
 
-        let mut parts = Vec::new();
-        if let Some(stat) = diff_stat {
-            if stat.files_changed > 0 {
-                parts.push(format!(
-                    "HEAD±: {} files (+{}, -{})",
-                    stat.files_changed, stat.insertions, stat.deletions
-                ));
-            } else {
-                parts.push("HEAD±: clean".to_string());
-            }
-        }
-        if let Some(div) = divergence {
-            if div.ahead > 0 || div.behind > 0 {
-                parts.push(format!("main↕: +{} -{}", div.ahead, div.behind));
-            } else {
-                parts.push("main↕: synced".to_string());
-            }
-        }
-        if !last_msg.is_empty() {
-            parts.push(format!("tip: \"{last_msg}\""));
-        }
-        if parts.is_empty() {
-            Ok("Worktree clean".to_string())
+/// Body of [`cmd_worktree_ai_summary`].
+fn worktree_ai_summary(
+    repo_path: &str,
+    worktree_path: &str,
+    branch: Option<&str>,
+) -> Result<String, String> {
+    let wt = std::path::Path::new(worktree_path);
+    if !wt.exists() {
+        return Err("Worktree path does not exist".to_string());
+    }
+    // Each measurement below reads a failed git as "absent", and with all
+    // three absent the summary used to say "Worktree clean". A read that
+    // produced no answer fails the summary instead, with its own cause —
+    // a deferral keeps its marker, so the call is asked again later.
+    let failures = crate::engine::git_cli::process_failures();
+    let diff_stat = crate::engine::worktree::measure_diff_stat(wt);
+    let repo = crate::engine::validate_repo(repo_path).ok();
+    let divergence = repo
+        .as_ref()
+        .and_then(|r| crate::engine::worktree::measure_main_divergence(r, branch));
+    let log_out = git_text(wt, &["log", "-1", "--pretty=%s"]).unwrap_or_default();
+    if crate::engine::git_cli::process_failures() != failures {
+        return Err(crate::engine::git_cli::last_process_failure()
+            .unwrap_or_else(|| "a git read for the worktree summary produced no answer".into()));
+    }
+    let last_msg = log_out.trim();
+
+    let mut parts = Vec::new();
+    if let Some(stat) = diff_stat {
+        if stat.files_changed > 0 {
+            parts.push(format!(
+                "HEAD±: {} files (+{}, -{})",
+                stat.files_changed, stat.insertions, stat.deletions
+            ));
         } else {
-            Ok(parts.join(" · "))
+            parts.push("HEAD±: clean".to_string());
         }
-    })
-    .await
+    }
+    if let Some(div) = divergence {
+        if div.ahead > 0 || div.behind > 0 {
+            parts.push(format!("main↕: +{} -{}", div.ahead, div.behind));
+        } else {
+            parts.push("main↕: synced".to_string());
+        }
+    }
+    if !last_msg.is_empty() {
+        parts.push(format!("tip: \"{last_msg}\""));
+    }
+    if parts.is_empty() {
+        Ok("Worktree clean".to_string())
+    } else {
+        Ok(parts.join(" · "))
+    }
 }
 
 #[tauri::command(async)]
@@ -2554,6 +2573,9 @@ pub struct Guarded<T> {
 /// Thin delegate to the harness's canonical owner (`crate::harness::
 /// guard_command`), so this file keeps no second copy of render→check→refuse.
 fn guard(repo_path: &str, argv: &[&str]) -> Result<crate::harness::PolicyVerdict, String> {
+    // Every mutation passes here, and only mutations: the user clicked
+    // something, so the spawn gate must not defer it behind refresh traffic.
+    crate::engine::git_cli::mark_user_action(repo_path);
     crate::harness::guard_command(repo_path, argv)
 }
 
@@ -3412,6 +3434,77 @@ mod tests {
         assert!(!is_unborn_head_error("fatal: not a git repository"));
     }
 
+    /// Every read failing used to leave every part absent, and the summary
+    /// then said "Worktree clean" about a worktree nothing had looked at.
+    #[test]
+    fn a_worktree_summary_whose_reads_failed_is_an_error_not_clean() {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(repo.path(), &["commit", "--allow-empty", "-m", "seed"]);
+        let path = repo.path().to_str().unwrap();
+        let read = super::worktree_ai_summary(path, path, Some("main")).expect("summary");
+        assert!(read.contains("HEAD±: clean"), "{read}");
+        let failed = crate::engine::git_cli::with_forced_spawn_failure(|| {
+            super::worktree_ai_summary(path, path, Some("main"))
+        });
+        let error = failed.expect_err("no read answered, so there is no summary");
+        assert!(
+            error.contains("forced by test"),
+            "the cause is named: {error}"
+        );
+    }
+
+    /// The Work view asks for up to 32 task titles per refresh. Each title
+    /// was its own command, and each command authenticated the repository
+    /// with `git worktree list`, so one refresh started a git process per
+    /// title.
+    #[test]
+    fn many_task_scopes_authenticate_the_repository_once() {
+        let dir = crate::test_support::git_repo();
+        let repo = dir.path().canonicalize().expect("canonical repository");
+        let path = repo.to_str().expect("utf8");
+        let db = crate::tasks::store_path(path);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        for id in ["T1", "T2", "T3"] {
+            store
+                .connection()
+                .execute(
+                    &format!(
+                        "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                         VALUES ('{id}', 'title of {id}', '', '[]', 'in_progress')"
+                    ),
+                    [],
+                )
+                .unwrap();
+        }
+        let listings = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "worktree"))
+                .count()
+        };
+        let ids: Vec<String> = ["T1", "T2", "T3", "T2", "MISSING"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+
+        let before = listings();
+        let scopes = super::task_scopes(path, &ids).expect("scopes");
+        assert_eq!(listings() - before, 1, "one authentication for the set");
+        let titles: Vec<&str> = scopes.iter().map(|scope| scope.title.as_str()).collect();
+        assert_eq!(titles, ["title of T1", "title of T2", "title of T3"]);
+
+        let before = listings();
+        assert!(super::task_scopes(path, &[]).expect("empty").is_empty());
+        assert_eq!(listings(), before, "nothing asked, nothing spawned");
+
+        let too_many: Vec<String> = (0..=crate::tasks::MAX_SCOPE_IDS)
+            .map(|n| format!("T{n}"))
+            .collect();
+        let error = super::task_scopes(path, &too_many).expect_err("over the limit");
+        assert!(error.contains("the limit is 64"), "{error}");
+    }
+
     #[test]
     fn an_empty_repository_graph_is_a_notice_not_a_fault() {
         let repo = crate::test_support::git_repo();
@@ -3762,7 +3855,9 @@ pub fn cmd_check_app_update() -> crate::updates::UpdateCheck {
 
 // --- the action ledger -------------------------------------------------
 
-/// Reads durable ledger events after `cursor`, oldest first.
+/// Reads durable ledger events after `cursor`, oldest first. With `newest`,
+/// the newest `limit` of them, so a reader that keeps only recent rows takes
+/// one request rather than paging the whole history.
 ///
 /// The frontend's action list is a projection of this, not a store of its own:
 /// it holds the last cursor it saw and asks for what followed. That is what
@@ -3773,12 +3868,18 @@ pub async fn cmd_ledger_tail(
     repo_path: String,
     cursor: i64,
     limit: u32,
+    newest: Option<bool>,
 ) -> Result<Vec<crate::ledger::LedgerEvent>, String> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
             .map_err(|e| e.to_string())?;
-        crate::ledger::tail(&address.anchor, cursor, limit).map_err(|e| e.to_string())
+        let read = if newest.unwrap_or(false) {
+            crate::ledger::tail_newest
+        } else {
+            crate::ledger::tail
+        };
+        read(&address.anchor, cursor, limit).map_err(|e| e.to_string())
     })
     .await
 }
@@ -3817,19 +3918,31 @@ pub async fn cmd_task_view(repo_path: String) -> Result<crate::tasks::TaskView, 
     .await
 }
 
-/// The scope one task declares, or `null` when the store or task is absent.
+/// The scopes several tasks declare. A task the store does not hold, or a
+/// repository with no store, is simply absent from the list.
+///
+/// One call for the whole set, because finding the store authenticates the
+/// repository with a `git worktree list`: a per-task command started one git
+/// process for every task title the Work view showed, on every refresh.
 #[tauri::command(async)]
-pub async fn cmd_task_scope(
+pub async fn cmd_task_scopes(
     repo_path: String,
-    task_id: String,
-) -> Result<Option<crate::tasks::TaskScope>, String> {
-    off_thread(move || {
-        let repo = validate_repo(&repo_path)?;
-        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
-            .map_err(|e| e.to_string())?;
-        crate::tasks::scope(&address.anchor, &task_id)
-    })
-    .await
+    task_ids: Vec<String>,
+) -> Result<Vec<crate::tasks::TaskScope>, String> {
+    off_thread(move || task_scopes(&repo_path, &task_ids)).await
+}
+
+fn task_scopes(
+    repo_path: &str,
+    task_ids: &[String],
+) -> Result<Vec<crate::tasks::TaskScope>, String> {
+    let repo = validate_repo(repo_path)?;
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+        .map_err(|e| e.to_string())?;
+    crate::tasks::scopes(&address.anchor, task_ids)
 }
 
 /// Binds a worktree to a task, so every later mutation in it is judged against
@@ -5083,6 +5196,7 @@ mod assemble_tests {
             missing.to_string_lossy().into_owned(),
             0,
             100,
+            None,
         ));
         let catch_up_result =
             tauri::async_runtime::block_on(cmd_catch_up(missing.to_string_lossy().into_owned()));
@@ -5181,6 +5295,7 @@ mod assemble_tests {
             linked_path.to_string_lossy().into_owned(),
             0,
             100,
+            None,
         ))
         .expect("tail from linked worktree");
         assert_eq!(events.len(), 1, "the shared row must appear exactly once");

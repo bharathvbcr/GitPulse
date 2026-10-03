@@ -7,7 +7,7 @@
  * page has. Only the reading stats stay TypeScript; they are not rendering.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 
 export interface MarkdownHeading {
   level: number;

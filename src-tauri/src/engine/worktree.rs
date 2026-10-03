@@ -10,7 +10,6 @@
 use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -118,6 +117,11 @@ pub fn resolve_worktree_family(
 /// tree from turning one listing call into hundreds of subprocess spawns.
 const MAX_DIRTY_SCANS: usize = 32;
 
+/// Worktrees one listing scans at a time. Each scan is three to five git
+/// children; an unbounded parallel walk put all 32 scans' children in the
+/// spawn gate's queue at once, ahead of everything else the app was asking.
+const DIRTY_SCAN_FAN_OUT: usize = 4;
+
 use crate::engine::cow_clone::reflink_ignored_caches;
 use crate::engine::portless::{detect_worktree_routes, WorktreeRouteInfo};
 use crate::engine::worktree_hooks::{execute_worktree_hooks, load_worktree_hooks};
@@ -153,8 +157,8 @@ pub struct WorktreeInfo {
     pub is_main: bool,
     pub is_locked: bool,
     pub is_prunable: bool,
-    /// Working-tree change count from `git status`; `None` when not scanned
-    /// (bare entries, or past the scan cap).
+    /// Working-tree change count from `git status`; `None` when not
+    /// scanned — `scan_note` says why.
     pub dirty_files: Option<usize>,
     /// Uncommitted line insertions/deletions diff stats.
     #[serde(default)]
@@ -165,6 +169,12 @@ pub struct WorktreeInfo {
     /// Active portless or dev server routes for this worktree.
     #[serde(default)]
     pub active_routes: Vec<WorktreeRouteInfo>,
+    /// Why this entry's measurements are absent or partial: a bare entry,
+    /// one past the scan cap, a missing directory, or a read that failed or
+    /// was deferred under load. `None` when every measurement was taken, so
+    /// an absent count never reads the same as a clean one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_note: Option<String>,
 }
 
 /// One parsed block of `worktree list --porcelain`, before dirty counting.
@@ -479,17 +489,6 @@ fn status_paths(bytes: &[u8]) -> Vec<String> {
 /// Every entry comes back with `dirty_files: None`, which already means "not
 /// scanned" in this type — so a caller cannot mistake an unscanned worktree
 /// for a clean one.
-/// Lists every worktree of the repository without scanning any of them.
-///
-/// Exactly one `git` spawn, whatever the worktree count. [`list_worktrees`]
-/// additionally runs `git status` in up to [`MAX_DIRTY_SCANS`] worktrees,
-/// which is right for the Work view of ONE repository and wrong for a sweep
-/// over a whole workspace: twenty-four repositories with a dozen agent
-/// worktrees each is several hundred subprocesses for a column of counts.
-///
-/// Every entry comes back with `dirty_files: None`, which already means "not
-/// scanned" in this type — so a caller cannot mistake an unscanned worktree
-/// for a clean one.
 pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
     let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
@@ -503,6 +502,7 @@ pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String>
             diff_stat: None,
             main_divergence: None,
             active_routes: Vec::new(),
+            scan_note: None,
             path: entry.path,
             head: entry.head,
             branch: entry.branch,
@@ -593,42 +593,54 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    type ScannedMetrics = (
-        usize,
-        Option<WorktreeDiffStat>,
-        Option<WorktreeDivergence>,
-        Vec<WorktreeRouteInfo>,
-    );
-
-    let metrics: HashMap<usize, ScannedMetrics> = scan_targets
-        .into_par_iter()
-        .filter_map(|idx| {
-            let entry = &parsed[idx];
-            let dir = Path::new(&entry.path);
-            if !dir.is_dir() {
-                return None;
+    // Scoped threads in bounded waves rather than rayon's pool: a pool thread
+    // starts in the default admission class, so the scans of a listing asked
+    // for as background work were promoted to refresh traffic.
+    let class = crate::engine::git_cli::current_admission();
+    let mut metrics: HashMap<usize, WorktreeScan> = HashMap::new();
+    for wave in scan_targets.chunks(DIRTY_SCAN_FAN_OUT) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|&idx| {
+                    let entry = &parsed[idx];
+                    let repo = &repo;
+                    let handle = scope.spawn(move || {
+                        crate::engine::git_cli::with_admission(class, || scan_worktree(repo, entry))
+                    });
+                    (idx, handle)
+                })
+                .collect();
+            for (idx, handle) in handles {
+                let scan = handle.join().unwrap_or_else(|_| WorktreeScan {
+                    note: Some("the scan panicked; nothing was measured".into()),
+                    ..WorktreeScan::default()
+                });
+                metrics.insert(idx, scan);
             }
-            let stdout = git_text(dir, &["status", "--porcelain", "-z"]).ok()?;
-            let dirty = count_status_entries(stdout.as_bytes());
-            let diff_stat = measure_diff_stat(dir);
-            let divergence = measure_main_divergence(&repo, entry.branch.as_deref());
-            let routes = detect_worktree_routes(&entry.path, entry.branch.as_deref());
-            Some((idx, (dirty, diff_stat, divergence, routes)))
-        })
-        .collect();
+        });
+    }
 
     Ok(parsed
         .into_iter()
         .enumerate()
         .map(|(idx, entry)| {
-            let scanned = metrics.get(&idx);
+            let scan = metrics.remove(&idx).unwrap_or_else(|| WorktreeScan {
+                note: Some(if entry.is_bare {
+                    "bare entry: no working tree to scan".to_string()
+                } else {
+                    format!("not scanned: past the {MAX_DIRTY_SCANS}-worktree scan limit")
+                }),
+                ..WorktreeScan::default()
+            });
             WorktreeInfo {
                 name: display_name(&entry.path),
                 is_main: idx == 0,
-                dirty_files: scanned.as_ref().map(|s| s.0),
-                diff_stat: scanned.as_ref().and_then(|s| s.1.clone()),
-                main_divergence: scanned.as_ref().and_then(|s| s.2.clone()),
-                active_routes: scanned.as_ref().map(|s| s.3.clone()).unwrap_or_default(),
+                dirty_files: scan.dirty,
+                diff_stat: scan.diff_stat,
+                main_divergence: scan.divergence,
+                active_routes: scan.routes,
+                scan_note: scan.note,
                 path: entry.path,
                 head: entry.head,
                 branch: entry.branch,
@@ -639,6 +651,54 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
             }
         })
         .collect())
+}
+
+/// What one worktree's scan measured, and why anything is missing.
+#[derive(Default)]
+struct WorktreeScan {
+    dirty: Option<usize>,
+    diff_stat: Option<WorktreeDiffStat>,
+    divergence: Option<WorktreeDivergence>,
+    routes: Vec<WorktreeRouteInfo>,
+    note: Option<String>,
+}
+
+fn scan_worktree(repo: &Path, entry: &ParsedWorktree) -> WorktreeScan {
+    let dir = Path::new(&entry.path);
+    if !dir.is_dir() {
+        return WorktreeScan {
+            note: Some("the worktree directory is missing".into()),
+            ..WorktreeScan::default()
+        };
+    }
+    // The measurements below swallow their own errors as "absent"; the
+    // failure counter is what says whether one was a refusal rather than a
+    // real absence (no upstream, no main branch).
+    let failures = crate::engine::git_cli::process_failures();
+    let status = match git_text(dir, &["status", "--porcelain", "-z"]) {
+        Ok(status) => status,
+        Err(reason) => {
+            return WorktreeScan {
+                note: Some(format!("status could not be read: {reason}")),
+                ..WorktreeScan::default()
+            }
+        }
+    };
+    let mut scan = WorktreeScan {
+        dirty: Some(count_status_entries(status.as_bytes())),
+        diff_stat: measure_diff_stat(dir),
+        divergence: measure_main_divergence(repo, entry.branch.as_deref()),
+        routes: detect_worktree_routes(&entry.path, entry.branch.as_deref()),
+        note: None,
+    };
+    if crate::engine::git_cli::process_failures() != failures {
+        scan.note = Some(format!(
+            "some measurements were not taken: {}",
+            crate::engine::git_cli::last_process_failure()
+                .unwrap_or_else(|| "a git read produced no answer".into())
+        ));
+    }
+    scan
 }
 
 use std::collections::HashMap;
@@ -1240,6 +1300,141 @@ some-future-field whatever
     fn test_list_worktrees_rejects_non_repo() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(list_worktrees(dir.path().to_str().unwrap()).is_err());
+    }
+
+    /// A main checkout with `linked` worktrees under one parent directory.
+    fn repo_with_worktrees(linked: usize) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>) {
+        let main = tempfile::TempDir::new().unwrap();
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").unwrap();
+        git_in(main.path(), &["add", "."]);
+        git_in(main.path(), &["commit", "-m", "init"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        let paths = (0..linked)
+            .map(|i| {
+                let path = parent.path().join(format!("wt-{i:02}"));
+                let branch = format!("agent/{i:02}");
+                git_in(
+                    main.path(),
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        &branch,
+                        path.to_str().unwrap(),
+                    ],
+                );
+                crate::test_support::trust_repo(&path);
+                path.canonicalize().unwrap()
+            })
+            .collect();
+        (main, parent, paths)
+    }
+
+    /// Every absent count says why, and a scanned one says nothing.
+    #[test]
+    fn every_unmeasured_worktree_names_its_reason() {
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        // One directory gone, one whose `.git` link points nowhere.
+        std::fs::remove_dir_all(&linked[1]).unwrap();
+        std::fs::write(linked[2].join(".git"), "gitdir: /nonexistent/worktree\n").unwrap();
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list");
+        assert_eq!(listed.len(), 4);
+        let named = |name: &str| listed.iter().find(|w| w.name == name).expect(name);
+        assert_eq!(listed[0].dirty_files, Some(0));
+        assert_eq!(listed[0].scan_note, None, "a full scan carries no note");
+        assert_eq!(named("wt-00").dirty_files, Some(0));
+        assert_eq!(named("wt-00").scan_note, None);
+        assert_eq!(named("wt-01").dirty_files, None);
+        assert_eq!(
+            named("wt-01").scan_note.as_deref(),
+            Some("the worktree directory is missing")
+        );
+        assert_eq!(named("wt-02").dirty_files, None);
+        let note = named("wt-02").scan_note.as_deref().unwrap_or_default();
+        assert!(note.starts_with("status could not be read: "), "{note}");
+        // On the wire an absent note is absent, so older readers see no change.
+        let wire = serde_json::to_value(&listed[0]).unwrap();
+        assert!(wire.get("scan_note").is_none(), "{wire}");
+    }
+
+    /// A status that answered with a diff stat that did not: the count is
+    /// kept, and the note says what is missing instead of the stat silently
+    /// reading as absent.
+    #[test]
+    fn a_partly_refused_scan_keeps_what_it_measured_and_names_the_rest() {
+        let (main, _parent, _linked) = repo_with_worktrees(0);
+        let entry = ParsedWorktree {
+            path: main.path().to_str().unwrap().to_string(),
+            branch: Some("main".into()),
+            ..ParsedWorktree::default()
+        };
+        let repo = main.path().canonicalize().unwrap();
+        let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
+            scan_worktree(&repo, &entry)
+        });
+        assert_eq!(scan.dirty, Some(0));
+        assert_eq!(scan.diff_stat, None);
+        let note = scan.note.unwrap_or_default();
+        assert!(note.starts_with("some measurements were not taken: "), "{note}");
+        assert!(note.contains("forced by test"), "{note}");
+        let whole = scan_worktree(&repo, &entry);
+        assert_eq!(whole.note, None);
+        assert!(whole.diff_stat.is_some());
+    }
+
+    #[test]
+    fn a_worktree_past_the_scan_limit_says_so() {
+        let (main, _parent, _linked) = repo_with_worktrees(MAX_DIRTY_SCANS);
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list");
+        assert_eq!(listed.len(), MAX_DIRTY_SCANS + 1);
+        let measured = listed.iter().filter(|w| w.dirty_files.is_some()).count();
+        assert_eq!(measured, MAX_DIRTY_SCANS);
+        let last = listed.last().unwrap();
+        assert_eq!(last.dirty_files, None);
+        assert_eq!(
+            last.scan_note.as_deref(),
+            Some("not scanned: past the 32-worktree scan limit")
+        );
+    }
+
+    /// The scans run in the class the listing was asked for. Under rayon they
+    /// ran on pool threads, which start `Reactive`, so a listing asked for as
+    /// background work competed as refresh traffic.
+    #[test]
+    fn worktree_scans_keep_the_callers_admission_class() {
+        use crate::engine::git_cli::{spawn_log, with_admission, Admission};
+        let (main, _parent, linked) = repo_with_worktrees(6);
+        let listed = with_admission(Admission::Background, || {
+            list_worktrees(main.path().to_str().unwrap()).expect("list")
+        });
+        // The directories exactly as the listing spelled them, which is what
+        // each scan's children ran in, plus their canonical form.
+        let mut dirs: Vec<PathBuf> = listed
+            .iter()
+            .skip(1)
+            .map(|w| PathBuf::from(&w.path))
+            .collect();
+        dirs.extend(linked.iter().cloned());
+        dirs.sort();
+        dirs.dedup();
+        let mut checked = 0;
+        for dir in &dirs {
+            for (argv, class) in spawn_log::classed_spawns_in(dir) {
+                assert_eq!(
+                    class,
+                    Admission::Background,
+                    "{argv:?} in {}",
+                    dir.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= linked.len() * 2,
+            "only {checked} scan spawns recorded"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! unbind is recorded rather than deleting the bind, for the same reason: the
 //! work that happened while the binding held really did happen under it.
 
-use super::{append, tail, ActorKind, Draft, LedgerError, Outcome};
+use super::{append, ActorKind, Draft, LedgerError, Outcome};
 
 /// The action name a binding event carries.
 pub const BIND: &str = "worktree.bind";
@@ -192,10 +192,10 @@ pub fn unbind(repo_path: &str, worktree_path: &str) -> Result<i64, LedgerError> 
 
 /// The task `worktree_path` is bound to, if any.
 ///
-/// Scans the ledger for the newest bind/unbind naming this path. Pages are
-/// bounded, while precedence uses the timestamp/ULID pair that survives a
-/// legacy sibling-ledger import; the anchor's newly assigned integer cursor
-/// cannot establish cross-database event order.
+/// Finds the newest bind/unbind naming this path with one indexed query.
+/// Precedence uses the timestamp/ULID pair that survives a legacy
+/// sibling-ledger import; the anchor's newly assigned integer cursor cannot
+/// establish cross-database event order.
 pub fn resolve(repo_path: &str, worktree_path: &str) -> Result<Option<String>, LedgerError> {
     Ok(resolve_binding(repo_path, worktree_path)?.map(|binding| binding.task_id))
 }
@@ -222,47 +222,14 @@ pub(crate) fn resolve_binding(
         return Ok(None);
     }
     let stored_worktree = super::redact::text(&address.worktree);
-    let mut cursor = 0i64;
     // Imported rows receive new integer cursors in the anchor database. ULIDs
     // retain their original timestamp and are the ledger's cross-database sort
-    // key, so binding precedence must use them rather than import order.
-    let mut current: Option<((String, String), Option<String>)> = None;
-    loop {
-        let page = tail(&address.anchor, cursor, 1000)?;
-        if page.is_empty() {
-            break;
-        }
-        for event in &page {
-            if !matches!(
-                event.worktree_path.as_deref(),
-                Some(path) if path == address.worktree || path == stored_worktree
-            ) {
-                continue;
-            }
-            let task_id = match event.action.as_str() {
-                BIND => event.task_id.clone(),
-                UNBIND => None,
-                _ => continue,
-            };
-            let key = (event.ts_utc.clone(), event.ulid.clone());
-            if current
-                .as_ref()
-                .is_none_or(|(current_key, _)| key > *current_key)
-            {
-                current = Some((key, task_id));
-            }
-        }
-        cursor = page[page.len() - 1].id;
-        if page.len() < 1000 {
-            break;
-        }
-    }
-    Ok(current.and_then(|(_, task_id)| {
-        task_id.map(|task_id| ResolvedBinding {
-            task_id,
-            anchor: address.anchor,
-            worktree: address.worktree,
-        })
+    // key, so binding precedence uses them rather than import order.
+    let newest = super::latest_binding(&address.anchor, &address.worktree, &stored_worktree)?;
+    Ok(newest.flatten().map(|task_id| ResolvedBinding {
+        task_id,
+        anchor: address.anchor,
+        worktree: address.worktree,
     }))
 }
 
@@ -270,6 +237,7 @@ pub(crate) fn resolve_binding(
 mod tests {
     use super::*;
 
+    use crate::ledger::tail;
     use crate::test_support::git_in;
 
     fn git_repo() -> tempfile::TempDir {
@@ -431,6 +399,78 @@ mod tests {
         bind(&repo, &repo, "TASK-1").unwrap();
         super::super::tests_support::reset_registry();
         assert_eq!(resolve(&repo, &repo).unwrap(), Some("TASK-1".into()));
+    }
+
+    /// Resolution runs on every gated mutation and once per worktree per Work
+    /// refresh. It paged the whole ledger, 1000 rows per query, holding the
+    /// app-wide ledger lock for each page; it is one query now.
+    #[test]
+    fn a_binding_lookup_is_one_ledger_query_however_long_the_history() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        for i in 0..2500 {
+            append(Draft {
+                repo_path: repo.clone(),
+                action: format!("git.commit{i}"),
+                actor_kind: Some(ActorKind::Human),
+                outcome: Some(Outcome::Ok),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let reads = || super::super::tests::LEDGER_READS.with(std::cell::Cell::get);
+        let before = reads();
+        assert_eq!(resolve(&repo, &repo).unwrap(), Some("TASK-1".into()));
+        assert_eq!(reads() - before, 1, "one query, not one per 1000 rows");
+    }
+
+    /// The query must stay on its partial index: without it, every lookup is
+    /// a scan of the whole events table under the ledger lock.
+    #[test]
+    fn the_binding_query_uses_its_index() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        let plan = super::super::with_conn(&repo, |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT action, task_id FROM events
+                     WHERE action IN ('worktree.bind', 'worktree.unbind')
+                       AND worktree_path IN (?1, ?2)
+                     ORDER BY ts_utc DESC, ulid DESC
+                     LIMIT 1",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params!["a", "b"], |row| row.get::<_, String>(3))
+                .unwrap();
+            Ok(rows.map(Result::unwrap).collect::<Vec<_>>().join(" | "))
+        })
+        .unwrap();
+        assert!(plan.contains("idx_events_binding"), "{plan}");
+        assert_eq!(
+            (BIND, UNBIND),
+            ("worktree.bind", "worktree.unbind"),
+            "the query and the index spell these as literals"
+        );
+    }
+
+    /// A row naming another repository refused every binding read when the
+    /// lookup paged through `tail`; the single query keeps that refusal.
+    #[test]
+    fn a_foreign_row_still_refuses_binding_resolution() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        super::super::with_conn(&repo, |conn| {
+            conn.execute(
+                "UPDATE events SET repo_path = '/somewhere/else' WHERE id = (SELECT MIN(id) FROM events)",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let error = resolve(&repo, &repo).expect_err("a foreign row refuses the read");
+        assert_eq!(error.code, "repository_mismatch");
     }
 
     #[test]

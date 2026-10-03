@@ -5,7 +5,7 @@
   import { repoStore } from "../../stores/repoStore";
   import { densityStore } from "../../stores/densityStore";
   import { CODE_ZOOM_MAX, CODE_ZOOM_MIN, rowHeight, scaledRowHeight } from "../../ui/density";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../../ipc/invoke";
   import {
     detectLanguageFromPath,
     tokenizeLineWithCarry,

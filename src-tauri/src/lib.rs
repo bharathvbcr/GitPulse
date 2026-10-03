@@ -344,7 +344,7 @@ pub fn run() {
             cmd_ledger_tail,
             cmd_ledger_status,
             cmd_task_view,
-            cmd_task_scope,
+            cmd_task_scopes,
             cmd_bind_worktree_task,
             cmd_unbind_worktree_task,
             cmd_worktree_task,

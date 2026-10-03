@@ -31,7 +31,8 @@ export function createPacedQueue(options: {
     !Number.isInteger(capacity) || capacity < 1) {
     throw new RangeError("Invalid background queue limits");
   }
-  const pending = new Map<string, { first: number; due: number }>();
+  /** `hold` is a retry's earliest start; later enqueues may not pull it in. */
+  const pending = new Map<string, { first: number; due: number; hold: number }>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let running: string | null = null;
   let generation = 0;
@@ -62,12 +63,27 @@ export function createPacedQueue(options: {
     timer = setTimeout(() => {
       timer = null;
       const now = performance.now();
-      for (const [key, { due }] of pending) {
-        if (due <= now && eligible(key)) {
-          pending.delete(key);
-          void run(key);
-          return;
+      const ready = (key: string) => {
+        const entry = pending.get(key);
+        return entry !== undefined && entry.due <= now && eligible(key);
+      };
+      // The focused repository goes first. Insertion order alone put it
+      // behind every tab restored before it, so at launch the one map the user
+      // is looking at waited on all the others.
+      const activeKey = scope?.visible ? scope.activeKey : null;
+      let next = activeKey !== null && ready(activeKey) ? activeKey : null;
+      if (next === null) {
+        for (const key of pending.keys()) {
+          if (ready(key)) {
+            next = key;
+            break;
+          }
         }
+      }
+      if (next !== null) {
+        pending.delete(next);
+        void run(next);
+        return;
       }
       schedule();
     }, Math.max(0, Math.ceil(Math.max(earliest, nextStart) - performance.now())));
@@ -89,8 +105,15 @@ export function createPacedQueue(options: {
   }
 
   return {
-    enqueue(key: string): boolean {
+    /**
+     * `delayMs` holds the key back at least that long, past the debounce and
+     * `maxWaitMs`: a retry after the backend declined under load. An enqueue
+     * while that retry is pending joins it rather than pulling it forward.
+     */
+    enqueue(key: string, retry?: { delayMs?: number }): boolean {
       if (!key || (scope !== null && !scope.retainedKeys.has(key))) return false;
+      const delayMs = retry?.delayMs ?? 0;
+      if (!Number.isFinite(delayMs) || delayMs < 0) throw new RangeError("Invalid background queue delay");
       const existing = pending.get(key);
       if (!existing && pending.size >= capacity) {
         if (!overflowReported) {
@@ -101,7 +124,8 @@ export function createPacedQueue(options: {
       }
       const now = performance.now();
       const first = existing?.first ?? now;
-      pending.set(key, { first, due: Math.min(now + debounceMs, first + maxWaitMs) });
+      const hold = Math.max(existing?.hold ?? 0, now + delayMs);
+      pending.set(key, { first, hold, due: Math.max(Math.min(now + debounceMs, first + maxWaitMs), hold) });
       schedule();
       return true;
     },

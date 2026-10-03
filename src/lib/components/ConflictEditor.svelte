@@ -115,7 +115,7 @@
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord } from "../ui/platformCopy";
   import { tick, untrack } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { Check, GitMerge, AlertTriangle, ChevronUp, ChevronDown, FileCode2, Search, RotateCcw, Loader2 } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";

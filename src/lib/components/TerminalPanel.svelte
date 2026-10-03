@@ -11,7 +11,7 @@
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import {
     Terminal,
     Play,

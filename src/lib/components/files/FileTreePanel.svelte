@@ -3,7 +3,7 @@
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
   import { repoStore, type FileStatus } from "../../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../../ipc/invoke";
   import {
     ChevronDown,
     ChevronRight,

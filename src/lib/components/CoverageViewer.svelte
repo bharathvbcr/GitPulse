@@ -23,7 +23,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import {
     Percent,
     RefreshCw,

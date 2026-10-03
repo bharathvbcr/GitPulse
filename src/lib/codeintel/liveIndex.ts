@@ -14,7 +14,8 @@
  * status+build loop after a finished run.
  */
 
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
+import { deferredRetryDelayMs, MAX_DEFERRED_RETRIES } from "../async/deferral";
 import { createPacedQueue, type BackgroundScope } from "../async/pacedQueue";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { maybeRefreshDevmap } from "./client";
@@ -105,10 +106,14 @@ export function createLiveIndex(opts?: {
   const snapshots = writable<Record<string, LiveIndexSnapshot>>({});
   const retained = new Set<string>();
   const busyRetries = new Map<string, number>();
+  /** Consecutive answers the backend declined to run under load, per repo. */
+  const deferrals = new Map<string, number>();
   /** Keys whose pending/running attempt came from a watcher tick. */
   const dirty = new Set<string>();
   /** Retained keys already offered a status-only heal. Re-open after close. */
   const offered = new Set<string>();
+  /** Focused key at the last `setScope`, so a re-apply is not a focus change. */
+  let lastFocused: string | null = null;
   let revision = 0;
   const queue = createPacedQueue({
     debounceMs,
@@ -119,7 +124,7 @@ export function createLiveIndex(opts?: {
     runWhen: "retained",
     run,
     onError: (repoPath, error) => {
-      busyRetries.delete(repoPath);
+      forgetRetries(repoPath);
       patch(repoPath, {
         phase: "failed", decision: null,
         reason: error instanceof Error ? error.message : String(error),
@@ -128,6 +133,16 @@ export function createLiveIndex(opts?: {
     },
     onOverflow: () => diagnostics.warn("code-index", "Background index queue is full (64 repositories); additional repositories were not refreshed."),
   });
+
+  /**
+   * Both retry budgets end together, and only when an attempt settles. Neither
+   * a busy answer nor a deferral resets the other's count, so alternating
+   * between them cannot retry forever.
+   */
+  function forgetRetries(repoPath: string) {
+    busyRetries.delete(repoPath);
+    deferrals.delete(repoPath);
+  }
 
   function patch(repoPath: string, next: Partial<LiveIndexSnapshot>) {
     snapshots.update((map) => {
@@ -141,12 +156,40 @@ export function createLiveIndex(opts?: {
     const repoChanged = dirty.has(repoPath);
     const outcome = await maybeRefresh(repoPath, repoChanged);
     if (!isCurrent()) return;
+    if (outcome.decision === "skip_deferred") {
+      // The backend's spawn gate declined to start the probe under load —
+      // nothing was examined. Settling it as "skipped" is what left every tab
+      // restored at launch unhealed for the session, so ask again, later.
+      // `dirty` is kept: the retry still owes the watcher its rebuild.
+      const attempt = (deferrals.get(repoPath) ?? 0) + 1;
+      const delayMs = deferredRetryDelayMs(attempt);
+      const retrying = attempt <= MAX_DEFERRED_RETRIES && queue.enqueue(repoPath, { delayMs });
+      if (retrying) deferrals.set(repoPath, attempt);
+      else {
+        // Bounded: a watcher tick or focusing the tab is a new request.
+        // `offered` is left alone, so re-applying the same scope cannot
+        // restart the chain (see `setScope`).
+        forgetRetries(repoPath);
+        dirty.delete(repoPath);
+      }
+      patch(repoPath, {
+        phase: retrying ? "scheduled" : "failed",
+        decision: outcome.decision,
+        reason: retrying
+          ? `Index check deferred while the app is busy; retrying in ${Math.round(delayMs / 1_000)} s.`
+          : outcome.reason ?? "Index check stayed deferred under load. Refresh the map again.",
+        refreshing: false,
+        updatedAt: Date.now(),
+        stage: null,
+      });
+      return;
+    }
     if (outcome.decision === "skip_building") {
       const retries = busyRetries.get(repoPath) ?? 0;
       const retrying = retries < LIVE_INDEX_BUSY_RETRIES && queue.enqueue(repoPath);
       if (retrying) busyRetries.set(repoPath, retries + 1);
       else {
-        busyRetries.delete(repoPath);
+        forgetRetries(repoPath);
         dirty.delete(repoPath);
       }
       patch(repoPath, {
@@ -164,7 +207,7 @@ export function createLiveIndex(opts?: {
       // Watcher echo backoff: keep the strip on "scheduled" so a storm does
       // not look like a hard failure. The next repo-changed tick re-enters
       // maybe_refresh; do not busy-spin like skip_building.
-      busyRetries.delete(repoPath);
+      forgetRetries(repoPath);
       dirty.delete(repoPath);
       patch(repoPath, {
         phase: "scheduled",
@@ -176,7 +219,7 @@ export function createLiveIndex(opts?: {
       });
       return;
     }
-    busyRetries.delete(repoPath);
+    forgetRetries(repoPath);
     dirty.delete(repoPath);
     const failed =
       outcome.decision === "refresh" && outcome.build?.ok !== true;
@@ -210,6 +253,16 @@ export function createLiveIndex(opts?: {
       for (const key of [...offered]) {
         if (!open.has(key)) offered.delete(key);
       }
+      // Focusing a tab whose heal ran out of deferral retries is a new
+      // request, so it is offered again. An identical apply is not: only a
+      // focus *change* re-offers, or a busy app would restart the chain on
+      // every apply.
+      const focused = scope.visible ? scope.activeKey : null;
+      if (focused && focused !== lastFocused) {
+        const prev = get(snapshots)[focused];
+        if (prev?.phase === "failed" && prev.decision === "skip_deferred") offered.delete(focused);
+      }
+      lastFocused = focused;
       snapshots.update((map) => {
         const closed = Object.keys(map).filter((key) => !open.has(key));
         if (!closed.length) return map;
@@ -217,7 +270,7 @@ export function createLiveIndex(opts?: {
         for (const key of closed) {
           delete next[key];
           retained.delete(key);
-          busyRetries.delete(key);
+          forgetRetries(key);
           dirty.delete(key);
         }
         return next;
@@ -253,7 +306,7 @@ export function createLiveIndex(opts?: {
         if (retained.size <= 65) break;
         if (queue.has(key)) continue;
         retained.delete(key);
-        busyRetries.delete(key);
+        forgetRetries(key);
         dirty.delete(key);
         snapshots.update((map) => {
           const next = { ...map };
@@ -289,8 +342,10 @@ export function createLiveIndex(opts?: {
       queue.reset();
       retained.clear();
       busyRetries.clear();
+      deferrals.clear();
       dirty.clear();
       offered.clear();
+      lastFocused = null;
       snapshots.set({});
     },
   };

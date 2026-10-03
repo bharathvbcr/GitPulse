@@ -37,7 +37,7 @@
  * visibly does nothing is worse than a duplicated scan.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import type { CoverageReport } from "../coverage/types";
 import type { LanguageStatsReport } from "../language/barStats";
 import type { StorageReport } from "../storage/types";

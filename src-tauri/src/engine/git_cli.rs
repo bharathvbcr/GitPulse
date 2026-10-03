@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -23,6 +24,8 @@ mod pipe_drain;
 
 #[cfg(any(not(unix), test))]
 mod thread_io;
+
+mod shared_budget;
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -1240,6 +1243,44 @@ pub fn run_captured(
 /// additionally pins the whole behavior end to end.
 const TIMEOUT_MARKER: &str = " timed out after ";
 
+/// The phrase a [`Refusal::Refused`] or [`Refusal::Shed`] error carries, and
+/// the only thing [`is_deferred_under_load`] matches. A deferral is the app
+/// declining to start more work under load, not git failing: it must never
+/// carry [`TIMEOUT_MARKER`], or every reader of the error calls it a hang.
+const DEFERRED_MARKER: &str = " deferred under load after ";
+
+/// True when `err` is the gate declining to start a child under load. The
+/// command may succeed if asked again once load falls; it did not run.
+pub(crate) fn is_deferred_under_load(err: &str) -> bool {
+    err.contains(DEFERRED_MARKER)
+}
+
+/// True when `err` is a child that never got a concurrency slot inside its
+/// own deadline — as opposed to one that started and then ran out of time.
+pub(crate) fn is_slot_wait_timeout(err: &str) -> bool {
+    err.contains(TIMEOUT_MARKER) && err.contains(SLOT_WAIT_SUFFIX)
+}
+
+const SLOT_WAIT_SUFFIX: &str = "s waiting for a process slot";
+
+pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
+    match refusal {
+        Refusal::Cancelled => format!("{label} cancelled before spawn"),
+        Refusal::TimedOut { deadline } => format!(
+            "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
+            deadline.as_secs_f64()
+        ),
+        Refusal::Refused { waited } => format!(
+            "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner",
+            waited.as_secs_f64()
+        ),
+        Refusal::Shed => format!(
+            "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
+             budget is low"
+        ),
+    }
+}
+
 /// First sleep between `try_wait` polls, and the ceiling it grows to.
 ///
 /// A fixed 15 ms sleep quantized EVERY git invocation upward by up to a full
@@ -1344,7 +1385,7 @@ impl Incomplete {
 }
 
 /// What [`run_bounded`] observed, before a caller shapes its own errors.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BoundedRun {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -1435,21 +1476,286 @@ fn observe_output(
 const SPAWN_LIMIT_FLOOR: usize = 4;
 const SPAWN_LIMIT_CEILING: usize = 16;
 
-thread_local! {
-    static BACKGROUND_PROCESSES: Cell<bool> = const { Cell::new(false) };
+/// Who is asking for a child, which decides what the gate may refuse it.
+///
+/// The measured storm on 2026-10-02 was a watcher-triggered refresh, and at
+/// launch the rate cap that stopped it also refused the user's own actions,
+/// because the gate could not tell the two apart. The class is the answer to
+/// "what may be refused": a refresh can be deferred, a click must not be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Admission {
+    /// A user action: a mutation behind the command guard. Concurrency-limited
+    /// only. It never waits for, and never spends, a rate token, so no amount
+    /// of refresh traffic can refuse the action that caused it.
+    Interactive,
+    /// The default for every command and thread: the reads a `repo-changed`
+    /// event, a poll or a tab switch asks for. Concurrency- and rate-limited,
+    /// and identical queued reads share one child (see [`run_read_shared`]).
+    Reactive,
+    /// Indexing, docs and live-index work. At most a quarter of the slots, and
+    /// shed — refused without waiting — while the rate budget is at or below
+    /// the reserve kept for reactive reads.
+    Background,
 }
 
-/// Applies only inside a synchronous blocking operation. Restore the worker's
-/// previous priority on normal return, errors and unwinding before pool reuse.
-pub(crate) fn with_background_processes<T>(body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            BACKGROUND_PROCESSES.set(self.0);
+impl Admission {
+    const ALL: [Admission; 3] = [Self::Interactive, Self::Reactive, Self::Background];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Interactive => 0,
+            Self::Reactive => 1,
+            Self::Background => 2,
         }
     }
-    let _restore = Restore(BACKGROUND_PROCESSES.replace(true));
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Reactive => "reactive",
+            Self::Background => "background",
+        }
+    }
+}
+
+/// Whether every thread of this process starts in [`Admission::Background`].
+///
+/// The app leaves it unset. `gitpulse-mcp` and `gitpulsed` set it once, first
+/// thing in `main`: their whole job is optional work on behalf of an agent or
+/// a schedule, so under load it should be shed before the app the user is
+/// looking at is deferred. A process-wide default rather than a scope, because
+/// a scope ends at a thread hop — a request worker, or rayon's pool behind a
+/// `par_iter` — and every hop would otherwise be promoted to `Reactive`.
+static PROCESS_BACKGROUND: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes [`Admission::Background`] the class every thread of this process
+/// starts in. Call before any thread is started; a thread that has already
+/// asked keeps the class it was given.
+pub fn run_process_as_background() {
+    PROCESS_BACKGROUND.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The class a thread starts in: see [`run_process_as_background`].
+fn thread_default_admission() -> Admission {
+    if PROCESS_BACKGROUND.load(std::sync::atomic::Ordering::Relaxed) {
+        Admission::Background
+    } else {
+        Admission::Reactive
+    }
+}
+
+thread_local! {
+    static ADMISSION: Cell<Admission> = Cell::new(thread_default_admission());
+    /// The repository the guarded mutation running on this thread named, so
+    /// the refresh that follows it can be credited (see [`run_command_scope`]).
+    static MARKED_REPO: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The class the current thread's spawns are admitted under. A new thread
+/// starts in [`thread_default_admission`]; a body that hops threads carries
+/// this value across with [`with_admission`].
+pub(crate) fn current_admission() -> Admission {
+    ADMISSION.get()
+}
+
+/// [`current_admission`] by name, for diagnostics and the process-default
+/// contract test, which runs in a process of its own.
+pub fn current_admission_name() -> &'static str {
+    current_admission().name()
+}
+
+/// Runs `body` under `class`, restoring the previous class on return, error
+/// and unwinding, so a pooled worker never keeps a class into its next task.
+pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T {
+    struct Restore(Admission);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ADMISSION.set(self.0);
+        }
+    }
+    let _restore = Restore(ADMISSION.replace(class));
     body()
+}
+
+/// Applies only inside a synchronous blocking operation.
+pub(crate) fn with_background_processes<T>(body: impl FnOnce() -> T) -> T {
+    with_admission(Admission::Background, body)
+}
+
+/// Marks the rest of the enclosing [`with_admission`] scope as a user action.
+/// The command guard calls this once per mutation, and the command runner
+/// scopes every command body, so the mark ends with the command that set it.
+pub(crate) fn mark_interactive() {
+    ADMISSION.set(Admission::Interactive);
+}
+
+/// [`mark_interactive`] for a mutation on `repo_path`, which also names the
+/// repository whose follow-up refresh [`run_command_scope`] credits.
+pub(crate) fn mark_user_action(repo_path: &str) {
+    mark_interactive();
+    let repo = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
+    MARKED_REPO.with(|slot| *slot.borrow_mut() = Some(repo));
+}
+
+/// Runs one IPC command body.
+///
+/// Every command starts `Reactive`, and the guard promotes the rest of a
+/// mutation's body to a user action. When the body ends, the promotion ends
+/// with it — the pool thread never carries it into its next task — and two
+/// things follow from a body that was a user action:
+///
+/// * Its error never carries the deferral marker out ([`not_retryable`]). The
+///   frontend retries a deferred call on the strength of "nothing ran"; a
+///   call that reached the mutation guard may already have changed things,
+///   for instance when a thread it hopped to was deferred mid-action.
+/// * The repository it named gets a short post-action credit: the refresh the
+///   frontend asks for next is admitted like the action that caused it,
+///   rather than deferred behind the refresh traffic the action itself set
+///   off. See [`POST_ACTION_CREDIT_SPAWNS`].
+pub(crate) fn run_command_scope<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    struct Scope {
+        previous: Admission,
+        previous_repo: Option<PathBuf>,
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ADMISSION.set(self.previous);
+            let previous = self.previous_repo.take();
+            MARKED_REPO.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _scope = Scope {
+        previous: ADMISSION.replace(Admission::Reactive),
+        previous_repo: MARKED_REPO.with(|slot| slot.borrow_mut().take()),
+    };
+    let result = body();
+    if current_admission() != Admission::Interactive {
+        return result;
+    }
+    if let Some(repo) = MARKED_REPO.with(|slot| slot.borrow_mut().take()) {
+        grant_post_action_credit(&repo, Instant::now());
+    }
+    result.map_err(not_retryable)
+}
+
+/// Rewrites a deferral so it no longer reads as one. The cause stays in the
+/// sentence; only the marker that means "nothing ran, ask again" goes.
+fn not_retryable(message: String) -> String {
+    if !is_deferred_under_load(&message) {
+        return message;
+    }
+    message.replacen(
+        DEFERRED_MARKER,
+        " was deferred under load (the action had already started, so it was not retried) after ",
+        1,
+    )
+}
+
+/// Spawns in the acted-on repository that a user action's follow-up refresh
+/// may make without a rate token, and for how long. Sized for one full
+/// snapshot (status, branches, tags, stash, operation probe, numstat, default
+/// branch probes) with headroom, and short enough that a watcher storm that
+/// starts after the action is back under the rate limit within seconds.
+/// Inferred from the hydrate read set, not measured per repository.
+const POST_ACTION_CREDIT_SPAWNS: u32 = 32;
+const POST_ACTION_CREDIT_WINDOW: Duration = Duration::from_secs(3);
+/// Repositories holding a live credit at once. A user acts on one repository
+/// at a time; the bound only stops a scripted burst growing the map.
+const POST_ACTION_CREDIT_REPOS: usize = 64;
+
+struct PostActionCredit {
+    remaining: u32,
+    until: Instant,
+}
+
+fn post_action_credits() -> &'static Mutex<HashMap<PathBuf, PostActionCredit>> {
+    static CREDITS: OnceLock<Mutex<HashMap<PathBuf, PostActionCredit>>> = OnceLock::new();
+    CREDITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn grant_post_action_credit(repo: &Path, now: Instant) {
+    let mut credits = post_action_credits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    credits.retain(|_, credit| credit.until > now);
+    if credits.len() >= POST_ACTION_CREDIT_REPOS && !credits.contains_key(repo) {
+        if let Some(oldest) = credits
+            .iter()
+            .min_by_key(|(_, credit)| credit.until)
+            .map(|(path, _)| path.clone())
+        {
+            credits.remove(&oldest);
+        }
+    }
+    credits.insert(
+        repo.to_path_buf(),
+        PostActionCredit {
+            remaining: POST_ACTION_CREDIT_SPAWNS,
+            until: now + POST_ACTION_CREDIT_WINDOW,
+        },
+    );
+}
+
+/// Spends one credit for a spawn whose working directory is `cwd`.
+fn take_post_action_credit(cwd: &Path, now: Instant) -> bool {
+    let mut credits = post_action_credits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(credit) = credits.get_mut(cwd) else {
+        return false;
+    };
+    if credit.until <= now || credit.remaining == 0 {
+        credits.remove(cwd);
+        return false;
+    }
+    credit.remaining -= 1;
+    true
+}
+
+/// Why the gate started nothing. Each cause is its own variant because each
+/// means something different to the person reading it: a deferral is the
+/// app protecting itself and says how long it tried; a timeout is a slot that
+/// never came free inside the command's own deadline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Refusal {
+    /// A reactive spawn waited [`SPAWN_QUEUE_BUDGET`] for a rate token.
+    Refused {
+        waited: Duration,
+    },
+    /// Background work refused without waiting: the rate budget was at or
+    /// below the reserve kept for reactive reads.
+    Shed,
+    /// No concurrency slot became free before the command's own deadline.
+    TimedOut {
+        deadline: Duration,
+    },
+    Cancelled,
+}
+
+/// What the gate did, per class, since launch. Exported with diagnostics so
+/// "user actions failed" can be told apart from "refreshes were deferred".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdmissionCounters {
+    pub admitted: u64,
+    /// Joined an identical queued read instead of starting a child.
+    pub coalesced: u64,
+    pub refused: u64,
+    pub shed: u64,
+    pub timed_out: u64,
+    pub cancelled: u64,
+}
+
+impl AdmissionCounters {
+    fn count(&mut self, refusal: Refusal) {
+        match refusal {
+            Refusal::Refused { .. } => self.refused += 1,
+            Refusal::Shed => self.shed += 1,
+            Refusal::TimedOut { .. } => self.timed_out += 1,
+            Refusal::Cancelled => self.cancelled += 1,
+        }
+    }
 }
 
 /// A counting semaphore over live child processes.
@@ -1464,6 +1770,12 @@ struct SpawnGate {
     /// [`production_spawn_rate`].
     burst: u32,
     refill_per_sec: u32,
+    /// The budget every GitPulse process of this user also draws from, when
+    /// it could be opened (see [`shared_budget`]). `None` for test gates,
+    /// and for a production gate whose record was unusable — `shared_note`
+    /// then says why, so a per-process budget is never reported as shared.
+    shared: Option<shared_budget::SharedBudget>,
+    shared_note: Option<String>,
     state: Mutex<GateState>,
     released: Condvar,
 }
@@ -1473,6 +1785,10 @@ struct GateState {
     in_flight: usize,
     background: usize,
     waiting_background: usize,
+    /// Interactive callers waiting for a slot. While any wait, the next free
+    /// slot is theirs: a user action never queues behind a refresh.
+    waiting_interactive: usize,
+    counters: [AdmissionCounters; 3],
     /// High-water mark, kept so a test can assert the ceiling actually held
     /// rather than assert on the counter it is trying to prove bounded.
     peak: usize,
@@ -1481,6 +1797,9 @@ struct GateState {
     /// rounding. The mutex makes the decrement atomic with the check.
     tokens: u32,
     tokens_at: Option<Instant>,
+    /// Decisions that could not consult the shared budget and fell back to
+    /// this process's own (a lock held past its patience, an I/O error).
+    shared_fallbacks: u64,
 }
 
 impl SpawnGate {
@@ -1502,11 +1821,74 @@ impl SpawnGate {
             limit: limit.max(1),
             burst,
             refill_per_sec,
+            shared: None,
+            shared_note: None,
             state: Mutex::new(GateState {
                 tokens: if unlimited { 0 } else { burst },
                 ..GateState::default()
             }),
             released: Condvar::new(),
+        }
+    }
+
+    /// Also draws every rate token from the record at `path`, shared with
+    /// every other process that opens it. An unusable record leaves the gate
+    /// on its own bucket and keeps the reason, so the report says so.
+    fn sharing(mut self, path: Result<PathBuf, String>) -> Self {
+        if self.refill_per_sec == u32::MAX {
+            self.shared_note = Some("unlimited gate: no rate budget to share".into());
+            return self;
+        }
+        match path.and_then(|path| shared_budget::SharedBudget::open(&path)) {
+            Ok(shared) => {
+                self.shared_note = None;
+                self.shared = Some(shared);
+            }
+            Err(reason) => {
+                log::warn!(
+                    target: "spawn_gate",
+                    "spawn rate budget is per-process only: {reason}"
+                );
+                self.shared_note = Some(reason);
+                self.shared = None;
+            }
+        }
+        self
+    }
+
+    /// Asks the shared budget for the token a non-interactive spawn is about
+    /// to spend. `true` when it was granted or could not be asked (counted,
+    /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when
+    /// the processes together have spent it.
+    fn take_shared(&self, state: &mut GateState, class: Admission) -> bool {
+        let Some(shared) = &self.shared else {
+            return true;
+        };
+        let floor = if class == Admission::Background {
+            self.background_reserve()
+        } else {
+            0
+        };
+        match shared.take(floor, self.burst, self.refill_per_sec) {
+            shared_budget::Take::Granted => true,
+            shared_budget::Take::Denied => false,
+            shared_budget::Take::Unavailable(reason) => {
+                state.shared_fallbacks = state.shared_fallbacks.saturating_add(1);
+                log_shared_fallback(&reason, state.shared_fallbacks);
+                true
+            }
+        }
+    }
+
+    /// One line on where this gate's rate budget lives, for the report.
+    fn sharing_report(&self, fallbacks: u64) -> String {
+        match (&self.shared, &self.shared_note) {
+            (Some(shared), _) => format!(
+                "budget=shared({}) fallbacks={fallbacks}",
+                shared.path().display()
+            ),
+            (None, Some(note)) => format!("budget=per-process ({note})"),
+            (None, None) => "budget=per-process".to_string(),
         }
     }
 
@@ -1537,15 +1919,34 @@ impl SpawnGate {
 
     #[cfg(test)]
     fn acquire(&self, deadline: Instant) -> Option<SpawnPermit<'_>> {
-        self.acquire_until(deadline, &|| false)
+        self.acquire_until(deadline, &|| false).ok()
+    }
+
+    /// Tokens background work may not spend: a quarter of the burst, so
+    /// optional work is shed while reactive reads still have budget.
+    fn background_reserve(&self) -> u32 {
+        self.burst / 4
     }
 
     fn acquire_until(
         &self,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
-    ) -> Option<SpawnPermit<'_>> {
-        let background = BACKGROUND_PROCESSES.get();
+    ) -> Result<SpawnPermit<'_>, Refusal> {
+        let class = current_admission();
+        let background = class == Admission::Background;
+        let interactive = class == Admission::Interactive;
+        let rate_limited = self.refill_per_sec != u32::MAX;
+        let entered = Instant::now();
+        // Declared before the state guard so that, unwinding, the guard is
+        // released first and the reservation can take the lock to give its
+        // waiting count back. A stranded interactive or background count
+        // would make every later refresh ineligible for good.
+        let mut reservation = WaitReservation {
+            gate: self,
+            class,
+            held: false,
+        };
         // A poisoned gate must not deadlock the app: a panic inside a permit
         // holder still ran the `Drop` below, so the count is accurate.
         let mut state = self
@@ -1556,42 +1957,90 @@ impl SpawnGate {
             state.waiting_background += 1;
             self.released.notify_all();
         }
+        if interactive {
+            state.waiting_interactive += 1;
+        }
+        reservation.held = background || interactive;
         let mut token_wait_started: Option<Instant> = None;
-        let admitted = loop {
+        let outcome = loop {
+            // The cancel check is the caller's code. Under the gate lock, a
+            // check that took a lock of its own or spawned anything would
+            // deadlock the whole gate, so it runs with the lock released and
+            // everything below is recomputed from fresh state.
+            drop(state);
+            let is_cancelled = cancelled();
+            state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = Instant::now();
             let remaining = deadline.saturating_duration_since(now);
-            if remaining.is_zero() || cancelled() {
-                break false;
+            if is_cancelled {
+                break Err(Refusal::Cancelled);
+            }
+            if remaining.is_zero() {
+                // Whatever the caller was last waiting for is the cause. A
+                // short deadline that ran out while the rate budget was spent
+                // is a deferral, not a slot that never came free.
+                break Err(match token_wait_started {
+                    Some(_) => Refusal::Refused {
+                        waited: now.saturating_duration_since(entered),
+                    },
+                    None => Refusal::TimedOut {
+                        deadline: deadline.saturating_duration_since(entered),
+                    },
+                });
             }
             // Optional work gets at most a quarter of the slots (at least
             // one). Conversely, a waiting background class gets the next
             // available slot if no background child is running, so sustained
-            // foreground traffic cannot indefinitely postpone all indexing.
-            let eligible = if background {
-                state.background < (self.limit / 4).max(1)
-            } else {
-                state.waiting_background == 0
-                    || state.background > 0
-                    || state.in_flight < self.limit.saturating_sub(1)
+            // reactive traffic cannot indefinitely postpone all indexing. A
+            // waiting user action outranks both.
+            let eligible = match class {
+                Admission::Interactive => true,
+                Admission::Background => {
+                    state.waiting_interactive == 0 && state.background < (self.limit / 4).max(1)
+                }
+                Admission::Reactive => {
+                    state.waiting_interactive == 0
+                        && (state.waiting_background == 0
+                            || state.background > 0
+                            || state.in_flight < self.limit.saturating_sub(1))
+                }
             };
             self.refill(&mut state, now);
-            // Every spawn draws a token, including foreground refresh. The
-            // measured storm was frontend `git` after `repo-changed`, not a
-            // background class, so a foreground exemption would let it return.
-            let rate_limited = self.refill_per_sec != u32::MAX;
-            let tokens_ok = !rate_limited || state.tokens >= 1;
+            let mut tokens_ok = match class {
+                Admission::Interactive => true,
+                Admission::Reactive => !rate_limited || state.tokens >= 1,
+                Admission::Background => !rate_limited || state.tokens > self.background_reserve(),
+            };
+            // The shared budget is asked last, and only by a spawn that would
+            // otherwise start now, so a granted token is spent at once below
+            // and never taken for a waiter that then gives up.
+            if tokens_ok && rate_limited && !interactive && state.in_flight < self.limit && eligible
+            {
+                tokens_ok = self.take_shared(&mut state, class);
+            }
             if !tokens_ok {
+                // Background is shed at once: it is the first thing to go
+                // under load, and waiting would only hold a pool thread.
+                if background {
+                    break Err(Refusal::Shed);
+                }
                 let started = *token_wait_started.get_or_insert(now);
+                let waited = now.saturating_duration_since(started);
                 // A storm that has spent the burst must fail the spawn instead
                 // of occupying a blocking-pool thread for the whole git timeout.
-                if now.saturating_duration_since(started) >= SPAWN_QUEUE_BUDGET {
-                    break false;
+                if waited >= SPAWN_QUEUE_BUDGET {
+                    break Err(Refusal::Refused {
+                        waited: now.saturating_duration_since(entered),
+                    });
                 }
             } else {
                 token_wait_started = None;
             }
             if state.in_flight < self.limit && eligible && tokens_ok {
-                break true;
+                break Ok(());
             }
             let (next, _) = self
                 .released
@@ -1599,27 +2048,48 @@ impl SpawnGate {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
         };
-        if background {
-            state.waiting_background -= 1;
-        }
-        if !admitted {
+        reservation.give_back(&mut state);
+        if let Err(refusal) = outcome {
+            state.counters[class.index()].count(refusal);
+            let counters = state.counters;
+            let sharing = self.sharing_report(state.shared_fallbacks);
             drop(state);
-            // A timed-out background waiter must release its reservation.
+            // A refused waiter must release its reservation.
             self.released.notify_all();
-            return None;
+            if refusal != Refusal::Cancelled {
+                log_refusals(&counters, &sharing);
+            }
+            return Err(refusal);
         }
         state.in_flight += 1;
         if background {
             state.background += 1;
         }
-        if self.refill_per_sec != u32::MAX {
+        if rate_limited && !interactive {
             state.tokens = state.tokens.saturating_sub(1);
         }
+        state.counters[class.index()].admitted += 1;
         state.peak = state.peak.max(state.in_flight);
-        Some(SpawnPermit {
+        Ok(SpawnPermit {
             gate: self,
             background,
         })
+    }
+
+    fn note_coalesced(&self, class: Admission) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counters[class.index()]
+        .coalesced += 1;
+    }
+
+    #[cfg(test)]
+    fn counters(&self) -> [AdmissionCounters; 3] {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counters
     }
 
     #[cfg(test)]
@@ -1628,6 +2098,48 @@ impl SpawnGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .peak
+    }
+}
+
+/// A waiter's place in `waiting_interactive` / `waiting_background`. Given
+/// back under the caller's lock on every normal exit, and by `Drop` when the
+/// waiter unwinds, so a panic anywhere in the wait cannot strand it.
+struct WaitReservation<'a> {
+    gate: &'a SpawnGate,
+    class: Admission,
+    held: bool,
+}
+
+impl WaitReservation<'_> {
+    fn give_back(&mut self, state: &mut GateState) {
+        if !std::mem::take(&mut self.held) {
+            return;
+        }
+        match self.class {
+            Admission::Interactive => {
+                state.waiting_interactive = state.waiting_interactive.saturating_sub(1)
+            }
+            Admission::Background => {
+                state.waiting_background = state.waiting_background.saturating_sub(1)
+            }
+            Admission::Reactive => {}
+        }
+    }
+}
+
+impl Drop for WaitReservation<'_> {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.give_back(&mut state);
+        drop(state);
+        self.gate.released.notify_all();
     }
 }
 
@@ -1668,13 +2180,10 @@ fn spawn_limit() -> usize {
 /// Sustained git spawns per second, and the burst that may start immediately.
 ///
 /// The measured storm on 2026-10-02 was 40–80 short-lived `git` processes per
-/// second for hours, children of the GitPulse app, lining up with cargo
-/// writing `target*/` trees. Concurrency alone does not stop that: 16 children
-/// that each live ~200 ms still start about 80 processes a second. The burst
-/// covers one uncached branch-stat pass (`MAX_BRANCH_STAT_TARGETS` × 2); after
-/// that the refill is the hard cap, for foreground refresh and background work
-/// alike. A refusal reports the time spent waiting, not the command's own
-/// deadline.
+/// second for hours. Concurrency alone does not stop that: 16 children that
+/// each live ~200 ms still start about 80 processes a second. The burst covers
+/// one uncached branch-stat pass (`MAX_BRANCH_STAT_TARGETS` × 2); after that
+/// the refill is the hard cap.
 const SPAWN_BURST: u32 = 192;
 const SPAWN_PER_SEC: u32 = 8;
 /// How long a caller may block once the burst is spent. Longer than one
@@ -1691,8 +2200,282 @@ fn configured_spawn_gate(testing: bool) -> SpawnGate {
         SpawnGate::new(spawn_limit())
     } else {
         let (burst, rate) = production_spawn_rate();
-        SpawnGate::with_rate(spawn_limit(), burst, rate)
+        SpawnGate::with_rate(spawn_limit(), burst, rate).sharing(shared_budget_path())
     }
+}
+
+/// The unit-test build never touches the real per-user record: a test that
+/// spends a burst would otherwise spend the running app's.
+#[cfg(test)]
+fn shared_budget_path() -> Result<PathBuf, String> {
+    Err("unit-test build: the per-user budget is not shared".into())
+}
+
+#[cfg(not(test))]
+fn shared_budget_path() -> Result<PathBuf, String> {
+    shared_budget::default_path()
+}
+
+/// Every child the gate actually started, so a test can count spawns in its
+/// own repository instead of inferring them from timing. Bounded: the whole
+/// suite shares it, and only the newest entries matter to a running test.
+#[cfg(test)]
+pub(crate) mod spawn_log {
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    use super::Admission;
+
+    const CAPACITY: usize = 16_384;
+    type Entry = (PathBuf, Vec<String>, Admission);
+    static LOG: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+
+    pub(super) fn record(cmd: &Command) {
+        let Some(cwd) = cmd.get_current_dir() else {
+            return;
+        };
+        let argv = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let mut log = LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.len() == CAPACITY {
+            log.pop_front();
+        }
+        log.push_back((cwd.to_path_buf(), argv, super::current_admission()));
+    }
+
+    /// Argument vectors of every recorded child whose working directory was
+    /// `cwd`, oldest first.
+    pub(crate) fn spawns_in(cwd: &Path) -> Vec<Vec<String>> {
+        classed_spawns_in(cwd)
+            .into_iter()
+            .map(|(argv, _)| argv)
+            .collect()
+    }
+
+    /// [`spawns_in`], with the admission class of the thread that spawned
+    /// each child.
+    pub(crate) fn classed_spawns_in(cwd: &Path) -> Vec<(Vec<String>, Admission)> {
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(dir, _, _)| dir == cwd)
+            .map(|(_, argv, class)| (argv.clone(), *class))
+            .collect()
+    }
+}
+
+/// What makes two reads the same read: where, what, how much output, and the
+/// class asking. The class is part of it so a user action never inherits a
+/// refresh's refusal.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedReadKey {
+    cwd: PathBuf,
+    program: std::ffi::OsString,
+    argv: Vec<std::ffi::OsString>,
+    stdout_cap: usize,
+    class: Admission,
+}
+
+/// A queued read that later identical reads may join. It leaves the table
+/// the moment the gate admits it, before the child starts: a caller that
+/// arrives after that point may be asking because of a write the running
+/// child cannot have seen, so it starts its own.
+struct SharedRead {
+    result: Mutex<Option<Result<BoundedRun, String>>>,
+    done: Condvar,
+}
+
+fn shared_reads() -> &'static Mutex<HashMap<SharedReadKey, Arc<SharedRead>>> {
+    static READS: OnceLock<Mutex<HashMap<SharedReadKey, Arc<SharedRead>>>> = OnceLock::new();
+    READS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Runs a read-only `cmd`, sharing one child with every identical read still
+/// queued at the gate. Only for commands that cannot change repository state:
+/// a shared write would report one write's outcome as another's. Commands
+/// without a working directory, or with stdin, are never shared.
+fn run_read_shared(
+    mut cmd: Command,
+    label: &str,
+    timeout: Duration,
+    stdout_cap: usize,
+    gate: &'static SpawnGate,
+) -> Result<BoundedRun, String> {
+    let Some(cwd) = cmd.get_current_dir().map(Path::to_path_buf) else {
+        return run_with_gate(&mut cmd, label, timeout, None, stdout_cap, &mut (), gate);
+    };
+    let key = SharedReadKey {
+        cwd,
+        program: cmd.get_program().to_os_string(),
+        argv: cmd.get_args().map(std::ffi::OsStr::to_os_string).collect(),
+        stdout_cap,
+        class: current_admission(),
+    };
+    let table = shared_reads();
+    let (flight, leader) = {
+        let mut reads = table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reads.get(&key) {
+            Some(flight) => (Arc::clone(flight), false),
+            None => {
+                let flight = Arc::new(SharedRead {
+                    result: Mutex::new(None),
+                    done: Condvar::new(),
+                });
+                reads.insert(key.clone(), Arc::clone(&flight));
+                (flight, true)
+            }
+        }
+    };
+    if !leader {
+        gate.note_coalesced(key.class);
+        let mut result = flight
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The leader always publishes, even when it panics (`Publish`), and
+        // its own wait is bounded by `timeout` twice over: queue, then run.
+        while result.is_none() {
+            result = flight
+                .done
+                .wait(result)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let shared = result
+            .clone()
+            .unwrap_or_else(|| Err(format!("{label} shared read lost")));
+        // The leader counted its own failure on its thread; a joiner that
+        // received it saw no answer either.
+        if let Err(message) = &shared {
+            note_process_failure(message);
+        }
+        return shared;
+    }
+
+    /// Closes the table entry and publishes whatever the leader ended with,
+    /// so a leader that panics or is refused cannot strand its joiners.
+    struct Publish<'a> {
+        key: &'a SharedReadKey,
+        flight: &'a Arc<SharedRead>,
+        label: &'a str,
+        outcome: Option<Result<BoundedRun, String>>,
+    }
+    impl Drop for Publish<'_> {
+        fn drop(&mut self) {
+            close_shared_read(self.key, self.flight);
+            let outcome = self.outcome.take().unwrap_or_else(|| {
+                Err(format!("{} shared read ended without a result", self.label))
+            });
+            *self
+                .flight
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+            self.flight.done.notify_all();
+        }
+    }
+    let mut publish = Publish {
+        key: &key,
+        flight: &flight,
+        label,
+        outcome: None,
+    };
+    let outcome = run_admitted(
+        &mut cmd,
+        label,
+        timeout,
+        None,
+        stdout_cap,
+        &mut (),
+        gate,
+        &|| close_shared_read(&key, &flight),
+    );
+    publish.outcome = Some(outcome.clone());
+    drop(publish);
+    outcome
+}
+
+/// Removes `flight` from the table if it is still the entry for `key`; a
+/// later flight under the same key is left alone.
+fn close_shared_read(key: &SharedReadKey, flight: &Arc<SharedRead>) {
+    let mut reads = shared_reads()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reads
+        .get(key)
+        .is_some_and(|entry| Arc::ptr_eq(entry, flight))
+    {
+        reads.remove(key);
+    }
+}
+
+/// Writes the totals into the diagnostic log when the gate refuses work, at
+/// most every [`REFUSAL_REPORT_INTERVAL`], so an exported log says whether a
+/// failed action was a deferred refresh, shed background work or a timeout,
+/// and how much was admitted meanwhile. A real log entry rather than a line
+/// appended at export: the export's "empty log" verdict must stay true.
+fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    {
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_REPORT_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+    log::warn!(target: "spawn_gate", "{}", format_gate_report(counters, sharing));
+}
+
+/// A decision that fell back to this process's own budget, logged with the
+/// running total at most every [`REFUSAL_REPORT_INTERVAL`].
+fn log_shared_fallback(reason: &str, total: u64) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    {
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_REPORT_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+    log::warn!(
+        target: "spawn_gate",
+        "shared spawn budget unavailable for a decision ({total} so far); used this process's own: {reason}"
+    );
+}
+
+const REFUSAL_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+fn format_gate_report(counters: &[AdmissionCounters; 3], sharing: &str) -> String {
+    let classes: Vec<String> = Admission::ALL
+        .iter()
+        .map(|class| {
+            let c = counters[class.index()];
+            format!(
+                "{} admitted={} coalesced={} deferred={} shed={} timed_out={} cancelled={}",
+                class.name(),
+                c.admitted,
+                c.coalesced,
+                c.refused,
+                c.shed,
+                c.timed_out,
+                c.cancelled
+            )
+        })
+        .collect();
+    format!("[spawn-gate] {} | {sharing}", classes.join(" | "))
 }
 
 fn spawn_gate() -> &'static SpawnGate {
@@ -1764,6 +2547,172 @@ fn run_with_gate(
     observer: &mut dyn ProcessObserver,
     gate: &'static SpawnGate,
 ) -> Result<BoundedRun, String> {
+    run_admitted(
+        cmd,
+        label,
+        timeout,
+        stdin_bytes,
+        stdout_cap,
+        observer,
+        gate,
+        &|| {},
+    )
+}
+
+thread_local! {
+    static PROCESS_FAILURES: Cell<u64> = const { Cell::new(0) };
+    static LAST_PROCESS_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static FORCE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
+    /// Runs at every forced failure, so a test can tell when a computation
+    /// is in progress, or stretch it, without timing guesses.
+    #[cfg(test)]
+    static FORCED_FAILURE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Fails only the spawns on this thread whose arguments include this one.
+    #[cfg(test)]
+    static FORCED_FAILURE_ARG: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Child processes on this thread that produced no answer at all: refused or
+/// deferred by the gate, failed to spawn, or killed at their deadline. A
+/// non-zero git exit is an answer and is not counted; neither is a run whose
+/// output was cut short, which carries its own `incomplete` reason.
+///
+/// Callers that swallow a git error as "not set" (`config --get`, a
+/// `symbolic-ref --quiet`) cannot tell those apart from a real "not set".
+/// Comparing this counter across a computation tells them whether it saw
+/// the repository or saw the gate, so a cache never keeps an answer that
+/// was really a refusal.
+pub(crate) fn process_failures() -> u64 {
+    PROCESS_FAILURES.get()
+}
+
+/// What the newest failure counted by [`process_failures`] said. A caller
+/// that compared the counter and found a failure it swallowed can report the
+/// cause instead of an empty field — and keep the deferral marker, so the
+/// frontend knows the answer is worth asking for again.
+pub(crate) fn last_process_failure() -> Option<String> {
+    LAST_PROCESS_FAILURE.with(|slot| slot.borrow().clone())
+}
+
+fn note_process_failure(message: &str) {
+    PROCESS_FAILURES.set(PROCESS_FAILURES.get().wrapping_add(1));
+    LAST_PROCESS_FAILURE.with(|slot| *slot.borrow_mut() = Some(message.to_string()));
+}
+
+/// Every child spawned on this thread inside `body` fails as a spawn error,
+/// without starting. Lets a test reproduce "the gate refused" independent of
+/// machine load.
+#[cfg(test)]
+pub(crate) fn with_forced_spawn_failure<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_SPAWN_FAILURE.set(self.0);
+        }
+    }
+    let _restore = Restore(FORCE_SPAWN_FAILURE.replace(true));
+    body()
+}
+
+/// [`with_forced_spawn_failure`] for only the spawns whose arguments include
+/// `arg` (a subcommand such as `"symbolic-ref"`), so a test can refuse one read
+/// of a computation and let the rest answer.
+#[cfg(test)]
+pub(crate) fn with_forced_spawn_failure_of<T>(arg: &str, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            FORCED_FAILURE_ARG.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let previous = FORCED_FAILURE_ARG.with(|slot| slot.borrow_mut().replace(arg.to_string()));
+    let _restore = Restore(previous);
+    body()
+}
+
+#[cfg(test)]
+fn forced_failure_matches(cmd: &Command) -> bool {
+    FORCED_FAILURE_ARG.with(|slot| {
+        slot.borrow()
+            .as_deref()
+            .is_some_and(|wanted| cmd.get_args().any(|arg| arg == wanted))
+    })
+}
+
+/// [`with_forced_spawn_failure`], calling `hook` at each forced failure.
+#[cfg(test)]
+pub(crate) fn with_forced_spawn_failure_then<T>(
+    hook: impl Fn() + 'static,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            FORCED_FAILURE_HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    FORCED_FAILURE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let _clear = Clear;
+    with_forced_spawn_failure(body)
+}
+
+/// [`run_with_gate`] with `on_admitted` called after the gate admits the
+/// child and before it is spawned — the last moment at which nothing has been
+/// read yet, which is what [`run_read_shared`] needs to stop new joiners.
+#[allow(clippy::too_many_arguments)]
+fn run_admitted(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    observer: &mut dyn ProcessObserver,
+    gate: &'static SpawnGate,
+    on_admitted: &dyn Fn(),
+) -> Result<BoundedRun, String> {
+    #[cfg(test)]
+    if FORCE_SPAWN_FAILURE.get() || forced_failure_matches(cmd) {
+        FORCED_FAILURE_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook();
+            }
+        });
+        let message = format!("Failed to spawn {label}: forced by test");
+        note_process_failure(&message);
+        return Err(message);
+    }
+    let result = run_admitted_inner(
+        cmd,
+        label,
+        timeout,
+        stdin_bytes,
+        stdout_cap,
+        observer,
+        gate,
+        on_admitted,
+    );
+    if let Err(message) = &result {
+        note_process_failure(message);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_admitted_inner(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    observer: &mut dyn ProcessObserver,
+    gate: &'static SpawnGate,
+    on_admitted: &dyn Fn(),
+) -> Result<BoundedRun, String> {
     if timeout > NETWORK_TIMEOUT {
         return Err(format!(
             "{label} deadline exceeds {}s",
@@ -1784,8 +2733,7 @@ fn run_with_gate(
             "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
         ));
     }
-    let queued_at = Instant::now();
-    let queue_deadline = queued_at + timeout;
+    let queue_deadline = Instant::now() + timeout;
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -1802,18 +2750,24 @@ fn run_with_gate(
     // Held until this function returns, covering the child's descriptors, its
     // output buffers and fallback reader threads -- see [`SpawnGate`] for why an
     // unbounded fan-out here exhausted the process descriptor table.
+    // A refresh in the repository a user action just changed is admitted
+    // like the action itself, within the credit `run_command_scope` granted.
+    let credited = current_admission() == Admission::Reactive
+        && cmd
+            .get_current_dir()
+            .is_some_and(|dir| take_post_action_credit(dir, Instant::now()));
+    let class = if credited {
+        Admission::Interactive
+    } else {
+        current_admission()
+    };
     let _permit = Arc::new(
-        gate.acquire_until(queue_deadline, &|| observer.cancelled())
-            .ok_or_else(|| {
-                if observer.cancelled() {
-                    return format!("{label} cancelled before spawn");
-                }
-                format!(
-                    "{label}{TIMEOUT_MARKER}{:.3}s waiting for a process slot",
-                    queued_at.elapsed().as_secs_f64()
-                )
-            })?,
+        with_admission(class, || {
+            gate.acquire_until(queue_deadline, &|| observer.cancelled())
+        })
+        .map_err(|refusal| refusal_message(label, refusal))?,
     );
+    on_admitted();
 
     // Slot wait is already bounded by `queue_deadline`. The child then gets
     // the full requested runtime: a 5s git call that spent 4.9s queued must
@@ -1828,6 +2782,8 @@ fn run_with_gate(
     // instead of orphaning them. See [`crate::procguard`].
     let (mut child, guard) = crate::procguard::spawn(cmd, label)
         .map_err(|e| format!("Failed to spawn {}: {}", label, e))?;
+    #[cfg(test)]
+    spawn_log::record(cmd);
 
     // On Unix the command waiter owns and drains both nonblocking pipes.
     // EOF no longer depends on two separately scheduled reader threads
@@ -2058,6 +3014,49 @@ fn git_run_capped(
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
 ) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+    git_run_inner(repo, args, timeout, stdin_bytes, stdout_cap, false)
+}
+
+/// [`git_text`] for a read-only command on a refresh path: identical reads
+/// still queued at the spawn gate share one child (see [`run_read_shared`]).
+/// Never for a command that can write — refs, index, config or worktree.
+pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let sub = args.first().unwrap_or(&"");
+    let (bytes, incomplete) = git_run_inner(
+        Some(repo),
+        args,
+        DEFAULT_TIMEOUT,
+        None,
+        MAX_OUTPUT_BYTES,
+        true,
+    )?;
+    if let Some(reason) = &incomplete {
+        return Err(format!("git {} output {}", sub, reason.describe()));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// [`git_text_capped`] for a read that identical callers may share, under the
+/// same rule as [`git_text_shared`]: joined only while the leader is queued.
+/// The cap is part of the sharing key, so a caller never receives a stream
+/// cut at someone else's budget.
+pub(crate) fn git_text_capped_shared(
+    repo: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(String, Option<Incomplete>), String> {
+    let (bytes, incomplete) = git_run_inner(Some(repo), args, DEFAULT_TIMEOUT, None, cap, true)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+}
+
+fn git_run_inner(
+    repo: Option<&Path>,
+    args: &[&str],
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    shared: bool,
+) -> Result<(Vec<u8>, Option<Incomplete>), String> {
     if let Some(repo) = repo {
         crate::repository_trust::require(repo)?;
     }
@@ -2073,7 +3072,11 @@ fn git_run_capped(
         if remaining.is_zero() {
             return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
         }
-        let out = run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?;
+        let out = if shared && stdin_bytes.is_none() {
+            run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
+        } else {
+            run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?
+        };
         if out.success {
             return Ok((out.stdout, out.incomplete));
         }
@@ -2270,52 +3273,223 @@ pub fn repo_name_from_url(url: &str) -> String {
 mod tests {
     #[test]
     fn background_priority_restores_after_nested_work_errors_and_panic() {
-        assert!(!super::BACKGROUND_PROCESSES.get());
+        use super::{current_admission, Admission};
+        assert_eq!(current_admission(), Admission::Reactive);
         let result = std::panic::catch_unwind(|| {
             super::with_background_processes(|| {
-                assert!(super::BACKGROUND_PROCESSES.get());
+                assert_eq!(current_admission(), Admission::Background);
                 let error: Result<(), &str> = super::with_background_processes(|| Err("expected"));
                 assert_eq!(error, Err("expected"));
-                assert!(super::BACKGROUND_PROCESSES.get());
+                assert_eq!(current_admission(), Admission::Background);
                 panic!("expected priority unwind");
             })
         });
         assert!(result.is_err());
-        assert!(!super::BACKGROUND_PROCESSES.get());
+        assert_eq!(current_admission(), Admission::Reactive);
         super::with_background_processes(|| {
-            std::thread::spawn(|| assert!(!super::BACKGROUND_PROCESSES.get()))
+            std::thread::spawn(|| assert_eq!(current_admission(), Admission::Reactive))
                 .join()
                 .unwrap();
         });
-        assert!(!super::BACKGROUND_PROCESSES.get());
+        assert_eq!(current_admission(), Admission::Reactive);
+    }
+
+    /// The command guard promotes a mutation for the rest of its command and
+    /// no further: the runner's scope ends the promotion, panics included, so
+    /// a pooled thread never carries a user-action class into the next task.
+    #[test]
+    fn a_guarded_mutation_is_interactive_until_its_command_scope_ends() {
+        use super::{current_admission, mark_interactive, with_admission, Admission};
+        with_admission(Admission::Reactive, || {
+            assert_eq!(current_admission(), Admission::Reactive);
+            mark_interactive();
+            assert_eq!(current_admission(), Admission::Interactive);
+        });
+        assert_eq!(current_admission(), Admission::Reactive);
+        let unwound = std::panic::catch_unwind(|| {
+            with_admission(Admission::Reactive, || {
+                mark_interactive();
+                panic!("mutation failed");
+            })
+        });
+        assert!(unwound.is_err());
+        assert_eq!(current_admission(), Admission::Reactive);
+    }
+
+    /// The launch failure: refresh traffic across ~20 repositories spent the
+    /// rate budget, and the user's own actions were refused with it. A user
+    /// action is limited by concurrency alone, and spends no token a refresh
+    /// would need.
+    #[test]
+    fn a_user_action_is_admitted_after_refreshes_spend_every_token() {
+        use super::{with_admission, Admission};
+        let gate = super::SpawnGate::with_rate(8, 2, 1);
+        let quick = || Instant::now() + std::time::Duration::from_millis(30);
+        let burst: Vec<_> = (0..2)
+            .map(|_| gate.acquire(quick()).expect("burst"))
+            .collect();
+        drop(burst);
+        assert!(
+            gate.acquire(quick()).is_none(),
+            "the refresh budget is spent"
+        );
+        let actions: Vec<_> = (0..4)
+            .map(|_| {
+                with_admission(Admission::Interactive, || gate.acquire(quick()))
+                    .expect("a user action must not wait for a rate token")
+            })
+            .collect();
+        assert_eq!(gate.state.lock().unwrap().tokens, 0);
+        drop(actions);
+        let counters = gate.counters();
+        assert_eq!(counters[Admission::Interactive.index()].admitted, 4);
+        assert_eq!(counters[Admission::Interactive.index()].refused, 0);
+        assert_eq!(counters[Admission::Reactive.index()].admitted, 2);
+        assert_eq!(counters[Admission::Reactive.index()].refused, 1);
+
+        // Still concurrency-limited: a user action is not a way past the
+        // descriptor budget the gate exists for.
+        let full: Vec<_> = (0..8)
+            .map(|_| {
+                with_admission(Admission::Interactive, || gate.acquire(quick())).expect("slot")
+            })
+            .collect();
+        assert!(with_admission(Admission::Interactive, || gate.acquire(quick())).is_none());
+        drop(full);
+    }
+
+    /// Background work goes first: once the budget is at the reserve kept for
+    /// refreshes, it is refused at once rather than queued, while a refresh
+    /// is still admitted from the reserve.
+    #[test]
+    fn background_is_shed_at_the_reserve_while_a_refresh_still_runs() {
+        use super::{with_admission, with_background_processes, Admission, Refusal};
+        let gate = super::SpawnGate::with_rate(16, 8, 1);
+        assert_eq!(gate.background_reserve(), 2);
+        let far = || Instant::now() + std::time::Duration::from_secs(10);
+        for _ in 0..6 {
+            drop(with_background_processes(|| gate.acquire(far())).expect("above reserve"));
+        }
+        let began = Instant::now();
+        let shed = with_background_processes(|| gate.acquire_until(far(), &|| false).err());
+        assert_eq!(shed, Some(Refusal::Shed));
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(500),
+            "shedding must not wait out the budget: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            with_admission(Admission::Reactive, || gate.acquire(far())).is_some(),
+            "the reserve is for refreshes"
+        );
+        assert_eq!(gate.counters()[Admission::Background.index()].shed, 1);
+    }
+
+    /// A waiting user action takes the next free slot even with refreshes
+    /// queued ahead of it.
+    #[test]
+    fn a_waiting_user_action_takes_the_next_slot_before_a_queued_refresh() {
+        use super::{with_admission, Admission};
+        use std::sync::Arc;
+        let gate = Arc::new(super::SpawnGate::new(1));
+        let held = gate
+            .acquire(Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        let (order_tx, order_rx) = std::sync::mpsc::channel();
+        let refresh = {
+            let gate = Arc::clone(&gate);
+            let order_tx = order_tx.clone();
+            std::thread::spawn(move || {
+                let permit = gate.acquire(Instant::now() + std::time::Duration::from_secs(5));
+                order_tx.send("refresh").unwrap();
+                drop(permit);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let action = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                with_admission(Admission::Interactive, || {
+                    let permit = gate.acquire(Instant::now() + std::time::Duration::from_secs(5));
+                    order_tx.send("action").unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    drop(permit);
+                })
+            })
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while gate.state.lock().unwrap().waiting_interactive == 0 {
+            assert!(Instant::now() < deadline, "the action never queued");
+            std::thread::yield_now();
+        }
+        drop(held);
+        let first = order_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(first, "action");
+        refresh.join().unwrap();
+        action.join().unwrap();
+    }
+
+    /// Each refusal carries exactly one marker, and the classifiers that the
+    /// secrets runner and `run_captured` rely on agree with the formatter.
+    #[test]
+    fn every_refusal_formats_to_the_one_cause_its_classifiers_name() {
+        use super::{
+            is_deferred_under_load, is_slot_wait_timeout, is_timeout_error, refusal_message,
+            Refusal,
+        };
+        let waited = std::time::Duration::from_millis(2_013);
+        let deferred = refusal_message("git status", Refusal::Refused { waited });
+        assert!(deferred.contains("2.013s"), "{deferred}");
+        let shed = refusal_message("git status", Refusal::Shed);
+        for message in [&deferred, &shed] {
+            assert!(is_deferred_under_load(message), "{message}");
+            assert!(!is_slot_wait_timeout(message), "{message}");
+            assert!(!is_timeout_error("git status", message), "{message}");
+        }
+        let timed_out = refusal_message(
+            "git status",
+            Refusal::TimedOut {
+                deadline: std::time::Duration::from_secs(90),
+            },
+        );
+        assert!(is_slot_wait_timeout(&timed_out), "{timed_out}");
+        assert!(is_timeout_error("git status", &timed_out), "{timed_out}");
+        assert!(!is_deferred_under_load(&timed_out), "{timed_out}");
+        let cancelled = refusal_message("git status", Refusal::Cancelled);
+        assert!(!is_deferred_under_load(&cancelled) && !is_slot_wait_timeout(&cancelled));
+        let report = super::format_gate_report(
+            &[super::AdmissionCounters::default(); 3],
+            "budget=per-process",
+        );
+        for class in super::Admission::ALL {
+            assert!(report.contains(class.name()), "{report}");
+        }
+        assert!(report.ends_with("| budget=per-process"), "{report}");
     }
 
     #[test]
     fn spawn_rate_cap_stops_a_burst_from_becoming_a_sustained_storm() {
-        // Background work may hold only a quarter of the slots. The limit has
-        // to leave room for the whole burst, or the class cap fails the test
-        // before the token bucket does.
-        let gate = super::SpawnGate::with_rate(16, 4, 4);
-        super::with_background_processes(|| {
-            let mut held = Vec::new();
-            for _ in 0..4 {
-                held.push(
-                    gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(200))
-                        .expect("burst slot"),
-                );
-            }
-            assert!(
-                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
-                    .is_none(),
-                "the fifth spawn inside the burst must not start"
+        let gate = super::SpawnGate::with_rate(8, 4, 4);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(200))
+                    .expect("burst slot"),
             );
-            drop(held);
-            assert!(
-                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
-                    .is_none(),
-                "a free concurrency slot must not bypass the per-second cap"
-            );
-        });
+        }
+        assert!(
+            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+                .is_none(),
+            "the fifth spawn inside the burst must not start"
+        );
+        drop(held);
+        assert!(
+            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+                .is_none(),
+            "a free concurrency slot must not bypass the per-second cap"
+        );
         let (burst, rate) = super::production_spawn_rate();
         assert!(
             rate < 40,
@@ -2331,18 +3505,15 @@ mod tests {
         let gate = super::configured_spawn_gate(false);
         let mut admitted = 0u32;
         let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
-        super::with_background_processes(|| {
-            while std::time::Instant::now() < drain_until {
-                match gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(20))
-                {
-                    Some(permit) => {
-                        admitted += 1;
-                        drop(permit);
-                    }
-                    None => break,
+        while std::time::Instant::now() < drain_until {
+            match gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(20)) {
+                Some(permit) => {
+                    admitted += 1;
+                    drop(permit);
                 }
+                None => break,
             }
-        });
+        }
         assert!(
             (192..192 + 16).contains(&admitted),
             "production burst admitted {admitted}, want 192 plus at most one refill window"
@@ -2358,13 +3529,11 @@ mod tests {
         for _ in 0..12 {
             let gate = Arc::clone(&gate);
             threads.push(std::thread::spawn(move || {
-                super::with_background_processes(|| {
-                    let began = std::time::Instant::now();
-                    let admitted = gate
-                        .acquire(std::time::Instant::now() + std::time::Duration::from_secs(30))
-                        .is_some();
-                    (admitted, began.elapsed())
-                })
+                let began = std::time::Instant::now();
+                let admitted = gate
+                    .acquire(std::time::Instant::now() + std::time::Duration::from_secs(30))
+                    .is_some();
+                (admitted, began.elapsed())
             }));
         }
         let mut admitted = 0u32;
@@ -2403,16 +3572,14 @@ mod tests {
             let gate = Arc::clone(&gate);
             let admitted = Arc::clone(&admitted);
             threads.push(std::thread::spawn(move || {
-                super::with_background_processes(|| {
-                    while started.elapsed() < std::time::Duration::from_millis(500) {
-                        if let Some(permit) = gate.acquire(
-                            std::time::Instant::now() + std::time::Duration::from_millis(15),
-                        ) {
-                            admitted.fetch_add(1, Ordering::Relaxed);
-                            drop(permit);
-                        }
+                while started.elapsed() < std::time::Duration::from_millis(500) {
+                    if let Some(permit) = gate
+                        .acquire(std::time::Instant::now() + std::time::Duration::from_millis(15))
+                    {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        drop(permit);
                     }
-                });
+                }
             }));
         }
         for thread in threads {
@@ -4791,59 +5958,454 @@ mod tests {
         assert!(error.contains(TIMEOUT_MARKER), "{error}");
     }
 
-    /// The diagnostic used to print the command's 90s deadline after a 2s
-    /// refusal, so a launch looked like git had hung.
+    /// Deterministic, dependency-free generator for the stress tests: a fixed
+    /// seed reproduces the exact schedule of classes, deadlines and cancels.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// `cancelled` is caller code. A waiter whose check panicked left its
+    /// waiting reservation behind, and a stranded interactive or background
+    /// reservation makes every later refresh ineligible for good.
+    #[test]
+    fn a_panicking_cancel_check_does_not_strand_its_reservation() {
+        use super::{with_admission, Admission};
+        for class in [Admission::Interactive, Admission::Background] {
+            let gate = Arc::new(SpawnGate::new(1));
+            let held = gate
+                .acquire(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            let waiter = {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        with_admission(class, || {
+                            let _ = gate
+                                .acquire_until(Instant::now() + Duration::from_secs(2), &|| {
+                                    panic!("observer failed")
+                                });
+                        })
+                    }))
+                    .is_err()
+                })
+            };
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(waiter.join());
+            });
+            let panicked = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the waiter never finished")
+                .expect("the waiter thread itself panicked");
+            assert!(panicked, "the check must have panicked inside the gate");
+            drop(held);
+            assert!(
+                gate.acquire(Instant::now() + Duration::from_millis(300))
+                    .is_some(),
+                "{class:?} reservation stranded by a panicking check"
+            );
+            let state = gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                (state.waiting_interactive, state.waiting_background),
+                (0, 0)
+            );
+        }
+    }
+
+    /// A cancel check that took a lock of its own, or re-entered the gate,
+    /// deadlocked against a gate that called it while holding its state.
+    #[test]
+    fn the_cancel_check_runs_without_the_gate_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let gate = Arc::new(SpawnGate::new(1));
+        let held = gate
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let checked = AtomicBool::new(false);
+        let lock_free = AtomicBool::new(true);
+        let probe = Arc::clone(&gate);
+        let outcome = gate.acquire_until(Instant::now() + Duration::from_millis(150), &|| {
+            checked.store(true, Ordering::Relaxed);
+            if probe.state.try_lock().is_err() {
+                lock_free.store(false, Ordering::Relaxed);
+            }
+            false
+        });
+        assert!(outcome.is_err(), "the only slot is held");
+        assert!(checked.load(Ordering::Relaxed), "the check never ran");
+        assert!(
+            lock_free.load(Ordering::Relaxed),
+            "the cancel check ran while the gate held its own lock"
+        );
+        drop(held);
+    }
+
+    /// Seeded stress across every class, deadline and cancellation shape. It
+    /// asserts the gate's invariants, never a duration: a slow host only
+    /// loosens the rate bound.
+    #[test]
+    fn mixed_class_stress_holds_every_gate_invariant() {
+        use super::{with_admission, Admission};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const THREADS: u64 = 24;
+        const ROUNDS: usize = 40;
+        let (limit, burst, rate) = (8usize, 16u32, 20u32);
+        let gate = Arc::new(SpawnGate::with_rate(limit, burst, rate));
+        let attempts = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+        let violations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let started = Instant::now();
+        let (done_tx, done_rx) = mpsc::channel();
+        for seed in 0..THREADS {
+            let gate = Arc::clone(&gate);
+            let attempts = Arc::clone(&attempts);
+            let violations = Arc::clone(&violations);
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                let mut rng = Lcg(0x9E37_79B9_7F4A_7C15 ^ (seed + 1).wrapping_mul(0xBF58_476D));
+                for _ in 0..ROUNDS {
+                    let class = Admission::ALL[(rng.next() % 3) as usize];
+                    let wait = Duration::from_millis(1 + rng.next() % 30);
+                    let cancel_at = rng
+                        .next()
+                        .is_multiple_of(4)
+                        .then(|| Instant::now() + Duration::from_millis(rng.next() % 10));
+                    attempts[class.index()].fetch_add(1, Ordering::Relaxed);
+                    let outcome = with_admission(class, || {
+                        gate.acquire_until(Instant::now() + wait, &|| {
+                            cancel_at.is_some_and(|at| Instant::now() >= at)
+                        })
+                    });
+                    if let Ok(permit) = outcome {
+                        {
+                            let state = gate
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut found = violations.lock().unwrap();
+                            if state.in_flight > limit {
+                                found.push(format!("in_flight {} > {limit}", state.in_flight));
+                            }
+                            if state.background > (limit / 4).max(1) {
+                                found.push(format!("background {}", state.background));
+                            }
+                        }
+                        let hold = rng.next() % 3;
+                        if hold > 0 {
+                            thread::sleep(Duration::from_millis(hold));
+                        }
+                        drop(permit);
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        drop(done_tx);
+        for _ in 0..THREADS {
+            done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("a stress thread hung inside the gate");
+        }
+        let elapsed = started.elapsed();
+        let found = violations.lock().unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        let state = gate.state.lock().unwrap();
+        assert_eq!(
+            (
+                state.in_flight,
+                state.background,
+                state.waiting_background,
+                state.waiting_interactive
+            ),
+            (0, 0, 0, 0),
+            "a reservation outlived its waiter"
+        );
+        assert!(state.peak <= limit);
+        for class in Admission::ALL {
+            let c = state.counters[class.index()];
+            assert_eq!(
+                c.admitted + c.refused + c.shed + c.timed_out + c.cancelled,
+                attempts[class.index()].load(Ordering::Relaxed),
+                "{class:?}: every attempt has exactly one outcome: {c:?}"
+            );
+        }
+        let rate_limited = state.counters[Admission::Reactive.index()].admitted
+            + state.counters[Admission::Background.index()].admitted;
+        let bound = u64::from(burst) + (f64::from(rate) * elapsed.as_secs_f64()).ceil() as u64 + 1;
+        assert!(
+            rate_limited <= bound,
+            "{rate_limited} rate-limited admissions in {elapsed:?}; the cap allows {bound}"
+        );
+        let reactive = state.counters[Admission::Reactive.index()];
+        assert!(
+            reactive.refused + reactive.timed_out + reactive.cancelled > 0,
+            "the schedule never pushed the gate past its limits: {reactive:?}"
+        );
+        assert!(state.counters[Admission::Interactive.index()].admitted > 0);
+    }
+
+    /// The hazard shared reads exist to avoid, under load: a caller must
+    /// never be answered by a child that started before it asked. A writer
+    /// bumps an epoch file (by rename) and publishes the new value only
+    /// afterwards; each child `cat`s the file, so its answer is at least the
+    /// epoch its caller saw on arrival — unless it joined an older child.
     #[cfg(unix)]
     #[test]
-    fn slot_wait_reports_the_queue_budget_not_the_command_deadline() {
+    fn a_shared_read_never_answers_with_a_child_older_than_its_caller() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(2)));
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("epoch"), "0").unwrap();
+        let published = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (cwd, published, stop) = (cwd.clone(), Arc::clone(&published), Arc::clone(&stop));
+            thread::spawn(move || {
+                let mut epoch = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    epoch += 1;
+                    let tmp = cwd.join("epoch.tmp");
+                    std::fs::write(&tmp, epoch.to_string()).unwrap();
+                    std::fs::rename(&tmp, cwd.join("epoch")).unwrap();
+                    published.store(epoch, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        // Start with every slot held so the first wave provably shares.
+        let held: Vec<_> = (0..2)
+            .map(|_| {
+                gate.acquire(Instant::now() + Duration::from_secs(1))
+                    .unwrap()
+            })
+            .collect();
+        let (done_tx, done_rx) = mpsc::channel();
+        for reader in 0..8u64 {
+            let (cwd, published, done_tx) = (cwd.clone(), Arc::clone(&published), done_tx.clone());
+            thread::spawn(move || {
+                let mut stale = Vec::new();
+                // Without jitter the readers stay in lockstep — all answered
+                // together, all asking again together — so every join lands
+                // before the child starts and the hazard is never exercised.
+                let mut rng = Lcg(0xD1B5_4A32_D192_ED03 ^ (reader + 1));
+                for _ in 0..25 {
+                    thread::sleep(Duration::from_millis(rng.next() % 26));
+                    let arrived = published.load(Ordering::SeqCst);
+                    // Read first, then linger: a caller that joins this child
+                    // after it started is then provably answered with an
+                    // epoch older than the one it arrived at.
+                    let mut cmd = Command::new("/bin/sh");
+                    cmd.args(["-c", "cat epoch; sleep 0.02"]).current_dir(&cwd);
+                    let run =
+                        super::run_read_shared(cmd, "epoch", Duration::from_secs(10), 64, gate)
+                            .expect("epoch read");
+                    let seen: u64 = String::from_utf8_lossy(&run.stdout).trim().parse().unwrap();
+                    if seen < arrived {
+                        stale.push((arrived, seen));
+                    }
+                }
+                let _ = done_tx.send(stale);
+            });
+        }
+        drop(done_tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.counters()[super::Admission::Reactive.index()].coalesced == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the first wave never shared a child"
+            );
+            thread::yield_now();
+        }
+        drop(held);
+        let mut stale = Vec::new();
+        for _ in 0..8 {
+            stale.extend(
+                done_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("a reader hung"),
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            stale.is_empty(),
+            "answered from before the caller arrived: {stale:?}"
+        );
+        // Every call either started a child or joined one; nothing is lost
+        // and nothing is counted twice.
+        let children = spawn_log::spawns_in(&cwd).len() as u64;
+        let joined = gate.counters()[super::Admission::Reactive.index()].coalesced;
+        assert_eq!(
+            children + joined,
+            8 * 25,
+            "{children} children + {joined} joins"
+        );
+        eprintln!("shared-read stress: {children} children served 200 reads ({joined} joined)");
+        let leftover = super::shared_reads()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.cwd == cwd)
+            .count();
+        assert_eq!(leftover, 0, "a finished read stayed joinable");
+    }
+
+    /// Identical reads queued behind a full gate share one child. Each child
+    /// appends its pid to a file, so the count is of processes, not of
+    /// results.
+    #[cfg(unix)]
+    #[test]
+    fn identical_queued_reads_share_one_child() {
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(1)));
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let pids = cwd.join("pids");
+        let script = format!("echo $$ >> '{}'; echo shared", pids.display());
+        let read = {
+            let cwd = cwd.clone();
+            move || {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", script.as_str()]).current_dir(&cwd);
+                super::run_read_shared(cmd, "shared-read", Duration::from_secs(10), 4096, gate)
+            }
+        };
+        let held = gate
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let read = read.clone();
+                thread::spawn(read)
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.counters()[super::Admission::Reactive.index()].coalesced < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the readers never queued together"
+            );
+            thread::yield_now();
+        }
+        drop(held);
+        for reader in readers {
+            let run = reader.join().unwrap().expect("shared read");
+            assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "shared");
+        }
+        let started = std::fs::read_to_string(&pids).unwrap();
+        assert_eq!(
+            started.lines().count(),
+            1,
+            "three queued reads, one child: {started}"
+        );
+    }
+
+    /// A read that arrives once the leader's child is running must start its
+    /// own: it may be asking because of a write that child cannot have seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_arriving_after_the_child_started_does_not_join_it() {
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(4)));
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let pids = cwd.join("pids");
+        let script = format!("echo $$ >> '{}'; sleep 0.4", pids.display());
+        let read = {
+            let cwd = cwd.clone();
+            move || {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", script.as_str()]).current_dir(&cwd);
+                super::run_read_shared(cmd, "late-read", Duration::from_secs(10), 4096, gate)
+            }
+        };
+        let first = thread::spawn(read.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&pids).map_or(0, |s| s.lines().count()) == 0 {
+            assert!(Instant::now() < deadline, "the first child never started");
+            thread::yield_now();
+        }
+        let second = thread::spawn(read);
+        first.join().unwrap().expect("first read");
+        second.join().unwrap().expect("second read");
+        let started = std::fs::read_to_string(&pids).unwrap();
+        assert_eq!(
+            started.lines().count(),
+            2,
+            "the late read joined a running child: {started}"
+        );
+        assert_eq!(
+            gate.counters()[super::Admission::Reactive.index()].coalesced,
+            0
+        );
+    }
+
+    /// A rate-limit refusal after ~2s used to print the command's own 30s or
+    /// 90s deadline as "timed out after 89.99s waiting for a process slot",
+    /// so a launch under load read as git hanging. It must say it was
+    /// deferred, and how long it actually waited.
+    #[cfg(unix)]
+    #[test]
+    fn a_rate_limit_refusal_reports_the_wait_not_the_command_deadline() {
         let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::with_rate(32, 1, 1)));
         let started = Instant::now();
         let (tx, rx) = mpsc::channel();
         for _ in 0..8 {
             let tx = tx.clone();
             thread::spawn(move || {
-                let result = super::with_background_processes(|| {
-                    run_with_gate(
-                        &mut Command::new("/usr/bin/true"),
-                        "slot-wait",
-                        Duration::from_secs(30),
-                        None,
-                        MAX_OUTPUT_BYTES,
-                        &mut (),
-                        gate,
-                    )
-                });
+                let result = run_with_gate(
+                    &mut Command::new("/usr/bin/true"),
+                    "slot-wait",
+                    Duration::from_secs(30),
+                    None,
+                    MAX_OUTPUT_BYTES,
+                    &mut (),
+                    gate,
+                );
                 let _ = tx.send(result);
             });
         }
         drop(tx);
         let mut refusals = Vec::new();
         for _ in 0..8 {
-            match rx
-                .recv_timeout(Duration::from_secs(5))
+            if let Err(error) = rx
+                .recv_timeout(Duration::from_secs(10))
                 .expect("queue budget")
             {
-                Ok(_) => {}
-                Err(error) => refusals.push(error),
+                refusals.push(error);
             }
         }
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(10),
             "refusals sat until the command deadline: {:?}",
             started.elapsed()
         );
-        assert!(!refusals.is_empty(), "the burst of 1 cannot admit all 8");
+        assert!(
+            !refusals.is_empty(),
+            "a burst of 1 at 1/s cannot admit all 8 in 2s"
+        );
         for error in &refusals {
-            assert!(error.contains("waiting for a process slot"), "{error}");
             let reported: f64 = error
-                .split(TIMEOUT_MARKER)
+                .split(" deferred under load after ")
                 .nth(1)
                 .and_then(|rest| rest.split('s').next())
                 .and_then(|number| number.parse().ok())
-                .unwrap_or_else(|| panic!("no wait duration in {error}"));
+                .unwrap_or_else(|| panic!("no deferral and wait in {error}"));
             assert!(
-                (1.5..5.0).contains(&reported),
+                (1.5..6.0).contains(&reported),
                 "reported {reported}s from {error}; the command deadline is 30s"
+            );
+            assert!(
+                !error.contains(TIMEOUT_MARKER),
+                "a deferral is not a timeout: {error}"
             );
         }
     }
@@ -5284,5 +6846,281 @@ mod tests {
         assert_eq!(out.stdout, b"progress");
         assert_eq!(observer.0, b"progress");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+
+/// The cross-process budget, the command scope and the post-action credit.
+#[cfg(test)]
+mod admission_scope_tests {
+    use super::*;
+
+    fn leak(gate: SpawnGate) -> &'static SpawnGate {
+        Box::leak(Box::new(gate))
+    }
+
+    fn shared_gate(path: &Path, burst: u32, rate: u32) -> &'static SpawnGate {
+        let gate = SpawnGate::with_rate(16, burst, rate).sharing(Ok(path.to_path_buf()));
+        assert!(gate.shared.is_some(), "{:?}", gate.shared_note);
+        leak(gate)
+    }
+
+    fn admits(gate: &SpawnGate) -> bool {
+        gate.acquire(Instant::now() + Duration::from_millis(20))
+            .is_some()
+    }
+
+    #[test]
+    fn two_processes_sharing_one_budget_obey_one_combined_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        // Two gates opening one record are two open-file descriptions, which
+        // is what two processes hold.
+        let a = shared_gate(&path, 6, 1);
+        let b = shared_gate(&path, 6, 1);
+        let started = Instant::now();
+        let admitted = (0..20)
+            .filter(|i| admits(if i % 2 == 0 { a } else { b }))
+            .count();
+        // One refill token per elapsed second may land meanwhile.
+        let refill = started.elapsed().as_secs() as usize + 1;
+        assert!(
+            (6..=6 + refill).contains(&admitted),
+            "admitted {admitted}: one burst between both, not one each"
+        );
+    }
+
+    #[test]
+    fn background_is_shed_at_the_shared_reserve_whoever_spent_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let a = shared_gate(&path, 8, 1);
+        let b = shared_gate(&path, 8, 1);
+        for _ in 0..6 {
+            assert!(admits(a));
+        }
+        // B has spent nothing itself, but together the two are at the
+        // reserve (8 / 4 = 2), so B's background work is shed at once.
+        let shed = with_admission(Admission::Background, || {
+            b.acquire_until(Instant::now() + Duration::from_secs(5), &|| false)
+                .map(|_| ())
+        });
+        assert_eq!(shed.err(), Some(Refusal::Shed));
+        assert!(admits(b), "a reactive read still has the reserve");
+    }
+
+    #[test]
+    fn a_user_action_neither_waits_for_nor_spends_the_shared_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let a = shared_gate(&path, 3, 1);
+        let b = shared_gate(&path, 3, 1);
+        while admits(a) {}
+        let clicked = with_admission(Admission::Interactive, || {
+            b.acquire_until(Instant::now() + Duration::from_millis(50), &|| false)
+                .map(|_| ())
+        });
+        assert_eq!(clicked, Ok(()));
+        let shared = b.shared.as_ref().unwrap();
+        assert_eq!(
+            shared.take(0, 3, 1),
+            shared_budget::Take::Denied,
+            "the click took no shared token"
+        );
+    }
+
+    #[test]
+    fn an_unusable_shared_record_leaves_the_gate_on_its_own_budget_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the record should be.
+        let gate = leak(SpawnGate::with_rate(16, 4, 1).sharing(Ok(dir.path().to_path_buf())));
+        assert!(gate.shared.is_none());
+        let report = gate.sharing_report(0);
+        assert!(report.starts_with("budget=per-process ("), "{report}");
+        let admitted = (0..8).filter(|_| admits(gate)).count();
+        assert_eq!(admitted, 4, "the process bucket still holds");
+
+        let unpathed = SpawnGate::with_rate(16, 4, 1).sharing(Err("no home".into()));
+        assert_eq!(unpathed.sharing_report(0), "budget=per-process (no home)");
+        // The unlimited test gate has nothing to share, and says that.
+        let unlimited = SpawnGate::new(4).sharing(Ok(dir.path().join("x")));
+        assert!(unlimited.shared.is_none());
+        assert!(!dir.path().join("x").exists(), "no record created for it");
+    }
+
+    #[test]
+    fn a_held_shared_lock_falls_back_to_the_process_budget_and_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let gate = shared_gate(&path, 4, 1);
+        let holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        assert!(admits(gate), "a stopped holder must not stop this process");
+        let fallbacks = gate.state.lock().unwrap().shared_fallbacks;
+        assert_eq!(fallbacks, 1);
+        assert!(gate.sharing_report(fallbacks).ends_with("fallbacks=1"));
+        holder.unlock().unwrap();
+    }
+
+    #[test]
+    fn the_report_names_where_the_budget_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let gate = shared_gate(&path, 4, 1);
+        let report = gate.sharing_report(0);
+        assert!(report.starts_with("budget=shared("), "{report}");
+        assert!(report.contains(&path.display().to_string()), "{report}");
+    }
+
+    fn deferral() -> String {
+        refusal_message(
+            "git status",
+            Refusal::Refused {
+                waited: Duration::from_millis(2_013),
+            },
+        )
+    }
+
+    #[test]
+    fn a_read_commands_deferral_stays_retryable() {
+        let out: Result<(), String> = run_command_scope(|| Err(deferral()));
+        assert!(is_deferred_under_load(&out.unwrap_err()));
+    }
+
+    #[test]
+    fn a_user_actions_deferral_is_never_handed_out_as_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap().to_string();
+        let out: Result<(), String> = run_command_scope(|| {
+            mark_user_action(&repo);
+            Err(deferral())
+        });
+        let message = out.unwrap_err();
+        assert!(!is_deferred_under_load(&message), "{message}");
+        assert!(
+            message.contains("deferred under load"),
+            "the cause stays: {message}"
+        );
+        assert!(message.contains("2.013"), "{message}");
+        // Other failures pass through untouched.
+        let plain: Result<(), String> = run_command_scope(|| {
+            mark_user_action(&repo);
+            Err("fatal: bad revision".into())
+        });
+        assert_eq!(plain.unwrap_err(), "fatal: bad revision");
+    }
+
+    #[test]
+    fn a_command_scope_restores_the_class_and_repo_even_when_it_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap().to_string();
+        assert_eq!(current_admission(), Admission::Reactive);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), String> = run_command_scope(|| {
+                mark_user_action(&repo);
+                panic!("expected");
+            });
+        }));
+        assert!(caught.is_err());
+        assert_eq!(current_admission(), Admission::Reactive);
+        assert!(MARKED_REPO.with(|slot| slot.borrow().is_none()));
+        // A panicking action grants nothing.
+        let canonical = dir.path().canonicalize().unwrap();
+        assert!(!take_post_action_credit(&canonical, Instant::now()));
+    }
+
+    #[cfg(unix)]
+    fn reactive_spawn_in(gate: &'static SpawnGate, cwd: &Path) -> Result<BoundedRun, String> {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "true"]).current_dir(cwd);
+        run_with_gate(
+            &mut cmd,
+            "credit-probe",
+            Duration::from_millis(200),
+            None,
+            1024,
+            &mut (),
+            gate,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_refresh_after_a_user_action_is_admitted_within_its_credit_and_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other = other.path().canonicalize().unwrap();
+        // One token, a refill too slow to matter inside this test.
+        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        reactive_spawn_in(gate, &repo).expect("the one token");
+        let starved = reactive_spawn_in(gate, &repo).unwrap_err();
+        assert!(
+            is_deferred_under_load(&starved) || is_slot_wait_timeout(&starved),
+            "{starved}"
+        );
+
+        let acted: Result<(), String> = run_command_scope(|| {
+            mark_user_action(repo.to_str().unwrap());
+            Ok(())
+        });
+        acted.unwrap();
+        // The credit is per repository, and a read command never earns one.
+        let read: Result<(), String> = run_command_scope(|| Ok(()));
+        read.unwrap();
+        assert!(reactive_spawn_in(gate, &other).is_err());
+        let started = Instant::now();
+        for i in 0..POST_ACTION_CREDIT_SPAWNS {
+            reactive_spawn_in(gate, &repo)
+                .unwrap_or_else(|e| panic!("credited spawn {i} refused: {e}"));
+        }
+        // Spent: what is admitted now is only the 1/s refill, not more credit.
+        let extra = (0..6)
+            .take_while(|_| reactive_spawn_in(gate, &repo).is_ok())
+            .count();
+        let refill = started.elapsed().as_secs() as usize + 1;
+        assert!(
+            extra <= refill,
+            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit (refill allows {refill})"
+        );
+    }
+
+    #[test]
+    fn a_credit_expires_with_its_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let at = Instant::now();
+        grant_post_action_credit(&repo, at);
+        assert!(take_post_action_credit(
+            &repo,
+            at + Duration::from_millis(10)
+        ));
+        assert!(!take_post_action_credit(
+            &repo,
+            at + POST_ACTION_CREDIT_WINDOW + Duration::from_millis(1)
+        ));
+        // Expired entries are dropped, so the map cannot grow past its bound.
+        for i in 0..(POST_ACTION_CREDIT_REPOS + 8) {
+            grant_post_action_credit(&repo.join(i.to_string()), at);
+        }
+        let held = post_action_credits().lock().unwrap().len();
+        assert!(held <= POST_ACTION_CREDIT_REPOS, "{held}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_swallowed_failure_can_still_be_reported() {
+        let gate = leak(SpawnGate::new(2));
+        let dir = tempfile::tempdir().unwrap();
+        let (failures, message) = with_forced_spawn_failure(|| {
+            let before = process_failures();
+            let _ = reactive_spawn_in(gate, dir.path());
+            (process_failures() - before, last_process_failure())
+        });
+        assert_eq!(failures, 1);
+        assert!(message.unwrap_or_default().contains("forced by test"));
     }
 }

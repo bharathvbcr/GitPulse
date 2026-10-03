@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { createAsyncGuard } from "../async/guard";
 import { searchSymbols, searchWorkspaceSymbols, listWorkspaceRepos } from "../codeintel/client";
 import type { CodeintelSymbolHit, WorkspaceFederatedHit, WorkspaceRepoEntry } from "../codeintel/types";

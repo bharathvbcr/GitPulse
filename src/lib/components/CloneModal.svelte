@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { guardedDismiss } from "./modalGuard";
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";

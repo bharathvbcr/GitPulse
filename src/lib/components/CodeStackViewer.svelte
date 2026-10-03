@@ -23,7 +23,7 @@
   import { repoStore } from "../stores/repoStore";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import {
     Layers,
     GitBranch,

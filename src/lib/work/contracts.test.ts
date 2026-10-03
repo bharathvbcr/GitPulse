@@ -7,12 +7,18 @@ describe("validateWorkResponse", () => {
     expect(() => validateWorkResponse("cmd_list_worktrees", payload)).not.toThrow();
   });
 
-  it("accepts a valid cmd_task_scope payload", () => {
-    expect(() => validateWorkResponse("cmd_task_scope", { title: "Task name" })).not.toThrow();
+  it("accepts a valid cmd_task_scopes payload", () => {
+    expect(() => validateWorkResponse("cmd_task_scopes", [{ id: "T1", title: "Task name" }])).not.toThrow();
   });
 
-  it("accepts null task scope payload when response is absent", () => {
-    expect(() => validateWorkResponse("cmd_task_scope", null)).not.toThrow();
+  it("accepts an empty task scopes list when the store holds none of the tasks", () => {
+    expect(() => validateWorkResponse("cmd_task_scopes", [])).not.toThrow();
+  });
+
+  it("rejects a task scope that has no id to key it by", () => {
+    expect(() => validateWorkResponse("cmd_task_scopes", [{ title: "Task name" }])).toThrow(
+      "cmd_task_scopes: invalid response",
+    );
   });
 
   it("accepts cmd_repo_operation with known kinds and numeric step counters", () => {
@@ -73,8 +79,8 @@ describe("validateWorkResponse", () => {
   });
 
   it("rejects malformed non-object payloads with command-scoped error", () => {
-    expect(() => validateWorkResponse("cmd_task_scope", "not-an-object")).toThrow(
-      "cmd_task_scope: invalid response",
+    expect(() => validateWorkResponse("cmd_task_scopes", "not-an-object")).toThrow(
+      "cmd_task_scopes: invalid response",
     );
   });
 

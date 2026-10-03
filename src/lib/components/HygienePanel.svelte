@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { RefreshCw, ShieldCheck, FolderTree, Clock, X, GitBranch, Trash2 } from "@lucide/svelte";
   import type { StorageReport } from "../storage/types";
   import type { CacheInventory, HygienePlan, HygieneOutcome } from "../storage/hygiene/types";

@@ -1,5 +1,5 @@
 import { writable, get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
 import { mergeEvents } from "../ledger/projection";
 import type { LedgerEvent, LedgerStatus } from "../ledger/types";
@@ -184,14 +184,6 @@ export interface HarnessState {
 }
 
 const STORAGE_KEY_MODEL = "gitpulse_ai_model";
-
-/**
- * Rows per `cmd_ledger_tail` call.
- *
- * Distinct from `MAX_AGENT_ACTIONS`, which is now only a *display* cap: this
- * is how much is read per round trip while draining a repository's history.
- */
-const LEDGER_PAGE = 200;
 
 type RepositoryProjectionState = Pick<
   HarnessState,
@@ -598,56 +590,52 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       const canonicalRun = adoptCanonicalRun(currentRun, status);
       if (!canonicalRun) return;
       currentRun = canonicalRun;
-      let cursor = ledgerBuckets.get(currentRun.key)!.ledgerCursor;
-      // Page until drained, so opening a repo with a long history shows all
-      // of it rather than only the first window.
-      for (;;) {
-        const events = await invokeFn<LedgerEvent[]>("cmd_ledger_tail", {
-          repoPath: currentRun.repoPath,
-          cursor,
-          limit: LEDGER_PAGE,
-        });
-        if (!isCurrentLedgerRun(currentRun)) return;
-        if (events.length === 0) break;
-        const nextCursor = events.reduce(
-          (highest, event) => Math.max(highest, event.id),
-          cursor,
-        );
-        // The backend query is already repository-scoped. Checking the row's
-        // stored canonical path as well means a corrupt/misrouted row cannot
-        // cross the final UI projection boundary.
-        const matching = events.filter(
-          (event) =>
-            repositoryAddress(event.repo_path).key === currentRun.key,
-        );
-        const repositoryMismatch = matching.length !== events.length;
-        if (
-          !mutateBucket(
-            currentRun.key,
-            (bucket) => ({
-              ...bucket,
-              actions: mergeEvents(bucket.actions, matching, MAX_AGENT_ACTIONS),
-              ledgerCursor: Math.max(bucket.ledgerCursor, nextCursor),
-              ledger: repositoryMismatch
-                ? {
-                    recording: false,
-                    path: bucket.ledger?.path ?? "",
-                    dropped: bucket.ledger?.dropped ?? 0,
-                    error:
-                      "The ledger returned rows for a different repository; those rows were not displayed.",
-                    error_code: "repository_mismatch",
-                  }
-                : bucket.ledger,
-            }),
-            currentRun.generation,
-          )
-        ) {
-          return;
-        }
-        if (nextCursor <= cursor) break;
-        cursor = nextCursor;
-        if (events.length < LEDGER_PAGE) break;
-      }
+      const cursor = ledgerBuckets.get(currentRun.key)!.ledgerCursor;
+      // The journal keeps only the newest MAX_AGENT_ACTIONS rows, so one
+      // request for the newest window after the cursor is the whole answer.
+      // Paging forward from 0 to reach it read the entire history, one
+      // request per page, and each request runs `git worktree list` to
+      // authenticate the repository: ~148 git processes at launch on a
+      // 29,573-row ledger, for rows the cap then discarded.
+      const events = await invokeFn<LedgerEvent[]>("cmd_ledger_tail", {
+        repoPath: currentRun.repoPath,
+        cursor,
+        limit: MAX_AGENT_ACTIONS,
+        newest: true,
+      });
+      if (!isCurrentLedgerRun(currentRun)) return;
+      if (events.length === 0) return;
+      const nextCursor = events.reduce(
+        (highest, event) => Math.max(highest, event.id),
+        cursor,
+      );
+      // The backend query is already repository-scoped. Checking the row's
+      // stored canonical path as well means a corrupt/misrouted row cannot
+      // cross the final UI projection boundary.
+      const matching = events.filter(
+        (event) =>
+          repositoryAddress(event.repo_path).key === currentRun.key,
+      );
+      const repositoryMismatch = matching.length !== events.length;
+      mutateBucket(
+        currentRun.key,
+        (bucket) => ({
+          ...bucket,
+          actions: mergeEvents(bucket.actions, matching, MAX_AGENT_ACTIONS),
+          ledgerCursor: Math.max(bucket.ledgerCursor, nextCursor),
+          ledger: repositoryMismatch
+            ? {
+                recording: false,
+                path: bucket.ledger?.path ?? "",
+                dropped: bucket.ledger?.dropped ?? 0,
+                error:
+                  "The ledger returned rows for a different repository; those rows were not displayed.",
+                error_code: "repository_mismatch",
+              }
+            : bucket.ledger,
+        }),
+        currentRun.generation,
+      );
     } catch (e) {
       // A ledger read that fails must not blank the journal: the rows already
       // projected are still true. Record why, and leave them.
@@ -668,9 +656,41 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     }
   }
 
-  async function syncLedger(repoPath: string): Promise<void> {
-    if (!repoPath) return;
-    await syncLedgerRun(beginLedgerRun(repoPath));
+  /**
+   * One sync per repository at a time, plus at most one after it.
+   *
+   * Every in-app append announces itself, and a catch-up appends a row per
+   * replayed event, so a burst of announcements arrived while a sync was
+   * still in flight, and each started another. Each sync runs
+   * `cmd_ledger_status` and `cmd_ledger_tail`, and each of those runs
+   * `git worktree list`, so it cost two git processes per appended row. A
+   * request during a sync now marks it to run once more when it finishes. The
+   * sync reads from the stored cursor, so that one re-run collects every row
+   * the joined requests announced, and every joined caller resolves after it.
+   */
+  const ledgerSyncs = new Map<string, { again: boolean; done: Promise<void> }>();
+
+  function syncLedger(repoPath: string): Promise<void> {
+    if (!repoPath) return Promise.resolve();
+    const key = resolvedRepositoryKey(repositoryAddress(repoPath).key);
+    const running = ledgerSyncs.get(key);
+    if (running) {
+      running.again = true;
+      return running.done;
+    }
+    const sync = { again: false, done: Promise.resolve() };
+    sync.done = (async () => {
+      try {
+        do {
+          sync.again = false;
+          await syncLedgerRun(beginLedgerRun(repoPath));
+        } while (sync.again);
+      } finally {
+        ledgerSyncs.delete(key);
+      }
+    })();
+    ledgerSyncs.set(key, sync);
+    return sync.done;
   }
 
   const store = {

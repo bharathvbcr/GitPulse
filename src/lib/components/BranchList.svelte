@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { AiGeneration } from "../stores/harnessStore";
   import { onMount, untrack } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";

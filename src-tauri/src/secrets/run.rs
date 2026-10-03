@@ -490,7 +490,9 @@ fn note_failure(report: &mut SecretsReport, reason: &str, facts: &ScanDiagnostic
 /// path, so none of it is forwarded — but each cause gets its own sentence:
 /// "timed out waiting for a process slot" is not the scan timing out.
 pub(super) fn runner_failure_reason(err: &str, deadline: Duration) -> String {
-    if err.contains("waiting for a process slot") {
+    if crate::engine::git_cli::is_deferred_under_load(err) {
+        "kingfisher was deferred: GitPulse was under load and started no new process in time".into()
+    } else if crate::engine::git_cli::is_slot_wait_timeout(err) {
         "kingfisher could not start: no process slot became free in time".into()
     } else if err.contains("cancelled before spawn") {
         SUPERSEDED.into()

@@ -23,7 +23,7 @@
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import {
     FolderGit2,
     GitPullRequest,

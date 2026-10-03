@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { listen } from "@tauri-apps/api/event";
 import { formatError } from "../ui/formatError";
 import { isTauri } from "../platform";

@@ -899,7 +899,12 @@ export type LiveRefreshDecision =
   | "skip_schema_outdated"
   | "skip_unavailable"
   | "skip_cooldown"
-  | "skip_daemon";
+  | "skip_daemon"
+  /**
+   * The backend's spawn gate declined to start the probe or build under load.
+   * Nothing was examined; ask again after a backoff, never settle on it.
+   */
+  | "skip_deferred";
 
 export interface LiveRefreshFactsDto {
   available: boolean;

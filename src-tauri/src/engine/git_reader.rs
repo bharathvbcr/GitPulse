@@ -1,8 +1,8 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::git_cli::{
-    self, git, git_text, git_text_capped, sandbox_join, sandbox_join_canonical, sandbox_join_entry,
-    validate_repo, Incomplete,
+    self, git, git_text, git_text_capped, git_text_shared, sandbox_join, sandbox_join_canonical,
+    sandbox_join_entry, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::graph::lane_solver::RawCommitNode;
@@ -463,13 +463,15 @@ impl GitReader {
         // The default branch follows the primary remote's HEAD, and the
         // primary remote is not always named "origin" (upstream, gitlab,
         // company forks); guessing origin here mislabels the churn base.
-        let remote = resolve_default_remote(&repo);
-        let head_ref = remote_head_ref(&remote);
-        let origin_head = git_text(&repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
         // Resolving the default base BEFORE listing lets ahead-behind vs that
         // base ride the same for-each-ref process, so this call never blocks
         // on per-branch churn subprocesses.
-        let default_base = resolve_default_base_on(&repo, &remote, origin_head.as_deref());
+        let DefaultBase {
+            remote,
+            remote_head: origin_head,
+            base: default_base,
+            ..
+        } = default_base(&repo).checked()?;
 
         let mut format = String::from(BRANCH_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
@@ -478,7 +480,7 @@ impl GitReader {
             format.push(')');
         }
         let format_arg = format!("--format={format}");
-        let listed = git_text(
+        let listed = git_text_shared(
             &repo,
             &[
                 "for-each-ref",
@@ -607,14 +609,17 @@ impl GitReader {
     pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
         let repo = validate_repo(repo_path)?;
         let repo_key = repo.to_string_lossy().into_owned();
-        let remote = resolve_default_remote(&repo);
-        let head_ref = remote_head_ref(&remote);
-        let origin_head = git_text(&repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
+        let DefaultBase {
+            remote,
+            remote_head: origin_head,
+            base: probed_default,
+            ..
+        } = default_base(&repo).checked()?;
 
         // Cheap listing only: refnames and tips, no history walks here.
         // Refnames and object ids cannot contain NULs, so %00 fields stay
         // aligned where \x01 could be split by hostile ref-adjacent content.
-        let stdout = git_text(
+        let stdout = git_text_shared(
             &repo,
             &[
                 "for-each-ref",
@@ -658,15 +663,14 @@ impl GitReader {
         // Same resolution rules as list_branches' pre-listing probe; when that
         // finds nothing (no origin/HEAD, no conventional name), fall back to
         // pick_default_branch's choice now that the locals are known.
-        let resolved_default = resolve_default_base_on(&repo, &remote, origin_head.as_deref())
-            .or_else(|| {
-                let refname = format!("refs/heads/{default_branch}^{{commit}}");
-                git_text(&repo, &["rev-parse", "--verify", "--quiet", &refname])
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty() && validate_oid(s).is_ok())
-                    .map(|oid| (default_branch.clone(), oid))
-            });
+        let resolved_default = probed_default.or_else(|| {
+            let refname = format!("refs/heads/{default_branch}^{{commit}}");
+            git_text(&repo, &["rev-parse", "--verify", "--quiet", &refname])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && validate_oid(s).is_ok())
+                .map(|oid| (default_branch.clone(), oid))
+        });
         let Some((compared_to, base_oid)) = resolved_default else {
             return Ok(BranchStatsReport {
                 compared_to: default_branch.clone(),
@@ -714,7 +718,9 @@ impl GitReader {
 
     pub fn head_id(repo_path: &str) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
-        Ok(git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string())
+        Ok(git_text_shared(&repo, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string())
     }
 
     /// Short name of the repository's default branch: the primary remote's
@@ -724,10 +730,7 @@ impl GitReader {
     /// no history walk, so the graph load can run it alongside the walk.
     pub fn default_branch_name(repo_path: &str) -> Result<Option<String>, String> {
         let repo = validate_repo(repo_path)?;
-        let remote = resolve_default_remote(&repo);
-        let head_ref = remote_head_ref(&remote);
-        let remote_head = git_text(&repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-        Ok(resolve_default_base_on(&repo, &remote, remote_head.as_deref()).map(|(name, _)| name))
+        Ok(default_base(&repo).checked()?.base.map(|(name, _)| name))
     }
 
     pub fn read_commit_history(
@@ -823,7 +826,9 @@ impl GitReader {
             args.push("--");
             args.push(spec);
         }
-        let stdout = git_text(&repo, &args)?;
+        // The graph, the history list and the AI context ask for the same
+        // page at once after a change; queued identical walks share a child.
+        let stdout = git_text_shared(&repo, &args)?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -919,15 +924,17 @@ impl GitReader {
         // than collapsed into directory roots. `GIT_OPTIONAL_LOCKS=0` is set
         // on every git child, so this status does not rewrite the index and
         // re-trigger the watcher.
-        let stdout = git_text(&repo, Self::STATUS_ARGV)?;
+        let stdout = git_text_shared(&repo, Self::STATUS_ARGV)?;
         // numstat failures are surfaced, not laundered into "zero churn": a
         // broken diff must fail the report rather than fabricate numbers, and
         // records that decode but carry unparseable counts ride their row as
         // an explicit warning instead of reading as fact.
         let numstat_work =
-            parse_numstat_with_issues(&git_text(&repo, &["diff", "--numstat", "-z"])?);
-        let numstat_index =
-            parse_numstat_with_issues(&git_text(&repo, &["diff", "--cached", "--numstat", "-z"])?);
+            parse_numstat_with_issues(&git_text_shared(&repo, &["diff", "--numstat", "-z"])?);
+        let numstat_index = parse_numstat_with_issues(&git_text_shared(
+            &repo,
+            &["diff", "--cached", "--numstat", "-z"],
+        )?);
 
         let mut statuses = Vec::new();
         for record in parse_status_records(stdout.as_bytes()) {
@@ -1390,10 +1397,7 @@ impl GitReader {
         // shaped exactly like an unmerged branch. Resolving the base the way
         // `list_branches` resolves it means a tag and a branch are measured
         // against the same thing, and it rides this one listing process.
-        let remote = resolve_default_remote(&repo);
-        let head_ref = remote_head_ref(&remote);
-        let origin_head = git_text(&repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-        let default_base = resolve_default_base_on(&repo, &remote, origin_head.as_deref());
+        let default_base = default_base(&repo).checked()?.base;
 
         let mut format = String::from(TAG_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
@@ -1402,7 +1406,7 @@ impl GitReader {
             format.push(')');
         }
         let format_arg = format!("--format={format}");
-        let listed = git_text(
+        let listed = git_text_shared(
             &repo,
             &["tag", "-l", "--sort=-creatordate", format_arg.as_str()],
         );
@@ -2409,6 +2413,215 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
     "origin".to_string()
 }
 
+/// The primary remote, its HEAD symref, and the default base it resolves to:
+/// everything `list_branches`, `list_tags`, `branch_stats` and the graph's
+/// default-branch label each derived on their own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DefaultBase {
+    pub remote: String,
+    pub remote_head: Option<String>,
+    /// (short name, commit oid), or `None` when no candidate resolves.
+    pub base: Option<(String, String)>,
+    /// Set when a lookup above produced no answer at all (refused or
+    /// deferred by the spawn gate, killed at its deadline), naming why. The
+    /// fields are then a guess built from "not set" readings, so callers go
+    /// through [`DefaultBase::checked`] rather than present the guess.
+    pub incomplete: Option<String>,
+}
+
+impl DefaultBase {
+    /// The answer, or the reason it is not one. A missing default branch read
+    /// through a refusal used to render as a repository with no default
+    /// branch; with the reason, a deferral is retried instead.
+    pub(crate) fn checked(self) -> Result<Self, String> {
+        match self.incomplete {
+            Some(reason) => Err(reason),
+            None => Ok(self),
+        }
+    }
+}
+
+/// One `hydrate` asks for the default base three times at once, and each
+/// answer cost five git processes. The answer is a function of a handful of
+/// files, so it is memoized against their identity rather than against time:
+/// a timer would serve the pre-change answer to the very refresh the change
+/// triggered, and nothing would ever ask again.
+///
+/// Every input is stamped *before* the lookup runs, so a write that races the
+/// lookup leaves a stamp that no longer matches and the next call recomputes.
+/// Git replaces config, HEAD, packed-refs and loose refs by lockfile rename,
+/// which gives each write a new inode and moves the containing directory's
+/// mtime.
+///
+/// Known blind spots, seen at the next change to any stamped file: files
+/// pulled in by `include.path`/`includeIf`, the system config, and a default
+/// branch nested below `refs/heads/<dir>/` (only its directory's mtime moves).
+pub(crate) fn default_base(repo: &Path) -> DefaultBase {
+    const MAX_MEMOIZED_REPOS: usize = 64;
+    static MEMO: OnceLock<Mutex<HashMap<std::path::PathBuf, MemoizedBase>>> = OnceLock::new();
+    // Process-wide, so a cleared memo can never hand out a generation a
+    // waiting caller already saw.
+    static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // `hydrate` asks three times at the same instant, so a memo alone still
+    // computed three times on a cold or changed repository. Callers for one
+    // repository take turns; the stamp is re-read after the wait, so the
+    // second caller is served the first one's answer only if nothing moved.
+    static TURNS: OnceLock<Mutex<HashMap<std::path::PathBuf, std::sync::Arc<Mutex<()>>>>> =
+        OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    // What had been computed when this caller arrived. Anything newer was
+    // computed while it waited for its turn.
+    let arrived = memo
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(repo)
+        .map_or(0, |entry| entry.generation);
+    let turn = {
+        let mut turns = TURNS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if turns.len() >= MAX_MEMOIZED_REPOS {
+            turns.retain(|_, turn| std::sync::Arc::strong_count(turn) > 1);
+        }
+        std::sync::Arc::clone(turns.entry(repo.to_path_buf()).or_default())
+    };
+    let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
+    let stamp = DefaultBaseStamp::read(repo);
+    if let Some(stamp) = &stamp {
+        let cached = memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(repo)
+            .cloned();
+        // A clean answer serves anyone while its stamp holds. A refused one
+        // serves only the callers that queued behind it: they would have
+        // been refused too, and repeating it in turn cost ~2 s apiece. A
+        // caller that arrives after it was stored asks git again.
+        if let Some(entry) = cached {
+            if &entry.stamp == stamp && (entry.clean || entry.generation > arrived) {
+                return entry.value;
+            }
+        }
+    }
+    // The lookups below read a failed spawn as "not set". Under load that is
+    // a refusal, not an answer, so a value computed while any of them failed
+    // is marked unclean: shared with the callers already queued behind it,
+    // never served to one that arrives later.
+    let failures_before = git_cli::process_failures();
+    let remote = resolve_default_remote(repo);
+    let head_ref = remote_head_ref(&remote);
+    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
+    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
+    let clean = git_cli::process_failures() == failures_before;
+    let value = DefaultBase {
+        remote,
+        remote_head,
+        base,
+        incomplete: (!clean).then(|| {
+            git_cli::last_process_failure()
+                .unwrap_or_else(|| "a default-branch lookup produced no answer".into())
+        }),
+    };
+    if let Some(stamp) = stamp {
+        let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
+        if memo.len() >= MAX_MEMOIZED_REPOS && !memo.contains_key(repo) {
+            memo.clear();
+        }
+        memo.insert(
+            repo.to_path_buf(),
+            MemoizedBase {
+                generation: GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                stamp,
+                value: value.clone(),
+                clean,
+            },
+        );
+    }
+    value
+}
+
+#[derive(Clone)]
+struct MemoizedBase {
+    generation: u64,
+    stamp: DefaultBaseStamp,
+    value: DefaultBase,
+    /// False when any git process in the lookup was refused or failed to
+    /// start: the value then reads a refusal as "not set".
+    clean: bool,
+}
+
+/// Identity of every file the default-base answer depends on. `None` for a
+/// file that does not exist, which is itself part of the state: creating
+/// `refs/remotes/origin/HEAD` must invalidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DefaultBaseStamp(Vec<(std::path::PathBuf, Option<FileIdentity>)>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    inode: u64,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl DefaultBaseStamp {
+    /// `None` when the git directories cannot be resolved: no stamp means no
+    /// memo, never a stamp that matches by accident.
+    fn read(repo: &Path) -> Option<Self> {
+        let (private, common) = crate::repository_trust::git_directories(repo).ok()?;
+        let mut paths = vec![
+            private.join("HEAD"),
+            private.join("config.worktree"),
+            common.join("config"),
+            common.join("packed-refs"),
+            common.join("reftable").join("tables.list"),
+            common.join("refs").join("heads"),
+        ];
+        // The primary remote is an output of the lookup, so every remote's
+        // directory is stamped; a repository has a handful.
+        let remotes = common.join("refs").join("remotes");
+        paths.push(remotes.clone());
+        if let Ok(entries) = std::fs::read_dir(&remotes) {
+            let mut dirs: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            dirs.sort();
+            dirs.truncate(64);
+            paths.extend(dirs);
+        }
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            paths.push(home.join(".gitconfig"));
+            paths.push(home.join(".config").join("git").join("config"));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
+            paths.push(xdg.join("git").join("config"));
+        }
+        Some(Self(
+            paths
+                .into_iter()
+                .map(|path| {
+                    let identity = std::fs::metadata(&path).ok().map(|meta| FileIdentity {
+                        inode: file_inode(&meta),
+                        len: meta.len(),
+                        modified: meta.modified().ok(),
+                    });
+                    (path, identity)
+                })
+                .collect(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(meta)
+}
+
+/// Windows has no stable inode through `std`; size and mtime still move on
+/// every lockfile rename git performs.
+#[cfg(not(unix))]
+fn file_inode(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
 /// Remote-tracking refname whose symref target marks the default branch.
 pub(crate) fn remote_head_ref(remote: &str) -> String {
     format!("refs/remotes/{remote}/HEAD")
@@ -2724,9 +2937,9 @@ fn compute_eligible_churn(
 
     // One tip at a time. `into_par_iter` started up to 96 tips at once, two
     // `git` processes each, and a concurrency cap of ~16 children that finish
-    // in ~200 ms is still ~80 starts a second — the storm measured while
-    // cargo wrote `target*/`. The spawn gate's per-second cap is the backstop;
-    // this walk must not be the thing that spends the whole burst in one tick.
+    // in ~200 ms is still ~80 starts a second. It also ran them on rayon
+    // workers, which do not inherit the caller's admission class. The gate's
+    // rate cap is the backstop; this walk must not spend the burst in one tick.
     let computed_map: HashMap<String, ComputedBranchChurn> = unique_uncached
         .into_iter()
         .filter_map(|tip| compute_branch_churn(repo, base_oid, &tip).map(|churn| (tip, churn)))
@@ -4577,6 +4790,273 @@ mod tests {
 
         let empty = init_repo_with_remotes(&[], "release");
         assert_eq!(resolve_default_remote(empty.path()), "origin");
+    }
+
+    /// One `hydrate` asks `list_branches`, `list_tags` and `branch_stats` in
+    /// parallel, and each resolved the default base itself: five git processes
+    /// apiece, measured at ~3x per refresh. Unchanged repository state must be
+    /// resolved once; a changed config or a moved default branch must not be
+    /// served from the memo.
+    #[test]
+    fn unchanged_state_resolves_the_default_base_once_per_change() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let lookups = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+                .count()
+        };
+        let before = lookups();
+        GitReader::list_branches(&path).expect("branches");
+        GitReader::list_tags(&path).expect("tags");
+        GitReader::branch_stats(&path).expect("stats");
+        assert_eq!(
+            lookups() - before,
+            1,
+            "one refresh, one default-base lookup"
+        );
+
+        git_in(&repo, &["config", "checkout.defaultRemote", "origin"]);
+        GitReader::list_branches(&path).expect("branches after config change");
+        assert_eq!(lookups() - before, 2, "a config write must be seen");
+
+        git_in(&repo, &["commit", "--allow-empty", "-m", "moves main"]);
+        let head = String::from_utf8_lossy(&git_output(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        let branches = GitReader::list_branches(&path).expect("branches after commit");
+        assert_eq!(lookups() - before, 3, "a moved default branch must be seen");
+        let main = branches
+            .iter()
+            .find(|b| b.name == "main")
+            .expect("main listed");
+        assert_eq!(main.tip_commit_id, head);
+        assert_eq!(
+            GitReader::default_branch_name(&path).unwrap().as_deref(),
+            Some("main")
+        );
+    }
+
+    /// The lookups read a failed spawn as "not set", so under load a refusal
+    /// produced "origin" and no base. A memo must not keep that: the next ask
+    /// after load falls has to see the repository, with nothing changed on
+    /// disk to invalidate the stamp.
+    #[test]
+    fn a_default_base_computed_while_spawns_failed_is_not_memoized() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let lookups = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+                .count()
+        };
+        let refused = crate::engine::git_cli::with_forced_spawn_failure(|| default_base(&repo));
+        assert_eq!(
+            refused.base, None,
+            "every spawn failed, so nothing resolved"
+        );
+        let reason = refused
+            .incomplete
+            .clone()
+            .expect("the guess says it is one");
+        assert!(reason.contains("forced by test"), "{reason}");
+        assert_eq!(refused.clone().checked(), Err(reason));
+        let before = lookups();
+        let seen = default_base(&repo);
+        assert_eq!(
+            lookups() - before,
+            1,
+            "the refused answer was served from the memo"
+        );
+        let (name, oid) = seen
+            .base
+            .clone()
+            .expect("the repository's own default base");
+        assert_eq!(name, "main");
+        let head = String::from_utf8_lossy(&git_output(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(oid, head);
+        let again = default_base(&repo);
+        assert_eq!(lookups() - before, 1, "a clean answer is memoized");
+        assert_eq!(again, seen);
+        assert_eq!(seen.incomplete, None);
+    }
+
+    /// The graph's default-branch label used to read a refused lookup as "this
+    /// repository has no default branch".
+    #[test]
+    fn a_default_branch_read_through_a_refusal_is_an_error_not_none() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let path = dir.path().to_str().unwrap().to_string();
+        let refused = crate::engine::git_cli::with_forced_spawn_failure(|| {
+            GitReader::default_branch_name(&path)
+        });
+        let error = refused.expect_err("a refusal is not an absent default branch");
+        assert!(error.contains("forced by test"), "{error}");
+        assert_eq!(
+            GitReader::default_branch_name(&path).unwrap().as_deref(),
+            Some("main")
+        );
+    }
+
+    /// Under load the leader's lookup is refused, and is rightly not memoized.
+    /// The two callers queued behind it then each ran the whole lookup again,
+    /// one after the other: three deferrals of ~2 s served in series. Callers
+    /// that arrived while it ran share its answer, refused or not, as long as
+    /// nothing stamped moved.
+    #[test]
+    fn callers_queued_behind_a_refused_lookup_share_its_answer() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let lookups = {
+            let repo = repo.clone();
+            move || {
+                crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                    .iter()
+                    .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+                    .count()
+            }
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let leader = {
+            let repo = repo.clone();
+            std::thread::spawn(move || {
+                crate::engine::git_cli::with_forced_spawn_failure_then(
+                    move || {
+                        let _ = entered_tx.send(());
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    },
+                    || default_base(&repo),
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the leader never started its lookup");
+        let before = lookups();
+        let followers: Vec<_> = (0..2)
+            .map(|_| {
+                let repo = repo.clone();
+                std::thread::spawn(move || default_base(&repo))
+            })
+            .collect();
+        let refused = leader.join().unwrap();
+        assert_eq!(refused.base, None);
+        for follower in followers {
+            assert_eq!(
+                follower.join().unwrap(),
+                refused,
+                "a queued caller ran its own lookup"
+            );
+        }
+        assert_eq!(
+            lookups() - before,
+            0,
+            "queued callers repeated the refused lookup in series"
+        );
+
+        let fresh = default_base(&repo);
+        assert_eq!(lookups() - before, 1, "a later caller must look again");
+        assert_eq!(fresh.base.map(|(name, _)| name).as_deref(), Some("main"));
+    }
+
+    /// Readers hammer the memo while a writer moves every input it stamps.
+    /// After each change settles, the memo must agree with an uncached
+    /// lookup: a reader that stamped before a write must never leave its
+    /// answer standing for the writer's state.
+    #[test]
+    fn the_default_base_tracks_concurrent_ref_and_config_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let uncached = |repo: &Path| {
+            let remote = resolve_default_remote(repo);
+            let head_ref = remote_head_ref(&remote);
+            let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
+            let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
+            DefaultBase {
+                remote,
+                remote_head,
+                base,
+                incomplete: None,
+            }
+        };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (repo, stop) = (repo.clone(), std::sync::Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = default_base(&repo);
+                    }
+                })
+            })
+            .collect();
+        let steps: [&[&str]; 10] = [
+            &["commit", "--allow-empty", "-m", "a"],
+            &["config", "checkout.defaultRemote", "upstream"],
+            &["branch", "master"],
+            &["update-ref", "refs/remotes/upstream/trunk", "HEAD"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/trunk",
+            ],
+            &["commit", "--allow-empty", "-m", "b"],
+            &["update-ref", "refs/remotes/upstream/trunk", "HEAD"],
+            &["config", "--unset", "checkout.defaultRemote"],
+            &["branch", "-D", "master"],
+            &["pack-refs", "--all"],
+        ];
+        for (n, step) in steps.iter().enumerate() {
+            git_in(&repo, step);
+            assert_eq!(
+                default_base(&repo),
+                uncached(&repo),
+                "diverged after step {n}: {step:?}"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(default_base(&repo), uncached(&repo));
+    }
+
+    /// What `hydrate` actually does: the three readers at the same instant on a
+    /// repository nobody has asked about yet.
+    #[test]
+    fn concurrent_first_asks_resolve_the_default_base_once() {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let callers: Vec<std::thread::JoinHandle<()>> = (0..3)
+            .map(|which| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    match which {
+                        0 => drop(GitReader::list_branches(&path).expect("branches")),
+                        1 => drop(GitReader::list_tags(&path).expect("tags")),
+                        _ => drop(GitReader::branch_stats(&path).expect("stats")),
+                    }
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        let lookups = crate::engine::git_cli::spawn_log::spawns_in(&repo)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+            .count();
+        assert_eq!(lookups, 1);
     }
 
     #[test]

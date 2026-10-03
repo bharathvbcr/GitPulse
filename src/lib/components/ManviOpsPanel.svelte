@@ -2,7 +2,7 @@
   import { onMount, tick } from "svelte";
   import { createVisibleInterval } from "../dom/visibleInterval";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";

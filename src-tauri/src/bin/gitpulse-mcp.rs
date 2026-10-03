@@ -519,6 +519,10 @@ fn read_loop<R: std::io::BufRead>(
 }
 
 fn main() {
+    // Agent and scheduled work: shed before the app the user is looking at is
+    // deferred, on every thread this process starts. First, so no thread has
+    // already been given the app's default.
+    gitpulse_lib::engine::git_cli::run_process_as_background();
     gitpulse_lib::logging::init();
     gitpulse_lib::logging::install_panic_hook();
     // Same descriptor headroom the GUI takes: this server answers agent

@@ -2120,6 +2120,53 @@ exit 2
         );
     }
 
+    /// A probe the spawn gate declined under load is not a devmap that cannot
+    /// answer, and must not be reported as one.
+    ///
+    /// The live heal runs as background work, which the gate sheds outright
+    /// while the spawn budget is low — exactly the condition at launch, when
+    /// every restored tab asks at once. Reported as `skip_unavailable`, the
+    /// frontend recorded the repository as settled and never asked again, so
+    /// those maps stayed stale for the rest of the session. The wire name is
+    /// asserted, not the variant, because the frontend switches on the string.
+    #[test]
+    #[cfg(unix)]
+    fn live_refresh_reports_a_probe_shed_under_load_as_deferred() {
+        use crate::engine::git_cli::{refusal_message, Refusal};
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        write_stub_artifacts(repo.path());
+        let devmap = bind_recording_devmap(repo.path());
+        for refusal in [
+            Refusal::Shed,
+            Refusal::Refused {
+                waited: Duration::from_millis(1_500),
+            },
+        ] {
+            let declined = refusal_message("devmap", refusal);
+            devmap.set_status(unavailable_status(&declined));
+            let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
+            assert_eq!(
+                serde_json::to_value(outcome.decision).unwrap(),
+                "skip_deferred",
+                "{refusal:?}: {outcome:?}"
+            );
+            assert!(outcome.build.is_none(), "{outcome:?}");
+            assert_eq!(outcome.reason.as_deref(), Some(declined.as_str()));
+            // Nothing was examined, so nothing may be claimed about the store.
+            assert!(
+                !outcome.facts.available && !outcome.facts.is_fresh,
+                "{outcome:?}"
+            );
+        }
+        let log = argv_log(repo.path());
+        assert!(
+            !log.lines().any(|line| line.starts_with("build ")),
+            "a deferred probe spawned a build:\n{log}"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn live_refresh_obsolete_payload_never_falls_back_to_incremental_across_a_storm() {

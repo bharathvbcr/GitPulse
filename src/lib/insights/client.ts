@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import type { CollisionRisk, InsightsSnapshot, McpInfo } from "./types";
 
 export function getInsightsSnapshot(repoPath: string): Promise<InsightsSnapshot> {

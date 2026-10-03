@@ -278,6 +278,44 @@ pub fn scope(repo_path: &str, task_id: &str) -> Result<Option<TaskScope>, String
     let Some(store) = open(repo_path)? else {
         return Ok(None);
     };
+    scope_in(&store, task_id)
+}
+
+/// Most task ids one [`scopes`] call reads.
+pub const MAX_SCOPE_IDS: usize = 64;
+
+/// The scopes of several tasks, read from one opening of the store.
+///
+/// Ids the store does not hold are absent from the answer, as [`scope`]
+/// answers `None` for them, and a repeated id is read once. More distinct ids
+/// than [`MAX_SCOPE_IDS`] are refused rather than cut, so a caller can never
+/// take a capped answer for a complete one.
+pub fn scopes(repo_path: &str, task_ids: &[String]) -> Result<Vec<TaskScope>, String> {
+    let mut wanted: Vec<&str> = Vec::new();
+    for id in task_ids {
+        if !wanted.contains(&id.as_str()) {
+            wanted.push(id);
+        }
+    }
+    if wanted.len() > MAX_SCOPE_IDS {
+        return Err(format!(
+            "{} task ids were asked for in one read; the limit is {MAX_SCOPE_IDS}",
+            wanted.len()
+        ));
+    }
+    let Some(store) = open(repo_path)? else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for id in wanted {
+        if let Some(scope) = scope_in(&store, id)? {
+            found.push(scope);
+        }
+    }
+    Ok(found)
+}
+
+fn scope_in(store: &dc_store::Store, task_id: &str) -> Result<Option<TaskScope>, String> {
     let Some(task) = store.task(task_id).map_err(|e| format!("{e}"))? else {
         return Ok(None);
     };

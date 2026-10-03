@@ -11,13 +11,14 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [1.3.5] - 2026-10-02
+## [1.3.5] - 2026-10-03
 
 Stale-branch cleanup with backups, a secret scan that never reads a partial
 scan as clean, worktree cache sync and named local routes, symbol-level
 collision notes, Markdown rendered by MarkDev, terminals that report what they
-are running, coloured tabs, timers that stop in the background, and Bun for
-installs and scripts.
+are running, coloured tabs, timers that stop in the background, Bun for
+installs and scripts, and git spawns admitted by class so a refresh storm
+can no longer starve the actions you asked for.
 
 ### Added
 
@@ -204,16 +205,137 @@ installs and scripts.
   audit ran and failed. `bun audit --json` runs when bun is on PATH and a
   `bun.lock` is present; an empty or unexpected body is an error, not a
   clean report.
-- **A refresh can no longer start a git storm.** Branch stats walked up to
-  96 tips at once, two `git` processes each, which is the 40–80 starts a
-  second measured while cargo wrote `target*/`. Tips are walked one at a
-  time, every spawn still draws from the per-second cap, and a refusal
-  reports how long it actually waited.
 - **A build-directory storm no longer fans out into git.** The watcher
   ignores directories that are build output by construction and directories
   gitignore already covers, and git spawns are rate-limited after a short
   burst. A failed or truncated ignore query stays partial; it does not read
   as "nothing is ignored".
+- **A repository with `core.fsmonitor=true` no longer refreshes itself once a
+  second.** Every `git status` makes git's filesystem monitor write a cookie
+  under `.git/fsmonitor--daemon/`. The watcher counted that as a change, so
+  each refresh announced the next one: about 1,350 git processes a minute,
+  all against the one watched repository that had fsmonitor on. The daemon's
+  state directory and socket are now watcher noise, including a linked
+  worktree's: the main worktree watches the common directory, so every
+  `git status` in an agent's worktree used to refresh the main tab.
+- **A repository with `core.splitIndex` no longer refreshes itself either.**
+  Every `git status` and `git diff` touches `.git/sharedindex.*` to keep it
+  from expiring, even with optional locks off. A real index change still
+  rewrites `.git/index`, which the watcher still sees. A test now runs a
+  whole refresh's reads under each index feature against the real watcher
+  and fails on any self-announced change.
+- **One refresh resolves the default branch once, not three times.** The
+  branch list, the tag list and branch stats each spent five git processes
+  finding the default base, all at the same moment. The answer is now
+  memoized against the identity of the files that decide it (HEAD, config,
+  packed-refs, the branch and remote ref directories, the global config). It
+  is recomputed the moment any of them changes, never on a timer. A lookup
+  during which any git process was refused or failed to start is never
+  memoized for later callers; under load it would have read as "no default
+  branch". Callers already queued behind it share it instead of repeating a
+  ~2 s refusal one after another.
+- **Branch stats walk one tip at a time.** Up to 96 tips started at once, two
+  git processes each.
+- **Identical reads waiting at the spawn gate share one git process.** A read
+  can only join one that has not started yet. A read that arrives after the
+  process started may be asking because of a write it cannot have seen, so
+  it starts its own.
+- **A refresh storm can no longer refuse your own actions.** Spawns are
+  admitted as interactive (a mutation you asked for), reactive (refreshes,
+  the default) or background (indexing and docs). Interactive work is
+  limited by concurrency only and never waits for, or spends, a rate token.
+  Background work is shed first, as soon as the rate budget is down to the
+  quarter kept for refreshes. A cancel check that panicked can no longer
+  leave its waiting place behind, which would have blocked every refresh
+  for the rest of the session, and the check no longer runs while the gate
+  holds its own lock.
+- **A deferral says it was a deferral.** A spawn refused under load used to
+  read "git -c timed out after 89.99s waiting for a process slot" after
+  about two seconds. It now reads "deferred under load after 2.013s". Every
+  panel shows it as a warning that expires and logs it as a warning, rather
+  than as a sticky error toast and an ERROR entry. When the gate refuses
+  work, the diagnostic log records the per-class totals of admitted, shared,
+  deferred, shed and timed-out spawns, and where the rate budget lives.
+- **Every panel asks again after a deferral, not just the repository
+  snapshot.** The frontend now has one IPC entry point
+  (`src/lib/ipc/invoke.ts`), and a test fails if a module imports Tauri's
+  `invoke` directly. A deferred call is retried after 3, 6, 12, 24 and 30 s,
+  never straight back into the limit. Identical calls waiting to retry share
+  one chain, so a poller cannot stack retries. If all five retries are
+  deferred, the deferral is shown as a warning. Retrying is safe because of a
+  backend guarantee: a command that reached the mutation guard never returns
+  the deferral marker, so a deferred call is one that changed nothing.
+- **All GitPulse processes share one spawn budget.** The app, each agent
+  session's `gitpulse-mcp`, `gitpulsed` and the hooks each had a rate bucket
+  of their own, so N processes could start N times the capped rate. They now
+  also draw from one per-user record (`spawn-budget.v1` in the GitPulse config
+  directory), updated under an advisory lock. The record can only tighten a
+  process's own limit, never loosen it. One that is not a private regular
+  file is refused at open, and the process stays on its own budget and logs
+  why. A lock held longer than 25 ms (a stopped process) is skipped for that
+  decision and counted; it never stalls this process.
+- **Agent and daemon work is background work.** `gitpulse-mcp` and
+  `gitpulsed` start every thread in the background class, so under load an
+  agent's query is deferred before the app you are looking at is.
+- **The refresh after your own action is not deferred.** A mutation grants
+  its repository a short credit: up to 32 spawns in the next 3 s are admitted
+  like the action itself, so the screen catches up with what you just did
+  even while a refresh storm holds the rate budget.
+- **Worktree listings say why a count is missing.** A worktree whose status
+  read failed or was deferred showed "not scanned", the same as one past the
+  32-worktree limit. Each entry now carries its reason. The scans run four
+  at a time, in the caller's admission class, instead of all at once on
+  rayon's pool, whose threads start in the default class. The worktree
+  summary no longer reports "Worktree clean" when none of its reads
+  answered.
+- **A refused lookup no longer passes for an absent answer.** The default
+  branch read through a refusal used to render as "this repository has no
+  default branch", and a refused current-branch lookup drew the graph with no
+  HEAD label. Both now fail with their own cause, which is retried when it
+  is a deferral.
+- **Live index: a status probe the spawn gate sheds or defers under load now
+  answers `skip_deferred` instead of `skip_unavailable`.** The frontend
+  re-queues it with the shared deferral backoff (3 s, doubling, at most 5
+  retries) rather than recording it as settled, so tabs restored at launch
+  heal later in the session; a tab whose retries run out says so and asks
+  again when focused or on its next change. The background queue now runs the focused
+  repository first instead of in tab order.
+- **More of a refresh's reads are shared.** The stash list, `HEAD`, the
+  branch-stats ref listing, a history page and the graph's ref listing now
+  share one git process when identical reads are queued together.
+- **Opening a repository no longer starts a burst of `git worktree list`.**
+  Every ledger and task-store read authenticates the repository with that
+  command. In a three-minute sample of the app it was 305 of its 420
+  children, and a timestamped re-sample put 232 of its 243 in the first 15
+  seconds. It came from three places:
+  - **The action journal read the whole ledger to show its last 200 rows.**
+    It paged from the start, 200 rows per request (about 148 requests on a
+    29,573-row ledger), and the display cap then threw away all but the
+    newest. Each sync now asks once for the newest 200 rows after its cursor
+    (`cmd_ledger_tail` with `newest`). The window is the newest rows by
+    insertion order, then sorted by time for display. Before, it was the
+    newest by time across the whole history, so the two can differ for a
+    replayed row that carries an older timestamp. The check that every row
+    belongs to this repository now covers the rows read, not the whole
+    history.
+  - **Every ledger append started its own journal sync.** A catch-up
+    announces each replayed row, and each announcement cost two git
+    processes. A request that arrives during a sync now folds into one more
+    sync after it.
+  - **The Work view asked for each task title separately.** That was up to
+    32 requests per refresh. Titles, and the Worktrees panel's task scopes,
+    now come from one `cmd_task_scopes` request, which replaces
+    `cmd_task_scope`.
+- **Finding a worktree's task is one indexed query.** The lookup runs before
+  every gated action and once per worktree on each Work refresh. It read the
+  whole ledger 1000 rows at a time, holding the app-wide ledger lock for each
+  read (about 30 on a 29,573-row ledger), so it briefly blocked every other
+  ledger read and write. It is now one query on a new partial index, created
+  when the ledger opens. It still refuses to answer if any row names another
+  repository. A row elsewhere in the ledger that cannot be decoded no longer
+  fails the lookup. The Worktrees panel now reads its worktrees' tasks four
+  at a time, through the same reader the Work view uses, instead of one
+  after another.
 
 ### Documentation
 

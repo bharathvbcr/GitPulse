@@ -5,7 +5,7 @@
  * PATH. Install uses a four-rung ladder (PATH → prebuilt → toolchain remote →
  * local checkout).
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { autoInit } from "../codeintel/autoInit";
 import { boundText } from "../codeintel/walkIncomplete";

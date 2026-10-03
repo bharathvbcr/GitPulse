@@ -4,7 +4,7 @@
  */
 
 import { writable, derived, get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { previewDevmapEdits } from "./client";
 import {
   CODEINTEL_FANOUT_CAP,

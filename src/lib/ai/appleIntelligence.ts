@@ -25,7 +25,7 @@
  * model still downloading just needs a minute.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 
 export interface AppleIntelligenceStatus {
   /** False when this build has no Foundation Models bridge at all. */

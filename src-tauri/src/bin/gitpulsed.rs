@@ -267,6 +267,10 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
 }
 
 fn main() {
+    // Agent and scheduled work: shed before the app the user is looking at is
+    // deferred, on every thread this process starts. First, so no thread has
+    // already been given the app's default.
+    gitpulse_lib::engine::git_cli::run_process_as_background();
     // The daemon runs unattended for hours, which is precisely when nobody is
     // watching stderr. Without this it had no durable record and no panic
     // hook at all: a crash mid-catch-up left the ledger hole it exists to

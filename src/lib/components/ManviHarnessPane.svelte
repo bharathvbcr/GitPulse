@@ -231,7 +231,7 @@
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import type { GrantView } from "../grants/types";
   import {
     activeGrants as selectActiveGrants,

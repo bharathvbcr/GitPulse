@@ -8,6 +8,7 @@ import {
   type HarnessStatus,
   type PolicyVerdict,
 } from "../harnessStore";
+import { MAX_AGENT_ACTIONS } from "../../agents/activity";
 import type { CatchUp } from "../../ingest/types";
 import type { LedgerEvent, LedgerStatus } from "../../ledger/types";
 
@@ -99,13 +100,73 @@ function ledgerInvoke(
       const cursor = Number(args?.cursor ?? 0);
       const limit = Number(args?.limit ?? 200);
       tailCalls.push({ repoPath, cursor });
-      return (ledgers.get(repoPath) ?? [])
-        .filter((event) => event.id > cursor)
-        .slice(0, limit);
+      const after = (ledgers.get(repoPath) ?? []).filter((event) => event.id > cursor);
+      // `newest` is `ledger::tail_newest`: the last `limit` rows, oldest first.
+      return args?.newest === true ? after.slice(-limit) : after.slice(0, limit);
     }
     throw new Error(`unexpected ${cmd}`);
   }) as <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 }
+
+describe("ledger sync cost", () => {
+  it("reads a long history's newest window in one request, not by paging all of it", async () => {
+    // Each request runs `git worktree list` in the backend. Draining a
+    // 29,573-row ledger 200 rows at a time was ~148 of them at launch.
+    const repo = "/repos/long";
+    const row = (id: number) => ({
+      ...ledgerEvent(repo, id, `01L${String(id).padStart(23, "0")}`, `row ${id}`),
+      ts_utc: new Date(Date.UTC(2026, 8, 1) + id * 1000).toISOString(),
+    });
+    const rows = Array.from({ length: 1000 }, (_, i) => row(i + 1));
+    const calls: Array<{ repoPath: string; cursor: number }> = [];
+    const store = createHarnessStore({ invoke: ledgerInvoke(new Map([[repo, rows]]), calls) });
+
+    await store.catchUp(repo);
+    expect(calls).toEqual([{ repoPath: repo, cursor: 0 }]);
+    expect(get(store).ledgerCursor).toBe(1000);
+    const labels = get(store).actions.map((action) => action.label);
+    expect(labels).toHaveLength(MAX_AGENT_ACTIONS);
+    expect(labels.at(0)).toBe(`row ${1000 - MAX_AGENT_ACTIONS + 1}`);
+    expect(labels.at(-1)).toBe("row 1000");
+
+    rows.push(row(1001));
+    await store.catchUp(repo);
+    expect(calls.at(-1)).toEqual({ repoPath: repo, cursor: 1000 });
+    expect(get(store).actions.at(-1)?.label).toBe("row 1001");
+  });
+
+  it("folds a burst of append announcements into one more sync, and loses none of the rows", async () => {
+    // A catch-up announces every replayed row. One sync per announcement was
+    // two backend git processes per row.
+    const repo = "/repos/burst";
+    const rows = [ledgerEvent(repo, 1, `01B${"1".padStart(23, "0")}`, "row 1")];
+    const calls: Array<{ repoPath: string; cursor: number }> = [];
+    const backend = ledgerInvoke(new Map([[repo, rows]]), calls);
+    // Both ledger commands authenticate the repository in the backend.
+    let authenticated = 0;
+    const invoke = (<T,>(cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "cmd_ledger_status" || cmd === "cmd_ledger_tail") authenticated += 1;
+      return backend<T>(cmd, args);
+    }) as typeof backend;
+    const store = createHarnessStore({ invoke });
+    store.activateRepository(repo);
+
+    const first = store.syncLedger(repo);
+    for (let id = 2; id <= 11; id += 1) {
+      rows.push(ledgerEvent(repo, id, `01B${String(id).padStart(23, "0")}`, `row ${id}`));
+      void store.syncLedger(repo);
+    }
+    const last = store.syncLedger(repo);
+    await Promise.all([first, last]);
+
+    expect(authenticated).toBe(4); // two syncs, a status and a tail each
+    expect(get(store).ledgerCursor).toBe(11);
+    expect(get(store).actions.map((action) => action.label)).toContain("row 11");
+
+    await store.syncLedger(repo);
+    expect(authenticated).toBe(6); // a later request, after the burst, still runs
+  });
+});
 
 const harnessOk = { available: true, binary: "manvi", protocol: 1, posture: "host", ops: [], error: "", error_code: "" } as HarnessStatus;
 

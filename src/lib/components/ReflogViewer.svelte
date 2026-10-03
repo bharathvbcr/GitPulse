@@ -10,7 +10,7 @@
 <script lang="ts">
   import type { ReflogEntry } from "../branches/types";
   import { repoStore } from "../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { History } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";

@@ -42,6 +42,7 @@
 //! of the child.
 
 use super::cli::{self, is_build_in_flight, BuildOutcome, CliStatus};
+use crate::engine::git_cli::is_deferred_under_load;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -103,6 +104,12 @@ pub enum LiveRefreshDecision {
     /// rebuilding them itself. Not a permanent skip: the daemon drains, the
     /// store goes fresh, and the next tick answers `SkipFresh` instead.
     SkipDaemon,
+    /// The spawn gate declined to start the status probe or the build under
+    /// load (background work is shed first). Nothing was examined, so this is
+    /// not [`Self::SkipUnavailable`]: the same request may succeed in a few
+    /// seconds, and reporting it as unavailable let the frontend settle a
+    /// repository that was never looked at.
+    SkipDeferred,
 }
 
 impl LiveRefreshDecision {
@@ -191,6 +198,46 @@ fn raise_echo_cooldown(repo_path: &str, now: Instant, unchanged_echo: bool) {
             unchanged_echo,
         },
     );
+}
+
+/// Facts for a probe the spawn gate refused to start: nothing was learned
+/// about the store, so nothing is claimed.
+const UNEXAMINED: LiveRefreshFacts = LiveRefreshFacts {
+    available: false,
+    is_fresh: false,
+    schema_ok: false,
+    already_building: false,
+    rebuild_required: false,
+    artifacts_missing: false,
+    daemon_pending: None,
+};
+
+/// A request the spawn gate refused to start, carrying whatever the status
+/// probe did establish ([`UNEXAMINED`] when the probe itself was refused) and
+/// the gate's own sentence as the reason.
+fn skip_deferred_outcome(facts: LiveRefreshFacts, reason: String) -> LiveRefreshOutcome {
+    LiveRefreshOutcome {
+        decision: LiveRefreshDecision::SkipDeferred,
+        facts: facts.into(),
+        build: None,
+        reason: Some(reason),
+        cooldown_remaining_ms: None,
+        artifacts_restored: false,
+    }
+}
+
+/// What a build that could not be started means for the decision that wanted
+/// it. Only the gate's own predicate classifies a deferral, so this cannot
+/// drift from the message the gate writes.
+fn decision_for_spawn_error(error: &str, wanted: LiveRefreshDecision) -> LiveRefreshDecision {
+    if error.contains("already running") {
+        // BuildGuard race: status said free, then another build won.
+        LiveRefreshDecision::SkipBuilding
+    } else if is_deferred_under_load(error) {
+        LiveRefreshDecision::SkipDeferred
+    } else {
+        wanted
+    }
 }
 
 fn skip_cooldown_outcome(remaining: Duration) -> LiveRefreshOutcome {
@@ -469,6 +516,15 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
     }
 
     let cli = cli::status(repo_path);
+    // Shed or deferred by the spawn gate: the probe never ran. Answering
+    // `SkipUnavailable` here is what stranded every tab restored at launch.
+    if let Some(reason) = cli
+        .reason
+        .as_deref()
+        .filter(|reason| !cli.available && is_deferred_under_load(reason))
+    {
+        return skip_deferred_outcome(UNEXAMINED, reason.to_string());
+    }
     let (available, status_fresh, schema_ok) = freshness_from_cli_status(&cli);
     let needs_manifest = needs_manifest_rebuild(cli.status.as_ref());
     // Filesystem-only, and only after `cli::status` — which validates the repo
@@ -549,6 +605,7 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                     facts.daemon_pending.unwrap_or_default()
                 ),
                 LiveRefreshDecision::SkipCooldown => unreachable!(),
+                LiveRefreshDecision::SkipDeferred => unreachable!(),
                 LiveRefreshDecision::Refresh => unreachable!(),
             }),
             cooldown_remaining_ms: None,
@@ -611,12 +668,12 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
             }
         }
         Err(e) => {
-            // BuildGuard race: status said free, then another build won.
-            let decision = if e.contains("already running") {
-                LiveRefreshDecision::SkipBuilding
-            } else {
-                decision
-            };
+            let decision = decision_for_spawn_error(&e, decision);
+            if decision == LiveRefreshDecision::SkipDeferred {
+                // Status answered, then the build itself was shed. Not a
+                // failed build: no cooldown; keep what status did establish.
+                return skip_deferred_outcome(facts, e);
+            }
             LiveRefreshOutcome {
                 decision,
                 facts: LiveRefreshFactsDto {
@@ -650,6 +707,50 @@ impl IfEmpty for String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A build the gate would not start is a deferral, not a failed refresh:
+    /// left as `Refresh` with no build, the frontend reported "Refresh returned
+    /// no build outcome" and settled the repository. Fed the gate's real
+    /// messages, so a reworded refusal fails here rather than in the field.
+    #[test]
+    fn a_build_the_gate_declined_is_deferred_not_failed() {
+        use crate::engine::git_cli::{refusal_message, Refusal};
+        let wanted = LiveRefreshDecision::Refresh;
+        for refusal in [
+            Refusal::Shed,
+            Refusal::Refused {
+                waited: Duration::from_secs(2),
+            },
+        ] {
+            assert_eq!(
+                decision_for_spawn_error(&refusal_message("devmap", refusal), wanted),
+                LiveRefreshDecision::SkipDeferred,
+                "{refusal:?}"
+            );
+        }
+        // Neither a slot that never came free inside the deadline nor a
+        // cancellation is load-shedding; both keep the decision that ran.
+        for refusal in [
+            Refusal::TimedOut {
+                deadline: Duration::from_secs(30),
+            },
+            Refusal::Cancelled,
+        ] {
+            assert_eq!(
+                decision_for_spawn_error(&refusal_message("devmap", refusal), wanted),
+                wanted,
+                "{refusal:?}"
+            );
+        }
+        assert_eq!(
+            decision_for_spawn_error("a devmap build is already running for /repo", wanted),
+            LiveRefreshDecision::SkipBuilding
+        );
+        assert_eq!(
+            serde_json::to_value(LiveRefreshDecision::SkipDeferred).unwrap(),
+            "skip_deferred"
+        );
+    }
 
     /// Give a fixture repository the consumer artifacts a real build writes.
     ///

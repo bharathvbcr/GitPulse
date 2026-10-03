@@ -2,7 +2,7 @@
   import { crossfade } from "svelte/transition";
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
   import { Archive, Bot, Clipboard, EyeOff, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";

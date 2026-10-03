@@ -6,7 +6,7 @@
   import { densityStore } from "../stores/densityStore";
   import { rowHeight } from "../ui/density";
   import { repoStore } from "../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { FileCode, PanelLeftClose, PanelLeftOpen, Search, X } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";

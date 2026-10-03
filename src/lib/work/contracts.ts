@@ -72,7 +72,7 @@ export function validateWorkResponse(command: string, value: unknown): void {
         break;
       }
       case "cmd_worktree_task": nullableText(value); break;
-      case "cmd_task_scope": if (value != null) fields(value, ["title"]); break;
+      case "cmd_task_scopes": list(value, entry => { fields(entry, ["id", "title"]); }); break;
       case "cmd_repo_operation": {
         if (value === null) break;
         const op = fields(value, ["kind"]);

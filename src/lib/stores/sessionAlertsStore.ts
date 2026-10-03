@@ -1,5 +1,5 @@
 import { writable, type Readable } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
 import { createAttendance } from "../terminal/attendance";
 

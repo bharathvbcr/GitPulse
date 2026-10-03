@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_repo_ts  ON events(repo_path, ts_utc);
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_binding  ON events(worktree_path, ts_utc)
+  WHERE action IN ('worktree.bind', 'worktree.unbind');
 CREATE TABLE IF NOT EXISTS ledger_family_imports (
   source_key     TEXT PRIMARY KEY,
   source_label   TEXT NOT NULL,
@@ -986,20 +988,101 @@ pub fn record(draft: Draft) -> Option<i64> {
 /// asks for what followed, and the answer is the same whether it has been
 /// listening for an hour or has just opened the app.
 pub fn tail(repo_path: &str, cursor: i64, limit: u32) -> Result<Vec<LedgerEvent>, LedgerError> {
+    read_after(repo_path, cursor, limit, false)
+}
+
+/// The newest `limit` events after `cursor`, oldest first.
+///
+/// For a reader that keeps only the most recent rows. Paging [`tail`] forward
+/// from 0 to reach the newest rows reads the whole history, one request per
+/// page. The highest id returned is still the highest id after `cursor`, so a
+/// reader that continues with [`tail`] from it misses nothing new. Rows
+/// skipped below the window are not checked for a repository mismatch,
+/// because they are not read at all.
+pub fn tail_newest(
+    repo_path: &str,
+    cursor: i64,
+    limit: u32,
+) -> Result<Vec<LedgerEvent>, LedgerError> {
+    read_after(repo_path, cursor, limit, true)
+}
+
+/// The newest bind or unbind recorded for a worktree under either spelling of
+/// its path: `Some(Some(task))` for a binding, `Some(None)` for an unbind (or
+/// a bind naming no task), `None` when neither was ever recorded.
+///
+/// One indexed query (`idx_events_binding`) in place of paging the whole
+/// ledger through [`tail`], which held the app-wide ledger lock once per
+/// 1000 rows and ran on every gated mutation. Precedence is `(ts_utc, ulid)`,
+/// the order an imported legacy row keeps across databases; `ulid` is unique,
+/// so there are no ties. Like [`tail`], any row attributed to a different
+/// repository refuses the read. Unlike paging, a row elsewhere in the ledger
+/// that could not be decoded no longer fails it, because no other row is
+/// decoded.
+fn latest_binding(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    #[cfg(test)]
+    tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+    let canonical_repo_path = canonical_repo(repo_path);
+    let stored_repo_path = redact::text(&canonical_repo_path);
+    with_conn(repo_path, |conn| {
+        let foreign = conn
+            .query_row(
+                "SELECT 1 FROM events WHERE repo_path NOT IN (?1, ?2) LIMIT 1",
+                params![canonical_repo_path, stored_repo_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+        if foreign.is_some() {
+            return Err(LedgerError::new(
+                "repository_mismatch",
+                "the ledger contains an event attributed to a different repository",
+            ));
+        }
+        conn.query_row(
+            "SELECT action, task_id FROM events
+             WHERE action IN ('worktree.bind', 'worktree.unbind')
+               AND worktree_path IN (?1, ?2)
+             ORDER BY ts_utc DESC, ulid DESC
+             LIMIT 1",
+            params![worktree, stored_worktree],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+        .map(|found| {
+            found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND))
+        })
+    })
+}
+
+fn read_after(
+    repo_path: &str,
+    cursor: i64,
+    limit: u32,
+    newest: bool,
+) -> Result<Vec<LedgerEvent>, LedgerError> {
+    #[cfg(test)]
+    tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
     // An unbounded limit would let one call page an entire history into the
     // webview. 1000 is well past a screenful and far short of a memory problem.
     let limit = limit.clamp(1, 1000);
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
+    let order = if newest { "DESC" } else { "ASC" };
     with_conn(repo_path, |conn| {
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, ulid, ts_utc, schema_version, repo_path, worktree_path,
                         actor_kind, actor_id, session_id, task_id, action, object,
                         argv_json, outcome, verdict_json, before_ref, after_ref,
                         duration_ms, detail_json
-                 FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
-            )
+                 FROM events WHERE id > ?1 ORDER BY id {order} LIMIT ?2"
+            ))
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
         let rows = stmt
             .query_map(params![cursor, limit], event_from_row)
@@ -1007,6 +1090,9 @@ pub fn tail(repo_path: &str, cursor: i64, limit: u32) -> Result<Vec<LedgerEvent>
         let mut events = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| LedgerError::new("row_failed", e.to_string()))?;
+        if newest {
+            events.reverse();
+        }
         for event in &mut events {
             if event.repo_path != canonical_repo_path && event.repo_path != stored_repo_path {
                 return Err(LedgerError::new(
@@ -2174,6 +2260,12 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Ledger queries this thread has issued through [`read_after`] or
+        /// [`latest_binding`]; a test reads it to count what a lookup costs.
+        pub(super) static LEDGER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// A read must never bring the thing it is reading into existence.
     ///
     /// `gitpulse-mcp` annotates every tool `readOnlyHint: true,
@@ -3255,6 +3347,38 @@ mod tests {
         // Zero would otherwise return nothing forever and look like "no events".
         assert_eq!(tail(repo, 0, 0).expect("tail").len(), 1);
         assert_eq!(tail(repo, 0, u32::MAX).expect("tail").len(), 3);
+    }
+
+    /// The journal keeps the newest rows. Reaching them by paging `tail`
+    /// from 0 was one request per 200 rows, and one `git worktree list`
+    /// each: ~148 at launch on a 29,573-row ledger.
+    #[test]
+    fn tail_newest_returns_the_most_recent_window_oldest_first() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        for i in 0..6 {
+            append(draft(repo, &format!("a.b{i}"))).expect("append");
+        }
+        let actions = |events: Vec<LedgerEvent>| -> Vec<String> {
+            events.into_iter().map(|event| event.action).collect()
+        };
+        assert_eq!(
+            actions(tail_newest(repo, 0, 2).expect("newest")),
+            ["a.b4", "a.b5"]
+        );
+        let window = tail_newest(repo, 0, 2).expect("newest");
+        assert_eq!(
+            window.last().map(|event| event.id),
+            Some(latest_cursor(repo).expect("cursor")),
+            "the window ends at the high-water mark, so continuing from it misses nothing"
+        );
+        let after_first = tail(repo, 0, 1).expect("tail")[0].id;
+        assert_eq!(
+            actions(tail_newest(repo, after_first, 100).expect("newest")),
+            ["a.b1", "a.b2", "a.b3", "a.b4", "a.b5"],
+            "a window larger than what follows the cursor is all of it"
+        );
+        assert_eq!(tail_newest(repo, 0, 0).expect("newest").len(), 1);
     }
 
     #[test]

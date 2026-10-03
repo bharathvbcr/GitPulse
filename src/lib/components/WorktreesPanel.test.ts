@@ -42,6 +42,13 @@ describe("WorktreesPanel agent worktree affordances", () => {
     expect(source).not.toContain("expire:");
   });
 
+  it("reads task bindings through the shared bounded reader, not one at a time", () => {
+    // A serial loop made each worktree wait for the previous one's
+    // repository check and ledger lookup.
+    expect(source).toContain("loadWorktreeTasks(invoke, repo,");
+    expect(source).not.toContain('await invoke<string | null>("cmd_worktree_task"');
+  });
+
   it("reloads when repository status generation changes", () => {
     expect(source).toContain("$repoStore.generation");
     expect(source).toContain("cmd_list_worktrees");

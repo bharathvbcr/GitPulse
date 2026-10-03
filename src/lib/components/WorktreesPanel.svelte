@@ -1,7 +1,9 @@
 <script lang="ts">
   import type { MergeTeardownResult, WorktreeInfo, WorktreeRouteInfo } from "../branches/types";
   import type { TaskScope, TaskView } from "../tasks/types";
-  import { invoke } from "@tauri-apps/api/core";
+  import { loadWorktreeTasks } from "../tasks/bindings";
+  import { loadTaskScopes } from "../tasks/scopes";
+  import { invoke } from "../ipc/invoke";
   import { reportPanelError } from "../diagnostics/report";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
@@ -124,29 +126,20 @@
       const view = await invoke<TaskView>("cmd_task_view", { repoPath: repo });
       if (!guard.isLive()) return;
       taskView = view;
+      const reads = await loadWorktreeTasks(invoke, repo, list.map((wt) => wt.path));
+      if (!guard.isLive()) return;
+      const failed = reads.find((read) => !read.ok);
+      if (failed && !failed.ok) throw new Error(failed.detail);
       const resolved: Record<string, string | null> = {};
-      for (const wt of list) {
-        resolved[wt.path] = await invoke<string | null>("cmd_worktree_task", {
-          repoPath: repo,
-          worktreePath: wt.path,
-        });
-        if (!guard.isLive()) return;
-      }
+      for (const read of reads) resolved[read.path] = read.taskId;
       bindings = resolved;
 
       // The declared scope of each bound task, so a row can say how much this
       // worktree is authorised to touch. Fetched only for tasks actually bound
       // here — the store may hold hundreds.
-      const wanted = [...new Set(Object.values(resolved).filter((t): t is string => !!t))];
-      const loaded: Record<string, TaskScope> = {};
-      for (const taskId of wanted) {
-        const scope = await invoke<TaskScope | null>("cmd_task_scope", {
-          repoPath: repo,
-          taskId,
-        });
-        if (!guard.isLive()) return;
-        if (scope) loaded[taskId] = scope;
-      }
+      const wanted = Object.values(resolved).filter((t): t is string => !!t);
+      const loaded = await loadTaskScopes(invoke, repo, wanted);
+      if (!guard.isLive()) return;
       scopes = loaded;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
@@ -543,7 +536,7 @@
           <button
             class="flex items-center gap-1.5 min-w-0 flex-1 text-left"
             onclick={() => open(wt)}
-            title="{wt.path}\n{wt.branch ?? 'detached'} · {wt.dirty_files === null ? 'not scanned' : wt.dirty_files + ' change(s)'}"
+            title="{wt.path}\n{wt.branch ?? 'detached'} · {wt.dirty_files === null ? (wt.scan_note ?? 'not scanned') : wt.dirty_files + ' change(s)'}{wt.dirty_files !== null && wt.scan_note ? '\n' + wt.scan_note : ''}"
           >
             <span class="truncate text-[11px] font-medium text-textPrimary">{wt.name}</span>
             <!-- Glyphs only, never text: the two marks small enough to share
