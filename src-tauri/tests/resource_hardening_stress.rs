@@ -149,6 +149,8 @@ fn a_binary_diff_is_cut_on_whole_lines() {
 /// the app would get slower and slower and never recover.
 #[test]
 fn the_spawn_gate_reclaims_permits_from_failures_timeouts_and_panics() {
+    // Permits, not rate tokens: a rate refusal would read as a leaked permit.
+    git_cli::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     let _ = repo_with(dir.path(), "f.txt", "a\n", "b\n");
     let repo = dir.path();

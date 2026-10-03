@@ -51,3 +51,43 @@ fn the_agent_server_and_the_daemon_run_as_background() {
         assert!(!source.contains("run_process_as_background"), "{bin}");
     }
 }
+
+/// The unlimited-rate switch exists for integration-test processes. A shipped
+/// binary that called it would run with no spawn rate cap and no shared
+/// budget, which is the storm the gate exists to stop.
+#[test]
+fn no_shipped_source_lifts_the_spawn_rate_cap() {
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    assert!(files.len() > 100, "walked only {} sources", files.len());
+    let call = "run_process_with_unlimited_spawn_rate();";
+    let definition = "pub fn run_process_with_unlimited_spawn_rate() {";
+    let mut callers = Vec::new();
+    let mut definitions = 0;
+    for path in &files {
+        let source = std::fs::read_to_string(path).unwrap();
+        definitions += source.matches(definition).count();
+        if source.contains(call) {
+            callers.push(path.display().to_string());
+        }
+    }
+    assert_eq!(
+        definitions, 1,
+        "the switch must still exist for this guard to mean anything"
+    );
+    assert!(
+        callers.is_empty(),
+        "shipped sources lift the spawn rate cap: {callers:?}"
+    );
+}

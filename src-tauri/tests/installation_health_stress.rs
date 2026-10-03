@@ -52,6 +52,7 @@ fn child_path(extra_env: &[(&str, &str)]) -> String {
 #[test]
 #[cfg(unix)]
 fn concurrent_spawns_each_receive_the_same_complete_path() {
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     const THREADS: usize = 16;
     const PER_THREAD: usize = 12;
 
@@ -94,6 +95,7 @@ fn concurrent_spawns_each_receive_the_same_complete_path() {
 #[test]
 #[cfg(unix)]
 fn an_explicit_path_survives_contention() {
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     const THREADS: usize = 12;
     std::thread::scope(|scope| {
         for index in 0..THREADS {

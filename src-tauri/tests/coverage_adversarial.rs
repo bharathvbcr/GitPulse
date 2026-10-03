@@ -342,6 +342,8 @@ fn detail_lookup_matches_case_insensitively() {
 /// all succeed and agree on totals (cache coherency under contention).
 #[test]
 fn concurrent_scans_and_details_agree() {
+    // Agreement under contention, not the production spawn rate.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let repo = git_repo();
     write(repo.path(), "src/lib.rs", "fn a() {}\nfn b() {}\n");
     write(repo.path(), "src/app.ts", "export const x = 1;\n");

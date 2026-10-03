@@ -171,6 +171,8 @@ fn a_conflict_larger_than_the_listing_cap_reports_the_true_total() {
 /// two different answers for one unchanging state.
 #[test]
 fn concurrent_detection_is_consistent_under_load() {
+    // Consistency under contention, not the production spawn rate.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let repo = init_repo();
     let dir = repo.path();
     commit(dir, "f.txt", "base\n", "base");
@@ -306,6 +308,7 @@ fn corrupt_control_files_never_panic_and_never_lose_the_escape() {
 /// up here as one repo reporting another's operation.
 #[test]
 fn parallel_repositories_never_report_each_others_operations() {
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let kinds: &[(&str, OperationKind)] = &[
         ("merge", OperationKind::Merge),
         ("cherry-pick", OperationKind::CherryPick),

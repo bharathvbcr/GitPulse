@@ -1536,6 +1536,28 @@ pub fn run_process_as_background() {
     PROCESS_BACKGROUND.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Set by [`run_process_with_unlimited_spawn_rate`]; never set in a shipped
+/// binary.
+static PROCESS_UNLIMITED_RATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Lifts the spawn *rate* cap, and with it the per-user shared budget, for
+/// the rest of this process. The concurrency limit still applies.
+///
+/// For integration-test processes only. Each `tests/*.rs` crate links the
+/// library without `cfg(test)`, so it otherwise runs under the production
+/// rate and draws from the user's real `spawn-budget.v1`, the record the
+/// running app and every agent session spend. A stress test that starts
+/// hundreds of children then measures that budget instead of the code under
+/// test, and spends the app's. The unit-test build gets the same gate from
+/// `cfg!(test)`. Order-independent: it takes effect at the next spawn, even
+/// if the gate already exists. `tests/process_admission.rs` fails if any
+/// source under `src/` calls it.
+#[doc(hidden)]
+pub fn run_process_with_unlimited_spawn_rate() {
+    PROCESS_UNLIMITED_RATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The class a thread starts in: see [`run_process_as_background`].
 fn thread_default_admission() -> Admission {
     if PROCESS_BACKGROUND.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1936,7 +1958,8 @@ impl SpawnGate {
         let class = current_admission();
         let background = class == Admission::Background;
         let interactive = class == Admission::Interactive;
-        let rate_limited = self.refill_per_sec != u32::MAX;
+        let rate_limited = self.refill_per_sec != u32::MAX
+            && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed);
         let entered = Instant::now();
         // Declared before the state guard so that, unwinding, the guard is
         // released first and the reservation can take the lock to give its

@@ -1377,7 +1377,10 @@ some-future-field whatever
         assert_eq!(scan.dirty, Some(0));
         assert_eq!(scan.diff_stat, None);
         let note = scan.note.unwrap_or_default();
-        assert!(note.starts_with("some measurements were not taken: "), "{note}");
+        assert!(
+            note.starts_with("some measurements were not taken: "),
+            "{note}"
+        );
         assert!(note.contains("forced by test"), "{note}");
         let whole = scan_worktree(&repo, &entry);
         assert_eq!(whole.note, None);

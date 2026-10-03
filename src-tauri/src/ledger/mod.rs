@@ -1054,9 +1054,7 @@ fn latest_binding(
         )
         .optional()
         .map_err(|e| LedgerError::new("query_failed", e.to_string()))
-        .map(|found| {
-            found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND))
-        })
+        .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
     })
 }
 
