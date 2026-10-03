@@ -1575,7 +1575,11 @@ impl SpawnGate {
                     || state.in_flight < self.limit.saturating_sub(1)
             };
             self.refill(&mut state, now);
-            let tokens_ok = self.refill_per_sec == u32::MAX || state.tokens >= 1;
+            // Every spawn draws a token, including foreground refresh. The
+            // measured storm was frontend `git` after `repo-changed`, not a
+            // background class, so a foreground exemption would let it return.
+            let rate_limited = self.refill_per_sec != u32::MAX;
+            let tokens_ok = !rate_limited || state.tokens >= 1;
             if !tokens_ok {
                 let started = *token_wait_started.get_or_insert(now);
                 // A storm that has spent the burst must fail the spawn instead
@@ -1664,10 +1668,13 @@ fn spawn_limit() -> usize {
 /// Sustained git spawns per second, and the burst that may start immediately.
 ///
 /// The measured storm on 2026-10-02 was 40–80 short-lived `git` processes per
-/// second for hours. Concurrency alone does not stop that: 16 children that
-/// each live ~200 ms still start about 80 processes a second. The burst covers
-/// one uncached branch-stat pass (`MAX_BRANCH_STAT_TARGETS` × 2); after that
-/// the refill is the hard cap.
+/// second for hours, children of the GitPulse app, lining up with cargo
+/// writing `target*/` trees. Concurrency alone does not stop that: 16 children
+/// that each live ~200 ms still start about 80 processes a second. The burst
+/// covers one uncached branch-stat pass (`MAX_BRANCH_STAT_TARGETS` × 2); after
+/// that the refill is the hard cap, for foreground refresh and background work
+/// alike. A refusal reports the time spent waiting, not the command's own
+/// deadline.
 const SPAWN_BURST: u32 = 192;
 const SPAWN_PER_SEC: u32 = 8;
 /// How long a caller may block once the burst is spent. Longer than one
@@ -1777,7 +1784,8 @@ fn run_with_gate(
             "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
         ));
     }
-    let queue_deadline = Instant::now() + timeout;
+    let queued_at = Instant::now();
+    let queue_deadline = queued_at + timeout;
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -1801,8 +1809,8 @@ fn run_with_gate(
                     return format!("{label} cancelled before spawn");
                 }
                 format!(
-                    "{label}{TIMEOUT_MARKER}{}s waiting for a process slot",
-                    timeout.as_secs_f64()
+                    "{label}{TIMEOUT_MARKER}{:.3}s waiting for a process slot",
+                    queued_at.elapsed().as_secs_f64()
                 )
             })?,
     );
@@ -2284,25 +2292,30 @@ mod tests {
 
     #[test]
     fn spawn_rate_cap_stops_a_burst_from_becoming_a_sustained_storm() {
-        let gate = super::SpawnGate::with_rate(8, 4, 4);
-        let mut held = Vec::new();
-        for _ in 0..4 {
-            held.push(
-                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(200))
-                    .expect("burst slot"),
+        // Background work may hold only a quarter of the slots. The limit has
+        // to leave room for the whole burst, or the class cap fails the test
+        // before the token bucket does.
+        let gate = super::SpawnGate::with_rate(16, 4, 4);
+        super::with_background_processes(|| {
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                held.push(
+                    gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(200))
+                        .expect("burst slot"),
+                );
+            }
+            assert!(
+                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+                    .is_none(),
+                "the fifth spawn inside the burst must not start"
             );
-        }
-        assert!(
-            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
-                .is_none(),
-            "the fifth spawn inside the burst must not start"
-        );
-        drop(held);
-        assert!(
-            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
-                .is_none(),
-            "a free concurrency slot must not bypass the per-second cap"
-        );
+            drop(held);
+            assert!(
+                gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+                    .is_none(),
+                "a free concurrency slot must not bypass the per-second cap"
+            );
+        });
         let (burst, rate) = super::production_spawn_rate();
         assert!(
             rate < 40,
@@ -2318,15 +2331,18 @@ mod tests {
         let gate = super::configured_spawn_gate(false);
         let mut admitted = 0u32;
         let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
-        while std::time::Instant::now() < drain_until {
-            match gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(20)) {
-                Some(permit) => {
-                    admitted += 1;
-                    drop(permit);
+        super::with_background_processes(|| {
+            while std::time::Instant::now() < drain_until {
+                match gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(20))
+                {
+                    Some(permit) => {
+                        admitted += 1;
+                        drop(permit);
+                    }
+                    None => break,
                 }
-                None => break,
             }
-        }
+        });
         assert!(
             (192..192 + 16).contains(&admitted),
             "production burst admitted {admitted}, want 192 plus at most one refill window"
@@ -2342,11 +2358,13 @@ mod tests {
         for _ in 0..12 {
             let gate = Arc::clone(&gate);
             threads.push(std::thread::spawn(move || {
-                let began = std::time::Instant::now();
-                let admitted = gate
-                    .acquire(std::time::Instant::now() + std::time::Duration::from_secs(30))
-                    .is_some();
-                (admitted, began.elapsed())
+                super::with_background_processes(|| {
+                    let began = std::time::Instant::now();
+                    let admitted = gate
+                        .acquire(std::time::Instant::now() + std::time::Duration::from_secs(30))
+                        .is_some();
+                    (admitted, began.elapsed())
+                })
             }));
         }
         let mut admitted = 0u32;
@@ -2385,14 +2403,16 @@ mod tests {
             let gate = Arc::clone(&gate);
             let admitted = Arc::clone(&admitted);
             threads.push(std::thread::spawn(move || {
-                while started.elapsed() < std::time::Duration::from_millis(500) {
-                    if let Some(permit) = gate
-                        .acquire(std::time::Instant::now() + std::time::Duration::from_millis(15))
-                    {
-                        admitted.fetch_add(1, Ordering::Relaxed);
-                        drop(permit);
+                super::with_background_processes(|| {
+                    while started.elapsed() < std::time::Duration::from_millis(500) {
+                        if let Some(permit) = gate.acquire(
+                            std::time::Instant::now() + std::time::Duration::from_millis(15),
+                        ) {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                            drop(permit);
+                        }
                     }
-                }
+                });
             }));
         }
         for thread in threads {
@@ -4769,6 +4789,63 @@ mod tests {
             .expect_err("the queued command must not start");
         assert!(error.contains("waiting for a process slot"), "{error}");
         assert!(error.contains(TIMEOUT_MARKER), "{error}");
+    }
+
+    /// The diagnostic used to print the command's 90s deadline after a 2s
+    /// refusal, so a launch looked like git had hung.
+    #[cfg(unix)]
+    #[test]
+    fn slot_wait_reports_the_queue_budget_not_the_command_deadline() {
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::with_rate(32, 1, 1)));
+        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..8 {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result = super::with_background_processes(|| {
+                    run_with_gate(
+                        &mut Command::new("/usr/bin/true"),
+                        "slot-wait",
+                        Duration::from_secs(30),
+                        None,
+                        MAX_OUTPUT_BYTES,
+                        &mut (),
+                        gate,
+                    )
+                });
+                let _ = tx.send(result);
+            });
+        }
+        drop(tx);
+        let mut refusals = Vec::new();
+        for _ in 0..8 {
+            match rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("queue budget")
+            {
+                Ok(_) => {}
+                Err(error) => refusals.push(error),
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refusals sat until the command deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(!refusals.is_empty(), "the burst of 1 cannot admit all 8");
+        for error in &refusals {
+            assert!(error.contains("waiting for a process slot"), "{error}");
+            let reported: f64 = error
+                .split(TIMEOUT_MARKER)
+                .nth(1)
+                .and_then(|rest| rest.split('s').next())
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_else(|| panic!("no wait duration in {error}"));
+            assert!(
+                (1.5..5.0).contains(&reported),
+                "reported {reported}s from {error}; the command deadline is 30s"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -204,6 +204,11 @@ installs and scripts.
   audit ran and failed. `bun audit --json` runs when bun is on PATH and a
   `bun.lock` is present; an empty or unexpected body is an error, not a
   clean report.
+- **A refresh can no longer start a git storm.** Branch stats walked up to
+  96 tips at once, two `git` processes each, which is the 40–80 starts a
+  second measured while cargo wrote `target*/`. Tips are walked one at a
+  time, every spawn still draws from the per-second cap, and a refusal
+  reports how long it actually waited.
 - **A build-directory storm no longer fans out into git.** The watcher
   ignores directories that are build output by construction and directories
   gitignore already covers, and git spawns are rate-limited after a short

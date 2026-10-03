@@ -7,7 +7,6 @@ use crate::engine::git_cli::{
 use crate::engine::git_writer::validate_ref_name;
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
@@ -2723,8 +2722,13 @@ fn compute_eligible_churn(
     unique_uncached.truncate(MAX_BRANCH_STAT_TARGETS);
     let attempted = unique_uncached.len();
 
+    // One tip at a time. `into_par_iter` started up to 96 tips at once, two
+    // `git` processes each, and a concurrency cap of ~16 children that finish
+    // in ~200 ms is still ~80 starts a second — the storm measured while
+    // cargo wrote `target*/`. The spawn gate's per-second cap is the backstop;
+    // this walk must not be the thing that spends the whole burst in one tick.
     let computed_map: HashMap<String, ComputedBranchChurn> = unique_uncached
-        .into_par_iter()
+        .into_iter()
         .filter_map(|tip| compute_branch_churn(repo, base_oid, &tip).map(|churn| (tip, churn)))
         .collect();
     let compute_failures = attempted.saturating_sub(computed_map.len());
