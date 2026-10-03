@@ -227,6 +227,12 @@ export interface WorktreeInfo {
   diff_stat: WorktreeDiffStat | null;
   main_divergence: WorktreeDivergence | null;
   active_routes: WorktreeRouteInfo[];
+  /**
+   * Why measurements are absent or partial: a bare entry, one past the scan
+   * limit, a missing directory, or a read that failed or was deferred under
+   * load. Absent when everything was measured.
+   */
+  scan_note?: string;
 }
 
 export interface MergeTeardownResult {

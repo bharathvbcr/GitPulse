@@ -16,7 +16,7 @@
    * footer and a panel can put it inline without this file knowing.
    */
   import { onDestroy, untrack } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { FolderOpen } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { repoStore } from "../stores/repoStore";

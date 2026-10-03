@@ -7,7 +7,7 @@
  * injected seam is named `invokeFn` for the same reason — that is one of the
  * two callee names the checker recognises.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import type { Guarded } from "../stores/harnessStore";
 import type {
   FirebaseBackendsReport,

@@ -29,10 +29,56 @@ it("retained mode runs every open repository while the window is visible", async
   });
   queue.enqueue("/b");
   queue.enqueue("/a");
+  // This used to expect ["/b", "/a"]: insertion order, which put the focused
+  // repository behind every tab opened before it. Both still run; the
+  // focused one now goes first (see the launch test below).
   await vi.advanceTimersByTimeAsync(200);
-  expect(run.mock.calls.map(([key]) => key)).toEqual(["/b"]);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/a"]);
   await vi.advanceTimersByTimeAsync(1_000);
-  expect(run.mock.calls.map(([key]) => key)).toEqual(["/b", "/a"]);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/a", "/b"]);
+  queue.reset();
+});
+
+it("runs the focused repository first when every restored tab is due at once", async () => {
+  const run = vi.fn<(key: string, isCurrent: () => boolean) => Promise<void>>(async () => {});
+  const tabs = ["/one", "/two", "/three", "/four"];
+  const queue = createPacedQueue({
+    ...limits, runWhen: "retained", run, onError: vi.fn(), onOverflow: vi.fn(),
+    scope: { activeKey: "/four", retainedKeys: tabs, visible: true },
+  });
+  // Launch: tabs are offered in tab order, and the focused tab is the last.
+  for (const key of tabs) queue.enqueue(key);
+  await vi.advanceTimersByTimeAsync(200);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/four"]);
+  // Focus moves while the rest are still queued: the new focus jumps the line.
+  queue.setScope({ activeKey: "/three", retainedKeys: tabs, visible: true });
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/four", "/three"]);
+  await vi.advanceTimersByTimeAsync(2_500);
+  expect(run.mock.calls.map(([key]) => key)).toEqual(["/four", "/three", "/one", "/two"]);
+  queue.reset();
+});
+
+it("a delayed retry is not pulled forward by a later enqueue, nor clamped by maxWait", async () => {
+  const run = vi.fn<(key: string, isCurrent: () => boolean) => Promise<void>>(async () => {});
+  const queue = createPacedQueue({
+    ...limits, runWhen: "retained", run, onError: vi.fn(), onOverflow: vi.fn(),
+    scope: { activeKey: "/a", retainedKeys: ["/a"], visible: true },
+  });
+  expect(queue.enqueue("/a", { delayMs: 30_000 })).toBe(true);
+  // A watcher tick lands inside the backoff: it joins the pending retry
+  // instead of resetting it to the debounce.
+  await vi.advanceTimersByTimeAsync(5_000);
+  queue.enqueue("/a");
+  await vi.advanceTimersByTimeAsync(24_000);
+  expect(run).not.toHaveBeenCalled();
+  expect(queue.isPending("/a")).toBe(true);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(run).toHaveBeenCalledExactlyOnceWith("/a", expect.any(Function));
+  // The hold belongs to that one retry; the next plain enqueue is debounced.
+  queue.enqueue("/a");
+  await vi.advanceTimersByTimeAsync(1_200);
+  expect(run).toHaveBeenCalledTimes(2);
   queue.reset();
 });
 

@@ -74,7 +74,7 @@
         cmd_ledger_tail: () => [],
         cmd_grants_view: () => ({ available: false, path: "", grants: [], error: "" }),
         cmd_worktree_task: a => scenario === "task" ? (a.worktreePath === root || a.worktreePath === "/workspace/release" ? "T1" : a.worktreePath.includes("review-flow") ? "T2" : "T3") : null,
-        cmd_task_scope: a => ({ id: a.taskId, title: a.taskId === "T1" ? "Partly scanned task" : a.taskId, status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] }),
+        cmd_task_scopes: a => a.taskIds.map(id => ({ id, title: id === "T1" ? "Partly scanned task" : id, status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] })),
         cmd_collision_risk: () => {
           if (scenario === "unavailable") throw new Error("Fixture overlap scan unavailable");
           return { ok: scenario !== "partial", error: scenario === "partial" ? "Fixture one worktree inaccessible" : "", overlapping_files: scenario === "partial" ? 1 : 0, worktrees_involved: scenario === "partial" ? 2 : 0,

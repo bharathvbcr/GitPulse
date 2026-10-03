@@ -78,7 +78,7 @@ function baseAnswers(over: Record<string, unknown> = {}) {
     cmd_grants_view: OK_GRANTS,
     cmd_worktree_task: null,
     cmd_repo_operation: null,
-    cmd_task_scope: { id: "TASK-1", title: "Close the gate bypass", status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] },
+    cmd_task_scopes: [{ id: "TASK-1", title: "Close the gate bypass", status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] }],
     ...over,
   };
 }
@@ -97,6 +97,35 @@ describe("loadWork", () => {
     expect(p.rows.map((r) => r.taskId)).toEqual(["TASK-1"]);
     expect(p.rows[0].title).toBe("Close the gate bypass");
     expect(p.rows[0].worktrees[0].worktree.path).toBe("/repo");
+  });
+
+  it("reads every task title in one scope request", async () => {
+    // Each scope request authenticates the repository with a `git worktree
+    // list`; one request per title was one git process per title per refresh.
+    const leases = Array.from({ length: 20 }, (_, i) => ({ ...OK_TASKS.leases[0], task_id: `TASK-${i}` }));
+    const invoke = fakeInvoke(
+      baseAnswers({
+        cmd_task_view: { ...OK_TASKS, leases },
+        cmd_task_scopes: (args: { taskIds: string[] }) =>
+          args.taskIds.map((id) => ({ id, title: `title of ${id}`, status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] })),
+      }),
+    );
+    const p = await loadWork("/repo", { invoke: invoke as never });
+
+    const scopeCalls = invoke.mock.calls.filter(([cmd]) => cmd.startsWith("cmd_task_scope"));
+    expect(scopeCalls.map(([cmd]) => cmd)).toEqual(["cmd_task_scopes"]);
+    expect(p.rows.find((r) => r.taskId === "TASK-7")?.title).toBe("title of TASK-7");
+    expect(p.sources.tasks.ok).toBe(true);
+  });
+
+  it("names a failed title read and falls back to task ids", async () => {
+    const invoke = fakeInvoke(baseAnswers({ cmd_task_scopes: new Error("store is locked") }));
+    const p = await loadWork("/repo", { invoke: invoke as never });
+
+    expect(p.sources.tasks.ok).toBe(false);
+    expect(p.sources.tasks.detail).toContain("store is locked");
+    const row = p.rows.find((r) => r.taskId === "TASK-1");
+    expect(row?.title).toBe(""); // the row still renders, under its task id
   });
 
   it("degrades rather than blanking when one source fails", async () => {

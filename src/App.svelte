@@ -2,7 +2,7 @@
   import type { RepoChangedPayload } from "./lib/repos/events";
   import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "./lib/ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore, pathsTrustedForBackground } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";

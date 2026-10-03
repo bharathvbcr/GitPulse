@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { repoStore, type RepoState, type MutationOutcome } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
 import { toastStore } from "../stores/toastStore";

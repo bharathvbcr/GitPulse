@@ -37,7 +37,7 @@
   import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
     ShieldAlert,

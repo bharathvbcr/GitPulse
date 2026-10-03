@@ -10,7 +10,7 @@
  * Serious means critical or high after {@link normalizeSeverity}, so CodeQL
  * `error` is high and an unknown spelling is info, never a silent promotion.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { createRepoPanelCache } from "../panels/repoPanelCache";
 import { formatError } from "../ui/formatError";
 import { normalizeSeverity } from "./format";

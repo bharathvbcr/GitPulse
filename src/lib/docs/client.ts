@@ -3,7 +3,7 @@
  * Production callers for `check:ipc`.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 
 export interface DocsStatus {
   noteCount: number;

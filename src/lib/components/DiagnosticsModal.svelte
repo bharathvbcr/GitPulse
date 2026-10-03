@@ -56,7 +56,7 @@
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { copyText } from "../desktop/clipboard";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import {
     formatDiagnosticFailure,
     withBackendLogSection,

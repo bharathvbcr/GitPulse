@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { get, writable, type Readable } from "svelte/store";
 import { createAsyncGuard, type AsyncGuard } from "../async/guard";
 import { createRepoPanelCache, type RepoPanelCache } from "../panels/repoPanelCache";

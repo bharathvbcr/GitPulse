@@ -4,7 +4,7 @@
    * Steps: explain → source → preflight → install → verify → done.
    */
   import { X, Download, Check, ChevronRight, Clipboard, Terminal } from "@lucide/svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../../ipc/invoke";
   import {
     cancelInstall,
     closeSetupWizard,

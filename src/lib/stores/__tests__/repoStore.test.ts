@@ -11,6 +11,7 @@ import { diagnostics } from "../../diagnostics/diagnostics";
 import { promptState, completePrompt, cancelPrompt } from "../modalStore";
 import { autoInit } from "../../codeintel/autoInit";
 import * as workspaceSync from "../../codeintel/workspaceSync";
+import { withDeferralRetry } from "../../ipc/invoke";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -441,6 +442,88 @@ describe("restored untrusted tabs", () => {
         scope.activeKey === REFUSED || scope.retainedKeys.includes(REFUSED),
       ),
     ).toBe(false);
+  });
+});
+
+describe("a snapshot deferred under load", () => {
+  afterEach(() => vi.useRealTimers());
+  const DEFERRAL =
+    "git status deferred under load after 2.013s: the git spawn rate limit admitted nothing sooner";
+
+  // Composed the way the app composes it: the store over the one IPC entry
+  // point, which owns the retry (src/lib/ipc/invoke.ts).
+  it("is neither an error nor retried straight back into the limit", async () => {
+    vi.useFakeTimers();
+    let snapshots = 0;
+    let deferrals = 1;
+    const invoke = makeInvoke({
+      cmd_get_status: async (_cmd, args) => {
+        snapshots += 1;
+        if (deferrals > 0) {
+          deferrals -= 1;
+          throw new Error(DEFERRAL);
+        }
+        return snapshotFor(String(args?.repoPath)).statuses as never;
+      },
+    });
+    const { store } = makeStore(withDeferralRetry(invoke as never) as InvokeFn);
+    // Not awaited: the open settles only once the retried snapshot does.
+    const opening = store.openRepo("/r/deferred");
+    await vi.advanceTimersByTimeAsync(0);
+    const opened = get(store);
+    expect(opened.error).toBeNull();
+    expect(opened.isLoading).toBe(true);
+    const afterOpen = snapshots;
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(snapshots, "retried inside the gate's own queue budget").toBe(afterOpen);
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    await opening;
+    const recovered = get(store);
+    expect(snapshots).toBeGreaterThan(afterOpen);
+    expect(recovered.error).toBeNull();
+    expect(recovered.isLoading).toBe(false);
+  });
+
+  it("becomes the error once the retry budget is spent", async () => {
+    vi.useFakeTimers();
+    const invoke = makeInvoke({
+      cmd_get_status: async () => {
+        throw new Error(DEFERRAL);
+      },
+    });
+    const { store } = makeStore(withDeferralRetry(invoke as never) as InvokeFn);
+    const opening = store.openRepo("/r/always-deferred");
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await opening;
+    expect(get(store).error).toContain("deferred under load");
+    expect(get(store).isLoading).toBe(false);
+  });
+
+  it("keeps the snapshot already rendered when a later refresh is deferred", async () => {
+    vi.useFakeTimers();
+    let defer = false;
+    const invoke = makeInvoke({
+      cmd_get_status: async (_cmd, args) => {
+        if (defer) throw new Error(DEFERRAL);
+        return snapshotFor(String(args?.repoPath)).statuses as never;
+      },
+    });
+    const { store } = makeStore(withDeferralRetry(invoke as never) as InvokeFn);
+    const opening = store.openRepo("/r/rendered");
+    await vi.advanceTimersByTimeAsync(0);
+    await opening;
+    const rendered = get(store).branches;
+    expect(rendered.length).toBeGreaterThan(0);
+
+    defer = true;
+    const refreshing = store.refresh("/r/rendered");
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await refreshing;
+    const after = get(store);
+    expect(after.branches).toEqual(rendered);
+    expect(after.error).toContain("deferred under load");
   });
 });
 

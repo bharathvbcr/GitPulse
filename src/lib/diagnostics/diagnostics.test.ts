@@ -242,6 +242,21 @@ describe("createDiagnostics", () => {
     expect(redactDiagnosticText(out)).toBe(out);
   });
 
+  it("records a deferral under load as a warning, whatever severity the caller chose", () => {
+    // Every surface that renders a backend failure reaches this seam. At launch
+    // nine refreshes deferred by the spawn gate were logged as ERROR, which is
+    // the report the user then has to decode. Nothing failed: nothing ran.
+    const { store } = makeStore([10, 20]);
+    store.error(
+      "graph:load",
+      new Error("git log deferred under load after 2.013s: the git spawn rate limit admitted nothing sooner"),
+    );
+    store.error("graph:load", new Error("git log timed out after 90.000s waiting for a process slot"));
+    const entries = get(store);
+    expect(entries.map((entry) => entry.severity)).toEqual(["error", "warning"]);
+    expect(entries[1].message).toContain("deferred under load");
+  });
+
   it("records errors and warnings newest-first through formatError", () => {
     const { store } = makeStore([10, 20]);
     store.error("console", new TypeError("nope"));

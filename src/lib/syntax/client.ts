@@ -6,7 +6,7 @@
  * `cmd_syntax_highlight`.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 
 /** UTF-16 span from `cmd_syntax_highlight`. */
 export interface TreeSitterSpan {

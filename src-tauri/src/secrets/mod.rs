@@ -313,9 +313,30 @@ mod tests {
     fn runner_failures_name_their_own_cause() {
         let deadline = std::time::Duration::from_secs(7);
         let reason = |err: &str| run::runner_failure_reason(err, deadline);
+        // The gate's own formatter, not a transcription of it.
+        use crate::engine::git_cli::{refusal_message, Refusal};
         assert_eq!(
-            reason("kingfisher timed out after 7s waiting for a process slot"),
+            reason(&refusal_message(
+                "kingfisher",
+                Refusal::TimedOut { deadline }
+            )),
             "kingfisher could not start: no process slot became free in time"
+        );
+        for deferral in [
+            Refusal::Refused {
+                waited: std::time::Duration::from_millis(2010),
+            },
+            Refusal::Shed,
+        ] {
+            assert_eq!(
+                reason(&refusal_message("kingfisher", deferral)),
+                "kingfisher was deferred: GitPulse was under load and started no new process in time",
+                "{deferral:?} is a deferral, not a slot timeout or a scan timeout"
+            );
+        }
+        assert_eq!(
+            reason(&refusal_message("kingfisher", Refusal::Cancelled)),
+            "superseded by a newer secrets scan"
         );
         assert_eq!(
             reason("kingfisher timed out after 7s"),

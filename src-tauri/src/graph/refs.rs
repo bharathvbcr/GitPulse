@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_text, git_text_shared, validate_repo};
 use crate::engine::git_reader::REFS_TAG_CAP;
 use crate::graph::ref_scope::{self, HiddenHistory, RefScope};
 
@@ -161,11 +161,19 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
         "--format=%(objectname)%00%(refname)%00%(objecttype)%00%(*objectname)%00%(creatordate:unix)%01",
     ];
     for_each_ref.extend_from_slice(ref_scope::decoration_patterns(scope));
-    let raw = git_text(&repo, &for_each_ref)?;
+    let raw = git_text_shared(&repo, &for_each_ref)?;
 
+    // A detached HEAD makes this exit 1, which is an answer: no current
+    // branch. A refusal is not, and used to render the graph with no HEAD
+    // branch label at all, so it fails the listing with its own cause.
+    let failures = crate::engine::git_cli::process_failures();
     let current_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    if crate::engine::git_cli::process_failures() != failures {
+        return Err(crate::engine::git_cli::last_process_failure()
+            .unwrap_or_else(|| "the current-branch lookup produced no answer".into()));
+    }
 
     let mut decorations = Vec::new();
     // Tags are held aside so the cap can keep the NEWEST ones; branches and
@@ -440,5 +448,23 @@ mod tests {
                 .any(|d| d.kind == RefKind::Local && d.name == "main"),
             "branch decoration missing"
         );
+    }
+
+    /// A detached HEAD is an answer (no current branch); a refused lookup is
+    /// not, and used to draw the graph with no HEAD label at all.
+    #[test]
+    fn a_refused_current_branch_lookup_fails_the_listing() {
+        let dir = init_repo();
+        let path = dir.path().to_str().unwrap();
+        let refused = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            list_ref_decorations(path, RefScope::Named)
+        });
+        let error = refused.expect_err("no current branch was learned");
+        assert!(error.contains("forced by test"), "{error}");
+        let listing = list_ref_decorations(path, RefScope::Named).unwrap();
+        assert!(listing
+            .decorations
+            .iter()
+            .any(|d| d.is_head && d.name == "main"));
     }
 }

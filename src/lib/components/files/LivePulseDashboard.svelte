@@ -4,7 +4,7 @@
   import { onMount } from "svelte";
   import { createVisibleInterval } from "../../dom/visibleInterval";
   import { repoStore } from "../../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../../ipc/invoke";
   import {
     Activity,
     RefreshCw,

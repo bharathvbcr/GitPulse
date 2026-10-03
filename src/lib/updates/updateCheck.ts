@@ -9,7 +9,7 @@
  * returns false unless the user has explicitly enabled the preference.
  */
 import { writable } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 
 /** Mirrors `crate::updates::UpdateCheck` (serde `camelCase`). */
 export interface UpdateCheck {

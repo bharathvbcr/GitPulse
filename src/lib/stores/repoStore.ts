@@ -1,6 +1,6 @@
 import type { RebaseStep } from "../rebase/planner";
 import { get, writable } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
@@ -1442,6 +1442,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
       const message = formatError(err);
+      // A deferral reaching here has already been retried through the whole
+      // backoff by src/lib/ipc/invoke.ts. The snapshot already rendered stays;
+      // the toast and diagnostics show the deferral as a warning, not an error.
       applyToSession(id, generation, {
         isLoading: false,
         error: message,

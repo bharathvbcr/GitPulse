@@ -14,7 +14,7 @@
    * something, so the cost of being early in the document is a `{#if}` that is
    * false for every repository that has nothing to fix.
    */
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { AlertTriangle } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";

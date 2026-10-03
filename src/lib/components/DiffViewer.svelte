@@ -65,7 +65,7 @@
     type RailEntry,
   } from "../diff/fileRail";
   import { buildCommitRail, type CommitEntry } from "../diff/commitRail";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import {
     ArrowDownWideNarrow,
     ArrowUpWideNarrow,

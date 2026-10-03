@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
   import StatusPopover from "./StatusPopover.svelte";
   import type { MenuState } from "./menuState";

@@ -80,6 +80,14 @@ describe("automatic enhancement controls", () => {
     expect(await putAutomation(input)).toMatchObject({ revision: 2, enabled: false });
     await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(3));
     expect(native.mock.calls[0]).toEqual(native.mock.calls[1]);
+    // The failed wake is published a few microtasks after its call is made.
+    // Wait for the publication itself, not for the call count that precedes
+    // it, which held only while the IPC path added no microtask of its own.
+    await vi.waitFor(() => {
+      let current = "";
+      automaticUpdates.subscribe((update) => { current = update.error; })();
+      expect(current).toBe("Worker closed");
+    });
     const errors: string[] = [];
     const stop = automaticUpdates.subscribe((update) => { errors.push(update.error); });
     expect(errors).toEqual(["Worker closed"]);

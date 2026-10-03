@@ -1,4 +1,5 @@
 import { writable } from "svelte/store";
+import { isDeferredUnderLoad } from "../async/deferral";
 
 export type ToastKind = "success" | "info" | "warning" | "error";
 
@@ -68,7 +69,12 @@ function createToastStore() {
 
   function add(input: ToastInput | string): string {
     const opts: ToastInput = typeof input === "string" ? { message: input, kind: "info" } : input;
-    const kind = opts.kind ?? "info";
+    // An error waits to be dismissed. A deferral under load is not an error:
+    // nothing failed, the read simply has not run yet, and at launch every
+    // panel reported one at once.
+    const requested = opts.kind ?? "info";
+    const kind: ToastKind =
+      requested === "error" && isDeferredUnderLoad(opts.message) ? "warning" : requested;
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const duration =
       opts.duration ?? (opts.action ? ACTION_DURATION_MS : DEFAULT_DURATIONS[kind]);

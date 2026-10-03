@@ -155,6 +155,10 @@ struct IgnoreRules {
 }
 
 impl IgnoreRules {
+    /// Rules with no repository-specific prefixes. Tests only: production
+    /// always goes through [`IgnoreRules::load`], whose failure path records
+    /// its reason instead of returning an empty set that looks complete.
+    #[cfg(test)]
     fn builtin() -> Self {
         Self {
             prefixes: HashSet::new(),
@@ -424,9 +428,8 @@ fn worktree_relative(
         return None;
     }
     if let Ok(relative) = path.strip_prefix(worktree) {
-        if relative.components().next().is_none() {
-            return None;
-        }
+        // The worktree root itself is not a path inside it.
+        relative.components().next()?;
         return Some(relative.to_path_buf());
     }
     if path.is_relative() && worktree.is_absolute() {
@@ -449,9 +452,7 @@ fn worktree_relative(
             relative.push(rest);
         }
     }
-    if relative.components().next().is_none() {
-        return None;
-    }
+    relative.components().next()?;
     Some(relative)
 }
 
@@ -484,6 +485,19 @@ fn is_generated_state_dir(name: &OsStr) -> bool {
 /// - `ORIG_HEAD`, `FETCH_HEAD`: transient pointers; real ref moves also emit
 ///   `refs/` events.
 /// - `gc.log*`: garbage-collection progress logs.
+/// - `fsmonitor--daemon/**` and `fsmonitor--daemon.ipc`: git's built-in
+///   filesystem monitor (`core.fsmonitor=true`). Every `git status` makes the
+///   daemon write a cookie under `fsmonitor--daemon/cookies/` to synchronise
+///   with its event stream, so a refresh that runs `git status` would announce
+///   its own `repo-changed` and run again — the ~1 s storm measured against
+///   the one watched repository that had fsmonitor on. The daemon never moves
+///   refs, the index or the worktree. A linked worktree's daemon lives under
+///   `worktrees/<name>/` of the common directory, which the main worktree
+///   watches recursively, so that shape is the daemon's too.
+/// - `sharedindex.*`: with `core.splitIndex`, every read of the index — the
+///   `git status` and `git diff` a refresh runs — touches the shared index's
+///   mtime so it does not expire, even with optional locks off. A real index
+///   change in split-index mode always rewrites `index` itself.
 ///
 /// The filter is deliberately scoped to the git directories: identically
 /// named files in the worktree root are tracked content with different
@@ -504,7 +518,39 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     if internal_roots.iter().any(|root| path == root) {
         return true;
     }
+    if is_fsmonitor_daemon_path(path, internal_roots) {
+        return true;
+    }
     is_noise_leaf_name(path)
+}
+
+/// The daemon's state directory (`fsmonitor--daemon`, cookies included) or its
+/// IPC socket, either directly below a git directory or below a linked
+/// worktree's private directory, `worktrees/<name>/`, inside the common one.
+/// Only those positions are consulted, so a ref that happens to be named
+/// `refs/heads/fsmonitor--daemon` still moves the repository.
+fn is_fsmonitor_daemon_path(path: &Path, internal_roots: &[PathBuf]) -> bool {
+    let is_daemon = |component: Option<Component<'_>>| {
+        component.is_some_and(|c| {
+            matches!(
+                c.as_os_str().to_str(),
+                Some("fsmonitor--daemon" | "fsmonitor--daemon.ipc")
+            )
+        })
+    };
+    internal_roots.iter().any(|root| {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let mut components = relative.components();
+        let first = components.next();
+        if is_daemon(first) {
+            return true;
+        }
+        first.is_some_and(|c| c.as_os_str() == "worktrees")
+            && components.next().is_some()
+            && is_daemon(components.next())
+    })
 }
 
 /// Leaf-name half of the noise rules, applied once the path is known to live
@@ -528,7 +574,8 @@ fn is_noise_leaf_name(path: &Path) -> bool {
             &*name,
             "COMMIT_EDITMSG" | "ORIG_HEAD" | "FETCH_HEAD" | "MERGE_MSG"
         )
-        || name.starts_with("gc.log");
+        || name.starts_with("gc.log")
+        || name.starts_with("sharedindex.");
     if !matches_deny_list {
         return false;
     }
@@ -2661,6 +2708,8 @@ mod tests {
             git_dir.join("MERGE_MSG"),
             git_dir.join("gc.log"),
             git_dir.join("gc.log.1.gz"),
+            // core.splitIndex: every index read touches it to keep it alive.
+            git_dir.join("sharedindex.2f8c39da4be50ca7706b3462cfdccc83fddd326d"),
         ];
         for path in noisy {
             std::fs::write(&path, b"x").unwrap();
@@ -2677,6 +2726,302 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// `core.fsmonitor=true` makes every `git status` write a cookie under
+    /// `.git/fsmonitor--daemon/cookies/`, so a refresh announced its own
+    /// `repo-changed` and ran again about once a second. The daemon's state
+    /// directory and socket are noise; a ref or a worktree file that merely
+    /// shares the name is not.
+    #[test]
+    fn fsmonitor_daemon_writes_are_noise_but_lookalikes_are_not() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let cookies = git_dir.join("fsmonitor--daemon").join("cookies");
+        std::fs::create_dir_all(&cookies).unwrap();
+        std::fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+        let roots = internal_roots_for(tmp.path());
+        let rules = IgnoreRules::builtin();
+
+        let daemon = [
+            cookies.join("12345-0"),
+            cookies.clone(),
+            git_dir.join("fsmonitor--daemon"),
+            git_dir.join("fsmonitor--daemon.ipc"),
+        ];
+        for path in &daemon {
+            assert!(
+                is_git_internal_noise(path, &roots),
+                "{} is fsmonitor bookkeeping",
+                path.display()
+            );
+        }
+        let storm = daemon
+            .iter()
+            .fold(notify::Event::new(notify::EventKind::Any), |event, path| {
+                event.add_path(path.clone())
+            });
+        assert!(
+            !event_has_signal(&storm, &roots, tmp.path(), None, &rules),
+            "a batch of cookie writes must not schedule a refresh"
+        );
+
+        for path in [
+            git_dir.join("refs").join("heads").join("fsmonitor--daemon"),
+            git_dir.join("index"),
+            tmp.path().join("fsmonitor--daemon"),
+        ] {
+            let event = notify::Event::new(notify::EventKind::Any).add_path(path.clone());
+            assert!(
+                event_has_signal(&event, &roots, tmp.path(), None, &rules),
+                "{} still moves the repository",
+                path.display()
+            );
+        }
+    }
+
+    /// The main worktree's `.git` IS the common directory, and it is watched
+    /// recursively, so it also sees every linked worktree's daemon under
+    /// `worktrees/<name>/`. Relative to that root the first component is
+    /// `worktrees`, and a `git status` in any linked worktree — an agent's, or
+    /// a second tab — refreshed the main tab. That worktree's own HEAD and
+    /// index still count, as before.
+    #[test]
+    fn a_linked_worktrees_fsmonitor_writes_are_noise_to_the_main_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let common = tmp.path().join(".git");
+        let linked = common.join("worktrees").join("agent-1");
+        let cookies = linked.join("fsmonitor--daemon").join("cookies");
+        std::fs::create_dir_all(&cookies).unwrap();
+        let roots = vec![common.clone()];
+        let rules = IgnoreRules::builtin();
+        for path in [
+            cookies.join("4242-7"),
+            cookies.clone(),
+            linked.join("fsmonitor--daemon"),
+            linked.join("fsmonitor--daemon.ipc"),
+        ] {
+            assert!(
+                is_git_internal_noise(&path, &roots),
+                "{} is a linked worktree's fsmonitor bookkeeping",
+                path.display()
+            );
+        }
+        for path in [
+            linked.join("HEAD"),
+            linked.join("index"),
+            common.join("worktrees").join("fsmonitor--daemon"),
+            common.join("refs").join("heads").join("worktrees"),
+        ] {
+            let event = notify::Event::new(notify::EventKind::Any).add_path(path.clone());
+            assert!(
+                event_has_signal(&event, &roots, tmp.path(), None, &rules),
+                "{} still moves the repository",
+                path.display()
+            );
+        }
+    }
+
+    /// The universal form of the fsmonitor fix: run the whole read set one
+    /// refresh performs, under every index and monitor feature that can make
+    /// git write while it reads, and require that none of it is announced as
+    /// a change. A new self-inflicted write — from any reader, under any of
+    /// these configs — fails here instead of becoming the next storm.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_full_refresh_announces_no_change_under_any_index_feature() {
+        use crate::engine::git_reader::GitReader;
+        use std::process::Command;
+        struct StopDaemon(PathBuf);
+        impl Drop for StopDaemon {
+            fn drop(&mut self) {
+                let _ = Command::new("git")
+                    .args(["fsmonitor--daemon", "stop"])
+                    .current_dir(&self.0)
+                    .output();
+            }
+        }
+        let git = |root: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // Every feature is covered, but `core.splitIndex` and
+        // `feature.manyFiles` never share a repository: together they break
+        // git's own add-then-commit (git 2.54, Apple Git-157 — the staged
+        // file reads as untracked), which says nothing about GitPulse.
+        let configs: [&[(&str, &str)]; 3] = [
+            &[],
+            &[
+                ("core.fsmonitor", "true"),
+                ("core.untrackedCache", "true"),
+                ("feature.manyFiles", "true"),
+                ("index.version", "4"),
+            ],
+            &[
+                ("core.fsmonitor", "true"),
+                ("core.untrackedCache", "true"),
+                ("core.splitIndex", "true"),
+            ],
+        ];
+        for config in configs {
+            let temp = TempDir::new().unwrap();
+            let (rx, stop, root) = spawn_loop(temp.path());
+            let _daemon = StopDaemon(root.clone());
+            crate::test_support::trust_repo(&root);
+            for (key, value) in config {
+                git(&root, &["config", key, value]);
+            }
+            std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+            git(&root, &["add", "tracked.txt"]);
+            git(&root, &["commit", "-m", "seed"]);
+            git(&root, &["tag", "v1"]);
+            git(&root, &["branch", "topic"]);
+            std::fs::write(root.join("tracked.txt"), "two\n").unwrap();
+            git(&root, &["stash", "push", "-m", "parked"]);
+            std::fs::write(root.join("tracked.txt"), "three\n").unwrap();
+            std::fs::write(root.join("staged.txt"), "s\n").unwrap();
+            git(&root, &["add", "staged.txt"]);
+            std::fs::write(root.join("untracked.txt"), "u\n").unwrap();
+            let path = root.to_string_lossy().into_owned();
+            let refresh = || {
+                GitReader::get_status(&path).expect("status");
+                GitReader::list_branches(&path).expect("branches");
+                GitReader::list_tags(&path).expect("tags");
+                GitReader::branch_stats(&path).expect("stats");
+                crate::engine::stash::list(&path).expect("stash");
+                crate::engine::repo_op::detect(&root).expect("operation");
+                GitReader::head_id(&path).expect("head");
+                GitReader::default_branch_name(&path).expect("default branch");
+                GitReader::read_commit_history_paged(
+                    &path,
+                    0,
+                    50,
+                    None,
+                    None,
+                    crate::graph::RefScope::Named,
+                )
+                .expect("history");
+                crate::graph::list_ref_decorations(&path, crate::graph::RefScope::Named)
+                    .expect("refs");
+            };
+            // First refresh outside the window: it may start a daemon or
+            // build a cache that later refreshes only read.
+            refresh();
+            prime_watcher(&rx, &root, PRIME_DEADLINE);
+            for _ in 0..3 {
+                refresh();
+                thread::sleep(Duration::from_millis(100));
+            }
+            match rx.recv_timeout(DEBOUNCE_MAX_WAIT + Duration::from_millis(500)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                other => panic!("a refresh under {config:?} announced repo-changed: {other:?}"),
+            }
+            let live_deadline = Instant::now() + PRIME_DEADLINE;
+            let mut n = 0u32;
+            loop {
+                std::fs::write(root.join(format!("after-refresh-{n}.txt")), "x").unwrap();
+                n += 1;
+                if rx
+                    .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                    .is_ok()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < live_deadline,
+                    "the watcher went silent under {config:?}, so the quiet window proves nothing"
+                );
+            }
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The loop itself, end to end: GitPulse's own read under fsmonitor must
+    /// not announce a change. Proven live afterwards, so a dead watcher cannot
+    /// pass this by staying silent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_status_read_under_fsmonitor_does_not_announce_itself() {
+        use std::process::Command;
+        struct StopDaemon(PathBuf);
+        impl Drop for StopDaemon {
+            fn drop(&mut self) {
+                let _ = Command::new("git")
+                    .args(["fsmonitor--daemon", "stop"])
+                    .current_dir(&self.0)
+                    .output();
+            }
+        }
+        let status = |root: &Path| {
+            let out = Command::new("git")
+                .args(["status", "--porcelain=v2"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .current_dir(root)
+                .output()
+                .expect("git status");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+        let _daemon = StopDaemon(root.clone());
+        let enabled = Command::new("git")
+            .args(["config", "core.fsmonitor", "true"])
+            .current_dir(&root)
+            .output()
+            .expect("git config");
+        assert!(enabled.status.success());
+        // Start the daemon outside the measured window; its first run creates
+        // the socket and state directory.
+        status(&root);
+        assert!(
+            root.join(".git")
+                .join("fsmonitor--daemon")
+                .join("cookies")
+                .is_dir(),
+            "this git did not start a built-in fsmonitor daemon"
+        );
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+
+        for _ in 0..3 {
+            status(&root);
+            thread::sleep(Duration::from_millis(150));
+        }
+        match rx.recv_timeout(DEBOUNCE_MAX_WAIT + Duration::from_millis(500)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("git status under fsmonitor announced repo-changed: {other:?}"),
+        }
+
+        let live_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(root.join(format!("after-status-{n}.txt")), "x").unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < live_deadline,
+                "the watcher went silent, so the quiet window above proves nothing"
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
     }
 
     /// Ref moves, real index/HEAD/packed-refs writes and directories that

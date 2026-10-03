@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";

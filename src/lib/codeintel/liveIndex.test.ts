@@ -306,6 +306,89 @@ describe("liveIndex controller", () => {
     vi.useRealTimers();
   });
 
+  it("re-queues a probe deferred under load with backoff instead of settling it", async () => {
+    const shed = outcome("skip_deferred", {
+      facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+      reason: "devmap deferred under load after 0.000s: background work is shed while the git spawn rate budget is low",
+    });
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => shed);
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    // Waiting, not settled: "skipped" is what used to strand it for the session.
+    expect(index.get("/repo").phase).toBe("scheduled");
+    expect(index.get("/repo").decision).toBe("skip_deferred");
+    // Never straight back into the window that refused it.
+    await vi.advanceTimersByTimeAsync(2_900);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    // Load falls: the next attempt heals it, still as a status-only probe.
+    maybeRefresh.mockResolvedValue(outcome("refresh"));
+    await vi.advanceTimersByTimeAsync(6_100);
+    expect(maybeRefresh).toHaveBeenCalledTimes(3);
+    expect(maybeRefresh.mock.calls.every(([, changed]) => changed === false)).toBe(true);
+    expect(index.get("/repo").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("keeps a deferred watcher tick dirty across retries and gives up after the bound", async () => {
+    const shed = outcome("skip_deferred", {
+      facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+      reason: "devmap deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner",
+    });
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => shed);
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    // One attempt plus MAX_DEFERRED_RETRIES (5) retries, then it stops asking.
+    expect(maybeRefresh).toHaveBeenCalledTimes(6);
+    expect(maybeRefresh.mock.calls.every(([, changed]) => changed === true)).toBe(true);
+    const settled = index.get("/repo");
+    expect(settled.phase).toBe("failed");
+    expect(settled.reason).toContain("deferred under load");
+    expect(vi.getTimerCount()).toBe(0);
+    // A new change is a new request.
+    maybeRefresh.mockResolvedValue(outcome("refresh"));
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(index.get("/repo").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("focusing a tab that gave up under load asks again; re-applying the same scope does not", async () => {
+    const shed = outcome("skip_deferred", {
+      facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+      reason: "devmap deferred under load after 0.000s: background work is shed while the git spawn rate budget is low",
+    });
+    const maybeRefresh = vi.fn(async (repo: string, _changed: boolean) => (repo === "/restored" ? shed : outcome("skip_fresh")));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    const tabs = ["/focused", "/restored"];
+    index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(index.get("/restored").phase).toBe("failed");
+    const restoredCalls = () => maybeRefresh.mock.calls.filter(([repo]) => repo === "/restored").length;
+    expect(restoredCalls()).toBe(6);
+    // An identical apply is not a request; this is the 1 Hz loop the
+    // `offered` set exists to prevent.
+    for (let i = 0; i < 8; i++) index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(restoredCalls()).toBe(6);
+    // Focusing the given-up tab is.
+    maybeRefresh.mockImplementation(async () => outcome("refresh"));
+    index.setScope({ activeKey: "/restored", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(restoredCalls()).toBe(7);
+    expect(index.get("/restored").phase).toBe("ready");
+    // A healthy tab is not re-asked just because focus returns to it.
+    const focusedCalls = maybeRefresh.mock.calls.filter(([repo]) => repo === "/focused").length;
+    index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(maybeRefresh.mock.calls.filter(([repo]) => repo === "/focused")).toHaveLength(focusedCalls);
+    index.reset();
+  });
+
   it("retains a follow-up after changes during an in-flight build", async () => {
     let release!: (value: LiveRefreshOutcome) => void;
     const maybeRefresh = vi.fn(() => Promise.resolve(outcome("refresh")))

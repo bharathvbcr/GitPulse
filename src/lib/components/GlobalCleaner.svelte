@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { hostPlatform } from "../stores/platformStore";
   import { closedAppSchedulingReason } from "../ui/platformCopy";
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";

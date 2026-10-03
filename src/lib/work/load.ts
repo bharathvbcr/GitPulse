@@ -1,12 +1,14 @@
 import { withinDeadline, workTimeout } from "./request";
 import { validateWorkResponse } from "./contracts";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
 import type { GrantView } from "../grants/types";
 import type { LedgerEvent } from "../ledger/types";
-import type { TaskScope, TaskView } from "../tasks/types";
+import { loadWorktreeTasks } from "../tasks/bindings";
+import { loadTaskScopes } from "../tasks/scopes";
+import type { TaskView } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
 import type { RepoOperation } from "../repos/operation";
 import { projectWork, type WorkInputs, type WorkProjection, type WorkSources } from "./projection";
@@ -242,19 +244,10 @@ export async function loadWork(
   if (input.worktrees && input.worktrees.length > 0) {
     const looked = input.worktrees.slice(0, MAX_BINDING_LOOKUPS);
     const bindings: Record<string, string> = Object.create(null);
-    const bindingReads = await mapItems(looked, DEFAULT_FAN_OUT, (worktree) =>
-      call<string | null>("cmd_worktree_task", {
-        repoPath,
-        worktreePath: worktree.path,
-      }).then(
-        (taskId) => ({ path: worktree.path, taskId, ok: true as const }),
-        (error) => ({
-          path: worktree.path,
-          taskId: null,
-          ok: false as const,
-          detail: formatError(error),
-        }),
-      ),
+    const bindingReads = await loadWorktreeTasks(
+      call,
+      repoPath,
+      looked.map((worktree) => worktree.path),
     );
     let bindingFailures = 0;
     let bindingFailureDetail = "";
@@ -290,14 +283,15 @@ export async function loadWork(
     `titles loaded for ${taskIds.length} of ${allTaskIds.length} tasks; other rows use task IDs`);
   if (taskIds.length > 0) {
     const titles: Record<string, string> = Object.create(null);
-    let failures = 0;
-    await mapItems(taskIds, DEFAULT_FAN_OUT, async taskId => {
-      try {
-        const scope = await call<TaskScope | null>("cmd_task_scope", { repoPath, taskId });
-        if (scope?.title) titles[taskId] = scope.title;
-      } catch { failures += 1; }
-    });
-    if (failures) sources.tasks = noteFailure(sources.tasks, `${failures} task titles could not be read; using task IDs`);
+    try {
+      const scopes = await loadTaskScopes(call, repoPath, taskIds);
+      for (const taskId of taskIds) {
+        const title = scopes[taskId]?.title;
+        if (title) titles[taskId] = title;
+      }
+    } catch (e) {
+      sources.tasks = noteFailure(sources.tasks, `task titles could not be read (${formatError(e)}); using task IDs`);
+    }
     input.titles = titles;
   }
 

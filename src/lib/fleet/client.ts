@@ -16,7 +16,7 @@
  * sites invisible to it.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import type { LanguageStatsReport } from "../language/barStats";
 import type { StorageReport } from "../storage/types";
 import type { DepsHealthReport } from "../health/types";

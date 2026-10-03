@@ -18,7 +18,7 @@
  * Both reject rather than resolve on failure, so callers surface the reason
  * instead of a silently dead menu item.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 
 /** Opens a repo-relative path with the OS default application. */
 export async function openInDefaultApp(repo: string, relative: string): Promise<void> {

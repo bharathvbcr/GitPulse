@@ -65,7 +65,7 @@
   import { onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord } from "../ui/platformCopy";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from "../ipc/invoke";
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";

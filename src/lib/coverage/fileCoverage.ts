@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../ipc/invoke";
 import type { CoveredLine, FileCoverage } from "./types";
 
 export function buildHitMap(lines: CoveredLine[]): Map<number, number> {
