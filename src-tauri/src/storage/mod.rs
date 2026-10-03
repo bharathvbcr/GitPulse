@@ -20,7 +20,9 @@
 //! degrade into notes on the report; only an invalid repository fails the
 //! command.
 
-use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
+use crate::engine::git_cli::{
+    git_text, is_deferred_under_load, resolve_git_common_dir, validate_repo,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -75,7 +77,13 @@ pub struct ArtifactDir {
     pub unignored: bool,
     /// Number of index-tracked files inside this directory. Committed cache
     /// content survives even a correct .gitignore — the classic history bloat.
+    /// Zero is a measurement only when [`Self::checks_unexamined`] is false.
     pub tracked_files: u64,
+    /// The ignore probe or the tracked-file probe did not run. `unignored`
+    /// and `tracked_files` are then unknown, not a finding that the directory
+    /// is disposable.
+    #[serde(default)]
+    pub checks_unexamined: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +707,51 @@ fn git_subdir_bytes(git_dir: &Path, name: &str, budget: &mut WalkBudget) -> u64 
     }
 }
 
+/// What one git probe established.
+///
+/// `Answered` is a measurement, including the empty one: `check-ignore` exit 1
+/// means none of the paths are ignored. `Unexamined` means git did not answer.
+/// Those must not share a representation — an empty set is also what exit 1
+/// produces, and callers turn that into "nothing is ignored" or "nothing is
+/// tracked", which is how a deferred probe becomes a license to delete.
+enum GitProbe<T> {
+    Answered(T),
+    Unexamined,
+}
+
+/// `check-ignore` exit 1, and not exit 10, 11, or 128.
+///
+/// The producer writes `failed with status 1` with the code at a token
+/// boundary. A substring search matches `failed with status 128`, which is
+/// how a broken repository was classified as "nothing is ignored".
+fn is_check_ignore_exit_one(reason: &str) -> bool {
+    const MARK: &str = "failed with status 1";
+    reason
+        .match_indices(MARK)
+        .any(|(at, _)| match reason.as_bytes().get(at + MARK.len()) {
+            None => true,
+            Some(byte) => !byte.is_ascii_digit(),
+        })
+}
+
+/// Classify one `check-ignore` result.
+///
+/// A message that carries the spawn gate's deferral marker is unexamined even
+/// when it also mentions exit status 1: the gate's sentence is the cause, and
+/// a status code that was never returned must not win.
+fn census_from_check_ignore(
+    result: Result<Vec<u8>, String>,
+) -> GitProbe<std::collections::HashSet<String>> {
+    match result {
+        Ok(out) => GitProbe::Answered(parse_check_ignore_z(&String::from_utf8_lossy(&out))),
+        Err(reason) if is_deferred_under_load(&reason) => GitProbe::Unexamined,
+        Err(reason) if is_check_ignore_exit_one(&reason) => {
+            GitProbe::Answered(std::collections::HashSet::new())
+        }
+        Err(_) => GitProbe::Unexamined,
+    }
+}
+
 /// Which of `candidates` are covered by ignore rules, in ONE batched call.
 ///
 /// Candidates are directories, so each is fed with a trailing `/`: patterns
@@ -706,13 +759,15 @@ fn git_subdir_bytes(git_dir: &Path, name: &str, budget: &mut WalkBudget) -> u64 
 /// the pathname as given. Echoed names are normalized back to bare paths so
 /// callers can look candidates up directly.
 ///
-/// Exit code 1 means "nothing is ignored" — a valid answer here, not an
-/// error. Any other failure returns the empty set (callers then report
-/// `unignored` conservatively, which is the safe direction for surfacing
-/// hygiene gaps).
-fn batch_check_ignore(repo: &Path, candidates: &[String]) -> std::collections::HashSet<String> {
+/// Exit code 1 means "nothing is ignored" — a valid answer, not an error.
+/// Any other failure, including a spawn the gate deferred, is
+/// [`GitProbe::Unexamined`]: the directory is not reported as unignored.
+fn batch_check_ignore(
+    repo: &Path,
+    candidates: &[String],
+) -> GitProbe<std::collections::HashSet<String>> {
     if candidates.is_empty() {
-        return Default::default();
+        return GitProbe::Answered(std::collections::HashSet::new());
     }
 
     // Paths go over stdin (they are pathnames, not pathspecs): no globbing,
@@ -724,7 +779,7 @@ fn batch_check_ignore(repo: &Path, candidates: &[String]) -> std::collections::H
         stdin_bytes.push(0);
     }
 
-    match crate::engine::git_cli::git_with_stdin(
+    census_from_check_ignore(crate::engine::git_cli::git_with_stdin(
         repo,
         // `--no-index`: report what the RULES say, independent of index
         // state. Without it, any directory containing tracked files is
@@ -740,11 +795,7 @@ fn batch_check_ignore(repo: &Path, candidates: &[String]) -> std::collections::H
             "--no-index",
         ],
         &stdin_bytes,
-    ) {
-        Ok(out) => parse_check_ignore_z(&String::from_utf8_lossy(&out)),
-        Err(e) if e.contains("failed with status 1") => Default::default(),
-        Err(_) => Default::default(),
-    }
+    ))
 }
 
 /// Parses `check-ignore -z --verbose` output: records of
@@ -772,10 +823,10 @@ fn parse_check_ignore_z(stdout: &str) -> std::collections::HashSet<String> {
 /// `git ls-files` call. Candidate prefixes get `:(literal)` pathspec magic so
 /// glob characters inside user-named intermediate directories cannot widen
 /// what is counted.
-fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> HashMap<String, u64> {
+fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> GitProbe<HashMap<String, u64>> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     if candidates.is_empty() {
-        return counts;
+        return GitProbe::Answered(counts);
     }
     let literal: Vec<String> = candidates
         .iter()
@@ -784,7 +835,7 @@ fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> HashMap<String, u
     let mut argv: Vec<&str> = vec!["-c", "core.fsmonitor=false", "ls-files", "-z", "--"];
     argv.extend(literal.iter().map(String::as_str));
     let Ok(bytes) = crate::engine::git_cli::git_with_stdin(repo, &argv, &[]) else {
-        return counts;
+        return GitProbe::Unexamined;
     };
     for raw in bytes.split(|b| *b == 0) {
         let Ok(path) = std::str::from_utf8(raw) else {
@@ -801,7 +852,7 @@ fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> HashMap<String, u
             }
         }
     }
-    counts
+    GitProbe::Answered(counts)
 }
 
 /// Attributes every walked byte to its nearest enclosing artifact scope, so
@@ -1207,6 +1258,7 @@ fn build_reclaim(
         }
         let committed = artifact.tracked_files > 0;
         let protected = hygiene::providers::protected_artifact(&artifact.path);
+        let unknown = artifact.checks_unexamined;
         let category = match artifact.kind {
             ArtifactKind::Build => ReclaimCategory::BuildOutput,
             ArtifactKind::Cache => ReclaimCategory::Cache,
@@ -1218,7 +1270,7 @@ fn build_reclaim(
             confidence: ReclaimConfidence::Measured,
             // Committed content is not regenerable output any more, whatever
             // the directory is named: deleting it changes the working tree.
-            safety: if committed || protected {
+            safety: if committed || protected || unknown {
                 ReclaimSafety::NeedsReview
             } else {
                 ReclaimSafety::Safe
@@ -1228,7 +1280,9 @@ fn build_reclaim(
             } else {
                 "Preview in Repository hygiene before cleanup".into()
             },
-            detail: if protected {
+            detail: if unknown && !artifact.unignored && !committed {
+                "Git did not answer whether this directory is ignored or contains tracked files, so it is not treated as disposable.".into()
+            } else if protected {
                 "This directory may hold environments, dependencies, persistent state or unrecoverable local work. Its name does not prove it is disposable.".into()
             } else if committed {
                 format!(
@@ -1240,10 +1294,15 @@ fn build_reclaim(
             } else {
                 "Regenerable build or cache output.".into()
             },
-            blocked_reason: (committed || protected).then(|| {
-                if committed { "Tracked in git — removing it is a commit, not a cleanup.".to_string() }
-                else { "Protected content: use the owning tool or review it manually.".to_string() }
-            }),
+            blocked_reason: if committed {
+                Some("Tracked in git — removing it is a commit, not a cleanup.".to_string())
+            } else if protected {
+                Some("Protected content: use the owning tool or review it manually.".to_string())
+            } else if unknown {
+                Some("The ignore or tracked-file check did not run.".to_string())
+            } else {
+                None
+            },
         });
     }
 
@@ -1359,7 +1418,15 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
 
     // Discover worktree layout upfront: identify any linked worktrees whose roots
     // live inside the repository (e.g. .claude/worktrees/*, .cursor/worktrees/*, or worktrees/*).
-    let worktree_infos = crate::engine::worktree::list_worktrees_lite(repo_path)?;
+    // A deferred listing is not an invalid repository. Continuing without it
+    // can count a nested worktree inside the main walk, so the scan is marked
+    // truncated and must not be read as a complete total.
+    let (worktree_infos, worktrees_unexamined) =
+        match crate::engine::worktree::list_worktrees_lite(repo_path) {
+            Ok(infos) => (infos, false),
+            Err(reason) if is_deferred_under_load(&reason) => (Vec::new(), true),
+            Err(reason) => return Err(reason),
+        };
     let mut linked_worktrees = std::collections::HashSet::new();
     for wt in worktree_infos.iter().filter(|w| !w.is_main) {
         let p = PathBuf::from(&wt.path);
@@ -1470,6 +1537,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
             kind: *kind,
             unignored: false,
             tracked_files: 0,
+            checks_unexamined: false,
         })
         .collect();
     artifacts.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
@@ -1481,9 +1549,16 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let candidates: Vec<String> = artifacts.iter().map(|a| a.path.clone()).collect();
     let ignored = batch_check_ignore(&repo, &candidates);
     let tracked = batch_tracked_counts(&repo, &candidates);
+    let checks_unexamined =
+        matches!(ignored, GitProbe::Unexamined) || matches!(tracked, GitProbe::Unexamined);
     for artifact in &mut artifacts {
-        artifact.unignored = !ignored.contains(&artifact.path);
-        artifact.tracked_files = tracked.get(&artifact.path).copied().unwrap_or(0);
+        artifact.checks_unexamined = checks_unexamined;
+        if let GitProbe::Answered(ignored) = &ignored {
+            artifact.unignored = !ignored.contains(&artifact.path);
+        }
+        if let GitProbe::Answered(tracked) = &tracked {
+            artifact.tracked_files = tracked.get(&artifact.path).copied().unwrap_or(0);
+        }
     }
 
     // ---- Linked worktrees + branches -------------------------------------
@@ -1506,6 +1581,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         .saturating_add(git_budget.permission_denied)
         .saturating_add(wt_perms);
     let is_truncated = artifacts_truncated
+        || worktrees_unexamined
         || worktree_budget.truncated
         || git_truncated
         || git_budget.truncated
@@ -1650,6 +1726,112 @@ mod tests {
         assert!(parse_check_ignore_z("").is_empty());
         // Truncated trailing record must not panic or half-match.
         assert!(parse_check_ignore_z("x\x001\0/p\0").is_empty());
+    }
+
+    fn artifact(path: &str, unexamined: bool, unignored: bool) -> ArtifactDir {
+        ArtifactDir {
+            path: path.into(),
+            bytes: 64,
+            kind: ArtifactKind::Build,
+            unignored,
+            tracked_files: 0,
+            checks_unexamined: unexamined,
+        }
+    }
+
+    fn branches() -> BranchStorageSummary {
+        BranchStorageSummary {
+            local_count: 0,
+            remote_tracking_count: 0,
+            merged_stale_count: 0,
+            gone_upstream_count: 0,
+            sample_merged_stale: Vec::new(),
+            sample_gone_upstream: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// Strings the spawn gate and git actually produce. A deferred or broken
+    /// probe must not classify as exit 1 ("nothing is ignored"), and a message
+    /// that contains both markers must follow the gate, not the status code.
+    #[test]
+    fn a_check_ignore_that_did_not_run_is_not_an_empty_ignore_census() {
+        let deferred = "git check-ignore deferred under load after 2.008s: the git spawn rate \
+                        limit admitted nothing sooner";
+        let shed = "git check-ignore deferred under load after 0.000s: background work is shed \
+                    while the git spawn rate budget is low";
+        let both = format!("{deferred}; failed with status 1");
+        let cases = [
+            deferred,
+            shed,
+            both.as_str(),
+            "git check-ignore timed out after 2.000s waiting for a process slot",
+            "git check-ignore failed with status 128: fatal: not a git repository",
+            "git check-ignore failed with status 128",
+            "git check-ignore failed with status 10",
+            "git check-ignore failed with status 11",
+            "",
+        ];
+        for case in cases {
+            assert!(
+                matches!(
+                    census_from_check_ignore(Err(case.into())),
+                    GitProbe::Unexamined
+                ),
+                "{case}"
+            );
+        }
+
+        match census_from_check_ignore(Err("git check-ignore failed with status 1".into())) {
+            GitProbe::Answered(set) => assert!(set.is_empty(), "exit 1 is a measured empty census"),
+            GitProbe::Unexamined => panic!("exit 1 is a real answer"),
+        }
+
+        let answered =
+            census_from_check_ignore(Ok(b".gitignore\x001\0/target/\0target\0".to_vec()));
+        match answered {
+            GitProbe::Answered(set) => assert!(set.contains("target")),
+            GitProbe::Unexamined => panic!("stdout is a measurement"),
+        }
+    }
+
+    #[test]
+    fn an_unexamined_artifact_is_not_disposable() {
+        let (unknown, _) = build_reclaim(
+            &[artifact("my-build-output", true, false)],
+            &GitStorage::default(),
+            &branches(),
+            &[],
+            &[],
+            false,
+        );
+        let item = unknown
+            .iter()
+            .find(|item| item.label == "my-build-output")
+            .expect("row");
+        assert_eq!(item.safety, ReclaimSafety::NeedsReview);
+        let reason = item.blocked_reason.as_deref().expect("blocked");
+        assert!(reason.contains("did not run"), "{reason}");
+        assert!(
+            !item.detail.contains("no ignore rule"),
+            "an unrun check must not be described as a missing ignore rule: {}",
+            item.detail
+        );
+
+        let (measured, _) = build_reclaim(
+            &[artifact("my-build-output", false, true)],
+            &GitStorage::default(),
+            &branches(),
+            &[],
+            &[],
+            false,
+        );
+        let item = measured
+            .iter()
+            .find(|item| item.label == "my-build-output")
+            .expect("row");
+        assert!(item.detail.contains("no ignore rule"), "{}", item.detail);
+        assert!(item.blocked_reason.is_none(), "{:?}", item.blocked_reason);
     }
 
     #[test]

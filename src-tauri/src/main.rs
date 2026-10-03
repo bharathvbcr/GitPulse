@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // The app spends the per-user spawn budget its agent servers and hooks
+    // share. First, ahead of the headless cleanup branch below, which spawns
+    // git too and never reaches `run()`.
+    gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--cleaner-due")

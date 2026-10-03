@@ -23,7 +23,9 @@
 //! for ignoring something in one clone, it is never committed, and it applies
 //! to linked worktrees through the common directory.
 
-use crate::engine::git_cli::{git_captured, resolve_git_common_dir, validate_repo};
+use crate::engine::git_cli::{
+    git_captured, is_deferred_under_load, resolve_git_common_dir, validate_repo,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -48,7 +50,11 @@ pub enum ExcludeOutcome {
     /// There is nothing to ignore — `DEVMAP_HOME` puts this repository's state
     /// outside the work tree.
     NotNeeded { reason: String },
-    /// Nothing was written and the state directory is still not ignored.
+    /// Nothing was written. `reason` says which: git confirmed the directory
+    /// is still not ignored, or the check that would have said so did not run.
+    /// Those are different facts, and [`registry_withheld_reason`] keeps them
+    /// apart — a deferred `check-ignore` must not be reported as an unignored
+    /// directory.
     Refused { reason: String },
 }
 
@@ -225,6 +231,22 @@ pub fn ensure_state_dir_excluded(repo: &Path) -> ExcludeOutcome {
     }
 }
 
+/// Why the workspace registry was not written when the state directory is
+/// not known to be hidden.
+///
+/// A `check-ignore` the spawn gate deferred did not learn anything about the
+/// directory. Saying it "is not ignored" would record a conclusion the probe
+/// never reached, and the next reader would treat an unexamined tree the same
+/// as one git has already refused to hide.
+fn registry_withheld_reason(exclude: &ExcludeOutcome) -> String {
+    match exclude {
+        ExcludeOutcome::Refused { reason } if is_deferred_under_load(reason) => format!(
+            "the ignore check did not run ({reason}); not creating untracked state until it does"
+        ),
+        _ => "the DevMap state directory is not ignored; not creating untracked state in it".into(),
+    }
+}
+
 /// Everything one repository's automatic initialization did or declined to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InitReport {
@@ -278,10 +300,9 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
             Some("devmap is not installed and this repository has no DevMap state yet".into());
     } else if !exclude.is_clean() {
         // Writing the registry now would create exactly the untracked
-        // directory the exclude step failed to hide.
-        workspace_reason = Some(
-            "the DevMap state directory is not ignored; not creating untracked state in it".into(),
-        );
+        // directory the exclude step failed to hide. A probe that did not
+        // run is not the same fact as a directory git says is unignored.
+        workspace_reason = Some(registry_withheld_reason(&exclude));
     } else {
         match crate::workspace_registry::sync_open_tabs(repo_path, open_repos) {
             Ok(snapshot) => {
@@ -622,6 +643,43 @@ mod tests {
         let report = initialize(&repo_path, std::slice::from_ref(&repo_path)).expect("initialize");
         assert!(matches!(report.exclude, ExcludeOutcome::Refused { .. }));
         assert!(report.workspace_registry.is_none());
+        let reason = report.workspace_reason.expect("registry withheld");
+        assert!(
+            reason.contains("is not ignored"),
+            "a rule git confirmed does not hide the directory must say so: {reason}"
+        );
         assert!(!Path::new(&report.state_dir).exists(), "no state written");
+    }
+
+    #[test]
+    fn a_deferred_ignore_check_is_not_reported_as_an_unignored_directory() {
+        let deferred = ExcludeOutcome::Refused {
+            reason: "git check-ignore deferred under load after 2.008s: the git spawn rate \
+                     limit admitted nothing sooner"
+                .into(),
+        };
+        let reason = registry_withheld_reason(&deferred);
+        assert!(
+            reason.contains("did not run"),
+            "an unrun check must say it did not run: {reason}"
+        );
+        assert!(
+            reason.contains("deferred under load"),
+            "the gate's own sentence must survive: {reason}"
+        );
+        assert!(
+            !reason.contains("is not ignored"),
+            "an unrun check must not be reported as a directory git found unignored: {reason}"
+        );
+
+        let confirmed = ExcludeOutcome::Refused {
+            reason: "a later rule re-includes it".into(),
+        };
+        let confirmed_reason = registry_withheld_reason(&confirmed);
+        assert!(
+            confirmed_reason.contains("is not ignored"),
+            "{confirmed_reason}"
+        );
+        assert!(!confirmed_reason.contains("deferred under load"));
     }
 }

@@ -30,15 +30,23 @@
  * So the memo records *why* a run stopped short. A run blocked by a missing
  * devmap is dropped by [`AutoInitController.onToolsChanged`], which the tool
  * probe calls whenever it sees devmap present — covering an install made in
- * this app and one made in a terminal alike. Every other shortfall keeps the
- * ordinary rule: memoized against a re-submitted scope so it cannot spin, and
- * retried when the open-tab set actually changes. Deliberately not cleared by
- * a tool probe, because a probe cannot fix them and a repository whose ignore
- * rule stays refused would otherwise be re-initialized every time a panel
- * looked at the tool list.
+ * this app and one made in a terminal alike. A run the spawn gate deferred
+ * learned nothing, so it is not a finished answer either: it is asked again
+ * after the same backoff the live index uses, and a re-submitted scope during
+ * that wait does not ask early. Every other shortfall keeps the ordinary
+ * rule: memoized against a re-submitted scope so it cannot spin, and retried
+ * when the open-tab set actually changes. Deliberately not cleared by a tool
+ * probe, because a probe cannot fix them and a repository whose ignore rule
+ * stays refused would otherwise be re-initialized every time a panel looked
+ * at the tool list.
  */
 
 import { writable } from "svelte/store";
+import {
+  deferredRetryDelayMs,
+  isDeferredUnderLoad,
+  MAX_DEFERRED_RETRIES,
+} from "../async/deferral";
 import type { BackgroundScope } from "../async/pacedQueue";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { initializeDevcouncil } from "./client";
@@ -68,6 +76,21 @@ export interface AutoInitSnapshot {
  */
 export function blockedOnMissingTool(report: InitReport): boolean {
   return !report.devmap_available;
+}
+
+/**
+ * Whether this report is an unexamined tree rather than a decision.
+ *
+ * The spawn gate's marker is the only classifier, same as the live index:
+ * a refused exclude whose reason is a real git answer ("a later rule
+ * re-includes it") is a finished refusal, and one whose reason carries the
+ * spawn gate's deferral marker means `check-ignore` never ran.
+ */
+export function stoppedShortUnderLoad(report: InitReport): boolean {
+  if (report.exclude.status === "refused" && isDeferredUnderLoad(report.exclude.reason)) {
+    return true;
+  }
+  return report.workspace_reason != null && isDeferredUnderLoad(report.workspace_reason);
 }
 
 export interface AutoInitController {
@@ -104,6 +127,12 @@ export function createAutoInit(opts?: {
    * worth redoing if one appears; see `blockedOnMissingTool`.
    */
   const applied = new Map<string, { sig: string; blocked: boolean }>();
+  /**
+   * A deferred run is unfinished, so it is not in `applied`. `until` is the
+   * earliest the same signature may be asked again; an earlier flush waits
+   * instead of starting another child into the gate that just refused one.
+   */
+  const held = new Map<string, { sig: string; until: number; attempt: number }>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let pending: { activeKey: string | null; retained: string[] } | null = null;
   let inFlight: Promise<void> | null = null;
@@ -121,18 +150,44 @@ export function createAutoInit(opts?: {
     patch(activeKey, { running: true });
     try {
       const report = await initialize(activeKey, retained);
-      applied.set(activeKey, { sig, blocked: blockedOnMissingTool(report) });
+      const deferred = stoppedShortUnderLoad(report);
+      const attempt = deferred ? (held.get(activeKey)?.attempt ?? 0) + 1 : 0;
+      const willRetry = deferred && attempt <= MAX_DEFERRED_RETRIES;
+      const stillCurrent =
+        lastScope !== null &&
+        lastScope.activeKey === activeKey &&
+        signature(lastScope.activeKey, lastScope.retained) === sig;
+      if (willRetry) {
+        const delayMs = deferredRetryDelayMs(attempt);
+        held.set(activeKey, { sig, until: Date.now() + delayMs, attempt });
+        // `pending` is set by a scope change that has not flushed yet. Stealing
+        // the timer from it would drop that change and retry the old scope.
+        const queuedSig = pending?.activeKey
+          ? signature(pending.activeKey, pending.retained)
+          : null;
+        if (queuedSig === null && stillCurrent) {
+          pending = { activeKey, retained: [...retained] };
+          if (timer !== null) clearTimeout(timer);
+          timer = setTimeout(flush, delayMs);
+        }
+      } else {
+        held.delete(activeKey);
+        applied.set(activeKey, { sig, blocked: blockedOnMissingTool(report) });
+      }
       patch(activeKey, { report, error: null, running: false });
       // A refusal is not an error — the Rust side declined on purpose and
       // said why — but it is the reason a repository keeps showing untracked
-      // index state, so it must not vanish silently.
-      if (report.exclude.status === "refused") {
+      // index state, so it must not vanish silently. A deferral that will be
+      // retried warns once; repeating it on every backoff would fill the
+      // diagnostics panel with the same unexamined check.
+      const announce = !deferred || attempt === 1 || !willRetry;
+      if (announce && report.exclude.status === "refused") {
         warn(
           "devcouncil-init",
           `${activeKey}: DevMap state could not be hidden from git status — ${report.exclude.reason}`,
         );
       }
-      if (report.workspace_registry === null && report.workspace_reason) {
+      if (announce && report.workspace_registry === null && report.workspace_reason) {
         warn(
           "devcouncil-init",
           `${activeKey}: cross-repository search has no registry — ${report.workspace_reason}`,
@@ -160,6 +215,13 @@ export function createAutoInit(opts?: {
     const { activeKey, retained } = next;
     lastScope = { activeKey, retained: [...retained] };
     const sig = signature(activeKey, retained);
+    const waiting = held.get(activeKey);
+    if (waiting && waiting.sig !== sig) held.delete(activeKey);
+    if (waiting && waiting.sig === sig && Date.now() < waiting.until) {
+      pending = { activeKey, retained: [...retained] };
+      timer = setTimeout(flush, waiting.until - Date.now());
+      return;
+    }
     if (applied.get(activeKey)?.sig === sig) return;
     // One at a time: initialization takes a cross-process lock on the registry,
     // and a queue of stale scopes would each wait for it in turn.
@@ -176,6 +238,9 @@ export function createAutoInit(opts?: {
       const open = new Set(scope.retainedKeys);
       for (const key of [...applied.keys()]) {
         if (!open.has(key)) applied.delete(key);
+      }
+      for (const key of [...held.keys()]) {
+        if (!open.has(key)) held.delete(key);
       }
       snapshots.update((map) => {
         const closed = Object.keys(map).filter((key) => !open.has(key));
@@ -221,6 +286,7 @@ export function createAutoInit(opts?: {
       inFlight = null;
       lastScope = null;
       applied.clear();
+      held.clear();
       snapshots.set({});
     },
   };

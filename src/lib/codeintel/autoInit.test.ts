@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { blockedOnMissingTool, createAutoInit } from "./autoInit";
+import { blockedOnMissingTool, createAutoInit, stoppedShortUnderLoad } from "./autoInit";
 import type { InitReport } from "./types";
 
 function report(overrides: Partial<InitReport> = {}): InitReport {
@@ -116,6 +116,91 @@ describe("autoInit", () => {
     index.setScope(scope("/a", ["/a"]));
     await vi.advanceTimersByTimeAsync(10);
     expect(warn).toHaveBeenCalledTimes(2);
+    index.reset();
+  });
+
+  it("retries a deferred ignore check after the backoff instead of remembering it", async () => {
+    const deferred = "git check-ignore deferred under load after 2.008s: the git spawn rate limit admitted nothing sooner";
+    const initialize = vi
+      .fn<(repo: string, open: string[]) => Promise<InitReport>>()
+      .mockResolvedValueOnce(
+        report({
+          exclude: { status: "refused", reason: deferred },
+          workspace_registry: null,
+          workspace_reason: `the ignore check did not run (${deferred}); not creating untracked state until it does`,
+        }),
+      )
+      .mockResolvedValue(report());
+    const warn = vi.fn();
+    const index = createAutoInit({ debounceMs: 0, initialize, warn });
+    index.setScope(scope("/a", ["/a"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(initialize).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    // The same scope inside the backoff must not start another child.
+    index.setScope(scope("/a", ["/a"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(initialize).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(initialize).toHaveBeenCalledTimes(2);
+    expect(index.get("/a").report?.workspace_registry).toBe("/a/.devmap/workspace.json");
+    index.reset();
+  });
+
+  it("keeps initializing a different repository while one deferral is backing off", async () => {
+    const deferred = "git check-ignore deferred under load after 2.008s: the git spawn rate limit admitted nothing sooner";
+    const initialize = vi.fn(async (repo: string) => {
+      if (repo === "/a") {
+        return report({
+          repo: "/a",
+          exclude: { status: "refused", reason: deferred },
+          workspace_registry: null,
+          workspace_reason: `the ignore check did not run (${deferred}); not creating untracked state until it does`,
+        });
+      }
+      return report({ repo: "/b", workspace_registry: "/b/.devmap/workspace.json" });
+    });
+    const index = createAutoInit({ debounceMs: 0, initialize });
+    index.setScope(scope("/a", ["/a", "/b"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    index.setScope(scope("/b", ["/a", "/b"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(initialize).toHaveBeenCalledTimes(2);
+    expect(initialize).toHaveBeenLastCalledWith("/b", ["/a", "/b"]);
+    expect(index.get("/b").report?.workspace_registry).toBe("/b/.devmap/workspace.json");
+
+    // Coming back inside the backoff must not start a third child.
+    index.setScope(scope("/a", ["/a", "/b"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(initialize).toHaveBeenCalledTimes(2);
+    index.reset();
+  });
+
+  it("stops retrying a deferral that never clears", async () => {
+    const deferred = "git check-ignore deferred under load after 0.000s: background work is shed while the git spawn rate budget is low";
+    const initialize = vi.fn(async () =>
+      report({
+        exclude: { status: "refused", reason: deferred },
+        workspace_registry: null,
+        workspace_reason: `the ignore check did not run (${deferred}); not creating untracked state until it does`,
+      }),
+    );
+    const index = createAutoInit({ debounceMs: 0, initialize });
+    index.setScope(scope("/a", ["/a"]));
+    await vi.advanceTimersByTimeAsync(0);
+    // 3s + 6s + 12s + 24s + 30s of backoff, then one settled attempt.
+    await vi.advanceTimersByTimeAsync(3_000 + 6_000 + 12_000 + 24_000 + 30_000);
+    const settled = initialize.mock.calls.length;
+    expect(settled).toBe(6);
+    index.setScope(scope("/a", ["/a"]));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(initialize).toHaveBeenCalledTimes(settled);
     index.reset();
   });
 
@@ -306,5 +391,29 @@ describe("blockedOnMissingTool", () => {
 
   it("does not call an unwritten registry a tool problem when devmap is there", () => {
     expect(blockedOnMissingTool(report({ workspace_registry: null }))).toBe(false);
+  });
+});
+
+describe("stoppedShortUnderLoad", () => {
+  it("is only a probe the spawn gate did not run", () => {
+    const deferred = "git check-ignore deferred under load after 2.008s: the git spawn rate limit admitted nothing sooner";
+    expect(
+      stoppedShortUnderLoad(
+        report({
+          exclude: { status: "refused", reason: deferred },
+          workspace_registry: null,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      stoppedShortUnderLoad(
+        report({
+          exclude: { status: "refused", reason: "a later rule re-includes it" },
+          workspace_registry: null,
+          workspace_reason: "the DevMap state directory is not ignored",
+        }),
+      ),
+    ).toBe(false);
+    expect(stoppedShortUnderLoad(report())).toBe(false);
   });
 });

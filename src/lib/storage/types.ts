@@ -23,6 +23,12 @@ export interface ArtifactDir {
   unignored: boolean;
   /** Index-tracked files inside an artifact dir: committed-cache bloat. */
   tracked_files: number;
+  /**
+   * The ignore or tracked-file probe did not run. Zero `tracked_files` and
+   * `unignored: false` are then unknown, not a finding that the directory
+   * is disposable.
+   */
+  checks_unexamined?: boolean;
 }
 
 export interface LargeFile {

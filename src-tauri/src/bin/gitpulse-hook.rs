@@ -28,6 +28,10 @@ use std::io;
 use gitpulse_lib::hooks::{self, IDENTITY_FLAGS, SUBCOMMANDS};
 
 fn main() {
+    // A hook runs git for the user's own agent, so it spends the per-user
+    // spawn budget the app and the agent servers spend. First, before any
+    // spawn builds the gate.
+    gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
     decide();
     // Not a bare return: a hook that finished while a caught signal was still
     // being swept would exit out from under it, leaving the git or harness

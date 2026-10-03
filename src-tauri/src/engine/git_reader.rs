@@ -1684,31 +1684,16 @@ impl GitReader {
                 }
             };
 
-        let (mut commits, top_files, extensions) = parse_pulse_stream(&stdout);
-        let payload_truncated = payload_incomplete.is_some();
-
-        // A cut-off stream ends mid-commit. Drop the last record so a
-        // half-parsed numstat block cannot pose as a complete commit.
-        if payload_truncated && !commits.is_empty() {
-            commits.pop();
-        }
-
-        let commit_capped = commits.len() > cap;
-        if commit_capped {
-            commits.truncate(cap);
-        }
-        let truncated = commit_capped || payload_truncated;
-        let total_commits_scanned = commits.len();
-
+        let captured = assemble_pulse_capture(&stdout, payload_incomplete, cap)?;
         Ok(PulseReport {
-            commits,
-            top_files_by_churn: top_files,
-            extensions,
+            commits: captured.commits,
+            top_files_by_churn: captured.top_files,
+            extensions: captured.extensions,
             has_mailmap,
-            total_commits_scanned,
-            truncated,
-            payload_truncated,
-            payload_truncation_reason: payload_incomplete.map(|reason| reason.describe()),
+            total_commits_scanned: captured.total_commits_scanned,
+            truncated: captured.truncated,
+            payload_truncated: captured.payload_truncated,
+            payload_truncation_reason: captured.payload_truncation_reason,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }
@@ -2241,6 +2226,58 @@ fn extract_extension(path: &str) -> String {
             }
             "other".to_string()
         })
+}
+
+#[derive(Debug)]
+struct PulseCapture {
+    commits: Vec<PulseCommitSummary>,
+    top_files: Vec<PulseFileChurn>,
+    extensions: Vec<PulseExtensionChurn>,
+    total_commits_scanned: usize,
+    truncated: bool,
+    payload_truncated: bool,
+    payload_truncation_reason: Option<String>,
+}
+
+/// Turns a capped `git log` capture into pulse rows.
+///
+/// A cut-off stream ends mid-commit, so the last record is dropped. A
+/// deadline that still leaves at least one complete commit is that prefix,
+/// marked truncated. A deadline that leaves none is a failure: an empty
+/// report would read as a repository with no history.
+fn assemble_pulse_capture(
+    stdout: &str,
+    incomplete: Option<Incomplete>,
+    cap: usize,
+) -> Result<PulseCapture, String> {
+    let (mut commits, top_files, extensions) = parse_pulse_stream(stdout);
+    let payload_truncated = incomplete.is_some();
+    if payload_truncated && !commits.is_empty() {
+        commits.pop();
+    }
+    if commits.is_empty() {
+        if let Some(Incomplete::Deadline {
+            message,
+            over_cap: None,
+        }) = &incomplete
+        {
+            return Err(message.clone());
+        }
+    }
+    let commit_capped = commits.len() > cap;
+    if commit_capped {
+        commits.truncate(cap);
+    }
+    let total_commits_scanned = commits.len();
+    Ok(PulseCapture {
+        commits,
+        top_files,
+        extensions,
+        total_commits_scanned,
+        truncated: commit_capped || payload_truncated,
+        payload_truncated,
+        payload_truncation_reason: incomplete.map(|reason| reason.describe()),
+    })
 }
 
 pub(crate) fn parse_pulse_stream(
@@ -7016,6 +7053,63 @@ __GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\
         assert_eq!(extract_target_path("{old => new}"), "new");
         assert_eq!(extract_target_path("dir/{a => b}/f.rs"), "dir/b/f.rs");
         assert_eq!(extract_target_path("plain/path.rs"), "plain/path.rs");
+    }
+
+    fn two_commit_pulse_log() -> String {
+        "\
+__GP_PULSE__\0abc123\0\x001700000000\0N\0first\0Ada\0ada@example.com\0\0\
+1\t0\ta.rs\n\
+\n\
+__GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
+2\t0\tb.rs\n\
+"
+        .to_string()
+    }
+
+    #[test]
+    fn a_deadline_with_complete_commits_is_a_truncated_pulse_not_an_error() {
+        let captured = super::assemble_pulse_capture(
+            &two_commit_pulse_log(),
+            Some(crate::engine::git_cli::Incomplete::Deadline {
+                message: "git log timed out after 90s".into(),
+                over_cap: None,
+            }),
+            5_000,
+        )
+        .expect("commits already printed survive the deadline");
+        // The cut-off record is dropped, so two printed commits become one.
+        assert_eq!(captured.total_commits_scanned, 1);
+        assert_eq!(captured.commits[0].sha, "abc123");
+        assert!(captured.truncated);
+        assert!(captured.payload_truncated);
+        let reason = captured.payload_truncation_reason.expect("a reason");
+        assert!(reason.contains("git log timed out after 90s"), "{reason}");
+        assert!(!reason.contains("waiting for a process slot"), "{reason}");
+        assert!(!reason.contains("deferred under load"), "{reason}");
+    }
+
+    #[test]
+    fn a_deadline_with_no_complete_commit_is_still_an_error() {
+        let err = super::assemble_pulse_capture(
+            "",
+            Some(crate::engine::git_cli::Incomplete::Deadline {
+                message: "git log timed out after 90s".into(),
+                over_cap: None,
+            }),
+            5_000,
+        )
+        .expect_err("an empty deadline must not look like a repository with no history");
+        assert_eq!(err, "git log timed out after 90s");
+    }
+
+    #[test]
+    fn a_finished_log_is_not_marked_truncated() {
+        let captured = super::assemble_pulse_capture(&two_commit_pulse_log(), None, 5_000)
+            .expect("a finished log");
+        assert_eq!(captured.total_commits_scanned, 2);
+        assert!(!captured.truncated);
+        assert!(!captured.payload_truncated);
+        assert!(captured.payload_truncation_reason.is_none());
     }
 
     #[test]

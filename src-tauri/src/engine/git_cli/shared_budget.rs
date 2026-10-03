@@ -6,7 +6,10 @@
 //! bucket is a small record in the per-user config directory, read and
 //! rewritten under an exclusive advisory lock. A process keeps its own bucket
 //! as well, and a spawn needs a token from both, so the shared record can only
-//! tighten the per-process limit, never loosen it.
+//! tighten the per-process limit, never loosen it. Only those shipped
+//! binaries open it, each by opting in at the top of `main`
+//! (`run_process_with_shared_spawn_budget`); a test or bench process that
+//! links the same engine keeps to its own bucket.
 //!
 //! It fails open, and says so. A record that cannot be opened safely leaves
 //! the process on its own bucket with a logged reason; a lock another process
@@ -34,8 +37,6 @@ const FILE_NAME: &str = "spawn-budget.v1";
 /// The config directory rather than `temp_dir()`: agent hosts commonly give
 /// the processes they start a private `TMPDIR`, which would silently split
 /// the app and its agents onto separate budgets again.
-// The unit-test build never opens the real record (see `shared_budget_path`).
-#[cfg_attr(test, allow(dead_code))]
 pub(super) fn default_path() -> Result<PathBuf, String> {
     crate::tool_config::default_config_dir()
         .map(|dir| dir.join(FILE_NAME))

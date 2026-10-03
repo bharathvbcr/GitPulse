@@ -481,6 +481,18 @@ impl Cleaner {
                                 .push(format!("Partial repository scan: {repo_path}"));
                         }
                     }
+                    if report
+                        .artifacts
+                        .iter()
+                        .any(|artifact| artifact.checks_unexamined)
+                    {
+                        result.partial = true;
+                        if result.issues.len() < 128 {
+                            result.issues.push(format!(
+                                "Ignore or tracked-file check did not run: {repo_path}"
+                            ));
+                        }
+                    }
                     for artifact in report.artifacts {
                         if result.candidates.len() >= 512 {
                             result.partial = true;
@@ -488,6 +500,7 @@ impl Cleaner {
                         }
                         if artifact.tracked_files > 0
                             || artifact.unignored
+                            || artifact.checks_unexamined
                             || excludes
                                 .iter()
                                 .any(|p| repo.join(&artifact.path).starts_with(p))

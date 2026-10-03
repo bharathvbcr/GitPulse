@@ -136,6 +136,42 @@ can no longer starve the actions you asked for.
 
 ### Fixed
 
+- **A pulse history walk that hits its deadline keeps the commits already read.**
+  The pulse report runs `git log` for up to 5,000 commits under the 90s git
+  deadline. When that deadline fired, every commit git had already printed was
+  discarded and Diagnostics recorded `git log timed out after 90s`. A capped
+  git read now keeps that prefix, drops the cut-off last record, and shows the
+  rest as an incomplete log. A deadline that produced no complete commit is
+  still an error, so an empty report cannot pass for a repository with no
+  history. Commands that must see the whole stream still fail, and a slot wait
+  is still a slot wait.
+- **No test or bench process draws from the per-user spawn budget any more.**
+  1.3.5 kept six stress tests off it, but every other integration test that
+  ran git still opened `spawn-budget.v1`, spent what the running app and
+  agent sessions share, and could be deferred by them. Sharing is now opt-in:
+  the app, `gitpulse-mcp`, `gitpulsed` and `gitpulse-hook` opt in at the top of
+  `main`, before anything can spawn, and anything else that links the engine
+  keeps its own per-process budget. Shipped behaviour is unchanged. A guard
+  reads the binary list from both `Cargo.toml` and `src/bin/` and fails if any
+  binary does not opt in. An opt-in made after the first spawn panics; it
+  could no longer take effect.
+- **A deferred DevMap ignore check is no longer reported as an unignored
+  directory, and it is retried.** When `git check-ignore` waits out the spawn
+  budget, initialization used to say the state directory "is not ignored" and
+  remember that for the session, so cross-repository search stayed empty
+  after the budget recovered. The registry reason now says the check did not
+  run, and the same open-tab set is asked again after the live-index backoff.
+  A directory git has actually refused to hide is unchanged: still withheld,
+  still not retried until the open tabs change.
+- **A storage scan whose ignore or tracked-file probe did not run is no
+  longer a license to delete.** `check-ignore` exit 1 (nothing ignored) and
+  a deferred or failed probe both used to come back as an empty set, so
+  every artifact looked unignored and untracked and the global cleaner
+  could select it. An unrun probe is now unexamined: reclaim stays blocked,
+  and the cleaner skips the directory and marks the inventory partial. Exit
+  status is matched on a token boundary, so status 128 is not read as status
+  1. A deferred `git worktree` listing no longer fails the scan; the report
+  is marked truncated instead.
 - **Secrets no longer reports a partial scan as clean.** Kingfisher exits 0
   when it cannot read a file and records the gap only in its audit block,
   which was ignored, so an unreadable `.env` produced "No secrets reported".

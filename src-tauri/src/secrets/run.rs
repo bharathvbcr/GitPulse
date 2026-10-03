@@ -395,6 +395,7 @@ pub fn scan_with_binary(
         let reason = match incomplete {
             Incomplete::OverCap(_) => "kingfisher output was truncated",
             Incomplete::Unread(_) => "kingfisher output could not be read to the end",
+            Incomplete::Deadline { .. } => "kingfisher did not finish within its deadline",
         };
         let diag = current_diagnostic(
             version.as_deref(),

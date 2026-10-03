@@ -1361,6 +1361,17 @@ pub enum Incomplete {
     /// The read did not finish inside the grace window, so how much is missing
     /// — if anything — is unknown. Captured bytes may still be available.
     Unread(String),
+    /// The child was stopped because its runtime deadline elapsed. Captured
+    /// bytes are a prefix of what it would have written. `over_cap` is set
+    /// when that prefix had already filled the caller's byte budget.
+    ///
+    /// `message` is the same sentence a timeout error carries
+    /// (`"{label} timed out after {n}s"`), so a caller that cannot accept a
+    /// prefix reports the deadline and not a slot wait or a deferral.
+    Deadline {
+        message: String,
+        over_cap: Option<usize>,
+    },
 }
 
 impl Incomplete {
@@ -1369,18 +1380,34 @@ impl Incomplete {
     /// renderer serves an error string, an AI warning and two UI banners
     /// without any of them re-deriving the cause and getting it wrong.
     ///
-    /// Both arms say what happened; neither invents a cause.
+    /// Every arm says what happened; none invents a cause.
     pub fn describe(&self) -> String {
         match self {
             // Whole MiB when the budget is one, exact bytes otherwise: a
             // 512 KiB cap rendered as "exceeded 0 MB" reads as a bug in the
             // message rather than a fact about the output.
-            Incomplete::OverCap(cap) if *cap >= 1024 * 1024 => {
-                format!("exceeded {} MB", cap / (1024 * 1024))
-            }
-            Incomplete::OverCap(cap) => format!("exceeded {cap} bytes"),
+            Incomplete::OverCap(cap) => over_cap_phrase(*cap),
             Incomplete::Unread(why) => format!("could not be read to the end ({why})"),
+            // The byte budget is the proven bound when both happened. The
+            // deadline message stays on the variant for callers that still
+            // have to fail a partial stream.
+            Incomplete::Deadline {
+                over_cap: Some(cap),
+                ..
+            } => over_cap_phrase(*cap),
+            Incomplete::Deadline {
+                message,
+                over_cap: None,
+            } => format!("stopped at its deadline ({message})"),
         }
+    }
+}
+
+fn over_cap_phrase(cap: usize) -> String {
+    if cap >= 1024 * 1024 {
+        format!("exceeded {} MB", cap / (1024 * 1024))
+    } else {
+        format!("exceeded {cap} bytes")
     }
 }
 
@@ -1541,21 +1568,53 @@ pub fn run_process_as_background() {
 static PROCESS_UNLIMITED_RATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Lifts the spawn *rate* cap, and with it the per-user shared budget, for
-/// the rest of this process. The concurrency limit still applies.
+/// Lifts the spawn *rate* cap for the rest of this process. The concurrency
+/// limit still applies.
 ///
 /// For integration-test processes only. Each `tests/*.rs` crate links the
 /// library without `cfg(test)`, so it otherwise runs under the production
-/// rate and draws from the user's real `spawn-budget.v1`, the record the
-/// running app and every agent session spend. A stress test that starts
-/// hundreds of children then measures that budget instead of the code under
-/// test, and spends the app's. The unit-test build gets the same gate from
-/// `cfg!(test)`. Order-independent: it takes effect at the next spawn, even
-/// if the gate already exists. `tests/process_admission.rs` fails if any
-/// source under `src/` calls it.
+/// rate; a stress test that starts hundreds of children then measures that
+/// rate instead of the code under test. (Such a process never reaches the
+/// per-user shared budget either way: only the shipped binaries opt into it,
+/// see [`run_process_with_shared_spawn_budget`].) The unit-test build gets
+/// the same gate from `cfg!(test)`. Order-independent: it takes effect at the
+/// next spawn, even if the gate already exists. `tests/process_admission.rs`
+/// fails if any source under `src/` calls it.
 #[doc(hidden)]
 pub fn run_process_with_unlimited_spawn_rate() {
     PROCESS_UNLIMITED_RATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set by [`run_process_with_shared_spawn_budget`], which only the shipped
+/// binaries call.
+static PROCESS_SHARED_BUDGET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes this process draw from the per-user spawn budget every GitPulse
+/// process of this user shares (see [`shared_budget`]), as well as its own.
+///
+/// Opt-in, so that only the processes the budget exists for spend it: the
+/// app, `gitpulse-mcp`, `gitpulsed` and `gitpulse-hook` each call it at the
+/// top of `main`. Everything else that links this library — every
+/// `tests/*.rs` crate and bench, which get the production gate because they
+/// build without `cfg(test)` — keeps a per-process budget by construction,
+/// rather than spending the running app's and being deferred by it.
+/// `tests/process_admission.rs` derives the binary list from `Cargo.toml` and
+/// `src/bin/` and fails if one does not make the call. A mobile build would
+/// enter through `run()` rather than `main` and stay per-process; none ships.
+///
+/// The record is opened when the gate is built, by the first spawn, so a
+/// call after that could not take effect: it panics rather than leave the
+/// process silently off the budget. Absent from the unit-test build, where
+/// opting in would open the real record under the developer's `HOME`.
+#[cfg(not(test))]
+pub fn run_process_with_shared_spawn_budget() {
+    assert!(
+        SPAWN_GATE.get().is_none(),
+        "run_process_with_shared_spawn_budget must run before the first spawn: \
+         the spawn gate is already built on a per-process budget"
+    );
+    PROCESS_SHARED_BUDGET.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The class a thread starts in: see [`run_process_as_background`].
@@ -1867,10 +1926,14 @@ impl SpawnGate {
                 self.shared = Some(shared);
             }
             Err(reason) => {
-                log::warn!(
-                    target: "spawn_gate",
-                    "spawn rate budget is per-process only: {reason}"
-                );
+                // Not opting in is the intended state of every process that
+                // is not a shipped binary, not a fault worth a warning.
+                if reason != SHARED_BUDGET_NOT_OPTED_IN {
+                    log::warn!(
+                        target: "spawn_gate",
+                        "spawn rate budget is per-process only: {reason}"
+                    );
+                }
                 self.shared_note = Some(reason);
                 self.shared = None;
             }
@@ -2227,16 +2290,19 @@ fn configured_spawn_gate(testing: bool) -> SpawnGate {
     }
 }
 
-/// The unit-test build never touches the real per-user record: a test that
-/// spends a burst would otherwise spend the running app's.
-#[cfg(test)]
-fn shared_budget_path() -> Result<PathBuf, String> {
-    Err("unit-test build: the per-user budget is not shared".into())
-}
+/// Why a production gate in a process that did not opt in stays per-process.
+const SHARED_BUDGET_NOT_OPTED_IN: &str = "this process did not opt into the per-user spawn budget";
 
-#[cfg(not(test))]
+/// The per-user record, for a process that opted in (see
+/// [`run_process_with_shared_spawn_budget`]). Every other process — the
+/// unit-test build, integration tests, benches — never touches the real one:
+/// a test that spends a burst would otherwise spend the running app's.
 fn shared_budget_path() -> Result<PathBuf, String> {
-    shared_budget::default_path()
+    if PROCESS_SHARED_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+        shared_budget::default_path()
+    } else {
+        Err(SHARED_BUDGET_NOT_OPTED_IN.into())
+    }
 }
 
 /// Every child the gate actually started, so a test can count spawns in its
@@ -2501,11 +2567,14 @@ fn format_gate_report(counters: &[AdmissionCounters; 3], sharing: &str) -> Strin
     format!("[spawn-gate] {} | {sharing}", classes.join(" | "))
 }
 
+/// The process-wide gate, built by the first spawn. Module-level so that
+/// [`run_process_with_shared_spawn_budget`] can refuse to run after it.
+static SPAWN_GATE: OnceLock<SpawnGate> = OnceLock::new();
+
 fn spawn_gate() -> &'static SpawnGate {
-    static GATE: OnceLock<SpawnGate> = OnceLock::new();
     // Tests share this process-wide gate and spawn far above the storm cap.
     // Production uses the same constructor with `testing == false`.
-    GATE.get_or_init(|| configured_spawn_gate(cfg!(test)))
+    SPAWN_GATE.get_or_init(|| configured_spawn_gate(cfg!(test)))
 }
 
 /// Shared engine behind `git_timeout` and `capture_command`: spawns `cmd`,
@@ -2583,6 +2652,10 @@ fn run_with_gate(
 }
 
 thread_local! {
+    /// Set only by [`KeepDeadlinePrefix`]. A capped git read holds it so a
+    /// deadline returns the bytes already captured. Every other caller leaves
+    /// it unset and still receives a timeout error.
+    static KEEP_DEADLINE_PREFIX: Cell<bool> = const { Cell::new(false) };
     static PROCESS_FAILURES: Cell<u64> = const { Cell::new(0) };
     static LAST_PROCESS_FAILURE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
@@ -2602,7 +2675,9 @@ thread_local! {
 /// Child processes on this thread that produced no answer at all: refused or
 /// deferred by the gate, failed to spawn, or killed at their deadline. A
 /// non-zero git exit is an answer and is not counted; neither is a run whose
-/// output was cut short, which carries its own `incomplete` reason.
+/// output was cut short, which carries its own `incomplete` reason. A deadline
+/// whose prefix a capped read kept is that second case: it is counted only
+/// when a caller that required the whole stream rejects it.
 ///
 /// Callers that swallow a git error as "not set" (`config --get`, a
 /// `symbolic-ref --quiet`) cannot tell those apart from a real "not set".
@@ -2624,6 +2699,30 @@ pub(crate) fn last_process_failure() -> Option<String> {
 fn note_process_failure(message: &str) {
     PROCESS_FAILURES.set(PROCESS_FAILURES.get().wrapping_add(1));
     LAST_PROCESS_FAILURE.with(|slot| *slot.borrow_mut() = Some(message.to_string()));
+}
+
+/// While alive on this thread, a child killed at its runtime deadline is a
+/// captured prefix ([`Incomplete::Deadline`]) rather than an error that drops
+/// those bytes. [`git_run_inner`] is the only production holder: pulse and
+/// the other capped git reads can show what git already printed, and a
+/// command that must see the whole stream still fails.
+struct KeepDeadlinePrefix;
+
+impl KeepDeadlinePrefix {
+    fn enter() -> Self {
+        KEEP_DEADLINE_PREFIX.set(true);
+        Self
+    }
+}
+
+impl Drop for KeepDeadlinePrefix {
+    fn drop(&mut self) {
+        KEEP_DEADLINE_PREFIX.set(false);
+    }
+}
+
+fn keeping_deadline_prefix() -> bool {
+    KEEP_DEADLINE_PREFIX.get()
 }
 
 /// Every child spawned on this thread inside `body` fails as a spawn error,
@@ -2719,6 +2818,20 @@ fn run_admitted(
         gate,
         on_admitted,
     );
+    // A capped git read asked to keep the prefix. Everyone else still sees
+    // the deadline as an error, with the same sentence as before.
+    let result = match result {
+        Ok(run)
+            if !keeping_deadline_prefix()
+                && matches!(run.incomplete, Some(Incomplete::Deadline { .. })) =>
+        {
+            let Some(Incomplete::Deadline { message, .. }) = run.incomplete else {
+                unreachable!("matched Deadline above");
+            };
+            Err(message)
+        }
+        other => other,
+    };
     if let Err(message) = &result {
         note_process_failure(message);
     }
@@ -2860,27 +2973,38 @@ fn run_admitted_inner(
 
     let mut backoff = POLL_BACKOFF_START;
     let mut cursors = [0; 2];
-    let outcome = loop {
+    enum Halt {
+        Exited(std::process::ExitStatus, bool),
+        /// Runtime deadline. The child has been reaped. `message` is the
+        /// timeout sentence callers that cannot keep a prefix still return.
+        Deadline(String),
+        Failed(String),
+    }
+    let halt = loop {
         #[cfg(unix)]
         output.drain_ready();
         #[cfg(unix)]
         input.pump();
         output.observe(observer, &mut cursors);
         if observer.cancelled() {
-            break guard
-                .stop_and_reap(&mut child, Duration::ZERO)
-                .map(|status| (status, true))
-                .map_err(|e| format!("Failed to reap cancelled {label}: {e}"));
+            break match guard.stop_and_reap(&mut child, Duration::ZERO) {
+                Ok(status) => Halt::Exited(status, true),
+                Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
+            };
         }
         // Every wait goes through the registration so the registry never
         // holds a pid that has already been reaped — see `procguard` for why
         // signalling a recycled pid is the thing to avoid.
         match guard.poll(|| child.try_wait()) {
-            Ok(Some(status)) => break Ok((status, false)),
+            Ok(Some(status)) => break Halt::Exited(status, false),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
+                    // Reap before reading the rest of the pipes: a live child
+                    // can hold them open, and the prefix is whatever was
+                    // already printed, not a reason to wait out the grace.
                     guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-                    break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
+                    break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
                 if let Err(error) = output.wait_with_input(
@@ -2888,7 +3012,7 @@ fn run_admitted_inner(
                     Some(&input),
                 ) {
                     guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-                    break Err(format!("Failed to poll {label} output: {error}"));
+                    break Halt::Failed(format!("Failed to poll {label} output: {error}"));
                 }
                 #[cfg(not(unix))]
                 thread::sleep(backoff);
@@ -2896,87 +3020,104 @@ fn run_admitted_inner(
             }
             Err(e) => {
                 guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-                break Err(format!("Failed to wait on {}: {}", label, e));
+                break Halt::Failed(format!("Failed to wait on {}: {}", label, e));
             }
         }
     };
-    match outcome {
-        Ok((status, cancelled)) => {
-            if let Err(error) = input.finish() {
-                if status.success() && !cancelled {
-                    return Err(format!("Failed to deliver {label} {error}"));
-                }
-            }
-            // Normal exit: EOF is imminent unless something else is holding a
-            // write end; then we take whatever was buffered after the grace
-            // window instead of hanging forever. Two things can hold one, and
-            // the rarer-sounding one is what actually fired in the field: a
-            // grandchild the child daemonized, and — until
-            // `procguard::with_inheritance_lock` — any sibling spawned inside
-            // this pipe's pre-`FD_CLOEXEC` window, which on macOS `std` cannot
-            // close atomically. Do not read this reason as the first cause
-            // alone.
-            let (mut stdout, mut stderr) = output.finish(
-                Instant::now()
-                    + if cancelled {
-                        Duration::ZERO
-                    } else {
-                        DRAIN_JOIN_GRACE
-                    },
-            );
-            observe_output(observer, &mut cursors, &stdout.bytes, &stderr.bytes);
-            // A stdout we could not read to the end is not a shorter stdout:
-            // every caller past this point parses what it is handed as the
-            // whole answer. A broken read is a fault and fails the run; an
-            // undelivered one is the documented grandchild case, where the
-            // child's status is still good — that reports as a prefix, and
-            // carries its reason so no caller has to guess at one.
-            let mut unread: Option<String> = None;
-            match stdout.stop.take() {
-                Some(Stop::Broken(e)) => return Err(format!("Failed to read {label} output: {e}")),
-                Some(Stop::Undelivered(e)) => {
-                    stderr
-                        .bytes
-                        .extend_from_slice(format!("\n[stdout incomplete: {e}]").as_bytes());
-                    unread = Some(e);
-                }
-                None => {}
-            }
-            // stderr is diagnosis, not payload: losing it must not fail a
-            // command that worked, but a message built from a partial stderr
-            // has to say that is what it is.
-            let mut stderr_incomplete = None;
-            if let Some(Stop::Broken(e) | Stop::Undelivered(e)) = stderr.stop.take() {
-                stderr
-                    .bytes
-                    .extend_from_slice(format!("\n[stderr incomplete: {e}]").as_bytes());
-                stderr_incomplete = Some(Incomplete::Unread(e));
-            }
-            if stderr.truncated {
-                stderr_incomplete = Some(Incomplete::OverCap(4 * 1024 * 1024));
-                stderr
-                    .bytes
-                    .extend_from_slice(b"\n[stderr incomplete: exceeded 4 MB]");
-            }
-            // A capped stream may also miss EOF. The proven cap violation is
-            // reported first; the read diagnosis remains in stderr.
-            let incomplete = if stdout.truncated {
-                Some(Incomplete::OverCap(stdout_cap))
-            } else {
-                unread.map(Incomplete::Unread)
-            };
-            Ok(BoundedRun {
-                stdout: stdout.bytes,
-                stderr: stderr.bytes,
-                success: status.success() && !cancelled,
-                status_code: status.code().unwrap_or(-1),
-                incomplete,
-                stderr_incomplete,
-                cancelled,
-            })
+    let (status, cancelled, deadline_message) = match halt {
+        Halt::Failed(error) => return Err(error),
+        Halt::Exited(status, cancelled) => (Some(status), cancelled, None),
+        Halt::Deadline(message) => (None, false, Some(message)),
+    };
+    if let Err(error) = input.finish() {
+        if deadline_message.is_none() && status.is_some_and(|status| status.success()) && !cancelled
+        {
+            return Err(format!("Failed to deliver {label} {error}"));
         }
-        Err(e) => Err(e),
     }
+    // Normal exit: EOF is imminent unless something else is holding a
+    // write end; then we take whatever was buffered after the grace
+    // window instead of hanging forever. Two things can hold one, and
+    // the rarer-sounding one is what actually fired in the field: a
+    // grandchild the child daemonized, and — until
+    // `procguard::with_inheritance_lock` — any sibling spawned inside
+    // this pipe's pre-`FD_CLOEXEC` window, which on macOS `std` cannot
+    // close atomically. Do not read this reason as the first cause
+    // alone. A deadline already reaped the child, so there is no grace
+    // left to spend: the bytes in the buffer are the prefix.
+    let (mut stdout, mut stderr) = output.finish(
+        Instant::now()
+            + if cancelled || deadline_message.is_some() {
+                Duration::ZERO
+            } else {
+                DRAIN_JOIN_GRACE
+            },
+    );
+    observe_output(observer, &mut cursors, &stdout.bytes, &stderr.bytes);
+    // A stdout we could not read to the end is not a shorter stdout:
+    // every caller past this point parses what it is handed as the
+    // whole answer. A broken read is a fault and fails the run; an
+    // undelivered one is the documented grandchild case, where the
+    // child's status is still good — that reports as a prefix, and
+    // carries its reason so no caller has to guess at one.
+    // A deadline is itself the reason the read stopped. A pipe that
+    // breaks because the child was killed must not discard the prefix.
+    let mut unread: Option<String> = None;
+    match stdout.stop.take() {
+        Some(Stop::Broken(e)) if deadline_message.is_none() => {
+            return Err(format!("Failed to read {label} output: {e}"));
+        }
+        Some(Stop::Broken(e) | Stop::Undelivered(e)) => {
+            stderr
+                .bytes
+                .extend_from_slice(format!("\n[stdout incomplete: {e}]").as_bytes());
+            if deadline_message.is_none() {
+                unread = Some(e);
+            }
+        }
+        None => {}
+    }
+    // stderr is diagnosis, not payload: losing it must not fail a
+    // command that worked, but a message built from a partial stderr
+    // has to say that is what it is.
+    let mut stderr_incomplete = None;
+    if let Some(Stop::Broken(e) | Stop::Undelivered(e)) = stderr.stop.take() {
+        stderr
+            .bytes
+            .extend_from_slice(format!("\n[stderr incomplete: {e}]").as_bytes());
+        stderr_incomplete = Some(Incomplete::Unread(e));
+    }
+    if stderr.truncated {
+        stderr_incomplete = Some(Incomplete::OverCap(4 * 1024 * 1024));
+        stderr
+            .bytes
+            .extend_from_slice(b"\n[stderr incomplete: exceeded 4 MB]");
+    }
+    // A capped stream may also miss EOF. The proven cap violation is
+    // reported first; the read diagnosis remains in stderr. A deadline
+    // keeps the cap on the same variant so the prefix is not thrown
+    // away on the way out of this function.
+    let incomplete = if let Some(message) = deadline_message.clone() {
+        Some(Incomplete::Deadline {
+            message,
+            over_cap: stdout.truncated.then_some(stdout_cap),
+        })
+    } else if stdout.truncated {
+        Some(Incomplete::OverCap(stdout_cap))
+    } else {
+        unread.map(Incomplete::Unread)
+    };
+    Ok(BoundedRun {
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        success: deadline_message.is_none()
+            && status.is_some_and(|status| status.success())
+            && !cancelled,
+        status_code: status.and_then(|status| status.code()).unwrap_or(-1),
+        incomplete,
+        stderr_incomplete,
+        cancelled,
+    })
 }
 
 /// Characterizes the retired channel handoff in regression tests. Production
@@ -3053,8 +3194,8 @@ pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, Stri
         MAX_OUTPUT_BYTES,
         true,
     )?;
-    if let Some(reason) = &incomplete {
-        return Err(format!("git {} output {}", sub, reason.describe()));
+    if let Some(reason) = incomplete {
+        return Err(incomplete_is_failure(sub, reason));
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -3089,6 +3230,10 @@ fn git_run_inner(
     let mut attempts = 0;
     const MAX_LOCK_RETRIES: usize = 3;
 
+    // A deadline keeps the bytes git already printed. Callers that need the
+    // whole stream (`git_timeout`, `git_text_shared`) still turn that prefix
+    // into an error. Callers that opted into a cap (pulse) show it.
+    let _keep_deadline_prefix = KeepDeadlinePrefix::enter();
     loop {
         let cmd = git_command(repo, args);
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -3100,7 +3245,7 @@ fn git_run_inner(
         } else {
             run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?
         };
-        if out.success {
+        if out.success || matches!(out.incomplete, Some(Incomplete::Deadline { .. })) {
             return Ok((out.stdout, out.incomplete));
         }
         // Some git failures report entirely on stdout — notably `commit`'s
@@ -3143,10 +3288,29 @@ fn git_timeout(
 ) -> Result<Vec<u8>, String> {
     let sub = args.first().unwrap_or(&"");
     let (stdout, incomplete) = git_run(repo, args, timeout, stdin_bytes)?;
-    if let Some(reason) = &incomplete {
-        return Err(format!("git {} output {}", sub, reason.describe()));
+    if let Some(reason) = incomplete {
+        return Err(incomplete_is_failure(sub, reason));
     }
     Ok(stdout)
+}
+
+/// A capped read may return a prefix. A caller that required the whole stream
+/// fails it here. A deadline with no byte-cap is the same failure the runner
+/// used to return directly, and it still moves [`process_failures`]: callers
+/// that swallow `git_text` with `.ok()` tell a refusal from "not set" by that
+/// counter. A prefix that filled its byte budget is an answer with a reason,
+/// same as before this path existed, so it does not.
+fn incomplete_is_failure(sub: &str, reason: Incomplete) -> String {
+    match reason {
+        Incomplete::Deadline {
+            message,
+            over_cap: None,
+        } => {
+            note_process_failure(&message);
+            message
+        }
+        other => format!("git {sub} output {}", other.describe()),
+    }
 }
 
 /// Upper bound on either stream embedded in a failure message. A chatty failure never
@@ -5574,6 +5738,210 @@ mod tests {
         )
         .expect_err("must time out");
         assert!(err.contains("timed out after"), "got: {err}");
+    }
+
+    #[test]
+    fn a_complete_reader_still_reports_a_deadline_prefix_as_the_timeout() {
+        let before = process_failures();
+        let err = incomplete_is_failure(
+            "log",
+            Incomplete::Deadline {
+                message: "git log timed out after 90s".into(),
+                over_cap: None,
+            },
+        );
+        assert_eq!(err, "git log timed out after 90s");
+        assert!(!err.contains(SLOT_WAIT_SUFFIX), "{err}");
+        assert!(!is_deferred_under_load(&err), "{err}");
+        assert_eq!(process_failures(), before + 1);
+        assert_eq!(
+            last_process_failure().as_deref(),
+            Some("git log timed out after 90s")
+        );
+        let capped = incomplete_is_failure(
+            "log",
+            Incomplete::Deadline {
+                message: "git log timed out after 90s".into(),
+                over_cap: Some(1024),
+            },
+        );
+        assert_eq!(capped, "git log output exceeded 1024 bytes");
+        assert_eq!(
+            process_failures(),
+            before + 1,
+            "a prefix that filled its byte budget is an answer with a reason"
+        );
+    }
+
+    /// The pulse log is a capped read. Killing it at the deadline used to
+    /// drop every commit git had already printed and surface
+    /// `git log timed out after 90s` as a diagnostics error. The bytes stay,
+    /// and a caller that did not opt into a prefix still gets the error.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_keeps_bytes_already_written_for_a_capped_read() {
+        // `/bin/echo` exits before the sleep, so the line is in the pipe
+        // even though a pipe is fully buffered for a still-running writer.
+        let script = "/bin/echo pulse-prefix; sleep 30";
+        let started = Instant::now();
+        let kept = KeepDeadlinePrefix::enter();
+        let run = run_bounded(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", script]);
+                cmd
+            },
+            "git log",
+            Duration::from_millis(300),
+            None,
+        )
+        .expect("bytes written before the deadline are the result");
+        drop(kept);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill must be prompt, took {:?}",
+            started.elapsed()
+        );
+        assert!(!run.success);
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("pulse-prefix"),
+            "stdout: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        match &run.incomplete {
+            Some(Incomplete::Deadline {
+                message,
+                over_cap: None,
+            }) => {
+                assert!(message.contains("timed out after"), "{message}");
+                assert!(!message.contains(SLOT_WAIT_SUFFIX), "{message}");
+                assert!(!is_deferred_under_load(message), "{message}");
+            }
+            other => panic!("expected a deadline prefix, got {other:?}"),
+        }
+
+        let discarded = run_bounded(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", script]);
+                cmd
+            },
+            "git log",
+            Duration::from_millis(200),
+            None,
+        )
+        .expect_err("a caller that needs the whole stream still fails");
+        assert!(discarded.contains("timed out after"), "{discarded}");
+        assert!(!discarded.contains("pulse-prefix"), "{discarded}");
+    }
+
+    /// A non-zero exit that printed something is the child failing, not a
+    /// deadline. Keeping prefixes must not relabel that run.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_child_is_not_a_deadline_prefix() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let run = run_bounded(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "/bin/echo not-a-timeout; exit 1"]);
+                cmd
+            },
+            "git log",
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("exit 1 still finishes; it is not a deadline");
+        assert!(!run.success);
+        assert!(
+            run.incomplete.is_none(),
+            "exit 1 must not be a deadline prefix: {:?}",
+            run.incomplete
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("not-a-timeout"),
+            "stdout: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    /// No bytes and a deadline is not an empty successful read.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_deadline_is_not_an_empty_success() {
+        let _kept = KeepDeadlinePrefix::enter();
+        let run = run_bounded(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30"]);
+                cmd
+            },
+            "git log",
+            Duration::from_millis(200),
+            None,
+        )
+        .expect("the deadline is a prefix, including an empty one");
+        assert!(run.stdout.is_empty());
+        assert!(!run.success);
+        assert!(matches!(
+            run.incomplete,
+            Some(Incomplete::Deadline { over_cap: None, .. })
+        ));
+    }
+
+    /// Several capped reads killed together must each keep their own prefix
+    /// and must not leave the sleep behind.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_deadline_prefixes_are_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let pidfile = dir.path().join(format!("pid-{index}"));
+            handles.push(std::thread::spawn(move || {
+                let script = format!(
+                    "echo $$ > '{}'; /bin/echo row-{index}; sleep 30",
+                    pidfile.display()
+                );
+                let _kept = KeepDeadlinePrefix::enter();
+                let started = Instant::now();
+                let run = run_bounded(
+                    {
+                        let mut cmd = Command::new("sh");
+                        cmd.args(["-c", &script]);
+                        cmd
+                    },
+                    "git log",
+                    Duration::from_millis(400),
+                    None,
+                )
+                .expect("prefix");
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "reader {index} took {:?}",
+                    started.elapsed()
+                );
+                assert!(String::from_utf8_lossy(&run.stdout).contains(&format!("row-{index}")));
+                assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
+                pidfile
+            }));
+        }
+        let pidfiles: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reader"))
+            .collect();
+        for pidfile in pidfiles {
+            let pid = std::fs::read_to_string(&pidfile).expect("pid");
+            let pid = pid.trim();
+            let probe = Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .expect("kill -0");
+            assert!(
+                !probe.success(),
+                "deadline left pid {pid} running ({pidfile:?})"
+            );
+        }
     }
 
     /// Regression (audit A4): the numbered-config channel injects arbitrary

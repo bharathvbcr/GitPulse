@@ -180,7 +180,7 @@
   let hygieneGaps = $derived.by(() => {
     const current = report;
     if (!current) return [] as ArtifactDir[];
-    return current.artifacts.filter((a) => a.unignored || a.tracked_files > 0);
+    return current.artifacts.filter((a) => a.unignored || a.tracked_files > 0 || a.checks_unexamined);
   });
 
   function artifactBar(bytes: number): number {
@@ -253,7 +253,7 @@
       lines.push("Build & cache directories:");
       for (const a of current.artifacts) {
         const flags = [
-          a.unignored ? "NOT IGNORED" : null,
+          a.checks_unexamined ? "NOT CHECKED" : a.unignored ? "NOT IGNORED" : null,
           a.tracked_files > 0 ? `${a.tracked_files} tracked` : null,
         ]
           .filter(Boolean)
@@ -450,7 +450,9 @@
               <div class="flex items-center gap-2">
                 <span class="font-mono text-textPrimary truncate">{artifact.path}</span>
                 <span class="text-[10px] uppercase px-1.5 py-0.5 rounded-full bg-surfaceHover text-textMuted">{artifact.kind}</span>
-                {#if artifact.unignored}
+                {#if artifact.checks_unexamined}
+                  <span class="text-[10px] uppercase font-semibold text-amber-300">not checked</span>
+                {:else if artifact.unignored}
                   <span class="text-[10px] uppercase font-semibold text-amber-300">not ignored</span>
                 {/if}
                 {#if artifact.tracked_files > 0}
@@ -460,7 +462,11 @@
                 {/if}
                 <span class="ml-auto font-mono text-textMuted">{humanBytes(artifact.bytes)}</span>
               </div>
-              {#if artifact.unignored}
+              {#if artifact.checks_unexamined}
+                <p class="mt-1 text-[11px] text-textMuted">
+                  Git did not answer whether this directory is ignored or tracked, so it is not treated as disposable.
+                </p>
+              {:else if artifact.unignored}
                 <p class="mt-1 text-[11px] text-textMuted">
                   No ignore rule covers this directory — it shows up in every status listing and can slip into commits.
                 </p>
@@ -631,7 +637,7 @@
                   ></div>
                 </div>
                 <span class="font-mono text-textSecondary w-20 text-right">{humanBytes(artifact.bytes)}</span>
-                {#if artifact.unignored}<span title="Not covered by .gitignore"><AlertTriangle size={12} class="text-amber-300" /></span>{/if}
+                {#if artifact.checks_unexamined}<span title="Git did not answer whether this directory is ignored or tracked"><AlertTriangle size={12} class="text-amber-300" /></span>{:else if artifact.unignored}<span title="Not covered by .gitignore"><AlertTriangle size={12} class="text-amber-300" /></span>{/if}
                 {#if artifact.tracked_files > 0}
                   <span class="text-[10px] font-mono text-rose-300" title="Committed files inside an artifact directory">
                     {artifact.tracked_files}✓
