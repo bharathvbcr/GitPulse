@@ -336,6 +336,13 @@ can no longer starve the actions you asked for.
   fails the lookup. The Worktrees panel now reads its worktrees' tasks four
   at a time, through the same reader the Work view uses, instead of one
   after another.
+- **Integration stress tests no longer spend the running app's git budget.**
+  Test crates link the library without its unit-test gate, so they ran
+  under the production spawn cap and drew from the same per-user
+  `spawn-budget.v1` the app and agent sessions use. Five concurrency tests
+  failed as "deferred under load". Tests that measure contention now lift
+  the rate cap for their own process only; the concurrency limit still
+  applies. A guard fails if any shipped source calls that switch.
 
 ### Documentation
 
