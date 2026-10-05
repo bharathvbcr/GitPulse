@@ -283,6 +283,49 @@ export function runExpired(run: { state: string; expires_at: number }, now: numb
   return !(Number(run.expires_at) * 1000 > now);
 }
 
+/** States in which an attempt holds its checkout whatever the clock says. */
+export const HOLDING_STATES: readonly string[] = ["starting", "running", "unresolved"];
+
+/**
+ * Whether the store still counts this attempt against its checkout.
+ *
+ * The exact mirror of the store's predicate — `state IN ('starting','running',
+ * 'unresolved') OR (state='prepared' AND expires_at > now)`. The panel used to
+ * call only prepared/starting/running "live", so an `unresolved` attempt — the
+ * one that blocks a launch and needs action — rendered as finished history,
+ * and the form opened as if a launch could succeed.
+ */
+export function runHoldsCheckout(run: { state: string; expires_at: number }, now: number = Date.now()): boolean {
+  if (HOLDING_STATES.includes(run.state)) return true;
+  return run.state === "prepared" && !runExpired(run, now);
+}
+
+/**
+ * Whether "Release" applies: the attempt holds its checkout and only the host
+ * can say whether its owner and process are gone. The host decides; this only
+ * decides whether to ask.
+ */
+export function canRelease(run: { state: string }): boolean {
+  return HOLDING_STATES.includes(run.state);
+}
+
+/**
+ * The one word a run row leads with.
+ *
+ * `exited` covers two different facts. An observed exit has an exit code; a
+ * reconciled attempt ended in a way nobody observed (`outcome_uncertain`), and
+ * reading it as "Process exited" would claim an observation that never
+ * happened.
+ */
+export function runStatusLabel(
+  run: { state: string; expires_at: number; outcome_uncertain: boolean },
+  now: number = Date.now(),
+): string {
+  if (run.state === "exited") return run.outcome_uncertain ? "Ended — outcome unknown" : "Process exited";
+  if (runExpired(run, now)) return "Preparation expired";
+  return runStateLabel(run.state);
+}
+
 export function runStateLabel(state: string): string {
   switch (state) {
     case "prepared": return "Prepared";

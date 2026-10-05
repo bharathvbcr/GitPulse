@@ -133,6 +133,28 @@ pub fn run() {
             // Tasks other processes file (an agent over MCP) reach the board
             // without waiting for the window to lose and regain focus.
             workbench::external_changes::install(app.handle());
+            // A crash or force-quit leaves its task runs holding their
+            // checkouts with no owner left to end them. Release the ones whose
+            // processes are provably gone, off the startup path.
+            {
+                use tauri::Manager as _;
+                let state = app.state::<workbench::WorkbenchState>().inner().clone();
+                state.attach_terminals(app.state::<terminal::TerminalSessions>().inner().clone());
+                if let Err(error) = std::thread::Builder::new()
+                    .name("task-run-reconcile".into())
+                    .spawn(move || match state.reconcile_stale_runs() {
+                        Ok(0) => {}
+                        Ok(released) => {
+                            log::info!(target: "workbench", "released {released} task run(s) left behind by an earlier session");
+                        }
+                        Err(error) => {
+                            log::warn!(target: "workbench", "task run reconciliation failed: {}: {}", error.code, error.message);
+                        }
+                    })
+                {
+                    log::warn!(target: "workbench", "task run reconciliation did not start: {error}");
+                }
+            }
             // Session notifications share the notification centre installed
             // above, so they start after it — but unconditionally, because a
             // centre that failed to install is a fault the status readout has

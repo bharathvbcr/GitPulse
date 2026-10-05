@@ -642,7 +642,10 @@ The operation omits repository identities/remotes, refuses stale or incomplete
 snapshots, and starts no model worker.
 
 Schema-five run records retain one immutable brief per attempt, bounded active
-reservations, and a one-use launch claim. `workbench/terminal_launch.rs` adds
+reservations, and a one-use launch claim. A reservation belongs to a checkout
+(its `git_dir`), not to the repository: agents in separate worktrees of one
+repository run concurrently, a second attempt in the same working tree is
+refused as `checkout_busy`, and the profile holds at most eight live attempts. `workbench/terminal_launch.rs` adds
 native `runs.prepare_terminal` through existing workbench IPC, observing actual
 cwd, Git directories, commit and branch before preparation. Native `runs.claim`
 rechecks those observations and then delegates snapshot/CAS validation to Manvi.
@@ -716,10 +719,25 @@ Process reaping evidence is carried separately from exit status. An unconfirmed
 exit stays unresolved in the store. During shutdown, new work is refused while
 already-owned native observers may persist receipts into the existing store; PTY
 cleanup retains its slot until the callback returns. Private brief files are
-removed on normal cleanup. Crash-file cleanup, durable retries after receipt
-storage failure, process-tree reconciliation, and termination proof for uncertain
-starts remain open. Run history uses bounded newest-first metadata pages and
-polls active attempts only while the inspector is visible.
+removed on normal cleanup.
+
+An owner that crashed never finishes its attempt, so `workbench/reconcile.rs`
+releases attempts whose owner can no longer report, through the store's
+`runs.reconcile`. It releases only on a definite *gone* from
+`process_birth::{probe, running_since}`, which separate "no such process" from
+"could not check": a recorded agent process must be gone by its creation
+identity, and an attempt with no recorded process needs the launching GitPulse
+gone (or this process, after it already wrote `unresolved`). A run whose PTY
+this process still holds is never touched. The sweep runs at startup and once
+before a `checkout_busy`/`capacity_reached` refusal is returned, and the run
+history's **Release checkout** asks for one run and shows the host's reason when
+it keeps it. A released attempt is `exited` with `outcome_uncertain`, no exit
+code, and the `run_unresolved` inbox notice. The renderer cannot call
+`runs.reconcile`; it is host-only. Managed attempts with no recorded process
+stay held, because nothing here can prove their Manvi owner ended. Crash-file
+cleanup and durable retries after receipt storage failure remain open. Run
+history uses bounded newest-first metadata pages and polls active attempts only
+while the inspector is visible.
 
 Board counts use indexed repository links, deduplicated workspace membership and
 FTS hits with explicit bound filters. Scoped searches evaluate their full-text

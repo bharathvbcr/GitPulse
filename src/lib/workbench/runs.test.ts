@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { cancelTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
+import { cancelTaskRun, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -81,5 +81,22 @@ describe("task attempt transport", () => {
     await expect(cancelTaskRun(run)).rejects.toMatchObject({code:"protocol_error"});
     native.mockRejectedValueOnce({code:"repository_changed",message:"Checkout moved"});
     await expect(prepareTaskRun(preparation)).rejects.toMatchObject({code:"repository_changed"});
+  });
+  it("releases only what the host says it released, and passes a refusal's reason through", async () => {
+    const released = {...run, state:"exited", outcome_uncertain:true, reason:"Reconciled: agent process 42 is no longer running"};
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,released:true,reason:released.reason,item:released}));
+    expect(await releaseTaskRun("run")).toMatchObject({released:true, run:{state:"exited", outcome_uncertain:true}});
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.release",input:'{"id":"run"}'});
+    const live = {...run, state:"running", session_id:"term-1"};
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,released:false,reason:"The agent process is still running as pid 42.",item:live}));
+    expect(await releaseTaskRun("run")).toEqual({released:false, reason:"The agent process is still running as pid 42.", run:taskRun(live)});
+    // A "released" reply whose row still holds the checkout, or is a clean
+    // exit, or names another run, is not believed.
+    for (const item of [{...released, state:"running"}, {...released, outcome_uncertain:false}, {...released, id:"other"}]) {
+      native.mockResolvedValueOnce(JSON.stringify({ok:true,released:true,reason:"x",item}));
+      await expect(releaseTaskRun("run")).rejects.toMatchObject({code:"protocol_error"});
+    }
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,released:"yes",reason:"x",item:released}));
+    await expect(releaseTaskRun("run")).rejects.toMatchObject({code:"protocol_error"});
   });
 });

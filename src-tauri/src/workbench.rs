@@ -15,6 +15,7 @@ pub(crate) mod intake;
 mod managed_run;
 pub(crate) mod notifications;
 mod process_birth;
+mod reconcile;
 pub(crate) mod terminal_command;
 mod terminal_launch;
 mod terminal_run;
@@ -64,6 +65,9 @@ struct Inner {
         )>,
     >,
     managed_launch: Mutex<()>,
+    /// The PTY registry, attached at startup. Run reconciliation reads it to
+    /// leave alone any run whose terminal this process still holds.
+    terminals: OnceLock<crate::terminal::TerminalSessions>,
 }
 
 #[derive(Clone, Default)]
@@ -77,6 +81,27 @@ impl Drop for Reservation {
 }
 
 impl WorkbenchState {
+    /// Gives run reconciliation the PTY registry. Set once at startup.
+    pub(crate) fn attach_terminals(&self, terminals: crate::terminal::TerminalSessions) {
+        let _ = self.0.terminals.set(terminals);
+    }
+
+    fn terminals(&self) -> Option<&crate::terminal::TerminalSessions> {
+        self.0.terminals.get()
+    }
+
+    /// Releases every run whose owner and process are provably gone.
+    ///
+    /// Runs at startup, which is when a crash's stranded attempts are first
+    /// visible. Does nothing for a profile that does not exist yet: a sweep is
+    /// a read first, and reads never create task storage.
+    pub(crate) fn reconcile_stale_runs(&self) -> Result<usize, WorkbenchError> {
+        if !self.profile_path()?.exists() {
+            return Ok(0);
+        }
+        reconcile::sweep(self)
+    }
+
     fn check_open(&self) -> Result<(), WorkbenchError> {
         if self.0.closed.load(Ordering::Acquire) {
             return Err(WorkbenchError::new(
@@ -192,6 +217,7 @@ impl WorkbenchState {
                 | "decisions.resolve"
                 | "runs.started"
                 | "runs.finish"
+                | "runs.reconcile"
                 | "runs.protocol"
                 | "runs.managed.prepare"
                 | "runs.managed.activate"
@@ -215,6 +241,9 @@ impl WorkbenchState {
         }
         if method == "runs.claim" {
             return terminal_launch::claim(self, input);
+        }
+        if method == "runs.release" {
+            return reconcile::release(self, input);
         }
         if matches!(
             method,

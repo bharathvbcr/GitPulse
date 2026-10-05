@@ -257,7 +257,23 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
         "git_dir":checkout.git_dir, "git_common_dir":checkout.git_common_dir,
         "head_oid":checkout.head_oid, "head_ref":checkout.head_ref,
     });
-    state.with_store(|store| query(store, "runs.prepare", &body.to_string()))
+    let prepare = || state.with_store(|store| query(store, "runs.prepare", &body.to_string()));
+    match prepare() {
+        // The slot may be held by an attempt whose owner died. Release what
+        // the evidence allows, once, and ask again with the identical request;
+        // a refusal is rolled back, so the same request_id is still unused.
+        Err(error) if matches!(error.code.as_str(), "checkout_busy" | "capacity_reached") => {
+            match super::reconcile::sweep(state) {
+                Ok(released) if released > 0 => prepare(),
+                Ok(_) => Err(error),
+                Err(sweep) => {
+                    log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
+                    Err(error)
+                }
+            }
+        }
+        other => other,
+    }
 }
 
 pub(super) fn revalidate(saved: &Value) -> Result<(), WorkbenchError> {

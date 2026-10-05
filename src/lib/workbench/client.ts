@@ -57,7 +57,7 @@ export type TaskDraft = Omit<Task, keyof RecordVersion>;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -428,6 +428,20 @@ export async function getTaskRun(id: string): Promise<TaskRun> {
 export async function listTaskRuns(taskID: string, cursor?: string): Promise<Page<TaskRun>> {
   const result = page(await request("runs.list", { task_id: taskID, limit: 30, newest: true, ...(cursor ? { cursor } : {}) }), taskRun);
   return result.items.every((run) => run.task_id === taskID) ? result : invalid();
+}
+export interface RunRelease { released: boolean; reason: string; run: TaskRun }
+/**
+ * Asks the host to release an attempt that holds its checkout. The host
+ * releases only on proof that the owner and agent process are gone; otherwise
+ * `released` is false and `reason` says what it found ("still running as pid
+ * N", "could not check …").
+ */
+export async function releaseTaskRun(id: string): Promise<RunRelease> {
+  const raw = object(await request("runs.release", { id }));
+  if (raw.ok !== true || typeof raw.released !== "boolean") return invalid();
+  const run = taskRun(raw.item);
+  if (run.id !== id || (raw.released && (run.state !== "exited" || !run.outcome_uncertain))) return invalid();
+  return { released: raw.released, reason: text(raw.reason), run };
 }
 export async function cancelTaskRun(run: TaskRun): Promise<TaskRun> {
   const saved = record(await request("runs.cancel", { id: run.id, expected_revision: run.revision, request_id: newID() }), taskRun);

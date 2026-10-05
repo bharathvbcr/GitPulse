@@ -10,7 +10,10 @@ import {
   normalizeCheckout,
   preferredCheckout,
   reconcileHandoff,
+  canRelease,
   runExpired,
+  runHoldsCheckout,
+  runStatusLabel,
   runStateLabel,
   sanitizeHandoff,
   supportsManaged,
@@ -296,5 +299,48 @@ describe("runExpired", () => {
     for (const state of ["starting", "running", "unresolved", "exited", "cancelled", "failed"]) {
       expect(runExpired({ state, expires_at: 0 }, Date.now())).toBe(false);
     }
+  });
+});
+
+describe("runHoldsCheckout", () => {
+  // The oracle is the store's own predicate, restated once here so the test
+  // cannot drift into agreeing with the implementation instead.
+  const store = (state: string, expiresAt: number, now: number) =>
+    ["starting", "running", "unresolved"].includes(state) || (state === "prepared" && expiresAt * 1000 > now);
+
+  it("agrees with the store for every state, either side of an expiry", () => {
+    const states = ["prepared", "starting", "running", "unresolved", "exited", "failed", "cancelled", "quantum"];
+    for (const state of states) {
+      for (const [expires, now] of [[1_000, 999_999], [1_000, 1_000_000], [1_000, 5_000_000], [0, 0], [Number.NaN, 1]]) {
+        expect(runHoldsCheckout({ state, expires_at: expires }, now), `${state} ${expires} ${now}`).toBe(store(state, expires, now));
+      }
+    }
+  });
+
+  it("counts an unresolved attempt as holding its checkout, which the old filter did not", () => {
+    // The pre-change filter was prepared/starting/running: an unresolved row
+    // rendered as history while the store refused every launch because of it.
+    expect(runHoldsCheckout({ state: "unresolved", expires_at: 0 }, Date.now())).toBe(true);
+    expect(canRelease({ state: "unresolved" })).toBe(true);
+  });
+
+  it("offers Release exactly where the host can act, never on history or a mere preparation", () => {
+    for (const state of ["starting", "running", "unresolved"]) expect(canRelease({ state }), state).toBe(true);
+    for (const state of ["prepared", "exited", "failed", "cancelled"]) expect(canRelease({ state }), state).toBe(false);
+  });
+});
+
+describe("runStatusLabel", () => {
+  const row = (state: string, outcome_uncertain = false, expires_at = 4_000_000_000) => ({ state, outcome_uncertain, expires_at });
+
+  it("never calls an unobserved end a process exit", () => {
+    expect(runStatusLabel(row("exited", true))).toBe("Ended — outcome unknown");
+    expect(runStatusLabel(row("exited", false))).toBe("Process exited");
+  });
+
+  it("names an expired preparation and defers everything else to the state label", () => {
+    expect(runStatusLabel(row("prepared", false, 1), 5_000)).toBe("Preparation expired");
+    expect(runStatusLabel(row("prepared"), 5_000)).toBe("Prepared");
+    expect(runStatusLabel(row("unresolved", true))).toBe("Unresolved");
   });
 });

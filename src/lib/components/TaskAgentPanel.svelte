@@ -27,6 +27,7 @@
     getTaskRun,
     launchManagedRun,
     listTaskRuns,
+    releaseTaskRun,
     stopManagedRun,
     type PermissionMode,
     type Repository,
@@ -35,8 +36,10 @@
   } from "../workbench/client";
   import {
     PROVIDER_LABELS,
+    canRelease,
     runExpired,
-    runStateLabel,
+    runHoldsCheckout,
+    runStatusLabel,
     sanitizeHandoff,
     type HandoffGate,
     type HandoffSettings,
@@ -65,8 +68,8 @@
     preapproved: "Preapproved actions only",
     bypass: "Bypass permissions (advanced)",
   };
-  /** Runs still worth watching; anything else is history. */
-  const LIVE = ["prepared", "starting", "running"];
+  /** States whose terminal can still be opened (an `unresolved` one cannot). */
+  const OPENABLE = ["prepared", "starting", "running"];
   /**
    * One instant per render pass, refreshed wherever polling is reconsidered.
    *
@@ -100,7 +103,7 @@
   let generation = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
-  const live = $derived(runs.filter((run) => LIVE.includes(run.state) && !runExpired(run, clock)));
+  const live = $derived(runs.filter((run) => runHoldsCheckout(run, clock)));
   // Null means "nobody has chosen"; the default follows whether a run is live.
   const formOpen = $derived(expandedForm ?? live.length === 0);
 
@@ -193,6 +196,21 @@
     catch (cause) { error = explainError(cause); }
     finally { busy = false; schedule(); }
   }
+  /**
+   * Ask the host to free a checkout this attempt still holds. It decides on
+   * process evidence, so the answer is either a release or the reason there
+   * was none — never a silent no-op.
+   */
+  async function release(run: TaskRun) {
+    busy = true; error = ""; note = "";
+    try {
+      const result = await releaseTaskRun(run.id);
+      if (disposed) return;
+      runs = runs.map((item) => item.id === result.run.id ? result.run : item);
+      note = result.released ? "Released. The checkout is free for another attempt." : result.reason;
+    } catch (cause) { error = explainError(cause); }
+    finally { busy = false; schedule(); }
+  }
   async function inspect(run: TaskRun) {
     busy = true; error = "";
     try { const current = await getTaskRun(run.id); if (!disposed) detail = current; }
@@ -254,14 +272,15 @@
   {#if !runs.length}<p>{loading ? "Loading runs…" : "No runs yet."}</p>{/if}
   {#each runs as run (run.id)}
     {@const expired = runExpired(run, clock)}
-    <article class:is-live={LIVE.includes(run.state) && !expired}>
-      <strong>{PROVIDER_LABELS[run.provider] ?? run.provider} · {run.kind === "managed" ? "Managed" : "Terminal"} · {run.state === "exited" ? "Process exited" : expired ? "Preparation expired" : runStateLabel(run.state)}</strong>
+    <article class:is-live={runHoldsCheckout(run, clock)}>
+      <strong>{PROVIDER_LABELS[run.provider] ?? run.provider} · {run.kind === "managed" ? "Managed" : "Terminal"} · {runStatusLabel(run, clock)}</strong>
       <small>Revision {run.source_revision} · {PERMISSION_LABELS[run.permission_mode] ?? run.permission_mode}{run.exit_code !== null ? ` · exit ${run.exit_code}` : ""}</small>
       <small title={run.cwd}>{run.cwd}</small>
       {#if run.reason}<p>{run.reason}</p>{/if}
-      {#if run.outcome_uncertain}<p class="error">Execution remains unresolved. Reconcile it before another attempt in this repository.</p>{/if}
-      {#if expired}<p>This preparation expired before it started, so it no longer holds the repository. Cancel it to clear it from the history, then prepare a new attempt.</p>{/if}
-      {#if run.kind === "external_terminal" && LIVE.includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => reopen(run)} disabled={busy}>Open terminal</button>{/if}
+      {#if run.state === "unresolved"}<p class="error">This attempt's outcome is unresolved and it still holds its checkout. Release it once its agent has stopped; another worktree can run meanwhile.</p>
+      {:else if run.outcome_uncertain}<p>Released without an observed exit. Review what it changed before relying on it.</p>{/if}
+      {#if expired}<p>This preparation expired before it started, so it no longer holds its checkout. Cancel it to clear it from the history, then prepare a new attempt.</p>{/if}
+      {#if run.kind === "external_terminal" && OPENABLE.includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => reopen(run)} disabled={busy}>Open terminal</button>{/if}
       {#if run.kind === "managed"}
         {#if ["prepared", "starting"].includes(run.state) && !expired}<button class="gp-btn" type="button" onclick={() => resumeManaged(run)} disabled={busy}>Start or recover managed launch</button>{/if}
         {#if ["starting", "running", "unresolved"].includes(run.state)}<button class="gp-btn" type="button" onclick={() => stopManaged(run)} disabled={busy}>Stop managed run</button>{/if}
@@ -278,7 +297,8 @@
         {/if}
       {/if}
       {#if run.state === "prepared"}<button class="gp-btn" type="button" onclick={() => cancel(run)} disabled={busy}>Cancel preparation</button>{/if}
-      {#if run.session_id}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
+      {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={busy} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released.">Release checkout</button>{/if}
+      {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
       {#if reviewingRunID === run.id}<AgentDecisions {run} {active} refreshToken={decisionRefresh} />{/if}
     </article>
   {/each}

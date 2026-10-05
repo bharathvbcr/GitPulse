@@ -81,7 +81,8 @@ describe("the agent handoff has one implementation", () => {
     // looked only at `state`, an expired preparation kept the form folded
     // away — so the one control that could recover the situation was hidden
     // behind a row that was already dead.
-    expect(panel).toContain("const live = $derived(runs.filter((run) => LIVE.includes(run.state) && !runExpired(run, clock)))");
+    expect(panel).toContain("const live = $derived(runs.filter((run) => runHoldsCheckout(run, clock)))");
+    expect(panel).not.toMatch(/LIVE\.includes/);
     expect(panel).toContain("const formOpen = $derived(expandedForm ?? live.length === 0)");
     // Tailwind preflight's `[hidden]` has zero specificity; without this the
     // fold would be decorative and the form would stay on screen.

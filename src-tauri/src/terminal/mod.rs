@@ -840,6 +840,21 @@ pub(crate) fn tracked_session(state: &TerminalSessions, run_id: &str) -> Option<
         .map(|s| s.spawned.clone())
 }
 
+/// Whether this process still holds the PTY session of `run_id`, dead or not.
+///
+/// Unlike `tracked_session`, a session whose child has already exited still
+/// counts: its entry leaves the map only after the run observer has written
+/// the exit receipt, so while it is here the real outcome may still arrive,
+/// and nothing else may record one in its place.
+pub(crate) fn tracks_run(state: &TerminalSessions, run_id: &str) -> bool {
+    state
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|s| s.tracked_run.as_deref() == Some(run_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     app: &AppHandle<R>,
