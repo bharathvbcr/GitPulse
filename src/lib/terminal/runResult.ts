@@ -203,6 +203,20 @@ export interface TerminalSpawned {
 }
 
 /**
+ * A live PTY as `cmd_terminal_sessions` lists it. What a reloaded page needs
+ * to count, name and take over the sessions the page before it started.
+ */
+export interface TerminalListing {
+  id: string;
+  shell: string;
+  cwd: string;
+  repo: string;
+  launcher: string | null;
+  run_id: string | null;
+  detached: boolean;
+}
+
+/**
  * Streamed terminal output. Consumed as an anonymous `{ id; data_b64 }` at the
  * listen() call until it was named — events are a wire surface too, and
  * check:types could not see this one at all.

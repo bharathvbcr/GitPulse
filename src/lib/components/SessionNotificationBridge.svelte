@@ -17,6 +17,7 @@
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { sessionByNativeId, terminalSessions } from "../terminal/sessionRegistry";
+  import { adoptDetachedSessions } from "../terminal/detachedSessions";
   import { LAYERS } from "../ui/layers";
 
   let missed = $state<string | null>(null);
@@ -37,8 +38,22 @@
     timer = setTimeout(() => (missed = null), 6000);
   }
 
+  function say(message: string, ms: number) {
+    missed = message;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => (missed = null), ms);
+  }
+
   onMount(() => {
     if (!isTauri()) return;
+    // Once per page. After a reload the host still runs what the previous
+    // page started; without this they would be invisible and uncounted.
+    void adoptDetachedSessions().then(
+      (count) => {
+        if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the terminal dock.`, 10000);
+      },
+      (error: unknown) => say(`Terminal sessions left running before the window reloaded could not be listed: ${String(error)}`, 15000),
+    );
     const listeners = createListenerTracker();
     void listen<string>("gitpulse-session-notification-open", (event) => open(event.payload))
       .then((unlisten) => listeners.track(unlisten))

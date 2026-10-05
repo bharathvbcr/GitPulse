@@ -51,6 +51,11 @@ export interface TerminalTab {
   taskRunId?: string;
   /** Set when this tab picks an ended attempt's Claude Code conversation back up. */
   resume?: ResumeLaunch;
+  /**
+   * A still-running session a reloaded page left behind, which this tab
+   * takes over (`cmd_terminal_attach`) instead of starting a process.
+   */
+  attachSessionId?: string;
 }
 
 /**
@@ -63,8 +68,11 @@ export interface TerminalTab {
  */
 export interface ResumeLaunch { sessionId: string; mode: PermissionMode }
 
-/** A task attempt's terminal, or — with `resume` — its conversation resumed. */
-export interface TaskLaunch { runId: string; title: string; resume?: ResumeLaunch }
+/**
+ * A task attempt's terminal; with `resume`, its conversation resumed; with
+ * `attach`, a session a reloaded page left running, shown again.
+ */
+export interface TaskLaunch { runId: string; title: string; resume?: ResumeLaunch; attach?: { sessionId: string } }
 
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -73,7 +81,8 @@ export function isSessionId(value: string): boolean { return CANONICAL_UUID.test
 
 /** The tab already showing this launch, if one is. */
 export function tabFor(state: TabState, launch: TaskLaunch): TerminalTab | undefined {
-  const resume = launch.resume;
+  const { resume, attach } = launch;
+  if (attach) return state.tabs.find((tab) => tab.attachSessionId === attach.sessionId);
   return resume
     ? state.tabs.find((tab) => tab.resume?.sessionId === resume.sessionId)
     : state.tabs.find((tab) => tab.taskRunId === launch.runId);
@@ -164,7 +173,11 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
   }
   if (!canOpenTab(state)) return state;
   const tab = createTab(launcher, typeof launch === "string" ? launch : undefined);
-  if (task?.resume) {
+  if (task?.attach) {
+    if (task.resume || !task.attach.sessionId) return state;
+    tab.attachSessionId = task.attach.sessionId;
+    tab.name = task.title;
+  } else if (task?.resume) {
     // A plain Claude Code tab, not the attempt's: the attempt ended and its
     // record is final, so this session is the reader's own continuation.
     if (launcher !== "claude" || !isSessionId(task.resume.sessionId)) return state;

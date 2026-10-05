@@ -17,7 +17,7 @@ mod flow;
 mod foreground;
 #[cfg(unix)]
 mod input;
-use flow::OutputFlow;
+use flow::{OutputFlow, Route};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -828,21 +828,9 @@ pub fn session_context(
     }
 }
 
-/// A live native binding repairs a lost launch response without issuing another
-/// process. The binding is created by the PTY host, never supplied by storage.
-pub(crate) fn tracked_session(state: &TerminalSessions, run_id: &str) -> Option<TerminalSpawned> {
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .find(|s| s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire))
-        .map(|s| s.spawned.clone())
-}
-
 /// Whether this process still holds the PTY session of `run_id`, dead or not.
 ///
-/// Unlike `tracked_session`, a session whose child has already exited still
+/// Unlike `attach_tracked_session`, a session whose child has already exited still
 /// counts: its entry leaves the map only after the run observer has written
 /// the exit receipt, so while it is here the real outcome may still arrive,
 /// and nothing else may record one in its place.
@@ -853,6 +841,140 @@ pub(crate) fn tracks_run(state: &TerminalSessions, run_id: &str) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .any(|s| s.tracked_run.as_deref() == Some(run_id))
+}
+
+/// A live PTY as a reloaded renderer needs to see it: enough to count it
+/// against the shared session limit, to say what it is and where, and to
+/// take it over.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalListing {
+    pub id: String,
+    pub shell: String,
+    pub cwd: String,
+    /// The repository the session was opened for (its canonical root).
+    pub repo: String,
+    /// The agent CLI it runs, when it runs one (`claude`, `codex`, …).
+    pub launcher: Option<String>,
+    /// The task attempt it belongs to, when it is one.
+    pub run_id: Option<String>,
+    /// No view holds it: the page that started it was reloaded.
+    pub detached: bool,
+}
+
+/// Every live session. Bounded by `MAX_PTY_SESSIONS`.
+pub fn list_sessions(state: &TerminalSessions) -> Vec<TerminalListing> {
+    let guard = state
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut listed: Vec<TerminalListing> = guard
+        .values()
+        .filter(|s| !s.dead.load(Ordering::Acquire))
+        .map(|s| TerminalListing {
+            id: s.spawned.id.clone(),
+            shell: s.spawned.shell.clone(),
+            cwd: s.spawned.cwd.clone(),
+            repo: s.repo.to_string_lossy().into_owned(),
+            launcher: launcher_kind(&s.spawned.shell).map(str::to_owned),
+            run_id: s.tracked_run.clone(),
+            detached: s.flow.is_detached(),
+        })
+        .collect();
+    listed.sort_by(|a, b| a.id.cmp(&b.id));
+    listed
+}
+
+/// The page holding every session is being replaced (a webview reload).
+/// Each live session stops waiting on that page's acknowledgements; none is
+/// stopped. Returns how many were detached.
+pub fn detach_all(state: &TerminalSessions) -> usize {
+    let guard = state
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut detached = 0;
+    for session in guard.values() {
+        if !session.dead.load(Ordering::Acquire) {
+            session.flow.detach();
+            detached += 1;
+        }
+    }
+    detached
+}
+
+/// Hands a detached session to a new view at that view's size.
+///
+/// Refused for a session a view still holds: two views of one PTY would both
+/// paint and both acknowledge. The size is set twice, the first time one
+/// column off, because a resize to the size a process already has sends no
+/// `SIGWINCH`: without the change a full-screen program (Claude Code, an
+/// editor) would not repaint, and the new view — which has none of the
+/// output from before the reload — would stay blank until the next keypress.
+pub fn attach_session(
+    state: &TerminalSessions,
+    session_id: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<TerminalSpawned, String> {
+    let (spawned, master) = {
+        let guard = state
+            .sessions
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        let session = guard
+            .get(session_id)
+            .filter(|s| !s.dead.load(Ordering::Acquire))
+            .ok_or_else(|| format!("Terminal session '{session_id}' has ended"))?;
+        if !session.flow.attach() {
+            return Err("This terminal is already shown in a tab.".into());
+        }
+        (session.spawned.clone(), session.master.clone())
+    };
+    repaint(&master, rows, cols);
+    Ok(spawned)
+}
+
+/// The live tracked task session of `run_id`, which repairs a lost launch
+/// response without issuing another process. The binding is created by the
+/// PTY host, never supplied by storage.
+///
+/// Taken over by the new view when the page that held it was reloaded; left
+/// as it is when a view still holds it (a lost launch response repaired in
+/// the same page).
+pub(crate) fn attach_tracked_session(
+    state: &TerminalSessions,
+    run_id: &str,
+    rows: u16,
+    cols: u16,
+) -> Option<TerminalSpawned> {
+    let (spawned, master, taken) = {
+        let guard = state
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = guard.values().find(|s| {
+            s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire)
+        })?;
+        let taken = session.flow.attach();
+        (session.spawned.clone(), session.master.clone(), taken)
+    };
+    if taken {
+        repaint(&master, rows, cols);
+    }
+    Some(spawned)
+}
+
+fn repaint(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, rows: u16, cols: u16) {
+    let target = bounded_pty_size(rows, cols);
+    let nudge = bounded_pty_size(rows, if target.cols > 1 { target.cols - 1 } else { 2 });
+    let master = master
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for size in [nudge, target] {
+        if let Err(error) = master.resize(size) {
+            log::warn!(target: "terminal", "could not resize a reattached terminal: {error}");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1070,7 +1192,10 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         // full tty queue undrained can prevent a killed writer
                         // from completing on macOS, stranding its process slot.
                         if dead_flag.load(Ordering::Relaxed) { continue; }
-                        let delivery = output_flow.reserve(n, Duration::from_secs(30)).and_then(|()| {
+                        let delivery = output_flow.reserve(n, Duration::from_secs(30)).and_then(|route| {
+                            // Detached: the page that would paint this is gone.
+                            // The process keeps running; the bytes are not sent.
+                            if route == Route::Hold { return Ok(()); }
                             app_handle.emit("terminal-output", TerminalOutputPayload {
                                 id: sid_for_thread.clone(),
                                 data_b64: BASE64_STANDARD.encode(&buf[..n]),
@@ -2649,6 +2774,76 @@ mod tests {
             observer.failed.load(Ordering::SeqCst),
             "a consumed launch claim must receive its failure receipt"
         );
+    }
+
+    /// The defect: a webview reload left every PTY running with nobody to
+    /// acknowledge its output. The first time one printed a window's worth,
+    /// its reader stalled, the program blocked on a full tty, and 30 s later
+    /// the session was killed as "renderer did not acknowledge output".
+    #[cfg(unix)]
+    #[test]
+    fn a_session_whose_page_reloaded_keeps_running_and_can_be_shown_again() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let marker = dir.path().join("printed-past-the-window");
+        // Prints more than the output window, which nothing acknowledges,
+        // then leaves a marker and waits.
+        let script = format!(
+            "head -c {} /dev/zero | tr '\\000' a; : > '{}'; read finish",
+            flow::OUTPUT_WINDOW * 3,
+            marker.display()
+        );
+        let spawned = spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), script]),
+            None,
+            None,
+        )
+        .unwrap();
+        let wait_for = |done: &dyn Fn() -> bool, within: Duration| {
+            let deadline = std::time::Instant::now() + within;
+            while !done() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            done()
+        };
+        // Attached and unacknowledged, the program is held back by the window.
+        assert!(!wait_for(&|| marker.exists(), Duration::from_millis(1500)));
+        assert!(!list_sessions(&state)[0].detached);
+        assert_eq!(
+            attach_session(&state, &spawned.id, 24, 80).unwrap_err(),
+            "This terminal is already shown in a tab."
+        );
+
+        assert_eq!(detach_all(&state), 1);
+        assert!(
+            wait_for(&|| marker.exists(), Duration::from_secs(10)),
+            "a detached session must keep running past its output window"
+        );
+        let listed = list_sessions(&state);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, spawned.id);
+        assert!(listed[0].detached);
+        assert_eq!(listed[0].launcher, None);
+        assert_eq!(listed[0].run_id, None);
+
+        let shown = attach_session(&state, &spawned.id, 30, 100).unwrap();
+        assert_eq!(shown.id, spawned.id);
+        assert!(!list_sessions(&state)[0].detached);
+        assert!(attach_session(&state, &spawned.id, 30, 100).is_err());
+        assert!(attach_session(&state, "term-missing", 30, 100).is_err());
+
+        kill_session(&state, &spawned.id).unwrap();
+        assert!(list_sessions(&state).is_empty());
+        assert_eq!(detach_all(&state), 0);
     }
 
     fn init_test_repo(dir: &std::path::Path) {

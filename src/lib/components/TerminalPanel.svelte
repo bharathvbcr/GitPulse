@@ -1078,6 +1078,7 @@
             <TerminalSession
               taskRunId={tab.taskRunId}
               resume={tab.resume}
+              attachSessionId={tab.attachSessionId}
               bind:this={sessions[tab.id]}
               repoPath={repoPath}
               tabId={tab.id}

@@ -92,6 +92,17 @@
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
           case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          // What a reload leaves behind: a session the host still runs that
+          // this page never started.
+          case "cmd_terminal_sessions":
+            return [{ id: "fixture-detached", shell: "/bin/zsh", cwd: "/fixture/GitPulse", repo: "/fixture/GitPulse", launcher: null, run_id: null, detached: true }];
+          case "cmd_terminal_attach": {
+            report.attaches = [...(report.attaches ?? []), { sessionId: args.sessionId, rows: args.rows, cols: args.cols }];
+            sessions.set(args.sessionId, "/fixture/GitPulse");
+            setTimeout(() => void output(args.sessionId, "\r\n/fixture/GitPulse $ "), 50);
+            showReport();
+            return { id: args.sessionId, cwd: "/fixture/GitPulse", shell: "/bin/zsh" };
+          }
           case "cmd_terminal_context": {
             const root = sessions.get(args.sessionId);
             if (!root) throw new Error(`Terminal session '${args.sessionId}' not found`);
@@ -458,6 +469,26 @@
           await wait(300);
           check("an idle shell closes without a question",
             () => !get(promptState) && report.killed === killedBeforeIdle + 1);
+          // A reload used to leave its sessions running, unlisted, uncounted,
+          // and — once one printed a window's worth — killed for want of an
+          // acknowledgement. The new page adopts them.
+          {
+            const { adoptDetachedSessions, DETACHED_STATUS } = await import("../src/lib/terminal/detachedSessions.ts");
+            const adopted = await adoptDetachedSessions();
+            check("a session a reload left running is adopted into this page", () => adopted === 1);
+            button("All terminal sessions").click(); await wait();
+            const row = [...label("Sessions across repositories").children].find((el) => el.textContent.includes(DETACHED_STATUS));
+            check("it is listed as still running", () => Boolean(row));
+            const spawnsBeforeAttach = report.spawned;
+            [...row.querySelectorAll("button")].find((el) => el.textContent.trim() === "Go to").click();
+            await wait(400);
+            check("Go to takes that session over rather than starting a process",
+              () => report.attaches?.length === 1 && report.attaches[0].sessionId === "fixture-detached" && report.spawned === spawnsBeforeAttach);
+            const { terminalSessions } = await import("../src/lib/terminal/sessionRegistry.ts");
+            const holding = get(terminalSessions).filter((record) => record.sessionId === "fixture-detached");
+            check("the taken-over session holds one slot, its tab's, and is no longer listed as detached",
+              () => holding.length === 1 && !holding[0].key.startsWith("detached:") && holding[0].status !== DETACHED_STATUS);
+          }
           check("expand ceiling is taller than the old 900px cap", () => TERMINAL_DOCK_MAX_HEIGHT > 900);
           check("controls never write to the shell", () => report.writes === writesBefore);
           check("no runtime errors", () => report.errors.length === 0);

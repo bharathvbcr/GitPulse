@@ -3742,6 +3742,30 @@ pub async fn cmd_terminal_context(
     off_thread(move || crate::terminal::session_context(&state, &session_id)).await
 }
 
+/// Every live terminal session, including ones started by a page that has
+/// since been reloaded — which the renderer cannot otherwise know exist, and
+/// which still count against the shared session limit.
+#[tauri::command(async)]
+pub async fn cmd_terminal_sessions(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<Vec<crate::terminal::TerminalListing>, String> {
+    let state = state.inner().clone();
+    off_thread(move || Ok(crate::terminal::list_sessions(&state))).await
+}
+
+/// Shows a session a reloaded page left running in a new tab. Refused for a
+/// session a tab still holds.
+#[tauri::command(async)]
+pub async fn cmd_terminal_attach(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<crate::terminal::TerminalSpawned, String> {
+    let state = state.inner().clone();
+    off_thread(move || crate::terminal::attach_session(&state, &session_id, rows, cols)).await
+}
+
 /// Feeds keystrokes into a live session's PTY.
 #[tauri::command(async)]
 pub async fn cmd_terminal_write(

@@ -73,7 +73,7 @@ See [coverage generation](COVERAGE.md) for details and verification.
 
 Saved tasks can also launch a dedicated terminal session from their run controls.
 GitPulse binds the launch to the saved brief, selected checkout and a single run
-attempt. Reattaching keeps the same live process and scrollback; ended attempts
+attempt. Reconnecting a tab keeps the same live process and its scrollback; ended attempts
 need an explicit new launch from task details. Process exit does not accept the
 task; the agent marks it Done or Review itself through the GitPulse MCP server.
 
@@ -90,6 +90,16 @@ has been removed, it says so instead of opening a tab. These handoffs remain use
 questions and approvals use the separate Manvi protocol. See
 [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for copying, permissions and
 verification limits.
+
+If the window reloads, the terminal processes it started keep running: they are
+detached rather than stopped, so one that prints a lot is no longer killed for
+lack of a page to show it. The reloaded window lists them under **Sessions** as
+still running, counts them against the session limit, and can stop them or
+show one again with **Go to**, which takes the same process over in a new tab
+(a task attempt's comes back as its own task tab). Output printed while the
+window was reloading is not kept, so the new tab starts empty; a full-screen
+program such as Claude Code is made to repaint, and a shell shows its next
+prompt.
 
 | Shortcut | Action |
 | --- | --- |

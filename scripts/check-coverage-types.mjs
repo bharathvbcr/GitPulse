@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 74 contracts over
- * 184 structs, spanning both wire surfaces: command returns and event payloads.
+ * 185 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -63,6 +63,7 @@ export const TERMINAL_STRUCTS = Object.freeze([
   "TerminalOutputPayload",
   "TerminalExitPayload",
   "TerminalContext",
+  "TerminalListing",
 ]);
 
 /**

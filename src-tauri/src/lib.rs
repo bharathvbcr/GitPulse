@@ -203,6 +203,21 @@ pub fn run() {
         .on_window_event(|window, event| {
             desktop::handle_window_event(window, event);
         })
+        // A reload replaces the page that acknowledged terminal output while
+        // the processes it started keep running here. Detached before the new
+        // page's script runs, so nothing it spawns is caught up in it.
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+            {
+                use tauri::Manager as _;
+                let sessions = webview.state::<terminal::TerminalSessions>();
+                let detached = terminal::detach_all(&sessions);
+                if detached > 0 {
+                    log::info!(target: "terminal", "page reloaded; {detached} terminal session(s) detached and still running");
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
@@ -350,6 +365,8 @@ pub fn run() {
             cmd_terminal_resize,
             cmd_terminal_kill,
             cmd_terminal_context,
+            cmd_terminal_sessions,
+            cmd_terminal_attach,
             cmd_terminal_run,
             cmd_manvi_run_action,
             cmd_take_pending_open,

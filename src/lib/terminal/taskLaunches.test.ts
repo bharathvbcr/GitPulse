@@ -66,3 +66,16 @@ describe("resumed conversations in the task terminal queue", () => {
     expect(get(taskTerminalRequests)).toEqual([]);
   });
 });
+
+describe("a session a reload left running, in the queue", () => {
+  it("is keyed by its session, survives an attempt's withdrawal, and refuses a bad id", () => {
+    enqueueTaskTerminal({ runId: "detached:term-1-a", repoPath: "/one", provider: "shell", title: "Shell", attach: { sessionId: "term-1-a" } });
+    enqueueTaskTerminal({ runId: "detached:term-1-a", repoPath: "/one", provider: "shell", title: "Shell", attach: { sessionId: "term-1-a" } });
+    expect(get(taskTerminalRequests)).toHaveLength(1);
+    consumeTaskTerminal("detached:term-1-a");
+    expect(get(taskTerminalRequests)).toHaveLength(1);
+    for (const sessionId of ["", "a b", "x".repeat(129), "../x"]) {
+      expect(() => enqueueTaskTerminal({ runId: "r", repoPath: "/one", provider: "shell", title: "Shell", attach: { sessionId } })).toThrow(/cannot be shown/);
+    }
+  });
+});

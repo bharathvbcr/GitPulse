@@ -132,6 +132,7 @@
     startDir,
     taskRunId,
     resume,
+    attachSessionId,
     active,
     onscreen = false,
     onTitle,
@@ -151,6 +152,8 @@
     taskRunId?: string;
     /** Pick an ended attempt's Claude Code conversation back up, in its own mode. */
     resume?: ResumeLaunch;
+    /** Take over this still-running session (left by a reloaded page) instead of starting one. */
+    attachSessionId?: string;
     active: boolean;
     /**
      * Whether the user can actually see this session right now — the selected
@@ -516,12 +519,17 @@
    */
   function resolvePermissionMode(): PermissionMode | null {
     if (taskRunId) return null;
+    // Nothing starts: the process already runs under the mode it started with.
+    if (attachSessionId) return null;
     // A resumed conversation continues the attempt, so it keeps that
     // attempt's mode rather than taking the host-wide default.
     if (resume) return resume.mode;
     const view = agentDefaults();
     return effectiveMode(view.defaults, launcher, view.launchers);
   }
+
+  /** The session this tab is still to take over, until its first start. */
+  let attachPending: string | null = untrack(() => attachSessionId ?? null);
 
   function createLifecycle() {
     return createSessionLifecycle({
@@ -537,6 +545,13 @@
           // `null` on the wire and the backend's u16 refuses the spawn.
           const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions());
           const cfg = launcherConfig(launcher);
+          // Once: a later restart of this tab starts a fresh process the
+          // ordinary way, because the session it took over has ended.
+          if (attachPending) {
+            const sessionId = attachPending;
+            attachPending = null;
+            return invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId, rows, cols });
+          }
           if (taskRunId) return invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
             input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),
           });
@@ -574,7 +589,9 @@
           nativeSessionId = spawned.id;
           terminalAttendance.report(nativeSessionId, onscreen);
           startedIn = spawned.cwd;
-          harnessStore.recordAction({
+          // A session taken over after a reload was already recorded as
+          // started, by the page that started it.
+          if (spawned.id !== attachSessionId) harnessStore.recordAction({
             repoPath,
             kind: "terminal-session",
             label: `${launcherLabel(launcher)} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,

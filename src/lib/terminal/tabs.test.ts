@@ -268,3 +268,24 @@ describe("a resumed conversation's tab", () => {
     expect(openTab(start, "claude", { ...resume, resume: { sessionId: "run-1", mode: "edit" as const } })).toBe(start);
   });
 });
+
+describe("a tab taking over a session a reload left running", () => {
+  const attach = { runId: "detached:term-1-a", title: "Claude", attach: { sessionId: "term-1-a" } };
+
+  it("carries the session to take over and is focused, not duplicated, when asked again", () => {
+    const state = openTab(initialState(), "claude", attach);
+    const tab = state.tabs.find((item) => item.id === state.activeId)!;
+    expect(tab.attachSessionId).toBe("term-1-a");
+    expect(tab.taskRunId).toBeUndefined();
+    expect(tab.resume).toBeUndefined();
+    const again = openTab(openTab(state, "shell"), "claude", attach);
+    expect(again.activeId).toBe(state.activeId);
+    expect(tabFor(again, attach)?.attachSessionId).toBe("term-1-a");
+  });
+
+  it("refuses a launch that would both resume and attach", () => {
+    const start = initialState();
+    expect(openTab(start, "claude", { ...attach, resume: { sessionId: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11", mode: "edit" as const } })).toBe(start);
+    expect(openTab(start, "claude", { ...attach, attach: { sessionId: "" } })).toBe(start);
+  });
+});

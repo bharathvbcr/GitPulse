@@ -80,7 +80,9 @@ pub(super) fn spawn<R: tauri::Runtime>(
         state.with_store(|store| query(store, "runs.get", &json!({"id":launch.id}).to_string()))?;
     let source: Source = serde_json::from_value(response["item"].clone())
         .map_err(|e| WorkbenchError::new("protocol_error", e.to_string()))?;
-    if let Some(session) = terminal::tracked_session(terminals, &source.id) {
+    if let Some(session) =
+        terminal::attach_tracked_session(terminals, &source.id, launch.rows, launch.cols)
+    {
         return Ok(session);
     }
     if source.state != "prepared" || source.revision != launch.expected_revision {

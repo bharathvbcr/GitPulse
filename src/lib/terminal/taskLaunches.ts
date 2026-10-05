@@ -1,7 +1,7 @@
 import { get, writable } from "svelte/store";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
-import { MAX_LIVE_RUNS, type AgentProvider } from "../workbench/vocabulary";
-import { isSessionId, type ResumeLaunch } from "./tabs";
+import { MAX_LIVE_RUNS } from "../workbench/vocabulary";
+import { isSessionId, type LauncherKind, type ResumeLaunch } from "./tabs";
 
 /**
  * Prepared task attempts waiting for their repository's terminal dock.
@@ -24,18 +24,34 @@ import { isSessionId, type ResumeLaunch } from "./tabs";
  * what a launch needs — wait for the right dock, match the checkout by
  * identity — and is keyed apart from the attempt's own terminal so neither
  * can absorb the other.
+ *
+ * And it carries a session a reloaded page left running (`attach` set),
+ * shown again in its repository's dock. That is not a task at all, which is
+ * why `provider` is any launcher here; it shares the queue for the same
+ * reason a resume does.
  */
-export interface TaskTerminalRequest { runId: string; repoPath: string; provider: AgentProvider; title: string; resume?: ResumeLaunch }
+export interface TaskTerminalRequest {
+  runId: string;
+  repoPath: string;
+  provider: LauncherKind;
+  title: string;
+  resume?: ResumeLaunch;
+  attach?: { sessionId: string };
+}
 const pending = writable<TaskTerminalRequest[]>([]);
 export const taskTerminalRequests = { subscribe: pending.subscribe };
 
 function requestKey(request: TaskTerminalRequest): string {
+  if (request.attach) return `attach:${request.attach.sessionId}`;
   return request.resume ? `resume:${request.resume.sessionId.toLowerCase()}` : `run:${request.runId}`;
 }
 
 export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
   if (request.resume && (request.provider !== "claude" || !isSessionId(request.resume.sessionId))) {
     throw new Error("Only a Claude Code conversation with a valid session id can be resumed.");
+  }
+  if (request.attach && (request.resume || !/^[\w-]{1,128}$/.test(request.attach.sessionId))) {
+    throw new Error("That terminal session cannot be shown.");
   }
   const current = get(pending);
   const key = requestKey(request);
@@ -46,7 +62,7 @@ export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
   pending.set([...current, request]);
 }
 /** Withdraws an attempt's own terminal request (not a resumed conversation). */
-export function consumeTaskTerminal(runId: string): void { pending.update((items) => items.filter((item) => item.resume || item.runId !== runId)); }
+export function consumeTaskTerminal(runId: string): void { pending.update((items) => items.filter((item) => item.resume || item.attach || item.runId !== runId)); }
 /** Removes exactly this request, whichever kind it is, once its tab exists. */
 export function consumeTaskTerminalRequest(request: TaskTerminalRequest): void {
   const key = requestKey(request);
