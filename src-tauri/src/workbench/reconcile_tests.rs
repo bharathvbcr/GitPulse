@@ -218,6 +218,13 @@ fn strand(state: &WorkbenchState, id: &str, owner: &str, child: Option<(u32, Str
 
 /// A process that has started and been reaped: its PID names nothing now
 /// (or something born after it), which is exactly a crashed agent.
+///
+/// The `cfg(test)` here and on the test below repeats the gated declaration
+/// of this whole file in `reconcile.rs`, and is kept because
+/// `tests/spawn_seam.rs` classifies source by the attributes it can see in
+/// the file: without it, these fixture processes read as production code
+/// spawning outside the gated seam.
+#[cfg(test)]
 fn reaped() -> (u32, String) {
     let mut child = std::process::Command::new("sh")
         .args(["-c", "read line"])
@@ -271,6 +278,7 @@ fn a_crashed_session_no_longer_blocks_its_checkout() {
         .any(|a| a["target_id"] == "crashed" && a["kind"] == "run_unresolved"));
 }
 
+#[cfg(test)]
 #[cfg(unix)]
 #[test]
 fn a_live_agent_keeps_its_checkout_and_says_so() {
