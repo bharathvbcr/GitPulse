@@ -8,18 +8,14 @@ fn profile() -> (tempfile::TempDir, PathBuf) {
 
 fn untrusted_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new("git")
-        .args(["init", "-q", dir.path().to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
+    // `git_in` trusts a repository it `init`s; a leading global option keeps
+    // this one untrusted, which is the state under test.
+    crate::test_support::git_in(dir.path(), &["--no-pager", "init", "-q"]);
     dir
 }
 
 fn git_repo() -> tempfile::TempDir {
-    let dir = untrusted_repo();
-    crate::test_support::trust_repo(dir.path());
-    dir
+    crate::test_support::git_repo()
 }
 
 fn registered(store: &Store, repo: &tempfile::TempDir) -> Value {
@@ -296,25 +292,11 @@ fn a_linked_worktree_files_under_the_same_repository() {
     let (_dir, path) = profile();
     let store = Store::open(&path).unwrap();
     let repo = untrusted_repo();
-    let root = repo.path().to_str().unwrap();
-    for args in [
-        vec!["-C", root, "commit", "-q", "--allow-empty", "-m", "init"],
-        vec!["-C", root, "worktree", "add", "-q", "wt"],
-    ] {
-        let out = std::process::Command::new("git")
-            .args(&args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "add", "-q", "wt"]);
     crate::test_support::trust_repo(repo.path());
     let worktree = repo.path().join("wt");
     let from_worktree = add_task(
@@ -484,7 +466,9 @@ fn an_item_at_the_derived_id_that_belongs_elsewhere_is_never_replaced() {
     });
     query(&store, "items.put", &input.to_string()).unwrap();
     for replace in [false, true] {
-        let error = place(&store, &mine, &task("gp-k", "Mine"), replace, 1).err().expect("refused");
+        let error = place(&store, &mine, &task("gp-k", "Mine"), replace, 1)
+            .err()
+            .expect("refused");
         assert_eq!(error.code, "key_collision");
     }
     let kept = query(&store, "items.get", &json!({"id": squatted}).to_string()).unwrap();

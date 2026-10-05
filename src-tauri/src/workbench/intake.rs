@@ -492,7 +492,10 @@ fn place_once(
     // The id is derived from this repository, so an item under it that this
     // repository does not link was not made here. Refuse rather than report it
     // as this task, or replace someone else's: the hash's quality stops mattering.
-    if current.as_ref().is_some_and(|item| !links(item, repository_id)) {
+    if current
+        .as_ref()
+        .is_some_and(|item| !links(item, repository_id))
+    {
         return Err(WorkbenchError::new(
             "key_collision",
             format!("Board item {id} exists but is not linked to this repository; refusing to treat it as task {:?}.", task.key),

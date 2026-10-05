@@ -1115,7 +1115,8 @@ pub fn scan_briefs(repo_path: &str, tasks_dir: Option<&str>) -> Result<BriefScan
         let path = resolved.join(name);
         // `O_NOFOLLOW` is the race-free guard, but it exists on unix only; this
         // check is what refuses a link on every platform.
-        let linked = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
+        let linked =
+            std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
         let parsed = if linked {
             Err(LINK_REFUSAL.to_string())
         } else {
