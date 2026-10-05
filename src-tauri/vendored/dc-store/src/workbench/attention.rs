@@ -30,7 +30,11 @@ pub(super) fn record_event(
 ) -> Result<()> {
     if !matches!(
         method,
-        "runs.finish" | "enhancements.complete" | "enhancements.recover" | "decisions.create"
+        "runs.finish"
+            | "runs.reconcile"
+            | "enhancements.complete"
+            | "enhancements.recover"
+            | "decisions.create"
     ) {
         return Ok(());
     }
@@ -60,7 +64,10 @@ pub(super) fn record_event(
         ),
         ("runs.finish", "exited") => ("run", "run_exited", "Coding agent exited"),
         ("runs.finish", "failed") => ("run", "run_failed", "Coding agent failed to start"),
-        ("runs.finish", "unresolved") => (
+        // A reconciled attempt ended in a way nobody observed. It reuses the
+        // unresolved kind rather than adding one: the outcome genuinely needs
+        // a person's review, and every consumer already decodes this kind.
+        ("runs.finish", "unresolved") | ("runs.reconcile", "exited") => (
             "run",
             "run_unresolved",
             "Coding agent outcome needs attention",

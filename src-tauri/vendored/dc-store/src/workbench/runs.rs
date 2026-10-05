@@ -8,7 +8,10 @@ use super::{
 };
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 
-const MAX_ACTIVE_RUNS: i64 = 2;
+/// Live attempts across the whole profile. Concurrency is per checkout (see
+/// `prepare`), so this bounds only how many agents one machine supervises at
+/// once; it is not what keeps two agents out of one working tree.
+const MAX_ACTIVE_RUNS: i64 = 8;
 const ACTIVE: &str =
     "(state IN ('starting','running','unresolved') OR (state='prepared' AND expires_at>?1))";
 const STATES: &[&str] = &[
@@ -117,6 +120,9 @@ pub(super) fn mutate(
         }
         "runs.finish" if matches!(state.as_str(), "starting" | "running" | "unresolved") => {
             finish(input, &prior, &state, now)?
+        }
+        "runs.reconcile" if matches!(state.as_str(), "starting" | "running" | "unresolved") => {
+            reconcile(input, &prior, now)?
         }
         "runs.protocol" => protocol(input, &prior, &state)?,
         _ => {
@@ -294,6 +300,54 @@ fn finish(input: &Input<'_>, prior: &Input<'_>, state: &str, now: i64) -> Result
     }
 }
 
+/// Releases an attempt whose recorded owner can no longer report its outcome.
+///
+/// `finish` belongs to the owner, and an owner that crashed never calls it, so
+/// without this the attempt holds its checkout forever. Storage still cannot
+/// prove that anything stopped: a *different* native host supplies that proof
+/// (the owner process is gone and so is the recorded child) and carries it in
+/// `reason`. The store's part is to refuse every shape that is not that —
+/// the recorded owner, which must use `finish`; a reconciler that names an
+/// owner other than the one it judged; a claim of success. The result is
+/// always `exited` with an uncertain outcome and no exit code, because the
+/// one thing a reconciler never observed is how the process ended.
+fn reconcile(input: &Input<'_>, prior: &Input<'_>, now: i64) -> Result<String> {
+    input.fields(&[
+        "id",
+        "request_id",
+        "expected_revision",
+        "owner_id",
+        "prior_owner_id",
+        "reason",
+    ])?;
+    let reconciler = input.id("owner_id")?;
+    let recorded = prior.id("owner_id")?;
+    if input.id("prior_owner_id")? != recorded {
+        return Err(refuse(
+            "owner_mismatch",
+            "the reconciliation names an owner other than the one recorded for this attempt",
+        ));
+    }
+    if reconciler == recorded {
+        return Err(refuse(
+            "invalid_state",
+            "the recorded owner reports its own outcome with runs.finish",
+        ));
+    }
+    let reason = input.required_text("reason", 2048)?;
+    if reason.trim().is_empty() {
+        return Err(Error::invalid(
+            "reconciliation requires the evidence that the owner and its process are gone",
+        ));
+    }
+    input.conn.query_row(
+        "SELECT json_set(?1,'$.state','exited','$.reason',?2,'$.exit_code',NULL,'$.outcome_uncertain',json('true'),'$.finished_at',?3)",
+        params![prior.raw, format!("Reconciled: {reason}"), now],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
 fn snapshot(input: &Input<'_>, task_id: &str, revision: i64) -> Result<String> {
     let raw: String = input.conn.query_row(
         "SELECT json_object('id',?1,'expected_revision',?2)",
@@ -421,15 +475,22 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             "the supplied Git common directory does not match the registered repository",
         ));
     }
+    // One agent per working tree, not per repository. Linked worktrees share
+    // the repository's common directory but each has its own `git_dir`, index
+    // and HEAD, so two agents in two worktrees cannot touch each other's files
+    // — while two in one checkout would. Keying on the repository serialized
+    // every task in it, worktrees included.
     let busy: bool = input.conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND {ACTIVE})"),
-        params![now, repository_id],
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND json_extract(body,'$.git_dir')=?3 AND {ACTIVE})"
+        ),
+        params![now, repository_id, git_dir],
         |r| r.get(0),
     )?;
     if busy {
         return Err(refuse(
-            "repository_busy",
-            "this repository already has a prepared, active or unresolved run",
+            "checkout_busy",
+            "this checkout already has a prepared, active or unresolved run; launch in another worktree, or finish or reconcile that run first",
         ));
     }
     let active: i64 = input.conn.query_row(
@@ -438,10 +499,12 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         |r| r.get(0),
     )?;
     if active >= MAX_ACTIVE_RUNS {
-        return Err(refuse(
-            "capacity_reached",
-            "two runs are already prepared, active or unresolved; finish or reconcile one before launching another",
-        ));
+        return Err(Error {
+            code: "capacity_reached",
+            message: format!(
+                "{MAX_ACTIVE_RUNS} runs are already prepared, active or unresolved; finish or reconcile one before launching another"
+            ),
+        });
     }
     let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',?2,'updated_at',?3,'created_at',?3,'expires_at',?4,'kind','external_terminal','task_id',?5,'source_revision',?6,'task_title',json_extract(?7,'$.task.title'),'repository_id',?8,'provider',?9,'permission_mode',?10,'bypass_acknowledged',json(CASE WHEN ?11 THEN 'true' ELSE 'false' END),'cwd',?12,'git_dir',?13,'git_common_dir',?14,'head_oid',?15,'head_ref',?16,'state','prepared','owner_id',NULL,'session_id',NULL,'process_id',NULL,'process_start',NULL,'claimed_at',NULL,'started_at',NULL,'finished_at',NULL,'exit_code',NULL,'reason','','outcome_uncertain',json('false'))",params![id,revision,now,now.saturating_add(300),task_id,source_revision,brief,repository_id,provider,mode,bypass,cwd,git_dir,common,head,head_ref],|r|r.get(0))?;
     let body: String = input.conn.query_row(
