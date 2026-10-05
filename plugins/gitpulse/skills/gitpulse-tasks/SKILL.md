@@ -1,6 +1,6 @@
 ---
 name: gitpulse-tasks
-description: File, import, list and read tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, or read a task's brief before implementing it.
+description: File, import, list, read and complete tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, read a task's brief before implementing it, or mark the task it was launched on done when the work is finished.
 license: MIT
 compatibility: Requires the gitpulse-mcp binary on PATH, an absolute git repository path, and a repository the person has trusted in GitPulse.
 metadata:
@@ -22,10 +22,11 @@ window is shown otherwise.
 | `gitpulse_import_tasks` | write | Put every Markdown brief in the repository's `tasks/` folder onto the board. |
 | `gitpulse_list_tasks` | read | List the board's tasks for a repository, in board order. |
 | `gitpulse_get_task` | read | Read one task with its canonical agent brief. |
+| `gitpulse_complete_task` | write | Move your task to `done` when the work is finished (or `review`, or `in_progress`), with a summary. |
 
-Both writes require the repository to be **trusted** in GitPulse. An untrusted
+Every write requires the repository to be **trusted** in GitPulse. An untrusted
 repository is refused with `untrusted_repository`; ask the person to open it in
-GitPulse and trust it. Neither write can delete a task or start an agent run.
+GitPulse and trust it. No write can delete a task or start an agent run.
 
 ## Before you file a task
 
@@ -137,6 +138,33 @@ frontmatter — what GitPulse's **Copy saved brief** produces, or a hand-written
 `gitpulse_get_task` takes the `task_id` you filed it with, or an `item_id` from
 `gitpulse_list_tasks`. It returns the stored task and `brief`: the same Markdown
 GitPulse hands an agent it launches on that task. Work from that brief.
+
+## Finishing a task
+
+When GitPulse launched you on a task, the brief's first lines name it:
+`Task: <id> (revision N)`. When every acceptance criterion is met and your
+verification passed, move it to `done`:
+
+```json
+{
+  "repo_path": "/absolute/path/to/repo",
+  "task_id": "<id from the Task: line>",
+  "summary": "What changed, and the checks you ran and their results."
+}
+```
+
+- `status` defaults to `done`. Use `review` instead when a person must judge
+  the result before it counts as finished, and `in_progress` when you start.
+- Only the status changes. The `summary` (at most 4,000 characters) is appended
+  to the task's logs so the person sees what you did; nothing else is rewritten,
+  and a person's edit made while you worked is kept.
+- Pass `expected_revision` (the `N` from `Task: <id> (revision N)`) to be
+  refused with `revision_conflict` if the task changed since you read it; then
+  re-read it with `gitpulse_get_task` before deciding.
+- The same call twice answers `unchanged`. A task already `done` is never
+  reopened (`already_done`): ask the person.
+- Do not mark a task done that you did not finish, or whose verification failed.
+  Say what is left instead, and use `review`.
 
 ## Guarantees
 

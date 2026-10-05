@@ -411,6 +411,11 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
     Ok((flags, mode == "inspect"))
 }
 
+/// What a launched agent is told about finishing. The brief's first lines
+/// carry `Task: <id> (revision N)`; the tool is `gitpulse_complete_task` on the
+/// GitPulse MCP server, which changes only the status and records the summary.
+pub(crate) const COMPLETION: &str = "Carry out the saved task within the selected permission mode. When every acceptance criterion is met and your verification passed, mark the task done with the gitpulse_complete_task tool, using the id on the brief's Task: line and a short summary of what changed and how you verified it; if anything is unfinished or needs a person's judgement, use status review instead and say what remains.";
+
 pub(super) fn arguments(
     provider: &str,
     mode: &str,
@@ -438,11 +443,11 @@ pub(super) fn arguments(
         _ => {}
     }
     let scope = if inspect {
-        "Inspect and propose a plan; do not modify files."
+        "Inspect and propose a plan; do not modify files or change the task's status."
     } else {
-        "Carry out the saved task within the selected permission mode. Report verification and anything requiring human review."
+        COMPLETION
     };
-    args.push(format!("Read the UTF-8 task brief at {quoted}. It contains the user's saved task and repository references. {scope} Do not mark the task accepted or publish changes on the user's behalf."));
+    args.push(format!("Read the UTF-8 task brief at {quoted}. It contains the user's saved task and repository references. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
     if args.iter().any(|a| a.len() > 16 * 1024 || a.contains('\0')) {
         return Err(error(
             "invalid_input",
@@ -821,6 +826,36 @@ mod tests {
         let path = brief.path.clone();
         drop(brief);
         assert!(!path.exists());
+    }
+    #[test]
+    fn an_agent_that_may_edit_is_told_how_to_mark_its_task_done_and_an_inspector_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        for provider in ["codex", "claude", "grok", "agy"] {
+            for mode in ["ask", "edit", "auto_review", "preapproved"] {
+                let prompt = arguments(provider, mode, false, "/checkout", &brief.path)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                assert!(
+                    prompt.contains("gitpulse_complete_task"),
+                    "{provider}/{mode}"
+                );
+                assert!(prompt.contains("Task: line"), "{provider}/{mode}");
+                assert!(prompt.contains("status review"), "{provider}/{mode}");
+                // Marking the task is allowed; publishing still is not.
+                assert!(
+                    prompt.contains("Do not publish changes"),
+                    "{provider}/{mode}"
+                );
+            }
+            let inspect = arguments(provider, "inspect", false, "/checkout", &brief.path)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(!inspect.contains("gitpulse_complete_task"), "{provider}");
+            assert!(inspect.contains("change the task's status"), "{provider}");
+        }
     }
     #[test]
     fn each_provider_mode_is_explicit_and_bypass_is_never_inherited() {

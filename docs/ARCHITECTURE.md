@@ -650,6 +650,11 @@ native `runs.prepare_terminal` through existing workbench IPC, observing actual
 cwd, Git directories, commit and branch before preparation. Native `runs.claim`
 rechecks those observations and then delegates snapshot/CAS validation to Manvi.
 An exact claim replay returns `claim_consumed`; process exit never accepts a task.
+The agent moves its own task instead: `gitpulse_complete_task` (MCP,
+`workbench/intake.rs::complete_task`) changes only the status to in progress,
+review or done, appends the agent's summary to the task logs, honours an
+`expected_revision`, never reopens a done task, and resolves the task through
+the same trusted-repository gate as the other task tools.
 Real Git tests cover linked worktrees, distinct clones, malformed/bare/unavailable
 checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise

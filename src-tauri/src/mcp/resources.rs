@@ -216,7 +216,15 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             "storeSchemaVersion": crate::codeintel::SUPPORTED_STORE_SCHEMA,
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
-            "readOnly": true,
+            // Derived from the tool annotations, so it cannot claim "read-only"
+            // while a tool writes. It said `true` after the task-board tools
+            // began writing the GitPulse task profile.
+            "readOnly": super::tools().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true),
+            "gitWrites": false,
+            "writes": super::tools().iter()
+                .filter(|tool| tool["annotations"]["readOnlyHint"] != true)
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>(),
             "capabilities": super::capabilities(),
             "tools": super::tools(),
             "resources": list(),
@@ -489,7 +497,18 @@ mod tests {
             parsed["tools"].as_array().unwrap().len(),
             super::super::tools().len()
         );
-        assert_eq!(parsed["readOnly"], true);
+        // The task-board tools write the task profile, so the surface is not
+        // read-only; it never writes git, and it names exactly what writes.
+        assert_eq!(parsed["readOnly"], false);
+        assert_eq!(parsed["gitWrites"], false);
+        assert_eq!(
+            parsed["writes"],
+            json!([
+                "gitpulse_add_task",
+                "gitpulse_import_tasks",
+                "gitpulse_complete_task"
+            ])
+        );
         assert_eq!(
             parsed["storeSchemaVersion"],
             crate::codeintel::SUPPORTED_STORE_SCHEMA

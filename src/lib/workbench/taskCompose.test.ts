@@ -135,6 +135,15 @@ describe("agent copy", () => {
     expect(formatDraftAgentCopy({ title: "   ", description: "" })).toBeNull();
   });
 
+  it("tells the agent how to mark a saved task done, conditionally and never for unfinished work", () => {
+    // A copied prompt reaches agents GitPulse did not launch. They learn the
+    // task id from the brief's Task: line, which only a saved brief carries.
+    expect(AGENT_COPY_PREAMBLE).toContain("gitpulse_complete_task");
+    expect(AGENT_COPY_PREAMBLE).toContain("Task: line");
+    expect(AGENT_COPY_PREAMBLE).toContain("status review");
+    expect(AGENT_COPY_PREAMBLE).toContain("Never mark done work you did not finish");
+  });
+
   it("carries pasted raw logs as a fenced evidence section and omits them when empty", () => {
     const withLogs = formatDraftAgentCopy({
       title: "Keep E42",

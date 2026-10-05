@@ -863,6 +863,28 @@ pub(crate) fn get_task(
         )
     })?;
     let repository_id = repository["id"].as_str().unwrap_or_default();
+    let (id, item) = find_task(store, repository_id, task)?;
+    let brief = query(
+        store,
+        "items.brief.get",
+        &json!({"id": id, "expected_revision": item["revision"]}).to_string(),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "item_id": id,
+        "repository": repository_summary(&repository),
+        "task": item,
+        "brief": brief["item"]["markdown"],
+    }))
+}
+
+/// A board task linked to `repository_id`, by the key it was filed with or by
+/// its board id (the id a launched agent finds in its brief).
+fn find_task(
+    store: &Store,
+    repository_id: &str,
+    task: &str,
+) -> Result<(String, Value), WorkbenchError> {
     let task = task.trim();
     let mut candidates = Vec::new();
     if file_tasks::validate_task_key(task).is_ok() {
@@ -880,25 +902,175 @@ pub(crate) fn get_task(
         let Some(item) = get_item(store, &id)? else {
             continue;
         };
-        if !links(&item, repository_id) {
-            continue;
+        if links(&item, repository_id) {
+            return Ok((id, item));
         }
-        let brief = query(
-            store,
-            "items.brief.get",
-            &json!({"id": id, "expected_revision": item["revision"]}).to_string(),
-        )?;
-        return Ok(json!({
-            "ok": true,
-            "item_id": id,
-            "repository": repository_summary(&repository),
-            "task": item,
-            "brief": brief["item"]["markdown"],
-        }));
     }
     Err(WorkbenchError::new(
         "not_found",
         format!("No task {task:?} on the board for this repository. Pass the task_id you added it with, or an item_id from gitpulse_list_tasks."),
+    ))
+}
+
+/// Statuses an agent may move its own task to. `done` is where a finished
+/// task goes (and is the board's archive); `review` hands it to a person;
+/// `in_progress` says work has started.
+pub(crate) const AGENT_STATUSES: [&str; 3] = ["in_progress", "review", "done"];
+/// Bound on the completion summary appended to the task's logs.
+pub(crate) const MAX_SUMMARY_CHARS: usize = 4000;
+
+/// The block a completion summary is recorded as in the task's logs.
+fn summary_block(status: &str, summary: &str, at_ms: i64) -> String {
+    let at = crate::ledger::ids::iso8601_utc(u64::try_from(at_ms).unwrap_or_default());
+    format!(
+        "--- Agent moved this task to {status} ({at}) ---\n{}",
+        summary.trim()
+    )
+}
+
+/// Move a board task to `status` on an agent's behalf, optionally recording
+/// what the agent says it did.
+///
+/// Only the status changes. `items.put` replaces a whole item, so every other
+/// stored field is sent back exactly as read, under the revision it was read
+/// at — a person's edit that lands in between is a conflict that is retried
+/// against the new revision, never overwritten. `expected_revision`, when the
+/// agent passes one, is held to: a task that changed since the agent read it
+/// is refused rather than moved, so the agent re-reads it first.
+///
+/// A task already in `done` is never moved back out by an agent: the person
+/// closed it. The same move twice is `unchanged`, so a retried call cannot
+/// append its summary twice.
+pub(crate) fn complete_task(
+    store: &Store,
+    repo_path: &str,
+    task: &str,
+    status: &str,
+    expected_revision: Option<i64>,
+    summary: Option<&str>,
+) -> Result<Value, WorkbenchError> {
+    if !AGENT_STATUSES.contains(&status) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("An agent can move its task to one of {AGENT_STATUSES:?}, not {status:?}."),
+        ));
+    }
+    let summary = summary.map(str::trim).filter(|s| !s.is_empty());
+    if summary.is_some_and(|s| s.chars().count() > MAX_SUMMARY_CHARS) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("The summary exceeds {MAX_SUMMARY_CHARS} characters."),
+        ));
+    }
+    let local = resolve_for_agent(repo_path)?;
+    let repository = find(store, &local.identity)?.ok_or_else(|| {
+        WorkbenchError::new(
+            "not_found",
+            "This repository is not on the GitPulse board yet; no task has been filed under it.",
+        )
+    })?;
+    let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
+    for _ in 0..2 {
+        let (id, item) = find_task(store, &repository_id, task)?;
+        let revision = item["revision"].as_i64().unwrap_or_default();
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(WorkbenchError::new(
+                "revision_conflict",
+                format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before moving it.", expected_revision.unwrap_or_default()),
+            ));
+        }
+        let previous = item["status"].as_str().unwrap_or_default().to_owned();
+        let logs = item["logs"].as_str().unwrap_or_default();
+        let block = summary.map(|s| summary_block(status, s, now_millis()));
+        // The marker carries a timestamp, so compare the summary text itself:
+        // the same summary already recorded under the same status is a retry.
+        let recorded = summary.is_some_and(|s| {
+            logs.contains(&format!("--- Agent moved this task to {status} ("))
+                && logs.trim_end().ends_with(s)
+        });
+        let response = |outcome: &str, item: &Value, sequence: Option<u64>| {
+            json!({
+                "ok": true,
+                "outcome": outcome,
+                "item_id": id,
+                "title": item["title"],
+                "previous_status": previous,
+                "status": item["status"],
+                "revision": item["revision"],
+                "summary_recorded": summary.is_some() && (outcome == "updated" || recorded),
+                "repository": repository_summary(&repository),
+                "sequence": sequence,
+            })
+        };
+        if previous == status && (summary.is_none() || recorded) {
+            return Ok(response("unchanged", &item, None));
+        }
+        if previous == "done" && status != "done" {
+            return Err(WorkbenchError::new(
+                "already_done",
+                "This task is already done; an agent does not reopen a task a person closed. Ask them to move it back first.",
+            ));
+        }
+        let mut input = serde_json::Map::new();
+        for key in [
+            "title",
+            "description",
+            "kind",
+            "priority",
+            "severity",
+            "owner",
+            "due_at",
+            "labels",
+            "acceptance_criteria",
+            "repository_ids",
+            "primary_repository_id",
+            "position",
+        ] {
+            if !item[key].is_null() {
+                input.insert(key.into(), item[key].clone());
+            }
+        }
+        input.insert(
+            "home_workspace_id".into(),
+            item["home_workspace_id"].clone(),
+        );
+        input.insert("status".into(), json!(status));
+        if let Some(block) = &block {
+            let joined = if logs.trim().is_empty() {
+                block.clone()
+            } else {
+                format!("{}\n\n{block}", logs.trim_end())
+            };
+            if joined.len() > file_tasks::MAX_TASK_LOGS {
+                return Err(WorkbenchError::new(
+                    "invalid_input",
+                    "The task's logs are full; move it without a summary, or shorten the summary.",
+                ));
+            }
+            input.insert("logs".into(), json!(joined));
+        }
+        input.insert("id".into(), json!(id));
+        input.insert("request_id".into(), json!(fresh_id("complete")));
+        input.insert("expected_revision".into(), json!(revision));
+        match query(store, "items.put", &Value::Object(input).to_string()) {
+            Ok(saved) => {
+                return Ok(response(
+                    "updated",
+                    &saved["item"],
+                    saved["sequence"].as_u64(),
+                ));
+            }
+            // A person saved it between our read and our write. Their
+            // content wins; move it again from what they saved.
+            Err(error) if error.code == "revision_conflict" && expected_revision.is_none() => {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(WorkbenchError::new(
+        "revision_conflict",
+        "The task kept changing while it was being moved. Re-read it and try again.",
     ))
 }
 

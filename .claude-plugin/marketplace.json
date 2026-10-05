@@ -9,7 +9,7 @@
     {
       "name": "gitpulse",
       "source": "./plugins/gitpulse",
-      "description": "Read-only GitPulse control plane for agents: worktrees, collisions, ledger, provenance, and in-process code intelligence.",
+      "description": "GitPulse control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never writes git.",
       "category": "development",
       "author": {
         "name": "GitPulse Team",

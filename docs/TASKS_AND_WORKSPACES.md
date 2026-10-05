@@ -283,6 +283,16 @@ launch. A terminal handoff opens a dedicated task-bound session in the existing
 [terminal dock](TERMINAL.md). It runs under that CLI's configured permissions;
 finishing the process does not accept the task or mark it Done.
 
+The agent marks it Done itself. Its launch prompt tells it to call
+`gitpulse_complete_task` on the GitPulse MCP server once every acceptance
+criterion is met and its verification passed, using the id on the brief's
+`Task:` line, or to move it to **Review** and say what remains when it is not
+finished. Only the status changes; the agent's summary of what it changed and
+how it verified it is appended to the task's **Logs**, and the board picks the change
+up as it does any external write. An agent never reopens a task that is already
+Done, and an agent without the GitPulse MCP server configured cannot move it at
+all — the card then stays where it was for you to move.
+
 ### Running several tasks at once
 
 One working tree holds one agent; a repository can hold several. Tick **Run in

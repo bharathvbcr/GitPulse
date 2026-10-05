@@ -14,8 +14,12 @@
 //! canonical schema for this revision, which is also why there is no `ping` and
 //! no `logging/setLevel` in the modern era — neither exists in 2026-07-28.
 //!
-//! The whole surface is read-only. A mutating tool must go through
-//! `harness::guard_command` and must update the test that pins that.
+//! Nothing here writes git. The only writes are the task-board tools
+//! (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`),
+//! which write the GitPulse task profile behind the repository trust gate.
+//! Any tool that would run a git mutation must go through
+//! `harness::guard_command`, and every writing tool must be added to the
+//! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
 pub mod complete;
 pub mod devmap_parity;
@@ -641,6 +645,40 @@ fn build_tools() -> Vec<Value> {
                 "required": ["ok", "item_id", "repository", "task", "brief"]
             }),
         ),
+        mutating_tool(
+            "gitpulse_complete_task",
+            "Complete task",
+            "Move your GitPulse board task to done when the work is finished (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
+            json!({
+                "repo_path": repo_prop(),
+                "task_id": bounded_string_prop("The task id from your brief ('Task: <id>'), its board item_id, or the task_id it was filed with", 1, 128),
+                "status": { "type": "string", "enum": crate::workbench::intake::AGENT_STATUSES, "maxLength": 32, "description": "Where the task goes (default done)" },
+                "summary": bounded_string_prop("What you changed and how you verified it, in a few lines; appended to the task's logs", 1, crate::workbench::intake::MAX_SUMMARY_CHARS * 4),
+                "expected_revision": {
+                    "type": "integer",
+                    "description": "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
+                    "minimum": 1,
+                    "maximum": 9_007_199_254_740_991_i64
+                }
+            }),
+            &["repo_path", "task_id"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "outcome": { "type": "string", "enum": ["updated", "unchanged"] },
+                    "item_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "previous_status": { "type": "string" },
+                    "status": { "type": "string" },
+                    "revision": { "type": "integer" },
+                    "summary_recorded": { "type": "boolean" },
+                    "repository": { "type": "object" }
+                },
+                "required": ["ok", "outcome", "item_id", "previous_status", "status", "revision", "summary_recorded", "repository"]
+            }),
+            true,
+        ),
         tool(
             "gitpulse_codeintel_search",
             "Symbol search",
@@ -760,7 +798,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "Read-only GitPulse control plane. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. This server never mutates git state.",
+                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools, which a person sees on the GitPulse board. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -1050,6 +1088,23 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let store = open_task_profile(false)?
                 .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
             crate::workbench::intake::get_task(&store, repo, task).map_err(workbench_message)
+        }
+        "gitpulse_complete_task" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let task = arguments["task_id"].as_str().ok_or("missing task_id")?;
+            let status = arguments["status"].as_str().unwrap_or("done");
+            // Reading, not creating: a task to complete has to exist already.
+            let store = open_task_profile(false)?
+                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
+            crate::workbench::intake::complete_task(
+                &store,
+                repo,
+                task,
+                status,
+                arguments["expected_revision"].as_i64(),
+                arguments["summary"].as_str(),
+            )
+            .map_err(workbench_message)
         }
         name if name.starts_with("devmap_") => devmap_parity::handle(name, arguments),
         "gitpulse_codeintel_search" => {
@@ -1927,7 +1982,10 @@ mod tests {
             if !read_only {
                 // Mutating tools must be in an explicit allowlist and policy-gated
                 assert!(
-                    matches!(name, "gitpulse_add_task" | "gitpulse_import_tasks"),
+                    matches!(
+                        name,
+                        "gitpulse_add_task" | "gitpulse_import_tasks" | "gitpulse_complete_task"
+                    ),
                     "unexpected mutating tool {name}"
                 );
                 assert_eq!(
@@ -2524,13 +2582,280 @@ mod tests {
                 (n.ends_with("_task") || n.ends_with("_tasks")) && n != "gitpulse_task_view"
             })
             .collect();
-        assert_eq!(task_tools.len(), 4, "{task_tools:?}");
+        assert_eq!(task_tools.len(), 5, "{task_tools:?}");
         for name in &task_tools {
             assert!(
                 skill.contains(&format!("| `{name}` |")),
                 "SKILL.md table omits {name}"
             );
         }
+    }
+
+    /// A task the person made on the board, the way the board makes it: a
+    /// random id, linked to the repository the board registered.
+    fn board_task(
+        profile: &std::path::Path,
+        repo: &str,
+        id: &str,
+    ) -> (crate::workbench::WorkbenchState, String) {
+        let board =
+            crate::workbench::WorkbenchState::for_profile(&profile.join("workbench.sqlite"));
+        let registered = board
+            .board_register(repo, "board-repo", "board-request")
+            .unwrap();
+        let repository_id = registered["repository"]["id"].as_str().unwrap().to_string();
+        board
+            .board_request(
+                "items.put",
+                &json!({
+                    "id": id, "request_id": format!("put-{id}"), "expected_revision": 0,
+                    "title": "Make the importer resumable", "description": "Background",
+                    "status": "in_progress", "priority": 1, "severity": "high", "owner": "@sam",
+                    "labels": ["import"], "acceptance_criteria": ["Resumes after a crash"],
+                    "logs": "first trace",
+                    "repository_ids": [repository_id], "primary_repository_id": repository_id,
+                    "position": 7
+                })
+                .to_string(),
+            )
+            .unwrap();
+        (board, repository_id)
+    }
+
+    #[test]
+    fn a_finished_task_reaches_done_on_the_board_with_only_its_status_changed() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        let before = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+
+        // The id a launched agent reads off its brief's `Task:` line.
+        let (error, brief) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": id}),
+        );
+        assert!(!error, "{brief}");
+        assert!(brief["brief"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("Task: {id} (revision 1)")));
+
+        let summary = "Checkpointed every 500 rows; resumed import passes the crash test.";
+        let (error, done) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": id, "summary": summary, "expected_revision": 1}),
+        );
+        assert!(!error, "{done}");
+        assert_eq!(done["outcome"], "updated");
+        assert_eq!(done["previous_status"], "in_progress");
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["summary_recorded"], true);
+
+        // What the person sees: the card is Done, and nothing else moved.
+        let after = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(after["status"], "done");
+        assert_eq!(after["revision"], 2);
+        for key in [
+            "title",
+            "description",
+            "priority",
+            "severity",
+            "owner",
+            "labels",
+            "acceptance_criteria",
+            "repository_ids",
+            "primary_repository_id",
+            "position",
+            "kind",
+        ] {
+            assert_eq!(after[key], before[key], "{key} changed");
+        }
+        let logs = after["logs"].as_str().unwrap();
+        assert!(
+            logs.starts_with("first trace\n\n--- Agent moved this task to done ("),
+            "{logs}"
+        );
+        assert!(logs.ends_with(summary), "{logs}");
+
+        // A retry changes nothing and records nothing twice.
+        let (error, again) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": id, "summary": summary}),
+        );
+        assert!(!error, "{again}");
+        assert_eq!(again["outcome"], "unchanged");
+        let replayed = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(replayed["revision"], 2);
+        assert_eq!(
+            replayed["logs"].as_str().unwrap().matches(summary).count(),
+            1
+        );
+
+        // Done is the person's to undo, not the agent's.
+        let (error, reopened) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": id, "status": "review"}),
+        );
+        assert!(
+            error && reopened.as_str().unwrap().contains("already_done"),
+            "{reopened}"
+        );
+    }
+
+    /// A task launched while its checkout was busy runs in a worktree of its
+    /// own, so the agent's `repo_path` is that linked worktree, not the
+    /// checkout the board registered. It is still the same repository.
+    #[test]
+    fn an_agent_in_its_own_worktree_marks_the_task_of_its_repository_done() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let id = "0b7d4e2a-91c3-4f6e-8a2d-5c4b3a291e70";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        let lane = dir.path().join(".gitpulse/worktrees/import-0b7d4e2a");
+        crate::test_support::git_in(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "gitpulse/import-0b7d4e2a",
+                lane.to_str().unwrap(),
+            ],
+        );
+
+        let (error, done) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": lane.to_str().unwrap(), "task_id": id, "summary": "Done in the lane."}),
+        );
+        assert!(!error, "{done}");
+        assert_eq!(done["status"], "done");
+        let after = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(after["status"], "done");
+    }
+
+    #[test]
+    fn completion_respects_a_changed_task_and_refuses_everything_it_should() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "board-task-1";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        // The person edited it after the agent read revision 1.
+        let current = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        let mut edit = current.clone();
+        for key in ["revision", "updated_at", "created_at", "locked_fields"] {
+            edit.as_object_mut().unwrap().remove(key);
+        }
+        edit["request_id"] = json!("person-edit");
+        edit["expected_revision"] = json!(1);
+        edit["title"] = json!("Make the importer resumable and fast");
+        board.board_request("items.put", &edit.to_string()).unwrap();
+
+        let (error, stale) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": id, "expected_revision": 1}),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        let unchanged = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(unchanged["status"], "in_progress");
+
+        // Without a pinned revision the move goes ahead on top of their edit.
+        let (error, moved) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": id, "status": "review"}),
+        );
+        assert!(!error, "{moved}");
+        let saved = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(saved["status"], "review");
+        assert_eq!(
+            saved["title"], "Make the importer resumable and fast",
+            "the person's edit survives"
+        );
+        assert_eq!(saved["logs"], "first trace", "no summary, no log entry");
+
+        for (arguments, expected) in [
+            (
+                json!({"repo_path": repo, "task_id": id, "status": "inbox"}),
+                "status",
+            ),
+            (
+                json!({"repo_path": repo, "task_id": "no-such-task"}),
+                "not_found",
+            ),
+            (
+                json!({"repo_path": repo, "task_id": id, "summary": "x".repeat(4001)}),
+                "4000",
+            ),
+        ] {
+            let (error, message) = tool_json("gitpulse_complete_task", arguments);
+            assert!(error, "{message}");
+            assert!(
+                message.to_string().contains(expected),
+                "{expected}: {message}"
+            );
+        }
+        let (_, final_state) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": id}),
+        );
+        assert_eq!(final_state["task"]["status"], "review");
+    }
+
+    #[test]
+    fn completion_never_reaches_a_task_of_another_repository() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let other_repo = other.path().to_string_lossy().into_owned();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", &other_repo])
+            .status()
+            .unwrap()
+            .success());
+        crate::test_support::trust_repo(other.path());
+        let (board, _) = board_task(profile.path(), &other_repo, "other-task");
+        // This repository needs a board record to be judged at all.
+        board.board_register(&repo, "mine", "mine-request").unwrap();
+        let (error, message) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": "other-task"}),
+        );
+        assert!(
+            error && message.as_str().unwrap().contains("not_found"),
+            "{message}"
+        );
+        assert_eq!(
+            board
+                .board_request("items.get", r#"{"id":"other-task"}"#)
+                .unwrap()["item"]["status"],
+            "in_progress"
+        );
     }
 
     #[test]
@@ -2545,6 +2870,14 @@ mod tests {
             "{message}"
         );
         let (error, message) = tool_json("gitpulse_import_tasks", json!({ "repo_path": repo }));
+        assert!(
+            error && message.as_str().unwrap().contains("untrusted_repository"),
+            "{message}"
+        );
+        let (error, message) = tool_json(
+            "gitpulse_complete_task",
+            json!({ "repo_path": repo, "task_id": "anything" }),
+        );
         assert!(
             error && message.as_str().unwrap().contains("untrusted_repository"),
             "{message}"
