@@ -46,11 +46,40 @@ export function startDirFrom(context: TerminalContext | null): string | null {
   return dir;
 }
 
-/** The question to ask before closing, or null when closing needs none. */
+/** What the panel knows about a tab whose process *is* an agent CLI. */
+export interface AgentTab {
+  /** The CLI's name as the tab strip shows it ("Claude"). */
+  name: string;
+  /** The tab's own lifecycle says the process is starting or running. */
+  running: boolean;
+  /** The process is a task attempt's, which a close ends for good. */
+  taskAttempt: boolean;
+}
+
+/**
+ * The question to ask before closing, or null when closing needs none.
+ *
+ * Two ways to have something worth asking about. A shell with a job in the
+ * foreground reports `busy`. An agent tab never does: its PTY's child *is*
+ * the agent, so the foreground leader is the root process and `busy` reads
+ * false — which is how closing a working Claude Code tab, or a task
+ * attempt's, used to kill it without a word. So a running agent tab asks on
+ * the strength of the panel's own lifecycle, even when the OS could not
+ * describe the process at all.
+ */
 export function closeQuestion(
   context: TerminalContext | null,
   tabLabel: string,
+  agent: AgentTab | null = null,
 ): { title: string; message: string } | null {
+  if (agent?.running) {
+    return {
+      title: `Close ${tabLabel}?`,
+      message: agent.taskAttempt
+        ? `${agent.name} is still working on this task. Closing the tab stops it and ends this attempt; it cannot be restarted, only resumed as a new conversation.`
+        : `${agent.name} is still running in this tab. Closing it stops the agent.`,
+    };
+  }
   if (context?.busy !== true) return null;
   const program = context.process?.trim() || "A program";
   return {

@@ -90,6 +90,7 @@ export function filterSessionRecords(
       query,
       session.repoPath,
       session.label,
+      session.title ?? "",
       session.status,
       session.key,
     ),

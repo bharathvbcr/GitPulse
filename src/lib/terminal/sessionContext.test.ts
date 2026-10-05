@@ -62,6 +62,30 @@ describe("closing a terminal with a job in it", () => {
     expect(closeQuestion({ ...idle, busy: null }, "Shell")).toBeNull();
     expect(closeQuestion(null, "Shell")).toBeNull();
   });
+
+  // The defect: an agent tab's PTY child *is* the agent, so the foreground
+  // leader is the root and `busy` reads false. Closing a working Claude Code
+  // tab — or a task attempt's — killed it without a word.
+  it("asks before stopping a running agent even though the OS reports it idle", () => {
+    const claude = { name: "Claude", running: true, taskAttempt: false };
+    const leaderIsTheAgent: TerminalContext = { process: "claude", busy: false, cwd: "/repo", repo_dir: "" };
+    for (const context of [leaderIsTheAgent, null, { ...leaderIsTheAgent, busy: null }]) {
+      expect(closeQuestion(context, "Claude", claude)).toEqual({
+        title: "Close Claude?",
+        message: "Claude is still running in this tab. Closing it stops the agent.",
+      });
+    }
+    const attempt = closeQuestion(leaderIsTheAgent, "Fix the importer", { ...claude, taskAttempt: true });
+    expect(attempt?.title).toBe("Close Fix the importer?");
+    expect(attempt?.message).toContain("ends this attempt");
+    expect(attempt?.message).toContain("resumed");
+  });
+
+  it("closes an agent that has already ended without asking, and still asks for a busy shell job", () => {
+    const ended = { name: "Claude", running: false, taskAttempt: true };
+    expect(closeQuestion({ process: "claude", busy: false, cwd: "/repo", repo_dir: "" }, "Claude", ended)).toBeNull();
+    expect(closeQuestion({ ...idle, busy: true, process: "cargo" }, "Claude", ended)?.message).toContain("cargo is still running");
+  });
 });
 
 describe("closing one half of a split", () => {

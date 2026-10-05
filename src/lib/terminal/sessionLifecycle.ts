@@ -31,6 +31,11 @@ export function createSessionLifecycle(options: {
   singleAttempt?: boolean;
   /** Panel-owned "bring this tab on screen"; see `TerminalSessionRecord.reveal`. */
   reveal?: () => void;
+  /** Panel-owned question before a close; see `TerminalSessionRecord.confirmClose`. */
+  confirmClose?: () => Promise<boolean>;
+  /** See `TerminalSessionRecord.title` and `.taskRunId`. */
+  title?: string;
+  taskRunId?: string;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -120,7 +125,12 @@ export function createSessionLifecycle(options: {
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let timedOut = false;
     try {
-      slot ??= registry.reserve({ key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close, reveal: options.reveal });
+      slot ??= registry.reserve({
+        key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
+        reveal: options.reveal, confirmClose: options.confirmClose,
+        ...(options.title ? { title: options.title } : {}),
+        ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
+      });
       state("starting");
       ready = await bus.prepare();
       if (disposed) { release(); return; }

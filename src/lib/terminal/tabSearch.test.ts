@@ -109,6 +109,15 @@ describe("filterLaunchers / filterSessionRecords", () => {
     expect(filterSessionRecords(sessions, "GitPulse").map((row) => row.key)).toEqual(["a"]);
     expect(filterSessionRecords(sessions, "nope")).toEqual([]);
   });
+
+  it("finds a session by the task it is working on, not only by \"Claude\"", () => {
+    const sessions: TerminalSessionRecord[] = [
+      { key: "a", repoPath: "/repos/GitPulse", label: "Claude", title: "Fix the importer", taskRunId: "run-1", status: "running", close: async () => {} },
+      { key: "b", repoPath: "/repos/GitPulse", label: "Claude", status: "running", close: async () => {} },
+    ];
+    expect(filterSessionRecords(sessions, "importer").map((row) => row.key)).toEqual(["a"]);
+    expect(filterSessionRecords(sessions, "claude").map((row) => row.key)).toEqual(["a", "b"]);
+  });
 });
 
 describe("stepSearchIndex / crowdedTabStrip", () => {

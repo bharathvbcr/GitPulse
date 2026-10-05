@@ -139,6 +139,8 @@
     onStatus = () => {},
     onActivity = () => {},
     revealSelf,
+    confirmCloseSelf,
+    title,
   }: {
     repoPath: string;
     tabId: string;
@@ -171,6 +173,10 @@
      * nothing.
      */
     revealSelf?: () => void;
+    /** The panel's question before a close; see `TerminalSessionRecord.confirmClose`. */
+    confirmCloseSelf?: () => Promise<boolean>;
+    /** What this session is about (a task title), for the Sessions list. */
+    title?: string;
   } = $props();
 
   /**
@@ -522,6 +528,9 @@
       key: tabId, repoPath, label: launcherLabel(launcher), bus: ptyBus, registry: terminalSessions,
       singleAttempt: !!taskRunId,
       reveal: revealSelf,
+      confirmClose: confirmCloseSelf,
+      title,
+      taskRunId,
       transport: {
         spawn: () => {
           // A tab hidden before its shell starts measures as NaN; NaN becomes

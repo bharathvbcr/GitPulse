@@ -150,6 +150,28 @@
       check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
       button("Open terminal").click();await pause(250);
       check("Repeated Open terminal focuses its existing tab",report.launchCalls===2&&report.taskSpawns===1);
+      // A task attempt's PTY child IS the agent, so the OS never reports it
+      // busy; closing its tab used to stop the agent and end the attempt
+      // without a word, from the tab's x and from the Sessions list alike.
+      {
+        const {promptState,completePrompt}=await import("../src/lib/stores/modalStore");
+        const {get}=await import("svelte/store");
+        const closeTab=[...document.querySelectorAll('button[title^="Close this session"]')][0];
+        closeTab.click();await wait(()=>get(promptState));
+        check("Closing a running task attempt's tab asks first and says it ends the attempt",
+          get(promptState).options.mode==="confirm"&&get(promptState).options.message.includes("ends this attempt")&&report.kills===0);
+        completePrompt(false);await pause(150);
+        check("Declining keeps the agent running and its tab open",report.kills===0&&document.querySelector('textarea[aria-label="Terminal input"]'));
+        document.querySelector('[aria-label="All terminal sessions"]').click();
+        const listed=await (async()=>{let row=null;await wait(()=>{row=[...(document.querySelector('[aria-label="Sessions across repositories"]')?.children??[])].find(el=>el.textContent.includes(task.title));return row;});return row;})();
+        check("The Sessions list names the task a session is working on",listed.textContent.includes("task attempt"));
+        [...listed.querySelectorAll("button")].find(el=>el.textContent.trim()==="Close session").click();
+        await wait(()=>get(promptState));
+        check("Closing it from the Sessions list asks the same question",get(promptState).options.message.includes("ends this attempt")&&report.kills===0);
+        completePrompt(false);await pause(150);
+        check("Declining there stops nothing",report.kills===0);
+        document.querySelector('[aria-label="All terminal sessions"]').click();await pause(50);
+      }
       check("A launched attempt folds its form away and keeps the run in view",launchForm().hidden&&toggleLabel()==="New attempt"&&formToggle().getAttribute("aria-expanded")==="false");
       await openLaunchForm();
       check("An ordinary permission mode survives its launch",field("Permission mode").value==="ask");

@@ -15,7 +15,24 @@ export interface TerminalSessionRecord {
    * `key` is a renderer invention the backend has never seen.
    */
   sessionId?: string;
+  /**
+   * What the session is about, when it is about something: the task title of
+   * an attempt's terminal or a resumed conversation. "Claude" alone does not
+   * say which of three Claude sessions is the one waiting on you.
+   */
+  title?: string;
+  /** Set when the process is a task attempt's, which a close ends for good. */
+  taskRunId?: string;
+  /** Stops the process without asking; the tab stays, showing that it ended. */
   close: () => Promise<void>;
+  /**
+   * Asks the panel's question — the one the tab's × asks — and resolves to
+   * whether to go ahead: true at once when closing would interrupt nothing,
+   * otherwise the person's answer. The Sessions list asks this before
+   * `close`, so stopping a working agent from there is never silent. Absent
+   * only for a record whose panel wired none.
+   */
+  confirmClose?: () => Promise<boolean>;
   /**
    * Brings this session on screen inside its own panel: selects its tab in
    * that repository's strip and focuses the terminal.

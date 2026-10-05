@@ -395,25 +395,51 @@
     return true;
   }
 
+  /** The Sessions list's close: the panel's question first, then stop the process. */
+  async function closeListed(session: TerminalSessionRecord) {
+    try {
+      if (await (session.confirmClose?.() ?? true)) await session.close();
+    } catch (error: unknown) {
+      validationError = formatError(error);
+    }
+  }
+
   /** Ids with a close question already on screen, so a second press does not ask twice. */
   const closing = new Set<string>();
 
   /**
-   * Close, asking first when a job is running in the foreground. A terminal
-   * whose foreground cannot be read closes as it always has: an unknown is
-   * not a reason to interrupt.
+   * Close, asking first when a job is running in the foreground or the tab's
+   * own process is a running agent (see `closeQuestion`). A shell whose
+   * foreground cannot be read closes as it always has: an unknown is not a
+   * reason to interrupt.
+   *
+   * The tab's × and the chord come through here; the Sessions list asks the
+   * same question through the registry's `confirmClose`, so a session in
+   * another repository's dock asks too.
    */
   async function requestClose(id: string) {
-    const tab = tabState.tabs.find((candidate) => candidate.id === id);
-    if (!tab || closing.has(id)) return;
+    if (closing.has(id)) return;
     closing.add(id);
     try {
-      const question = closeQuestion((await sessions[id]?.readContext()) ?? null, tabLabel(tab));
-      if (question && !(await askConfirm({ ...question, confirmLabel: "Close", destructive: true }))) return;
+      if (!(await confirmClose(id))) return;
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
     } finally {
       closing.delete(id);
     }
+  }
+
+  /** Whether closing this tab may go ahead: asked when it would interrupt something. */
+  async function confirmClose(id: string): Promise<boolean> {
+    const tab = tabState.tabs.find((candidate) => candidate.id === id);
+    if (!tab) return false;
+    const status = tabStatuses[id];
+    const agent = tab.launcher === "shell" ? null : {
+      name: launcherLabel(tab.launcher),
+      running: status === "starting" || status === "running",
+      taskAttempt: Boolean(tab.taskRunId),
+    };
+    const question = closeQuestion((await sessions[id]?.readContext()) ?? null, tabLabel(tab), agent);
+    return !question || (await askConfirm({ ...question, confirmLabel: "Close", destructive: true }));
   }
 
   $effect(() => {
@@ -817,7 +843,7 @@
       {#each filteredSessions as session (session.key)}
         <div class="flex gap-2 items-center py-0.5">
           <span class="flex-1 min-w-0 truncate" title={session.repoPath}>
-            {session.repoPath.split(/[\\/]/).pop()} · {session.label} · {session.status}
+            {session.repoPath.split(/[\\/]/).pop()} · {session.title ? `${session.title} — ${session.label}` : session.label}{session.taskRunId ? " · task attempt" : ""} · {session.status}
             {#if session.repoPath !== repoPath}<span class="text-textMuted"> · other repository</span>{/if}
           </span>
           <!-- The list has always been able to NAME every shell across every
@@ -832,7 +858,7 @@
               : "This session's panel is not mounted, so it cannot be shown"}
             onclick={() => void goToSession(session)}
           >Go to</button>
-          <button type="button" class="gp-btn py-0!" onclick={() => session.close().catch((error: unknown) => (validationError = formatError(error)))}>Close session</button>
+          <button type="button" class="gp-btn py-0!" onclick={() => void closeListed(session)}>Close session</button>
         </div>
       {:else}
         <span>{$terminalSessions.length ? "No sessions match." : "No active processes."}</span>
@@ -1063,6 +1089,8 @@
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
               revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => sessions[tab.id]?.reveal()); }}
+              confirmCloseSelf={() => confirmClose(tab.id)}
+              title={tab.name}
               onStatus={(status) => { tabStatuses = { ...tabStatuses, [tab.id]: status }; terminalLaunchRequests.update(tab.id, status); }}
               onActivity={() => { if (paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
