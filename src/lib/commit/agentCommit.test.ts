@@ -95,20 +95,20 @@ describe("agentCommit", () => {
   describe("getAgentCommitCliCommand", () => {
     it("generates correct CLI invocation for Antigravity (agy)", () => {
       const cmd = getAgentCommitCliCommand("agy", "Commit these changes", "/path/to/repo");
-      expect(cmd).toBe('cd "/path/to/repo" && agy --prompt-interactive "Commit these changes"');
+      expect(cmd).toBe("cd '/path/to/repo' && agy --prompt-interactive 'Commit these changes'");
     });
 
     it("generates correct CLI invocation for Claude Code (claude)", () => {
       const cmd = getAgentCommitCliCommand("claude", "Commit these changes", "/path/to/repo");
-      expect(cmd).toBe('cd "/path/to/repo" && claude -- "Commit these changes"');
+      expect(cmd).toBe("cd '/path/to/repo' && claude -- 'Commit these changes'");
     });
 
     it("handles command generation without repoPath", () => {
       const cmdAgy = getAgentCommitCliCommand("agy", "Prompt text");
-      expect(cmdAgy).toBe('agy --prompt-interactive "Prompt text"');
+      expect(cmdAgy).toBe("agy --prompt-interactive 'Prompt text'");
 
       const cmdClaude = getAgentCommitCliCommand("claude", "Prompt text");
-      expect(cmdClaude).toBe('claude -- "Prompt text"');
+      expect(cmdClaude).toBe("claude -- 'Prompt text'");
     });
   });
 

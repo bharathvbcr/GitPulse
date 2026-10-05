@@ -610,6 +610,105 @@ pub(crate) fn preserve_metadata(source: &std::fs::File, target: &std::fs::File) 
     Ok(())
 }
 
+/// Why [`read_bounded_nofollow`] refused a file.
+#[derive(Debug)]
+pub(crate) enum BoundedRead {
+    /// Opening or reading failed; a symlink in the final component lands here.
+    Io(io::Error),
+    /// A directory, FIFO, socket or device — never opened for a blocking read.
+    NotRegular,
+    /// Larger than the cap when opened.
+    TooLarge,
+    /// Within the cap when opened, past it by the time it was read.
+    Grew,
+}
+
+/// Read a regular file of at most `cap` bytes without following a symlink.
+///
+/// The open is non-blocking, so a FIFO substituted for the file cannot park
+/// the caller, and the descriptor's own metadata decides "regular file" — not
+/// a path check that a rename could invalidate before the open.
+pub(crate) fn read_bounded_nofollow(path: &Path, cap: usize) -> Result<Vec<u8>, BoundedRead> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(BoundedRead::Io)?;
+    let meta = file.metadata().map_err(BoundedRead::Io)?;
+    if !meta.is_file() {
+        return Err(BoundedRead::NotRegular);
+    }
+    if meta.len() > cap as u64 {
+        return Err(BoundedRead::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BoundedRead::Io)?;
+    if bytes.len() > cap {
+        return Err(BoundedRead::Grew);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    use super::{read_bounded_nofollow, BoundedRead};
+
+    #[test]
+    fn reads_a_file_at_the_cap_and_refuses_one_byte_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_bounded_nofollow(&path, 4).unwrap(), b"abcd");
+        assert!(matches!(
+            read_bounded_nofollow(&path, 3),
+            Err(BoundedRead::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn refuses_directories_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_bounded_nofollow(dir.path(), 10),
+            Err(BoundedRead::NotRegular)
+        ));
+        assert!(matches!(
+            read_bounded_nofollow(&dir.path().join("absent"), 10),
+            Err(BoundedRead::Io(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlink_and_never_blocks_on_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"secret").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            read_bounded_nofollow(&link, 100),
+            Err(BoundedRead::Io(_))
+        ));
+
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a plain mode.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // No writer is attached: a blocking open would hang this test forever.
+        assert!(matches!(
+            read_bounded_nofollow(&fifo, 100),
+            Err(BoundedRead::NotRegular)
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::rename_noreplace;

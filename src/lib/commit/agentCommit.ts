@@ -101,11 +101,24 @@ export function getAgentCommitCliCommand(
   prompt: string,
   repoPath?: string,
 ): string {
-  const safeDir = repoPath ? `cd ${JSON.stringify(repoPath)} && ` : "";
+  const safeDir = repoPath ? `cd ${posixShellQuote(repoPath)} && ` : "";
   if (launcher === "agy") {
-    return `${safeDir}agy --prompt-interactive ${JSON.stringify(prompt)}`;
+    return `${safeDir}agy --prompt-interactive ${posixShellQuote(prompt)}`;
   }
-  return `${safeDir}claude -- ${JSON.stringify(prompt)}`;
+  return `${safeDir}claude -- ${posixShellQuote(prompt)}`;
+}
+
+/**
+ * Quote one argument for a POSIX shell (sh, bash, zsh).
+ *
+ * Single quotes are the only form in which the shell expands nothing, so a
+ * file name or note carrying `$(...)`, backticks or `"` stays data. A single
+ * quote itself cannot appear inside them and is spelled `'\''` — close, an
+ * escaped quote, reopen. `JSON.stringify` is not a substitute: its double
+ * quotes leave command substitution live.
+ */
+function posixShellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 /**

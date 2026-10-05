@@ -83,6 +83,129 @@ async function clickPreview(name,selector,repo=root,staged=true){
  check(`${name}: shared file rail`,!!preview.querySelector('[aria-label="Files in this diff"]')&&preview.textContent.includes("shared.ts")&&preview.textContent.includes("notes.md"));
  check(`${name}: actual modifications`,preview.textContent.includes(`${repo} ${staged?"staged":"unstaged"} modification`)&&!preview.textContent.includes("old commit content"));
 }
+/*
+ * Ask Agent to Commit. The panel used to be an `absolute` child of its trigger,
+ * so the sidebar scroller, the 48px collapsed rail and this page's own 260px
+ * `overflow:auto` surface all cut it off. Visibility is judged by hit-testing
+ * the panel's corners (`elementFromPoint` ignores clipped paint), not by its
+ * rect, which reports the full box even where nothing is drawn.
+ */
+const agentTriggers=()=>[...document.querySelectorAll("[data-agent-commit-menu]")].map(wrapper=>({uid:wrapper.dataset.agentCommitMenu,trigger:wrapper.querySelector("button")})).filter(entry=>entry.trigger&&!entry.trigger.disabled);
+const agentPanel=uid=>document.querySelector(`[data-agent-commit-panel="${uid}"]`);
+const agentPanels=()=>document.querySelectorAll("[data-agent-commit-panel]").length;
+const pointerDown=node=>node.dispatchEvent(new PointerEvent("pointerdown",{bubbles:true,cancelable:true,pointerId:1,pointerType:"mouse"}));
+const agentDiagnostics=[];
+/** Probes sit 14px in: hit-testing honours the 12px corner radius. */
+function paintedWhole(panel){
+ const r=panel.getBoundingClientRect(),inset=14;
+ const points=[[r.left+inset,r.top+inset],[r.right-inset,r.top+inset],[r.left+inset,r.bottom-inset],[r.right-inset,r.bottom-inset],[(r.left+r.right)/2,(r.top+r.bottom)/2]];
+ const missed=points.filter(([x,y])=>{const hit=document.elementFromPoint(x,y);return !hit||!panel.contains(hit);});
+ if(missed.length)agentDiagnostics.push({panel:[r.left,r.top,r.width,r.height],viewport:[innerWidth,innerHeight],missed:missed.map(([x,y])=>{const hit=document.elementFromPoint(x,y);return {x,y,hit:hit?hit.tagName+'.'+String(hit.className).slice(0,60):null};})});
+ return missed.length===0;
+}
+/** The entrance is a scale animation; geometry is only final once it ends. */
+async function settled(panel){await Promise.all(panel.getAnimations({subtree:true}).map(a=>a.finished.catch(()=>{})));await frames();}
+function insideWindow(panel){const r=panel.getBoundingClientRect();return r.left>=0&&r.top>=0&&r.right<=innerWidth+0.5&&r.bottom<=innerHeight+0.5;}
+/** Overlap is a defect only when either side of the trigger could hold the panel. */
+function coversTrigger(panel,trigger){
+ const p=panel.getBoundingClientRect(),t=trigger.getBoundingClientRect();
+ const roomy=t.bottom+6+p.height<=innerHeight-8||t.top-6-p.height>=8;
+ return roomy&&p.top<t.bottom&&p.bottom>t.top&&p.left<t.right&&p.right>t.left;
+}
+async function frames(n=2){for(let i=0;i<n;i++)await step();await tick();}
+/** Idempotent: the section remembers being open across a close and reopen. */
+async function expandDetails(panel){
+ const toggle=[...panel.querySelectorAll("button")].find(b=>b.textContent.includes("CLI & Developer SDK"));
+ if(toggle.getAttribute("aria-expanded")!=="true")toggle.click();
+ await until(()=>panel.querySelector("pre"),"agent commit details");await frames(3);
+}
+async function openAgentMenu(entry){
+ if(!agentPanel(entry.uid))entry.trigger.click();
+ await until(()=>agentPanel(entry.uid),`agent commit panel ${entry.uid}`);await frames();
+ await settled(agentPanel(entry.uid));
+ return agentPanel(entry.uid);
+}
+async function closeAgentMenu(entry){
+ if(!agentPanel(entry.uid))return;
+ window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));
+ await until(()=>!agentPanel(entry.uid),`agent commit panel ${entry.uid} closes`);await frames();
+}
+async function placementChecks(site,{rail=null}={}){
+ const entries=agentTriggers();
+ check(`${site}: Ask Agent triggers are mounted`,entries.length>0);
+ check(`${site}: every mount carries its own instance id`,new Set(entries.map(e=>e.uid)).size===entries.length);
+ for(const entry of entries){
+  entry.trigger.scrollIntoView({block:"center",inline:"nearest"});await frames();
+  const panel=await openAgentMenu(entry);
+  const label=`${site} ${entry.uid}`;
+  check(`${label}: panel escapes its clipping pane into <body>`,panel.parentElement===document.body&&getComputedStyle(panel).position==="fixed");
+  check(`${label}: panel sits inside the window`,insideWindow(panel));
+  check(`${label}: every corner of the panel is painted, none clipped`,paintedWhole(panel));
+  check(`${label}: panel keeps its full width`,panel.getBoundingClientRect().width>=Math.min(320,innerWidth-16)-1);
+  check(`${label}: panel does not cover its own trigger`,!coversTrigger(panel,entry.trigger));
+  if(rail)check(`${label}: panel is wider than the rail that used to clip it`,panel.getBoundingClientRect().width>rail.getBoundingClientRect().width*2);
+  check(`${label}: focus moves into the panel`,panel.contains(document.activeElement)&&document.activeElement.tagName==="INPUT");
+  const note=panel.querySelector("input");
+  check(`${label}: note field has a unique id its label resolves`,!!note?.id&&document.querySelectorAll(`#${CSS.escape(note.id)}`).length===1&&panel.querySelector(`label[for="${CSS.escape(note.id)}"]`)!==null);
+  await expandDetails(panel);
+  check(`${label}: expanded panel is re-placed inside the window`,insideWindow(panel)&&paintedWhole(panel));
+  check(`${label}: expanded panel still clears its trigger`,!coversTrigger(panel,entry.trigger));
+  await closeAgentMenu(entry);
+  await new Promise(resolve=>setTimeout(resolve,0));
+  check(`${label}: Escape returns focus to the trigger`,document.activeElement===entry.trigger);
+ }
+ return entries;
+}
+async function agentCommitMenuChecks(){
+ files=[status("src/shared.ts",true),status("src/shared.ts"),status("notes.md",false,"??")];
+ await repoStore.openRepo(root);await repoStore.refresh();await repoStore.previewUncommitted();
+ await until(()=>!get(repoStore).selectedDiffPending&&get(repoStore).selectedCommitId===null,"uncommitted preview for agent menu");
+ await show("Sidebar");await frames();
+ const expanded=await placementChecks("expanded sidebar + diff toolbar");
+ check("expanded: sidebar header, commit composer and diff toolbar all mount the menu",expanded.length>=3);
+
+ // A second instance's trigger is OUTSIDE the first one's panel.
+ const [first,second]=expanded;
+ await openAgentMenu(first);
+ pointerDown(second.trigger);second.trigger.click();
+ await until(()=>agentPanel(second.uid),"second agent panel");await frames();
+ check("opening another mount's menu closes the first",!agentPanel(first.uid)&&agentPanels()===1);
+ await closeAgentMenu(second);
+
+ // Scope is the user's pick; a background status refresh must not reset it.
+ const panel=await openAgentMenu(first);
+ const scopeButton=label=>[...panel.querySelectorAll("button")].find(b=>b.textContent.trim().startsWith(label));
+ check("partially staged changes default to the staged scope",scopeButton("Staged")?.getAttribute("aria-pressed")==="true");
+ scopeButton("All changes").click();await frames();
+ files=[...files,status("extra.ts",false,"??")];await repoStore.refresh();await frames(3);
+ check("a status refresh keeps the user's scope choice",!!agentPanel(first.uid)&&scopeButton("All changes")?.getAttribute("aria-pressed")==="true"&&scopeButton("All changes").textContent.includes("(4)"));
+ await expandDetails(panel);
+ [...panel.querySelectorAll("button")].find(b=>b.textContent.trim()==="CLI Command").click();await frames();
+ const cli=panel.querySelector("pre").textContent;
+ check("the copy-paste command single-quotes the repository and prompt",cli.startsWith(`cd '${root}' && agy --prompt-interactive '`)&&cli.endsWith("'")&&!cli.includes(`cd "${root}"`));
+ await closeAgentMenu(first);
+
+ // Stress: rapid toggles across every mount leave exactly the panels that are open and no listeners behind.
+ const added=new Map();let net=0;
+ const add=window.addEventListener,remove=window.removeEventListener;
+ window.addEventListener=function(type,handler,options){const key=handler;if(!added.has(key)){added.set(key,1);net++;}return add.call(this,type,handler,options);};
+ window.removeEventListener=function(type,handler,options){if(added.delete(handler))net--;return remove.call(this,type,handler,options);};
+ try{
+  for(let i=0;i<60;i++){const entry=expanded[i%expanded.length];pointerDown(entry.trigger);entry.trigger.click();if(i%7===0)await tick();}
+  await frames();
+  check("rapid toggling never stacks panels",agentPanels()<=1);
+  for(const entry of expanded)await closeAgentMenu(entry);
+  await frames();
+  check("rapid toggling leaks no panel",agentPanels()===0);
+  check("rapid toggling leaks no window listener",net===0);
+ }finally{window.addEventListener=add;window.removeEventListener=remove;}
+
+ layoutStore.toggleCollapsed();await show("Sidebar");await frames();
+ const rail=surface.querySelector("aside")??surface.firstElementChild;
+ try{await placementChecks("collapsed rail",{rail});}
+ finally{layoutStore.toggleCollapsed();}
+ files=[status("src/shared.ts",true),status("src/shared.ts"),status("notes.md",false,"??")];await repoStore.refresh();
+}
 async function run(){
  document.getElementById("run").disabled=true;
  try{
@@ -200,10 +323,11 @@ async function run(){
    await until(()=>get(repoStore).error?.includes("Fixture revocation denied"),"visible revocation failure");
    check("failed revocation preserves the repository tab",get(repoStore).openTabs.some(tab=>tab.path===root));
   }finally{cancelPrompt();await unmount(prompt);promptTarget.remove();}
+  await agentCommitMenuChecks();
   check("No unexpected commands",unexpected.length===0);
   check("No runtime errors",crashes.length===0);
  }catch(error){results.push({name:String(error),pass:false});}
- const result={results,crashes,unexpected};window.__gpResult=result;
+ const result={results,crashes,unexpected,agentDiagnostics};window.__gpResult=result;
  const encoded=encodeURIComponent(JSON.stringify(result));document.documentElement.dataset.gpResult=encoded;
  document.getElementById("result").textContent=`${results.filter(r=>r.pass).length}/${results.length} checks passed`;
  document.getElementById("results").textContent=results.map(r=>`${r.pass?"PASS":"FAIL"} ${r.name}`).join("\n")+"\n"+JSON.stringify({crashes,unexpected});

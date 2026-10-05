@@ -364,6 +364,113 @@ describe("popover placement", () => {
     handle.destroy();
   });
 
+  it("lines an end-aligned panel up with its trigger's right edge", () => {
+    // A trigger at the right of a narrow pane: opening flush-left would push
+    // the panel across the neighbouring pane instead of under its own button.
+    fakeWindow({ width: 1000, height: 800 });
+    const node = fakeNode({ width: 320, height: 200 });
+    const handle = popover(node, {
+      anchor: {
+        kind: "element",
+        element: anchorElement({ left: 240, right: 300, top: 40, bottom: 60 }),
+        gap: 6,
+        align: "end",
+      },
+    });
+    expect(node.style).toEqual({ left: "0px", top: "66px" });
+    handle.destroy();
+
+    const wide = fakeNode({ width: 120, height: 200 });
+    const fits = popover(wide, {
+      anchor: {
+        kind: "element",
+        element: anchorElement({ left: 240, right: 300, top: 40, bottom: 60 }),
+        gap: 6,
+        align: "end",
+      },
+    });
+    expect(wide.style).toEqual({ left: "180px", top: "66px" });
+    fits.destroy();
+  });
+
+  it("falls back to the left edge when an end anchor reports no right edge", () => {
+    fakeWindow();
+    const node = fakeNode({ width: 100, height: 50 });
+    const handle = popover(node, {
+      anchor: { kind: "element", element: anchorElement({ left: 40, top: 8, bottom: 30 }), gap: 6, align: "end" },
+    });
+    expect(node.style).toEqual({ left: "40px", top: "36px" });
+    handle.destroy();
+  });
+
+  it("flips a below panel above its trigger when only the room above holds it", () => {
+    // A trigger in the bottom dock: clamping alone would slide the panel up
+    // over the very button that opened it.
+    fakeWindow({ width: 1000, height: 800 });
+    const node = fakeNode({ width: 200, height: 300 });
+    const handle = popover(node, {
+      anchor: { kind: "element", element: anchorElement({ left: 40, top: 700, bottom: 724 }), gap: 6 },
+      inset: 8,
+    });
+    expect(node.style).toEqual({ left: "40px", top: "394px" });
+    handle.destroy();
+  });
+
+  it("flips an above panel below its trigger when only the room below holds it", () => {
+    fakeWindow({ width: 1000, height: 800 });
+    const node = fakeNode({ width: 200, height: 300 });
+    const handle = popover(node, {
+      anchor: {
+        kind: "element",
+        element: anchorElement({ left: 40, top: 60, bottom: 84 }),
+        gap: 6,
+        place: "above",
+      },
+      inset: 8,
+    });
+    expect(node.style).toEqual({ left: "40px", top: "90px" });
+    handle.destroy();
+  });
+
+  it("keeps the asked-for side and clamps when neither side holds the panel", () => {
+    fakeWindow({ width: 1000, height: 400 });
+    const node = fakeNode({ width: 200, height: 300 });
+    const handle = popover(node, {
+      anchor: { kind: "element", element: anchorElement({ left: 40, top: 180, bottom: 204 }), gap: 6 },
+      inset: 8,
+    });
+    // Below was asked for and does not fit; above does not fit either. The
+    // clamp keeps it on screen rather than flipping to an equally bad side.
+    expect(node.style).toEqual({ left: "40px", top: "92px" });
+    handle.destroy();
+  });
+
+  it("never overlaps a trigger that has room on either side", () => {
+    // Exhaustive sweep of trigger positions down a window: whenever either
+    // side can hold the panel, the panel must not cover the trigger.
+    const height = 600;
+    fakeWindow({ width: 800, height });
+    for (const place of ["below", "above"] as const) {
+      for (let top = 0; top <= height - 24; top += 7) {
+        const rect = { left: 100, right: 160, top, bottom: top + 24 };
+        const node = fakeNode({ width: 240, height: 250 });
+        const handle = popover(node, {
+          anchor: { kind: "element", element: anchorElement(rect), gap: 6, place },
+          inset: 8,
+        });
+        const y = Number.parseFloat(node.style.top);
+        expect(y).toBeGreaterThanOrEqual(8);
+        expect(y + 250).toBeLessThanOrEqual(height - 8 + 1e-9);
+        const roomy = rect.bottom + 6 + 250 <= height - 8 || rect.top - 6 - 250 >= 8;
+        if (roomy) {
+          const overlaps = y < rect.bottom && y + 250 > rect.top;
+          expect(overlaps, `${place} trigger at ${top}`).toBe(false);
+        }
+        handle.destroy();
+      }
+    }
+  });
+
   it("waits for an element anchor rather than placing against nothing", () => {
     fakeWindow();
     const node = fakeNode();

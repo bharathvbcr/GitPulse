@@ -5,11 +5,13 @@
 use dc_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, State};
 
+pub(crate) mod external_changes;
+pub(crate) mod intake;
 mod managed_run;
 pub(crate) mod notifications;
 mod process_birth;
@@ -32,7 +34,7 @@ pub struct WorkbenchError {
 }
 
 impl WorkbenchError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -87,14 +89,7 @@ impl WorkbenchState {
     fn profile_path(&self) -> Result<PathBuf, WorkbenchError> {
         let path = match &self.0.path {
             Some(path) => path.clone(),
-            None => crate::tool_config::default_config_dir()
-                .ok_or_else(|| {
-                    WorkbenchError::new(
-                        "store_error",
-                        "Cannot resolve the GitPulse profile directory.",
-                    )
-                })?
-                .join("workbench.sqlite"),
+            None => intake::default_profile_path()?,
         };
         if !path.is_absolute() {
             return Err(WorkbenchError::new(
@@ -344,43 +339,31 @@ impl WorkbenchState {
         request_id: &str,
     ) -> Result<Value, WorkbenchError> {
         self.check_open()?;
-        let resolved = crate::engine::git_cli::resolve_repo(repo_path)
-            .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
-        let common = crate::engine::git_cli::resolve_git_common_dir(Path::new(&resolved.path))
-            .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
-        let identity = format!(
-            "local:{}",
-            common.to_str().ok_or_else(|| WorkbenchError::new(
-                "invalid_input",
-                "Repository path is not valid Unicode."
-            ))?
-        );
-        self.with_store(|store| {
-            let mut cursor: Option<String> = None;
-            let mut pages = 0;
-            loop {
-                pages += 1;
-                if pages > 50 {
-                    return Err(WorkbenchError::new("registry_limit", "Repository registration requires an indexed identity lookup beyond 10,000 repositories."));
-                }
-                let mut input = json!({"limit":200});
-                if let Some(cursor) = &cursor { input["cursor"] = json!(cursor); }
-                let page = query(store, "repositories.list", &input.to_string())?;
-                let records = page["items"].as_array().ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid repository page."))?;
-                if let Some(repository) = records.iter().find(|r| r["identity_key"].as_str() == Some(&identity)) {
-                    return Ok(json!({"repository":repository,"path":resolved.path,"is_bare":resolved.is_bare}));
-                }
-                if page["has_more"] != true { break; }
-                let next = page["next_cursor"].as_str().ok_or_else(|| WorkbenchError::new("protocol_error", "Missing repository cursor."))?;
-                if cursor.as_deref() == Some(next) {
-                    return Err(WorkbenchError::new("protocol_error", "Repository cursor did not advance."));
-                }
-                cursor = Some(next.into());
-            }
-            let input = json!({"id":id,"request_id":request_id,"expected_revision":0,"name":resolved.name,"identity_key":identity});
-            let response = query(store, "repositories.put", &input.to_string())?;
-            Ok(json!({"repository":response["item"],"path":resolved.path,"is_bare":resolved.is_bare,"sequence":response["sequence"]}))
-        })
+        let local = intake::resolve(repo_path)?;
+        self.with_store(|store| intake::register(store, &local, id, request_id))
+    }
+}
+
+/// The board's own read path, for tests in other modules that must prove a
+/// task reached what the board renders rather than merely that a write passed.
+#[cfg(test)]
+impl WorkbenchState {
+    pub(crate) fn for_profile(path: &std::path::Path) -> Self {
+        Self(Arc::new(Inner {
+            path: Some(path.to_path_buf()),
+            ..Inner::default()
+        }))
+    }
+    pub(crate) fn board_register(
+        &self,
+        repo_path: &str,
+        id: &str,
+        request_id: &str,
+    ) -> Result<Value, WorkbenchError> {
+        self.register(repo_path, id, request_id)
+    }
+    pub(crate) fn board_request(&self, method: &str, input: &str) -> Result<Value, WorkbenchError> {
+        self.request(method, input)
     }
 }
 

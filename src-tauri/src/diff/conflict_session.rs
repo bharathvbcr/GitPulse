@@ -9,7 +9,7 @@ use crate::engine::git_cli::{
 use crate::engine::git_writer::repo_mutation_lock;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,32 +69,16 @@ pub(super) struct Worktree {
 }
 
 fn bounded_read(path: &Path, cap: usize) -> Result<Vec<u8>, String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file() || meta.len() > cap as u64 {
-        return Err(format!(
+    use crate::fs_entry::BoundedRead;
+    crate::fs_entry::read_bounded_nofollow(path, cap).map_err(|error| match error {
+        BoundedRead::Io(e) => format!("Cannot read {}: {e}", path.display()),
+        BoundedRead::NotRegular | BoundedRead::TooLarge => format!(
             "{} is not a regular file within the {} MiB limit",
             path.display(),
             cap / 1024 / 1024
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > cap {
-        return Err("File grew beyond the resolution size limit; reload".into());
-    }
-    Ok(bytes)
+        ),
+        BoundedRead::Grew => "File grew beyond the resolution size limit; reload".into(),
+    })
 }
 
 /// Reject metadata paths and symlink ancestors, even links back into the repo.

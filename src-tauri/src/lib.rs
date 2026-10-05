@@ -130,6 +130,9 @@ pub fn run() {
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());
             workbench::notifications::install(app.handle());
+            // Tasks other processes file (an agent over MCP) reach the board
+            // without waiting for the window to lose and regain focus.
+            workbench::external_changes::install(app.handle());
             // Session notifications share the notification centre installed
             // above, so they start after it — but unconditionally, because a
             // centre that failed to install is a fault the status readout has

@@ -1,1781 +1,1202 @@
-//! File-based tasks and GitPulse task format engine.
+//! Reader for Markdown task briefs kept in a repository's `tasks/` folder.
 //!
-//! Provides creation, parsing, formatting, listing, and inspection of
-//! tasks in a repository's `tasks` folder following the GitPulse tasks format
-//! (Markdown Task Brief v1 with YAML frontmatter).
+//! A brief is interchange, not storage. The task board renders workbench
+//! items, and [`crate::workbench::intake`] is the one path that turns a brief
+//! into one; this module only reads. It used to write briefs too, and an agent
+//! following that path produced files no GitPulse surface ever displayed.
 //!
-//! Every task creation or modification is policy-gated via
-//! [`crate::harness::guard_file`] and recorded to the durable ledger.
+//! Two input shapes are accepted, because both exist in the wild:
+//!
+//! * YAML frontmatter (`---` … `---`) followed by a `# Task brief v1` body —
+//!   what agents and the earlier writer produce;
+//! * the body alone — what **Copy saved brief** puts on the clipboard, and
+//!   what someone writes by hand.
+//!
+//! # Frontmatter wins; the body only fills gaps
+//!
+//! A brief commonly states its metadata twice, once in each half. When they
+//! disagree the frontmatter is what a person edits, so it is what counts; the
+//! body supplies only the fields the frontmatter left out.
+//!
+//! # A file that cannot be read is reported, never dropped
+//!
+//! [`scan_briefs`] returns one entry per candidate file with either a brief or
+//! a reason. Silently skipping a malformed file is how a task goes missing with
+//! nothing to say why — the same symptom as a task that was never written.
 
-use std::fs;
-use std::io::Write as _;
+use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use serde::{Deserialize, Serialize};
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Maximum allowed length of a task title.
-pub const MAX_TASK_TITLE: usize = 1_200;
-/// Maximum allowed length of a task description.
-pub const MAX_TASK_DESCRIPTION: usize = 65_536;
-/// Maximum allowed length of a task ID.
-pub const MAX_TASK_ID: usize = 128;
-/// Maximum allowed length of a task directory path.
-pub const MAX_TASKS_DIR: usize = 256;
-/// Maximum allowed labels per task.
-pub const MAX_TASK_LABELS: usize = 64;
-/// Maximum allowed planned files per task.
-pub const MAX_TASK_PLANNED_FILES: usize = 128;
-/// Maximum allowed acceptance criteria per task.
-pub const MAX_TASK_CRITERIA: usize = 128;
-/// Maximum allowed repositories per task.
-pub const MAX_TASK_REPOSITORIES: usize = 64;
-/// Maximum task listing limit.
-pub const MAX_LIST_LIMIT: usize = 500;
-/// Default task listing limit.
-pub const DEFAULT_LIST_LIMIT: usize = 50;
-/// Default tasks directory relative to repository root.
+/// Default tasks directory relative to the repository root.
 pub const DEFAULT_TASKS_DIR: &str = "tasks";
-/// Maximum raw logs payload in bytes (256 KiB).
+/// Longest accepted tasks directory, in bytes.
+pub const MAX_TASKS_DIR: usize = 256;
+/// Largest brief file read, in bytes.
+pub const MAX_BRIEF_BYTES: usize = 1024 * 1024;
+/// Most candidate files one scan parses; the rest are counted, not read.
+pub const MAX_BRIEF_FILES: usize = 500;
+/// Longest task key, in bytes. Matches the workbench identifier bound.
+pub const MAX_TASK_KEY: usize = 96;
+/// Longest title, in characters. The board refuses anything longer.
+pub const MAX_TASK_TITLE: usize = 300;
+/// Longest description, in bytes, before planned files are folded in.
+pub const MAX_TASK_DESCRIPTION: usize = 65_536;
+/// Longest raw log, in bytes.
 pub const MAX_TASK_LOGS: usize = 256 * 1024;
+/// Label bounds: count, and bytes per label.
+pub const MAX_TASK_LABELS: usize = 64;
+pub const MAX_LABEL_BYTES: usize = 128;
+/// Acceptance-criteria bounds: count, and bytes per item.
+pub const MAX_TASK_CRITERIA: usize = 128;
+pub const MAX_CRITERION_BYTES: usize = 4096;
+/// Planned-file bounds: count, and bytes per path.
+pub const MAX_TASK_PLANNED_FILES: usize = 256;
+pub const MAX_PLANNED_FILE_BYTES: usize = 4096;
+/// Linked-repository bounds: count, and bytes per name.
+pub const MAX_TASK_REPOSITORIES: usize = 64;
+pub const MAX_REPOSITORY_BYTES: usize = 300;
+/// Longest owner and kind, in bytes. Workbench bounds.
+pub const MAX_OWNER_BYTES: usize = 300;
+pub const MAX_KIND_BYTES: usize = 64;
 
-/// Structured task details in the GitPulse task format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TaskFileDetails {
-    pub id: String,
+/// The statuses the board has columns for.
+pub const STATUSES: [&str; 6] = ["inbox", "backlog", "ready", "in_progress", "review", "done"];
+/// The severities the board accepts. `none` is the absence of one.
+pub const SEVERITIES: [&str; 4] = ["low", "medium", "high", "critical"];
+
+/// One parsed brief. `None` means the brief did not say, not a default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TaskBrief {
+    /// The stable key a brief names itself by (`id:` or `Task:`).
+    pub key: Option<String>,
     pub title: String,
-    pub status: String,
-    pub priority: u32,
-    pub severity: String,
-    pub kind: String,
-    pub owner: String,
-    pub due: String,
+    pub status: Option<String>,
+    pub priority: Option<u8>,
+    pub severity: Option<String>,
+    pub kind: Option<String>,
+    pub owner: Option<String>,
+    /// As written; [`crate::workbench::intake`] decides what it means.
+    pub due: Option<String>,
     pub labels: Vec<String>,
     pub repositories: Vec<String>,
     pub planned_files: Vec<String>,
     pub acceptance_criteria: Vec<String>,
     pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub logs: Option<String>,
 }
 
-impl Default for TaskFileDetails {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            title: String::new(),
-            status: "inbox".to_string(),
-            priority: 2,
-            severity: "none".to_string(),
-            kind: "feature".to_string(),
-            owner: "unassigned".to_string(),
-            due: "none".to_string(),
-            labels: Vec::new(),
-            repositories: Vec::new(),
-            planned_files: Vec::new(),
-            acceptance_criteria: Vec::new(),
-            description: String::new(),
-            logs: None,
-        }
-    }
+/// One candidate file of a scan: a brief, or the reason there is none.
+#[derive(Debug, Clone, Serialize)]
+pub struct BriefFile {
+    /// Repository-relative path, `/`-separated.
+    pub file: String,
+    /// The key the task is known by: the brief's own, else the file name's.
+    pub key: Option<String>,
+    pub brief: Option<TaskBrief>,
+    pub error: Option<String>,
 }
 
-
-/// Request to create a new task file in GitPulse tasks format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewTaskRequest {
-    pub repo_path: String,
-    pub title: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub task_id: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub priority: Option<u32>,
-    #[serde(default)]
-    pub severity: Option<String>,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub owner: Option<String>,
-    #[serde(default)]
-    pub due: Option<String>,
-    #[serde(default)]
-    pub labels: Option<Vec<String>>,
-    #[serde(default)]
-    pub repositories: Option<Vec<String>>,
-    #[serde(default)]
-    pub planned_files: Option<Vec<String>>,
-    #[serde(default)]
-    pub acceptance_criteria: Option<Vec<String>>,
-    #[serde(default)]
-    pub logs: Option<String>,
-    #[serde(default)]
-    pub tasks_dir: Option<String>,
-    #[serde(default)]
-    pub overwrite: Option<bool>,
-}
-
-/// Summary of a task file for listings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TaskSummary {
-    pub id: String,
-    pub title: String,
-    pub status: String,
-    pub priority: u32,
-    pub priority_label: String,
-    pub severity: String,
-    pub kind: String,
-    pub owner: String,
-    pub due: String,
-    pub labels: Vec<String>,
-    pub file_path: String,
-    pub criteria_count: usize,
-    pub planned_files_count: usize,
-}
-
-/// Result of adding a task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskAddResult {
-    pub ok: bool,
-    pub task_id: String,
-    pub file_path: String,
-    pub absolute_path: String,
-    pub title: String,
-    pub status: String,
-    pub priority: u32,
-    pub content: String,
-    pub verdict: crate::harness::PolicyVerdict,
-}
-
-/// Result of listing tasks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskListResult {
-    pub ok: bool,
+/// Every candidate in a tasks directory, read or explained.
+#[derive(Debug, Clone, Serialize)]
+pub struct BriefScan {
     pub tasks_dir: String,
-    pub returned: usize,
-    pub total: usize,
+    /// False when the directory does not exist — which is not "zero tasks".
+    pub directory_exists: bool,
+    /// Candidate `.md` files present.
+    pub found: usize,
+    /// Of those, the ones this scan read (the first [`MAX_BRIEF_FILES`] by name).
+    pub read: usize,
     pub truncated: bool,
-    pub tasks: Vec<TaskSummary>,
+    pub files: Vec<BriefFile>,
 }
 
-/// Result of reading a single task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskGetResult {
-    pub ok: bool,
-    pub file_path: String,
-    pub task: TaskFileDetails,
-    pub content: String,
-}
-
-/// Human-readable priority label.
-pub fn priority_label(priority: u32) -> &'static str {
-    match priority {
-        0 => "Urgent",
-        1 => "High",
-        2 => "Normal",
-        3 => "Low",
-        _ => "Normal",
+/// Validate a task key: the identity a brief or an agent gives a task.
+pub fn validate_task_key(raw: &str) -> Result<String, String> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err("task key is empty".into());
     }
-}
-
-/// Validate and clean task title.
-pub fn validate_title(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("Task title cannot be empty".to_string());
+    if key.len() > MAX_TASK_KEY {
+        return Err(format!("task key exceeds {MAX_TASK_KEY} bytes"));
     }
-    if trimmed.chars().count() > MAX_TASK_TITLE {
+    if key.starts_with('.') || key.contains("..") {
         return Err(format!(
-            "Task title exceeds maximum length of {MAX_TASK_TITLE} characters (got {})",
-            trimmed.chars().count()
+            "task key {key:?} must not start with '.' or contain '..'"
         ));
     }
-    for ch in trimmed.chars() {
-        let code = ch as u32;
-        if (code < 32 && ch != '\t' && ch != '\n' && ch != '\r') || code == 127 {
-            return Err("Task title contains prohibited control characters".to_string());
-        }
-    }
-    Ok(trimmed.to_string())
-}
-
-/// Validate and clean description.
-pub fn validate_description(raw: Option<&str>) -> Result<String, String> {
-    let Some(text) = raw else {
-        return Ok(String::new());
-    };
-    if text.contains('\0') {
-        return Err("Task description contains NUL byte".to_string());
-    }
-    if text.chars().count() > MAX_TASK_DESCRIPTION {
+    if let Some(bad) = key
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
         return Err(format!(
-            "Task description exceeds maximum length of {MAX_TASK_DESCRIPTION} characters"
+            "task key {key:?} contains {bad:?}; use letters, digits, '-', '_' or '.'"
         ));
     }
-    Ok(text.to_string())
+    Ok(key.to_string())
 }
 
-/// Validate and clean optional raw logs.
-pub fn validate_logs(raw: Option<&str>) -> Result<Option<String>, String> {
-    let Some(text) = raw else {
-        return Ok(None);
-    };
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if trimmed.len() > MAX_TASK_LOGS {
-        return Err(format!(
-            "Task logs exceed maximum length of {MAX_TASK_LOGS} bytes"
-        ));
-    }
-    Ok(Some(trimmed.to_string()))
-}
-
-/// Validate and clean task ID.
-pub fn validate_task_id(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("Task ID cannot be empty".to_string());
-    }
-    if trimmed.len() > MAX_TASK_ID {
-        return Err(format!(
-            "Task ID exceeds maximum length of {MAX_TASK_ID} characters"
-        ));
-    }
-    if trimmed.contains("..") || trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
-        return Err("Task ID contains invalid path traversal characters".to_string());
-    }
-    for ch in trimmed.chars() {
-        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.' {
-            return Err(format!("Task ID contains invalid character: {ch:?}"));
-        }
-    }
-    Ok(trimmed.to_string())
-}
-
-/// Generate a URL-friendly slug from title.
-pub fn slugify_title(title: &str) -> String {
+/// A key derived from free text: lowercase ASCII words joined by `-`.
+pub fn slugify(text: &str) -> String {
     let mut slug = String::new();
-    let mut last_dash = false;
-    for ch in title.chars() {
+    for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
             slug.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
+        } else if !slug.ends_with('-') && !slug.is_empty() {
             slug.push('-');
-            last_dash = true;
         }
         if slug.len() >= 60 {
             break;
         }
     }
-    let trimmed = slug.trim_matches('-');
-    if trimmed.is_empty() {
-        "task".to_string()
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "task".into()
     } else {
-        trimmed.to_string()
+        slug.into()
     }
 }
 
-/// Normalize tasks status.
-pub fn normalize_status(raw: Option<&str>) -> Result<String, String> {
-    let Some(status) = raw else {
-        return Ok("inbox".to_string());
-    };
-    let clean = status.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-    match clean.as_str() {
-        "inbox" | "backlog" | "ready" | "in_progress" | "review" | "done" => Ok(clean),
+/// Validate a title against the board's rule: one line, at most 300 characters.
+pub fn validate_title(raw: &str) -> Result<String, String> {
+    let title = raw.trim();
+    if title.is_empty() {
+        return Err("title is empty".into());
+    }
+    if let Some(bad) = title.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "title contains control character {bad:?}; a title is one line"
+        ));
+    }
+    let count = title.chars().count();
+    if count > MAX_TASK_TITLE {
+        return Err(format!(
+            "title is {count} characters; the board allows {MAX_TASK_TITLE}"
+        ));
+    }
+    Ok(title.into())
+}
+
+/// Normalise a status (`In Progress`, `in-progress` → `in_progress`).
+pub fn normalize_status(raw: &str) -> Result<String, String> {
+    let status = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if STATUSES.contains(&status.as_str()) {
+        Ok(status)
+    } else {
+        Err(format!(
+            "unknown status {raw:?}; expected one of {}",
+            STATUSES.join(", ")
+        ))
+    }
+}
+
+/// Parse a priority: `0`–`3`, `p0`–`p3`, a word, or the brief form `1 (High)`.
+pub fn parse_priority(raw: &str) -> Result<u8, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let head = lower.split_whitespace().next().unwrap_or("");
+    let number = head.strip_prefix('p').unwrap_or(head);
+    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+        return match number.parse::<u8>() {
+            Ok(value) if value <= 3 => Ok(value),
+            _ => Err(format!(
+                "priority {raw:?} is out of range; use 0 (urgent) to 3 (low)"
+            )),
+        };
+    }
+    match lower.as_str() {
+        "urgent" => Ok(0),
+        "high" => Ok(1),
+        "normal" | "medium" => Ok(2),
+        "low" => Ok(3),
         _ => Err(format!(
-            "Invalid status '{clean}'. Must be one of: inbox, backlog, ready, in_progress, review, done"
+            "priority {raw:?} is not 0–3 or urgent/high/normal/low"
         )),
     }
 }
 
-/// Normalize priority (0..=3).
-pub fn normalize_priority(raw: Option<u32>) -> Result<u32, String> {
-    match raw {
-        None => Ok(2), // normal
-        Some(p) if p <= 3 => Ok(p),
-        Some(p) => Err(format!("Invalid priority {p}. Must be 0 (urgent), 1 (high), 2 (normal), or 3 (low)")),
+/// Parse a severity. `none` is the absence of one.
+pub fn parse_severity(raw: &str) -> Result<Option<String>, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower == "none" {
+        return Ok(None);
+    }
+    if SEVERITIES.contains(&lower.as_str()) {
+        Ok(Some(lower))
+    } else {
+        Err(format!(
+            "unknown severity {raw:?}; expected none, {}",
+            SEVERITIES.join(", ")
+        ))
     }
 }
 
-/// Validate tasks directory.
+/// Validate the tasks directory: relative, plain components only.
 pub fn validate_tasks_dir(raw: Option<&str>) -> Result<PathBuf, String> {
-    let dir_str = raw.unwrap_or(DEFAULT_TASKS_DIR).trim();
-    if dir_str.is_empty() {
-        return Err("Tasks directory cannot be empty".to_string());
+    let dir = raw.unwrap_or(DEFAULT_TASKS_DIR).trim();
+    if dir.is_empty() {
+        return Err("tasks directory is empty".into());
     }
-    if dir_str.len() > MAX_TASKS_DIR {
-        return Err(format!("Tasks directory path exceeds limit of {MAX_TASKS_DIR} characters"));
+    if dir.len() > MAX_TASKS_DIR {
+        return Err(format!("tasks directory exceeds {MAX_TASKS_DIR} bytes"));
     }
-    if dir_str.contains('\0') {
-        return Err("Tasks directory path contains NUL byte".to_string());
+    if dir.contains('\0') || dir.contains('\\') {
+        return Err("tasks directory contains NUL or a backslash".into());
     }
-    let path = Path::new(dir_str);
-    if path.is_absolute() {
-        return Err("Tasks directory must be a relative path".to_string());
-    }
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(_) => {}
-            _ => return Err("Tasks directory must not contain path traversal (.., /, \\)".to_string()),
-        }
+    let path = Path::new(dir);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("tasks directory must be a relative path inside the repository".into());
     }
     Ok(path.to_path_buf())
 }
 
-/// Clean a list of strings with caps and boundaries.
-fn clean_string_list(
-    items: Option<Vec<String>>,
-    max_items: usize,
-    max_item_len: usize,
-    name: &str,
-) -> Result<Vec<String>, String> {
-    let Some(list) = items else {
-        return Ok(Vec::new());
-    };
-    if list.len() > max_items {
-        return Err(format!("{name} exceeds maximum item count of {max_items} (got {})", list.len()));
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+/// Values a brief states; `None` until something states it.
+#[derive(Default)]
+struct Stated {
+    key: Option<String>,
+    title: Option<String>,
+    status: Option<String>,
+    priority: Option<u8>,
+    severity: Option<Option<String>>,
+    kind: Option<String>,
+    owner: Option<Option<String>>,
+    due: Option<Option<String>>,
+    labels: Option<Vec<String>>,
+    repositories: Option<Vec<String>>,
+    planned_files: Option<Vec<String>>,
+    acceptance_criteria: Option<Vec<String>>,
+    description: Option<String>,
+}
+
+impl Stated {
+    /// Fill every field `self` left unstated from `other`.
+    fn fill_from(&mut self, other: Stated) {
+        macro_rules! fill {
+            ($($field:ident),*) => {$(
+                if self.$field.is_none() { self.$field = other.$field; }
+            )*};
+        }
+        fill!(
+            key,
+            title,
+            status,
+            priority,
+            severity,
+            kind,
+            owner,
+            due,
+            labels,
+            repositories,
+            planned_files,
+            acceptance_criteria,
+            description
+        );
     }
-    let mut cleaned = Vec::with_capacity(list.len());
-    for item in list {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
+
+    /// Apply one `key: value` metadata pair. `source` names it in errors.
+    fn set(&mut self, key: &str, value: Value, source: &str) -> Result<(), String> {
+        let scalar = |value: Value| -> Result<String, String> {
+            match value {
+                Value::Scalar(text) => Ok(text),
+                Value::List(_) => Err(format!(
+                    "{source}: `{key}` must be a single value, not a list"
+                )),
+            }
+        };
+        let absent = |text: &str| {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "" | "none" | "null" | "~" | "unassigned" | "unspecified"
+            )
+        };
+        match key {
+            "id" | "task" => {
+                let text = scalar(value)?;
+                // The exported form is `Task: <id> (revision 4)`.
+                let head = text.split_whitespace().next().unwrap_or("");
+                self.key = Some(validate_task_key(head).map_err(|e| format!("{source}: {e}"))?);
+            }
+            "title" => {
+                self.title =
+                    Some(validate_title(&scalar(value)?).map_err(|e| format!("{source}: {e}"))?)
+            }
+            "status" => {
+                let text = scalar(value)?;
+                if !absent(&text) {
+                    self.status =
+                        Some(normalize_status(&text).map_err(|e| format!("{source}: {e}"))?);
+                }
+            }
+            "priority" => {
+                self.priority =
+                    Some(parse_priority(&scalar(value)?).map_err(|e| format!("{source}: {e}"))?)
+            }
+            "severity" => {
+                self.severity =
+                    Some(parse_severity(&scalar(value)?).map_err(|e| format!("{source}: {e}"))?)
+            }
+            "type" | "kind" => {
+                let text = scalar(value)?.trim().to_ascii_lowercase();
+                if !absent(&text) {
+                    if text.len() > MAX_KIND_BYTES || text.chars().any(char::is_control) {
+                        return Err(format!(
+                            "{source}: type exceeds {MAX_KIND_BYTES} bytes or spans lines"
+                        ));
+                    }
+                    self.kind = Some(text);
+                }
+            }
+            "owner" => {
+                let text = scalar(value)?.trim().to_string();
+                if text.len() > MAX_OWNER_BYTES || text.chars().any(char::is_control) {
+                    return Err(format!(
+                        "{source}: owner exceeds {MAX_OWNER_BYTES} bytes or spans lines"
+                    ));
+                }
+                self.owner = Some((!absent(&text)).then_some(text));
+            }
+            "due" => {
+                let text = scalar(value)?.trim().to_string();
+                self.due = Some((!absent(&text)).then_some(text));
+            }
+            "labels" => {
+                self.labels = Some(list(
+                    value,
+                    MAX_TASK_LABELS,
+                    MAX_LABEL_BYTES,
+                    "labels",
+                    source,
+                )?)
+            }
+            "repositories" => {
+                self.repositories = Some(list(
+                    value,
+                    MAX_TASK_REPOSITORIES,
+                    MAX_REPOSITORY_BYTES,
+                    "repositories",
+                    source,
+                )?)
+            }
+            "planned_files" => {
+                self.planned_files = Some(list(
+                    value,
+                    MAX_TASK_PLANNED_FILES,
+                    MAX_PLANNED_FILE_BYTES,
+                    "planned_files",
+                    source,
+                )?)
+            }
+            "acceptance_criteria" => {
+                self.acceptance_criteria = Some(list(
+                    value,
+                    MAX_TASK_CRITERIA,
+                    MAX_CRITERION_BYTES,
+                    "acceptance_criteria",
+                    source,
+                )?)
+            }
+            "description" => self.description = Some(scalar(value)?),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Value {
+    Scalar(String),
+    List(Vec<String>),
+}
+
+/// Bound and de-duplicate a list. A scalar is a one-item (or comma) list.
+fn list(
+    value: Value,
+    max_items: usize,
+    max_bytes: usize,
+    name: &str,
+    source: &str,
+) -> Result<Vec<String>, String> {
+    let items = match value {
+        Value::List(items) => items,
+        Value::Scalar(text) => text.split(',').map(str::to_string).collect(),
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let item = item.trim();
+        if item.is_empty() || item.eq_ignore_ascii_case("none") {
             continue;
         }
-        if trimmed.contains('\0') {
-            return Err(format!("{name} item contains NUL byte"));
+        if item.len() > max_bytes || item.chars().any(char::is_control) {
+            return Err(format!(
+                "{source}: a {name} item exceeds {max_bytes} bytes or spans lines"
+            ));
         }
-        if trimmed.chars().count() > max_item_len {
-            return Err(format!("{name} item exceeds length of {max_item_len} characters"));
+        if seen.insert(item.to_string()) {
+            out.push(item.to_string());
         }
-        cleaned.push(trimmed.to_string());
     }
-    Ok(cleaned)
+    if out.len() > max_items {
+        return Err(format!(
+            "{source}: {name} has {} items; at most {max_items}",
+            out.len()
+        ));
+    }
+    Ok(out)
 }
 
-/// Format a task into the canonical GitPulse task markdown format with YAML frontmatter.
-pub fn format_gitpulse_task(task: &TaskFileDetails) -> String {
-    let mut out = String::new();
-
-    // Frontmatter (YAML-compatible)
-    out.push_str("---\n");
-    out.push_str(&format!("id: \"{}\"\n", escape_yaml(&task.id)));
-    out.push_str(&format!("title: \"{}\"\n", escape_yaml(&task.title)));
-    out.push_str(&format!("status: {}\n", task.status));
-    out.push_str(&format!("priority: {}\n", task.priority));
-    out.push_str(&format!("severity: {}\n", task.severity));
-    out.push_str(&format!("type: {}\n", task.kind));
-    out.push_str(&format!("owner: \"{}\"\n", escape_yaml(&task.owner)));
-    out.push_str(&format!("due: \"{}\"\n", escape_yaml(&task.due)));
-
-    if !task.labels.is_empty() {
-        out.push_str("labels:\n");
-        for label in &task.labels {
-            out.push_str(&format!("  - \"{}\"\n", escape_yaml(label)));
-        }
+/// Parse a brief from file content.
+pub fn parse_brief(content: &str) -> Result<TaskBrief, String> {
+    let text = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    if text.contains('\0') {
+        return Err("brief contains a NUL byte".into());
+    }
+    if text.trim().is_empty() {
+        return Err("brief is empty".into());
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (mut stated, body) = if lines[0].trim_end() == "---" {
+        let close = lines
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, line)| matches!(line.trim_end(), "---" | "..."))
+            .map(|(index, _)| index)
+            .ok_or("frontmatter opens with `---` but is never closed by a `---` line")?;
+        (frontmatter(&lines[1..close])?, &lines[close + 1..])
     } else {
-        out.push_str("labels: []\n");
+        (Stated::default(), &lines[..])
+    };
+    let (from_body, logs) = body_sections(body)?;
+    stated.fill_from(from_body);
+
+    let title = stated
+        .title
+        .ok_or("no title: give `title:` in the frontmatter or a `## Title` section")?;
+    let description = stated.description.unwrap_or_default().trim().to_string();
+    if description.len() > MAX_TASK_DESCRIPTION {
+        return Err(format!("description exceeds {MAX_TASK_DESCRIPTION} bytes"));
     }
-
-    if !task.repositories.is_empty() {
-        out.push_str("repositories:\n");
-        for repo in &task.repositories {
-            out.push_str(&format!("  - \"{}\"\n", escape_yaml(repo)));
-        }
-    } else {
-        out.push_str("repositories: []\n");
+    if logs.as_ref().is_some_and(|l| l.len() > MAX_TASK_LOGS) {
+        return Err(format!("raw logs exceed {MAX_TASK_LOGS} bytes"));
     }
-
-    if !task.planned_files.is_empty() {
-        out.push_str("planned_files:\n");
-        for file in &task.planned_files {
-            out.push_str(&format!("  - \"{}\"\n", escape_yaml(file)));
-        }
-    } else {
-        out.push_str("planned_files: []\n");
-    }
-
-    if !task.acceptance_criteria.is_empty() {
-        out.push_str("acceptance_criteria:\n");
-        for crit in &task.acceptance_criteria {
-            out.push_str(&format!("  - \"{}\"\n", escape_yaml(crit)));
-        }
-    } else {
-        out.push_str("acceptance_criteria: []\n");
-    }
-    out.push_str("---\n\n");
-
-    // Markdown Task Brief v1 body
-    out.push_str("# Task brief v1\n\n");
-    out.push_str("## Title\n");
-    out.push_str(&task.title);
-    out.push_str("\n\n");
-
-    out.push_str(&format!("Task: {}\n", task.id));
-    out.push_str(&format!("Type: {}\n", if task.kind.is_empty() { "Unspecified" } else { &task.kind }));
-    out.push_str(&format!("Status: {}\n", task.status));
-    out.push_str(&format!("Priority: {} ({})\n", task.priority, priority_label(task.priority)));
-    out.push_str(&format!("Severity: {}\n", if task.severity.is_empty() { "None" } else { &task.severity }));
-    out.push_str(&format!("Owner: {}\n", if task.owner.is_empty() { "Unassigned" } else { &task.owner }));
-    out.push_str(&format!("Due: {}\n", if task.due.is_empty() { "None" } else { &task.due }));
-    out.push_str(&format!(
-        "Labels: {}\n\n",
-        if task.labels.is_empty() { "None".to_string() } else { task.labels.join(", ") }
-    ));
-
-    out.push_str("## Repositories\n");
-    if task.repositories.is_empty() {
-        out.push_str("None linked yet.\n");
-    } else {
-        for repo in &task.repositories {
-            out.push_str(&format!("- {repo}\n"));
-        }
-    }
-    out.push('\n');
-
-    out.push_str("## Description\n");
-    if task.description.trim().is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        out.push_str(task.description.trim());
-        out.push('\n');
-    }
-    out.push('\n');
-
-    out.push_str("## Acceptance criteria\n");
-    if task.acceptance_criteria.is_empty() {
-        out.push_str("No acceptance criteria recorded.\n");
-    } else {
-        for crit in &task.acceptance_criteria {
-            out.push_str(&format!("- [ ] {crit}\n"));
-        }
-    }
-
-    if !task.planned_files.is_empty() {
-        out.push_str("\n## Planned files\n");
-        for file in &task.planned_files {
-            out.push_str(&format!("- {file}\n"));
-        }
-    }
-
-    if let Some(logs) = &task.logs {
-        let trimmed_logs = logs.trim();
-        if !trimmed_logs.is_empty() {
-            out.push_str("\n## Raw logs\nPasted evidence. Keep stack frames, timestamps, error codes and quoted text exactly as written.\n\n");
-            out.push_str(&fence_logs(trimmed_logs));
-            out.push('\n');
-        }
-    }
-
-    out
-}
-
-fn fence_logs(text: &str) -> String {
-    let mut ticks = 3;
-    let mut run = 0;
-    for ch in text.chars() {
-        if ch == '`' {
-            run += 1;
-            if run + 1 > ticks {
-                ticks = run + 1;
-            }
+    Ok(TaskBrief {
+        key: stated.key,
+        title,
+        status: stated.status,
+        priority: stated.priority,
+        severity: stated.severity.flatten(),
+        kind: stated.kind,
+        owner: stated.owner.flatten(),
+        due: stated.due.flatten(),
+        labels: stated.labels.unwrap_or_default(),
+        repositories: stated.repositories.unwrap_or_default(),
+        planned_files: stated.planned_files.unwrap_or_default(),
+        acceptance_criteria: stated.acceptance_criteria.unwrap_or_default(),
+        description: if description == "(none)" {
+            String::new()
         } else {
-            run = 0;
-        }
-    }
-    let mark = "`".repeat(ticks);
-    format!("{mark}\n{text}\n{mark}")
+            description
+        },
+        logs,
+    })
 }
 
-fn escape_yaml(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Parse a GitPulse task from file content.
-pub fn parse_gitpulse_task(content: &str) -> Result<TaskFileDetails, String> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Err("Task file content is empty".to_string());
-    }
-
-    let mut task = TaskFileDetails::default();
-    let body_text;
-
-    // Check if YAML frontmatter exists
-    if let Some(rest) = trimmed.strip_prefix("---") {
-        if let Some(end_idx) = rest.find("\n---") {
-            let frontmatter = &rest[..end_idx];
-            body_text = rest[end_idx + 4..].trim();
-            parse_yaml_frontmatter(frontmatter, &mut task);
-        } else {
-            body_text = trimmed;
-        }
-    } else {
-        body_text = trimmed;
-    }
-
-    // Parse body markdown sections (for title, description, criteria, planned_files, logs)
-    parse_markdown_sections(body_text, &mut task);
-
-    if task.title.is_empty() {
-        return Err("Could not extract task title from content".to_string());
-    }
-    if task.id.is_empty() {
-        task.id = slugify_title(&task.title);
-    }
-
-    Ok(task)
-}
-
-fn parse_yaml_frontmatter(frontmatter: &str, task: &mut TaskFileDetails) {
-    let mut current_list: Option<&mut Vec<String>> = None;
-
-    for line in frontmatter.lines() {
+/// The YAML subset briefs use: `key: scalar`, `key: [a, b]`, and block lists.
+///
+/// Anything outside that subset is an error naming the line, not a guess —
+/// a guessed reading of a status or a priority is a task filed in the wrong
+/// column with nothing to say so.
+fn frontmatter(lines: &[&str]) -> Result<Stated, String> {
+    let mut stated = Stated::default();
+    let mut seen = HashSet::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let number = index + 2; // 1-based, after the opening `---`.
+        let line = lines[index];
+        index += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-
-        if let Some(list) = current_list.as_mut() {
-            if let Some(stripped) = trimmed.strip_prefix('-') {
-                let item = stripped.trim().trim_matches('"').trim_matches('\'').trim();
-                if !item.is_empty() && !list.contains(&item.to_string()) {
-                    list.push(item.to_string());
-                }
-                continue;
-            } else if !trimmed.contains(':') {
-                continue;
-            }
+        if line.starts_with([' ', '\t', '-']) {
+            return Err(format!(
+                "frontmatter line {number}: indented or list line with no key above it"
+            ));
         }
-        current_list = None;
-
-        if let Some((key, val)) = line.split_once(':') {
-            let k = key.trim().to_ascii_lowercase();
-            let v = val.trim().trim_matches('"').trim_matches('\'').trim();
-
-            match k.as_str() {
-                "id" if !v.is_empty() => task.id = v.to_string(),
-                "title" if !v.is_empty() => task.title = v.to_string(),
-                "status" if !v.is_empty() => {
-                    let s = v.to_ascii_lowercase().replace(['-', ' '], "_");
-                    if !s.is_empty() {
-                        task.status = s;
-                    }
-                }
-                "priority" => {
-                    if let Some(digit) = v.chars().find(|c| c.is_ascii_digit()).and_then(|c| c.to_digit(10)) {
-                        task.priority = digit.min(3);
-                    } else {
-                        let lower = v.to_ascii_lowercase();
-                        if lower.contains("urgent") {
-                            task.priority = 0;
-                        } else if lower.contains("high") {
-                            task.priority = 1;
-                        } else if lower.contains("normal") || lower.contains("medium") {
-                            task.priority = 2;
-                        } else if lower.contains("low") {
-                            task.priority = 3;
-                        }
-                    }
-                }
-                "severity" if !v.is_empty() => task.severity = v.to_ascii_lowercase(),
-                "type" | "kind" if !v.is_empty() => task.kind = v.to_ascii_lowercase(),
-                "owner" if !v.is_empty() => task.owner = v.to_string(),
-                "due" if !v.is_empty() => task.due = v.to_string(),
-                "labels" => {
-                    if v == "[]" {
-                        task.labels.clear();
-                    } else if !v.is_empty() {
-                        let parsed = v.trim_matches('[').trim_matches(']');
-                        for part in parsed.split(',') {
-                            let item = part.trim().trim_matches('"').trim_matches('\'').trim();
-                            if !item.is_empty() && !task.labels.contains(&item.to_string()) {
-                                task.labels.push(item.to_string());
-                            }
-                        }
-                    } else {
-                        current_list = Some(&mut task.labels);
-                    }
-                }
-                "repositories" => {
-                    if v == "[]" {
-                        task.repositories.clear();
-                    } else if !v.is_empty() {
-                        let parsed = v.trim_matches('[').trim_matches(']');
-                        for part in parsed.split(',') {
-                            let item = part.trim().trim_matches('"').trim_matches('\'').trim();
-                            if !item.is_empty() && !task.repositories.contains(&item.to_string()) {
-                                task.repositories.push(item.to_string());
-                            }
-                        }
-                    } else {
-                        current_list = Some(&mut task.repositories);
-                    }
-                }
-                "planned_files" => {
-                    if v == "[]" {
-                        task.planned_files.clear();
-                    } else if !v.is_empty() {
-                        let parsed = v.trim_matches('[').trim_matches(']');
-                        for part in parsed.split(',') {
-                            let item = part.trim().trim_matches('"').trim_matches('\'').trim();
-                            if !item.is_empty() && !task.planned_files.contains(&item.to_string()) {
-                                task.planned_files.push(item.to_string());
-                            }
-                        }
-                    } else {
-                        current_list = Some(&mut task.planned_files);
-                    }
-                }
-                "acceptance_criteria" => {
-                    if v == "[]" {
-                        task.acceptance_criteria.clear();
-                    } else if !v.is_empty() {
-                        let parsed = v.trim_matches('[').trim_matches(']');
-                        for part in parsed.split(',') {
-                            let item = part.trim().trim_matches('"').trim_matches('\'').trim();
-                            if !item.is_empty() && !task.acceptance_criteria.contains(&item.to_string()) {
-                                task.acceptance_criteria.push(item.to_string());
-                            }
-                        }
-                    } else {
-                        current_list = Some(&mut task.acceptance_criteria);
-                    }
-                }
-                _ => {}
-            }
+        let (key, rest) = line
+            .split_once(':')
+            .ok_or_else(|| format!("frontmatter line {number}: expected `key: value`"))?;
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(format!(
+                "frontmatter line {number}: {key:?} is not a plain key"
+            ));
         }
+        let canonical = match key.as_str() {
+            "kind" => "type".to_string(),
+            "task" => "id".to_string(),
+            _ => key.clone(),
+        };
+        if !seen.insert(canonical) {
+            return Err(format!("frontmatter line {number}: `{key}` appears twice"));
+        }
+        let source = format!("frontmatter line {number}");
+        let rest = rest.trim();
+        let value = if rest.is_empty() {
+            // A block list, or nothing. Indented lines below belong to this key.
+            let mut items = Vec::new();
+            while index < lines.len() {
+                let next = lines[index];
+                if !next.trim().is_empty() && !next.starts_with([' ', '\t', '-']) {
+                    break;
+                }
+                index += 1;
+                let item = next.trim();
+                if item.is_empty() || item.starts_with('#') {
+                    continue;
+                }
+                let Some(item) = item.strip_prefix('-') else {
+                    return Err(format!(
+                        "frontmatter line {}: expected a `- item` under `{key}`",
+                        index + 1
+                    ));
+                };
+                items.push(scalar(item.trim(), index + 1)?);
+            }
+            Value::List(items)
+        } else if rest.starts_with('[') {
+            Value::List(flow_list(rest, number)?)
+        } else if rest.starts_with(['|', '>']) {
+            if is_known_key(&key) {
+                return Err(format!(
+                    "{source}: block scalars (`|`, `>`) are not supported for `{key}`"
+                ));
+            }
+            while index < lines.len()
+                && (lines[index].trim().is_empty() || lines[index].starts_with([' ', '\t']))
+            {
+                index += 1;
+            }
+            continue;
+        } else {
+            Value::Scalar(scalar(rest, number)?)
+        };
+        stated.set(&key, value, &source)?;
     }
+    Ok(stated)
 }
 
-fn parse_kv_metadata_line(k: &str, val: &str, task: &mut TaskFileDetails) {
-    let key = k.trim().to_ascii_lowercase();
-    let val = val.trim();
-    match key.as_str() {
-        "task" if task.id.is_empty() => {
-            let clean = val.split_whitespace().next().unwrap_or(val).trim();
-            task.id = clean.to_string();
-        }
-        "type" | "kind" if task.kind.is_empty() || task.kind == "feature" => task.kind = val.to_ascii_lowercase(),
-        "status" => {
-            let s = val.to_ascii_lowercase().replace(['-', ' '], "_");
-            if s != "unspecified" && !s.is_empty() {
-                task.status = s;
+fn is_known_key(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "title"
+            | "status"
+            | "priority"
+            | "severity"
+            | "type"
+            | "kind"
+            | "owner"
+            | "due"
+            | "labels"
+            | "repositories"
+            | "planned_files"
+            | "acceptance_criteria"
+            | "description"
+    )
+}
+
+/// One YAML scalar: double-quoted (with escapes), single-quoted, or plain.
+fn scalar(raw: &str, number: usize) -> Result<String, String> {
+    let raw = raw.trim();
+    let (value, rest) = if let Some(inner) = raw.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = inner.char_indices();
+        let mut end = None;
+        while let Some((at, ch)) = chars.next() {
+            match ch {
+                '"' => {
+                    end = Some(at + 1);
+                    break;
+                }
+                '\\' => {
+                    let (_, escaped) = chars.next().ok_or_else(|| {
+                        format!("frontmatter line {number}: string ends inside an escape")
+                    })?;
+                    match escaped {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        'u' => {
+                            let hex: String = chars.by_ref().take(4).map(|(_, c)| c).collect();
+                            let decoded = u32::from_str_radix(&hex, 16)
+                                .ok()
+                                .filter(|_| hex.len() == 4)
+                                .and_then(char::from_u32)
+                                .ok_or_else(|| {
+                                    format!("frontmatter line {number}: invalid \\u escape")
+                                })?;
+                            out.push(decoded);
+                        }
+                        other => {
+                            return Err(format!(
+                                "frontmatter line {number}: unsupported escape \\{other}"
+                            ))
+                        }
+                    }
+                }
+                ch => out.push(ch),
             }
         }
-        "priority" => {
-            if let Some(digit) = val.chars().find(|c| c.is_ascii_digit()).and_then(|c| c.to_digit(10)) {
-                task.priority = digit.min(3);
+        let end = end.ok_or_else(|| {
+            format!("frontmatter line {number}: unterminated double-quoted string")
+        })?;
+        (out, &inner[end..])
+    } else if let Some(inner) = raw.strip_prefix('\'') {
+        let mut out = String::new();
+        let mut chars = inner.char_indices().peekable();
+        let mut end = None;
+        while let Some((at, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    out.push('\'');
+                } else {
+                    end = Some(at + 1);
+                    break;
+                }
             } else {
-                let lower = val.to_ascii_lowercase();
-                if lower.contains("urgent") {
-                    task.priority = 0;
-                } else if lower.contains("high") {
-                    task.priority = 1;
-                } else if lower.contains("normal") || lower.contains("medium") {
-                    task.priority = 2;
-                } else if lower.contains("low") {
-                    task.priority = 3;
-                }
+                out.push(ch);
             }
         }
-        "severity" if task.severity.is_empty() || task.severity == "none" => {
-            let s = val.to_ascii_lowercase();
-            if s != "none" {
-                task.severity = s;
-            }
-        }
-        "owner" if task.owner.is_empty() || task.owner == "unassigned" => {
-            if val != "Unassigned" && !val.is_empty() {
-                task.owner = val.to_string();
-            }
-        }
-        k if (k == "due" || k.starts_with("due")) && (task.due.is_empty() || task.due == "none") => {
-            if val != "None" && !val.is_empty() {
-                task.due = val.to_string();
-            }
-        }
-        "labels" if val != "None" && !val.is_empty() => {
-            for part in val.split(',') {
-                let l = part.trim();
-                if !l.is_empty() && !task.labels.contains(&l.to_string()) {
-                    task.labels.push(l.to_string());
-                }
-            }
-        }
-        _ => {}
+        let end = end.ok_or_else(|| {
+            format!("frontmatter line {number}: unterminated single-quoted string")
+        })?;
+        (out, &inner[end..])
+    } else {
+        // A plain scalar keeps a ` #`. YAML would read the rest as a comment,
+        // but `- Close issue #42` losing its issue number silently is worse
+        // than a stray `# note` on a status line failing loudly.
+        return Ok(raw.to_string());
+    };
+    let rest = rest.trim();
+    if !rest.is_empty() && !rest.starts_with('#') {
+        return Err(format!(
+            "frontmatter line {number}: unexpected text after a quoted string"
+        ));
     }
+    Ok(value)
 }
 
-fn parse_markdown_sections(body: &str, task: &mut TaskFileDetails) {
-    #[derive(PartialEq)]
+/// A flow list: `[a, "b, c", 'd']`.
+fn flow_list(raw: &str, number: usize) -> Result<Vec<String>, String> {
+    let inner = raw
+        .strip_prefix('[')
+        .and_then(|rest| {
+            let rest = rest.trim_end();
+            let rest = match rest.rfind(" #") {
+                Some(cut) if rest[..cut].trim_end().ends_with(']') => rest[..cut].trim_end(),
+                _ => rest,
+            };
+            rest.strip_suffix(']')
+        })
+        .ok_or_else(|| {
+            format!("frontmatter line {number}: a `[` list must close with `]` on the same line")
+        })?;
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in inner.chars() {
+        match (quote, ch) {
+            (None, ',') => {
+                items.push(std::mem::take(&mut current));
+                continue;
+            }
+            (None, '"' | '\'') => quote = Some(ch),
+            (Some(open), c) if c == open => quote = None,
+            (None, '[' | ']') => {
+                return Err(format!(
+                    "frontmatter line {number}: nested lists are not supported"
+                ))
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    if quote.is_some() {
+        return Err(format!(
+            "frontmatter line {number}: unterminated quote in a list"
+        ));
+    }
+    items.push(current);
+    items
+        .into_iter()
+        .filter(|item| !item.trim().is_empty())
+        .map(|item| scalar(&item, number))
+        .collect()
+}
+
+/// Read the Markdown body: titled sections plus `Key: value` metadata lines.
+fn body_sections(lines: &[&str]) -> Result<(Stated, Option<String>), String> {
+    #[derive(Clone, Copy, PartialEq)]
     enum Section {
-        None,
+        Preamble,
         Title,
-        Metadata,
         Repositories,
         Description,
         Criteria,
         PlannedFiles,
         Logs,
     }
+    let mut stated = Stated::default();
+    let mut section = Section::Preamble;
+    let mut title: Option<String> = None;
+    let mut first_heading: Option<String> = None;
+    let mut description: Vec<String> = Vec::new();
+    let mut criteria: Vec<String> = Vec::new();
+    let mut planned: Vec<String> = Vec::new();
+    let mut repositories: Vec<String> = Vec::new();
+    let mut logs: Vec<String> = Vec::new();
+    // Raw logs are the first fenced block of their section, verbatim. Text
+    // after it closes is commentary, not evidence.
+    let mut logs_fenced = false;
+    let mut logs_done = false;
+    let mut fence: Option<(char, usize)> = None;
 
-    let mut current_section = Section::None;
-    let mut active_fence: Option<(char, usize)> = None;
-    let mut log_lines = Vec::new();
-    let mut desc_lines = Vec::new();
-
-    for line in body.lines() {
+    for (offset, &line) in lines.iter().enumerate() {
+        let source = format!("body line {}", offset + 1);
         let trimmed = line.trim();
-
-        if let Some((f_char, fence_len)) = active_fence {
-            let leading = trimmed.chars().take_while(|c| *c == f_char).count();
-            if leading >= fence_len && trimmed[leading..].trim().is_empty() {
-                active_fence = None;
-                if current_section == Section::Logs {
-                    continue;
-                } else if current_section == Section::Description {
-                    desc_lines.push(line);
-                    continue;
-                }
-            } else if current_section == Section::Logs {
-                log_lines.push(line);
-                continue;
-            } else if current_section == Section::Description {
-                desc_lines.push(line);
-                continue;
+        // Fences first: nothing inside one is a heading or a metadata line.
+        let marker = trimmed
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '`' | '~'))
+            .map(|c| (c, trimmed.chars().take_while(|x| *x == c).count()))
+            .filter(|(_, n)| *n >= 3);
+        if let Some((open_char, open_len)) = fence {
+            let closes = marker.is_some_and(|(c, n)| {
+                c == open_char && n >= open_len && trimmed.chars().all(|x| x == c)
+            });
+            if closes {
+                fence = None;
             }
-        } else {
-            let fence_char = if trimmed.starts_with("```") {
-                Some('`')
-            } else if trimmed.starts_with("~~~") {
-                Some('~')
-            } else {
-                None
-            };
-
-            if let Some(ch) = fence_char {
-                let count = trimmed.chars().take_while(|c| *c == ch).count();
-                if count >= 3 {
-                    active_fence = Some((ch, count));
-                    if current_section == Section::Logs {
-                        continue;
-                    } else if current_section == Section::Description {
-                        desc_lines.push(line);
-                        continue;
-                    }
+            match section {
+                Section::Logs if logs_fenced && !logs_done && !closes => {
+                    logs.push(line.to_string())
                 }
-            }
-        }
-
-        if active_fence.is_some() {
-            continue;
-        }
-
-        if trimmed.starts_with('#') {
-            let heading = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
-            match heading.as_str() {
-                "title" => {
-                    current_section = Section::Title;
-                    continue;
-                }
-                "repositories" => {
-                    current_section = Section::Repositories;
-                    continue;
-                }
-                "description" => {
-                    current_section = Section::Description;
-                    continue;
-                }
-                "acceptance criteria" | "checklist" | "subtasks" => {
-                    current_section = Section::Criteria;
-                    continue;
-                }
-                "planned files" | "files" => {
-                    current_section = Section::PlannedFiles;
-                    continue;
-                }
-                "raw logs" | "logs" => {
-                    current_section = Section::Logs;
-                    continue;
-                }
-                "task brief v1" | "gitpulse task" | "unsaved gitpulse task draft" => {
-                    current_section = Section::Metadata;
-                    continue;
+                Section::Logs => logs_done |= logs_fenced && closes,
+                Section::Description | Section::Preamble | Section::Title => {
+                    description.push(line.to_string())
                 }
                 _ => {}
             }
+            continue;
+        }
+        if let Some(open) = marker {
+            fence = Some(open);
+            match section {
+                Section::Logs if !logs_fenced && logs.iter().all(|l| l.trim().is_empty()) => {
+                    logs.clear();
+                    logs_fenced = true;
+                }
+                Section::Logs => {}
+                Section::Description | Section::Preamble | Section::Title => {
+                    description.push(line.to_string())
+                }
+                _ => {}
+            }
+            continue;
         }
 
-        match current_section {
-            Section::Title => {
-                if !trimmed.is_empty() {
-                    if let Some((k, v)) = trimmed.split_once(':') {
-                        parse_kv_metadata_line(k, v, task);
-                    } else if task.title.is_empty() {
-                        task.title = trimmed.to_string();
-                    }
+        if let Some(heading) = heading(trimmed) {
+            let name = heading.to_ascii_lowercase();
+            let next = match name.as_str() {
+                "title" => Some(Section::Title),
+                "repositories" => Some(Section::Repositories),
+                "description" => Some(Section::Description),
+                "acceptance criteria" | "checklist" | "subtasks" => Some(Section::Criteria),
+                "planned files" | "files" => Some(Section::PlannedFiles),
+                "raw logs" | "logs" => Some(Section::Logs),
+                "task brief v1" | "gitpulse task" | "unsaved gitpulse task draft" => {
+                    Some(Section::Preamble)
+                }
+                _ => None,
+            };
+            match next {
+                Some(next) => {
+                    section = next;
+                    continue;
+                }
+                None if first_heading.is_none()
+                    && section == Section::Preamble
+                    && trimmed.starts_with("# ") =>
+                {
+                    // A hand-written brief's top heading is its title.
+                    first_heading = Some(heading.to_string());
+                    continue;
+                }
+                None if section == Section::Logs => continue,
+                None => {
+                    // Any other heading is part of the description — losing a
+                    // `## Context` section silently is worse than keeping it.
+                    section = Section::Description;
+                    description.push(line.to_string());
+                    continue;
                 }
             }
-            Section::Metadata | Section::None => {
-                if let Some((k, v)) = trimmed.split_once(':') {
-                    parse_kv_metadata_line(k, v, task);
+        }
+
+        match section {
+            Section::Title if title.is_none() => {
+                if !trimmed.is_empty() {
+                    title = Some(trimmed.to_string());
+                }
+            }
+            Section::Title | Section::Preamble => {
+                if let Some((key, value)) = metadata(trimmed) {
+                    stated.set(key, Value::Scalar(value.to_string()), &source)?;
+                } else if !trimmed.is_empty() && !is_ignored_metadata(trimmed) {
+                    description.push(line.to_string());
                 }
             }
             Section::Repositories => {
-                if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                    let repo = trimmed[1..].trim();
-                    if !repo.is_empty() && repo != "None linked yet." {
-                        let clean = repo
-                            .split(" — ")
-                            .next()
-                            .unwrap_or(repo)
-                            .split(" - ")
-                            .next()
-                            .unwrap_or(repo)
-                            .trim();
-                        let clean = clean.split('[').next().unwrap_or(clean).trim();
-                        if !clean.is_empty() && !task.repositories.contains(&clean.to_string()) {
-                            task.repositories.push(clean.to_string());
-                        }
+                if let Some(item) = bullet(trimmed) {
+                    let name = item.split(" [").next().unwrap_or(item);
+                    let name = name.split(" — ").next().unwrap_or(name).trim();
+                    if !name.is_empty() && name != "None linked yet." {
+                        repositories.push(name.to_string());
                     }
                 }
             }
-            Section::Description => {
-                desc_lines.push(line);
-            }
+            Section::Description => description.push(line.to_string()),
             Section::Criteria => {
-                if trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
-                    let crit = trimmed[5..].trim();
-                    if !crit.is_empty() && !task.acceptance_criteria.contains(&crit.to_string()) {
-                        task.acceptance_criteria.push(crit.to_string());
+                if let Some(item) = bullet(trimmed) {
+                    let item = ["[ ]", "[x]", "[X]"]
+                        .iter()
+                        .find_map(|box_| item.strip_prefix(box_))
+                        .unwrap_or(item)
+                        .trim();
+                    if !item.is_empty() && item != "No acceptance criteria recorded." {
+                        criteria.push(item.to_string());
                     }
-                } else if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                    let crit = trimmed[1..].trim();
-                    if !crit.is_empty() && crit != "No acceptance criteria recorded." && !task.acceptance_criteria.contains(&crit.to_string()) {
-                        task.acceptance_criteria.push(crit.to_string());
+                } else if !trimmed.is_empty() {
+                    // A wrapped criterion continues the one above it.
+                    match criteria.last_mut() {
+                        Some(last) => {
+                            last.push(' ');
+                            last.push_str(trimmed);
+                        }
+                        None => criteria.push(trimmed.to_string()),
                     }
                 }
             }
             Section::PlannedFiles => {
-                if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                    let file = trimmed[1..].trim();
-                    if !file.is_empty() && !task.planned_files.contains(&file.to_string()) {
-                        task.planned_files.push(file.to_string());
+                if let Some(item) = bullet(trimmed) {
+                    let item = item.trim_matches('`').trim();
+                    if !item.is_empty() {
+                        planned.push(item.to_string());
                     }
                 }
             }
             Section::Logs => {
-                if !trimmed.starts_with("Pasted evidence") && (!trimmed.is_empty() || !log_lines.is_empty()) {
-                    log_lines.push(line);
+                if !logs_fenced
+                    && !trimmed.starts_with("Pasted evidence")
+                    && !(trimmed.is_empty() && logs.is_empty())
+                {
+                    logs.push(line.to_string());
                 }
             }
         }
     }
-
-    if task.description.is_empty() {
-        let desc = desc_lines.join("\n").trim().to_string();
-        if desc != "(none)" && !desc.is_empty() {
-            task.description = desc;
-        }
+    if fence.is_some() && section == Section::Logs && logs_fenced && !logs_done {
+        return Err("raw logs open a code fence that is never closed".into());
     }
 
-    if task.logs.is_none() && !log_lines.is_empty() {
-        let log_content = log_lines.join("\n").trim().to_string();
-        if !log_content.is_empty() {
-            task.logs = Some(log_content);
+    if let Some(title) = title.or(first_heading) {
+        stated.title = Some(validate_title(&title)?);
+    }
+    let text = description.join("\n");
+    if !text.trim().is_empty() {
+        stated.description = Some(text);
+    }
+    let lists = [
+        (
+            &mut stated.acceptance_criteria,
+            criteria,
+            MAX_TASK_CRITERIA,
+            MAX_CRITERION_BYTES,
+            "acceptance criteria",
+        ),
+        (
+            &mut stated.planned_files,
+            planned,
+            MAX_TASK_PLANNED_FILES,
+            MAX_PLANNED_FILE_BYTES,
+            "planned files",
+        ),
+        (
+            &mut stated.repositories,
+            repositories,
+            MAX_TASK_REPOSITORIES,
+            MAX_REPOSITORY_BYTES,
+            "repositories",
+        ),
+    ];
+    for (slot, items, max_items, max_bytes, name) in lists {
+        if !items.is_empty() {
+            *slot = Some(list(
+                Value::List(items),
+                max_items,
+                max_bytes,
+                name,
+                "body",
+            )?);
         }
     }
+    let logs = logs.join("\n");
+    let logs = logs.trim_matches('\n');
+    Ok((stated, (!logs.trim().is_empty()).then(|| logs.to_string())))
 }
 
-/// Add a task to the repository's tasks folder with policy evaluation and ledger recording.
-pub fn add_task_file(req: NewTaskRequest) -> Result<TaskAddResult, String> {
-    let repo_path = Path::new(&req.repo_path);
-    if !repo_path.exists() || !repo_path.is_dir() {
-        return Err(format!("Repository path '{}' does not exist or is not a directory", req.repo_path));
+fn heading(trimmed: &str) -> Option<&str> {
+    let level = trimmed.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
     }
+    let rest = &trimmed[level..];
+    (rest.starts_with(' ') || rest.is_empty()).then(|| rest.trim())
+}
 
-    let title = validate_title(&req.title)?;
-    let description = validate_description(req.description.as_deref())?;
-    let logs = validate_logs(req.logs.as_deref())?;
-
-    let task_id = match req.task_id.as_deref() {
-        Some(custom_id) => validate_task_id(custom_id)?,
-        None => {
-            let slug = slugify_title(&title);
-            let candidate_id = format!("gp-{slug}");
-            validate_task_id(&candidate_id)?
-        }
-    };
-
-    let status = normalize_status(req.status.as_deref())?;
-    let priority = normalize_priority(req.priority)?;
-    let severity = req.severity.unwrap_or_else(|| "none".to_string()).trim().to_ascii_lowercase();
-    let kind = req.kind.unwrap_or_else(|| "feature".to_string()).trim().to_ascii_lowercase();
-    let owner = req.owner.unwrap_or_else(|| "unassigned".to_string()).trim().to_string();
-    let due = req.due.unwrap_or_else(|| "none".to_string()).trim().to_string();
-
-    let labels = clean_string_list(req.labels, MAX_TASK_LABELS, 128, "labels")?;
-    let repositories = clean_string_list(req.repositories, MAX_TASK_REPOSITORIES, 300, "repositories")?;
-    let planned_files = clean_string_list(req.planned_files, MAX_TASK_PLANNED_FILES, 4096, "planned_files")?;
-    let acceptance_criteria = clean_string_list(req.acceptance_criteria, MAX_TASK_CRITERIA, 4096, "acceptance_criteria")?;
-
-    let tasks_dir_rel = validate_tasks_dir(req.tasks_dir.as_deref())?;
-    let filename = format!("{task_id}.md");
-    let rel_file_path = tasks_dir_rel.join(&filename);
-    let rel_file_path_str = rel_file_path.to_string_lossy().into_owned();
-
-    let target_dir = repo_path.join(&tasks_dir_rel);
-    let target_file = repo_path.join(&rel_file_path);
-
-    let overwrite = req.overwrite.unwrap_or(false);
-    if target_file.exists() && !overwrite {
-        return Err(format!(
-            "Task file already exists: {rel_file_path_str}. Specify overwrite: true to replace it."
-        ));
+fn bullet(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return Some(rest.trim());
     }
-
-    // Policy check via harness guard_file
-    let verdict = crate::harness::guard_file(&req.repo_path, &rel_file_path_str, "write")?;
-    if verdict.status.blocks() {
-        return Err(format!(
-            "Task file creation refused by repository policy: {} (rule: {})",
-            verdict.reason, verdict.rule
-        ));
-    }
-
-    let task_details = TaskFileDetails {
-        id: task_id.clone(),
-        title: title.clone(),
-        status: status.clone(),
-        priority,
-        severity,
-        kind,
-        owner,
-        due,
-        labels,
-        repositories,
-        planned_files,
-        acceptance_criteria,
-        description,
-        logs,
-    };
-
-    let content = format_gitpulse_task(&task_details);
-
-    // Create target directory if needed
-    if !target_dir.exists() {
-        fs::create_dir_all(&target_dir)
-            .map_err(|e| format!("Failed to create tasks directory '{}': {e}", target_dir.display()))?;
-    }
-
-    if overwrite {
-        // Atomic overwrite via unique temporary file + rename
-        let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_filename = format!(".{task_id}.tmp.{}.{counter}", std::process::id());
-        let tmp_path = target_dir.join(tmp_filename);
-
-        fs::write(&tmp_path, content.as_bytes())
-            .map_err(|e| format!("Failed to write temporary task file: {e}"))?;
-
-        if let Err(e) = fs::rename(&tmp_path, &target_file) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("Failed to commit task file '{}': {e}", target_file.display()));
-        }
-    } else {
-        // Atomic exclusive creation: fails if file already exists with zero race condition
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target_file)
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 {
+        if let Some(rest) = trimmed[digits..]
+            .strip_prefix(". ")
+            .or_else(|| trimmed[digits..].strip_prefix(") "))
         {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(format!(
-                    "Task file already exists: {rel_file_path_str}. Specify overwrite: true to replace it."
-                ));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "Failed to create task file '{}': {e}",
-                    target_file.display()
-                ));
+            return Some(rest.trim());
+        }
+    }
+    None
+}
+
+/// A body metadata line this reader understands, as `(key, value)`.
+fn metadata(trimmed: &str) -> Option<(&'static str, &str)> {
+    let (key, value) = trimmed.split_once(':')?;
+    let key = key.trim().to_ascii_lowercase();
+    let mapped = match key.as_str() {
+        "task" => "task",
+        "type" | "kind" => "type",
+        "status" => "status",
+        "priority" => "priority",
+        "severity" => "severity",
+        "owner" => "owner",
+        "due" | "due date" | "due (unix seconds)" => "due",
+        "labels" => "labels",
+        _ => return None,
+    };
+    Some((mapped, value.trim()))
+}
+
+/// Export bookkeeping lines that carry nothing a task needs.
+fn is_ignored_metadata(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        "updated (unix seconds):",
+        "enhancement field locks:",
+        "home workspace:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+// ---------------------------------------------------------------------------
+// Scanning
+// ---------------------------------------------------------------------------
+
+/// Read every candidate brief in a repository's tasks directory.
+///
+/// Fails as a whole only when the directory itself cannot be trusted or read:
+/// it resolves outside the repository, or `read_dir` fails. Each file's own
+/// failure — unreadable, oversized, not UTF-8, a symlink, malformed — is an
+/// entry with a reason. A missing directory is `directory_exists: false`.
+pub fn scan_briefs(repo_path: &str, tasks_dir: Option<&str>) -> Result<BriefScan, String> {
+    let relative = validate_tasks_dir(tasks_dir)?;
+    let display_dir = relative.to_string_lossy().replace('\\', "/");
+    let repo = Path::new(repo_path);
+    if !repo.is_absolute() {
+        return Err("repository path must be absolute".into());
+    }
+    let repo = repo
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve repository {repo_path}: {e}"))?;
+    let dir = repo.join(&relative);
+    match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BriefScan {
+                tasks_dir: display_dir,
+                directory_exists: false,
+                found: 0,
+                read: 0,
+                truncated: false,
+                files: Vec::new(),
+            })
+        }
+        Err(e) => return Err(format!("cannot inspect {display_dir}: {e}")),
+        Ok(_) => {}
+    }
+    let resolved = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {display_dir}: {e}"))?;
+    if !resolved.starts_with(&repo) {
+        return Err(format!(
+            "{display_dir} resolves outside the repository; refusing to read it"
+        ));
+    }
+    if !resolved.is_dir() {
+        return Err(format!("{display_dir} is not a directory"));
+    }
+    let mut names = Vec::new();
+    let mut files = Vec::new();
+    for entry in
+        std::fs::read_dir(&resolved).map_err(|e| format!("cannot list {display_dir}: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("cannot list {display_dir}: {e}"))?;
+        let raw = entry.file_name();
+        let Some(name) = raw.to_str() else {
+            files.push(BriefFile {
+                file: format!("{display_dir}/{}", raw.to_string_lossy()),
+                key: None,
+                brief: None,
+                error: Some("file name is not valid UTF-8".into()),
+            });
+            continue;
+        };
+        let is_brief = name.len() > 3
+            && name[name.len() - 3..].eq_ignore_ascii_case(".md")
+            && !name.starts_with('.');
+        if is_brief {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    let found = names.len() + files.len();
+    let truncated = names.len() > MAX_BRIEF_FILES;
+    names.truncate(MAX_BRIEF_FILES);
+
+    for name in &names {
+        let file = format!("{display_dir}/{name}");
+        let stem = &name[..name.len() - 3];
+        let path = resolved.join(name);
+        // `O_NOFOLLOW` is the race-free guard, but it exists on unix only; this
+        // check is what refuses a link on every platform.
+        let linked = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
+        let parsed = if linked {
+            Err(LINK_REFUSAL.to_string())
+        } else {
+            match crate::fs_entry::read_bounded_nofollow(&path, MAX_BRIEF_BYTES) {
+                Ok(bytes) => String::from_utf8(bytes)
+                    .map_err(|_| "file is not valid UTF-8".to_string())
+                    .and_then(|text| parse_brief(&text)),
+                Err(error) => Err(read_failure(error)),
             }
         };
-
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("Failed to write task content to '{}': {e}", target_file.display()))?;
-        file.flush()
-            .map_err(|e| format!("Failed to flush task file '{}': {e}", target_file.display()))?;
-    }
-
-    Ok(TaskAddResult {
-        ok: true,
-        task_id,
-        file_path: rel_file_path_str,
-        absolute_path: target_file.to_string_lossy().into_owned(),
-        title,
-        status,
-        priority,
-        content,
-        verdict,
-    })
-}
-
-/// List all task files in the repository's tasks folder.
-pub fn list_task_files(
-    repo_path: &str,
-    tasks_dir: Option<&str>,
-    status_filter: Option<&str>,
-    limit: usize,
-) -> Result<TaskListResult, String> {
-    let repo = Path::new(repo_path);
-    if !repo.exists() || !repo.is_dir() {
-        return Err(format!("Repository path '{repo_path}' does not exist or is not a directory"));
-    }
-
-    let tasks_dir_rel = validate_tasks_dir(tasks_dir)?;
-    let tasks_dir_abs = repo.join(&tasks_dir_rel);
-    let tasks_dir_str = tasks_dir_rel.to_string_lossy().into_owned();
-
-    if !tasks_dir_abs.exists() || !tasks_dir_abs.is_dir() {
-        return Ok(TaskListResult {
-            ok: true,
-            tasks_dir: tasks_dir_str,
-            returned: 0,
-            total: 0,
-            truncated: false,
-            tasks: Vec::new(),
-        });
-    }
-
-    let filter_status = status_filter
-        .map(|s| s.trim().to_ascii_lowercase().replace(['-', ' '], "_"))
-        .filter(|s| !s.is_empty());
-
-    let mut all_tasks = Vec::new();
-    let entries = fs::read_dir(&tasks_dir_abs)
-        .map_err(|e| format!("Failed to read tasks directory '{}': {e}", tasks_dir_abs.display()))?;
-
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if filename.starts_with('.') {
-                continue;
-            }
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(task) = parse_gitpulse_task(&content) {
-                    if let Some(ref desired_status) = filter_status {
-                        if &task.status != desired_status {
-                            continue;
-                        }
-                    }
-                    let rel_path = tasks_dir_rel.join(filename).to_string_lossy().into_owned();
-                    all_tasks.push(TaskSummary {
-                        id: task.id,
-                        title: task.title,
-                        status: task.status,
-                        priority: task.priority,
-                        priority_label: priority_label(task.priority).to_string(),
-                        severity: task.severity,
-                        kind: task.kind,
-                        owner: task.owner,
-                        due: task.due,
-                        labels: task.labels,
-                        file_path: rel_path,
-                        criteria_count: task.acceptance_criteria.len(),
-                        planned_files_count: task.planned_files.len(),
-                    });
+        files.push(match parsed {
+            Ok(brief) => {
+                let key = match &brief.key {
+                    Some(key) => Ok(key.clone()),
+                    None => validate_task_key(stem).or_else(|_| Ok::<_, String>(slugify(stem))),
+                };
+                match key {
+                    Ok(key) => BriefFile {
+                        file,
+                        key: Some(key),
+                        brief: Some(brief),
+                        error: None,
+                    },
+                    Err(error) => BriefFile {
+                        file,
+                        key: None,
+                        brief: None,
+                        error: Some(error),
+                    },
                 }
             }
+            Err(error) => BriefFile {
+                file,
+                key: None,
+                brief: None,
+                error: Some(error),
+            },
+        });
+    }
+    // Two files claiming one key would silently overwrite each other on the
+    // board; the first by name keeps it and the rest say so.
+    let mut owners: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in &mut files {
+        if let Some(key) = entry.key.clone() {
+            if let Some(owner) = owners.get(&key) {
+                entry.error = Some(format!("task key {key:?} is already used by {owner}"));
+                entry.brief = None;
+            } else {
+                owners.insert(key, entry.file.clone());
+            }
         }
     }
-
-    // Sort by priority (0=urgent first), then by title
-    all_tasks.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.title.cmp(&b.title))
-    });
-
-    let total = all_tasks.len();
-    let cap = limit.clamp(1, MAX_LIST_LIMIT);
-    let truncated = total > cap;
-    let tasks: Vec<TaskSummary> = all_tasks.into_iter().take(cap).collect();
-    let returned = tasks.len();
-
-    Ok(TaskListResult {
-        ok: true,
-        tasks_dir: tasks_dir_str,
-        returned,
-        total,
+    let read = names.len();
+    Ok(BriefScan {
+        tasks_dir: display_dir,
+        directory_exists: true,
+        found,
+        read,
         truncated,
-        tasks,
+        files,
     })
 }
 
-/// Read and parse a specific task file by ID or relative path.
-pub fn get_task_file(
-    repo_path: &str,
-    tasks_dir: Option<&str>,
-    task_id_or_path: &str,
-) -> Result<TaskGetResult, String> {
-    let repo = Path::new(repo_path);
-    if !repo.exists() || !repo.is_dir() {
-        return Err(format!("Repository path '{repo_path}' does not exist or is not a directory"));
-    }
+const LINK_REFUSAL: &str = "is a symbolic link; briefs must be regular files inside the repository";
 
-    let raw = task_id_or_path.trim().trim_start_matches("./");
-    if raw.is_empty() || raw.contains("..") || raw.contains('\0') || raw.contains('\\') {
-        return Err("Invalid task ID or path: contains forbidden path traversal characters".to_string());
-    }
-
-    let tasks_dir_rel = validate_tasks_dir(tasks_dir)?;
-    let tasks_dir_prefix = format!("{}/", tasks_dir_rel.to_string_lossy());
-    let file_stem = raw
-        .strip_prefix(&tasks_dir_prefix)
-        .unwrap_or(raw)
-        .trim_start_matches('/');
-
-    if file_stem.is_empty() || file_stem.contains("..") || file_stem.contains('\0') || file_stem.contains('\\') {
-        return Err("Invalid task ID or path: contains forbidden path traversal characters".to_string());
-    }
-
-    let candidate_rel = if file_stem.ends_with(".md") {
-        tasks_dir_rel.join(file_stem)
-    } else {
-        tasks_dir_rel.join(format!("{file_stem}.md"))
-    };
-
-    let target_file = repo.join(&candidate_rel);
-    if !target_file.exists() || !target_file.is_file() {
-        return Err(format!(
-            "Task file not found at '{}' in repository '{repo_path}'",
-            candidate_rel.display()
-        ));
-    }
-
-    if let (Ok(canon_repo), Ok(canon_file)) = (repo.canonicalize(), target_file.canonicalize()) {
-        if !canon_file.starts_with(&canon_repo) {
-            return Err("Task file resolves outside repository root".to_string());
+fn read_failure(error: crate::fs_entry::BoundedRead) -> String {
+    use crate::fs_entry::BoundedRead;
+    match error {
+        #[cfg(unix)]
+        BoundedRead::Io(e) if e.raw_os_error() == Some(libc::ELOOP) => LINK_REFUSAL.into(),
+        BoundedRead::Io(e) => format!("cannot read: {e}"),
+        BoundedRead::NotRegular => "is not a regular file".into(),
+        BoundedRead::TooLarge | BoundedRead::Grew => {
+            format!(
+                "is larger than the {} KiB brief limit",
+                MAX_BRIEF_BYTES / 1024
+            )
         }
     }
-
-    let content = fs::read_to_string(&target_file)
-        .map_err(|e| format!("Failed to read task file '{}': {e}", target_file.display()))?;
-
-    let task = parse_gitpulse_task(&content)?;
-
-    Ok(TaskGetResult {
-        ok: true,
-        file_path: candidate_rel.to_string_lossy().into_owned(),
-        task,
-        content,
-    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_and_parse_round_trip() {
-        let task = TaskFileDetails {
-            id: "gp-auth-flow".to_string(),
-            title: "Implement secure OAuth login flow".to_string(),
-            status: "ready".to_string(),
-            priority: 1,
-            severity: "high".to_string(),
-            kind: "feature".to_string(),
-            owner: "@ada".to_string(),
-            due: "2026-10-20".to_string(),
-            labels: vec!["security".to_string(), "backend".to_string()],
-            repositories: vec!["GitPulse".to_string()],
-            planned_files: vec!["src/auth.rs".to_string(), "src/login.rs".to_string()],
-            acceptance_criteria: vec![
-                "Validates PKCE challenge".to_string(),
-                "Persists refresh token securely".to_string(),
-            ],
-            description: "Replace legacy basic auth with hardened PKCE OAuth2 flow.".to_string(),
-            logs: Some("Error 401: Unauthorized session token expired".to_string()),
-        };
-
-        let formatted = format_gitpulse_task(&task);
-        assert!(formatted.contains("# Task brief v1"));
-        assert!(formatted.contains("Task: gp-auth-flow"));
-        assert!(formatted.contains("Priority: 1 (High)"));
-        assert!(formatted.contains("- [ ] Validates PKCE challenge"));
-        assert!(formatted.contains("- src/auth.rs"));
-        assert!(formatted.contains("Error 401"));
-
-        let parsed = parse_gitpulse_task(&formatted).expect("parsed");
-        assert_eq!(parsed.id, task.id);
-        assert_eq!(parsed.title, task.title);
-        assert_eq!(parsed.status, task.status);
-        assert_eq!(parsed.priority, task.priority);
-        assert_eq!(parsed.severity, task.severity);
-        assert_eq!(parsed.kind, task.kind);
-        assert_eq!(parsed.owner, task.owner);
-        assert_eq!(parsed.due, task.due);
-        assert_eq!(parsed.labels, task.labels);
-        assert_eq!(parsed.repositories, task.repositories);
-        assert_eq!(parsed.planned_files, task.planned_files);
-        assert_eq!(parsed.acceptance_criteria, task.acceptance_criteria);
-        assert_eq!(parsed.description, task.description);
-        assert_eq!(parsed.logs, task.logs);
-    }
-
-    #[test]
-    fn parse_pure_markdown_without_frontmatter() {
-        let md = r#"# Task brief v1
-
-## Title
-Fix race condition in debounce timer
-
-Task: gp-fix-timer
-Type: bug
-Status: in_progress
-Priority: 0 (Urgent)
-Severity: critical
-Owner: @linus
-Due: 2026-10-06
-Labels: runtime, bug
-
-## Repositories
-- GitPulse
-
-## Description
-A race condition occurs when concurrent timer events fire before cancel.
-
-## Acceptance criteria
-- [ ] Mutex guards state transition
-- [ ] Stress test with 100 concurrent triggers
-
-## Planned files
-- src/watcher/debouncer.rs
-"#;
-
-        let parsed = parse_gitpulse_task(md).expect("parse markdown");
-        assert_eq!(parsed.id, "gp-fix-timer");
-        assert_eq!(parsed.title, "Fix race condition in debounce timer");
-        assert_eq!(parsed.status, "in_progress");
-        assert_eq!(parsed.priority, 0);
-        assert_eq!(parsed.severity, "critical");
-        assert_eq!(parsed.kind, "bug");
-        assert_eq!(parsed.owner, "@linus");
-        assert_eq!(parsed.labels, vec!["runtime", "bug"]);
-        assert_eq!(parsed.repositories, vec!["GitPulse"]);
-        assert_eq!(parsed.acceptance_criteria.len(), 2);
-        assert_eq!(parsed.planned_files, vec!["src/watcher/debouncer.rs"]);
-    }
-
-    #[test]
-    fn add_and_read_task_file_in_temp_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", &repo_path])
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        crate::test_support::trust_repo(dir.path());
-
-        let req = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: "Add offline caching for network requests".to_string(),
-            description: Some("Cache GET requests with TTL in IndexedDB".to_string()),
-            task_id: Some("gp-cache-layer".to_string()),
-            status: Some("ready".to_string()),
-            priority: Some(1),
-            severity: Some("medium".to_string()),
-            kind: Some("feature".to_string()),
-            owner: Some("dev".to_string()),
-            due: Some("2026-11-01".to_string()),
-            labels: Some(vec!["offline".to_string(), "storage".to_string()]),
-            repositories: Some(vec!["GitPulse".to_string()]),
-            planned_files: Some(vec!["src/cache.rs".to_string()]),
-            acceptance_criteria: Some(vec!["TTL is respected".to_string()]),
-            logs: None,
-            tasks_dir: Some("tasks".to_string()),
-            overwrite: Some(false),
-        };
-
-        let result = add_task_file(req).expect("add task");
-        assert!(result.ok);
-        assert_eq!(result.task_id, "gp-cache-layer");
-        assert_eq!(result.file_path, "tasks/gp-cache-layer.md");
-        assert!(Path::new(&result.absolute_path).exists());
-
-        // Read it back
-        let read = get_task_file(&repo_path, Some("tasks"), "gp-cache-layer").expect("get task");
-        assert_eq!(read.task.title, "Add offline caching for network requests");
-        assert_eq!(read.task.status, "ready");
-        assert_eq!(read.task.priority, 1);
-
-        // List it
-        let list = list_task_files(&repo_path, Some("tasks"), None, 50).expect("list tasks");
-        assert_eq!(list.returned, 1);
-        assert_eq!(list.tasks[0].id, "gp-cache-layer");
-        assert_eq!(list.tasks[0].criteria_count, 1);
-
-        // Overwrite without flag fails
-        let dup_req = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: "Another title".to_string(),
-            description: None,
-            task_id: Some("gp-cache-layer".to_string()),
-            status: None,
-            priority: None,
-            severity: None,
-            kind: None,
-            owner: None,
-            due: None,
-            labels: None,
-            repositories: None,
-            planned_files: None,
-            acceptance_criteria: None,
-            logs: None,
-            tasks_dir: Some("tasks".to_string()),
-            overwrite: Some(false),
-        };
-        let dup_err = add_task_file(dup_req).unwrap_err();
-        assert!(dup_err.contains("already exists"));
-
-        // Overwrite with flag succeeds
-        let overwrite_req = NewTaskRequest {
-            repo_path,
-            title: "Updated title".to_string(),
-            description: None,
-            task_id: Some("gp-cache-layer".to_string()),
-            status: None,
-            priority: None,
-            severity: None,
-            kind: None,
-            owner: None,
-            due: None,
-            labels: None,
-            repositories: None,
-            planned_files: None,
-            acceptance_criteria: None,
-            logs: None,
-            tasks_dir: Some("tasks".to_string()),
-            overwrite: Some(true),
-        };
-        let overwrite_res = add_task_file(overwrite_req).expect("overwrite");
-        assert_eq!(overwrite_res.title, "Updated title");
-    }
-
-    #[test]
-    fn path_traversal_attempts_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-
-        let req = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: "Exploit attempt".to_string(),
-            description: None,
-            task_id: Some("../../../escaped".to_string()),
-            status: None,
-            priority: None,
-            severity: None,
-            kind: None,
-            owner: None,
-            due: None,
-            labels: None,
-            repositories: None,
-            planned_files: None,
-            acceptance_criteria: None,
-            logs: None,
-            tasks_dir: Some("tasks".to_string()),
-            overwrite: Some(false),
-        };
-        assert!(add_task_file(req).is_err());
-
-        let req_dir = NewTaskRequest {
-            repo_path,
-            title: "Exploit attempt dir".to_string(),
-            description: None,
-            task_id: Some("legit".to_string()),
-            status: None,
-            priority: None,
-            severity: None,
-            kind: None,
-            owner: None,
-            due: None,
-            labels: None,
-            repositories: None,
-            planned_files: None,
-            acceptance_criteria: None,
-            logs: None,
-            tasks_dir: Some("../../../etc".to_string()),
-            overwrite: Some(false),
-        };
-        assert!(add_task_file(req_dir).is_err());
-    }
-
-    #[test]
-    fn title_slug_auto_generation_when_id_omitted() {
-        let slug = slugify_title("Refactor Database Connection Pool & Cleanup!");
-        assert_eq!(slug, "refactor-database-connection-pool-cleanup");
-    }
-
-    #[test]
-    fn concurrent_task_creation_stress() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", &repo_path])
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        crate::test_support::trust_repo(dir.path());
-
-        let handles: Vec<_> = (0..20)
-            .map(|i| {
-                let repo = repo_path.clone();
-                std::thread::spawn(move || {
-                    let req = NewTaskRequest {
-                        repo_path: repo,
-                        title: format!("Concurrent task {i}"),
-                        description: Some(format!("Description for concurrent task {i}")),
-                        task_id: Some(format!("gp-concurrent-{i:03}")),
-                        status: Some("inbox".to_string()),
-                        priority: Some((i % 4) as u32),
-                        severity: Some("low".to_string()),
-                        kind: Some("task".to_string()),
-                        owner: Some(format!("worker-{i}")),
-                        due: None,
-                        labels: Some(vec!["concurrency".to_string()]),
-                        repositories: Some(vec!["GitPulse".to_string()]),
-                        planned_files: None,
-                        acceptance_criteria: Some(vec!["Done".to_string()]),
-                        logs: None,
-                        tasks_dir: Some("tasks".to_string()),
-                        overwrite: Some(false),
-                    };
-                    add_task_file(req)
-                })
-            })
-            .collect();
-
-        for h in handles {
-            let res = h.join().unwrap().expect("task creation succeeded");
-            assert!(res.ok);
-        }
-
-        let list = list_task_files(&repo_path, Some("tasks"), None, 100).expect("list tasks");
-        assert_eq!(list.total, 20);
-        assert_eq!(list.returned, 20);
-        assert!(!list.truncated);
-    }
-
-    #[test]
-    fn concurrent_duplicate_creation_race() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", &repo_path])
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        crate::test_support::trust_repo(dir.path());
-
-        let handles: Vec<_> = (0..10)
-            .map(|_| {
-                let repo = repo_path.clone();
-                std::thread::spawn(move || {
-                    let req = NewTaskRequest {
-                        repo_path: repo,
-                        title: "Raced Task".to_string(),
-                        description: None,
-                        task_id: Some("gp-raced-task".to_string()),
-                        status: None,
-                        priority: None,
-                        severity: None,
-                        kind: None,
-                        owner: None,
-                        due: None,
-                        labels: None,
-                        repositories: None,
-                        planned_files: None,
-                        acceptance_criteria: None,
-                        logs: None,
-                        tasks_dir: Some("tasks".to_string()),
-                        overwrite: Some(false),
-                    };
-                    add_task_file(req)
-                })
-            })
-            .collect();
-
-        let mut successes = 0;
-        let mut failures = 0;
-        for h in handles {
-            match h.join().unwrap() {
-                Ok(_) => successes += 1,
-                Err(err) => {
-                    assert!(err.contains("already exists"), "unexpected err: {err}");
-                    failures += 1;
-                }
-            }
-        }
-        assert_eq!(successes, 1, "exactly one creation must win the race");
-        assert_eq!(failures, 9, "all racing duplicates must be refused");
-    }
-
-    #[test]
-    fn malformed_and_adversarial_files_in_tasks_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-
-        // 1. Empty file
-        std::fs::write(tasks_dir.join("empty.md"), b"").unwrap();
-        // 2. Corrupted frontmatter
-        std::fs::write(tasks_dir.join("corrupt.md"), b"---\ninvalid yaml: [[\n---\nbody").unwrap();
-        // 3. Dotfile (should be skipped)
-        std::fs::write(tasks_dir.join(".hidden.md"), b"some secret").unwrap();
-        // 4. Non-md file (should be skipped)
-        std::fs::write(tasks_dir.join("notes.txt"), b"some notes").unwrap();
-        // 5. Valid task
-        std::fs::write(
-            tasks_dir.join("valid.md"),
-            b"---\nid: \"valid-task\"\ntitle: \"Valid Task\"\nstatus: inbox\npriority: 2\n---\n# Task brief v1\n",
-        ).unwrap();
-
-        let list = list_task_files(&repo_path, Some("tasks"), None, 50).expect("list tasks");
-        // Only valid.md should be in the listing, corrupted/empty/dotfiles safely ignored
-        assert_eq!(list.returned, 1);
-        assert_eq!(list.tasks[0].id, "valid-task");
-
-        // get_task_file on empty or corrupt should error cleanly without panicking
-        assert!(get_task_file(&repo_path, Some("tasks"), "empty").is_err());
-    }
-
-    #[test]
-    fn unicode_and_boundary_input_validation() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", &repo_path])
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        crate::test_support::trust_repo(dir.path());
-
-        // Oversized title
-        let huge_title = "A".repeat(MAX_TASK_TITLE + 1);
-        let req = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: huge_title,
-            description: None,
-            task_id: None,
-            status: None,
-            priority: None,
-            severity: None,
-            kind: None,
-            owner: None,
-            due: None,
-            labels: None,
-            repositories: None,
-            planned_files: None,
-            acceptance_criteria: None,
-            logs: None,
-            tasks_dir: None,
-            overwrite: None,
-        };
-        assert!(add_task_file(req).is_err());
-
-        // Control characters in title
-        let ctrl_title = "Title\x07With\x1bEscapes";
-        let req_ctrl = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: ctrl_title.to_string(),
-            description: None,
-            task_id: None,
-            status: None,
-            priority: None,
-            severity: None,
-            kind: None,
-            owner: None,
-            due: None,
-            labels: None,
-            repositories: None,
-            planned_files: None,
-            acceptance_criteria: None,
-            logs: None,
-            tasks_dir: None,
-            overwrite: None,
-        };
-        assert!(add_task_file(req_ctrl).is_err());
-
-        // Unicode emoji and multi-lingual characters
-        let unicode_req = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: "Support multilingual UTF-8: 🚀 ログ & 日本語".to_string(),
-            description: Some("Detailed desc: café, naïve, ⚡".to_string()),
-            task_id: Some("gp-unicode-task".to_string()),
-            status: Some("ready".to_string()),
-            priority: Some(2),
-            severity: Some("none".to_string()),
-            kind: Some("feature".to_string()),
-            owner: Some("@ユーザー".to_string()),
-            due: Some("2026-12-31".to_string()),
-            labels: Some(vec!["i18n".to_string(), "日本語".to_string()]),
-            repositories: Some(vec!["GitPulse".to_string()]),
-            planned_files: Some(vec!["src/i18n.rs".to_string()]),
-            acceptance_criteria: Some(vec!["UTF-8 round trip works 💯".to_string()]),
-            logs: None,
-            tasks_dir: None,
-            overwrite: None,
-        };
-        let add_res = add_task_file(unicode_req).expect("add unicode task");
-        assert!(add_res.ok);
-
-        let get_res = get_task_file(&repo_path, None, "gp-unicode-task").expect("get unicode task");
-        assert_eq!(get_res.task.title, "Support multilingual UTF-8: 🚀 ログ & 日本語");
-        assert_eq!(get_res.task.owner, "@ユーザー");
-        assert!(get_res.content.contains("UTF-8 round trip works 💯"));
-    }
-
-    #[test]
-    fn hardened_path_variants_and_dc_store_compatibility() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().to_str().unwrap().to_string();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", &repo_path])
-            .output()
-            .expect("git init");
-        assert!(init.status.success());
-        crate::test_support::trust_repo(dir.path());
-
-        // 1. Create a task with complex raw logs containing backticks
-        let logs_with_backticks = "Error occurred:\n```rust\nlet x = 42;\n```\nExtra `code` quote.";
-        let req = NewTaskRequest {
-            repo_path: repo_path.clone(),
-            title: "Task with embedded backticks in logs".to_string(),
-            description: Some("Context description".to_string()),
-            task_id: Some("gp-backticks-test".to_string()),
-            status: Some("in-progress".to_string()), // hyphenated status
-            priority: Some(1),
-            severity: Some("high".to_string()),
-            kind: Some("bug".to_string()),
-            owner: Some("@bob".to_string()),
-            due: Some("2026-06-01".to_string()),
-            labels: Some(vec!["bug".to_string()]),
-            repositories: Some(vec!["GitPulse".to_string()]),
-            planned_files: Some(vec!["src/main.rs".to_string()]),
-            acceptance_criteria: Some(vec!["Fix backtick escape".to_string()]),
-            logs: Some(logs_with_backticks.to_string()),
-            tasks_dir: None,
-            overwrite: None,
-        };
-        let add_res = add_task_file(req).expect("create task");
-        assert!(add_res.ok);
-        assert_eq!(add_res.status, "in_progress"); // normalized from in-progress
-
-        // 2. Fetch using various path formats:
-        // Bare ID
-        let get1 = get_task_file(&repo_path, None, "gp-backticks-test").expect("get bare id");
-        assert_eq!(get1.task.id, "gp-backticks-test");
-        assert_eq!(get1.task.logs.as_deref(), Some(logs_with_backticks));
-
-        // With .md
-        let get2 = get_task_file(&repo_path, None, "gp-backticks-test.md").expect("get .md");
-        assert_eq!(get2.task.id, "gp-backticks-test");
-
-        // With tasks/ prefix
-        let get3 = get_task_file(&repo_path, None, "tasks/gp-backticks-test.md").expect("get tasks/ prefix");
-        assert_eq!(get3.task.id, "gp-backticks-test");
-
-        // With ./tasks/ prefix
-        let get4 = get_task_file(&repo_path, None, "./tasks/gp-backticks-test.md").expect("get ./tasks/ prefix");
-        assert_eq!(get4.task.id, "gp-backticks-test");
-
-        // 3. Test filter status with hyphenated query
-        let list_hyphen = list_task_files(&repo_path, None, Some("in-progress"), 10).expect("list hyphen");
-        assert_eq!(list_hyphen.total, 1);
-        assert_eq!(list_hyphen.tasks[0].id, "gp-backticks-test");
-
-        // 4. Test dc-store format parsing
-        let dc_brief = r#"# Task brief v1
-
-## Title
-Fix crash on startup
-
-Task: gp-crash-fix (revision 4)
-Updated (Unix seconds): 1774900000
-Type: bug
-Status: In Progress
-Severity: critical
-Owner: @charlie
-Priority: 0 (Urgent)
-Due (Unix seconds): 1775000000
-Labels: stability, core
-Enhancement field locks: none
-
-## Repositories
-- GitPulse [repo-1] (revision 2) — primary
-
-Home workspace: Default
-
-## Description
-Application crashes when reading corrupt cache file.
-
-## Acceptance criteria
-- [ ] Reproduce crash with fixture
-- [ ] Add defensive error handling
-- [ ] Unit tests passing
-
-## Raw logs
-Pasted evidence. Keep stack frames, timestamps, error codes and quoted text exactly as written.
-
-```
-thread 'main' panicked at 'called `Option::unwrap()` on a `None` value'
-src/cache.rs:42:10
-```
-"#;
-        let parsed = parse_gitpulse_task(dc_brief).expect("parse dc-store format");
-        assert_eq!(parsed.id, "gp-crash-fix"); // stripped (revision 4)
-        assert_eq!(parsed.title, "Fix crash on startup");
-        assert_eq!(parsed.status, "in_progress"); // normalized from In Progress
-        assert_eq!(parsed.priority, 0); // parsed from 0 (Urgent)
-        assert_eq!(parsed.severity, "critical");
-        assert_eq!(parsed.kind, "bug");
-        assert_eq!(parsed.owner, "@charlie");
-        assert_eq!(parsed.due, "1775000000"); // extracted from Due (Unix seconds)
-        assert_eq!(parsed.repositories, vec!["GitPulse".to_string()]); // stripped [repo-1] (revision 2) — primary
-        assert_eq!(parsed.acceptance_criteria.len(), 3);
-        assert!(parsed.logs.as_ref().unwrap().contains("panicked at"));
-        assert!(!parsed.logs.as_ref().unwrap().contains("Pasted evidence"));
-
-        // 5. Test frontmatter with string labels for priority
-        let frontmatter_labels = r#"---
-id: gp-label-priority
-title: Label priority test
-status: In Progress
-priority: urgent
-labels:
-  - test
----
-# Task brief v1
-
-## Title
-Label priority test
-"#;
-        let parsed_fm = parse_gitpulse_task(frontmatter_labels).expect("parse frontmatter labels");
-        assert_eq!(parsed_fm.id, "gp-label-priority");
-        assert_eq!(parsed_fm.status, "in_progress");
-        assert_eq!(parsed_fm.priority, 0); // "urgent" -> 0
-    }
-}
+#[path = "file_tasks_tests.rs"]
+mod tests;

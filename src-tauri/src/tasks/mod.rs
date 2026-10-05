@@ -23,10 +23,7 @@
 
 pub mod file_tasks;
 
-pub use file_tasks::{
-    add_task_file, format_gitpulse_task, get_task_file, list_task_files, parse_gitpulse_task,
-    NewTaskRequest, TaskAddResult, TaskFileDetails, TaskGetResult, TaskListResult, TaskSummary,
-};
+pub use file_tasks::{parse_brief, scan_briefs, BriefFile, BriefScan, TaskBrief};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

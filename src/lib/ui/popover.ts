@@ -44,15 +44,23 @@ export type PopoverAnchor =
   /** A point in viewport coordinates — a right-click, or a keyboard menu key. */
   | { kind: "point"; x: number; y: number }
   /**
-   * A trigger element. The panel opens flush with its left edge, `gap` pixels
-   * below it — or above it, for a trigger in the status bar, where "below"
-   * is off the bottom of the window.
+   * A trigger element. The panel opens `gap` pixels below it — or above it,
+   * for a trigger in the status bar, where "below" is off the bottom of the
+   * window. `place` is a preference, not a promise: when that side cannot
+   * hold the panel and the other side can, the panel flips rather than being
+   * clamped back over the trigger that opened it.
+   *
+   * `align` picks which trigger edge the panel lines up with: `"start"`
+   * (default) is flush with its left edge, `"end"` with its right edge — the
+   * spelling for a trigger at the right of a narrow pane, whose panel would
+   * otherwise open across the neighbouring pane.
    */
   | {
       kind: "element";
       element: HTMLElement | null | undefined;
       gap?: number;
       place?: "below" | "above";
+      align?: "start" | "end";
     };
 
 export interface PopoverDismissOptions {
@@ -223,12 +231,24 @@ export function popover(node: HTMLElement, options: PopoverOptions = {}) {
       if (!anchor.element) return;
       const rect = anchor.element.getBoundingClientRect();
       const gap = anchor.gap ?? 0;
-      x = rect.left;
+      // A rect missing its right edge (a renderer-less test double) keeps the
+      // start alignment rather than handing the clamp a NaN.
+      x =
+        anchor.align === "end" && Number.isFinite(rect.right) ? rect.right - width : rect.left;
       // "above" is expressed as a top, not a bottom, so one clamp covers both
       // placements. With a measured height the panel still grows upward as
       // its content grows — and, unlike a raw `bottom:`, it cannot grow off
       // the top of the window.
-      y = anchor.place === "above" ? rect.top - gap - height : rect.bottom + gap;
+      const below = rect.bottom + gap;
+      const above = rect.top - gap - height;
+      // NaN compares false, so a rect missing an edge never "fits" on that
+      // side and never causes a flip toward it.
+      const fitsBelow = below + height <= window.innerHeight - inset;
+      const fitsAbove = above >= inset;
+      // Flip only to a side that holds the panel whole. When neither does,
+      // the asked-for side stands and the clamp below keeps it on screen.
+      const useAbove = anchor.place === "above" ? fitsAbove || !fitsBelow : !fitsBelow && fitsAbove;
+      y = useAbove ? above : below;
     }
 
     const clamped = clampMenuPosition(
