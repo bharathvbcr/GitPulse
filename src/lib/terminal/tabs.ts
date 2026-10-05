@@ -7,6 +7,7 @@
  */
 
 import { isImeComposition } from "../keyboard/imeGuard";
+import type { PermissionMode } from "./agentDefaults";
 
 /** What a tab runs. `shell` is the user's own login shell; the rest are agent CLIs. */
 export type LauncherKind = "shell" | "claude" | "manvi" | "codex" | "grok" | "agy";
@@ -48,6 +49,34 @@ export interface TerminalTab {
    */
   startDir?: string;
   taskRunId?: string;
+  /** Set when this tab picks an ended attempt's Claude Code conversation back up. */
+  resume?: ResumeLaunch;
+}
+
+/**
+ * An ended attempt's Claude Code conversation, picked up again with
+ * `claude --resume <sessionId>`.
+ *
+ * It carries the attempt's own permission mode because a resumed conversation
+ * is the same work continuing: under the host-wide default, an attempt that
+ * was only allowed to inspect would come back able to edit.
+ */
+export interface ResumeLaunch { sessionId: string; mode: PermissionMode }
+
+/** A task attempt's terminal, or — with `resume` — its conversation resumed. */
+export interface TaskLaunch { runId: string; title: string; resume?: ResumeLaunch }
+
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The only session id shape Claude Code's `--resume` and `--session-id` take. */
+export function isSessionId(value: string): boolean { return CANONICAL_UUID.test(value); }
+
+/** The tab already showing this launch, if one is. */
+export function tabFor(state: TabState, launch: TaskLaunch): TerminalTab | undefined {
+  const resume = launch.resume;
+  return resume
+    ? state.tabs.find((tab) => tab.resume?.sessionId === resume.sessionId)
+    : state.tabs.find((tab) => tab.taskRunId === launch.runId);
 }
 
 export interface TabState {
@@ -82,7 +111,7 @@ export function createTab(launcher: LauncherKind, initialPrompt?: string): Termi
   return { id: nextTabId(), launcher, title: null, ...(initialPrompt === undefined ? {} : { initialPrompt }) };
 }
 
-export function initialState(launcher: LauncherKind = "shell", task?: { runId: string; title: string }): TabState {
+export function initialState(launcher: LauncherKind = "shell", task?: TaskLaunch): TabState {
   return openTab({ tabs: [], activeId: null }, launcher, task);
 }
 
@@ -127,15 +156,21 @@ export function paneOnScreen({ visible, mode, splitIds, activeId, tabId }: PaneV
  * Silent refusal is the caller's cue to have disabled the control already;
  * this returning the same object is what makes "nothing happened" checkable.
  */
-export function openTab(state: TabState, launcher: LauncherKind, launch?: string | { runId: string; title: string }): TabState {
+export function openTab(state: TabState, launcher: LauncherKind, launch?: string | TaskLaunch): TabState {
   const task = typeof launch === "object" ? launch : undefined;
   if (task) {
-    const existing = state.tabs.find((tab) => tab.taskRunId === task.runId);
+    const existing = tabFor(state, task);
     if (existing) return { ...state, activeId: existing.id };
   }
   if (!canOpenTab(state)) return state;
   const tab = createTab(launcher, typeof launch === "string" ? launch : undefined);
-  if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
+  if (task?.resume) {
+    // A plain Claude Code tab, not the attempt's: the attempt ended and its
+    // record is final, so this session is the reader's own continuation.
+    if (launcher !== "claude" || !isSessionId(task.resume.sessionId)) return state;
+    tab.resume = { ...task.resume };
+    tab.name = `${task.title} (resumed)`;
+  } else if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
   return { tabs: [...state.tabs, tab], activeId: tab.id };
 }
 

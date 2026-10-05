@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { cancelTaskRun, listHoldingRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
+import { cancelTaskRun, findConversation, listHoldingRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -109,5 +109,20 @@ describe("task attempt transport", () => {
     }
     native.mockResolvedValueOnce(JSON.stringify({ok:true,released:"yes",reason:"x",item:released}));
     await expect(releaseTaskRun("run")).rejects.toMatchObject({code:"protocol_error"});
+  });
+});
+
+describe("resuming a conversation", () => {
+  const SESSION = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+  it("believes only a well-formed answer naming a session Claude Code accepts", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:true,session_id:SESSION,cwd:"/checkout",permission_mode:"inspect",reason:"saved"}));
+    expect(await findConversation("run")).toEqual({resumable:true,sessionId:SESSION,cwd:"/checkout",mode:"inspect",reason:"saved"});
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.conversation",input:'{"id":"run"}'});
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:false,reason:"Claude Code has no saved conversation for this attempt."}));
+    expect(await findConversation("run")).toEqual({resumable:false,reason:"Claude Code has no saved conversation for this attempt."});
+    for (const change of [{session_id:"run"},{session_id:null},{permission_mode:"everything"},{cwd:7},{resumable:"yes"},{ok:false}]) {
+      native.mockResolvedValueOnce(JSON.stringify({ok:true,resumable:true,session_id:SESSION,cwd:"/checkout",permission_mode:"edit",reason:"saved",...change}));
+      await expect(findConversation("run")).rejects.toMatchObject({code:"protocol_error"});
+    }
   });
 });

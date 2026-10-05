@@ -87,13 +87,16 @@ pub(super) fn spawn<R: tauri::Runtime>(
         return Err(WorkbenchError::new("launch_consumed", "This attempt was already claimed or ended. Inspect its run state; starting again requires a new attempt."));
     }
     let program = terminal_command::program(&source.provider)?;
+    // Read once, so the flags the build is checked for are the flags it gets.
+    let notify = crate::tool_config::session_alerts().configure_agents;
     terminal_command::check(
         &program,
         &source.cwd,
         &source.provider,
         &source.permission_mode,
+        notify,
     )?;
-    start(app, terminals, state, launch, source, program)
+    start(app, terminals, state, launch, source, program, notify)
 }
 
 fn start<R: tauri::Runtime>(
@@ -103,6 +106,7 @@ fn start<R: tauri::Runtime>(
     launch: Launch,
     source: Source,
     program: String,
+    notify: bool,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     let brief = terminal_command::BriefFile::create(&source.brief.markdown)?;
     let args = terminal_command::arguments(
@@ -111,6 +115,11 @@ fn start<R: tauri::Runtime>(
         source.bypass_acknowledged,
         &source.cwd,
         &brief.path,
+        &terminal_command::Extras {
+            run_id: Some(&source.id),
+            brief_dir: Some(&brief.dir),
+            notify,
+        },
     )?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -371,6 +380,7 @@ mod tests {
             launch(),
             source(&state),
             program,
+            false,
         )
         .unwrap();
         let running = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -465,6 +475,7 @@ mod tests {
             launch(),
             source(&state),
             program,
+            false,
         )
         .unwrap();
         state.shutdown();
@@ -508,7 +519,8 @@ mod tests {
             root.path()
                 .join("removed-provider")
                 .to_string_lossy()
-                .into_owned()
+                .into_owned(),
+            false
         )
         .is_err());
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -541,7 +553,8 @@ mod tests {
             &state,
             launch(),
             source(&state),
-            program
+            program,
+            false,
         )
         .is_err());
         received.recv_timeout(Duration::from_secs(5)).unwrap();

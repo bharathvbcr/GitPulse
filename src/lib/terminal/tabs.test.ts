@@ -9,6 +9,7 @@ import {
   initialState,
   launcherLabel,
   openTab,
+  tabFor,
   setTabTitle,
   tabLabel,
   terminalTabChord,
@@ -235,4 +236,35 @@ it("bounds stored titles and consumes repeated tab chords without shell input", 
   const next = setTabTitle(state, state.tabs[0].id, "x".repeat(100000));
   expect(next.tabs[0].title?.length).toBeLessThanOrEqual(256);
   expect(terminalTabChord({key:"W", ctrlKey:true, metaKey:false, shiftKey:true, altKey:false, repeat:true})).toBe("ignore");
+});
+
+describe("a resumed conversation's tab", () => {
+  const SESSION = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+  const resume = { runId: "run-1", title: "Fix the importer", resume: { sessionId: SESSION, mode: "inspect" as const } };
+
+  it("is a plain Claude tab carrying the session and the attempt's mode, not the attempt", () => {
+    const state = openTab(initialState(), "claude", resume);
+    const tab = state.tabs.find((item) => item.id === state.activeId)!;
+    expect(tab.launcher).toBe("claude");
+    expect(tab.resume).toEqual({ sessionId: SESSION, mode: "inspect" });
+    expect(tab.taskRunId).toBeUndefined();
+    expect(tabLabel(tab)).toContain("(resumed)");
+  });
+
+  it("is focused rather than opened twice, and never confused with the attempt's own tab", () => {
+    const withAttempt = openTab(initialState(), "claude", { runId: "run-1", title: "Fix the importer" });
+    const resumed = openTab(withAttempt, "claude", resume);
+    expect(resumed.tabs).toHaveLength(withAttempt.tabs.length + 1);
+    const again = openTab(openTab(resumed, "shell"), "claude", resume);
+    expect(again.tabs).toHaveLength(resumed.tabs.length + 1);
+    expect(again.activeId).toBe(resumed.activeId);
+    expect(tabFor(again, resume)?.id).toBe(resumed.activeId);
+    expect(tabFor(again, { runId: "run-1", title: "x" })?.taskRunId).toBe("run-1");
+  });
+
+  it("opens nothing for a launcher or session id Claude Code would refuse", () => {
+    const start = initialState();
+    expect(openTab(start, "codex", resume)).toBe(start);
+    expect(openTab(start, "claude", { ...resume, resume: { sessionId: "run-1", mode: "edit" as const } })).toBe(start);
+  });
 });

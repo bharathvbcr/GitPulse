@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, State};
 
 mod agent_worktree;
+mod conversation;
 pub(crate) mod external_changes;
 pub(crate) mod intake;
 mod managed_run;
@@ -245,6 +246,9 @@ impl WorkbenchState {
         }
         if method == "runs.release" {
             return reconcile::release(self, input);
+        }
+        if method == "runs.conversation" {
+            return conversation::find(self, input);
         }
         if matches!(
             method,

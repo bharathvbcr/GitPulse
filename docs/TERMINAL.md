@@ -75,7 +75,18 @@ Saved tasks can also launch a dedicated terminal session from their run controls
 GitPulse binds the launch to the saved brief, selected checkout and a single run
 attempt. Reattaching keeps the same live process and scrollback; ended attempts
 need an explicit new launch from task details. Process exit does not accept the
-task. These handoffs remain user-controlled CLI sessions; structured managed-run
+task; the agent marks it Done or Review itself through the GitPulse MCP server.
+
+A task's agent gets the same notification flags as an agent tab (*Configure
+agent CLIs GitPulse launches* in the session notification settings), so one waiting on a permission prompt in a
+hidden tab still raises an alert. Claude Code is also given the attempt's id as
+its session id and the brief's private folder as a readable directory. An ended
+Claude Code attempt offers **Resume conversation**: GitPulse looks for the
+transcript Claude Code saved for that session and, if it is there, opens a new
+Claude Code tab in the attempt's checkout with `claude --resume`, in the
+attempt's own permission mode. If there is no saved conversation (attempts
+launched before this, or one Claude never got as far as saving), or its checkout
+has been removed, it says so instead of opening a tab. These handoffs remain user-controlled CLI sessions; structured managed-run
 questions and approvals use the separate Manvi protocol. See
 [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for copying, permissions and
 verification limits.

@@ -8,8 +8,7 @@
     <script type="module">
       import { mockIPC } from "@tauri-apps/api/mocks";
       import { emit } from "@tauri-apps/api/event";
-      import { agentNotifyArgs, agentPromptArgs } from "../src/lib/terminal/launchRequests";
-      import { sessionAlertSettings } from "../src/lib/stores/sessionAlertsStore";
+      import { agentPromptArgs } from "../src/lib/terminal/launchRequests";
       import "../src/app.css";
       // `?mode=ojas` (or any fixture mode) opens on that fixture, for looking at it.
       let mode = new URL(location.href).searchParams.get("mode") ?? "empty";
@@ -128,17 +127,13 @@
         select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); await tick();
       };
       const launch = async agent => { await choose("Coverage coding agent", agent); button(agent === "codex" ? "Run in Codex" : "Run in Claude Code").click(); };
-      // Derived, never transcribed. The configuration flags a launched CLI
-      // carries are owned by launchRequests.ts and read through the same
-      // toggle the terminal reads; a harness that restated the argv here
-      // reported "wrong prompt" the moment that owner gained a flag, which is
-      // precisely what it did. What stays pinned is the part this file is
-      // actually about: the preview reaches the CLI as one literal argument,
-      // last, exactly once, and nothing is typed into a shell.
-      const expectedArgv = (kind, text) => [
-        ...agentNotifyArgs(kind, sessionAlertSettings().configure_agents),
-        ...agentPromptArgs(kind, text),
-      ];
+      // Derived, never transcribed. The renderer sends only the prompt; the
+      // notification and permission flags are added by the backend at spawn
+      // (`terminal_command::notify_flags`), so they never reach this mock.
+      // What stays pinned is the part this file is actually about: the
+      // preview reaches the CLI as one literal argument, last, exactly once,
+      // and nothing is typed into a shell.
+      const expectedArgv = (kind, text) => [...agentPromptArgs(kind, text)];
       const checks = document.querySelector("#checks");
       checks.disabled = false;
       checks.onclick = async () => {

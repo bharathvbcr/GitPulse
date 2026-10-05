@@ -2,6 +2,7 @@ import { invoke } from "../ipc/invoke";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";
+import { isSessionId } from "../terminal/tabs";
 import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
@@ -59,7 +60,7 @@ export type TaskDraft = Omit<Task, keyof RecordVersion>;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -458,6 +459,24 @@ export async function releaseTaskRun(id: string): Promise<RunRelease> {
   const run = taskRun(raw.item);
   if (run.id !== id || (raw.released && (run.state !== "exited" || !run.outcome_uncertain))) return invalid();
   return { released: raw.released, reason: text(raw.reason), run };
+}
+export type RunConversation =
+  | { resumable: true; sessionId: string; cwd: string; mode: PermissionMode; reason: string }
+  | { resumable: false; reason: string };
+/**
+ * Whether an ended attempt's Claude Code conversation can be resumed. The host
+ * answers from the transcript Claude Code saved, so `resumable` is evidence,
+ * not an inference from the attempt's id; `reason` says what it found either
+ * way, including "could not check".
+ */
+export async function findConversation(id: string): Promise<RunConversation> {
+  const raw = object(await request("runs.conversation", { id }));
+  if (raw.ok !== true || typeof raw.resumable !== "boolean") return invalid();
+  if (!raw.resumable) return { resumable: false, reason: text(raw.reason) };
+  const mode = PERMISSION_MODES.find((mode) => mode === raw.permission_mode) ?? invalid();
+  const sessionId = text(raw.session_id);
+  if (!isSessionId(sessionId)) return invalid();
+  return { resumable: true, sessionId, cwd: text(raw.cwd), mode, reason: text(raw.reason) };
 }
 export async function cancelTaskRun(run: TaskRun): Promise<TaskRun> {
   const saved = record(await request("runs.cancel", { id: run.id, expected_revision: run.revision, request_id: newID() }), taskRun);

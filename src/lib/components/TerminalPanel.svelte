@@ -7,7 +7,7 @@
   import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
-  import { taskTerminalRequests, consumeTaskTerminal, requestFor } from "../terminal/taskLaunches";
+  import { taskTerminalRequests, consumeTaskTerminalRequest, requestFor } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
@@ -57,6 +57,7 @@
     initialState,
     launcherLabel,
     openTab,
+    tabFor,
     paneOnScreen,
     setTabStartDir,
     setTabTitle,
@@ -165,7 +166,7 @@
   function initialTabs(): TabState {
     if (get(terminalLaunchRequests)?.repoPath === repoPath) return { tabs: [], activeId: null };
     const request = requestFor(get(taskTerminalRequests), repoPath, { caseInsensitive: isCaseInsensitiveFs() });
-    return request ? initialState(request.provider, { runId: request.runId, title: request.title }) : initialState();
+    return request ? initialState(request.provider, request) : initialState();
   }
   let tabState = $state<TabState>(untrack(initialTabs));
   const activeId = $derived(tabState.activeId);
@@ -327,11 +328,11 @@
 
   $effect(() => {
     const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
-    if (!request || (!canCreate && !tabState.tabs.some((tab) => tab.taskRunId === request.runId))) return;
+    if (!request || (!canCreate && !tabFor(tabState, request))) return;
     untrack(() => {
-      tabState = openTab(tabState, request.provider, { runId: request.runId, title: request.title });
+      tabState = openTab(tabState, request.provider, request);
       mode = "shell";
-      consumeTaskTerminal(request.runId);
+      consumeTaskTerminalRequest(request);
     });
   });
 
@@ -1050,6 +1051,7 @@
           >
             <TerminalSession
               taskRunId={tab.taskRunId}
+              resume={tab.resume}
               bind:this={sessions[tab.id]}
               repoPath={repoPath}
               tabId={tab.id}

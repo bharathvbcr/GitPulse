@@ -6,14 +6,16 @@ const setTerminalOpen = vi.fn();
 const setGlobalSurface = vi.fn();
 vi.mock("../stores/repoStore", () => ({ repoStore: { openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args) } }));
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (...args: unknown[]) => setGlobalSurface(...args) } }));
+const findConversation = vi.fn();
+vi.mock("./client", () => ({ findConversation: (...args: unknown[]) => findConversation(...args) }));
 
-const { openTaskTerminal, queuedTerminalNote } = await import("./taskTerminal");
-const { consumeTaskTerminal, taskTerminalRequests } = await import("../terminal/taskLaunches");
+const { openTaskTerminal, queuedTerminalNote, resumeTaskConversation } = await import("./taskTerminal");
+const { consumeTaskTerminalRequest, taskTerminalRequests } = await import("../terminal/taskLaunches");
 
 const run = (id: string, cwd: string) => ({ id, cwd, provider: "claude" as const, task_title: `Task ${id}` });
 
-beforeEach(() => { openRepo.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); });
-afterEach(() => { for (const request of get(taskTerminalRequests)) consumeTaskTerminal(request.runId); });
+beforeEach(() => { openRepo.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); });
+afterEach(() => { for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request); });
 
 describe("openTaskTerminal", () => {
   it("queues the request before the checkout opens, then shows the dock", async () => {
@@ -53,5 +55,25 @@ describe("openTaskTerminal", () => {
   it("says where the queued terminal will appear", () => {
     expect(queuedTerminalNote("/work/repo/.gitpulse/worktrees/fix-a1b2c3d4")).toContain("fix-a1b2c3d4's terminal dock");
     expect(queuedTerminalNote("C:\\work\\repo\\")).toContain("repo's terminal dock");
+  });
+});
+
+describe("resumeTaskConversation", () => {
+  const SESSION = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+  it("reopens the saved conversation where the host found it, in the attempt's mode", async () => {
+    findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a/.gitpulse/worktrees/fix-1", mode: "inspect", reason: "saved" });
+    openRepo.mockImplementation(async (_path: string, options: { onReady: () => void }) => { options.onReady(); return true; });
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "opened" });
+    expect(openRepo).toHaveBeenCalledWith("/work/a/.gitpulse/worktrees/fix-1", expect.anything());
+    expect(get(taskTerminalRequests)).toEqual([
+      { runId: "a", repoPath: "/work/a/.gitpulse/worktrees/fix-1", provider: "claude", title: "Fix", resume: { sessionId: SESSION, mode: "inspect" } },
+    ]);
+  });
+
+  it("opens nothing when there is nothing to resume, and says why", async () => {
+    findConversation.mockResolvedValueOnce({ resumable: false, reason: "Claude Code has no saved conversation for this attempt." });
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "unavailable", reason: "Claude Code has no saved conversation for this attempt." });
+    expect(openRepo).not.toHaveBeenCalled();
+    expect(get(taskTerminalRequests)).toEqual([]);
   });
 });

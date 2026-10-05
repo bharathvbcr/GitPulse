@@ -87,8 +87,8 @@
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
-  import { launcherLabel, type LauncherKind } from "../terminal/tabs";
-  import { agentNotifyArgs, agentPromptArgs } from "../terminal/launchRequests";
+  import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
+  import { agentPromptArgs } from "../terminal/launchRequests";
   import {
     effectiveMode,
     PERMISSION_LABELS,
@@ -96,11 +96,7 @@
     type PermissionMode,
   } from "../terminal/agentDefaults";
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
-  import {
-    loadSessionAlerts,
-    sessionAlertSettings,
-    terminalAttendance,
-  } from "../stores/sessionAlertsStore";
+  import { terminalAttendance } from "../stores/sessionAlertsStore";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -135,6 +131,7 @@
     initialPrompt,
     startDir,
     taskRunId,
+    resume,
     active,
     onscreen = false,
     onTitle,
@@ -150,6 +147,8 @@
     /** Repository-relative directory to start in; absent starts at the root. */
     startDir?: string;
     taskRunId?: string;
+    /** Pick an ended attempt's Claude Code conversation back up, in its own mode. */
+    resume?: ResumeLaunch;
     active: boolean;
     /**
      * Whether the user can actually see this session right now — the selected
@@ -182,17 +181,9 @@
    */
   let nativeSessionId = "";
   /**
-   * Whether GitPulse adds each CLI's notification flags to this launch.
-   *
-   * Read once, before the spawn, because it becomes argv. A change takes
-   * effect on the next session rather than this one, which is the only thing
-   * a command line can mean.
-   */
-  let configureAgents = sessionAlertSettings().configure_agents;
-  /**
    * The permission mode this tab launches with, or null for the CLI's own
-   * default. Read once before the spawn for the same reason `configureAgents`
-   * is: it becomes argv, and a change can only mean the next session.
+   * default. Read once before the spawn because it becomes argv, and a change
+   * can only mean the next session.
    */
   let permissionMode: PermissionMode | null = null;
   /**
@@ -500,10 +491,12 @@
     // other GitPulse spawn uses — a GUI-launched app's own PATH does not
     // contain the directories these CLIs install into.
     //
-    // Notification flags come first. Claude Code's prompt form is `-- <text>`,
-    // after which everything is positional, so a flag appended behind it would
-    // be read as part of the prompt.
-    const args = [...agentNotifyArgs(kind, configureAgents), ...(agentPromptArgs(kind, initialPrompt) ?? [])];
+    // Only the prompt. The notification flags and the permission flags are
+    // the backend's (`terminal_command::notify_flags` / `policy`), added in
+    // front of these at spawn so they can never land behind Claude Code's
+    // `-- <text>` and be read as prompt — and so a task attempt, which never
+    // passes through here, gets the same ones.
+    const args = resume ? ["--resume", resume.sessionId] : agentPromptArgs(kind, initialPrompt) ?? [];
     return kind === "shell" ? {} : { program: kind, args };
   }
 
@@ -517,6 +510,9 @@
    */
   function resolvePermissionMode(): PermissionMode | null {
     if (taskRunId) return null;
+    // A resumed conversation continues the attempt, so it keeps that
+    // attempt's mode rather than taking the host-wide default.
+    if (resume) return resume.mode;
     const view = agentDefaults();
     return effectiveMode(view.defaults, launcher, view.launchers);
   }
@@ -920,12 +916,10 @@
     });
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
     lifecycle = createLifecycle();
-    // Awaited before the spawn so the launch arguments reflect the saved
-    // setting rather than the default the store starts at. A failure keeps
-    // that default, which is the shipped behaviour and not silence.
-    void Promise.allSettled([loadSessionAlerts(), loadAgentDefaults()])
-      .then(([alerts]) => {
-        if (alerts.status === "fulfilled") configureAgents = alerts.value.settings.configure_agents;
+    // Awaited before the spawn so the launch reflects the saved default mode
+    // rather than the one the store starts at.
+    void Promise.allSettled([loadAgentDefaults()])
+      .then(() => {
         // Read after the load settles, from the store rather than the
         // resolved value, so a failed read falls back to "the CLI's own
         // default" rather than to a stale mode.

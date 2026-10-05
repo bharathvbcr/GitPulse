@@ -13,7 +13,7 @@
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore } from "../stores/repoStore";
 import { enqueueTaskTerminal } from "../terminal/taskLaunches";
-import type { TaskRun } from "./client";
+import { findConversation, type TaskRun } from "./client";
 
 export type TaskTerminalOutcome = "opened" | "queued";
 
@@ -21,8 +21,35 @@ export async function openTaskTerminal(
   run: Pick<TaskRun, "id" | "cwd" | "provider" | "task_title">,
 ): Promise<TaskTerminalOutcome> {
   enqueueTaskTerminal({ runId: run.id, repoPath: run.cwd, provider: run.provider, title: run.task_title });
+  return showCheckout(run.cwd);
+}
+
+/**
+ * Picks an ended attempt's Claude Code conversation back up in a new tab in
+ * its checkout, under the attempt's own permission mode.
+ *
+ * The host decides whether there is a conversation (from the transcript
+ * Claude Code saved), so an attempt with nothing to resume is answered with
+ * the reason rather than a tab that opens only to say "No conversation found".
+ */
+export async function resumeTaskConversation(
+  run: Pick<TaskRun, "id" | "task_title">,
+): Promise<{ outcome: TaskTerminalOutcome } | { outcome: "unavailable"; reason: string }> {
+  const conversation = await findConversation(run.id);
+  if (!conversation.resumable) return { outcome: "unavailable", reason: conversation.reason };
+  enqueueTaskTerminal({
+    runId: run.id,
+    repoPath: conversation.cwd,
+    provider: "claude",
+    title: run.task_title,
+    resume: { sessionId: conversation.sessionId, mode: conversation.mode },
+  });
+  return { outcome: await showCheckout(conversation.cwd) };
+}
+
+async function showCheckout(cwd: string): Promise<TaskTerminalOutcome> {
   let ready = false;
-  const opened = await repoStore.openRepo(run.cwd, {
+  const opened = await repoStore.openRepo(cwd, {
     onReady: () => {
       ready = true;
       interfaceStore.setGlobalSurface("repository");

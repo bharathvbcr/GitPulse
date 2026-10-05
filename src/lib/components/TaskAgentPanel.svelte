@@ -20,7 +20,7 @@
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { consumeTaskTerminal } from "../terminal/taskLaunches";
-  import { openTaskTerminal, queuedTerminalNote } from "../workbench/taskTerminal";
+  import { openTaskTerminal, queuedTerminalNote, resumeTaskConversation } from "../workbench/taskTerminal";
   import {
     cancelTaskRun,
     explainError,
@@ -70,6 +70,12 @@
   };
   /** States whose terminal can still be opened (an `unresolved` one cannot). */
   const OPENABLE = ["prepared", "starting", "running"];
+  /**
+   * Ended states whose Claude Code conversation may be resumable. Offered, not
+   * promised: the host answers from the transcript Claude Code saved, and says
+   * why when there is none.
+   */
+  const RESUMABLE = ["exited", "failed", "cancelled"];
   /**
    * One instant per render pass, refreshed wherever polling is reconsidered.
    *
@@ -211,6 +217,16 @@
     finally { busy = false; }
   }
   async function reopen(run: TaskRun) { busy = true; try { await open(run); } catch (cause) { error = explainError(cause); } finally { busy = false; } }
+  async function resume(run: TaskRun) {
+    busy = true; error = ""; note = "";
+    try {
+      const result = await resumeTaskConversation(run);
+      if (disposed) return;
+      if (result.outcome === "unavailable") note = result.reason;
+      else if (result.outcome === "queued") note = queuedTerminalNote(run.cwd);
+    } catch (cause) { error = explainError(cause); }
+    finally { busy = false; }
+  }
 </script>
 
 <section class="task-runs" aria-label="Task agent runs" data-testid="task-agent-panel">
@@ -251,7 +267,7 @@
       </button>
       {#if !gate.ok && gate.reason}<span class="meta gate">{gate.reason}</span>{/if}
     </div>
-    <p class="meta">Completing a run leaves task acceptance for review.</p>
+    <p class="meta">An agent with the GitPulse MCP server moves this task to Done — or to Review, saying what remains — when it finishes. Its process ending never does.</p>
   </div>
 
   {#if note}<p role="status">{note}</p>{/if}
@@ -289,6 +305,7 @@
           </section>
         {/if}
       {/if}
+      {#if run.provider === "claude" && RESUMABLE.includes(run.state)}<button class="gp-btn" type="button" onclick={() => resume(run)} disabled={busy} title="Opens a new Claude Code tab in this attempt's checkout that continues its conversation, in the same permission mode.">Resume conversation</button>{/if}
       {#if run.state === "prepared"}<button class="gp-btn" type="button" onclick={() => cancel(run)} disabled={busy}>Cancel preparation</button>{/if}
       {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={busy} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released.">Release checkout</button>{/if}
       {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}

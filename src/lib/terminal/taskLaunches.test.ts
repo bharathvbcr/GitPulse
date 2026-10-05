@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { consumeTaskTerminal, enqueueTaskTerminal, requestFor, taskTerminalRequests } from "./taskLaunches";
+import { consumeTaskTerminal, consumeTaskTerminalRequest, enqueueTaskTerminal, requestFor, taskTerminalRequests } from "./taskLaunches";
 import { MAX_LIVE_RUNS } from "../workbench/vocabulary";
 
-afterEach(() => { for (const request of get(taskTerminalRequests)) consumeTaskTerminal(request.runId); });
+afterEach(() => { for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request); });
 describe("task terminal requests", () => {
   it("deduplicates by attempt across repositories", () => {
     enqueueTaskTerminal({ runId: "a", repoPath: "/one", provider: "claude", title: "First" });
@@ -41,5 +41,28 @@ describe("task terminal requests", () => {
     expect(requestFor(requests, "/work/repo", insensitive)).toBeUndefined();
     expect(requestFor(requests, null, insensitive)).toBeUndefined();
     expect(requestFor(requests, "", insensitive)).toBeUndefined();
+  });
+});
+
+describe("resumed conversations in the task terminal queue", () => {
+  const SESSION = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+  it("keys a resumed conversation apart from the attempt's own terminal", () => {
+    enqueueTaskTerminal({ runId: "a", repoPath: "/one", provider: "claude", title: "First" });
+    enqueueTaskTerminal({ runId: "a", repoPath: "/one", provider: "claude", title: "First", resume: { sessionId: SESSION, mode: "inspect" } });
+    // The same conversation twice is one request, however its id is cased.
+    enqueueTaskTerminal({ runId: "a", repoPath: "/one", provider: "claude", title: "First", resume: { sessionId: SESSION.toUpperCase(), mode: "inspect" } });
+    expect(get(taskTerminalRequests)).toHaveLength(2);
+    // Cancelling the attempt withdraws its terminal, not the reader's resume.
+    consumeTaskTerminal("a");
+    expect(get(taskTerminalRequests).map((request) => request.resume?.sessionId)).toEqual([SESSION]);
+    consumeTaskTerminalRequest(get(taskTerminalRequests)[0]);
+    expect(get(taskTerminalRequests)).toEqual([]);
+  });
+
+  it("refuses a resume Claude Code could not act on", () => {
+    for (const [provider, sessionId] of [["codex", SESSION], ["claude", "run-1"], ["claude", `${SESSION}x`], ["claude", ""]] as const) {
+      expect(() => enqueueTaskTerminal({ runId: "a", repoPath: "/one", provider, title: "First", resume: { sessionId, mode: "edit" } })).toThrow(/resumed/);
+    }
+    expect(get(taskTerminalRequests)).toEqual([]);
   });
 });

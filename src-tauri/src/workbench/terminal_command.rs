@@ -13,7 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// The brief, alone in a private directory of its own.
+///
+/// A directory rather than a file in the shared temp root because that
+/// directory is what the agent is granted (`--add-dir`): Claude Code confines
+/// its file tools to the working directories, so a brief outside the checkout
+/// was a read the agent had to ask for — or, under `dontAsk`, was refused —
+/// before it knew what the task was. Granting the temp root itself would hand
+/// it every other program's scratch files.
 pub(super) struct BriefFile {
+    pub dir: PathBuf,
     pub path: PathBuf,
     _file: File,
 }
@@ -33,11 +42,23 @@ impl BriefFile {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| error("file_error", e.to_string()))?
             .as_nanos();
-        let path = root.join(format!(
-            "gitpulse-task-{}-{tick}-{}.md",
+        let dir = root.join(format!(
+            "gitpulse-task-{}-{tick}-{}",
             std::process::id(),
             FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        // Not recursive: an existing directory at this name is refused rather
+        // than adopted, so a planted one cannot become the agent's grant.
+        builder
+            .create(&dir)
+            .map_err(|e| error("file_error", e.to_string()))?;
+        let path = dir.join("task-brief.md");
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -45,10 +66,19 @@ impl BriefFile {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options
-            .open(&path)
-            .map_err(|e| error("file_error", e.to_string()))?;
-        let mut brief = Self { path, _file: file };
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(error("file_error", e.to_string()));
+            }
+        };
+        // From here `Drop` owns the cleanup of both the file and the directory.
+        let mut brief = Self {
+            dir,
+            path,
+            _file: file,
+        };
         brief
             ._file
             .write_all(markdown.as_bytes())
@@ -59,12 +89,110 @@ impl BriefFile {
 }
 impl Drop for BriefFile {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                log::warn!(target: "workbench", "could not remove the temporary task brief: {error}");
+        for (what, result) in [
+            ("brief", std::fs::remove_file(&self.path)),
+            ("brief directory", std::fs::remove_dir(&self.dir)),
+        ] {
+            if let Err(error) = result {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(target: "workbench", "could not remove the temporary task {what}: {error}");
+                }
             }
         }
     }
+}
+
+/// Each agent CLI's own documented, **session-scoped** notification override:
+/// the flags that make it speak to a GitPulse terminal at all.
+///
+/// Neither Claude Code nor Codex says anything here by default. Claude Code
+/// sends a desktop notification only in Ghostty, kitty and iTerm2 and is
+/// otherwise silent unless `preferredNotifChannel` is set; Codex probes for a
+/// terminal it recognises and falls back to nothing it can be sure of. So an
+/// agent stopped on a permission prompt in a hidden tab with no sign at all.
+///
+/// * `claude --settings '<json>'` sits above the user's files and below
+///   managed settings, merges key by key — a key not named here keeps its
+///   value from wherever it was set — lasts one session and writes no file.
+///   Exactly one key, so nothing the user set is overridden.
+/// * `codex -c key=value` is parsed as TOML for that invocation. The inner
+///   quotes are TOML, not shell: these are argv entries and nothing expands
+///   them. `notification_condition = "always"` because Codex can only guess
+///   at focus from escape sequences, while GitPulse knows which tab is on
+///   screen and decides itself.
+///
+/// Launchers absent here get nothing: Grok, Antigravity and Manvi publish no
+/// notification setting this code has read, and an invented flag would at
+/// best be ignored and at worst refuse to start. Their own bells and OSC
+/// notifications still reach the user, because detection does not depend on
+/// this.
+///
+/// This is the only copy. Both launch paths — a plain agent tab
+/// ([`with_notify_flags`], from `cmd_terminal_spawn`) and a task attempt
+/// ([`arguments`]) — read it, so the task lane can no longer be the one that
+/// forgot, which it was.
+pub(crate) fn notify_flags(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &["--settings", r#"{"preferredNotifChannel":"terminal_bell"}"#],
+        "codex" => &[
+            "-c",
+            "tui.notifications=true",
+            "-c",
+            r#"tui.notification_method="osc9""#,
+            "-c",
+            r#"tui.notification_condition="always""#,
+        ],
+        _ => &[],
+    }
+}
+
+/// A plain agent tab's arguments with the notification flags in front.
+///
+/// In front because Claude Code's prompt form is `-- <text>`, after which
+/// every argument is positional: a flag appended behind the prompt becomes
+/// part of what the user asked for. [`apply_permission_mode`] then puts the
+/// policy flags in front of these, so the order is policy, notify, caller.
+pub(crate) fn with_notify_flags(
+    program: Option<&str>,
+    notify: bool,
+    args: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let flags = program
+        .map(str::trim)
+        .filter(|_| notify)
+        .map(notify_flags)
+        .unwrap_or_default();
+    if flags.is_empty() {
+        return args;
+    }
+    let mut out: Vec<String> = flags.iter().map(|flag| (*flag).to_owned()).collect();
+    out.extend(args.unwrap_or_default());
+    Some(out)
+}
+
+/// Whether `id` is a UUID in the canonical 8-4-4-4-12 hex form, which is the
+/// only form Claude Code's `--session-id` accepts.
+pub(crate) fn is_canonical_uuid(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// What a task attempt adds to its provider's argv beyond policy and prompt.
+#[derive(Default)]
+pub(super) struct Extras<'a> {
+    /// The attempt's id, passed to Claude Code as `--session-id` when it is a
+    /// canonical UUID so the conversation can be found and resumed by the id
+    /// GitPulse already holds. Any other shape is omitted, never reshaped: a
+    /// derived id would be one nothing else could look up.
+    pub run_id: Option<&'a str>,
+    /// The brief's private directory, granted to Claude Code with `--add-dir`.
+    pub brief_dir: Option<&'a Path>,
+    /// Whether to add [`notify_flags`].
+    pub notify: bool,
 }
 
 fn error(code: &str, message: impl Into<String>) -> WorkbenchError {
@@ -111,6 +239,7 @@ pub(super) fn check(
     cwd: &str,
     provider: &str,
     mode: &str,
+    notify: bool,
 ) -> Result<(), WorkbenchError> {
     let version = capture_command(
         program,
@@ -128,7 +257,7 @@ pub(super) fn check(
         &[],
     )
     .map_err(|e| error("capability_error", e))?;
-    advertises(provider, mode, &version, &help)
+    advertises(provider, mode, notify, &version, &help)
 }
 
 /// Whether what a build *said* proves it can be launched the way `mode` asks.
@@ -139,9 +268,14 @@ pub(super) fn check(
 /// spawns made every case here wait on a child reaching `main` inside eight
 /// seconds — a bound on host load, not on any of this. `capture_command` owns
 /// the other half, that the spawn happens and its output comes back.
+///
+/// Every flag [`arguments`] will pass is proved here, not only the policy
+/// ones: a build that does not know `--add-dir` or `--settings` would refuse
+/// to start, or worse read the flag's value as the prompt.
 fn advertises(
     provider: &str,
     mode: &str,
+    notify: bool,
     version: &CapturedOutput,
     help: &CapturedOutput,
 ) -> Result<(), WorkbenchError> {
@@ -186,6 +320,7 @@ fn advertises(
     let required: &[&str] = match provider {
         "codex" => &["--cd"],
         "grok" => &["--cwd"],
+        "claude" => &["--session-id", "--add-dir"],
         "agy" => &[
             "--mode",
             "--prompt-interactive",
@@ -193,10 +328,14 @@ fn advertises(
         ],
         _ => &[],
     };
+    let notifying = notify_flags(provider)
+        .iter()
+        .filter(|flag| notify && flag.starts_with('-'));
     if !identity
         || !supported
         || required
             .iter()
+            .chain(notifying)
             .any(|flag| !advertised_option(help, flag, None))
     {
         return Err(error(
@@ -422,6 +561,7 @@ pub(super) fn arguments(
     acknowledged: bool,
     cwd: &str,
     brief: &Path,
+    extras: &Extras<'_>,
 ) -> Result<Vec<String>, WorkbenchError> {
     if (mode == "bypass") != acknowledged {
         return Err(error(
@@ -435,11 +575,28 @@ pub(super) fn arguments(
         .ok_or_else(|| error("file_error", "Task brief path is not Unicode."))?;
     let quoted = serde_json::to_string(path).map_err(|e| error("file_error", e.to_string()))?;
     let mut args: Vec<String> = flags.into_iter().map(String::from).collect();
+    if extras.notify {
+        args.extend(notify_flags(provider).iter().map(|flag| (*flag).to_owned()));
+    }
     match provider {
         "codex" => args.extend(["--cd".into(), cwd.into()]),
         "grok" => args.extend(["--cwd".into(), cwd.into()]),
         // Antigravity ignores positional arguments as prompts.
         "agy" => args.push("--prompt-interactive".into()),
+        "claude" => {
+            if let Some(id) = extras.run_id.filter(|id| is_canonical_uuid(id)) {
+                args.extend(["--session-id".into(), id.into()]);
+            }
+            if let Some(dir) = extras.brief_dir {
+                let dir = dir
+                    .to_str()
+                    .ok_or_else(|| error("file_error", "Task brief path is not Unicode."))?;
+                args.extend(["--add-dir".into(), dir.into()]);
+            }
+            // `--add-dir` takes any number of values, so without the separator
+            // it would swallow the prompt as a second directory.
+            args.push("--".into());
+        }
         _ => {}
     }
     let scope = if inspect {
@@ -743,7 +900,295 @@ mod permission_default_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{arguments, BriefFile, CapturedOutput};
+    use super::{
+        is_canonical_uuid, notify_flags, with_notify_flags, BriefFile, CapturedOutput, Extras,
+    };
+
+    /// The launch as these tests mostly want it: no session id, no granted
+    /// directory, no notification flags — the argv the policy alone produces.
+    fn arguments(
+        provider: &str,
+        mode: &str,
+        acknowledged: bool,
+        cwd: &str,
+        brief: &std::path::Path,
+    ) -> Result<Vec<String>, super::WorkbenchError> {
+        super::arguments(provider, mode, acknowledged, cwd, brief, &Extras::default())
+    }
+
+    /// The options a current Claude Code advertises that a task launch uses,
+    /// laid out the way its `--help` lays them out.
+    const CLAUDE_HELP: &str = "  --add-dir <directories...>  Additional directories to allow tool\n                              access to\n  --permission-mode <mode>  Permission mode\n    (choices: \"plan\", \"manual\")\n  --session-id <uuid>  Use a specific session ID for the\n                       conversation (must be a valid UUID)\n  --settings <file-or-json>  Path to a settings JSON file\n";
+
+    const RUN: &str = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+
+    #[test]
+    fn claude_is_given_its_notification_channel_and_nothing_else() {
+        let flags = notify_flags("claude");
+        assert_eq!(flags[0], "--settings");
+        // `--settings` merges key by key, so a second key here would silently
+        // override something the user set.
+        let parsed: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(flags[1]).unwrap();
+        assert_eq!(parsed.keys().collect::<Vec<_>>(), ["preferredNotifChannel"]);
+        assert_eq!(parsed["preferredNotifChannel"], "terminal_bell");
+        assert_eq!(flags.len(), 2);
+    }
+
+    #[test]
+    fn codex_is_given_toml_overrides_quoted_as_toml_and_not_as_shell() {
+        let flags = notify_flags("codex");
+        assert_eq!(flags.iter().filter(|flag| **flag == "-c").count(), 3);
+        assert!(flags.contains(&"tui.notifications=true"));
+        // The inner quotes are the TOML string. Nothing expands argv, so
+        // stripping them would hand Codex a bare word.
+        assert!(flags.contains(&r#"tui.notification_method="osc9""#));
+        assert!(flags.contains(&r#"tui.notification_condition="always""#));
+    }
+
+    #[test]
+    fn no_flag_is_invented_for_a_cli_whose_setting_has_not_been_read() {
+        for launcher in crate::terminal::AGENT_LAUNCHERS {
+            let flags = notify_flags(launcher);
+            if !matches!(launcher, "claude" | "codex") {
+                assert!(flags.is_empty(), "{launcher}: {flags:?}");
+            }
+            for flag in flags {
+                assert!(!flag.contains('\0') && !flag.contains('\n'), "{flag}");
+            }
+        }
+        for unknown in ["shell", "manvi", "", "claude ", "Claude"] {
+            assert!(notify_flags(unknown).is_empty(), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_agent_tab_gets_policy_then_notification_then_its_prompt() {
+        let prompt = Some(vec!["--".to_owned(), "Fix the failing test".to_owned()]);
+        let with = with_notify_flags(Some("claude"), true, prompt.clone());
+        let out = super::apply_permission_mode(Some("claude"), Some("edit"), false, with)
+            .unwrap()
+            .unwrap();
+        let at = |flag: &str| out.iter().position(|a| a == flag).unwrap();
+        assert!(at("--permission-mode") < at("--settings"), "{out:?}");
+        assert!(at("--settings") < at("--"), "{out:?}");
+        assert_eq!(out.last().unwrap(), "Fix the failing test");
+        assert_eq!(out.iter().filter(|a| *a == "--settings").count(), 1);
+
+        // Off means exactly what the caller sent, including "nothing at all".
+        assert_eq!(
+            with_notify_flags(Some("claude"), false, prompt.clone()),
+            prompt
+        );
+        assert_eq!(with_notify_flags(Some("claude"), false, None), None);
+        assert_eq!(with_notify_flags(None, true, prompt.clone()), prompt);
+        assert_eq!(with_notify_flags(Some("grok"), true, None), None);
+        // A promptless Codex tab is flags only.
+        assert_eq!(
+            with_notify_flags(Some("codex"), true, None).unwrap(),
+            notify_flags("codex")
+        );
+    }
+
+    /// The defect: a task attempt's argv was built only from the policy and
+    /// the brief pointer, so the agent most likely to stop on a permission
+    /// prompt in a hidden tab was the one launched with no way to say so.
+    #[test]
+    fn a_task_attempt_gets_the_same_notification_flags_as_a_plain_tab() {
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        for provider in ["claude", "codex"] {
+            let on = super::arguments(
+                provider,
+                "edit",
+                false,
+                "/checkout",
+                &brief.path,
+                &Extras {
+                    notify: true,
+                    ..Extras::default()
+                },
+            )
+            .unwrap();
+            let flags = notify_flags(provider);
+            assert!(
+                on.windows(flags.len()).any(|run| run == flags),
+                "{provider}: {on:?}"
+            );
+            assert!(on.last().unwrap().starts_with("Read the UTF-8 task brief"));
+            let off = arguments(provider, "edit", false, "/checkout", &brief.path).unwrap();
+            assert!(
+                !off.iter().any(|a| flags.contains(&a.as_str()) && a != "-c"),
+                "{provider}: {off:?}"
+            );
+            assert!(!off.iter().any(|a| a == "-c" || a == "--settings"));
+        }
+    }
+
+    #[test]
+    fn a_claude_attempt_is_resumable_by_its_run_id_and_may_read_its_brief() {
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        let args = super::arguments(
+            "claude",
+            "preapproved",
+            false,
+            "/checkout",
+            &brief.path,
+            &Extras {
+                run_id: Some(RUN),
+                brief_dir: Some(&brief.dir),
+                notify: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            args.windows(2).any(|pair| pair == ["--session-id", RUN]),
+            "{args:?}"
+        );
+        let dir = brief.dir.to_str().unwrap();
+        assert!(
+            args.windows(2).any(|pair| pair == ["--add-dir", dir]),
+            "{args:?}"
+        );
+        // `--add-dir` is variadic: only the separator stops it reading the
+        // prompt as a second directory.
+        let separator = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(separator, args.len() - 2, "{args:?}");
+        assert!(args.iter().position(|a| a == "--add-dir").unwrap() < separator);
+        assert!(args.iter().position(|a| a == "--settings").unwrap() < separator);
+        assert!(args[separator + 1].contains(&*brief.path.to_string_lossy()));
+
+        // An id Claude would refuse is left out, never reshaped into one.
+        for id in ["run", "6F1C2A7E0D4B4C1E9A553B0E8F2D9C11", "../../run", ""] {
+            let args = super::arguments(
+                "claude",
+                "edit",
+                false,
+                "/checkout",
+                &brief.path,
+                &Extras {
+                    run_id: Some(id),
+                    ..Extras::default()
+                },
+            )
+            .unwrap();
+            assert!(!args.iter().any(|a| a == "--session-id"), "{id}: {args:?}");
+        }
+        // Only Claude is handed these; the others would not know them.
+        for provider in ["codex", "grok", "agy"] {
+            let args = super::arguments(
+                provider,
+                "edit",
+                false,
+                "/checkout",
+                &brief.path,
+                &Extras {
+                    run_id: Some(RUN),
+                    brief_dir: Some(&brief.dir),
+                    notify: false,
+                },
+            )
+            .unwrap();
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "--session-id" || a == "--add-dir" || a == "--"),
+                "{provider}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_uuid_is_only_the_canonical_form() {
+        assert!(is_canonical_uuid(RUN));
+        assert!(is_canonical_uuid("6F1C2A7E-0D4B-4C1E-9A55-3B0E8F2D9C11"));
+        for not in [
+            "",
+            "run",
+            "6f1c2a7e0d4b4c1e9a553b0e8f2d9c11",
+            "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c1",
+            "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c111",
+            "6f1c2a7e_0d4b-4c1e-9a55-3b0e8f2d9c11",
+            "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9cxz",
+            "{6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c1}",
+            "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c1\u{e9}",
+        ] {
+            assert!(!is_canonical_uuid(not), "{not:?}");
+        }
+    }
+
+    /// Every flag the launch passes is one the build was asked about.
+    #[test]
+    fn a_claude_build_must_advertise_every_flag_the_launch_will_pass() {
+        let version = on_stdout("2.1.289 (Claude Code)\n");
+        let help = on_stdout(CLAUDE_HELP);
+        super::advertises("claude", "ask", true, &version, &help).unwrap();
+        for missing in ["--session-id", "--add-dir", "--settings"] {
+            let narrower: String = CLAUDE_HELP
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(missing))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            assert_eq!(
+                super::advertises("claude", "ask", true, &version, &on_stdout(&narrower))
+                    .unwrap_err()
+                    .code,
+                "unsupported_capability",
+                "{missing}"
+            );
+        }
+        // Without notifications, `--settings` is not passed and not required.
+        let no_settings: String = CLAUDE_HELP
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--settings"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        super::advertises("claude", "ask", false, &version, &on_stdout(&no_settings)).unwrap();
+    }
+
+    #[test]
+    fn codex_must_advertise_its_config_flag_only_when_it_will_be_passed() {
+        let version = on_stdout("codex-cli 0.130.0\n");
+        let base = "  -s, --sandbox <MODE>\n    [possible values: read-only, workspace-write]\n  -a, --ask-for-approval <POLICY>\n    - on-request: ask\n  -C, --cd <DIR>\n    Set root\n";
+        let with_config = format!("  -c, --config <key=value>\n    Override a value\n{base}");
+        super::advertises("codex", "edit", true, &version, &on_stdout(&with_config)).unwrap();
+        super::advertises("codex", "edit", false, &version, &on_stdout(base)).unwrap();
+        assert_eq!(
+            super::advertises("codex", "edit", true, &version, &on_stdout(base))
+                .unwrap_err()
+                .code,
+            "unsupported_capability"
+        );
+    }
+
+    #[test]
+    fn the_brief_lives_alone_in_a_private_directory_that_goes_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        assert_eq!(brief.path.parent(), Some(brief.dir.as_path()));
+        assert_eq!(brief.dir.parent(), Some(root.path()));
+        assert_eq!(std::fs::read_dir(&brief.dir).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&brief.dir), 0o700);
+            assert_eq!(mode(&brief.path), 0o600);
+        }
+        let other = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        assert_ne!(other.dir, brief.dir);
+        let (dir, path) = (brief.dir.clone(), brief.path.clone());
+        drop(brief);
+        assert!(!path.exists() && !dir.exists());
+        assert!(other.path.exists());
+        // An empty brief leaves nothing behind.
+        assert!(BriefFile::under(root.path(), "").is_err());
+        drop(other);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
     #[test]
     #[ignore = "requires explicitly installed Claude Code, Codex, Grok and Antigravity binaries; probes help only"]
     fn installed_provider_help_supports_requested_modes() {
@@ -758,8 +1203,14 @@ mod tests {
                 "preapproved",
                 "bypass",
             ] {
-                super::check(&program, root.path().to_str().unwrap(), provider, mode)
-                    .unwrap_or_else(|error| panic!("{provider}/{mode}: {}", error.message));
+                super::check(
+                    &program,
+                    root.path().to_str().unwrap(),
+                    provider,
+                    mode,
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("{provider}/{mode}: {}", error.message));
             }
         }
     }
@@ -794,10 +1245,10 @@ mod tests {
     #[test]
     fn probe_refuses_a_build_that_advertises_the_flag_without_the_requested_value() {
         let version = on_stdout("2.1.263 (Claude Code)\n");
-        let help = on_stdout("  --permission-mode <mode>\n    (choices: \"plan\", \"manual\")\n");
-        assert!(super::advertises("claude", "ask", &version, &help).is_ok());
+        let help = on_stdout(CLAUDE_HELP);
+        assert!(super::advertises("claude", "ask", false, &version, &help).is_ok());
         assert_eq!(
-            super::advertises("claude", "bypass", &version, &help)
+            super::advertises("claude", "bypass", false, &version, &help)
                 .unwrap_err()
                 .code,
             "unsupported_capability",
@@ -1009,8 +1460,8 @@ mod tests {
              default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
                       Working directory\n",
         );
-        super::advertises("grok", "ask", &version, &help).unwrap();
-        super::advertises("grok", "bypass", &version, &help).unwrap();
+        super::advertises("grok", "ask", false, &version, &help).unwrap();
+        super::advertises("grok", "bypass", false, &version, &help).unwrap();
 
         // The same build without the mode `ask` needs, and without `--cwd`.
         let narrower = on_stdout(
@@ -1018,7 +1469,7 @@ mod tests {
              default, plan]\n",
         );
         assert_eq!(
-            super::advertises("grok", "ask", &version, &narrower)
+            super::advertises("grok", "ask", false, &version, &narrower)
                 .unwrap_err()
                 .code,
             "unsupported_capability"
@@ -1036,14 +1487,14 @@ mod tests {
              prompt interactively\n  --dangerously-skip-permissions  Auto-approve all tool \
              permission requests\n  --sandbox                       Run in a sandbox\n",
         );
-        super::advertises("agy", "ask", &version, &help).unwrap();
-        super::advertises("agy", "inspect", &version, &help).unwrap();
-        super::advertises("agy", "bypass", &version, &help).unwrap();
+        super::advertises("agy", "ask", false, &version, &help).unwrap();
+        super::advertises("agy", "inspect", false, &version, &help).unwrap();
+        super::advertises("agy", "bypass", false, &version, &help).unwrap();
 
         let without_controls =
             on_stderr("Usage of agy:\n  --prompt-interactive            prompt\n");
         assert_eq!(
-            super::advertises("agy", "ask", &version, &without_controls)
+            super::advertises("agy", "ask", false, &version, &without_controls)
                 .unwrap_err()
                 .code,
             "unsupported_capability"
@@ -1061,12 +1512,13 @@ mod tests {
              default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
                       Working directory\n",
         );
-        super::advertises("grok", "ask", &version, &help).expect("the bounded case still passes");
+        super::advertises("grok", "ask", false, &version, &help)
+            .expect("the bounded case still passes");
 
         let mut flood = help.clone();
         flood.stdout.resize(128 * 1024 + 1, b' ');
         assert_eq!(
-            super::advertises("grok", "ask", &version, &flood)
+            super::advertises("grok", "ask", false, &version, &flood)
                 .unwrap_err()
                 .code,
             "capability_error",
@@ -1076,7 +1528,7 @@ mod tests {
         let mut chatty = version.clone();
         chatty.stderr.resize(1025, b' ');
         assert_eq!(
-            super::advertises("grok", "ask", &chatty, &help)
+            super::advertises("grok", "ask", false, &chatty, &help)
                 .unwrap_err()
                 .code,
             "capability_error"
