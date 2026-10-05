@@ -3,6 +3,7 @@
   import { displayName } from "../repos/paths";
   import BranchList from "./BranchList.svelte";
   import CommitComposer from "./CommitComposer.svelte";
+  import AgentCommitMenu from "./AgentCommitMenu.svelte";
   import WorktreesPanel from "./WorktreesPanel.svelte";
   import TrustExtensionBanner from "./TrustExtensionBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
@@ -270,27 +271,30 @@
             <span>Working tree clean</span>
           </div>
         {:else}
-          <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 w-full text-left hover:text-accent" title="Preview uncommitted files and modifications">
-            <span
-              class="font-mono text-[11px] shrink-0"
-              title="Total added / deleted lines across all changed files"
-            >
-              <span class="text-green-400">+{totalAdditions}</span>
-              <span class="text-red-400">−{totalDeletions}</span>
-            </span>
-            <span class="truncate" title={`${dirtyCount} file${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}>
-              {dirtyCount} changed file{dirtyCount === 1 ? "" : "s"}
-            </span>
-            {#if conflictedCount > 0}
+          <div class="flex items-center justify-between gap-1.5 min-w-0 w-full">
+            <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:text-accent" title="Preview uncommitted files and modifications">
               <span
-                class="ml-auto flex items-center gap-1 shrink-0 text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25"
-                title={`${conflictedCount} file${conflictedCount === 1 ? "" : "s"} with merge conflicts`}
+                class="font-mono text-[11px] shrink-0"
+                title="Total added / deleted lines across all changed files"
               >
-                <AlertTriangle size={10} class="shrink-0" />
-                {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}
+                <span class="text-green-400">+{totalAdditions}</span>
+                <span class="text-red-400">−{totalDeletions}</span>
               </span>
-            {/if}
-          </button>
+              <span class="truncate" title={`${dirtyCount} file${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}>
+                {dirtyCount} changed file{dirtyCount === 1 ? "" : "s"}
+              </span>
+              {#if conflictedCount > 0}
+                <span
+                  class="ml-auto flex items-center gap-1 shrink-0 text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25"
+                  title={`${conflictedCount} file${conflictedCount === 1 ? "" : "s"} with merge conflicts`}
+                >
+                  <AlertTriangle size={10} class="shrink-0" />
+                  {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}
+                </span>
+              {/if}
+            </button>
+            <AgentCommitMenu compact={true} align="right" />
+          </div>
         {/if}
 
         <!-- Quick actions -->
@@ -559,6 +563,9 @@
         >
           {dirtyCount}
         </button>
+        {#if dirtyCount > 0}
+          <AgentCommitMenu compact={true} align="left" />
+        {/if}
       {/if}
     </div>
   {/if}

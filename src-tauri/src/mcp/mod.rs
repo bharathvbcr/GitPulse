@@ -209,6 +209,63 @@ pub(crate) fn tool(
     })
 }
 
+fn mutating_tool_annotations(idempotent: bool) -> Value {
+    json!({
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": idempotent,
+        "openWorldHint": false
+    })
+}
+
+pub(crate) fn mutating_tool(
+    name: &str,
+    title: &str,
+    description: &str,
+    properties: Value,
+    required: &[&str],
+    output: Value,
+    idempotent: bool,
+) -> Value {
+    json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        },
+        "outputSchema": output,
+        "annotations": mutating_tool_annotations(idempotent)
+    })
+}
+
+pub(crate) fn bounded_string_prop(description: &str, min_len: usize, max_len: usize) -> Value {
+    let mut obj = json!({
+        "type": "string",
+        "description": description,
+        "maxLength": max_len
+    });
+    if min_len > 0 {
+        obj["minLength"] = json!(min_len);
+    }
+    obj
+}
+
+pub(crate) fn string_array_prop(description: &str, max_items: usize, max_item_len: usize) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "string",
+            "maxLength": max_item_len
+        },
+        "maxItems": max_items
+    })
+}
+
 pub(crate) fn repo_prop() -> Value {
     json!({
         "type": "string",
@@ -448,6 +505,105 @@ fn build_tools() -> Vec<Value> {
             &["repo_path"],
             json!({ "type": "object" }),
         ),
+        mutating_tool(
+            "gitpulse_add_task",
+            "Add task",
+            "Add a task file to the repository tasks folder in GitPulse tasks format (Markdown Task Brief v1 with YAML frontmatter). Gated by repository policy and recorded to the durable ledger.",
+            json!({
+                "repo_path": repo_prop(),
+                "title": bounded_string_prop("Task title", 1, crate::tasks::file_tasks::MAX_TASK_TITLE),
+                "description": bounded_string_prop("Detailed task description or problem statement", 0, crate::tasks::file_tasks::MAX_TASK_DESCRIPTION),
+                "task_id": bounded_string_prop("Optional custom task ID (e.g. 'gp-auth-flow'). If omitted, generated from title slug.", 1, crate::tasks::file_tasks::MAX_TASK_ID),
+                "status": bounded_string_prop("Task status: inbox (default), backlog, ready, in_progress, review, done", 1, 32),
+                "priority": {
+                    "type": "integer",
+                    "description": "Priority: 0 (urgent), 1 (high), 2 (normal, default), 3 (low)",
+                    "minimum": 0,
+                    "maximum": 3
+                },
+                "severity": bounded_string_prop("Severity: none, low, medium, high, critical", 1, 32),
+                "kind": bounded_string_prop("Kind/type: feature, bug, refactor, test, docs, task", 1, 32),
+                "owner": bounded_string_prop("Assignee or agent owner (e.g. '@user', 'unassigned')", 1, 128),
+                "due": bounded_string_prop("Due date or timeline (e.g. '2026-03-31', 'Sprint 4')", 1, 64),
+                "labels": string_array_prop("Labels/tags for categorization", crate::tasks::file_tasks::MAX_TASK_LABELS, 128),
+                "repositories": string_array_prop("Linked repository paths or names", crate::tasks::file_tasks::MAX_TASK_REPOSITORIES, 300),
+                "planned_files": string_array_prop("Authorized or planned files for this task", crate::tasks::file_tasks::MAX_TASK_PLANNED_FILES, 4096),
+                "acceptance_criteria": string_array_prop("Acceptance criteria checklist items", crate::tasks::file_tasks::MAX_TASK_CRITERIA, 4096),
+                "logs": bounded_string_prop("Raw logs, crash dumps, or error traces (up to 256 KiB)", 0, crate::tasks::file_tasks::MAX_TASK_LOGS),
+                "tasks_dir": bounded_string_prop("Tasks directory relative to repository root (defaults to 'tasks')", 1, crate::tasks::file_tasks::MAX_TASKS_DIR),
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Whether to overwrite an existing task file with the same ID (default false)"
+                }
+            }),
+            &["repo_path", "title"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "task_id": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "absolute_path": { "type": "string" },
+                    "title": { "type": "string" },
+                    "status": { "type": "string" },
+                    "priority": { "type": "integer" },
+                    "content": { "type": "string" },
+                    "verdict": { "type": "object" }
+                },
+                "required": ["ok", "task_id", "file_path", "absolute_path", "title", "status", "priority", "content", "verdict"]
+            }),
+            false,
+        ),
+        tool(
+            "gitpulse_list_tasks",
+            "List tasks",
+            "List task files from the repository tasks folder, ordered by priority (urgent first) and title.",
+            json!({
+                "repo_path": repo_prop(),
+                "tasks_dir": bounded_string_prop("Tasks directory relative to repository root (defaults to 'tasks')", 1, crate::tasks::file_tasks::MAX_TASKS_DIR),
+                "status": bounded_string_prop("Optional filter by status (inbox, backlog, ready, in_progress, review, done)", 1, 32),
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of tasks to return (default 50, max 500)",
+                    "minimum": 1,
+                    "maximum": crate::tasks::file_tasks::MAX_LIST_LIMIT as u64
+                }
+            }),
+            &["repo_path"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "tasks_dir": { "type": "string" },
+                    "returned": { "type": "integer" },
+                    "total": { "type": "integer" },
+                    "truncated": { "type": "boolean" },
+                    "tasks": { "type": "array" }
+                },
+                "required": ["ok", "tasks_dir", "returned", "total", "truncated", "tasks"]
+            }),
+        ),
+        tool(
+            "gitpulse_get_task",
+            "Get task",
+            "Read and parse a task file from the repository tasks folder by ID or relative file path.",
+            json!({
+                "repo_path": repo_prop(),
+                "task_id": bounded_string_prop("Task ID (e.g. 'gp-auth-flow') or relative filename (e.g. 'gp-auth-flow.md')", 1, crate::tasks::file_tasks::MAX_TASKS_DIR),
+                "tasks_dir": bounded_string_prop("Tasks directory relative to repository root (defaults to 'tasks')", 1, crate::tasks::file_tasks::MAX_TASKS_DIR)
+            }),
+            &["repo_path", "task_id"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "file_path": { "type": "string" },
+                    "task": { "type": "object" },
+                    "content": { "type": "string" }
+                },
+                "required": ["ok", "file_path", "task", "content"]
+            }),
+        ),
         tool(
             "gitpulse_codeintel_search",
             "Symbol search",
@@ -654,6 +810,14 @@ fn validate_arguments(name: &str, arguments: &Value) -> Result<(), String> {
     ))
 }
 
+fn parse_string_vec(val: &Value) -> Option<Vec<String>> {
+    val.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
     // Every arm below reads arguments the schema has already accepted, so a
     // missing required field is unreachable here and the `ok_or` fallbacks are
@@ -731,6 +895,66 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let task_id = arguments["task_id"].as_str();
             let view = crate::tasks::view_filtered(&address.anchor, task_id);
             Ok(json!(view))
+        }
+        "gitpulse_add_task" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let title = arguments["title"].as_str().ok_or("missing title")?;
+            let description = arguments["description"].as_str().map(str::to_string);
+            let task_id = arguments["task_id"].as_str().map(str::to_string);
+            let status = arguments["status"].as_str().map(str::to_string);
+            let priority = arguments["priority"].as_u64().map(|p| p as u32);
+            let severity = arguments["severity"].as_str().map(str::to_string);
+            let kind = arguments["kind"].as_str().map(str::to_string);
+            let owner = arguments["owner"].as_str().map(str::to_string);
+            let due = arguments["due"].as_str().map(str::to_string);
+            let labels = parse_string_vec(&arguments["labels"]);
+            let repositories = parse_string_vec(&arguments["repositories"]);
+            let planned_files = parse_string_vec(&arguments["planned_files"]);
+            let acceptance_criteria = parse_string_vec(&arguments["acceptance_criteria"]);
+            let logs = arguments["logs"].as_str().map(str::to_string);
+            let tasks_dir = arguments["tasks_dir"].as_str().map(str::to_string);
+            let overwrite = arguments["overwrite"].as_bool();
+
+            let req = crate::tasks::NewTaskRequest {
+                repo_path: repo.to_string(),
+                title: title.to_string(),
+                description,
+                task_id,
+                status,
+                priority,
+                severity,
+                kind,
+                owner,
+                due,
+                labels,
+                repositories,
+                planned_files,
+                acceptance_criteria,
+                logs,
+                tasks_dir,
+                overwrite,
+            };
+
+            let res = crate::tasks::add_task_file(req)?;
+            Ok(json!(res))
+        }
+        "gitpulse_list_tasks" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let tasks_dir = arguments["tasks_dir"].as_str();
+            let status = arguments["status"].as_str();
+            let limit = arguments["limit"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(crate::tasks::file_tasks::DEFAULT_LIST_LIMIT);
+            let res = crate::tasks::list_task_files(repo, tasks_dir, status, limit)?;
+            Ok(json!(res))
+        }
+        "gitpulse_get_task" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let task_id = arguments["task_id"].as_str().ok_or("missing task_id")?;
+            let tasks_dir = arguments["tasks_dir"].as_str();
+            let res = crate::tasks::get_task_file(repo, tasks_dir, task_id)?;
+            Ok(json!(res))
         }
         name if name.starts_with("devmap_") => devmap_parity::handle(name, arguments),
         "gitpulse_codeintel_search" => {
@@ -1602,6 +1826,16 @@ mod tests {
     fn no_advertised_tool_offers_an_ungated_mutation() {
         for tool in tools() {
             let name = tool["name"].as_str().unwrap();
+            let read_only = tool["annotations"]["readOnlyHint"].as_bool().unwrap_or(false);
+            if !read_only {
+                // Mutating tools must be in an explicit allowlist and policy-gated
+                assert_eq!(name, "gitpulse_add_task", "unexpected mutating tool {name}");
+                assert_eq!(
+                    tool["annotations"]["destructiveHint"], false,
+                    "{name} must not be destructive"
+                );
+                continue;
+            }
             for verb in [
                 "write", "commit", "push", "checkout", "apply", "delete", "revert", "ingest",
                 "bind", "revoke",
@@ -1699,6 +1933,7 @@ mod tests {
                             "{name}.{argument} is an array with no maxItems"
                         );
                     }
+                    Some("boolean") => {}
                     other => panic!("{name}.{argument} has unexpected type {other:?}"),
                 }
             }
@@ -1732,6 +1967,9 @@ mod tests {
 
         for tool in tools() {
             let name = tool["name"].as_str().expect("name");
+            if tool["annotations"]["readOnlyHint"] != true {
+                continue;
+            }
             assert_eq!(
                 tool["annotations"]["readOnlyHint"], true,
                 "{name} is not annotated read-only"
@@ -1740,7 +1978,7 @@ mod tests {
             // are exercised with placeholders, because the point is the side
             // effect, not the answer.
             let mut arguments = json!({ "repo_path": repo });
-            for extra in ["query", "target", "file_path", "from", "to", "commit_sha"] {
+            for extra in ["query", "target", "file_path", "from", "to", "commit_sha", "task_id"] {
                 if tool["inputSchema"]["properties"][extra].is_object() {
                     arguments[extra] = json!("probe");
                 }
@@ -1947,5 +2185,154 @@ mod tests {
                 .expect("answered");
             assert_eq!(resp.id, json!("abc-123"), "{method}");
         }
+    }
+
+    #[test]
+    fn gitpulse_add_task_list_and_get_e2e_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", &repo])
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        crate::test_support::trust_repo(dir.path());
+
+        // 1. Add first task
+        let add_res = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_add_task",
+                "arguments": {
+                    "repo_path": repo,
+                    "title": "Build authentication flow",
+                    "description": "Implement OAuth2 and passkey support.",
+                    "status": "in_progress",
+                    "priority": 1,
+                    "severity": "high",
+                    "kind": "feature",
+                    "owner": "@alice",
+                    "due": "2026-04-01",
+                    "labels": ["auth", "security"],
+                    "repositories": ["GitPulse"],
+                    "planned_files": ["src/auth.rs"],
+                    "acceptance_criteria": ["Support PKCE", "Verify tokens"],
+                    "logs": "Traceback:\n  File auth.rs line 12"
+                }
+            }),
+        );
+        assert!(
+            !add_res["isError"].as_bool().unwrap_or(false),
+            "add_task failed: {}",
+            add_res["content"][0]["text"]
+        );
+        let content_text = add_res["content"][0]["text"].as_str().unwrap();
+        let add_data: Value = serde_json::from_str(content_text).unwrap();
+        assert_eq!(add_data["ok"], true);
+        assert_eq!(add_data["task_id"], "gp-build-authentication-flow");
+        assert_eq!(add_data["file_path"], "tasks/gp-build-authentication-flow.md");
+        assert!(add_data["content"].as_str().unwrap().contains("# Task brief v1"));
+        assert!(add_data["content"].as_str().unwrap().contains("priority: 1"));
+
+        // 2. Add second task with custom task_id and priority 0 (urgent)
+        let add_res2 = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_add_task",
+                "arguments": {
+                    "repo_path": repo,
+                    "task_id": "gp-fix-critical-leak",
+                    "title": "Fix critical memory leak",
+                    "status": "ready",
+                    "priority": 0
+                }
+            }),
+        );
+        assert_eq!(add_res2["isError"], false);
+
+        // 3. List tasks - verify sorting (priority 0 before priority 1)
+        let list_res = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_list_tasks",
+                "arguments": {
+                    "repo_path": repo
+                }
+            }),
+        );
+        assert_eq!(list_res["isError"], false);
+        let list_data: Value = serde_json::from_str(list_res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(list_data["ok"], true);
+        assert_eq!(list_data["total"], 2);
+        assert_eq!(list_data["tasks"][0]["id"], "gp-fix-critical-leak");
+        assert_eq!(list_data["tasks"][0]["priority"], 0);
+        assert_eq!(list_data["tasks"][0]["priority_label"], "Urgent");
+        assert_eq!(list_data["tasks"][1]["id"], "gp-build-authentication-flow");
+
+        // 4. List tasks with filter
+        let filtered_res = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_list_tasks",
+                "arguments": {
+                    "repo_path": repo,
+                    "status": "ready"
+                }
+            }),
+        );
+        let filtered_data: Value = serde_json::from_str(filtered_res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(filtered_data["total"], 1);
+        assert_eq!(filtered_data["tasks"][0]["id"], "gp-fix-critical-leak");
+
+        // 5. Get task by ID and by relative path
+        let get_res = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_get_task",
+                "arguments": {
+                    "repo_path": repo,
+                    "task_id": "tasks/gp-build-authentication-flow.md"
+                }
+            }),
+        );
+        assert_eq!(get_res["isError"], false);
+        let get_data: Value = serde_json::from_str(get_res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(get_data["ok"], true);
+        assert_eq!(get_data["task"]["title"], "Build authentication flow");
+        assert_eq!(get_data["task"]["status"], "in_progress");
+        assert_eq!(get_data["task"]["owner"], "@alice");
+        assert_eq!(get_data["task"]["planned_files"], json!(["src/auth.rs"]));
+        assert_eq!(get_data["task"]["acceptance_criteria"], json!(["Support PKCE", "Verify tokens"]));
+        assert_eq!(get_data["task"]["logs"], "Traceback:\n  File auth.rs line 12");
+
+        // 6. Overwrite refusal unless overwrite: true
+        let dup_res = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_add_task",
+                "arguments": {
+                    "repo_path": repo,
+                    "task_id": "gp-fix-critical-leak",
+                    "title": "Duplicate task without overwrite"
+                }
+            }),
+        );
+        assert_eq!(dup_res["isError"], true);
+        assert!(dup_res["content"][0]["text"].as_str().unwrap().contains("already exists"));
+
+        // Overwrite succeeded with overwrite: true
+        let ow_res = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_add_task",
+                "arguments": {
+                    "repo_path": repo,
+                    "task_id": "gp-fix-critical-leak",
+                    "title": "Updated title with overwrite",
+                    "overwrite": true
+                }
+            }),
+        );
+        assert_eq!(ow_res["isError"], false);
     }
 }

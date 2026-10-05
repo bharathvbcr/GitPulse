@@ -9,6 +9,7 @@
     type PolicyVerdict,
   } from "../stores/harnessStore";
   import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "@lucide/svelte";
+  import AgentCommitMenu from "./AgentCommitMenu.svelte";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatError } from "../ui/formatError";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -431,16 +432,19 @@
         <span>Include unstaged</span>
       </label>
     </div>
-    <button
-      onclick={() => void handleCommit()}
-      disabled={commitDisabled}
-      title={quickCommit
-        ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
-        : "Commit staged files (Cmd/Ctrl+Enter)"}
-      class="gp-btn-primary shrink-0 whitespace-nowrap"
-    >
-      <Send size={12} />
-      <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>
-    </button>
+    <div class="flex items-center gap-1.5 shrink-0">
+      <AgentCommitMenu compact={true} align="right" direction="up" />
+      <button
+        onclick={() => void handleCommit()}
+        disabled={commitDisabled}
+        title={quickCommit
+          ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
+          : "Commit staged files (Cmd/Ctrl+Enter)"}
+        class="gp-btn-primary shrink-0 whitespace-nowrap"
+      >
+        <Send size={12} />
+        <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>
+      </button>
+    </div>
   </div>
 </div>

@@ -574,3 +574,11 @@ describe("DiffViewer opens at the configured defaults", () => {
     }
   });
 });
+
+describe("DiffViewer agent commit integration", () => {
+  it("imports and mounts AgentCommitMenu for working tree uncommitted changes", () => {
+    expect(source).toContain('import AgentCommitMenu from "./AgentCommitMenu.svelte";');
+    expect(source).toMatch(/<AgentCommitMenu\b/);
+  });
+});
+

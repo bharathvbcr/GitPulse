@@ -174,6 +174,7 @@ describe("agent copy", () => {
     for (const packet of [draft, saved]) {
       expect(packet).toContain("Preserve the author's intent and message");
       expect(packet).toContain("gitpulse-insights");
+      expect(packet).toContain("gitpulse-tasks");
       expect(packet).toContain("devmap-impact");
       expect(packet).toContain("devmap_* MCP tools");
       expect(packet).toContain("gitpulse_* MCP tools");

@@ -21,6 +21,13 @@
 //! and never an empty list that reads as "no tasks" — those are different facts
 //! and the UI renders them differently.
 
+pub mod file_tasks;
+
+pub use file_tasks::{
+    add_task_file, format_gitpulse_task, get_task_file, list_task_files, parse_gitpulse_task,
+    NewTaskRequest, TaskAddResult, TaskFileDetails, TaskGetResult, TaskListResult, TaskSummary,
+};
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

@@ -156,6 +156,7 @@
   import type { CodeintelRung, CodeintelRungHistogram } from "../codeintel/types";
   import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
   import RungFilterControl from "./RungFilterControl.svelte";
+  import AgentCommitMenu from "./AgentCommitMenu.svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
   import { observeResize } from "../dom/observeResize";
@@ -1270,6 +1271,10 @@
           <Check size={13} />
           <span>{isStaged ? "Unstage File" : "Stage File"}</span>
         </button>
+      {/if}
+
+      {#if $repoStore.statuses.length > 0 && $repoStore.selectedCommitId === null}
+        <AgentCommitMenu align="right" />
       {/if}
     </div>
   </div>
