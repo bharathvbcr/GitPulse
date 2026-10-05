@@ -423,6 +423,18 @@
             await wait(40);
           }
           check("global session limit spans both repositories", () => report.spawned === MAX_TERMINAL_TABS && button("New Shell session").disabled);
+          // A task terminal arriving at the limit waits for a slot. It used
+          // to wait without a word, so the agent seemed never to have started.
+          {
+            const { enqueueTaskTerminal, consumeTaskTerminalRequest } = await import("../src/lib/terminal/taskLaunches.ts");
+            const waiting = { runId: "fixture-waiting", repoPath: "/fixture/GitPulse", provider: "claude", title: "Fix the importer" };
+            enqueueTaskTerminal(waiting); await wait();
+            const notice = document.querySelector('[data-testid="terminal-waiting-for-capacity"]');
+            check("a task terminal waiting for a free session says so, by name",
+              () => notice?.textContent.includes("Fix the importer") && notice.textContent.includes(`all ${MAX_TERMINAL_TABS}`) && report.spawned === MAX_TERMINAL_TABS);
+            consumeTaskTerminalRequest(waiting); await wait();
+            check("and the notice goes with the request", () => !document.querySelector('[data-testid="terminal-waiting-for-capacity"]'));
+          }
           await wait();
           const stripEl = label("Terminal sessions");
           check("tab strip scrolls when many sessions are open", () => stripEl.scrollWidth > stripEl.clientWidth + 1);

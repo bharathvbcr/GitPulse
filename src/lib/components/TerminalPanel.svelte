@@ -326,6 +326,17 @@
     return () => scroller.removeEventListener("wheel", onWheel);
   });
 
+  /**
+   * A task terminal (or resumed conversation, or session to show again) that
+   * belongs in this dock but cannot open, because every session slot is in
+   * use. It waits rather than failing — and used to wait in silence, so the
+   * agent seemed never to have started.
+   */
+  const waitingForCapacity = $derived.by(() => {
+    const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    return request && !canCreate && !tabFor(tabState, request) ? request : null;
+  });
+
   $effect(() => {
     const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
     if (!request || (!canCreate && !tabFor(tabState, request))) return;
@@ -863,6 +874,11 @@
       {:else}
         <span>{$terminalSessions.length ? "No sessions match." : "No active processes."}</span>
       {/each}
+    </div>
+  {/if}
+  {#if waitingForCapacity && mode === "shell"}
+    <div class="px-3 py-1.5 border-b border-border/60 text-[11px] text-amber-300 bg-amber-500/10" role="status" data-testid="terminal-waiting-for-capacity">
+      {waitingForCapacity.title} is waiting to open here: all {MAX_TERMINAL_TABS} terminal sessions are in use. Close one in Sessions and it opens.
     </div>
   {/if}
   {#if shortcutsOpen}
