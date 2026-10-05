@@ -4,7 +4,7 @@ import { get } from "svelte/store";
 vi.mock("./ptyBus.tauri", () => ({ ptyBus: { subscribe: () => () => {} } }));
 vi.mock("../ipc/invoke", () => ({ invoke: vi.fn() }));
 
-const { adoptDetachedSessions, parseListing, DETACHED_STATUS } = await import("./detachedSessions");
+const { adoptDetachedSessions, handOverDetachedRun, parseListing, stopQuestion, DETACHED_STATUS } = await import("./detachedSessions");
 const { createSessionRegistry } = await import("./sessionRegistry");
 const { taskTerminalRequests, consumeTaskTerminalRequest } = await import("./taskLaunches");
 import type { PtyBus, PtySessionHandlers } from "./ptyBus";
@@ -25,15 +25,17 @@ function fakeBus() {
   return { bus, handlers };
 }
 
-function setup(rows: unknown) {
+function setup(rows: unknown, answer = true) {
   const registry = createSessionRegistry();
+  const asked: { title: string; message: string }[] = [];
+  const confirm = async (options: { title: string; message: string }) => { asked.push(options); return answer; };
   const { bus, handlers } = fakeBus();
   const calls: { command: string; args?: Record<string, unknown> }[] = [];
   const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
     calls.push({ command, args });
     return (command === "cmd_terminal_sessions" ? rows : null) as T;
   };
-  return { registry, handlers, calls, adopt: () => adoptDetachedSessions({ invoke, bus, registry }) };
+  return { registry, handlers, calls, asked, adopt: () => adoptDetachedSessions({ invoke, bus, registry, confirm }) };
 }
 
 afterEach(() => { for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request); });
@@ -92,6 +94,39 @@ describe("sessions a reloaded page left running", () => {
     const { registry, adopt } = setup([{ id: "x" }, row({ id: "" }), row({ repo: "\0" }), row({ detached: "yes" as never })]);
     expect(await adopt()).toBe(0);
     expect(get(registry)).toEqual([]);
+  });
+
+  // The same class e27e6daf fixed for tabs: a running agent stopped from
+  // the Sessions list without a word.
+  it("ask before the Sessions list stops one, and stop nothing when declined", async () => {
+    const { registry, calls, asked, adopt } = setup([row({ run_id: "run-1" })], false);
+    await adopt();
+    const record = get(registry)[0];
+    expect(await record.confirmClose?.()).toBe(false);
+    expect(asked[0]).toMatchObject({ ...stopQuestion({ run_id: "run-1" }, "Claude"), confirmLabel: "Stop", destructive: true });
+    expect(asked[0].message).toContain("ends that attempt");
+    expect(calls.some((call) => call.command === "cmd_terminal_kill")).toBe(false);
+    expect(stopQuestion({ run_id: null }, "Shell").message).toContain("still running from before the window reloaded");
+  });
+
+  // The advisor's case: "Open terminal" takes a reloaded task session over
+  // through the task's own launch path, never through the adopted record.
+  it("a task tab that takes a session over leaves it listed once, by the tab", async () => {
+    const { registry, adopt } = setup([row({ run_id: "run-1" })]);
+    await adopt();
+    const tab = registry.reserve({ key: "tab-7", repoPath: "/repos/app", label: "Claude", status: "starting", close: async () => {} });
+    tab.identify("term-1-a");
+    expect(get(registry).map((record) => record.key)).toEqual(["tab-7"]);
+  });
+
+  it("hand an adopted task session over to its task, freeing its slot first", async () => {
+    const { registry, adopt } = setup([row({ run_id: "run-1" })]);
+    await adopt();
+    expect(handOverDetachedRun("run-2", registry)).toBe(false);
+    expect(get(registry)).toHaveLength(1);
+    expect(handOverDetachedRun("run-1", registry)).toBe(true);
+    expect(get(registry)).toEqual([]);
+    expect(get(taskTerminalRequests).map((request) => request.runId)).toEqual(["run-1"]);
   });
 
   it("parses only a well-formed row", () => {

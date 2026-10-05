@@ -27,10 +27,42 @@ import type { TerminalListing } from "./runResult";
 import { terminalSessions, type createSessionRegistry } from "./sessionRegistry";
 import { enqueueTaskTerminal } from "./taskLaunches";
 import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
+import { askConfirm } from "../stores/modalStore";
 
 export const DETACHED_STATUS = "Still running — not shown since the window reloaded";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive: boolean }) => Promise<boolean>;
+
+const KEY_PREFIX = "detached:";
+
+/**
+ * The question before stopping an adopted session. Always asked: it is
+ * running by definition, and nothing on this page has seen what it is doing.
+ */
+export function stopQuestion(listing: Pick<TerminalListing, "run_id">, label: string): { title: string; message: string } {
+  return {
+    title: `Stop ${label}?`,
+    message: listing.run_id
+      ? `${label} is still working on a task from before the window reloaded. Stopping it ends that attempt; it cannot be restarted, only resumed as a new conversation.`
+      : `${label} is still running from before the window reloaded. Stopping it ends whatever it is doing.`,
+  };
+}
+
+/**
+ * Hands an adopted task session to its task's own launch path, freeing the
+ * adopted record's slot first. Called by "Open terminal": with every slot
+ * held, the tab that takes the session over could otherwise never open.
+ * Returns whether there was one.
+ */
+export function handOverDetachedRun(
+  runId: string,
+  registry: ReturnType<typeof createSessionRegistry> = terminalSessions,
+): boolean {
+  const adopted = get(registry).find((record) => record.key.startsWith(KEY_PREFIX) && record.taskRunId === runId);
+  adopted?.reveal?.();
+  return Boolean(adopted);
+}
 
 /** Validates the payload at the boundary. A malformed row is no row. */
 export function parseListing(raw: unknown): TerminalListing | null {
@@ -58,11 +90,13 @@ function launcherOf(listing: TerminalListing): LauncherKind {
  */
 export async function adoptDetachedSessions(deps: {
   invoke?: Invoke;
+  confirm?: Confirm;
   bus?: PtyBus;
   registry?: ReturnType<typeof createSessionRegistry>;
 } = {}): Promise<number> {
   const invoke = deps.invoke ?? (tauriInvoke as Invoke);
   const bus = deps.bus ?? tauriBus;
+  const confirm = deps.confirm ?? askConfirm;
   const registry = deps.registry ?? terminalSessions;
   const raw = await invoke<unknown>("cmd_terminal_sessions");
   if (!Array.isArray(raw)) throw new Error("The terminal host returned an invalid session list.");
@@ -72,14 +106,15 @@ export async function adoptDetachedSessions(deps: {
     // Adopting twice must not list a session twice.
     if (get(registry).some((record) => record.sessionId === listing.id)) continue;
     const launcher = launcherOf(listing);
-    const key = `detached:${listing.id}`;
+    const key = `${KEY_PREFIX}${listing.id}`;
+    const label = launcherLabel(launcher);
     let unsubscribe: (() => void) | null = null;
     // A refused reserve (the shared limit) throws out of here: sessions the
     // host holds but this page cannot list are reported, not skipped.
     let slot: ReturnType<typeof registry.reserve> | null = registry.reserve({
       key,
       repoPath: listing.repo,
-      label: launcherLabel(launcher),
+      label,
       ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
       status: DETACHED_STATUS,
       sessionId: listing.id,
@@ -87,6 +122,7 @@ export async function adoptDetachedSessions(deps: {
         await invoke("cmd_terminal_kill", { sessionId: listing.id });
         drop();
       },
+      confirmClose: () => confirm({ ...stopQuestion(listing, label), confirmLabel: "Stop", destructive: true }),
       reveal() {
         // Queued first, so a refusal leaves the session listed. Then this
         // record and its exit watch give way, before the tab that takes the
@@ -96,7 +132,7 @@ export async function adoptDetachedSessions(deps: {
           runId: listing.run_id ?? key,
           repoPath: listing.repo,
           provider: launcher,
-          title: listing.run_id ? "Task attempt" : launcherLabel(launcher),
+          title: listing.run_id ? "Task attempt" : label,
           ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
         });
         drop();

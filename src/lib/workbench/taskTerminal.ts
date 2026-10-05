@@ -13,6 +13,7 @@
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore } from "../stores/repoStore";
 import { enqueueTaskTerminal } from "../terminal/taskLaunches";
+import { handOverDetachedRun } from "../terminal/detachedSessions";
 import { findConversation, type TaskRun } from "./client";
 
 export type TaskTerminalOutcome = "opened" | "queued";
@@ -21,6 +22,10 @@ export async function openTaskTerminal(
   run: Pick<TaskRun, "id" | "cwd" | "provider" | "task_title">,
 ): Promise<TaskTerminalOutcome> {
   enqueueTaskTerminal({ runId: run.id, repoPath: run.cwd, provider: run.provider, title: run.task_title });
+  // A session a reloaded page left running for this attempt gives up its
+  // adopted record now, before the tab that takes the same process over
+  // reserves a slot. Queued first, so the request that stands is this one.
+  handOverDetachedRun(run.id);
   return showCheckout(run.cwd);
 }
 

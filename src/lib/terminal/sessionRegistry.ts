@@ -105,11 +105,24 @@ export function createSessionRegistry() {
           records.set(record.key, { ...current, status });
           publish();
         },
-        /** Records the backend id once the PTY has one. */
+        /**
+         * Records the backend id once the PTY has one.
+         *
+         * One record per native session: any other record holding this id
+         * gives way. A session a reloaded page left running is adopted as a
+         * record of its own, and a task tab can take that same process over
+         * through its own launch path ("Open terminal"), never through the
+         * adopted record. Without this the session was listed twice, held
+         * two slots against the shared limit, and the stale row's Close
+         * stopped the live tab's process.
+         */
         identify(sessionId: string) {
           if (released || !sessionId) return;
           const current = records.get(record.key) ?? record;
           if (current.sessionId === sessionId) return;
+          for (const [key, other] of records) {
+            if (key !== record.key && other.sessionId === sessionId) records.delete(key);
+          }
           records.set(record.key, { ...current, sessionId });
           publish();
         },

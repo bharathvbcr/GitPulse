@@ -206,3 +206,20 @@ describe("finding the tab a notification belongs to", () => {
     expect(get(registry)).toHaveLength(0);
   });
 });
+
+describe("one record per native session", () => {
+  it("a record that identifies a session displaces any other holding it, and nothing else", () => {
+    const registry = createSessionRegistry();
+    const close = async () => {};
+    const adopted = registry.reserve({ key: "detached:term-1", repoPath: "/r", label: "Claude", status: "running", close });
+    adopted.identify("term-1");
+    const other = registry.reserve({ key: "tab-2", repoPath: "/r", label: "Shell", status: "running", close });
+    other.identify("term-2");
+    const tab = registry.reserve({ key: "tab-1", repoPath: "/r", label: "Claude", status: "starting", close });
+    tab.identify("term-1");
+    expect(get(registry).map((record) => record.key).sort()).toEqual(["tab-1", "tab-2"]);
+    // The displaced holder releasing late frees nothing that is not its own.
+    adopted.release();
+    expect(get(registry).map((record) => record.key).sort()).toEqual(["tab-1", "tab-2"]);
+  });
+});

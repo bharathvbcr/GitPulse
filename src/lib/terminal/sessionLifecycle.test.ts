@@ -299,7 +299,11 @@ describe("terminal lifecycle races", () => {
   });
   it("enforces the global slot ceiling across 100 concurrent repository starts", async () => {
     const registry = createSessionRegistry();
-    const sessions = Array.from({ length: 100 }, (_, i) => fixture({}, registry, String(i)));
+    // Each process its own native id, as the backend issues them: the
+    // registry keeps one record per native session, so 100 sessions sharing
+    // one id would be one session, not a ceiling test.
+    const sessions = Array.from({ length: 100 }, (_, i) =>
+      fixture({ spawn: async () => ({ id: `native-${i}`, shell: "/bin/sh", cwd: "/repo" }) }, registry, String(i)));
     await Promise.all(sessions.map((f) => f.owner.start()));
     expect(get(registry)).toHaveLength(MAX_TERMINAL_TABS);
     expect(sessions.reduce((n, f) => n + f.transport.spawn.mock.calls.length, 0)).toBe(MAX_TERMINAL_TABS);
