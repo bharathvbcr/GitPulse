@@ -19,8 +19,8 @@
   import AgentDecisions from "./AgentDecisions.svelte";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { repoStore } from "../stores/repoStore";
-  import { consumeTaskTerminal, enqueueTaskTerminal } from "../terminal/taskLaunches";
+  import { consumeTaskTerminal } from "../terminal/taskLaunches";
+  import { openTaskTerminal, queuedTerminalNote } from "../workbench/taskTerminal";
   import {
     cancelTaskRun,
     explainError,
@@ -162,14 +162,7 @@
     schedule();
   }
   async function open(run: TaskRun) {
-    let queued = false;
-    const opened = await repoStore.openRepo(run.cwd, { onReady: (path) => {
-      enqueueTaskTerminal({ runId: run.id, repoPath: path, provider: run.provider, title: run.task_title });
-      queued = true;
-      interfaceStore.setGlobalSurface("repository");
-      repoStore.setTerminalOpen(true);
-    } });
-    if (!opened || !queued) throw new Error("The checkout did not finish opening. The attempt remains available below; open it again or cancel its preparation.");
+    if ((await openTaskTerminal(run)) === "queued" && !disposed) note = queuedTerminalNote(run.cwd);
   }
   async function cancel(run: TaskRun) {
     busy = true; error = "";

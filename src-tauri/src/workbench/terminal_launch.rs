@@ -22,6 +22,10 @@ struct Preparation {
     #[serde(default)]
     acknowledge_bypass: bool,
     repo_path: String,
+    /// Give this attempt a fresh linked worktree branched from `repo_path`,
+    /// instead of running in `repo_path` itself.
+    #[serde(default)]
+    worktree: bool,
 }
 
 fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
@@ -246,7 +250,37 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     if kind == "managed" {
         managed_adapter_gate(state, &input.provider)?;
     }
-    let checkout = checkout(&input.repo_path)?;
+    if !input.worktree {
+        return prepare_in(state, &input, kind, &input.repo_path);
+    }
+    let task = state
+        .with_store(|store| query(store, "items.get", &json!({"id":input.task_id}).to_string()))?;
+    let title = task["item"]["title"].as_str().unwrap_or_default();
+    let provisioned = super::agent_worktree::provision(&input.repo_path, &input.id, title)?;
+    let prepared = prepare_in(state, &input, kind, &provisioned.path);
+    if let Err(refusal) = prepared {
+        // The attempt does not exist, so neither may the worktree made for it.
+        return Err(match super::agent_worktree::discard(&provisioned) {
+            Ok(()) => refusal,
+            Err(cleanup) => WorkbenchError::new(
+                &refusal.code,
+                format!(
+                    "{} The worktree made for it could not be removed and is still at {} on branch {}: {cleanup}",
+                    refusal.message, provisioned.path, provisioned.branch
+                ),
+            ),
+        });
+    }
+    prepared
+}
+
+fn prepare_in(
+    state: &WorkbenchState,
+    input: &Preparation,
+    kind: &str,
+    repo_path: &str,
+) -> Result<Value, WorkbenchError> {
+    let checkout = checkout(repo_path)?;
     let body = json!({
         "id":input.id, "request_id":input.request_id, "expected_revision":0,
         "kind":kind,
@@ -719,6 +753,155 @@ mod tests {
         assert_eq!(
             state.request("runs.get", r#"{"id":"run"}"#).unwrap()["item"]["state"],
             "prepared"
+        );
+    }
+
+    fn with_worktree(root: &Path, id: &str) -> Value {
+        let mut input = prepare(root);
+        input["id"] = json!(id);
+        input["request_id"] = json!(format!("prepare-{id}"));
+        input["worktree"] = json!(true);
+        input
+    }
+
+    fn porcelain(root: &Path) -> String {
+        git_text(root, &["status", "--porcelain", "--untracked-files=all"]).unwrap()
+    }
+
+    #[test]
+    fn a_second_task_in_a_busy_checkout_runs_in_its_own_ignored_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        // The main checkout is taken; the same checkout again is refused...
+        let mut again = prepare(&root);
+        again["id"] = json!("again");
+        again["request_id"] = json!("prepare-again");
+        assert_eq!(
+            state
+                .request("runs.prepare_terminal", &again.to_string())
+                .unwrap_err()
+                .code,
+            "checkout_busy"
+        );
+        // ...and a fresh worktree is admitted beside it, concurrently.
+        let run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "f00dcafe-1").to_string(),
+            )
+            .unwrap();
+        let cwd = run["item"]["cwd"].as_str().unwrap();
+        let expected = root
+            .canonicalize()
+            .unwrap()
+            .join(".gitpulse/worktrees/preserve-e42-f00dcafe");
+        assert_eq!(Path::new(cwd), expected);
+        assert_eq!(
+            git_text(Path::new(cwd), &["branch", "--show-current"])
+                .unwrap()
+                .trim(),
+            "gitpulse/preserve-e42-f00dcafe"
+        );
+        // The main checkout's status does not show the agent's tree. (The
+        // gate's own ledger may appear here; it is not this change's.)
+        let status = porcelain(&root);
+        assert!(!status.contains(".gitpulse"), "{status}");
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains("/.gitpulse/worktrees/"));
+        // A third task gets a third tree; two live runs, one repository.
+        state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "beefbeef-2").to_string(),
+            )
+            .unwrap();
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 3);
+    }
+
+    #[test]
+    fn a_refused_attempt_takes_its_worktree_and_branch_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let mut stale = with_worktree(&root, "abcdef12-x");
+        stale["source_revision"] = json!(9);
+        let error = state
+            .request("runs.prepare_terminal", &stale.to_string())
+            .unwrap_err();
+        assert_ne!(error.code, "worktree_unavailable", "{}", error.message);
+        assert!(!root
+            .join(".gitpulse/worktrees/preserve-e42-abcdef12")
+            .exists());
+        assert_eq!(
+            git_text(&root, &["branch", "--list", "gitpulse/*"])
+                .unwrap()
+                .trim(),
+            ""
+        );
+        assert_eq!(
+            git_text(&root, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .matches("worktree ")
+                .count(),
+            1
+        );
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 0);
+    }
+
+    #[test]
+    fn a_replayed_worktree_preparation_reuses_its_tree_and_its_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let input = with_worktree(&root, "cafe0123-r").to_string();
+        let first = state.request("runs.prepare_terminal", &input).unwrap();
+        // A lost reply is retried with the identical request.
+        let second = state.request("runs.prepare_terminal", &input).unwrap();
+        assert_eq!(first["item"], second["item"]);
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 1);
+        assert_eq!(
+            git_text(&root, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .matches("worktree ")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_stranger_directory_at_the_worktree_path_is_never_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let squatter = root.join(".gitpulse/worktrees/preserve-e42-deadbeef");
+        std::fs::create_dir_all(&squatter).unwrap();
+        std::fs::write(squatter.join("keep.txt"), "mine").unwrap();
+        let error = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "deadbeef-s").to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "worktree_unavailable");
+        assert_eq!(
+            std::fs::read_to_string(squatter.join("keep.txt")).unwrap(),
+            "mine"
         );
     }
 }

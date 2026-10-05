@@ -52,6 +52,8 @@ export interface RunPreparation {
   id: string; request_id: string; task_id: string; source_revision: number;
   repository_id: string; repository_revision: number; repo_path: string;
   provider: AgentProvider; permission_mode: PermissionMode; acknowledge_bypass: boolean;
+  /** Run in a fresh worktree the host creates from `repo_path` (and removes if refused). */
+  worktree?: boolean;
 }
 export type TaskDraft = Omit<Task, keyof RecordVersion>;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
@@ -428,6 +430,20 @@ export async function getTaskRun(id: string): Promise<TaskRun> {
 export async function listTaskRuns(taskID: string, cursor?: string): Promise<Page<TaskRun>> {
   const result = page(await request("runs.list", { task_id: taskID, limit: 30, newest: true, ...(cursor ? { cursor } : {}) }), taskRun);
   return result.items.every((run) => run.task_id === taskID) ? result : invalid();
+}
+/**
+ * Every attempt in one repository, across tasks, in a state that can hold a
+ * checkout — what the handoff form needs to see which checkouts already have
+ * an agent. Asked per state, newest first, so a long-running agent can never
+ * be pushed off the first page by later history; `prepared` rows past their
+ * expiry are among them and are filtered by the caller's clock.
+ */
+export async function listHoldingRuns(repositoryID: string): Promise<TaskRun[]> {
+  const pages = await Promise.all(["prepared", "starting", "running", "unresolved"].map(async (state) => {
+    const result = page(await request("runs.list", { repository_id: repositoryID, state, limit: 50, newest: true }), taskRun);
+    return result.items.every((run) => run.repository_id === repositoryID && run.state === state) ? result.items : invalid();
+  }));
+  return pages.flat();
 }
 export interface RunRelease { released: boolean; reason: string; run: TaskRun }
 /**

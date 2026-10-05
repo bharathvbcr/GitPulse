@@ -283,6 +283,27 @@ launch. A terminal handoff opens a dedicated task-bound session in the existing
 [terminal dock](TERMINAL.md). It runs under that CLI's configured permissions;
 finishing the process does not accept the task or mark it Done.
 
+### Running several tasks at once
+
+One working tree holds one agent; a repository can hold several. Tick **Run in
+a new worktree** and GitPulse creates `.gitpulse/worktrees/<task>-<id>` in the
+repository's main checkout on a new `gitpulse/<task>-<id>` branch from the
+selected checkout, keeps that folder out of `git status` through
+`.git/info/exclude`, and runs the agent there. When the selected checkout
+already has an agent, the form says which task holds it and selects a new
+worktree for you. If the attempt is refused, the worktree and its branch are
+removed again; once it is accepted, the worktree is the agent's and stays until
+you remove it from **Worktrees**. Up to eight attempts can be live at once
+across the profile, and each attempt's terminal waits in its repository's dock
+if you navigate elsewhere while it opens.
+
+An attempt holds its checkout until its process is known to have ended. If
+GitPulse crashed or was force-quit while an agent ran, the next start — or the
+next launch into that checkout — releases the attempt once its agent process is
+provably gone, and the inbox says so. **Release checkout** on a run asks for that
+check directly; an agent that is still running is never released, and the
+answer names its process.
+
 Managed runs use a separate Manvi host protocol for configuration checks,
 structured questions/approvals and completion receipts. A saved decision and its
 delivery to the provider are separate states. Terminal handoffs do not produce

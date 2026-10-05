@@ -301,6 +301,26 @@ export function runHoldsCheckout(run: { state: string; expires_at: number }, now
 }
 
 /**
+ * The attempt already holding `checkout`, if any.
+ *
+ * One checkout holds one agent, so a second task aimed at a busy checkout can
+ * only run in a worktree of its own. Knowing that before pressing launch is
+ * what turns "already has a prepared, active or unresolved run" into a launch
+ * that just works. Compared by path identity, the same rule the checkout list
+ * uses, so `/work/Repo` and `/work/repo` on a case-insensitive disk are one.
+ */
+export function attemptHolding<T extends { state: string; expires_at: number; cwd: string }>(
+  runs: readonly T[],
+  checkout: string,
+  options: PathIdentityOptions,
+  now: number = Date.now(),
+): T | null {
+  const key = identityKey(normalizeCheckout(checkout), options);
+  if (!key) return null;
+  return runs.find((run) => runHoldsCheckout(run, now) && identityKey(run.cwd, options) === key) ?? null;
+}
+
+/**
  * Whether "Release" applies: the attempt holds its checkout and only the host
  * can say whether its owner and process are gone. The host decides; this only
  * decides whether to ask.

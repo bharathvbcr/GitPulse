@@ -19,16 +19,16 @@
   import { invoke } from "../ipc/invoke";
   import { FolderOpen } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import { isCaseInsensitiveFs } from "../repos/paths";
-  import { enqueueTaskTerminal } from "../terminal/taskLaunches";
+  import { openTaskTerminal, queuedTerminalNote } from "../workbench/taskTerminal";
   import { bounded } from "../workbench/taskActions";
   import {
     PERMISSION_MODES,
     explainError,
     getRepository,
     getTask,
+    listHoldingRuns,
     launchManagedRun,
     newID,
     prepareTaskRun,
@@ -44,6 +44,7 @@
     PROVIDER_LABELS,
     checkoutCandidates,
     defaultHandoff,
+    attemptHolding,
     handoffGate,
     normalizeCheckout,
     preferredCheckout,
@@ -129,6 +130,27 @@
   const locked = $derived(busy || disabled || pending !== null);
   const gate = $derived(handoffGate({ checkout, settings, acknowledgedBypass: acknowledged, dirty, busy: busy || disabled }));
   const repositoryName = $derived(repositories.find((repo) => repo.id === selected)?.name ?? selected);
+  /**
+   * Attempts already holding a checkout in this repository, from any task.
+   * Null while unread or after a failed read: then nothing is forced, and a
+   * busy checkout is still caught by the store's own refusal below.
+   */
+  let holding = $state<TaskRun[] | null>(null);
+  let holdingTicket = 0;
+  const occupant = $derived(holding ? attemptHolding(holding, checkout, pathOpts) : null);
+  /** A checkout that already has an agent can only take this one in a worktree. */
+  const useWorktree = $derived(provisionWorktree || occupant !== null);
+
+  async function loadHolding(repository: string) {
+    const ticket = ++holdingTicket;
+    try {
+      const runs = await listHoldingRuns(repository);
+      if (!disposed && ticket === holdingTicket) holding = runs;
+    } catch {
+      if (!disposed && ticket === holdingTicket) holding = null;
+    }
+  }
+  $effect(() => { const repository = selected; untrack(() => { void loadHolding(repository); }); });
 
   export function launchState(): HandoffGate { return gate; }
 
@@ -166,19 +188,9 @@
     } catch (cause) { error = explainError(cause); }
   }
 
-  async function openTerminalFor(run: TaskRun) {
-    let queued = false;
-    const opened = await repoStore.openRepo(run.cwd, {
-      onReady: (path) => {
-        enqueueTaskTerminal({ runId: run.id, repoPath: path, provider: run.provider, title: run.task_title });
-        queued = true;
-        interfaceStore.setGlobalSurface("repository");
-        repoStore.setTerminalOpen(true);
-      },
-    });
-    if (!opened || !queued) {
-      throw new Error("The checkout did not finish opening. The attempt is prepared; open it again from the run history, or cancel it there.");
-    }
+  /** True when the terminal is showing; false when it is queued for later. */
+  async function openTerminalFor(run: TaskRun): Promise<boolean> {
+    return (await openTaskTerminal(run)) === "opened";
   }
 
   /**
@@ -203,21 +215,9 @@
         }
         const repo = await bounded(getRepository(selected));
         if (disposed) return;
-        let agentCheckoutPath = path;
-        if (provisionWorktree) {
-          note = "Provisioning isolated agent worktree with CoW cache…";
-          const laneId = newID().slice(0, 8);
-          const wtPath = `${path}/.gitpulse/worktrees/${laneId}`;
-          await invoke("cmd_add_worktree", {
-            repoPath: path,
-            targetPath: wtPath,
-            newBranch: `agent/${laneId}`,
-            startPoint: null,
-            detach: false,
-            cowCaches: true,
-          });
-          agentCheckoutPath = wtPath;
-        }
+        // The host makes the worktree, inside the same step that prepares the
+        // attempt, and removes it again if the attempt is refused.
+        if (useWorktree) note = "Creating a worktree for this attempt…";
         pending = {
           kind: settings.kind,
           id: newID(),
@@ -226,7 +226,8 @@
           source_revision: latest.revision,
           repository_id: repo.id,
           repository_revision: repo.revision,
-          repo_path: agentCheckoutPath,
+          repo_path: path,
+          ...(useWorktree ? { worktree: true } : {}),
           provider: settings.provider,
           permission_mode: settings.permission,
           acknowledge_bypass: acknowledged,
@@ -257,16 +258,26 @@
         return;
       }
       note = "Opening the provider terminal…";
-      await openTerminalFor(run);
+      const shown = await openTerminalFor(run);
       if (disposed) return;
-      note = "";
+      note = shown ? "" : queuedTerminalNote(run.cwd);
       toastStore.success(`${PROVIDER_LABELS[settings.provider]} requested for revision ${run.source_revision}.`);
       onLaunched(run);
     } catch (cause) {
       if (disposed) return;
       error = explainError(cause);
       if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code)) pending = null;
-    } finally { if (!disposed) busy = false; }
+      // The store saw an agent this form did not (a read that failed, or one
+      // that started since). Select the worktree so the next press runs.
+      if (cause instanceof WorkbenchError && cause.code === "checkout_busy" && pending === null) {
+        provisionWorktree = true;
+        error = `${error} A new worktree is now selected for this attempt; launch again to run it beside that one.`;
+      }
+    } finally {
+      if (!disposed) busy = false;
+      // Whatever happened, this repository's occupancy may have changed.
+      if (!disposed) void loadHolding(selected);
+    }
   }
 </script>
 
@@ -339,9 +350,19 @@
   {/if}
 
   <label class="ack">
-    <input type="checkbox" bind:checked={provisionWorktree} disabled={locked} />
-    Provision isolated agent worktree with CoW build caches
+    <input
+      type="checkbox"
+      checked={useWorktree}
+      disabled={locked || occupant !== null}
+      onchange={(e) => { provisionWorktree = e.currentTarget.checked; }}
+    />
+    Run in a new worktree, so other tasks can run at the same time
   </label>
+  {#if occupant}
+    <p class="meta" data-testid="checkout-occupied">An agent is already working in this checkout ({occupant.task_title || "another task"}, {occupant.state}). This attempt gets its own worktree and branch beside it.</p>
+  {:else if useWorktree}
+    <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the attempt is refused.</p>
+  {/if}
 
   <label>Permission mode
     <select class="gp-select" bind:value={settings.permission} disabled={locked} onchange={() => { acknowledged = false; }}>

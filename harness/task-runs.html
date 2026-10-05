@@ -10,7 +10,7 @@
   const runs = new Map(), sessions = new Map(), prepared = new Map();
   const decisions = new Map(), decisionReceipts = new Map(), decisionWrites = [];
   let loseDecision = false;
-  const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, errors:[], checks:[] };
+  const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, holdingLists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, errors:[], checks:[] };
   let loseManagedLaunch = true;
   let loseLaunch = true, losePreparation = false;
   const preparations = [];
@@ -39,8 +39,15 @@
       if (args.method === "items.get") return record(task);
       if (args.method === "repositories.get") return record(repository);
       if (args.method === "runs.list") {
-        report.lists++; show();
-        const items = [...runs.values()].reverse().map(({output,effective_configuration,...summary})=>summary);
+        // Honour the filters the store honours. The handoff form reads which
+        // checkouts are occupied (by repository and state); those reads are
+        // counted apart from the run history's polling, which the checks
+        // below measure.
+        if (input.repository_id) report.holdingLists++; else report.lists++;
+        show();
+        const items = [...runs.values()].reverse()
+          .filter(run=>(!input.task_id||run.task_id===input.task_id)&&(!input.repository_id||run.repository_id===input.repository_id)&&(!input.state||run.state===input.state))
+          .map(({output,effective_configuration,...summary})=>summary);
         return JSON.stringify({ok:true,items,shown:items.length,total:items.length,has_more:false,next_cursor:null});
       }
       if (args.method === "runs.prepare_terminal" || args.method === "runs.prepare_managed") {
@@ -141,30 +148,10 @@
       check("Hidden task inspector stops run polling",report.lists===suspended);
       button("Resume run updates").click();await wait(()=>report.lists>suspended);
       check("Visible inspector refreshes immediately after resume",true);
-      const current=[...runs.values()][0], now=Math.floor(Date.now()/1000);
-      const exactPayload='{"command":"git status","number":9007199254740993,"context":"first","context":"second"}';
-      for(const [id,kind,payload] of [["allow","permission",exactPayload],["deny","permission",'{"command":"git push"}'],["question","question",'{"question":"Which tests?"}'],["stale","permission",'{"command":"git diff"}']]){
-        const hash=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(payload));
-        const digest=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,"0")).join("");
-        decisions.set(id,{id,revision:1,updated_at:now,run_id:current.id,task_id:task.id,source_revision:task.revision,repository_id:repository.id,repository_revision:repository.revision,owner_id:"fixture",session_id:current.session_id,provider_thread_id:"thread",provider_turn_id:"turn",protocol_request_id:`s:${id}`,provider:"codex",permission_mode:"ask",policy_revision:1,cwd:current.cwd,kind,payload,payload_digest:digest,created_at:now,expires_at:now+300,state:"pending",decision:null,answer:null,actionable:true,reason:""});
-      }
-      button("Review requests").click();await wait(()=>document.querySelector('[aria-label="Complete agent request"]'));
-      const panel=()=>document.querySelector('[aria-label="Agent requests"]');
-      check("Permission review preserves the exact request including large numbers and duplicate fields",panel().querySelector('textarea').value===exactPayload);
-      loseDecision=true;button("Allow once").click();await wait(()=>button("Retry saved decision"));
-      check("An uncertain decision disables alternative responses",[...panel().querySelectorAll('fieldset button')].every(b=>b.matches(':disabled')));
-      button("Retry saved decision").click();await wait(()=>!button("Retry saved decision")&&panel().textContent.includes("Saved response: Allow once"));
-      check("Decision retry preserves the request and records one saved response",decisionWrites.length===2&&decisionWrites[0]===decisionWrites[1]&&decisions.get("allow").revision===2);
-      check("Saving a decision does not claim provider delivery",panel().textContent.includes("Decision saved · delivery pending")&&!panel().textContent.includes("Provider confirmed"));
-      button("Deny request").click();await wait(()=>panel().textContent.includes("Saved response: Deny"));
-      const answer=panel().querySelector('label textarea');answer.value="Run the workbench tests";answer.dispatchEvent(new Event("input",{bubbles:true}));
-      await wait(()=>!button("Save answer").disabled);button("Save answer").click();await wait(()=>panel().textContent.includes("Saved response: Run the workbench tests"));
-      check("Questions and denials save distinct responses",decisions.get("deny").decision==="deny"&&decisions.get("question").decision==="answer");
-      decisions.get("stale").actionable=false;button("Refresh requests").click();await wait(()=>panel().textContent.includes("expired or its target changed"));
-      check("Stale requests expose no approval controls",!button("Allow once")&&!button("Deny request"));
-      button("Hide requests").click();await wait(()=>!panel());button("Review requests").click();await wait(()=>panel()?.textContent.includes("Saved response: Allow once"));
-      check("Reopening review retains receipts without accepting the task",decisions.get("allow").revision===2&&task.revision===2&&task.status==="ready");
-      button("Hide requests").click();
+      // Structured requests only come from a managed session (Manvi creates
+      // them, and the store binds each to the run's own owner), so a terminal
+      // run offers no review it could never have.
+      check("A terminal run offers no structured request review",!button("Review requests"));
       await finish();button("Refresh").click();await wait(()=>document.body.textContent.includes("Process exited"));
       check("Process completion remains separate from task acceptance",task.status==="ready");
       await openLaunchForm();set("Permission mode","edit");await pause(30);
@@ -196,6 +183,29 @@
       button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Claude Code started"));
       check("Managed retry reuses the original session",report.managedSpawns===1);
       check("Run history does not fetch full output or effective settings",report.detailReads===0);
+      const current=[...runs.values()].find(run=>run.kind==="managed"), now=Math.floor(Date.now()/1000);
+      const exactPayload='{"command":"git status","number":9007199254740993,"context":"first","context":"second"}';
+      for(const [id,kind,payload] of [["allow","permission",exactPayload],["deny","permission",'{"command":"git push"}'],["question","question",'{"question":"Which tests?"}'],["stale","permission",'{"command":"git diff"}']]){
+        const hash=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(payload));
+        const digest=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,"0")).join("");
+        decisions.set(id,{id,revision:1,updated_at:now,run_id:current.id,task_id:task.id,source_revision:task.revision,repository_id:repository.id,repository_revision:repository.revision,owner_id:"fixture",session_id:current.session_id,provider_thread_id:"thread",provider_turn_id:"turn",protocol_request_id:`s:${id}`,provider:"codex",permission_mode:"ask",policy_revision:1,cwd:current.cwd,kind,payload,payload_digest:digest,created_at:now,expires_at:now+300,state:"pending",decision:null,answer:null,actionable:true,reason:""});
+      }
+      (button("Review requests")??button("Refresh requests")).click();await wait(()=>document.querySelector('[aria-label="Complete agent request"]'));
+      const panel=()=>document.querySelector('[aria-label="Agent requests"]');
+      check("Permission review preserves the exact request including large numbers and duplicate fields",panel().querySelector('textarea').value===exactPayload);
+      loseDecision=true;button("Allow once").click();await wait(()=>button("Retry saved decision"));
+      check("An uncertain decision disables alternative responses",[...panel().querySelectorAll('fieldset button')].every(b=>b.matches(':disabled')));
+      button("Retry saved decision").click();await wait(()=>!button("Retry saved decision")&&panel().textContent.includes("Saved response: Allow once"));
+      check("Decision retry preserves the request and records one saved response",decisionWrites.length===2&&decisionWrites[0]===decisionWrites[1]&&decisions.get("allow").revision===2);
+      check("Saving a decision does not claim provider delivery",panel().textContent.includes("Decision saved · delivery pending")&&!panel().textContent.includes("Provider confirmed"));
+      button("Deny request").click();await wait(()=>panel().textContent.includes("Saved response: Deny"));
+      const answer=panel().querySelector('label textarea');answer.value="Run the workbench tests";answer.dispatchEvent(new Event("input",{bubbles:true}));
+      await wait(()=>!button("Save answer").disabled);button("Save answer").click();await wait(()=>panel().textContent.includes("Saved response: Run the workbench tests"));
+      check("Questions and denials save distinct responses",decisions.get("deny").decision==="deny"&&decisions.get("question").decision==="answer");
+      decisions.get("stale").actionable=false;button("Refresh requests").click();await wait(()=>panel().textContent.includes("expired or its target changed"));
+      check("Stale requests expose no approval controls",!button("Allow once")&&!button("Deny request"));
+      button("Hide requests").click();await wait(()=>!panel());button("Review requests").click();await wait(()=>panel()?.textContent.includes("Saved response: Allow once"));
+      check("Reopening review retains receipts without accepting the task",decisions.get("allow").revision===2&&task.revision===2&&task.status==="ready");
       const managed=[...runs.values()].find(run=>run.kind==="managed");
       const multiPayload=JSON.stringify({method:"item/tool/requestUserInput",params:{questions:[{id:"scope",question:"Which test scope?",options:[{label:"Focused",description:"Run focused tests"}]},{id:"format",question:"Which output format?"}]}});
       const multiHash=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(multiPayload));

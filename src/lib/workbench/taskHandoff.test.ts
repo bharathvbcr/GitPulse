@@ -10,6 +10,7 @@ import {
   normalizeCheckout,
   preferredCheckout,
   reconcileHandoff,
+  attemptHolding,
   canRelease,
   runExpired,
   runHoldsCheckout,
@@ -327,6 +328,29 @@ describe("runHoldsCheckout", () => {
   it("offers Release exactly where the host can act, never on history or a mere preparation", () => {
     for (const state of ["starting", "running", "unresolved"]) expect(canRelease({ state }), state).toBe(true);
     for (const state of ["prepared", "exited", "failed", "cancelled"]) expect(canRelease({ state }), state).toBe(false);
+  });
+});
+
+describe("attemptHolding", () => {
+  const insensitive = { caseInsensitive: true };
+  const held = (cwd: string, state = "running", expires_at = 0) => ({ cwd, state, expires_at, id: cwd });
+
+  it("names the attempt in this checkout, by identity, and ignores other checkouts", () => {
+    const runs = [held("/work/Repo/.gitpulse/worktrees/a-1"), held("/work/Repo")];
+    expect(attemptHolding(runs, "/work/repo/", insensitive)?.cwd).toBe("/work/Repo");
+    expect(attemptHolding(runs, "/work/repo/.gitpulse/worktrees/a-1", insensitive)?.id).toBe("/work/Repo/.gitpulse/worktrees/a-1");
+    expect(attemptHolding(runs, "/work/repo/.gitpulse/worktrees/b-2", insensitive)).toBeNull();
+    expect(attemptHolding(runs, "", insensitive)).toBeNull();
+  });
+
+  it("does not count history or an expired preparation as occupying the checkout", () => {
+    for (const state of ["exited", "failed", "cancelled"]) {
+      expect(attemptHolding([held("/r", state)], "/r", insensitive), state).toBeNull();
+    }
+    expect(attemptHolding([held("/r", "prepared", 1)], "/r", insensitive, 5_000)).toBeNull();
+    expect(attemptHolding([held("/r", "prepared", 10)], "/r", insensitive, 5_000)?.state).toBe("prepared");
+    // Unresolved holds it: that is the row that refused launches before.
+    expect(attemptHolding([held("/r", "unresolved")], "/r", insensitive)?.state).toBe("unresolved");
   });
 });
 

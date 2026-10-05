@@ -35,6 +35,24 @@ describe("the agent handoff has one implementation", () => {
     }
   });
 
+  it("leaves worktree creation to the host and terminal opening to one owner", () => {
+    // The form used to create the worktree itself, before the store accepted
+    // anything, and never removed it: each refused attempt leaked a worktree
+    // and a branch. The host now owns both creation and rollback.
+    expect(form).not.toContain("cmd_add_worktree");
+    expect(form).toContain("worktree: true");
+    // Both places that open a task terminal share one implementation, which
+    // queues before opening so a superseded open cannot lose the terminal.
+    for (const [name, host] of [["TaskHandoffForm", form], ["TaskAgentPanel", panel]] as const) {
+      expect(host, name).toContain("openTaskTerminal(");
+      expect(host, name).not.toContain("enqueueTaskTerminal(");
+      expect(host, name).not.toContain("repoStore.openRepo(");
+    }
+    // A checkout another agent holds forces the worktree, visibly.
+    expect(form).toContain("const useWorktree = $derived(provisionWorktree || occupant !== null)");
+    expect(form).toContain('cause.code === "checkout_busy"');
+  });
+
   it("re-reads the saved task and refuses a revision that moved", () => {
     expect(form).toContain("await bounded(getTask(taskId))");
     expect(form).toContain("if (latest.revision !== revision)");

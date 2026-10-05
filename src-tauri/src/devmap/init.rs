@@ -138,7 +138,7 @@ fn ignore_source(repo: &Path, query: &str) -> Result<Option<String>, String> {
 }
 
 /// Append `pattern` to this repository's local exclude file.
-fn append_exclude(exclude: &Path, pattern: &str) -> Result<(), String> {
+fn append_exclude(exclude: &Path, pattern: &str, marker: &str) -> Result<(), String> {
     use std::io::Write;
     if let Some(parent) = exclude.parent() {
         std::fs::create_dir_all(parent)
@@ -182,7 +182,7 @@ fn append_exclude(exclude: &Path, pattern: &str) -> Result<(), String> {
     } else {
         "\n"
     };
-    file.write_all(format!("{lead}{EXCLUDE_MARKER}\n{pattern}\n").as_bytes())
+    file.write_all(format!("{lead}{marker}\n{pattern}\n").as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", exclude.display()))?;
     file.flush()
         .map_err(|e| format!("cannot flush {}: {e}", exclude.display()))
@@ -199,6 +199,36 @@ pub fn ensure_state_dir_excluded(repo: &Path) -> ExcludeOutcome {
             reason: "this repository's DevMap state directory is outside its work tree".into(),
         };
     };
+    exclude_verified(repo, paths, EXCLUDE_MARKER)
+}
+
+/// Keep `relative` — a directory under the work tree root, written with `/`
+/// and no leading or trailing slash — out of `git status`, the same way and
+/// with the same verification as the DevMap state directory. `marker` is the
+/// comment written above the pattern, naming who added it.
+pub(crate) fn ensure_dir_excluded(repo: &Path, relative: &str, marker: &str) -> ExcludeOutcome {
+    let parts: Vec<&str> = relative.split('/').collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == ".." || part.contains('\\'))
+        || marker.contains('\n')
+        || !marker.starts_with('#')
+    {
+        return ExcludeOutcome::Refused {
+            reason: format!("`{relative}` is not a plain relative directory"),
+        };
+    }
+    exclude_verified(
+        repo,
+        StateDirPaths {
+            query: format!("{relative}/"),
+            pattern: format!("/{relative}/"),
+        },
+        marker,
+    )
+}
+
+fn exclude_verified(repo: &Path, paths: StateDirPaths, marker: &str) -> ExcludeOutcome {
     match ignore_source(repo, &paths.query) {
         Ok(Some(source)) => return ExcludeOutcome::AlreadyIgnored { source },
         Ok(None) => {}
@@ -209,7 +239,7 @@ pub fn ensure_state_dir_excluded(repo: &Path) -> ExcludeOutcome {
         Err(reason) => return ExcludeOutcome::Refused { reason },
     };
     let exclude = common.join("info").join("exclude");
-    if let Err(reason) = append_exclude(&exclude, &paths.pattern) {
+    if let Err(reason) = append_exclude(&exclude, &paths.pattern, marker) {
         return ExcludeOutcome::Refused { reason };
     }
     // Never report success on an unverified write: an exclude file git does

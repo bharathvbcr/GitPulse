@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { cancelTaskRun, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
+import { cancelTaskRun, listHoldingRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -81,6 +81,17 @@ describe("task attempt transport", () => {
     await expect(cancelTaskRun(run)).rejects.toMatchObject({code:"protocol_error"});
     native.mockRejectedValueOnce({code:"repository_changed",message:"Checkout moved"});
     await expect(prepareTaskRun(preparation)).rejects.toMatchObject({code:"repository_changed"});
+  });
+  it("lists every holding state of one repository and refuses rows from elsewhere", async () => {
+    native.mockImplementation(async (_command, args) => {
+      const input = JSON.parse((args as {input: string}).input) as {state: string; repository_id: string};
+      const item = {...run, id: input.state, state: input.state, repository_id: input.repository_id};
+      return JSON.stringify({ok:true,items:[item],total:1,shown:1,has_more:false,next_cursor:null});
+    });
+    expect((await listHoldingRuns("repo")).map((item) => item.state).sort()).toEqual(["prepared","running","starting","unresolved"]);
+    for (const call of native.mock.calls) expect(JSON.parse((call[1] as {input: string}).input)).toMatchObject({repository_id:"repo", newest:true});
+    native.mockImplementation(async () => JSON.stringify({ok:true,items:[{...run, repository_id:"other"}],total:1,shown:1,has_more:false,next_cursor:null}));
+    await expect(listHoldingRuns("repo")).rejects.toMatchObject({code:"protocol_error"});
   });
   it("releases only what the host says it released, and passes a refusal's reason through", async () => {
     const released = {...run, state:"exited", outcome_uncertain:true, reason:"Reconciled: agent process 42 is no longer running"};

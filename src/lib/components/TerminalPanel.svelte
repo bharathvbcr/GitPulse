@@ -7,7 +7,8 @@
   import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
-  import { taskTerminalRequests, consumeTaskTerminal } from "../terminal/taskLaunches";
+  import { taskTerminalRequests, consumeTaskTerminal, requestFor } from "../terminal/taskLaunches";
+  import { isCaseInsensitiveFs } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
@@ -163,7 +164,7 @@
   let mode = $state<PtyMode>("shell");
   function initialTabs(): TabState {
     if (get(terminalLaunchRequests)?.repoPath === repoPath) return { tabs: [], activeId: null };
-    const request = get(taskTerminalRequests).find((request) => request.repoPath === repoPath);
+    const request = requestFor(get(taskTerminalRequests), repoPath, { caseInsensitive: isCaseInsensitiveFs() });
     return request ? initialState(request.provider, { runId: request.runId, title: request.title }) : initialState();
   }
   let tabState = $state<TabState>(untrack(initialTabs));
@@ -325,7 +326,7 @@
   });
 
   $effect(() => {
-    const request = $taskTerminalRequests.find((request) => request.repoPath === repoPath);
+    const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
     if (!request || (!canCreate && !tabState.tabs.some((tab) => tab.taskRunId === request.runId))) return;
     untrack(() => {
       tabState = openTab(tabState, request.provider, { runId: request.runId, title: request.title });

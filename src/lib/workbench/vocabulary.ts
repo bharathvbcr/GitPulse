@@ -78,3 +78,11 @@ export function asAgentProvider(value: unknown): AgentProvider | null {
 
 /** A provider terminal GitPulse opens, or a connection GitPulse supervises. */
 export type RunKind = "external_terminal" | "managed";
+
+/**
+ * How many attempts the profile may hold at once — the store's
+ * `MAX_ACTIVE_RUNS` in the vendored `dc-store/src/workbench/runs.rs`, which
+ * `run-capacity-contract.test.ts` reads to keep this equal. One checkout
+ * holds one attempt; this bounds the whole machine.
+ */
+export const MAX_LIVE_RUNS = 8;
