@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Archive, ArrowLeft, Bot, Calendar, Check, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
+  import { Archive, ArrowLeft, Bot, Calendar, Check, CircleDot, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
   import { portal } from "../dom/portal";
   import { popover } from "../ui/popover";
   import { cycleFocus } from "../ui/focusTrap";
@@ -226,6 +226,8 @@
   {:else if name === "id"}<Hash size={13} />
   {:else if name === "brief"}<Clipboard size={13} />
   {:else if name === "agent"}<Bot size={13} class="text-accent" />
+  <!-- The glyph GitHubPanel draws beside issues, so the row reads as one. -->
+  {:else if name === "issue"}<CircleDot size={13} />
   {:else if name === "due"}<Calendar size={13} />
   {:else if name === "owner"}<User size={13} />
   {:else if name === "label"}<Tag size={13} />

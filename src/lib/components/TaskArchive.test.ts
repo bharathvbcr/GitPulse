@@ -269,10 +269,16 @@ describe("the dock stays current after a write", () => {
 
   it("nudges from every place the board finishes a write, and nowhere else", () => {
     const calls = board.match(/taskWritten\(\);/g) ?? [];
-    expect(calls.length, "taskWritten must be called from all three write sites").toBe(3);
+    expect(calls.length, "taskWritten must be called from all five write sites").toBe(5);
     expect(board).toContain("if (done) { taskWritten(); await loadBoard(); }");
     expect(board).toContain("if (ids.length) taskWritten();");
     expect(board).toContain("function onEditorSaved(saved: Task) {\n    taskWritten();");
+    // Linking tasks to the GitHub issues filed from them writes their labels,
+    // both in the run and in its Retry link.
+    const filing = board.slice(board.indexOf("async function fileTaskIssues("), board.indexOf("async function retryIssueLink("));
+    expect(filing).toContain("if (linked.length) {\n        taskWritten();");
+    const relinking = board.slice(board.indexOf("async function retryIssueLink("), board.indexOf("async function onMenuAction("));
+    expect(relinking).toContain("toastStore.success(announce);\n      taskWritten();");
     // Not from loadBoard: that also runs on every debounced keystroke, and
     // would reset the dock's paging and selection under a reader who is
     // only typing in the board's search box.

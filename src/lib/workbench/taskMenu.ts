@@ -2,6 +2,8 @@ import { PRIORITY_LABELS } from "./boardDrag";
 import { ARCHIVE_STATUS, archiveState } from "./taskArchive";
 import { STATUSES, STATUS_LABELS, type TaskCard, type TaskStatus } from "./client";
 import { displayTitle, isRevision, isTaskId } from "./taskDelete";
+import { linkedIssueNumber } from "./issueTask";
+import { MAX_TASK_ISSUE_BATCH } from "./taskIssue";
 import type { AgentProvider, ManagedProvider } from "./vocabulary";
 
 export type TaskMenuSubmenu = "move" | "priority" | "copy" | "due" | "owner" | "label" | "agent";
@@ -19,6 +21,7 @@ export type TaskMenuIcon =
   | "owner"
   | "label"
   | "agent"
+  | "issue"
   | "select"
   | "add"
   | "archive"
@@ -52,6 +55,12 @@ export type TaskMenuAction =
   | { kind: "owner"; owner: string | null }
   | { kind: "label"; label: string; add: boolean }
   | { kind: "agent"; target: TaskAgentTarget }
+  /**
+   * File the task, or each task in the selection, as an issue on its
+   * repository's GitHub remote. `taskIssue.ts` owns the run: one confirmation,
+   * one creation at a time, and a stop at the first one that does not land.
+   */
+  | { kind: "githubIssue" }
   | { kind: "selectColumn" }
   | { kind: "newInColumn"; status: TaskStatus }
   /**
@@ -277,6 +286,39 @@ function bounded(values: readonly string[] | undefined): string[] {
   return [...seen];
 }
 
+/**
+ * The Create GitHub issue row, for one task or a selection.
+ *
+ * A task imported from an issue, or already filed as one, carries the link
+ * the import side matches on; filing it again would publish a duplicate, so a
+ * single linked task names its issue and a selection counts the linked ones
+ * the run will skip. A selection past the batch cap is refused here rather
+ * than silently trimmed.
+ */
+function githubIssueItem(cards: readonly TaskCard[], busy: boolean): TaskMenuItem {
+  const base = { id: "github-issue", action: { kind: "githubIssue" } as const, icon: "issue" as const };
+  if (cards.length === 1) {
+    const linked = linkedIssueNumber(cards[0]);
+    return {
+      ...base,
+      label: "Create GitHub issue…",
+      hint: linked === null ? undefined : `Linked to #${linked}`,
+      disabled: busy || linked !== null,
+    };
+  }
+  const linked = cards.filter((card) => linkedIssueNumber(card) !== null).length;
+  const fileable = cards.length - linked;
+  if (cards.length > MAX_TASK_ISSUE_BATCH) {
+    return { ...base, label: `Create ${fileable} GitHub issues…`, hint: `At most ${MAX_TASK_ISSUE_BATCH}`, disabled: true };
+  }
+  return {
+    ...base,
+    label: fileable > 1 ? `Create ${fileable} GitHub issues…` : "Create GitHub issue…",
+    hint: fileable === 0 ? "All linked" : linked ? `${linked} linked` : undefined,
+    disabled: busy || fileable === 0,
+  };
+}
+
 export function taskMenuItems(options: {
   cards: readonly TaskCard[];
   column?: TaskStatus | null;
@@ -284,6 +326,8 @@ export function taskMenuItems(options: {
   vocabulary?: TaskMenuVocabulary;
   /** False while no repository is registered, so a handoff cannot be offered. */
   canHandoff?: boolean;
+  /** False while no repository is registered, so there is no remote to file on. */
+  canFileIssue?: boolean;
 }): TaskMenuItem[] {
   const cards = options.cards.filter((card) => isTaskId(card.id) && isRevision(card.revision));
   const busy = options.busy === true;
@@ -332,6 +376,7 @@ export function taskMenuItems(options: {
         });
       }
     }
+    if (options.canFileIssue !== false) items.push(githubIssueItem(cards, busy));
     items.push({
       id: "duplicate",
       label: "Duplicate…",
@@ -341,6 +386,7 @@ export function taskMenuItems(options: {
     });
   }
 
+  if (many && options.canFileIssue !== false) items.push(githubIssueItem(cards, busy));
   items.push({
     id: "copy-menu",
     label: "Copy…",

@@ -11,7 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [1.3.5] - 2026-10-03
+## [1.4.0] - 2026-10-05
 
 Stale-branch cleanup with backups, a secret scan that never reads a partial
 scan as clean, worktree cache sync and named local routes, symbol-level
@@ -2942,8 +2942,8 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.5...HEAD
-[1.3.5]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.3.5
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.2.1

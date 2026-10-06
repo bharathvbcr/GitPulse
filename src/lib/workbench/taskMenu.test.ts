@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { STATUS_LABELS, type TaskCard } from "./client";
 import { ARCHIVE_STATUS } from "./taskArchive";
+import { MAX_TASK_ISSUE_BATCH } from "./taskIssue";
 import {
   cardsById,
   contextMenuAnchor,
@@ -108,6 +109,47 @@ describe("taskMenuItems", () => {
     expect(items.find((item) => item.id === "copy-agent")?.label).toContain("2");
     expect(menuPageItems(items, "copy").map((item) => item.id)).toContain("copy-agent");
     expect(items.find((item) => item.id === "delete")?.label).toContain("2");
+  });
+
+  describe("the Create GitHub issue row", () => {
+    const row = (items: ReturnType<typeof taskMenuItems>) => items.find((item) => item.id === "github-issue");
+
+    it("is offered for one task, on the root page", () => {
+      const items = taskMenuItems({ cards: [card()] });
+      expect(row(items)).toMatchObject({ action: { kind: "githubIssue" }, icon: "issue", disabled: false });
+      expect(menuPageItems(items, "root").map((item) => item.id)).toContain("github-issue");
+    });
+
+    it("files a selection in one run, counting the tasks it will skip as already linked", () => {
+      const two = row(taskMenuItems({ cards: [card({ id: "a" }), card({ id: "b" })] }));
+      expect(two).toMatchObject({ label: "Create 2 GitHub issues…", action: { kind: "githubIssue" }, disabled: false });
+      expect(two?.hint).toBeUndefined();
+      const partial = row(taskMenuItems({ cards: [card({ id: "a" }), card({ id: "b", labels: ["issue-9"] }), card({ id: "c" })] }));
+      expect(partial).toMatchObject({ label: "Create 2 GitHub issues…", hint: "1 linked", disabled: false });
+      const one = row(taskMenuItems({ cards: [card({ id: "a" }), card({ id: "b", title: "[#3] Imported" })] }));
+      expect(one).toMatchObject({ label: "Create GitHub issue…", hint: "1 linked", disabled: false });
+    });
+
+    it("refuses a selection with nothing left to file, or past the batch cap, instead of trimming it", () => {
+      const linked = row(taskMenuItems({ cards: [card({ id: "a", labels: ["issue-1"] }), card({ id: "b", labels: ["issue-2"] })] }));
+      expect(linked).toMatchObject({ hint: "All linked", disabled: true });
+      const many = Array.from({ length: MAX_TASK_ISSUE_BATCH + 1 }, (_, i) => card({ id: `t${i}` }));
+      expect(row(taskMenuItems({ cards: many }))).toMatchObject({ hint: `At most ${MAX_TASK_ISSUE_BATCH}`, disabled: true });
+      const atCap = many.slice(0, MAX_TASK_ISSUE_BATCH);
+      expect(row(taskMenuItems({ cards: atCap }))?.disabled).toBe(false);
+    });
+
+    it("is withheld with no registered repository, and disabled while busy", () => {
+      expect(row(taskMenuItems({ cards: [card()], canFileIssue: false }))).toBeUndefined();
+      expect(row(taskMenuItems({ cards: [card()], busy: true }))?.disabled).toBe(true);
+    });
+
+    it("names the issue instead of filing a duplicate for a task already linked to one", () => {
+      for (const linked of [card({ labels: ["issue-42"] }), card({ title: "[#42] Imported from GitHub" })]) {
+        expect(row(taskMenuItems({ cards: [linked] }))).toMatchObject({ disabled: true, hint: "Linked to #42" });
+      }
+      expect(row(taskMenuItems({ cards: [card({ title: "Mentions #42 later" })] }))?.disabled).toBe(false);
+    });
   });
 
   // The reason this whole row exists: the board had `Move to… › Done` and no

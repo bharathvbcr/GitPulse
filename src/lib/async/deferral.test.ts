@@ -12,6 +12,9 @@ import {
   MAX_DEFERRED_RETRIES,
   deferredRetryDelayMs,
   isDeferredUnderLoad,
+  outcomeUnknown,
+  RUN_TIMEOUT_MARKER,
+  SLOT_WAIT_SUFFIX,
 } from "./deferral";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -23,6 +26,24 @@ describe("deferred-under-load marker", () => {
     expect(match, "DEFERRED_MARKER declaration not found in src-tauri/src/engine/git_cli.rs").not
       .toBeNull();
     expect(DEFERRED_UNDER_LOAD_MARKER).toBe(match?.[1]);
+  });
+
+  it("reads the timeout marker and slot-wait suffix from the Rust source", () => {
+    const marker = gitCli.match(/const TIMEOUT_MARKER:\s*&str\s*=\s*"([^"]*)"\s*;/);
+    const suffix = gitCli.match(/const SLOT_WAIT_SUFFIX:\s*&str\s*=\s*"([^"]*)"\s*;/);
+    expect(marker, "TIMEOUT_MARKER declaration not found in git_cli.rs").not.toBeNull();
+    expect(suffix, "SLOT_WAIT_SUFFIX declaration not found in git_cli.rs").not.toBeNull();
+    expect(RUN_TIMEOUT_MARKER).toBe(marker?.[1]);
+    expect(SLOT_WAIT_SUFFIX).toBe(suffix?.[1]);
+  });
+
+  it("calls a write's outcome unknown only when it started and hit its deadline", () => {
+    expect(outcomeUnknown("gh timed out after 90s")).toBe(true);
+    expect(outcomeUnknown("gh timed out after 90.000s waiting for a process slot")).toBe(false);
+    expect(outcomeUnknown("gh deferred under load after 2.000s: the git spawn rate limit admitted nothing sooner")).toBe(false);
+    expect(outcomeUnknown("gh cancelled before spawn")).toBe(false);
+    expect(outcomeUnknown("gh: To get started with GitHub CLI, please run: gh auth login")).toBe(false);
+    expect(outcomeUnknown("")).toBe(false);
   });
 
   it("recognises a gate deferral and nothing that merely times out", () => {

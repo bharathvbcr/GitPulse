@@ -26,7 +26,10 @@
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
   import { workspaceMembershipLabel } from "../workbench/taskRepositories";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
-  import { handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
+  import { checkoutCandidates, handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
+  import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
+  import { askConfirm } from "../stores/modalStore";
+  import { openExternal } from "../desktop/openExternal";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, type TaskFacet } from "../workbench/taskOrganize";
   import { plural } from "../format";
   import { ARCHIVE_STATUS, archiveAction, archivable, archiveState, offersArchive } from "../workbench/taskArchive";
@@ -227,7 +230,19 @@
   const selectedCards = $derived(cardsById(displayColumns, selected));
   /** Whether the selection bar's Archive would change anything. */
   const selectionArchived = $derived(archiveState(selectedCards));
-  const busy = $derived(moving || opening || deleting || actionDialog !== null || pendingUpdate !== null);
+  /** Tasks are being filed as GitHub issues; one run at a time, since each issue is published. */
+  let filingIssue = $state(false);
+  /** Which issue of the run is being created, for the progress line. */
+  let issueProgress = $state<{ index: number; total: number; title: string } | null>(null);
+  /** Set by Stop; the run checks it before each creation, never mid-`gh`. */
+  let issueStop = $state(false);
+  /**
+   * Issues runs created but could not link, each offered as a Link button.
+   * Kept until linked, across runs and reloads: such a task has no link
+   * label, so this is also what stops a re-run filing it twice.
+   */
+  let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
+  const busy = $derived(moving || opening || deleting || filingIssue || actionDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
   /** The server's count for this scope, so the badge is not a page size. */
@@ -1012,6 +1027,109 @@
       error = failed[0] ?? "Clipboard unavailable";
     }
   }
+  /** Where a task's issue would be filed, or why it cannot be. */
+  function issueTarget(card: TaskCard): TaskIssueTarget | string {
+    const repositoryId = card.primary_repository_id || card.repository_ids[0] || "";
+    const repository = repositories.find((repo) => repo.id === repositoryId);
+    if (!repository) return "its repository is not loaded, so there is no remote to file on";
+    const checkout = checkoutCandidates(repository.id, repositories, openTabRefs, pathOpts)[0];
+    if (!checkout) return `no working checkout of ${repository.name} is known; open it in GitPulse first`;
+    return { repositoryName: repository.name, checkout: checkout.path, derived: checkout.source === "derived" };
+  }
+  /** Carry a freshly linked task into the editor tab that has it open. */
+  function adoptLinked(task: Task) {
+    if (session?.value?.id !== task.id) return;
+    session = { ...session, value: task, status: task.status };
+    taskTabs = updateTaskTab(taskTabs, task.id, { title: task.title, status: task.status });
+  }
+  /**
+   * File saved tasks as issues on their repositories' GitHub remotes, linking
+   * each task to its issue.
+   *
+   * Each remote is read from a working checkout of the task's own repository,
+   * which need not be the repository open in the window — resolved the way a
+   * handoff resolves it, and named in the one confirmation the run asks for.
+   * `taskIssue.ts` owns the run itself: creations go through the guarded
+   * issue owner one at a time, and the run stops at the first task that does
+   * not end linked, so a refusal, an unknown outcome or a lost link is
+   * reported against that task instead of repeated down the selection.
+   */
+  async function fileTaskIssues(cards: TaskCard[]) {
+    if (busy || !cards.length) return;
+    if (cards.length > MAX_TASK_ISSUE_BATCH) { error = `File at most ${MAX_TASK_ISSUE_BATCH} tasks as issues at a time.`; return; }
+    filingIssue = true;
+    issueStop = false;
+    error = "";
+    try {
+      const { ready, skipped } = await prepareTaskIssues(cards, {
+        resolve: issueTarget,
+        read: getTask,
+        unlinked: (id) => relinks.find((entry) => entry.taskId === id)?.number ?? null,
+      });
+      if (disposed) return;
+      if (!ready.length) { error = summarizeTaskIssues([], skipped, false).message; return; }
+      const one = ready.length === 1;
+      const confirmed = await askConfirm({
+        title: one ? "Create GitHub issue" : "Create GitHub issues",
+        message: taskIssuesConfirmation(ready, skipped),
+        confirmLabel: one ? "Create issue" : `Create ${ready.length} issues`,
+      });
+      if (!confirmed || disposed) return;
+      const results = await runTaskIssues(ready, {
+        create: (entry) => repoStore.reportIssue(entry.draft.title, entry.draft.body, [], { repoPath: entry.target.checkout }),
+        stopped: () => issueStop || disposed,
+        progress: (index, total, title) => { issueProgress = { index, total, title }; announce = `Filing issue ${index} of ${total}: ${title}`; },
+      });
+      const summary = summarizeTaskIssues(results, skipped, issueStop);
+      const linked = results.filter((r): r is Extract<TaskIssueResult, { state: "linked" }> => r.state === "linked");
+      const urls = results.flatMap((r) => (r.state === "linked" || r.state === "unlinked") && r.url ? [r.url] : []);
+      const open = urls.length === 1 ? { label: "Open", onClick: () => openExternal(urls[0]) } : undefined;
+      const lost = results.find((r): r is Extract<TaskIssueResult, { state: "unlinked" }> => r.state === "unlinked" && r.number !== null);
+      if (lost && lost.number !== null) relinks = [...relinks.filter((entry) => entry.taskId !== lost.taskId), { taskId: lost.taskId, number: lost.number, title: lost.title }];
+      // Reload before reporting: a reload clears `error` as it starts, and
+      // would otherwise erase the account of what this run did not file.
+      if (linked.length) {
+        taskWritten();
+        for (const result of linked) adoptLinked(result.task);
+        await loadBoard();
+        if (disposed) return;
+      }
+      if (summary.ok) { announce = summary.message; toastStore.success(summary.message, open); }
+      else { error = summary.message; announce = summary.message; if (linked.length || urls.length) toastStore.warning("Some issues were filed; see the board for what was not.", open); }
+    } catch (cause) {
+      if (!disposed) error = explainError(cause);
+    } finally {
+      filingIssue = false;
+      issueProgress = null;
+      issueStop = false;
+    }
+  }
+  /**
+   * Link a task to the issue a run created but could not link — usually
+   * because the task was edited while the run was going. Reads the task again
+   * and links at its current revision, so nothing is filed twice.
+   */
+  async function retryIssueLink(pending: { taskId: string; number: number; title: string }) {
+    if (busy) return;
+    filingIssue = true;
+    try {
+      const fresh = await bounded(getTask(pending.taskId));
+      const linked = await linkTaskToIssue(fresh, pending.number);
+      if (disposed) return;
+      if (!linked.ok) { error = `Issue #${pending.number} still is not linked to “${pending.title}”: ${linked.reason}.`; return; }
+      relinks = relinks.filter((entry) => entry.taskId !== pending.taskId);
+      error = "";
+      announce = `Linked “${pending.title}” to issue #${pending.number}.`;
+      toastStore.success(announce);
+      taskWritten();
+      adoptLinked(linked.task);
+      void loadBoard();
+    } catch (cause) {
+      if (!disposed) error = explainError(cause);
+    } finally {
+      filingIssue = false;
+    }
+  }
   async function onMenuAction(item: TaskMenuItem) {
     const cards = menu?.cards ?? [];
     const column = menu?.column ?? null;
@@ -1082,6 +1200,9 @@
         void applyUpdate(new TaskBatch(cards, { kind: "label", label, add }));
         break;
       }
+      case "githubIssue":
+        void fileTaskIssues(cards);
+        break;
       case "agent":
         if (cards[0]) handoff = { card: cards[0], settings: handoffFromTarget(item.action.target, $interfaceStore.taskHandoff) };
         break;
@@ -1332,7 +1453,11 @@
       />
     {/if}
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
+    {#if issueProgress}<div class="banner" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
+    <!-- Its own banner, not part of `error`: a board reload clears `error`,
+         and the issue would still exist with nothing on screen to link it. -->
+    {#each relinks as entry (entry.taskId)}<div class="banner error" role="alert" data-testid="task-issue-relink"><span>Issue #{entry.number} exists but is not linked to “{entry.title}”.</span><button type="button" class="gp-btn" disabled={busy} onclick={() => void retryIssueLink(entry)}>Link to #{entry.number}</button></div>{/each}
     <div class="sr-only" role="status" aria-live="polite">{announce}</div>
     {#if !initialized && loading}
       <div class="pad"><Skeleton variant="card" count={4} /></div>
@@ -1461,6 +1586,7 @@
         busy,
         vocabulary: { owners: facetOptions.owners, labels: facetOptions.labels },
         canHandoff: repositories.length > 0,
+        canFileIssue: repositories.length > 0,
       })}
       x={menu.x}
       y={menu.y}

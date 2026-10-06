@@ -16,6 +16,10 @@ const results = [], crashes = [], writes = [], unknown = [];
 const copies = [];
 Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { copies.push(text); } } });
 const preparedRuns = [], appleDrafts = [];
+const issueCalls = [];
+// `issueFailOnCall` aims a failure at one call of a run (1-based over every
+// call so far); 0 fails them all. `holdIssue` parks a creation mid-run.
+let issueFailure = "", issueFailOnCall = 0, holdIssue = false, releaseIssue, failIssueLinkOnce = false;
 let appleStatus = { compiled: true, state: "available", reason: null, detail: "The on-device model is ready. Nothing leaves this Mac." };
 let appleFailure = "";
 const repos = ["GitPulse", "Manvi"].map((name, i) => ({ id: `repo-${i}`, name, revision: 1, updated_at: 1, identity_key: `local:/fixture/${name}/.git`, remote_url: null }));
@@ -56,6 +60,15 @@ mockIPC(async (cmd, args) => {
       ready: true,
       detail: "Fixture model ready.",
     };
+  }
+  // Never reaches `gh`: filing an issue is published the moment it runs, so
+  // the fixture records what the board sent and answers the way the guarded
+  // command does — a policy verdict plus gh's printed URL.
+  if (cmd === "cmd_github_create_issue") {
+    issueCalls.push(structuredClone(args));
+    if (holdIssue) await new Promise(resolve => { releaseIssue = resolve; });
+    if (issueFailure && (!issueFailOnCall || issueCalls.length === issueFailOnCall)) throw issueFailure;
+    return { policy: { status: "allow", checked: true, target: "gh issue create", rule: "", severity: "", reason: "", demoted: "", grant_id: "", grant_issuer: "" }, output: `Creating issue in fixture/GitPulse\n\nhttps://github.com/fixture/GitPulse/issues/${77 + issueCalls.length - 1}\n` };
   }
   if (cmd === "cmd_apple_intelligence_status") return appleStatus;
   if (cmd === "cmd_apple_intelligence_draft") {
@@ -185,6 +198,10 @@ mockIPC(async (cmd, args) => {
     }
     case "items.put": {
       writes.push(structuredClone(input));
+      if (failIssueLinkOnce && input.labels?.some(label => label.startsWith("issue-"))) {
+        failIssueLinkOnce = false;
+        throw {code:"conflict", message:"Task changed. Reload the saved task."};
+      }
       if (holdSave) await new Promise(resolve => { releaseSave = resolve; });
       if (receipts.has(input.request_id)) return receipts.get(input.request_id);
       const previous = tasks.find(task => task.id === input.id);
@@ -1351,6 +1368,151 @@ if (params.has("check")) {
     const labelText = firstLabel?.textContent.trim();
     firstLabel?.click(); await settle(200);
     check("the menu toggles a label in place", tasks.find(task=>task.id==="task-11").labels.includes(labelText));
+
+    // ---- Filing a task as a GitHub issue ----------------------------------
+    {
+      const issuePrompt = () => [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === "Create GitHub issue").at(-1);
+      // By its stem: a selection's row reads "Create 2 GitHub issues…".
+      const issueRow = () => menu() && [...menu().querySelectorAll("button")].find(el => /^Create (\d+ )?GitHub issues?…/.test(el.textContent.trim()));
+      const labelsOf = id => tasks.find(task => task.id === id).labels;
+      const writesBefore = writes.length;
+      await openMenu("task-20");
+      check("a card's menu offers Create GitHub issue", Boolean(issueRow()) && !issueRow().disabled);
+      issueRow().click(); await wait(() => Boolean(issuePrompt()));
+      const promptText = issuePrompt().textContent;
+      check("the confirmation names the task, the repository and the checkout its remote is read from",
+        promptText.includes("Ready task 11") && promptText.includes("GitHub remote of GitPulse")
+        && promptText.includes("/fixture/GitPulse") && promptText.includes("inferred"));
+      check("nothing is published before the reader confirms", issueCalls.length === 0);
+      button("Create issue", issuePrompt()).click();
+      await wait(() => labelsOf("task-20").includes("issue-77"));
+      await settle(100);
+      const sent = issueCalls[0];
+      check(`the issue is filed through the guarded command on the task's own checkout (sent ${JSON.stringify(sent && { repoPath: sent.repoPath, title: sent.title, labels: sent.labels })})`,
+        issueCalls.length === 1 && sent.repoPath === "/fixture/GitPulse" && sent.title === "Ready task 11"
+        && Array.isArray(sent.labels) && sent.labels.length === 0);
+      check("the issue body carries the description and no local path",
+        sent.body.includes("Keep changes focused and verify the result.") && !sent.body.includes("/fixture"));
+      check("the task is linked to the new issue in one revision-checked write",
+        writes.length === writesBefore + 1 && writes.at(-1).id === "task-20" && writes.at(-1).expected_revision === 1);
+      await openMenu("task-20");
+      check("a linked task names its issue instead of offering a duplicate",
+        Boolean(issueRow()) && issueRow().disabled && issueRow().textContent.includes("Linked to #77"));
+      menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+
+      await openMenu("task-21"); issueRow().click(); await wait(() => Boolean(issuePrompt()));
+      button("Cancel", issuePrompt()).click(); await settle(150);
+      check("cancelling the confirmation files nothing and writes nothing",
+        issueCalls.length === 1 && writes.length === writesBefore + 1 && !labelsOf("task-21").some(label => label.startsWith("issue-")));
+
+      issueFailure = "gh: To get started with GitHub CLI, please run: gh auth login";
+      await openMenu("task-22"); issueRow().click(); await wait(() => Boolean(issuePrompt()));
+      button("Create issue", issuePrompt()).click(); await settle(200);
+      const alertText = [...root.querySelectorAll('[role="alert"]')].map(node => node.textContent).join(" ");
+      check(`a refused creation says so and links nothing (${alertText.slice(0, 160)})`,
+        alertText.includes("Not created — “Ready task 13”") && alertText.includes("gh auth login")
+        && writes.length === writesBefore + 1 && !labelsOf("task-22").some(label => label.startsWith("issue-")));
+      issueFailure = "";
+
+      // ---- Several tasks in one run ----
+      const boardAlert = () => [...root.querySelectorAll('[role="alert"]')].map(node => node.textContent).join(" ");
+      const multiSelect = async ids => {
+        if (root.querySelector('[aria-label="Selected task actions"]')) await click("Clear task selection");
+        for (const id of ids) { card(id).dispatchEvent(new MouseEvent("click",{bubbles:true,ctrlKey:true})); await settle(); }
+      };
+      const batchPrompt = () => [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === "Create GitHub issues").at(-1);
+      await multiSelect(["task-23", "task-24", "task-20"]);
+      await openMenu("task-23");
+      check(`a selection offers one run and counts the linked task it will skip (${issueRow()?.textContent.trim()})`,
+        Boolean(issueRow()) && !issueRow().disabled && issueRow().textContent.includes("Create 2 GitHub issues") && issueRow().textContent.includes("1 linked"));
+      const callsBeforeBatch = issueCalls.length;
+      issueRow().click(); await wait(() => Boolean(batchPrompt()));
+      const batchText = batchPrompt().textContent;
+      check("the run asks once, listing every issue and the task it will not file",
+        batchText.includes("Create 2 issues on GitHub?") && batchText.includes("Ready task 14") && batchText.includes("Ready task 15")
+        && batchText.includes("Not filed (1)") && batchText.includes("Ready task 11 — already linked to #77")
+        && issueCalls.length === callsBeforeBatch);
+      button("Create 2 issues", batchPrompt()).click();
+      await wait(() => labelsOf("task-24").some(label => label.startsWith("issue-")));
+      await settle(100);
+      const batchCalls = issueCalls.slice(callsBeforeBatch);
+      check(`the run files each task in board order and links each to its own issue (${batchCalls.map(call => call.title).join(", ")})`,
+        batchCalls.length === 2 && batchCalls[0].title === "Ready task 14" && batchCalls[1].title === "Ready task 15"
+        && labelsOf("task-23").includes(`issue-${77 + callsBeforeBatch}`) && labelsOf("task-24").includes(`issue-${78 + callsBeforeBatch}`)
+        && labelsOf("task-20").filter(label => label.startsWith("issue-")).length === 1);
+
+      // A refusal partway stops the run: nothing after it is filed.
+      await multiSelect(["task-25", "task-26", "task-27"]);
+      await openMenu("task-25");
+      const callsBeforeStop = issueCalls.length;
+      issueFailure = "gh: HTTP 403: Resource not accessible"; issueFailOnCall = callsBeforeStop + 2;
+      issueRow().click(); await wait(() => Boolean(batchPrompt()));
+      button("Create 3 issues", batchPrompt()).click(); await settle(300);
+      check(`a refusal partway stops the run and says what was and was not filed (${boardAlert().slice(0, 200)})`,
+        issueCalls.length === callsBeforeStop + 2
+        && labelsOf("task-25").some(label => label.startsWith("issue-"))
+        && !labelsOf("task-26").some(label => label.startsWith("issue-")) && !labelsOf("task-27").some(label => label.startsWith("issue-"))
+        && boardAlert().includes("Not created — “Ready task 17”") && boardAlert().includes("Stopped there; 1 more task was not filed."));
+      issueFailure = ""; issueFailOnCall = 0;
+
+      // Re-running the same selection resumes: the filed task is skipped.
+      await multiSelect(["task-25", "task-26", "task-27"]);
+      await openMenu("task-26");
+      check("re-running a stopped selection skips what it already filed",
+        Boolean(issueRow()) && issueRow().textContent.includes("Create 2 GitHub issues") && issueRow().textContent.includes("1 linked"));
+
+      // Stop takes effect before the next creation, never mid-gh.
+      holdIssue = true;
+      const callsBeforeHold = issueCalls.length;
+      issueRow().click(); await wait(() => Boolean(batchPrompt()));
+      button("Create 2 issues", batchPrompt()).click();
+      await wait(() => Boolean(root.querySelector('[data-testid="task-issue-progress"]')) && issueCalls.length === callsBeforeHold + 1);
+      const progress = root.querySelector('[data-testid="task-issue-progress"]');
+      const progressText = progress.textContent;
+      button("Stop", progress).click(); await settle();
+      holdIssue = false; releaseIssue?.(); await settle(300);
+      check(`Stop finishes the creation in flight and files nothing more (${progressText.trim()}; ${boardAlert().slice(0, 160)})`,
+        progressText.includes("Filing issue 1 of 2") && issueCalls.length === callsBeforeHold + 1
+        && labelsOf("task-26").some(label => label.startsWith("issue-")) && !labelsOf("task-27").some(label => label.startsWith("issue-"))
+        && boardAlert().includes("Stopped as asked; 1 task was not filed."));
+
+      // gh can publish and then miss its deadline: that outcome is unknown,
+      // and calling it "not created" would invite a duplicate.
+      issueFailure = "gh timed out after 90s";
+      await multiSelect(["task-27"]);
+      await openMenu("task-27"); issueRow().click(); await wait(() => Boolean(issuePrompt()));
+      button("Create issue", issuePrompt()).click(); await settle(300);
+      check(`a creation that hit its deadline is reported as unknown, with the title to look for (${boardAlert().slice(0, 200)})`,
+        boardAlert().includes("Could not confirm whether “Ready task 18” was filed")
+        && boardAlert().includes("Check GitHub for an issue titled “Ready task 18”") && !boardAlert().includes("Not created"));
+      issueFailure = "";
+
+      // An issue created but not linked keeps a way to link it, even after
+      // the board reloads, and linking it files nothing new.
+      failIssueLinkOnce = true;
+      await multiSelect(["task-28"]);
+      await openMenu("task-28"); issueRow().click(); await wait(() => Boolean(issuePrompt()));
+      const callsBeforeRelink = issueCalls.length;
+      button("Create issue", issuePrompt()).click(); await settle(300);
+      const relinkBanner = () => root.querySelector('[data-testid="task-issue-relink"]');
+      const createdNumber = 77 + callsBeforeRelink;
+      check(`a created issue the task could not be linked to stays linkable (${relinkBanner()?.textContent.trim()})`,
+        Boolean(relinkBanner()) && relinkBanner().textContent.includes(`#${createdNumber}`)
+        && boardAlert().includes(`Created issue #${createdNumber} for “Ready task 19”, but the task is not linked`)
+        && !labelsOf("task-28").some(label => label.startsWith("issue-")));
+      await click("Refresh tasks"); await settle(200);
+      check("a board reload does not drop the way to link it", Boolean(relinkBanner()));
+      // Re-running before linking must not file the same task a second time.
+      await multiSelect(["task-28"]);
+      await openMenu("task-28"); issueRow().click(); await settle(300);
+      check(`re-running a task whose issue exists but is unlinked files nothing (${boardAlert().slice(0, 200)})`,
+        issueCalls.length === callsBeforeRelink + 1 && !issuePrompt()
+        && boardAlert().includes(`issue #${createdNumber} already exists for it; link it instead`));
+      button(`Link to #${createdNumber}`, relinkBanner()).click();
+      await wait(() => labelsOf("task-28").includes(`issue-${createdNumber}`)); await settle(100);
+      check("linking it afterwards writes the label, files nothing new, and clears the offer",
+        !relinkBanner() && issueCalls.length === callsBeforeRelink + 1);
+    }
 
     // ---- Handing a card to an agent --------------------------------------
     await openMenu("task-11"); button("Send to agent…", menu()).click(); await settle();

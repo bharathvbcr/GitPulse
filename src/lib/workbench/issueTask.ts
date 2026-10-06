@@ -285,6 +285,38 @@ export function isIssueInTask(
   return false;
 }
 
+/**
+ * The label that links a task to GitHub issue `issueNumber`.
+ *
+ * Filing a task as an issue writes this label back onto the task, and
+ * `isIssueInTask` reads it, so a task pushed to GitHub is never imported back
+ * from that issue as a second task. One spelling, owned here, for both sides.
+ */
+export function issueLinkLabel(issueNumber: number): string {
+  return `issue-${issueNumber}`;
+}
+
+/**
+ * The GitHub issue this task is already linked to, or null.
+ *
+ * Every candidate is confirmed through `isIssueInTask`, so this can never
+ * name an issue the import side would not also treat as this task's.
+ */
+export function linkedIssueNumber(card: Pick<TaskCard, "title" | "labels">): number | null {
+  if (!card) return null;
+  const candidates: number[] = [];
+  for (const label of Array.isArray(card.labels) ? card.labels : []) {
+    const match = typeof label === "string" ? /^(?:issue-|#)(\d{1,9})$/.exec(label) : null;
+    if (match) candidates.push(Number(match[1]));
+  }
+  if (typeof card.title === "string") {
+    const match = /^(?:\[#(\d{1,9})\]|#(\d{1,9})|\[issue\s*#(\d{1,9})\])/i.exec(card.title.trim());
+    const digits = match?.[1] ?? match?.[2] ?? match?.[3];
+    if (digits) candidates.push(Number(digits));
+  }
+  return candidates.find((n) => n > 0 && isIssueInTask(card, n)) ?? null;
+}
+
 /** Find existing task matching issue number. */
 export function findTaskForIssue(
   tasks: readonly TaskCard[],

@@ -16,6 +16,29 @@ export function isDeferredUnderLoad(message: string): boolean {
 }
 
 /**
+ * What a child that hit its deadline says (`TIMEOUT_MARKER` in git_cli.rs),
+ * and the suffix that marks one which never got a process slot at all
+ * (`SLOT_WAIT_SUFFIX`). Both are checked against the Rust source by
+ * deferral.test.ts.
+ */
+export const RUN_TIMEOUT_MARKER = " timed out after ";
+export const SLOT_WAIT_SUFFIX = "s waiting for a process slot";
+
+/**
+ * True when a command started and was killed at its deadline, so whether its
+ * side effect happened is unknown.
+ *
+ * A write that timed out may have landed: `gh issue create` can publish the
+ * issue and then miss its deadline before printing the URL. Calling that
+ * "failed" invites a retry that files a duplicate. A child that never got a
+ * slot, a deferral, or a refusal before spawn ran nothing, so none of those
+ * count.
+ */
+export function outcomeUnknown(message: string): boolean {
+  return message.includes(RUN_TIMEOUT_MARKER) && !message.includes(SLOT_WAIT_SUFFIX);
+}
+
+/**
  * Delay before asking again after the `attempt`-th consecutive deferral
  * (1-based): 3 s, 6 s, 12 s, 24 s, then 30 s. The first is longer than the
  * gate's 2 s queue budget, so a retry never lands inside the window that just

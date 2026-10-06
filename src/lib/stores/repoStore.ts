@@ -2932,15 +2932,37 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         (path) =>
           invokeFn("cmd_push", { repoPath: path, remote, branch, force }),
       ),
-    reportIssue: async (title: string, body: string, labels: string[] = []) =>
-      runMutating<string>("issue-report", title.slice(0, 80), (path) =>
-        invokeFn("cmd_github_create_issue", {
-          repoPath: path,
-          title,
-          body,
-          labels,
-        }),
-      ),
+    /**
+     * File a GitHub issue on a checkout's remote. Without `target` that is the
+     * active repository; a task board names its task's own checkout, which
+     * need not be open at all. Either way the verdict and the action land in
+     * the same harness record. Nothing in `.git` changes, so the explicit
+     * form neither refreshes a session nor files its error on one — the
+     * caller that asked owns the failure.
+     */
+    reportIssue: async (
+      title: string,
+      body: string,
+      labels: string[] = [],
+      target?: { repoPath: string },
+    ): Promise<MutationOutcome<string>> => {
+      const create = (path: string) =>
+        invokeFn("cmd_github_create_issue", { repoPath: path, title, body, labels });
+      const label = title.slice(0, 80);
+      if (!target) return runMutating<string>("issue-report", label, create);
+      const path = target.repoPath.trim();
+      if (!path) return { ok: false, error: "No repository checkout was given for the issue." };
+      try {
+        const result = await create(path);
+        const policy = recordPolicyVerdict(result, path);
+        harnessStore.recordAction({ repoPath: path, kind: "issue-report", label, ok: true, verdict: policy ?? null });
+        const output = mutationOutput<string>(result);
+        return output === undefined ? { ok: true, policy } : { ok: true, policy, output };
+      } catch (err: unknown) {
+        harnessStore.recordAction({ repoPath: path, kind: "issue-report", label, ok: false });
+        return { ok: false, error: formatError(err) };
+      }
+    },
     publishRelease: async (tag: string, message: string) =>
       runMutating<ReleasePublishResult>("release-publish", tag, (path) =>
         invokeFn("cmd_publish_release", { repoPath: path, tag, message }),
