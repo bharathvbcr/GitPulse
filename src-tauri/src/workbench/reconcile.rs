@@ -16,7 +16,9 @@
 //! - A run that never recorded a process is released only when the GitPulse
 //!   process that launched it is gone, or is this process and has already
 //!   written its final `unresolved`. A Manvi-owned attempt with no process is
-//!   left alone: nothing here can prove its owner ended.
+//!   released only when the Manvi process its owner names is gone (owners
+//!   are `manvi-{pid}-{nanos}-{token}` since Manvi 18fc2c6); one with an older
+//!   opaque owner is left alone, because nothing here can prove it ended.
 //! - A run whose PTY session this process still holds is never touched — its
 //!   observer may be about to record the real exit code, which is better
 //!   evidence than anything a reconciler has.
@@ -50,6 +52,19 @@ fn native_owner(owner: &str) -> Option<(u32, u128)> {
     let stamp = parts.next()?.parse::<u128>().ok()?;
     parts.next()?.parse::<u64>().ok()?;
     parts.next().is_none().then_some((pid, stamp))
+}
+
+/// `manvi-{pid}-{nanos}-{token}`: the owner a managed claim records — the
+/// Manvi process that claimed and when. The token is the random part that
+/// keeps owners unique; only its shape is checked.
+fn manvi_owner(owner: &str) -> Option<(u32, u128)> {
+    let mut parts = owner.strip_prefix("manvi-")?.split('-');
+    let pid = parts.next()?.parse::<u32>().ok().filter(|p| *p > 0)?;
+    let stamp = parts.next()?.parse::<u128>().ok()?;
+    let token = parts.next()?;
+    let opaque =
+        !token.is_empty() && token.len() <= 64 && token.bytes().all(|b| b.is_ascii_hexdigit());
+    (opaque && parts.next().is_none()).then_some((pid, stamp))
 }
 
 /// The pure decision, with every observation injected so it can be driven
@@ -100,6 +115,23 @@ pub(crate) fn judge(
             )),
             Liveness::Unknown(reason) => Verdict::Keep(format!(
                 "Could not check whether agent process {pid} is still running: {reason}"
+            )),
+        };
+    }
+    if let Some((manvi, stamp)) = run["owner_id"].as_str().and_then(manvi_owner) {
+        // Before activation a managed attempt has no provider pid; Manvi alone
+        // knows its provider, and its jobs live only in its memory. So the
+        // Manvi process is the evidence: gone means the attempt cannot
+        // finish, and its provider lost the pipe it was driven over.
+        return match owner_since(manvi, stamp) {
+            Liveness::Gone => Verdict::Release(format!(
+                "the Manvi process {manvi} that ran it has exited, and no agent process was recorded; its provider lost its connection with it"
+            )),
+            Liveness::Alive => Verdict::Keep(format!(
+                "Manvi (pid {manvi}) is still running this attempt; it ends an attempt that is never activated within five minutes."
+            )),
+            Liveness::Unknown(reason) => Verdict::Keep(format!(
+                "Could not check whether the Manvi process {manvi} running it is still alive: {reason}"
             )),
         };
     }

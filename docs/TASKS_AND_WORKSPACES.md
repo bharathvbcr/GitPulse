@@ -318,7 +318,10 @@ GitPulse crashed or was force-quit while an agent ran, the next start — or the
 next launch into that checkout — releases the attempt once its agent process is
 provably gone, and the inbox says so. **Release checkout** on a run asks for that
 check directly; an agent that is still running is never released, and the
-answer names its process.
+answer names its process. A managed attempt whose Manvi died before it was
+activated never recorded an agent process; it is released once that Manvi
+process is provably gone (its owner names it, since Manvi 18fc2c6). Attempts
+claimed by an older Manvi carry an owner nothing can check, and stay held.
 
 Managed runs use a separate Manvi host protocol for configuration checks,
 structured questions/approvals and completion receipts. A saved decision and its
