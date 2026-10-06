@@ -94,6 +94,15 @@
           case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
           // What a reload leaves behind: a session the host still runs that
           // this page never started.
+          // A task attempt's run record: the one place that names its task,
+          // which is what a session's "Task" link reads.
+          case "cmd_workbench_request": {
+            const input = JSON.parse(args.input);
+            if (args.method !== "runs.get" || input.id !== "fixture-run") throw { code: "not_found", message: `fixture has no ${args.method} ${input.id}` };
+            (report.runReads ??= []).push(input.id);
+            const now = Math.floor(Date.now() / 1000);
+            return JSON.stringify({ ok: true, item: { kind: "external_terminal", id: "fixture-run", revision: 2, updated_at: 1, task_id: "fixture-task", source_revision: 1, task_title: "Fix the flaky test", repository_id: "repo", provider: "claude", permission_mode: "ask", state: "running", cwd: "/fixture/GitPulse", created_at: now, expires_at: now + 300, session_id: "fixture-task-session", exit_code: null, reason: "", outcome_uncertain: false } });
+          }
           case "cmd_terminal_sessions":
             return [{ id: "fixture-detached", shell: "/bin/zsh", cwd: "/fixture/GitPulse", repo: "/fixture/GitPulse", launcher: null, run_id: null, detached: true }];
           case "cmd_terminal_attach": {
@@ -500,6 +509,30 @@
             const holding = get(terminalSessions).filter((record) => record.sessionId === "fixture-detached");
             check("the taken-over session holds one slot, its tab's, and is no longer listed as detached",
               () => holding.length === 1 && !holding[0].key.startsWith("detached:") && holding[0].status !== DETACHED_STATUS);
+          }
+          // The back link: a session working on a task opens that task. The
+          // task is read from the run, so a row that knows only its run id
+          // links the same way a tab does; a row that is not a task offers
+          // no link to nowhere.
+          {
+            const { terminalSessions } = await import("../src/lib/terminal/sessionRegistry.ts");
+            const { taskOpenRequest, consumeTaskOpen } = await import("../src/lib/workbench/taskOpen.ts");
+            const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
+            const handle = terminalSessions.reserve({ key: "fixture-task-tab", repoPath: "/fixture/GitPulse", label: "Claude", title: "Fix the flaky test", taskRunId: "fixture-run", status: "running", close: async () => {} });
+            if (!label("Sessions across repositories")) { button("All terminal sessions").click(); await wait(); }
+            const rows = () => [...(label("Sessions across repositories")?.children ?? [])];
+            const taskRow = rows().find((el) => el.textContent.includes("Fix the flaky test"));
+            const link = taskRow?.querySelector('[data-testid="session-open-task"]');
+            check("a session working on a task offers a link to it", () => Boolean(link));
+            check("a session that is not a task offers none",
+              () => rows().filter((el) => !el.textContent.includes("task attempt")).every((el) => !el.querySelector('[data-testid="session-open-task"]')));
+            link?.click();
+            await wait(300);
+            check("the link reads the run and asks the task board for its task",
+              () => report.runReads?.at(-1) === "fixture-run" && get(taskOpenRequest) === "fixture-task" && get(interfaceStore).globalSurface === "tasks");
+            consumeTaskOpen("fixture-task");
+            interfaceStore.setGlobalSurface("repository");
+            handle.release();
           }
           check("expand ceiling is taller than the old 900px cap", () => TERMINAL_DOCK_MAX_HEIGHT > 900);
           check("controls never write to the shell", () => report.writes === writesBefore);

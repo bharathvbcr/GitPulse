@@ -7,6 +7,7 @@ import { applyPlatformClass } from "../src/lib/platform";
 import { shortcutTextLabel } from "../src/lib/ui/platformCopy";
 import { hostPlatform } from "../src/lib/stores/platformStore";
 import TasksHost from "./TasksHost.svelte";
+import { requestTaskOpen, taskOpenRequest } from "../src/lib/workbench/taskOpen";
 import { themeStore } from "../src/lib/stores/themeStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
 
@@ -1434,6 +1435,38 @@ if (params.has("check")) {
     await click("New task"); await settle();
     check("a build with no bridge offers no engine picker at all", !enginePicks());
     confirmAnswer = true; await click("Close task details"); await settle();
+
+    // The back link from a terminal session (`taskOpen.ts`): a task asked
+    // for from outside the board opens on the global board, exactly once,
+    // and a repository's own board leaves the request for the global one.
+    {
+      const titleOf = id => tasks.find(task => task.id === id)?.title;
+      if (editor()) { confirmAnswer = true; await click("Close task details"); await settle(); }
+      await click("GitPulse fixture"); await settle(400);
+      requestTaskOpen("task-3");
+      await settle(400);
+      check("a repository's board leaves a task request for the global board",
+        get(taskOpenRequest) === "task-3" && !editor());
+      await click("Global fixture"); await settle(400);
+      await wait(() => editor() && field("Title")?.value === titleOf("task-3"));
+      check("the global board opens the task a session links to, and takes the request",
+        field("Title")?.value === titleOf("task-3") && get(taskOpenRequest) === null);
+      requestTaskOpen("task-1");
+      await wait(() => field("Title")?.value === titleOf("task-1"));
+      check("a second link opens its task over the first", get(taskOpenRequest) === null);
+      requestTaskOpen("task-3");
+      await wait(() => field("Title")?.value === titleOf("task-3"));
+      check("linking back to a task already opened once opens it again", get(taskOpenRequest) === null);
+      // task-1's tab is still open, so the sheet shows it; a dead link must
+      // say so and leave that task where it was.
+      const before = field("Title")?.value;
+      requestTaskOpen("no-such-task");
+      await settle(400);
+      check("a link to a task that no longer exists says so rather than doing nothing",
+        get(taskOpenRequest) === null && field("Title")?.value === before
+        && /\S/.test(root.querySelector('[role="alert"]')?.textContent ?? ""));
+      confirmAnswer = true; await click("Close task details"); await settle();
+    }
 
     check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }

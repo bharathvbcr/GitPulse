@@ -30,8 +30,12 @@ than four tabs are open.
 searches across repositories and shows each session's repository, launcher, and
 status. **Go to** brings a session on screen wherever it is running, switching
 repository tabs and opening that repository's dock when the session lives in
-another one. **Close session** frees capacity. A failed close stays listed with an
-explicit retry; it does not silently release a live process.
+another one. A session working on a task — a task terminal, or one adopted after a
+reload — also offers **Task**, which opens that task on the Tasks board; an ended
+task tab offers **Open task** beside its disabled Restart, since a new attempt
+starts from the task. The link reads the task from the attempt's run record, the
+one place that names it. **Close session** frees capacity. A failed close stays
+listed with an explicit retry; it does not silently release a live process.
 
 A repository tab carries a terminal glyph while it holds live sessions, with a count
 past the first, so a shell running in a repository you are not looking at is still

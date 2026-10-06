@@ -104,6 +104,8 @@
   import { repoStore } from "../stores/repoStore";
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
   import { requestReveal } from "../files/revealRequests";
+  import { openTaskForRun } from "../workbench/taskOpen";
+  import { toastStore } from "../stores/toastStore";
   import {
     clampTerminalFontSize, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -663,6 +665,16 @@
 
   export function restart() { void lifecycle?.restart(); }
 
+  /** Opens the task this attempt belongs to, where a new attempt starts. */
+  async function openOwnTask() {
+    if (!taskRunId) return;
+    try {
+      await openTaskForRun(taskRunId);
+    } catch (cause) {
+      toastStore.error(`This attempt's task could not be opened: ${formatError(cause)}`);
+    }
+  }
+
   export async function copySelection() {
     const text = term?.getSelection() ?? "";
     if (!text) warning = "Select terminal text to copy.";
@@ -1142,6 +1154,13 @@
         </button>
       {:else if exited}
         <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
+        {#if taskRunId}
+          <!-- The task details are where a new attempt starts, so the way
+               there is here rather than only named in a tooltip. -->
+          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
+            Open task
+          </button>
+        {/if}
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Launch a new attempt from the task details." : "Restart this terminal"}>
           <RotateCw size={12} /> Restart
         </button>

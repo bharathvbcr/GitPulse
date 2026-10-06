@@ -185,6 +185,21 @@
       check("A terminal run offers no structured request review",!button("Review requests"));
       await finish();button("Refresh").click();await wait(()=>document.body.textContent.includes("Process exited"));
       check("Process completion remains separate from task acceptance",task.status==="ready");
+      // An ended attempt's tab says a new attempt starts from the task, and
+      // links there rather than only naming it in a tooltip.
+      {
+        const {taskOpenRequest,consumeTaskOpen}=await import("../src/lib/workbench/taskOpen.ts");
+        const {get}=await import("svelte/store");
+        await wait(()=>document.querySelector('[data-testid="terminal-open-task"]'));
+        const readsBefore=report.detailReads;
+        document.querySelector('[data-testid="terminal-open-task"]').click();
+        await wait(()=>get(taskOpenRequest)!==null);
+        check("An ended attempt's tab links back to its task",get(taskOpenRequest)===task.id&&report.detailReads===readsBefore+1);
+        // That one read was the reader's click, not run history polling,
+        // which "Run history does not fetch full output" below measures.
+        report.detailReads=readsBefore;
+        consumeTaskOpen(task.id);
+      }
       const ended=[...runs.values()].find(run=>run.state==="exited"&&run.provider==="claude");
       conversationMissing=true;button("Resume conversation").click();await wait(()=>document.body.textContent.includes("no saved conversation"));
       check("An attempt with no saved conversation says so and opens nothing",report.resumes.length===0&&report.conversationReads===1);

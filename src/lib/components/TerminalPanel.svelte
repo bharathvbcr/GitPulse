@@ -46,6 +46,7 @@
   import TerminalSession from "./TerminalSession.svelte";
   import { closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm } from "../stores/modalStore";
+  import { openTaskForRun } from "../workbench/taskOpen";
   import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
@@ -369,6 +370,21 @@
    * worktree it was spawned in. So the capability arrives as a prop and this
    * only reports failure where the user is looking.
    */
+  /**
+   * The back link: the task this session is an attempt of. Read from the
+   * run, which is the one record that names it, so a session adopted after a
+   * reload — which knows only its run — links the same way a tab does.
+   */
+  async function openListedTask(session: TerminalSessionRecord) {
+    if (!session.taskRunId) return;
+    sessionListOpen = false;
+    try {
+      await openTaskForRun(session.taskRunId);
+    } catch (cause) {
+      validationError = `That session's task could not be opened: ${formatError(cause)}`;
+    }
+  }
+
   async function goToSession(session: TerminalSessionRecord) {
     sessionListOpen = false;
     if (!onGoToSession) {
@@ -869,6 +885,15 @@
               : "This session's panel is not mounted, so it cannot be shown"}
             onclick={() => void goToSession(session)}
           >Go to</button>
+          {#if session.taskRunId}
+            <button
+              type="button"
+              class="gp-btn py-0!"
+              data-testid="session-open-task"
+              title={`Open the task ${session.title ? `“${session.title}” ` : ""}this session is working on`}
+              onclick={() => void openListedTask(session)}
+            >Task</button>
+          {/if}
           <button type="button" class="gp-btn py-0!" onclick={() => void closeListed(session)}>Close session</button>
         </div>
       {:else}

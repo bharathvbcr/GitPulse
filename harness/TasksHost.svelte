@@ -10,7 +10,7 @@
   <button onclick={() => { repositoryPath = "/fixture/GitPulse"; }}>GitPulse fixture</button>
   <button onclick={() => { repositoryPath = "/fixture/Manvi"; }}>Manvi fixture</button>
 </div>
-<TaskBoard {repositoryPath} />
+<TaskBoard {repositoryPath} acceptsOpenRequests={repositoryPath === null} />
 <PromptModal />
 
 <style>

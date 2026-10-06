@@ -32,6 +32,7 @@
   import { ARCHIVE_STATUS, archiveAction, archivable, archiveState, offersArchive } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
+  import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
@@ -67,7 +68,12 @@
   import TaskHandoffSheet from "./TaskHandoffSheet.svelte";
   import Skeleton from "./Skeleton.svelte";
 
-  let { repositoryPath = null, active = true }: { repositoryPath?: string | null; active?: boolean } = $props();
+  let { repositoryPath = null, active = true, acceptsOpenRequests = false }: {
+    repositoryPath?: string | null;
+    active?: boolean;
+    /** Only the global board opens a task asked for from elsewhere (`taskOpen.ts`). */
+    acceptsOpenRequests?: boolean;
+  } = $props();
   const macos = isMacOS();
   const [sendScope, receiveScope] = crossfade(liquidSelection());
   let scope = $state<Scope>({ kind: "global" });
@@ -317,6 +323,21 @@
     } catch (cause) { if (!disposed && ticket === initializationRevision) { catalogError = explainError(cause); loading = false; } }
   }
   $effect(() => { const path = repositoryPath; untrack(() => { void initialize(path); }); });
+  // The back link from a terminal session (see `taskOpen.ts`). Waits for the
+  // board to finish starting — its restore of the last open tab would
+  // otherwise replace the task asked for — and for any edit in progress,
+  // then takes the request so it is opened exactly once.
+  $effect(() => {
+    const id = $taskOpenRequest;
+    if (!id || !acceptsOpenRequests || !active || !initialized || busy) return;
+    untrack(() => {
+      if (!consumeTaskOpen(id)) return;
+      // Said where it can be seen: the ceiling's own message is for a screen
+      // reader, and this request came from another surface.
+      if (refuseAtCeiling(id)) { error = announce; return; }
+      void openTask(id);
+    });
+  });
   onMount(() => {
     const listeners = createListenerTracker();
     if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
