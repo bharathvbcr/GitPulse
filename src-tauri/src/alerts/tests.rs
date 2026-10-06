@@ -423,7 +423,8 @@ impl Recorder {
 fn an_agent_notice_is_announced_at_once_even_when_its_banner_is_suppressed() {
     // Each of these suppresses the banner; none changes what the agent waits
     // for, and the pane must still be able to say so.
-    let suppressors: Vec<Box<dyn Fn(&mut Driver)>> = vec![
+    type Suppress = Box<dyn Fn(&mut Driver)>;
+    let suppressors: Vec<Suppress> = vec![
         Box::new(|d: &mut Driver| *d.recorder.attended.lock().unwrap() = Some("term-1".into())),
         Box::new(|d: &mut Driver| d.recorder.config.lock().unwrap().enabled = false),
         Box::new(|d: &mut Driver| {
@@ -481,9 +482,8 @@ fn a_burst_is_one_announcement_now_and_the_newest_after_the_gap() {
         driver.tick(Some(ring), start + Duration::from_millis(step * 10));
     }
     assert_eq!(driver.recorder.announcements().len(), 1);
-    assert_eq!(
+    assert!(
         next_wake(&driver.tracked).is_some(),
-        true,
         "the held announcement must wake the worker"
     );
     driver.tick(None, start + ANNOUNCE_GAP + Duration::from_millis(1));
