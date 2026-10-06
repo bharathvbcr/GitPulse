@@ -523,15 +523,15 @@ describe("resolveDevPort", () => {
 
 describe("tryListen error matrix", () => {
   it("reports free only when a bind succeeds", async () => {
-    const port = await findFreePort(19000, 19900);
+    const { server: probe, port } = await claimPort();
+    await closeServer(probe);
     const diagnostics: string[] = [];
     await expect(tryListen(port, "127.0.0.1", diagnostics)).resolves.toBe(true);
     expect(diagnostics).toEqual([]);
   });
 
   it("reports EADDRINUSE as taken with no diagnostic", async () => {
-    const port = await findFreePort(19000, 19900);
-    const server = await listenOn(port);
+    const { server, port } = await claimPort();
     try {
       const diagnostics: string[] = [];
       await expect(tryListen(port, "127.0.0.1", diagnostics)).resolves.toBe(
@@ -576,9 +576,7 @@ describe("findFreePort argument handling", () => {
   });
 
   it("throws an honest all-busy message (not 'could not identify') when the range is exhausted", async () => {
-    const base = await findFreePort(19000, 19900);
-    const first = await listenOn(base);
-    const second = await listenOn(base + 1);
+    const { servers, base } = await holdConsecutive(2);
     try {
       const err = await findFreePort(base, base + 1).catch((e) => e);
       expect(err).toBeInstanceOf(DevPortError);
@@ -586,20 +584,18 @@ describe("findFreePort argument handling", () => {
       expect(err.message).not.toMatch(/could not identify/);
       expect(Array.isArray(err.diagnostics)).toBe(true);
     } finally {
-      await closeServer(first);
-      await closeServer(second);
+      await Promise.all(servers.map(closeServer));
     }
   });
 });
 
 describe("live ports", () => {
   it("findFreePort skips an occupied bind", async () => {
-    const base = await findFreePort(19000, 19900);
-    const occupied = await listenOn(base);
+    const { server: occupied, port: base } = await claimPort(5);
     try {
       const next = await findFreePort(base, base + 5);
       expect(next).toBeGreaterThan(base);
-      expect(await isPortFree(next)).toBe(true);
+      expect(await isPortFree(next), `port ${next}`).toBe(true);
     } finally {
       await closeServer(occupied);
     }
@@ -608,10 +604,8 @@ describe("live ports", () => {
   it.runIf(process.platform !== "win32")(
     "kills a leftover Vite-named listener in this repo and keeps the preferred port",
     async () => {
-      const port = await findFreePort(19000, 19900);
-      const child = await spawnHolder(
+      const { child, port } = await spawnHolder(
         path.join(scriptsDir, "fixtures/vite/hold-port.mjs"),
-        port,
       );
       expect(await isPortFree(port)).toBe(false);
 
@@ -634,8 +628,11 @@ describe("live ports", () => {
   it.runIf(process.platform !== "win32")(
     "does not kill a non-Vite holder; picks another port instead",
     async () => {
-      const port = await findFreePort(19000, 19900);
-      await spawnHolder(path.join(scriptsDir, "fixtures/hold-port.mjs"), port);
+      const range = 20;
+      const { port } = await spawnHolder(
+        path.join(scriptsDir, "fixtures/hold-port.mjs"),
+        range,
+      );
       expect(await isPortFree(port)).toBe(false);
 
       const result = await resolveDevPort({
@@ -643,13 +640,13 @@ describe("live ports", () => {
         env: {},
         repoRoot,
         allowAutoport: true,
-        range: 20,
+        range,
       });
 
       expect(result.source).toBe("autoport");
       expect(result.port).not.toBe(port);
       expect(await isPortFree(port)).toBe(false);
-      expect(await isPortFree(result.port)).toBe(true);
+      expect(await isPortFree(result.port), `port ${result.port}`).toBe(true);
     },
   );
 });
@@ -667,6 +664,31 @@ describe("PREFERRED_DEV_PORT", () => {
   });
 });
 
+/*
+ * Live-port tests never take a port from a fixed range: findFreePort probes and
+ * releases, always answering the lowest free port, so concurrent suites in one
+ * checkout converged on the same port and stole each other's binds (and the
+ * reclaim test could kill a sibling run's holder). Nor do they scan up from an
+ * OS-assigned port: macOS hands out ephemeral ports sequentially, so the ports
+ * just above one are the next any process on the host is given.
+ *
+ * Each test instead starts at a random port in a band below every default
+ * ephemeral range (Linux from 32768, macOS and Windows from 49152), and a port
+ * it needs held is claimed by binding it, moving elsewhere on EADDRINUSE.
+ */
+const BAND_FIRST = 20000;
+const BAND_END = 32768; // exclusive
+const CLAIM_ATTEMPTS = 20;
+
+/** A random band port with `span` more band ports above it. */
+function randomBandPort(span: number): number {
+  return BAND_FIRST + Math.floor(Math.random() * (BAND_END - span - BAND_FIRST));
+}
+
+function isAddrInUse(err: unknown): boolean {
+  return err instanceof Error && "code" in err && err.code === "EADDRINUSE";
+}
+
 function listenOn(port: number): Promise<http.Server> {
   return new Promise((resolve, reject) => {
     const server = http.createServer();
@@ -675,24 +697,69 @@ function listenOn(port: number): Promise<http.Server> {
   });
 }
 
+/** `count` consecutive band ports, all held, with `headroom` band ports above. */
+async function holdConsecutive(
+  count: number,
+  headroom = 0,
+): Promise<{ servers: http.Server[]; base: number }> {
+  for (let attempt = 0; attempt < CLAIM_ATTEMPTS; attempt += 1) {
+    const base = randomBandPort(count - 1 + headroom);
+    const servers: http.Server[] = [];
+    try {
+      for (let offset = 0; offset < count; offset += 1) {
+        servers.push(await listenOn(base + offset));
+      }
+      return { servers, base };
+    } catch (err) {
+      await Promise.all(servers.map(closeServer));
+      if (!isAddrInUse(err)) throw err;
+    }
+  }
+  throw new Error(`could not hold ${count} consecutive ports in ${CLAIM_ATTEMPTS} attempts`);
+}
+
+/** One held band port with `headroom` band ports above it. */
+async function claimPort(
+  headroom = 0,
+): Promise<{ server: http.Server; port: number }> {
+  const { servers, base } = await holdConsecutive(1, headroom);
+  return { server: servers[0], port: base };
+}
+
 function closeServer(server: http.Server): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((err) => (err ? reject(err) : resolve()));
   });
 }
 
-async function spawnHolder(script: string, port: number): Promise<ChildProcess> {
-  const child = spawn(process.execPath, [script, String(port)], {
-    cwd: repoRoot,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  liveChildren.push(child);
-  await waitForReady(child);
-  return child;
+/**
+ * Spawns a holder on a band port with `headroom` band ports above it, moving
+ * to another port when the holder's bind meets EADDRINUSE.
+ */
+async function spawnHolder(
+  script: string,
+  headroom = 0,
+): Promise<{ child: ChildProcess; port: number }> {
+  for (let attempt = 0; attempt < CLAIM_ATTEMPTS; attempt += 1) {
+    const port = randomBandPort(headroom);
+    const child = spawn(process.execPath, [script, String(port)], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    liveChildren.push(child);
+    try {
+      await waitForReady(child);
+      return { child, port };
+    } catch (err) {
+      if (!(err instanceof Error && err.message.includes("EADDRINUSE"))) throw err;
+    }
+  }
+  throw new Error(`no holder could bind a port in ${CLAIM_ATTEMPTS} attempts`);
 }
 
 function waitForReady(child: ChildProcess): Promise<void> {
   return new Promise((resolve, reject) => {
+    let stderr = "";
     const timer = setTimeout(() => {
       reject(new Error("holder did not become ready"));
     }, 3000);
@@ -700,15 +767,19 @@ function waitForReady(child: ChildProcess): Promise<void> {
       clearTimeout(timer);
       reject(err);
     });
-    child.once("exit", (code) => {
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    // `close` (not `exit`) so the holder's stderr — the bind error — is complete.
+    child.once("close", (code) => {
       clearTimeout(timer);
-      reject(new Error(`holder exited before ready (${code})`));
+      reject(new Error(`holder exited before ready (${code}): ${stderr.trim()}`));
     });
     child.stdout?.on("data", (chunk: Buffer) => {
       if (chunk.toString().includes("ready")) {
         clearTimeout(timer);
         child.stdout?.removeAllListeners("data");
-        child.removeAllListeners("exit");
+        child.removeAllListeners("close");
         resolve();
       }
     });
