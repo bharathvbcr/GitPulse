@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { BROWSER_HARNESSES, readBrowserVerdict } from "./browser-regressions.mjs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { BROWSER_HARNESSES, chromeBinary, readBrowserVerdict } from "./browser-regressions.mjs";
 
 describe("browser regression gate", () => {
   it("keeps the native WebKit entrypoint aligned with every supported harness", () => {
@@ -40,4 +44,43 @@ describe("failure reporting a CI reader can see", () => {
     const { annotation } = await import("./browser-regressions.mjs");
     expect(annotation("Chrome a:b,c", "one\ntwo 50%")).toBe("::error title=Chrome a%3Ab%2Cc::one%0Atwo 50%25");
   });
+});
+
+describe("a browser cannot outlive its runner", () => {
+  const chrome = chromeBinary();
+  // Reported as skipped where there is no Chrome, never as passed.
+  it.skipIf(!existsSync(chrome))("Chrome exits when the runner is killed before its cleanup can run", async () => {
+    const profile = mkdtempSync(path.join(tmpdir(), "gitpulse-browser-orphan-"));
+    const runner = fileURLToPath(new URL("./browser-regressions.mjs", import.meta.url));
+    // A stand-in runner: launches Chrome exactly as a harness run does, then
+    // is SIGKILLed, so no `finally`, handler or `exit` hook can run.
+    const parent = spawn(process.execPath, ["--input-type=module", "-e", `
+      import { spawn } from "node:child_process";
+      const { chromeLaunch } = await import(${JSON.stringify(pathToFileURL(runner).href)});
+      const launch = chromeLaunch(${JSON.stringify(chrome)}, ${JSON.stringify(profile)}, "about:blank");
+      const child = spawn(launch.file, launch.args, { stdio: launch.stdio });
+      console.log(String(child.pid));
+      setInterval(() => {}, 1000);
+    `], { stdio: ["ignore", "pipe", "inherit"] });
+    let pid = 0;
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      pid = await new Promise<number>((resolve, reject) => {
+        parent.stdout.once("data", (d: Buffer) => resolve(Number(String(d).trim())));
+        parent.once("exit", code => reject(new Error(`stand-in runner exited (${code})`)));
+      });
+      expect(pid).toBeGreaterThan(0);
+      // Chrome is up and waiting on its control pipe before the runner dies.
+      await new Promise(r => setTimeout(r, 1500));
+      expect(alive()).toBe(true);
+      parent.kill("SIGKILL");
+      const deadline = Date.now() + 10_000;
+      while (alive() && Date.now() < deadline) await new Promise(r => setTimeout(r, 100));
+      expect(alive(), `Chrome ${pid} outlived its killed runner`).toBe(false);
+    } finally {
+      if (pid && alive()) process.kill(pid, "SIGKILL");
+      parent.kill("SIGKILL");
+      rmSync(profile, { recursive: true, force: true, maxRetries: 3 });
+    }
+  }, 30_000);
 });

@@ -159,3 +159,66 @@ fn gitpulse_mcp_stdio_speaks_2026_07_28_twice() {
         );
     }
 }
+
+/// Runs the binary with `args` and a stdin held open, as a terminal would
+/// leave it, and returns its exit code, stdout and stderr. A server that went
+/// on to serve would wait on that stdin forever; it is killed at the deadline
+/// and reported as hung.
+fn run_with_args(args: &[&str]) -> (Option<i32>, String, String) {
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let mut child = Command::new(mcp_bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GITPULSE_LOG_DIR", log_dir.path())
+        .spawn_locked()
+        .unwrap_or_else(|e| panic!("spawn {}: {e}", mcp_bin()));
+    let held_stdin = child.stdin.take();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().expect("kill");
+            child.wait().expect("reap");
+            panic!("gitpulse-mcp {args:?} did not exit: it is serving a stdin nobody writes");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(held_stdin);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    (status.code(), stdout, stderr)
+}
+
+/// A person who types `gitpulse-mcp --help` gets an answer and their prompt
+/// back. It used to start serving and sit on the terminal's stdin, and every
+/// such probe left a process behind.
+#[test]
+fn command_line_arguments_are_answered_without_serving() {
+    for flag in ["--help", "-h"] {
+        let (code, stdout, stderr) = run_with_args(&[flag]);
+        assert_eq!(code, Some(0), "{flag}: {stderr}");
+        assert!(stdout.starts_with("gitpulse-mcp"), "{flag}: {stdout}");
+        assert!(stdout.contains("--version"), "{flag}: {stdout}");
+    }
+    for flag in ["--version", "-V"] {
+        let (code, stdout, stderr) = run_with_args(&[flag]);
+        assert_eq!(code, Some(0), "{flag}: {stderr}");
+        assert_eq!(
+            stdout,
+            format!("gitpulse-mcp {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+    for args in [&["--stdio"][..], &["serve"], &["--help", "extra"]] {
+        let (code, stdout, stderr) = run_with_args(args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{args:?} wrote to the wire: {stdout}");
+        assert!(stderr.contains("unexpected argument"), "{args:?}: {stderr}");
+    }
+}

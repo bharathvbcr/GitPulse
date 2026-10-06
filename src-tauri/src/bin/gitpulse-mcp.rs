@@ -518,6 +518,60 @@ fn read_loop<R: std::io::BufRead>(
     }
 }
 
+const USAGE: &str = "\
+gitpulse-mcp — GitPulse MCP server
+
+USAGE:
+    gitpulse-mcp
+
+Speaks JSON-RPC (MCP) over stdin and stdout until stdin closes. An MCP host
+starts it with no arguments; see `npm run mcp:install`.
+
+OPTIONS:
+    -h, --help       Print this message
+    -V, --version    Print the version
+";
+
+/// What the command line asked for. Hosts pass no arguments, so any argument
+/// is a person at a terminal, and serving them would wait on a stdin nobody
+/// writes to — a `gitpulse-mcp --help` that never returns.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    Serve,
+    Help,
+    Version,
+    Unknown(String),
+}
+
+fn invocation(args: &[String]) -> Invocation {
+    match args {
+        [] => Invocation::Serve,
+        [only] if only == "--help" || only == "-h" => Invocation::Help,
+        [only] if only == "--version" || only == "-V" => Invocation::Version,
+        _ => Invocation::Unknown(args.join(" ")),
+    }
+}
+
+/// Answers a command line that is not a host's, or returns to serve.
+fn answer_command_line() {
+    use std::io::Write;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let text = match invocation(&args) {
+        Invocation::Serve => return,
+        Invocation::Help => USAGE.to_string(),
+        Invocation::Version => format!("{} {}\n", mcp::SERVER_NAME, mcp::server_version()),
+        Invocation::Unknown(given) => {
+            eprintln!(
+                "gitpulse-mcp: unexpected argument {given:?}; a host passes none (see --help)"
+            );
+            std::process::exit(2);
+        }
+    };
+    let mut out = io::stdout().lock();
+    let written = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+    std::process::exit(if written.is_ok() { 0 } else { 1 });
+}
+
 fn main() {
     // Agent and scheduled work: shed before the app the user is looking at is
     // deferred, on every thread this process starts. First, so no thread has
@@ -526,6 +580,9 @@ fn main() {
     // And from the per-user spawn budget every GitPulse process shares, before
     // any spawn builds the gate.
     gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
+    // Both switches above only set a flag. Everything below logs, spawns or
+    // arms a handler, and none of it applies to printing a usage line.
+    answer_command_line();
     gitpulse_lib::logging::init();
     gitpulse_lib::logging::install_panic_hook();
     // Same descriptor headroom the GUI takes: this server answers agent

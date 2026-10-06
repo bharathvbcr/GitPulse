@@ -1,7 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -38,9 +39,56 @@ export function readBrowserVerdict(html) {
   return `${rows.length}/${rows.length} browser regressions passed`;
 }
 
+export function chromeBinary() {
+  return process.env.CHROME_BIN || (process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
+}
+
+/** How Chrome is started so that it cannot outlive this runner.
+ *
+ * `finally` covers every way a harness ends inside this process, but not this
+ * process being killed — Ctrl-C, a CI step timeout, a SIGKILL — and a plain
+ * headless Chrome survives its parent: one was found still running three days
+ * after its run. With `--remote-debugging-pipe` Chrome reads its control
+ * channel from fds 3 and 4, and the kernel closes those when this process
+ * dies, however it dies; Chrome then exits.
+ * @param {string} chrome @param {string} profile @param {string} url
+ */
+export function chromeLaunch(chrome, profile, url) {
+  return {
+    file: chrome,
+    args: [
+      "--headless", "--remote-debugging-pipe", `--user-data-dir=${profile}`, "--no-first-run",
+      "--no-default-browser-check", "--disable-background-networking", "--window-size=1400,1000",
+      url,
+    ],
+    /** @type {import('node:child_process').StdioOptions} */
+    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+  };
+}
+
+/** What a signal or an uncaught error must still undo: the live browser and
+ * its profile. `finally` does it for every other exit.
+ * @type {Set<() => void>}
+ */
+const live = new Set();
+
+function undoLive() {
+  for (const undo of live) {
+    try { undo(); } catch { /* the next one still runs */ }
+  }
+  live.clear();
+}
+
 /** @param {string} harness @param {boolean} webkit */
 async function runHarness(harness, webkit) {
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-browser-"));
+  const undo = () => {
+    if (browser && browser.exitCode === null && browser.signalCode === null) browser.kill("SIGKILL");
+    rmSync(profile, { recursive: true, force: true, maxRetries: 3 });
+  };
+  live.add(undo);
   /** @type {import('vite').ViteDevServer | undefined} */
   let server;
   const reportPath = `/__gp_result/${randomUUID()}`;
@@ -88,17 +136,18 @@ async function runHarness(harness, webkit) {
     await server.listen();
     const address = server.httpServer?.address();
     if (!address || typeof address === "string") throw new Error("Vite did not bind a test port");
-    const chrome = process.env.CHROME_BIN || (process.platform === "darwin"
-      ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-      : process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
+    const chrome = chromeBinary();
     const version = await run(webkit ? "xcrun" : chrome, webkit ? ["swift", "--version"] : ["--version"], { timeout: 10_000 });
     console.log(version.stdout.trim());
     const url = `http://127.0.0.1:${address.port}/harness/${harness}.html?check=1&report=${reportPath}`;
-    browser = execFile(webkit ? "xcrun" : chrome, webkit ? ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url] : [
-      "--headless", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check",
-      "--disable-background-networking", "--window-size=1400,1000",
-      url,
-    ], { timeout: 65_000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
+    if (webkit) {
+      // The Swift runner ends itself at its own 65-second deadline.
+      browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url],
+        { timeout: 65_000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
+    } else {
+      const launch = chromeLaunch(chrome, profile, url);
+      browser = spawn(launch.file, launch.args, { stdio: launch.stdio });
+    }
     const exited = new Promise((_, reject) => {
       browser?.once("error", reject);
       browser?.once("exit", code => reject(new Error(`${webkit ? "WebKit" : "Chrome"} exited before the verdict (${code})`)));
@@ -106,13 +155,16 @@ async function runHarness(harness, webkit) {
     console.log(await Promise.race([completed, exited]));
   } finally {
     clearTimeout(deadline);
-    if (browser && browser.exitCode === null) {
+    // A browser ended by a signal has no exit code; waiting for its `close`
+    // again would wait forever.
+    if (browser && browser.exitCode === null && browser.signalCode === null) {
       const closed = new Promise(resolve => browser?.once("close", resolve));
       browser.kill("SIGKILL");
       await closed;
     }
     await server?.close();
     await rm(profile, { recursive: true, force: true, maxRetries: 3 });
+    live.delete(undo);
   }
 }
 
@@ -186,5 +238,11 @@ async function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  // `exit` runs on process.exit and on an uncaught exception; a signal's
+  // default action skips it, so each one exits through it instead.
+  process.on("exit", undoLive);
+  for (const signal of /** @type {const} */ (["SIGINT", "SIGTERM", "SIGHUP"])) {
+    process.once(signal, () => process.exit(128 + constants.signals[signal]));
+  }
   main().catch(error => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; });
 }
