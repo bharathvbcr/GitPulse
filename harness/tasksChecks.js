@@ -10,7 +10,7 @@ import TasksHost from "./TasksHost.svelte";
 import { requestTaskOpen, taskOpenRequest } from "../src/lib/workbench/taskOpen";
 import { themeStore } from "../src/lib/stores/themeStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
-import { noteForegroundFocus } from "../src/lib/runtime/foreground";
+import { describeForeground, holdForeground } from "./foreground";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
@@ -251,20 +251,10 @@ window.addEventListener("error", e => crashes.push(e.message));
 window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
 const root = document.getElementById("app");
 // The board's polls (a running Manvi suggestion, for one) pause while the
-// window is in the background, and on WKWebView that means "not focused":
-// `document.hasFocus()` is false with `visibilityState` still "visible". The
-// WebKit runner is an accessory app whose window may never become key, or
-// becomes key and then loses it to another app mid-run; either way every
-// poll-gated wait timed out there. The fixture models a person looking at
-// the board, so it says so through the product's own focus record, and hands
-// focus back after a real window blur through the same `focus` event the
-// product listens for, which also re-arms its paused timers. The blur still
-// reaches every listener first; this only undoes it. The one background check
-// below sets `document.hidden`, which outranks both.
-noteForegroundFocus(true);
-window.addEventListener("blur", event => {
-  if (event.target === window) setTimeout(() => window.dispatchEvent(new Event("focus")), 0);
-});
+// window is in the background. A person is looking at the board for the whole
+// run, including after a real window blur (see harness/foreground.ts). The one
+// background check below sets `document.hidden`, which outranks it.
+holdForeground();
 mount(TasksHost, {target: root});
 let confirmations = 0, confirmAnswer = true;
 const settle = async (ms = 30) => {
@@ -275,7 +265,7 @@ const settle = async (ms = 30) => {
   if (prompt && pendingPrompt.options.title.startsWith("Discard")) { confirmations++; [...prompt.querySelectorAll("button")].find(button => button.textContent.trim() === (confirmAnswer ? "Discard edits" : "Keep editing"))?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
   if (prompt && pendingPrompt.options.title === "Reload saved task?") { button("Reload", prompt)?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
-const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error("Timed out waiting for task UI"); };
+const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error(`Timed out waiting for task UI [${describeForeground()}]`); };
 const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete", "Copy for agent":"Copy task for an AI agent"};
 const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => {
   const names = [text, aliases[text]].filter(Boolean);

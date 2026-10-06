@@ -246,6 +246,13 @@ requires all 24 assertions, and fails on missing completion, browser exit,
 or the 60-second deadline. CI runs Chrome on Linux and WebKit on macOS;
 `ci:local` includes Chrome. WebKit briefly opens a dedicated test window.
 
+That window may never become key, or may lose key to another app mid-run.
+On WKWebView the product's polls pause whenever the window is not focused,
+so a harness whose waits depend on a poll must call `holdForeground()` from
+`harness/foreground.ts` before `mount`. Put `describeForeground()` in its wait
+timeout message too, because the runner returns only the verdict and never
+the console.
+
 For interactive inspection:
 
 Run `node node_modules/vite/bin/vite.js --config vite.config.ts --host 127.0.0.1 --port 5189 --strictPort`

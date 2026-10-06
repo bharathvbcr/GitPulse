@@ -5,6 +5,11 @@
   import { mockIPC } from "@tauri-apps/api/mocks";
   import { emit } from "@tauri-apps/api/event";
   import "../src/app.css";
+  import { describeForeground, focusChanges, holdForeground } from "./foreground";
+  // The pane polls only while the window is in front. A person is looking at
+  // the task for the whole run, including after a real window blur (see
+  // harness/foreground.ts). Before anything mounts, so a startup blur counts.
+  holdForeground();
   const task = { id:"task", revision:2, updated_at:1, title:"Preserve E42 when reconnecting", description:"Retain the original process and repository.", acceptance_criteria:["No duplicate process"], kind:"bug", status:"ready", priority:1, severity:null, owner:null, due_at:null, labels:[], repository_ids:["repo"], primary_repository_id:"repo", home_workspace_id:null, position:0 };
   const repository = { id:"repo", revision:3, updated_at:1, name:"GitPulse", identity_key:"local:/fixture/GitPulse/.git", remote_url:null };
   const runs = new Map(), sessions = new Map(), prepared = new Map();
@@ -125,23 +130,27 @@
   // Per repository tab, and every tab starts closed: nothing to clear here.
   interfaceStore.setTerminalDockHeight(500);
   const Host=(await import("./TaskAgentHost.svelte")).default;
-  // The pane polls only while the window is in front, and on WKWebView that
-  // means focused: `hasFocus()` is false with `visibilityState` "visible". The
-  // WebKit runner is an accessory app whose window never becomes key while
-  // another app holds focus, so every poll-gated wait timed out there. The
-  // fixture models a person looking at the task, through the product's own
-  // focus record (as tasksChecks.js does).
-  const {noteForegroundFocus}=await import("../src/lib/runtime/foreground");
-  noteForegroundFocus(true);
   mount(Host,{target:document.getElementById("app"),props:{task,repositories:[repository],openTabs:[{path:"/fixture/GitPulse",label:"GitPulse"}]}});
   show();
-  const wait=async condition => {const deadline=performance.now()+6000;while(!condition()){
+  // A timeout names what the product believed about the window when it gave
+  // up: the runner returns only the verdict, so this line is the only place
+  // a focus or timer cause can be read.
+  const wait=async condition => {const start=performance.now(),deadline=start+6000;let iterations=0;while(!condition()){
     if(performance.now()>deadline){
       const alert=[...document.querySelectorAll('[role="alert"]')].map(el=>el.textContent.trim()).filter(Boolean).join(" | ");
-      throw new Error(alert?`UI condition timed out while showing: ${alert}`:"UI condition timed out");
+      const why=`${describeForeground()} wait iterations=${iterations} elapsed=${(performance.now()-start).toFixed(0)}ms lists=${report.lists} holdingLists=${report.holdingLists}`;
+      throw new Error(`${alert?`UI condition timed out while showing: ${alert}`:"UI condition timed out"} [${why}]`);
     }
-    await new Promise(r=>setTimeout(r,25));}};
+    iterations++;await new Promise(r=>setTimeout(r,25));}};
   const pause=ms=>new Promise(r=>setTimeout(r,ms));
+  // How much `count` grew over `ms` in which the window's focus held still. A
+  // focus change wakes the pane, which rightly refreshes at once; that is not
+  // polling, so a disturbed window is measured again. Three in a row fail
+  // rather than pass a count nobody could take.
+  const quietGrowth=async(ms,count)=>{for(let attempt=0;attempt<3;attempt++){
+    const focus=focusChanges(),before=count();await pause(ms);
+    if(focusChanges()===focus)return count()-before;}
+    throw new Error(`Window focus changed during each of 3 ${ms}ms measurements [${describeForeground()}]`);};
   const button=name=>[...document.querySelectorAll("button")].find(el=>el.textContent.trim()===name);
   const field=name=>document.querySelector(`[aria-label="${name}"]`)?.matches("select,input")
     ? document.querySelector(`[aria-label="${name}"]`)
@@ -159,8 +168,8 @@
   const params=new URLSearchParams(location.search);
   const runChecks=async()=>{
     try {
-      await wait(()=>report.lists>0);const idle=report.lists;await pause(250);
-      check("Idle run history performs no repeated fetches",report.lists===idle);
+      await wait(()=>report.lists>0);
+      check("Idle run history performs no repeated fetches",await quietGrowth(250,()=>report.lists)===0);
       check("An open checkout for this repository is offered without being typed",field("Checkout path").value==="/fixture/GitPulse");
       check("The open tab and the folder derived from the git directory are one entry, not two",
         [...field("Known checkouts").options].map(o=>o.textContent.trim()).join("|")==="GitPulse|Another folder…");
@@ -507,7 +516,7 @@
     }
     finally{
       await finish();show();
-      document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify({results,counters:{...report,checks:report.checks.length,preparations:preparations.length}})));
+      document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify({results,counters:{...report,checks:report.checks.length,preparations:preparations.length},diagnostics:describeForeground()})));
       if(params.has("report"))await fetch(params.get("report"),{method:"POST",body:document.documentElement.outerHTML});
     }
   };
