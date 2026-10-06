@@ -17,6 +17,8 @@ export default defineConfig({
     // stress tests past their 5s safety budgets on an 18-core host. Four
     // concurrent files keep the suite parallel while the same hostile cases
     // complete in 1.5-2.6s, so the budgets stay strict instead of being raised.
+    // Tests whose cost is serial process spawns rather than CPU derive their
+    // own budget from case count (src/lib/commit/agentCommit.stress.test.ts).
     maxWorkers: 4,
     include: ["src/**/*.{test,spec}.{js,ts}", "scripts/**/*.test.ts"],
     coverage: {

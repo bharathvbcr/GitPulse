@@ -64,6 +64,23 @@ describe("agentCommit stress testing & hardening", () => {
    */
   describe.skipIf(process.platform === "win32")("copy-paste CLI command under a real shell", () => {
     const shells = ["/bin/sh", "/bin/bash", "/bin/zsh"].filter((shell) => existsSync(shell));
+    /**
+     * Wall-clock allowance for one case: a fresh `shell -c` plus the fake
+     * agent it execs, run serially with `spawnSync`. These tests' cost is
+     * process spawns, not CPU, so it scales with whatever else the host is
+     * running and vitest's flat 5s default is the wrong budget: the 300-case
+     * fuzz took 2.3s alone and 3.4-4.5s beside three parallel full suites, and
+     * timed out in one full run. Every case still runs in its own shell —
+     * batching them would let one case's leaked quoting judge the next.
+     * Measured 2026-10-05 on an 18-core host: about 7ms per case at p50 alone;
+     * 12ms at p50 and 108ms at worst beside two parallel `npx vitest run`.
+     * This is an average allowance summed over the corpus, about 8x the loaded
+     * p50, not a per-case ceiling: that ceiling is each spawn's own 10s
+     * timeout, which still fails a hung case by name. Each test's budget is
+     * this times its case count, so it moves with the corpus.
+     */
+    const SHELL_CASE_BUDGET_MS = 100;
+    const FUZZ_CASES_PER_SHELL = 100;
     let sandbox = "";
     let bin = "";
 
@@ -119,10 +136,15 @@ describe("agentCommit stress testing & hardening", () => {
       });
       const argv = existsSync(out) ? readFileSync(out, "utf8").split("\0").slice(0, -1) : null;
       const cwd = existsSync(`${out}.cwd`) ? readFileSync(`${out}.cwd`, "utf8").trim() : null;
-      return { status: result.status, stderr: result.stderr, argv, cwd };
+      // A spawn killed by its timeout has a null status and often no stderr;
+      // name why it ended so that failure does not read as a quoting bug.
+      const ended = result.error ? `${result.error.message}; ` : result.signal ? `signal ${result.signal}; ` : "";
+      return { status: result.status, stderr: `${ended}${result.stderr}`, argv, cwd };
     }
 
-    it("hands every hostile prompt to the agent byte-for-byte and executes none of it", () => {
+    it("hands every hostile prompt to the agent byte-for-byte and executes none of it", {
+      timeout: shells.length * payloads().length * 2 * SHELL_CASE_BUDGET_MS,
+    }, () => {
       expect(shells.length).toBeGreaterThan(0);
       const repo = join(sandbox, `repo $(touch ${marker()}) \`touch ${marker()}\` it's`);
       mkdirSync(repo, { recursive: true });
@@ -145,7 +167,9 @@ describe("agentCommit stress testing & hardening", () => {
       expect(runs).toBe(shells.length * payloads().length * 2);
     });
 
-    it("survives a seeded fuzz of shell metacharacters without executing or altering a byte", () => {
+    it("survives a seeded fuzz of shell metacharacters without executing or altering a byte", {
+      timeout: shells.length * FUZZ_CASES_PER_SHELL * SHELL_CASE_BUDGET_MS,
+    }, () => {
       const alphabet = [..."'\"$`\\!;&|<>(){}[]*?~#%^=,. \t\n\rab-_/:@", "🚀", "é", "\u202e"];
       let seed = 0x9e3779b9;
       const next = () => {
@@ -156,7 +180,7 @@ describe("agentCommit stress testing & hardening", () => {
       mkdirSync(repo, { recursive: true });
       let runs = 0;
       for (const shell of shells) {
-        for (let i = 0; i < 100; i += 1) {
+        for (let i = 0; i < FUZZ_CASES_PER_SHELL; i += 1) {
           const length = next() % 40;
           let prompt = "";
           for (let c = 0; c < length; c += 1) prompt += alphabet[next() % alphabet.length];
@@ -169,7 +193,7 @@ describe("agentCommit stress testing & hardening", () => {
           expect(existsSync(marker()), label).toBe(false);
         }
       }
-      expect(runs).toBe(shells.length * 100);
+      expect(runs).toBe(shells.length * FUZZ_CASES_PER_SHELL);
     });
   });
 
