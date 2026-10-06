@@ -2,9 +2,11 @@ import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
 import { appVersion } from "./scripts/app-version.mjs";
+import { gitpulseIgnoreNestedWorktrees } from "./scripts/vite-watch.mjs";
 
 export default defineConfig({
-  plugins: [tailwindcss(), svelte()],
+  // `vitest` watch mode runs on a vite dev server and its file watcher.
+  plugins: [tailwindcss(), svelte(), gitpulseIgnoreNestedWorktrees()],
   // Same definition as the production build, from the same source.
   define: {
     __APP_VERSION__: JSON.stringify(appVersion()),
