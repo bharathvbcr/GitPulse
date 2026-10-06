@@ -95,11 +95,16 @@ describe("RepoTabBar", () => {
   });
 
   it("keeps close controls outside tab elements and exposes one roving tab stop", () => {
-    expect(source).toContain('<button\n            type="button"\n            role="tab"');
-    expect(source).not.toContain('<div\n          role="tab"');
-    const tablist = source.slice(source.indexOf('role="tablist"'), source.indexOf("{#each $repoStore.openTabs"));
+    expect(source).toMatch(/<button\s+type="button"\s+role="tab"/);
+    expect(source).not.toMatch(/<div\s+role="tab"/);
+    const tablistAt = source.indexOf('role="tablist"');
+    const eachAt = source.indexOf("{#each tabLayout.visibleItems");
+    // Both anchors must exist, or the slice below is empty and proves nothing.
+    expect(tablistAt).toBeGreaterThan(-1);
+    expect(eachAt).toBeGreaterThan(tablistAt);
+    const tablist = source.slice(tablistAt, eachAt);
     expect(tablist).not.toContain('tabindex="0"');
-    expect(source).toContain("[data-tab-shell-index]");
+    expect(source).toContain("[data-drop-unit]");
     expect(source).toContain('aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"');
     expect(source).toContain('if (e.key === "Delete")');
 
@@ -121,10 +126,11 @@ describe("RepoTabBar", () => {
   });
 
   it("lets the repo label and current branch render in full instead of clipping both inside 14rem", () => {
-    const each = source.slice(
-      source.indexOf("{#each $repoStore.openTabs"),
-      source.indexOf("{#if tab.pinned}"),
-    );
+    const pillAt = source.indexOf("{#snippet repoTab");
+    const pinnedAt = source.indexOf("{#if tab.pinned}");
+    expect(pillAt).toBeGreaterThan(-1);
+    expect(pinnedAt).toBeGreaterThan(pillAt);
+    const each = source.slice(pillAt, pinnedAt);
     expect(each).not.toContain("max-w-56");
     expect(each).not.toContain("min-w-0 flex-1");
 
@@ -142,7 +148,9 @@ describe("RepoTabBar", () => {
   });
 
   it("reorders tabs by drag, keyboard, and the context menu", () => {
-    expect(source).toContain("dropReorderIndex");
+    // Drops and moves are planned on the drawn strip (stripNav) and applied as
+    // one order, so the bar the reader sees is where the tab lands.
+    expect(source).toContain("planDrop(tabLayout, dragFrom");
     expect(source).toContain('e.dataTransfer.setData("text/plain", id)');
     expect(source).toContain("application/x-gitpulse-repo-tab");
     expect(source).toContain("Control+Shift+ArrowLeft");
@@ -150,8 +158,12 @@ describe("RepoTabBar", () => {
     expect(source).toContain("Move right");
     expect(source).toContain("Move to start");
     expect(source).toContain("Move to end");
-    expect(source).toContain("repoStore.moveTab");
-    expect(source).toContain("repoStore.moveTabBy");
+    // Keyboard and menu moves go through the store, which plans them on the
+    // same drawn strip; drops apply the planned order directly.
+    expect(source).toContain("repoStore.moveTabBy(id, delta)");
+    expect(source).toContain("repoStore.moveTabToEdge(id, edge)");
+    expect(source).toContain("repoStore.canMoveTab(tab.id, -1)");
+    expect(source).toContain("repoStore.arrangeTabs(");
     expect(source).toContain('aria-live="polite"');
     expect(source).toContain("Drag to reorder");
   });

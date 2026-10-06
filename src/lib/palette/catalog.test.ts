@@ -240,7 +240,7 @@ describe("command catalog and context", () => {
     let current = { ...ready(), activeTabId: "b", currentPath: "/two/same", openTabs: [tab("a", "/one/same", false), tab("b", "/two/same", true), tab("c", "/three/same", false)], recentRepos: ["/one/same", "/four/same"] };
     vi.spyOn(repoStore, "subscribe").mockImplementation(listener => { listener(current); return () => {}; });
     const open = vi.spyOn(repoStore, "openRepo").mockImplementation(async path => { current = { ...current, currentPath: path }; return true; });
-    const move = vi.spyOn(repoStore, "moveTabBy").mockImplementation(() => {});
+    const move = vi.spyOn(repoStore, "moveTabBy").mockImplementation(() => true);
     const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
     const commands = buildCommands(current, () => {});
     expect(commands.filter(command => command.id.startsWith("recent:"))).toHaveLength(1);

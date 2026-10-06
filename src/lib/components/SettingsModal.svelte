@@ -868,6 +868,15 @@
                         onchange={(next) => interfaceStore.setAutoHideRepoTabs(next)}
                       />
                     </div>
+                    <div data-setting="stack-worktree-tabs" hidden={!shown("stack-worktree-tabs")}>
+                      <SettingToggle
+                        label="Stack worktree tabs"
+                        description="Worktrees of one repository share a tab with a switcher, instead of a tab each."
+                        ariaLabel="Stack the worktrees of one repository into a single tab"
+                        checked={$interfaceStore.stackWorktreeTabs}
+                        onchange={(next) => interfaceStore.setStackWorktreeTabs(next)}
+                      />
+                    </div>
                     <div data-setting="language-bar" hidden={!shown("language-bar")}>
                       <SettingToggle
                         label="Language mix"

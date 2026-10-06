@@ -24,8 +24,6 @@ import {
   type PathIdentityOptions,
 } from "../repos/paths";
 import {
-  activateNext,
-  activatePrev,
   activateTab,
   closeOtherTabs,
   closeTab,
@@ -35,8 +33,8 @@ import {
   openTab,
   pinTab as pinWorkspaceTab,
   removeRecent as removeWorkspaceRecent,
-  moveTabBy as moveWorkspaceTabBy,
   moveTabTo as moveWorkspaceTabTo,
+  arrangeTabs as arrangeWorkspaceTabs,
   setTabGroup as setWorkspaceTabGroup,
   setTabColor as setWorkspaceTabColor,
   setGroupColor as setWorkspaceGroupColor,
@@ -64,6 +62,17 @@ import * as workspaceSync from "../codeintel/workspaceSync";
 import { autoInit } from "../codeintel/autoInit";
 import { liveIndex } from "../codeintel/liveIndex";
 import { normalizeTabColor, type GroupColor, type TabColor } from "../repos/tabColors";
+import { familyFromCommonDir } from "../repos/repoFamily";
+import { computeTabLayout, type StackingOptions } from "../repos/tabGroups";
+import {
+  activationStops,
+  canMoveUnit,
+  cycleStop,
+  moveUnit,
+  moveUnitToEdge,
+  unitForTab,
+} from "../repos/stripNav";
+import { expandedStacks, lastUsedCheckouts, noteActiveCheckout } from "../repos/stackState";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
 import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
 import { hasUnstagedChanges } from "../files/fileStatus";
@@ -159,6 +168,12 @@ export interface ResolvedRepo {
   path: string;
   name: string;
   is_bare: boolean;
+  /**
+   * Canonical common Git directory, shared by every worktree of the
+   * repository. Optional on the wire: older fixtures and a backend that could
+   * not read the metadata both leave the tab without a family.
+   */
+  common_dir?: string | null;
 }
 
 
@@ -194,6 +209,13 @@ export interface OpenRepoTab {
   group?: string | null;
   /** Own color. Missing and null both inherit the group color, when the group has one. */
   color?: TabColor | null;
+  /**
+   * Repository family: one key shared by every checkout of a repository
+   * (see repos/repoFamily.ts). Null until resolved, or when unreadable.
+   */
+  family?: string | null;
+  /** The family's own directory, for naming it; null with `family`. */
+  familyRoot?: string | null;
   isActive: boolean;
   isBare: boolean;
   isDirty: boolean;
@@ -232,6 +254,8 @@ export interface RepoSession {
   path: string;
   name: string;
   isBare: boolean;
+  /** From `ResolvedRepo.common_dir`; null until resolved or when unreadable. */
+  commonDir: string | null;
   pinned: boolean;
   branches: BranchInfo[];
   tags: TagInfo[];
@@ -579,6 +603,7 @@ function createSession(
     path: tab.path,
     name: extras.name ?? displayName(tab.path),
     isBare: extras.isBare ?? false,
+    commonDir: extras.commonDir ?? null,
     pinned: tab.pinned,
     branches: extras.branches ?? [],
     tags: extras.tags ?? [],
@@ -624,13 +649,14 @@ function createSession(
   };
 }
 
-function project(internal: InternalState): RepoState {
+function project(internal: InternalState, options: PathIdentityOptions): RepoState {
   const labels = disambiguateLabels(
     internal.workspace.tabs.map((tab) => tab.path),
   );
   const openTabs: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
     const session = internal.sessions[tab.id];
     const statuses = session?.statuses ?? [];
+    const family = familyFromCommonDir(session?.commonDir, options);
     return {
       id: tab.id,
       path: tab.path,
@@ -639,6 +665,8 @@ function project(internal: InternalState): RepoState {
       pinned: tab.pinned,
       group: tab.group ?? null,
       color: normalizeTabColor(tab.color),
+      family: family?.key ?? null,
+      familyRoot: family?.root ?? null,
       isActive: tab.id === internal.workspace.activeId,
       isBare: session?.isBare ?? false,
       isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
@@ -1022,6 +1050,32 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /** Non-zero while restore is applying the durable copy. Writes wait. */
   let persistSuspended = 0;
 
+  function familyOfTab(id: string) {
+    return familyFromCommonDir(internal.sessions[id]?.commonDir, options);
+  }
+
+  /**
+   * Moves a newly opened checkout to just after the last open checkout of the
+   * same repository in the same group. Without it an agent's worktree tab
+   * landed at the far end of the strip, as far from its repository as the
+   * strip allowed, and with stacking turned off nothing tied the two together.
+   */
+  function placeBesideFamily(id: string, commonDir: string | null | undefined) {
+    const family = familyFromCommonDir(commonDir, options);
+    if (!family) return;
+    const ws = internal.workspace;
+    const from = ws.tabs.findIndex((tab) => tab.id === id);
+    if (from < 0) return;
+    const group = ws.tabs[from].group ?? null;
+    let last = -1;
+    ws.tabs.forEach((tab, index) => {
+      if (tab.id === id || (tab.group ?? null) !== group) return;
+      if (familyOfTab(tab.id)?.key === family.key) last = index;
+    });
+    if (last < 0) return;
+    replaceWorkspace(moveWorkspaceTabTo(ws, id, from > last ? last + 1 : last));
+  }
+
   function beginShortcut(): boolean {
     if (shortcutLocked) return false;
     shortcutLocked = true;
@@ -1031,8 +1085,32 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return true;
   }
 
+  /** How the strip stacks worktrees right now; the one input the bar and cycling share. */
+  function stripStacking(): StackingOptions {
+    return {
+      enabled: get(interfaceStore).stackWorktreeTabs,
+      expanded: get(expandedStacks),
+      lastUsed: lastUsedCheckouts(),
+      identity: (path: string) => identityKey(path, options),
+    };
+  }
+
+  /** The strip as drawn, for shortcuts that step through what the reader sees. */
+  function drawnLayout() {
+    const projected = project(internal, options);
+    return computeTabLayout(
+      projected.openTabs,
+      projected.collapsedGroups,
+      undefined,
+      projected.groupColors,
+      stripStacking(),
+    );
+  }
+
   function publish() {
-    set(project(internal));
+    const activeId = internal.workspace.activeId;
+    if (activeId) noteActiveCheckout(familyOfTab(activeId)?.key, activeId);
+    set(project(internal, options));
     persist();
     const active = internal.workspace.activeId
       ? internal.sessions[internal.workspace.activeId]
@@ -1785,6 +1863,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           (item) => !sameRepo(item, path, options),
         ),
       });
+      // A restore keeps the order it was saved in; anything else opened
+      // beside an open checkout of the same repository lands next to it.
+      if (opened.created && !extras.keepEpoch) {
+        placeBesideFamily(opened.id, resolved?.common_dir);
+      }
       const existing = internal.sessions[opened.id];
       const session = existing
         ? {
@@ -1792,6 +1875,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             path,
             name: resolved?.name ?? existing.name,
             isBare: resolved?.is_bare ?? existing.isBare,
+            // A fresh resolve is the answer, including "could not read it";
+            // a failed one keeps what the last good resolve said.
+            commonDir: resolved ? resolved.common_dir ?? null : existing.commonDir,
             pinned:
               opened.workspace.tabs.find((tab) => tab.id === opened.id)
                 ?.pinned ?? existing.pinned,
@@ -1813,6 +1899,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             {
               name: resolved?.name,
               isBare: resolved?.is_bare,
+              commonDir: resolved?.common_dir ?? null,
               // An adopted alias tab hands over its state; an explicit
               // restore payload always wins over what the alias carried.
               activeTab: extras.restore?.viewTab ?? carriedSession?.activeTab,
@@ -2060,40 +2147,72 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       revealGraph(activeSession());
       flushPersist();
     },
+    // Next/previous and number keys step through the strip as drawn — a
+    // folded worktree stack is one stop, a group's tabs sit together — so
+    // the keyboard and the native menu land where the eye expects.
     nextTab: async () => {
       if (!beginShortcut()) return;
-      const next = activateNext(internal.workspace);
-      if (next.activeId && next.activeId !== internal.workspace.activeId) {
-        await store.activateTab(next.activeId);
+      const next = cycleStop(drawnLayout(), internal.workspace.activeId, 1);
+      if (next && next !== internal.workspace.activeId) {
+        await store.activateTab(next);
       }
     },
     prevTab: async () => {
       if (!beginShortcut()) return;
-      const next = activatePrev(internal.workspace);
-      if (next.activeId && next.activeId !== internal.workspace.activeId) {
-        await store.activateTab(next.activeId);
+      const next = cycleStop(drawnLayout(), internal.workspace.activeId, -1);
+      if (next && next !== internal.workspace.activeId) {
+        await store.activateTab(next);
       }
     },
-    activateTabAt: async (index: number) => {
-      const tab = internal.workspace.tabs[index];
-      if (tab) await store.activateTab(tab.id);
-    },
-    reorderTabs: (fromIndex: number, toIndex: number) => {
-      const tab = internal.workspace.tabs[fromIndex];
-      if (tab) store.moveTab(tab.id, toIndex);
-    },
-    moveTab: (id: string, toIndex: number) => {
-      const next = moveWorkspaceTabTo(internal.workspace, id, toIndex);
-      if (next === internal.workspace) return;
+    /**
+     * Applies an order the strip computed from what it draws. A regroup, when
+     * given, moves those tabs into that group first (and opens it, so a drop
+     * never makes the dropped tab vanish). Refused whole when the order is
+     * not a permutation of the open tabs.
+     */
+    arrangeTabs: (orderedIds: readonly string[], regroup?: { ids: readonly string[]; group: string | null }) => {
+      let next = internal.workspace;
+      if (regroup) {
+        for (const id of regroup.ids) next = setWorkspaceTabGroup(next, id, regroup.group);
+        if (regroup.group) next = setWorkspaceGroupCollapsed(next, regroup.group, false);
+      }
+      const arranged = arrangeWorkspaceTabs(next, orderedIds);
+      const alreadyInOrder =
+        orderedIds.length === next.tabs.length && next.tabs.every((tab, i) => tab.id === orderedIds[i]);
+      // A stale plan must not half-apply: refused order means no regroup either.
+      if (arranged === next && !alreadyInOrder) return false;
+      if (arranged === internal.workspace) return false;
       commitEdit();
-      replaceWorkspace(next);
+      replaceWorkspace(arranged);
       publish();
+      flushPersist();
+      return true;
     },
-    moveTabBy: (id: string, delta: number) => {
-      const next = moveWorkspaceTabBy(internal.workspace, id, delta);
-      if (next === internal.workspace) return;
-      replaceWorkspace(next);
-      publish();
+    activateTabAt: async (index: number) => {
+      if (!Number.isInteger(index) || index < 0) return;
+      const id = activationStops(drawnLayout())[index];
+      if (id) await store.activateTab(id);
+    },
+    // Moves step through the strip as drawn (see repos/stripNav.ts): a folded
+    // worktree stack moves with every checkout in it, a group's tab stays in
+    // its group, and a step never swaps with a tab the reader cannot see. The
+    // tab bar, the command palette and the keyboard all come through here.
+    moveTabBy: (id: string, delta: number): boolean => {
+      const layout = drawnLayout();
+      const unit = unitForTab(layout, id);
+      const order = unit ? moveUnit(layout, unit, delta) : null;
+      return order ? store.arrangeTabs(order) : false;
+    },
+    moveTabToEdge: (id: string, edge: "start" | "end"): boolean => {
+      const layout = drawnLayout();
+      const unit = unitForTab(layout, id);
+      const order = unit ? moveUnitToEdge(layout, unit, edge) : null;
+      return order ? store.arrangeTabs(order) : false;
+    },
+    canMoveTab: (id: string, delta: -1 | 1): boolean => {
+      const layout = drawnLayout();
+      const unit = unitForTab(layout, id);
+      return unit !== null && canMoveUnit(layout, unit, delta);
     },
     pinTab: (id: string, pinned: boolean) => {
       commitEdit();
@@ -2126,7 +2245,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     groupByParentFolder: () => {
       commitEdit();
-      replaceWorkspace(groupWorkspaceByParentFolder(internal.workspace));
+      replaceWorkspace(
+        groupWorkspaceByParentFolder(internal.workspace, (tab) => familyOfTab(tab.id)?.root),
+      );
       publish();
       flushPersist();
     },

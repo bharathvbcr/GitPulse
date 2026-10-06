@@ -35,7 +35,6 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
   const unavailable = repoUnavailable(state);
   const worktree = worktreeUnavailable(state);
   const active = state.openTabs.find(tab => tab.isActive);
-  const activeIndex = state.openTabs.findIndex(tab => tab.isActive);
   const checkOrigin = () => {
     if (get(repoStore).activeTabId !== state.activeTabId || get(repoStore).currentPath !== state.currentPath) {
       throw Error("The active repository changed. Run the command again in the intended repository.");
@@ -123,8 +122,8 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "next_tab", label: "Next Repository Tab", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+Tab", disabledReason: state.openTabs.length < 2 ? "Open another repository tab first." : undefined, action: () => repoStore.nextTab() },
     { id: "prev_tab", label: "Previous Repository Tab", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+⇧+Tab", disabledReason: state.openTabs.length < 2 ? "Open another repository tab first." : undefined, action: () => repoStore.prevTab() },
     { id: "reopen_tab", label: "Reopen Closed Repository", category: "Repositories", icon: FolderGit2, disabledReason: state.lastClosed.length ? undefined : "No closed repository to reopen.", action: () => repoStore.reopenLastClosed() },
-    { id: "move_tab_left", label: "Move Repository Tab Left", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+⇧+←", disabledReason: activeIndex <= 0 ? "This tab is already first." : undefined, action: () => { if (active) repoStore.moveTabBy(active.id, -1); } },
-    { id: "move_tab_right", label: "Move Repository Tab Right", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+⇧+→", disabledReason: activeIndex < 0 || activeIndex === state.openTabs.length - 1 ? "This tab is already last." : undefined, action: () => { if (active) repoStore.moveTabBy(active.id, 1); } },
+    { id: "move_tab_left", label: "Move Repository Tab Left", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+⇧+←", disabledReason: !active || !repoStore.canMoveTab(active.id, -1) ? "This tab is already first." : undefined, action: () => { if (active) repoStore.moveTabBy(active.id, -1); } },
+    { id: "move_tab_right", label: "Move Repository Tab Right", category: "Repositories", icon: FolderGit2, shortcut: "Ctrl+⇧+→", disabledReason: !active || !repoStore.canMoveTab(active.id, 1) ? "This tab is already last." : undefined, action: () => { if (active) repoStore.moveTabBy(active.id, 1); } },
     { id: "group_by_parent_folder", label: "Group All Repositories by Parent Folder", category: "Repositories", icon: FolderGit2, disabledReason: state.openTabs.length < 2 ? "Open multiple repositories first." : undefined, action: () => repoStore.groupByParentFolder() },
     { id: "collapse_all_groups", label: "Collapse All Repository Groups", category: "Repositories", icon: FolderGit2, disabledReason: state.openTabs.every(t => !t.group) ? "No repositories are currently grouped." : undefined, action: () => repoStore.collapseAllGroups() },
     { id: "expand_all_groups", label: "Expand All Repository Groups", category: "Repositories", icon: FolderGit2, disabledReason: (!state.collapsedGroups || state.collapsedGroups.length === 0) ? "No repository groups are currently collapsed." : undefined, action: () => repoStore.expandAllGroups() },

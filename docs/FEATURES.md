@@ -610,6 +610,23 @@ sessions survive and nothing re-hydrates on the way back.
 - **Repository Tab Groups.** Open repository tabs can be organized into named,
   color-coded tab groups with collapse/expand and bulk close/reload controls,
   simplifying navigation across multi-repository workspaces.
+- **Stacked Worktree Tabs.** Every checkout of one repository — the primary
+  checkout and its linked worktrees, including agent worktrees under
+  `.<agent>/worktrees/` — shares one tab instead of taking a tab each. The tab
+  names the repository and the checkout it is showing, counts the checkouts,
+  and carries their combined uncommitted, conflict and terminal badges, so work
+  in a checkout that is not on screen still shows. Its switcher (click the
+  count, press `↓`, or right-click) lists every checkout by session name with
+  its branch and the agent that made it, and can close one or all of them; the
+  worktrees stay on disk. **Show each checkout as a tab** (or `+`) unfolds the
+  stack in place; clicking its header folds it again. Membership comes from
+  Git's common directory as the backend reads it, never from a path guess, so a
+  checkout whose metadata cannot be read stands alone. Your own groups win: a
+  repository split across two groups stacks once in each. A worktree opened
+  while its repository is open lands next to it, and **Group all by parent
+  folder** groups a worktree with the folder its repository lives in. Turn it
+  off under **Settings → Layout → Stack worktree tabs**, or from the strip's
+  right-click menu.
 - **Coloured Tabs.** A tab can carry its own colour, and a group can carry one
   that its tabs inherit when they have none. Colours persist with the workspace,
   survive restore, and are named in the tab bar's accessible labels, including
@@ -637,7 +654,13 @@ GitPulse provides comprehensive keyboard navigation accelerators across the enti
 | **Next Repository Tab** | `Ctrl Tab` | `Ctrl+Tab` |
 | **Previous Repository Tab** | `Ctrl ⇧ Tab` | `Ctrl+Shift+Tab` |
 | **Jump to Tab 1–9** | `Ctrl ⌥ 1–9` | `Ctrl+Alt+1–9` |
+| **Open a stack's checkout switcher** (focused stack) | `↓` | `↓` |
+| **Unfold / fold a worktree stack** (focused stack) | `+` / `-` | `+` / `-` |
 | **Preferences / Settings…** | `⌘ ,` | `Ctrl+,` |
+
+Next/previous tab and the number keys count what the strip draws: a folded
+worktree stack is one stop (the checkout it shows), and an unfolded one is a
+stop per checkout.
 
 ### 6.2 View Switching
 
