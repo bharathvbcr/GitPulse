@@ -11,6 +11,18 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-06
+
+Agents that start in the background with a pane showing every one at work,
+stacked worktree tabs, a model choice per agent, one agent guidance in every
+handoff, and board tools that delete tasks and make agents group work before
+filing — plus stale-branch cleanup with backups, a secret scan that never
+reads a partial scan as clean, worktree cache sync and named local routes,
+symbol-level collision notes, Markdown rendered by MarkDev, terminals that
+report what they are running, coloured tabs, timers that stop in the
+background, Bun for installs and scripts, and git spawns admitted by class so
+a refresh storm can no longer starve the actions you asked for.
+
 ### Added
 
 - **Agents group work instead of filing a card per finding.**
@@ -41,74 +53,15 @@ before that tag is pushed.
   respect your own groups. Membership is read from Git's common directory by
   the backend (`ResolvedRepo.common_dir`), so a checkout it cannot read stands
   alone rather than joining a guess.
-
-### Changed
-
-- **Launching an agent keeps you on the task.** Starting an agent from a task
-  sheet, or from a board card's Send to agent, no longer switches to the
-  repository and opens its terminal dock — which closed the sheet you
-  launched from. The agent starts in the background. The launch toast and the
-  task's Agents pane each offer Show terminal for when you want to watch it.
-- **The task sheet's Agent tab is now Agents.** It leads with the attempts
-  working now, each showing what its terminal is doing in this window:
-  running, starting, waiting for a free terminal session, or not connected.
-  Show terminal, Stop agent (asked first, as the tab's × asks), and a resumed
-  conversation listed under the attempt it continues. Ended attempts follow,
-  under History. The tab's badge counts the attempts working now, not the
-  whole history.
-- **Every agent on a task, at a glance.** The Agents pane lists all the
-  attempts working on the task — read apart from the history, so an old one
-  is never paged off — most urgent first. Each line says what its agent last
-  told you (needs your permission or input, asking a question, finished,
-  stopped on an error, with what it asked), what it calls itself, and when it
-  last printed — "Output 4s ago", "Quiet for 3m", never "working" or "stuck",
-  which output cannot tell. Its checkout's uncommitted file count shows when
-  GitPulse has read it, and a managed attempt says how many requests wait for
-  you. The summary and the tab's badge count the agents that need you. An
-  agent still running after the window reloaded, whose terminal is not on
-  screen, says what it asked too.
-- **Board cards show the agents working on them.** A card carries how many
-  agents are working on its task, amber with "1 needs you" when one is asking
-  for you — judged exactly as the task's Agents pane judges it. The board
-  reads while an agent works and when a task changes; if it cannot read, it
-  says so and marks no card rather than keep old marks.
-- Permission modes in the handoff use the same names and descriptions as
-  Settings → Agents.
-- **Next/previous tab and the number keys follow the strip as drawn.** A
-  folded stack is one stop, and a group's tabs are visited where the group is
-  drawn. Moving, dragging and dropping a tab plan against the drawn strip too,
-  so a move can no longer swap with a tab you cannot see.
-- **A worktree opened while its repository is open lands next to it**, not at
-  the far end of the strip. Restoring a workspace keeps its saved order.
-
-### Fixed
-
-- A repository opened in the background (a task agent's checkout, a restored
-  tab) no longer cancels the repository you were opening at that moment.
-- A terminal started while hidden opens at 24 × 80 instead of the 6 × 11 grid
-  measured inside a hidden dock, so an agent's first screen is not laid out
-  for 11 columns.
-- The handoff form read at most 50 attempts per state when working out which
-  checkouts already have an agent, below the 64 attempts that may be live at
-  once; it now reads 100 per state.
-- A managed agent's request review listed requests oldest first, 30 at a
-  time, so on a long run the ones waiting for you sat pages behind answered
-  ones. It now leads with the requests still pending.
-- **Group all by parent folder put every agent worktree in a "worktrees"
-  group**, away from the repository it belongs to. Worktrees now join the group
-  of the folder their repository lives in.
-
-## [1.4.0] - 2026-10-05
-
-Stale-branch cleanup with backups, a secret scan that never reads a partial
-scan as clean, worktree cache sync and named local routes, symbol-level
-collision notes, Markdown rendered by MarkDev, terminals that report what they
-are running, coloured tabs, timers that stop in the background, Bun for
-installs and scripts, and git spawns admitted by class so a refresh storm
-can no longer starve the actions you asked for.
-
-### Added
-
+- **Choose each agent's model.** Settings → Agents → Agent models sets the
+  model each agent starts with, for task attempts and new agent tabs alike;
+  empty keeps the CLI's own choice. Claude Code takes a model, an effort level,
+  up to four fallback models and an advisor model; Antigravity a model and an
+  effort level; Codex and Grok a model. A task attempt checks that the
+  installed CLI advertises each control before starting. The fields suggest
+  names: Antigravity's **List models** asks `agy models` only when you press
+  it, and Claude Code offers its aliases plus the models your settings name.
+  Managed sessions keep the CLI's own model.
 - **Dead-branch cleanup.** Scan local and remote branches for age, protection,
   work-in-progress names, ancestry merges, and squash or rebase merges
   (`git merge-tree`). Cleaning writes a restorable tip backup first and
@@ -172,6 +125,50 @@ can no longer starve the actions you asked for.
 
 ### Changed
 
+- **Every agent handoff carries the same agent guidance.** A task's brief now
+  opens with an `## Agent guidance` section from the task store — read the
+  repository's own instructions first, orient with GitPulse, DevMap and
+  DevCouncil and treat an unavailable answer as a gap, fix root causes with a
+  test that fails first, never report a check that could not run as passed —
+  so a clipboard copy, a terminal launch, a managed run and `gitpulse_get_task`
+  all say the same thing, and each run records it. A task made from an issue
+  no longer stores its own narrower workflow block.
+- **Launching an agent keeps you on the task.** Starting an agent from a task
+  sheet, or from a board card's Send to agent, no longer switches to the
+  repository and opens its terminal dock — which closed the sheet you
+  launched from. The agent starts in the background. The launch toast and the
+  task's Agents pane each offer Show terminal for when you want to watch it.
+- **The task sheet's Agent tab is now Agents.** It leads with the attempts
+  working now, each showing what its terminal is doing in this window:
+  running, starting, waiting for a free terminal session, or not connected.
+  Show terminal, Stop agent (asked first, as the tab's × asks), and a resumed
+  conversation listed under the attempt it continues. Ended attempts follow,
+  under History. The tab's badge counts the attempts working now, not the
+  whole history.
+- **Every agent on a task, at a glance.** The Agents pane lists all the
+  attempts working on the task — read apart from the history, so an old one
+  is never paged off — most urgent first. Each line says what its agent last
+  told you (needs your permission or input, asking a question, finished,
+  stopped on an error, with what it asked), what it calls itself, and when it
+  last printed — "Output 4s ago", "Quiet for 3m", never "working" or "stuck",
+  which output cannot tell. Its checkout's uncommitted file count shows when
+  GitPulse has read it, and a managed attempt says how many requests wait for
+  you. The summary and the tab's badge count the agents that need you. An
+  agent still running after the window reloaded, whose terminal is not on
+  screen, says what it asked too.
+- **Board cards show the agents working on them.** A card carries how many
+  agents are working on its task, amber with "1 needs you" when one is asking
+  for you — judged exactly as the task's Agents pane judges it. The board
+  reads while an agent works and when a task changes; if it cannot read, it
+  says so and marks no card rather than keep old marks.
+- Permission modes in the handoff use the same names and descriptions as
+  Settings → Agents.
+- **Next/previous tab and the number keys follow the strip as drawn.** A
+  folded stack is one stop, and a group's tabs are visited where the group is
+  drawn. Moving, dragging and dropping a tab plan against the drawn strip too,
+  so a move can no longer swap with a tab you cannot see.
+- **A worktree opened while its repository is open lands next to it**, not at
+  the far end of the strip. Restoring a workspace keeps its saved order.
 - **Markdown is rendered by MarkDev's module crates and HTML renderer.** The
   single vendored `markdev` crate is replaced by `markdev-md`,
   `markdev-highlight`, `markdev-html` and `markdev-vault`. Relative pictures
@@ -223,6 +220,39 @@ can no longer starve the actions you asked for.
 
 ### Fixed
 
+- A repository opened in the background (a task agent's checkout, a restored
+  tab) no longer cancels the repository you were opening at that moment.
+- A terminal started while hidden opens at 24 × 80 instead of the 6 × 11 grid
+  measured inside a hidden dock, so an agent's first screen is not laid out
+  for 11 columns.
+- The handoff form read at most 50 attempts per state when working out which
+  checkouts already have an agent, below the 64 attempts that may be live at
+  once; it now reads 100 per state.
+- A managed agent's request review listed requests oldest first, 30 at a
+  time, so on a long run the ones waiting for you sat pages behind answered
+  ones. It now leads with the requests still pending.
+- **Group all by parent folder put every agent worktree in a "worktrees"
+  group**, away from the repository it belongs to. Worktrees now join the group
+  of the folder their repository lives in.
+- **Send to agent from a board card crashed on every launch.** The sheet's
+  host closed it while the form still read the card it was opened for; the
+  form and sheet now hold what they were opened with.
+- **A branch's menu Push, Pull and Checkout did nothing and threw.** Each read
+  the branch from the menu after closing it; they now read it first.
+- **"Not installed" is said only when the system found nothing to run.** A
+  `gh` or `npm` probe deferred under load, refused, or that started and then
+  failed was reported as a missing tool — the Health panel told people with
+  `gh` on their PATH to install it. Each probe now reports *not found*,
+  *found but failed* or *not run*, and only the first suggests installing.
+- **Agent activity from transcripts is no longer lost.** Transcript catch-up
+  compared an agent's timestamps with the ledger's write time, so a pass cut
+  short, a terminal spawn or a line still being written dropped events for
+  good, and a checkout no agent had touched re-read every transcript on each
+  call. Each transcript is now read by byte offset, committed with the events
+  it produced, so a cut-short pass resumes where it stopped.
+- The diagnostics report no longer carries a JSON parse error for every
+  successful `devmap serve --print-socket-path`, which prints a path, not a
+  report.
 - **A pulse history walk that hits its deadline keeps the commits already read.**
   The pulse report runs `git log` for up to 5,000 commits under the 90s git
   deadline. When that deadline fired, every commit git had already printed was
