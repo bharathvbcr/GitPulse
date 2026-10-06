@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { consumeTaskTerminal, consumeTaskTerminalRequest, enqueueTaskTerminal, requestFor, taskTerminalRequests } from "./taskLaunches";
+import { awaitedTabIds, consumeTaskTerminal, consumeTaskTerminalRequest, enqueueTaskTerminal, requestFor, taskTerminalRequests } from "./taskLaunches";
 import { MAX_LIVE_RUNS } from "../workbench/vocabulary";
 
 afterEach(() => { for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request); });
@@ -41,6 +41,30 @@ describe("task terminal requests", () => {
     expect(requestFor(requests, "/work/repo", insensitive)).toBeUndefined();
     expect(requestFor(requests, null, insensitive)).toBeUndefined();
     expect(requestFor(requests, "", insensitive)).toBeUndefined();
+  });
+
+  it("names exactly the open tabs whose panel would take a request", () => {
+    // The dock hosts these. They must be the tabs `requestFor` matches inside
+    // the panel, by the same identity rule: a tab hosted for a request it
+    // will not consume spends a PTY slot on nothing, and a tab missed leaves
+    // the agent never starting while the reader waits on the task sheet.
+    const requests = [
+      { runId: "w", repoPath: "/Work/Repo/.gitpulse/worktrees/fix-a1b2c3d4", provider: "claude" as const, title: "Fix" },
+      { runId: "m", repoPath: "/work/other", provider: "codex" as const, title: "Other" },
+    ];
+    const tabs = [
+      { id: "1", path: "/work/repo/.gitpulse/worktrees/fix-a1b2c3d4/" },
+      { id: "2", path: "/work/repo" },
+      { id: "3", path: "/work/other" },
+      { id: "4", path: "" },
+    ];
+    const insensitive = { caseInsensitive: true };
+    expect(awaitedTabIds(tabs, requests, insensitive)).toEqual(new Set(["1", "3"]));
+    expect(awaitedTabIds(tabs, requests, { caseInsensitive: false })).toEqual(new Set(["3"]));
+    expect(awaitedTabIds(tabs, [], insensitive)).toEqual(new Set());
+    for (const tab of tabs) {
+      expect(awaitedTabIds([tab], requests, insensitive).has(tab.id)).toBe(requestFor(requests, tab.path, insensitive) !== undefined);
+    }
   });
 });
 

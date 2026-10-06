@@ -15,7 +15,7 @@ describe("editorTabs", () => {
 
   it("gives a saved task the two panes, in a fixed order", () => {
     expect(editorTabs(true).map((tab) => tab.id)).toEqual(["task", "agent"]);
-    expect(editorTabs(true).map((tab) => tab.label)).toEqual(["Task", "Agent"]);
+    expect(editorTabs(true).map((tab) => tab.label)).toEqual(["Task", "Agents"]);
   });
 
   it("hands back a fresh array each call so a caller cannot reorder the source", () => {
@@ -91,20 +91,20 @@ describe("resolveEditorTab", () => {
 
 describe("editorTabBadge", () => {
   it("counts only things that already exist", () => {
-    expect(editorTabBadge("agent", { runs: 3 })).toBe(3);
-    expect(editorTabBadge("task", { runs: 3 })).toBe(0);
+    expect(editorTabBadge("agent", { working: 3 })).toBe(3);
+    expect(editorTabBadge("task", { working: 3 })).toBe(0);
   });
 
   it("shows nothing for zero, missing, negative or nonsense counts", () => {
     expect(editorTabBadge("agent", {})).toBe(0);
-    expect(editorTabBadge("agent", { runs: 0 })).toBe(0);
-    expect(editorTabBadge("agent", { runs: -5 })).toBe(0);
-    expect(editorTabBadge("agent", { runs: Number.NaN })).toBe(0);
-    expect(editorTabBadge("agent", { runs: Number.POSITIVE_INFINITY })).toBe(0);
+    expect(editorTabBadge("agent", { working: 0 })).toBe(0);
+    expect(editorTabBadge("agent", { working: -5 })).toBe(0);
+    expect(editorTabBadge("agent", { working: Number.NaN })).toBe(0);
+    expect(editorTabBadge("agent", { working: Number.POSITIVE_INFINITY })).toBe(0);
   });
 
   it("caps a runaway count instead of widening the tab strip", () => {
-    expect(editorTabBadge("agent", { runs: 5_000 })).toBe(99);
-    expect(editorTabBadge("agent", { runs: 12.9 })).toBe(12);
+    expect(editorTabBadge("agent", { working: 5_000 })).toBe(99);
+    expect(editorTabBadge("agent", { working: 12.9 })).toBe(12);
   });
 });

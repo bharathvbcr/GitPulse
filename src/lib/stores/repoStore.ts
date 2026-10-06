@@ -1758,7 +1758,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         };
       } = {},
     ) => {
-      const requestId = ++openEpoch;
+      // Only an open that may take the screen is navigation. A background
+      // open (a task agent's checkout, a restored tab) bumping the epoch
+      // cancelled whatever the reader was opening at that moment.
+      const requestId = extras.activate === false ? openEpoch : ++openEpoch;
       internal = { ...internal, workspaceError: null };
       let resolved: ResolvedRepo | null = null;
       let deferredTrustMessage: string | null = null;

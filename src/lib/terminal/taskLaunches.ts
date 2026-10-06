@@ -69,6 +69,27 @@ export function consumeTaskTerminalRequest(request: TaskTerminalRequest): void {
   pending.update((items) => items.filter((item) => requestKey(item) !== key));
 }
 
+/**
+ * Open repository tabs that a queued request is waiting for, matched by
+ * checkout identity exactly as `requestFor` matches them inside the panel —
+ * so the dock hosts precisely the panels that will consume a request, and a
+ * request no open tab can take hosts nothing.
+ */
+export function awaitedTabIds(
+  tabs: readonly { id: string; path: string }[],
+  requests: readonly TaskTerminalRequest[],
+  options: PathIdentityOptions,
+): Set<string> {
+  const wanted = new Set<string>();
+  if (!requests.length) return wanted;
+  const keys = new Set(requests.map((request) => identityKey(request.repoPath, options)).filter(Boolean));
+  for (const tab of tabs) {
+    const key = identityKey(tab.path, options);
+    if (key && keys.has(key)) wanted.add(tab.id);
+  }
+  return wanted;
+}
+
 /** The first request whose checkout is `repoPath`, by identity, or undefined. */
 export function requestFor(
   requests: readonly TaskTerminalRequest[],

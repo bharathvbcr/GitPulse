@@ -10,7 +10,7 @@
   const runs = new Map(), sessions = new Map(), prepared = new Map();
   const decisions = new Map(), decisionReceipts = new Map(), decisionWrites = [];
   let loseDecision = false;
-  const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, holdingLists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, conversationReads:0, resumes:[], errors:[], checks:[] };
+  const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, holdingLists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, conversationReads:0, resumes:[], resizes:[], writes:[], errors:[], checks:[] };
   let loseManagedLaunch = true;
   let loseLaunch = true, losePreparation = false, conversationMissing = false;
   const preparations = [];
@@ -23,8 +23,11 @@
     if (cmd === "cmd_workbench_request") {
       const input = JSON.parse(args.input);
       if (args.method === "decisions.list") {
-        const items=[...decisions.values()].filter(item=>item.run_id===input.run_id);
-        return JSON.stringify({ok:true,items,shown:items.length,total:items.length,has_more:false,next_cursor:null});
+        // As the store does: filtered by run and state, oldest first, paged.
+        const all=[...decisions.values()].filter(item=>item.run_id===input.run_id&&(!input.state||item.state===input.state))
+          .sort((a,b)=>a.created_at-b.created_at||(a.id<b.id?-1:a.id>b.id?1:0));
+        const start=input.cursor?Number(input.cursor):0, limit=input.limit??30, items=all.slice(start,start+limit), more=start+limit<all.length;
+        return JSON.stringify({ok:true,items,shown:items.length,total:all.length,has_more:more,next_cursor:more?String(start+limit):null});
       }
       if (args.method === "decisions.decide") {
         decisionWrites.push(args.input);
@@ -45,10 +48,12 @@
         // below measure.
         if (input.repository_id) report.holdingLists++; else report.lists++;
         show();
-        const items = [...runs.values()].reverse()
+        // Newest first and paged by `limit`, as the store pages them.
+        const all = [...runs.values()].reverse()
           .filter(run=>(!input.task_id||run.task_id===input.task_id)&&(!input.repository_id||run.repository_id===input.repository_id)&&(!input.state||run.state===input.state))
           .map(({output,effective_configuration,...summary})=>summary);
-        return JSON.stringify({ok:true,items,shown:items.length,total:items.length,has_more:false,next_cursor:null});
+        const start=input.cursor?Number(input.cursor):0, limit=input.limit??30, items=all.slice(start,start+limit), more=start+limit<all.length;
+        return JSON.stringify({ok:true,items,shown:items.length,total:all.length,has_more:more,next_cursor:more?String(start+limit):null});
       }
       if (args.method === "runs.prepare_terminal" || args.method === "runs.prepare_managed") {
         preparations.push(args.input);
@@ -82,6 +87,10 @@
       const input=JSON.parse(args.input), run=runs.get(input.id);
       if (!run || !["prepared","running"].includes(run.state)) throw new Error("Attempt has ended");
       report.launchCalls++;
+      // The grid the FIRST start asked for. It now starts with the dock
+      // closed, so this is what an unseen terminal measures itself as.
+      report.launchGrid ??= {rows:input.rows,cols:input.cols};
+      (report.launchGrids ??= []).push({rows:input.rows,cols:input.cols});
       if (!run.session_id) { run.session_id=`task-session-${++report.taskSpawns}`;run.state="running";run.revision=3;sessions.set(run.session_id,run.id); }
       show();
       if (loseLaunch) { loseLaunch=false; throw new Error("Launch reply lost by fixture; reconnect the same attempt"); }
@@ -95,8 +104,12 @@
         if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); return {id:`resume-${report.resumes.length}`,cwd:args.repoPath,shell:"claude"}; }
         report.shellSpawns++;show();return {id:`shell-${report.shellSpawns}`,cwd:args.repoPath,shell:"/bin/sh"};
       case "cmd_terminal_kill":report.kills++;show();return null;
-      case "cmd_terminal_ack":case "cmd_terminal_resize":case "cmd_terminal_write":case "cmd_workspace_sync":return null;
-      case "cmd_list_branches":case "cmd_get_status":case "cmd_list_remotes":case "cmd_list_submodules":return [];
+      case "cmd_terminal_resize":report.resizes.push({id:args.sessionId,rows:args.rows,cols:args.cols});return null;
+      case "cmd_terminal_write":report.writes.push({id:args.sessionId,data:typeof args.data==="string"?args.data:""});return null;
+      case "cmd_terminal_ack":case "cmd_workspace_sync":return null;
+      // One uncommitted file, so the pane has a real status reading to show.
+      case "cmd_get_status":return [{path:"src/reconnect.ts",status_code:"M",is_staged:false,is_conflicted:false,additions:3,deletions:1}];
+      case "cmd_list_branches":case "cmd_list_remotes":case "cmd_list_submodules":return [];
       case "cmd_stash_list":return { entries: [], truncated: false };
       case "cmd_list_tags":return {tags:[],truncated:false};
       case "cmd_branch_stats":return {};
@@ -106,10 +119,20 @@
   },{shouldMockEvents:true});
   const {mount}=await import("svelte");
   const {interfaceStore}=await import("../src/lib/stores/interfaceStore");
+  const {repoStore}=await import("../src/lib/stores/repoStore");
+  const {get:read}=await import("svelte/store");
   const {sanitizeHandoff}=await import("../src/lib/workbench/taskHandoff");
   // Per repository tab, and every tab starts closed: nothing to clear here.
   interfaceStore.setTerminalDockHeight(500);
   const Host=(await import("./TaskAgentHost.svelte")).default;
+  // The pane polls only while the window is in front, and on WKWebView that
+  // means focused: `hasFocus()` is false with `visibilityState` "visible". The
+  // WebKit runner is an accessory app whose window never becomes key while
+  // another app holds focus, so every poll-gated wait timed out there. The
+  // fixture models a person looking at the task, through the product's own
+  // focus record (as tasksChecks.js does).
+  const {noteForegroundFocus}=await import("../src/lib/runtime/foreground");
+  noteForegroundFocus(true);
   mount(Host,{target:document.getElementById("app"),props:{task,repositories:[repository],openTabs:[{path:"/fixture/GitPulse",label:"GitPulse"}]}});
   show();
   const wait=async condition => {const deadline=performance.now()+6000;while(!condition()){
@@ -144,12 +167,79 @@
       const typed=field("Checkout path");typed.value="/fixture/elsewhere";typed.dispatchEvent(new Event("input",{bubbles:true}));await pause(30);
       button("Browse").click();await wait(()=>field("Checkout path").value==="/fixture/GitPulse");
       check("Browse replaces a typed checkout with the folder that was picked",true);
+      // The reader launches from the Tasks surface, with no repository open.
+      // Launching used to switch to the repository surface and open its dock,
+      // which took the reader off the task sheet that launched the agent.
+      interfaceStore.setGlobalSurface("tasks");
+      const dock=()=>document.querySelector("[data-terminal-dock]");
+      const dockShown=()=>{const el=dock();return !!el&&el.offsetParent!==null&&getComputedStyle(el).display!=="none";};
+      const pane=()=>document.querySelector('[data-testid="task-agent-panel"]');
+      const paneSessions=()=>[...pane().querySelectorAll('[data-testid="agent-session"]')];
       button("Launch in Claude Code").click();await wait(()=>button("Reconnect attempt"));
+      check("Launching keeps the reader on the task: no surface switch, no dock opened",
+        read(interfaceStore).globalSurface==="tasks"&&!read(repoStore).terminalOpen&&!dockShown());
+      check(`The agent starts unseen, at a usable terminal grid${report.launchGrid.rows>=10&&report.launchGrid.cols>=40?"":` (got ${JSON.stringify(report.launchGrid)})`}`,report.taskSpawns===1&&report.launchGrid.rows>=10&&report.launchGrid.cols>=40);
       check("Lost launch response retains one task process and starts no shell",report.taskSpawns===1&&report.shellSpawns===0);
+      // The start reply was lost, so no session in this window is attached to
+      // the attempt the store calls running. The pane must say exactly that —
+      // the hidden tab's Reconnect button is the only other place it shows.
+      await wait(()=>pane().querySelector('[data-testid="agent-session-elsewhere"]'));
+      check("A start that did not attach is reported in the pane, not only in a hidden tab",
+        pane().querySelector('[data-testid="agent-session-elsewhere"]').textContent.includes("Show terminal to reconnect")&&!paneSessions().length);
+      check("The Agents badge counts the attempt working now",document.querySelector('[data-testid="host-working"]').dataset.count==="1");
+      check("A working attempt is listed under Working now, ahead of the form",
+        !!pane().querySelector('[data-testid="agents-working"] [data-testid="agent-run"]')
+        &&pane().querySelector('[data-testid="agents-working"]').compareDocumentPosition(formToggle())&Node.DOCUMENT_POSITION_FOLLOWING);
+      button("Show terminal").click();await wait(()=>dockShown()&&read(interfaceStore).globalSurface==="repository");
+      check("Show terminal is what brings the attempt's terminal on screen",read(repoStore).terminalOpen&&report.taskSpawns===1);
       button("Reconnect attempt").click();await wait(()=>document.querySelector('textarea[aria-label="Terminal input"]')&&!button("Reconnect attempt"));
       check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
-      button("Open terminal").click();await pause(250);
-      check("Repeated Open terminal focuses its existing tab",report.launchCalls===2&&report.taskSpawns===1);
+      await wait(()=>paneSessions().some(el=>el.dataset.phase==="running"));
+      check("The pane shows the session running in this window, with a Stop agent control",!!button("Stop agent"));
+      // ---- Monitoring one agent from the pane ------------------------------
+      {
+        const watched=[...runs.values()].find(run=>run.session_id==="task-session-1"), sid=watched.session_id;
+        const card=()=>pane().querySelector(`[data-run-id="${watched.id}"]`);
+        const line=()=>card().querySelector('[data-testid="agent-session"]');
+        await emit("terminal-output",{id:sid,data_b64:btoa("\x1b]0;Fixing E42\x07reading src/reconnect.ts\r\n")});
+        await wait(()=>card().querySelector('[data-testid="agent-title"]')?.textContent.includes("Fixing E42"));
+        check("The pane shows what the agent calls itself right now",true);
+        await wait(()=>line().dataset.tone==="active");
+        check("Fresh output reads as recent output, never as working",/Output (just now|\ds ago)/.test(line().textContent)&&!/working/i.test(line().querySelector(".headline").textContent));
+        await wait(()=>card().querySelector('[data-testid="agent-changes"]'));
+        check("The checkout's uncommitted changes show once its status has been read",
+          card().querySelector('[data-testid="agent-changes"]').textContent.includes("1 file changed in this shared checkout"));
+        await emit("gitpulse-session-attention",{session:sid,channel:"hook",event:"permission_prompt",detail:"Bash: cargo test"});
+        await wait(()=>card().dataset.tone==="needs-you");
+        check("An agent asking for permission says so in its row, with what it asked",
+          line().textContent.includes("Needs your permission")&&card().querySelector('[data-testid="agent-said"]').textContent==="Bash: cargo test");
+        check("The summary and the tab badge count it as needing you",
+          pane().querySelector('[data-testid="agents-summary"]').textContent.includes("1 needs you")&&document.querySelector('[data-testid="host-working"]').dataset.asking==="1");
+        await emit("terminal-output",{id:sid,data_b64:btoa("still printing\r\n")});await pause(1200);
+        check("More output does not answer the agent's question",card().dataset.tone==="needs-you");
+        const writesBefore=report.writes.length;
+        const terminalInput=document.querySelector('textarea[aria-label="Terminal input"]');
+        terminalInput.focus();terminalInput.dispatchEvent(new InputEvent("input",{data:"y",inputType:"insertText",bubbles:true}));
+        await wait(()=>report.writes.slice(writesBefore).some(write=>write.id===sid));
+        await wait(()=>card().dataset.tone!=="needs-you");
+        check("Typing into the agent's terminal answers it, and the pane stops asking",document.querySelector('[data-testid="host-working"]').dataset.asking==="0");
+        await emit("gitpulse-session-attention",{session:sid,channel:"hook",event:"agent_completed"});
+        await wait(()=>line().dataset.tone==="finished");
+        await emit("terminal-output",{id:sid,data_b64:btoa("> \r\n")});await pause(1200);
+        check("A finished agent stays finished when it repaints its prompt",line().dataset.tone==="finished"&&line().textContent.includes("Finished its work"));
+        // Malformed notices for this very session: no channel, a non-string
+        // session, an array. Each must leave the line as it was.
+        for(const bad of [{session:sid,event:"permission_prompt"},{session:[sid],channel:"hook",event:"permission_prompt"},[sid,"hook","permission_prompt"]])
+          await emit("gitpulse-session-attention",bad);
+        await pause(300);
+        check("A malformed notice is ignored, even one naming a live session",line().dataset.tone==="finished");
+        await emit("gitpulse-session-attention",{session:sid,channel:"bell"});
+        await wait(()=>line().dataset.tone==="signalled");
+        check("A bare terminal signal shows as signalled, never as a request",!line().textContent.includes("Needs")&&report.errors.length===0);
+      }
+      interfaceStore.setGlobalSurface("tasks");
+      button("Show terminal").click();await pause(250);
+      check("Repeated Show terminal focuses its existing tab",report.launchCalls===2&&report.taskSpawns===1&&read(interfaceStore).globalSurface==="repository");
       // A task attempt's PTY child IS the agent, so the OS never reports it
       // busy; closing its tab used to stop the agent and end the attempt
       // without a word, from the tab's x and from the Sessions list alike.
@@ -171,6 +261,10 @@
         completePrompt(false);await pause(150);
         check("Declining there stops nothing",report.kills===0);
         document.querySelector('[aria-label="All terminal sessions"]').click();await pause(50);
+        button("Stop agent").click();await wait(()=>get(promptState));
+        check("Stop agent in the task's pane asks the same question first",get(promptState).options.message.includes("ends this attempt")&&report.kills===0);
+        completePrompt(false);await pause(150);
+        check("Declining in the pane stops nothing and says nothing was stopped",report.kills===0&&!pane().textContent.includes("was stopped"));
       }
       check("A launched attempt folds its form away and keeps the run in view",launchForm().hidden&&toggleLabel()==="New attempt"&&formToggle().getAttribute("aria-expanded")==="false");
       await openLaunchForm();
@@ -203,11 +297,16 @@
       const ended=[...runs.values()].find(run=>run.state==="exited"&&run.provider==="claude");
       conversationMissing=true;button("Resume conversation").click();await wait(()=>document.body.textContent.includes("no saved conversation"));
       check("An attempt with no saved conversation says so and opens nothing",report.resumes.length===0&&report.conversationReads===1);
+      interfaceStore.setGlobalSurface("tasks");
       conversationMissing=false;button("Resume conversation").click();await wait(()=>report.resumes.length===1);
       check("Resume continues the attempt's own Claude Code session",report.resumes[0].program==="claude"&&report.resumes[0].args.join(" ")===`--resume ${ended.id}`);
       check("A resumed conversation keeps the attempt's permission mode",report.resumes[0].permissionMode===ended.permission_mode);
-      button("Resume conversation").click();await pause(250);
-      check("Resuming again focuses the open conversation rather than starting a second",report.resumes.length===1);
+      check("Resuming keeps the reader on the task",read(interfaceStore).globalSurface==="tasks");
+      await wait(()=>paneSessions().some(el=>el.textContent.includes("Resumed conversation")));
+      check("The resumed conversation is listed under the attempt it continues, and Resume is not offered twice",
+        !!button("Show conversation")&&!button("Resume conversation"));
+      button("Show conversation").click();await wait(()=>read(interfaceStore).globalSurface==="repository");
+      check("Show conversation focuses the open conversation rather than starting a second",report.resumes.length===1);
       await openLaunchForm();set("Permission mode","edit");await pause(30);
       button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===2);
       await openLaunchForm();
@@ -244,6 +343,11 @@
         const digest=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,"0")).join("");
         decisions.set(id,{id,revision:1,updated_at:now,run_id:current.id,task_id:task.id,source_revision:task.revision,repository_id:repository.id,repository_revision:repository.revision,owner_id:"fixture",session_id:current.session_id,provider_thread_id:"thread",provider_turn_id:"turn",protocol_request_id:`s:${id}`,provider:"codex",permission_mode:"ask",policy_revision:1,cwd:current.cwd,kind,payload,payload_digest:digest,created_at:now,expires_at:now+300,state:"pending",decision:null,answer:null,actionable:true,reason:""});
       }
+      const managedCard=()=>pane().querySelector(`[data-run-id="${current.id}"]`);
+      button("Refresh").click();await wait(()=>managedCard()?.querySelector('[data-testid="agent-requests"]'));
+      check("A managed agent's pending requests show on its card and count as needing you",
+        managedCard().querySelector('[data-testid="agent-requests"]').textContent.includes("4 requests are waiting for you")
+          &&managedCard().dataset.tone==="needs-you"&&document.querySelector('[data-testid="host-working"]').dataset.asking==="1");
       (button("Review requests")??button("Refresh requests")).click();await wait(()=>document.querySelector('[aria-label="Complete agent request"]'));
       const panel=()=>document.querySelector('[aria-label="Agent requests"]');
       check("Permission review preserves the exact request including large numbers and duplicate fields",panel().querySelector('textarea').value===exactPayload);
@@ -258,6 +362,8 @@
       check("Questions and denials save distinct responses",decisions.get("deny").decision==="deny"&&decisions.get("question").decision==="answer");
       decisions.get("stale").actionable=false;button("Refresh requests").click();await wait(()=>panel().textContent.includes("expired or its target changed"));
       check("Stale requests expose no approval controls",!button("Allow once")&&!button("Deny request"));
+      button("Refresh").click();await wait(()=>!managedCard().querySelector('[data-testid="agent-requests"]'));
+      check("Once every request is answered or stale, the card stops asking",document.querySelector('[data-testid="host-working"]').dataset.asking==="0");
       button("Hide requests").click();await wait(()=>!panel());button("Review requests").click();await wait(()=>panel()?.textContent.includes("Saved response: Allow once"));
       check("Reopening review retains receipts without accepting the task",decisions.get("allow").revision===2&&task.revision===2&&task.status==="ready");
       const managed=[...runs.values()].find(run=>run.kind==="managed");
@@ -270,6 +376,35 @@
       const format=[...panel().querySelectorAll("label")].find(label=>label.textContent.includes("Which output format?")).querySelector("textarea");format.value="Markdown";format.dispatchEvent(new Event("input",{bubbles:true}));
       await wait(()=>!button("Save answers").disabled);button("Save answers").click();await wait(()=>decisions.get("multi").state==="decided");
       check("Structured answers retain question identities",decisions.get("multi").answer==='{"scope":["Focused"],"format":["Markdown"]}');
+      // ---- A long managed run: thirty answered requests, then a new one ----
+      // The store lists a run's requests oldest first, 30 to a page. Read
+      // unfiltered, the first page is all answered history: the card said
+      // nothing was waiting and the review led with old receipts.
+      {
+        const oldPayload='{"command":"ls"}';
+        const oldDigest=[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(oldPayload)))].map(b=>b.toString(16).padStart(2,"0")).join("");
+        for(let i=0;i<30;i++){
+          const id=`old-${String(i).padStart(2,"0")}`;
+          decisions.set(id,{...decisions.get("deny"),id,run_id:managed.id,session_id:managed.session_id,protocol_request_id:`s:${id}`,payload:oldPayload,payload_digest:oldDigest,
+            created_at:now-1000+i,expires_at:now-1000+i+300,state:"decided",decision:"allow_once",answer:null,actionable:false});
+        }
+        const latePayload='{"command":"cargo test --workspace"}';
+        const lateDigest=[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(latePayload)))].map(b=>b.toString(16).padStart(2,"0")).join("");
+        decisions.set("late",{...decisions.get("deny"),id:"late",run_id:managed.id,session_id:managed.session_id,protocol_request_id:"s:late",kind:"permission",payload:latePayload,payload_digest:lateDigest,
+          created_at:now+5,expires_at:now+300,state:"pending",decision:null,answer:null,actionable:true,reason:""});
+        button("Refresh").click();
+        await wait(()=>managedCard()?.querySelector('[data-testid="agent-requests"]')?.textContent.includes("1 request is waiting for you"));
+        check("A long run's newest request is counted, not hidden behind thirty answered ones",managedCard().dataset.tone==="needs-you");
+        button("Refresh requests").click();
+        const articles=()=>[...(panel()?.querySelectorAll("article")??[])];
+        const lateAt=()=>articles().findIndex(item=>[...item.querySelectorAll("textarea")].some(field=>field.value.includes("cargo test --workspace")));
+        await wait(()=>lateAt()!==-1);
+        const firstReceipt=articles().findIndex(item=>item.querySelector("strong")?.textContent.includes("Decision saved"));
+        check("Request review leads with what is still waiting, not with old receipts",
+          articles()[lateAt()].querySelector("strong").textContent.includes("Needs review")&&(firstReceipt===-1||lateAt()<firstReceipt));
+        decisions.get("late").state="cancelled";decisions.get("late").actionable=false;decisions.get("late").revision++;
+        button("Refresh").click();await wait(()=>!managedCard().querySelector('[data-testid="agent-requests"]'));
+      }
       button("View output and settings").click();await wait(()=>document.querySelector('[aria-label="Managed agent output"]'));
       check("Output loads only when opened",report.detailReads===1&&document.querySelector('[aria-label="Managed agent output"]').value==="Managed fixture output");
       button("Stop managed run").click();await wait(()=>report.managedStops===1);button("Refresh").click();await wait(()=>document.body.textContent.includes("Provider turn: interrupted"));
@@ -279,6 +414,89 @@
       runs.set(failed.id,failed);button("Refresh").click();await wait(()=>document.body.textContent.includes(failed.reason));
       check("Initialization failure renders without a fabricated provider thread",document.body.textContent.includes("Provider turn: failed"));
       check("Reading failed initialization starts no replacement agent",report.managedSpawns===1&&task.status==="ready"&&task.revision===2);
+      // ---- Several agents from one sheet, back to back ----------------------
+      // The sheet stays put, so the reader can start one agent after another
+      // from it. Every one must start unseen, be listed as working, and count
+      // in the badge; then a launch with every terminal slot taken must say
+      // it is waiting for one — in the pane, not only in a dock it cannot see.
+      {
+        const {setTerminalSessionLimit}=await import("../src/lib/terminal/sessionLimit");
+        const {terminalSessions}=await import("../src/lib/terminal/sessionRegistry");
+        await finish();button("Refresh").click();await pause(100);
+        interfaceStore.setGlobalSurface("tasks");
+        await openLaunchForm();seg("Connection","Terminal").click();await pause(30);
+        // Started with the dock closed, the agent opens at 24 × 80; the grid
+        // it really has must reach the process when its terminal is first
+        // shown, or it runs 80 columns wide in a dock that fits more or fewer.
+        repoStore.setTerminalOpen(false);await wait(()=>!dockShown());
+        const hiddenBefore=report.taskSpawns;
+        await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);
+        button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===hiddenBefore+1);
+        const hiddenRun=[...runs.values()].find(run=>run.session_id===`task-session-${report.taskSpawns}`);
+        check("An agent started with the dock closed opens at 24 × 80, not at a hidden measurement",
+          !dockShown()&&report.launchGrids.at(-1).rows===24&&report.launchGrids.at(-1).cols===80);
+        const resizesBefore=report.resizes.length;
+        pane().querySelector(`[data-run-id="${hiddenRun.id}"] button.gp-btn-primary`).click();
+        await wait(()=>dockShown()&&report.resizes.slice(resizesBefore).some(r=>r.id===hiddenRun.session_id));
+        const fitted=report.resizes.slice(resizesBefore).filter(r=>r.id===hiddenRun.session_id).at(-1);
+        check(`Showing it sends the grid the dock really fits (${fitted.rows} × ${fitted.cols})`,
+          fitted.rows>=2&&fitted.cols>=2&&(fitted.rows!==24||fitted.cols!==80));
+        await finish();button("Refresh").click();await pause(100);
+        interfaceStore.setGlobalSurface("tasks");
+        const before=report.taskSpawns, BURST=5;
+        for(let i=0;i<BURST;i++){
+          await openLaunchForm();
+          await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);
+          button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===before+i+1);
+        }
+        const working=()=>[...pane().querySelectorAll('[data-testid="agents-working"] [data-testid="agent-run"]')];
+        await wait(()=>working().length===BURST&&working().every(card=>card.querySelector('[data-testid="agent-session"][data-phase="running"]')));
+        check("Back-to-back launches start every agent, each listed as running, and none moves the reader",
+          read(interfaceStore).globalSurface==="tasks"&&report.taskSpawns===before+BURST&&report.shellSpawns===0);
+        check("The Agents badge counts every attempt working now",document.querySelector('[data-testid="host-working"]').dataset.count===String(BURST));
+        {
+          const last=working().at(-1).dataset.runId, lastSession=runs.get(last).session_id;
+          await emit("gitpulse-session-attention",{session:lastSession,channel:"hook",event:"elicitation_dialog",detail:"Which branch?"});
+          await wait(()=>working()[0].dataset.runId===last);
+          check("The agent asking for you moves to the top of Working now, and the others keep their order",
+            working()[0].dataset.tone==="needs-you"&&working().slice(1).every(card=>card.dataset.tone!=="needs-you")&&working().length===BURST);
+        }
+        setTerminalSessionLimit(read(terminalSessions).length);
+        await openLaunchForm();
+        await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);
+        button("Launch in Claude Code").click();
+        await wait(()=>pane().querySelector('[data-testid="agent-session-waiting"]'));
+        check("A launch with every terminal slot taken says, in the pane, that it waits for one",
+          pane().querySelector('[data-testid="agent-session-waiting"]').textContent.includes("waiting for a free terminal session")&&report.taskSpawns===before+BURST);
+        setTerminalSessionLimit(32);
+        await wait(()=>report.taskSpawns===before+BURST+1&&!pane().querySelector('[data-testid="agent-session-waiting"]'));
+        check("Raising the limit starts the waiting agent at once",read(interfaceStore).globalSurface==="tasks");
+        await finish();button("Refresh").click();await wait(()=>!pane().querySelector('[data-testid="agents-working"]'));
+        check("Ended attempts leave Working now and the badge clears",document.querySelector('[data-testid="host-working"]').dataset.count==="0");
+        // A prepared attempt this window is not starting (the launch queue is
+        // per window, so a reload forgets it) must not sit there silently.
+        const orphan={...[...runs.values()].find(run=>run.kind==="external_terminal"),id:"orphan-prepared",state:"prepared",session_id:null,exit_code:null,revision:1,expires_at:Math.floor(Date.now()/1000)+300};
+        runs.set(orphan.id,orphan);button("Refresh").click();
+        await wait(()=>pane().querySelector('[data-run-id="orphan-prepared"] [data-testid="agent-session-unstarted"]'));
+        check("A prepared attempt nothing is starting says so, and offers Show terminal to start it",
+          !!pane().querySelector('[data-run-id="orphan-prepared"]').querySelector("button.gp-btn-primary")?.textContent.includes("Show terminal"));
+        runs.delete(orphan.id);button("Refresh").click();await pause(100);
+        // An agent older than a full page of history is read only from the
+        // live list. Polling once looked at the history page alone, so it
+        // stopped while that agent was still running and never saw it end.
+        const elder={...orphan,id:"elder-live",state:"running",session_id:"elder-session",revision:3,expires_at:Math.floor(Date.now()/1000)+600};
+        runs.set(elder.id,elder);
+        const later=[];
+        for(let i=0;i<31;i++){const id=`later-${String(i).padStart(2,"0")}`;later.push(id);runs.set(id,{...orphan,id,state:"exited",session_id:null,exit_code:0,revision:2});}
+        button("Refresh").click();
+        await wait(()=>pane().querySelector('[data-testid="agents-working"] [data-run-id="elder-live"]'));
+        check("An agent older than a page of history is still listed as working",!pane().querySelector('[data-testid="agents-history"] [data-run-id="elder-live"]'));
+        elder.state="exited";elder.exit_code=0;elder.revision++;
+        await wait(()=>!pane().querySelector('[data-testid="agents-working"] [data-run-id="elder-live"]'));
+        check("The pane goes on polling for it, and sees it end without a manual refresh",document.querySelector('[data-testid="host-working"]').dataset.count==="0");
+        for(const id of [elder.id,...later])runs.delete(id);
+        button("Refresh").click();await pause(100);
+      }
       check("No unrelated shell was started",report.shellSpawns===0);
       check("The remembered handoff never carries bypass into storage",sanitizeHandoff({provider:"codex",kind:"managed",permission:"bypass"}).permission==="ask");
       check("No browser runtime errors after every handoff path",report.errors.length===0);

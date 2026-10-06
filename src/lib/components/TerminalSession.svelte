@@ -97,6 +97,7 @@
   } from "../terminal/agentDefaults";
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
   import { terminalAttendance } from "../stores/sessionAlertsStore";
+  import { sessionActivity } from "../terminal/sessionActivity";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
@@ -107,7 +108,7 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { toastStore } from "../stores/toastStore";
   import {
-    clampTerminalFontSize, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
+    clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
     SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
   } from "../terminal/viewControls";
@@ -433,6 +434,9 @@
         if (shape.printable > 0) console.info("[gitpulse-terminal]", line);
         else console.debug("[gitpulse-terminal]", line);
       }
+      // The reader answering whatever the agent last asked; xterm's own
+      // replies (focus, cursor reports) are told apart inside.
+      if (nativeSessionId) sessionActivity.input(nativeSessionId, data);
       lifecycle?.write(data);
     });
     created.onBinary((data) => { lifecycle?.write(data, true); });
@@ -442,7 +446,7 @@
     // OSC 0/2: what the running program calls itself. A shell configured to
     // report its directory, or an agent CLI reporting its task, then names its
     // own tab — which is the whole reason a tab strip beats a session counter.
-    created.onTitleChange((title) => onTitle(title));
+    created.onTitleChange((title) => { onTitle(title); if (nativeSessionId) sessionActivity.title(nativeSessionId, title); });
     // xterm forwards nearly every keystroke to the PTY, so a tab chord typed
     // with the terminal focused — which is where it will always be typed —
     // reaches the shell instead of the strip unless it is intercepted here.
@@ -541,11 +545,12 @@
       confirmClose: confirmCloseSelf,
       title,
       taskRunId,
+      continuesRunId: resume?.runId,
       transport: {
         spawn: () => {
           // A tab hidden before its shell starts measures as NaN; NaN becomes
           // `null` on the wire and the backend's u16 refuses the spawn.
-          const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions());
+          const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions(), hasRenderedBox(container));
           const cfg = launcherConfig(launcher);
           // Once: a later restart of this tab starts a fresh process the
           // ordinary way, because the session it took over has ended.
@@ -587,7 +592,7 @@
           // the notifier.
           // A restart is a new process with a new id. The old id is dead, and
           // left behind it pushes the live one out of the bounded report.
-          if (nativeSessionId && nativeSessionId !== spawned.id) terminalAttendance.forget(nativeSessionId);
+          if (nativeSessionId && nativeSessionId !== spawned.id) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
           nativeSessionId = spawned.id;
           terminalAttendance.report(nativeSessionId, onscreen);
           startedIn = spawned.cwd;
@@ -618,7 +623,10 @@
           } else if (decision.action === "stop") {
             void lifecycle?.stop(decision.failure);
           }
-          if (decision.action !== "stop" && !disposed && !active) onActivity();
+          if (decision.action !== "stop" && !disposed) {
+            sessionActivity.output(sessionId);
+            if (!active) onActivity();
+          }
         },
         exit(event) {
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
@@ -985,7 +993,7 @@
       armTimers.clear();
       disposed = true;
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
-      if (nativeSessionId) terminalAttendance.forget(nativeSessionId);
+      if (nativeSessionId) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
       lifecycle?.dispose();
       lifecycle = null;
       linkProvider?.dispose();

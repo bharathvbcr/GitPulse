@@ -58,7 +58,16 @@ export interface TerminalTab {
  * is the same work continuing: under the host-wide default, an attempt that
  * was only allowed to inspect would come back able to edit.
  */
-export interface ResumeLaunch { sessionId: string; mode: PermissionMode }
+export interface ResumeLaunch {
+  sessionId: string;
+  mode: PermissionMode;
+  /**
+   * The ended attempt this conversation continues. Linkage only, so the
+   * task's Agents pane can list the session under its attempt; a resumed tab
+   * is the reader's own and never acts on that attempt's record.
+   */
+  runId?: string;
+}
 
 /**
  * A task attempt's terminal; with `resume`, its conversation resumed; with
@@ -177,7 +186,7 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
     // A plain Claude Code tab, not the attempt's: the attempt ended and its
     // record is final, so this session is the reader's own continuation.
     if (launcher !== "claude" || !isSessionId(task.resume.sessionId)) return state;
-    tab.resume = { ...task.resume };
+    tab.resume = { ...task.resume, runId: task.runId };
     tab.name = `${task.title} (resumed)`;
   } else if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
   return { tabs: [...state.tabs, tab], activeId: tab.id };

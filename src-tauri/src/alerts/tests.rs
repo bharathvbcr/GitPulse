@@ -14,6 +14,7 @@ struct Recorder {
     config: Mutex<SessionAlertSettings>,
     minute: Mutex<Option<u16>>,
     refuse: Mutex<bool>,
+    announced: Mutex<Vec<Attention>>,
 }
 
 impl Recorder {
@@ -73,6 +74,9 @@ impl Host for Recorder {
     }
     fn minute(&self) -> Option<u16> {
         *self.minute.lock().unwrap()
+    }
+    fn announce(&self, attention: &Attention) {
+        self.announced.lock().unwrap().push(attention.clone());
     }
 }
 
@@ -392,4 +396,214 @@ fn a_workbench_activity_identifier_is_not_a_session_identifier() {
     assert_eq!(native_session_key("gitpulse.session."), None);
     assert_eq!(native_session_key("gitpulse.session.a/b"), None);
     assert_eq!(native_session_key("term-1"), None);
+}
+
+// ---- Announcements: what the task's Agents pane is told ------------------
+
+fn hook(key: &str, reason: &str, detail: Option<&str>) -> Notice {
+    Notice {
+        key: key.to_owned(),
+        origin: Origin::Hook,
+        label: "Claude Code".into(),
+        place: None,
+        reason: Some(reason.into()),
+        detail: detail.map(str::to_owned),
+        is_agent: true,
+        channel: "hook",
+    }
+}
+
+impl Recorder {
+    fn announcements(&self) -> Vec<Attention> {
+        self.announced.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn an_agent_notice_is_announced_at_once_even_when_its_banner_is_suppressed() {
+    // Each of these suppresses the banner; none changes what the agent waits
+    // for, and the pane must still be able to say so.
+    let suppressors: Vec<Box<dyn Fn(&mut Driver)>> = vec![
+        Box::new(|d: &mut Driver| *d.recorder.attended.lock().unwrap() = Some("term-1".into())),
+        Box::new(|d: &mut Driver| d.recorder.config.lock().unwrap().enabled = false),
+        Box::new(|d: &mut Driver| {
+            let mut config = d.recorder.config.lock().unwrap();
+            config.quiet_start = Some(0);
+            config.quiet_end = Some(23 * 60 + 59);
+        }),
+    ];
+    for suppress in suppressors {
+        let mut driver = Driver::new();
+        suppress(&mut driver);
+        driver.tick(
+            Some(hook(
+                "term-1",
+                "needs your permission",
+                Some("Bash: cargo test"),
+            )),
+            Instant::now(),
+        );
+        assert_eq!(driver.recorder.count(), 0, "the banner was suppressed");
+        assert_eq!(
+            driver.recorder.announcements(),
+            vec![Attention {
+                session: "term-1".into(),
+                channel: "hook",
+                event: Some("permission_prompt"),
+                detail: Some("Bash: cargo test".into()),
+            }]
+        );
+    }
+}
+
+#[test]
+fn announcements_are_not_held_for_the_banner_window() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "finished its work", None)), start);
+    driver.tick(
+        Some(hook("term-1", "needs your permission", None)),
+        start + ANNOUNCE_GAP + Duration::from_millis(1),
+    );
+    // Two announcements a second apart, while the banner for the second is
+    // still waiting out its five-second window.
+    assert_eq!(driver.recorder.announcements().len(), 2);
+    assert_eq!(driver.recorder.count(), 1);
+}
+
+#[test]
+fn a_burst_is_one_announcement_now_and_the_newest_after_the_gap() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    for step in 0..50u64 {
+        let mut ring = notice("term-1");
+        ring.detail = Some(format!("ring {step}"));
+        driver.tick(Some(ring), start + Duration::from_millis(step * 10));
+    }
+    assert_eq!(driver.recorder.announcements().len(), 1);
+    assert_eq!(
+        next_wake(&driver.tracked).is_some(),
+        true,
+        "the held announcement must wake the worker"
+    );
+    driver.tick(None, start + ANNOUNCE_GAP + Duration::from_millis(1));
+    let said = driver.recorder.announcements();
+    assert_eq!(said.len(), 2);
+    assert_eq!(said[1].detail.as_deref(), Some("ring 49"));
+    // A terminal signal says only that something was signalled.
+    assert_eq!(said[1].event, None);
+    assert_eq!(said[1].channel, "bell");
+}
+
+#[test]
+fn every_hook_event_is_announced_by_its_name() {
+    // Derived from the bridge's own table, so an event added there cannot
+    // reach the pane as an unnamed signal.
+    for (name, phrase) in bridge::EVENTS {
+        let mut driver = Driver::new();
+        driver.tick(Some(hook("term-1", phrase, None)), Instant::now());
+        assert_eq!(driver.recorder.announcements()[0].event, Some(*name));
+    }
+}
+
+#[test]
+fn a_plain_shell_or_a_session_outside_gitpulse_is_never_announced() {
+    let mut driver = Driver::new();
+    let now = Instant::now();
+    let mut shell = notice("term-1");
+    shell.is_agent = false;
+    driver.tick(Some(shell), now);
+    driver.tick(
+        Some(hook("hook-claude-GitPulse", "finished its work", None)),
+        now,
+    );
+    assert_eq!(driver.recorder.announcements(), vec![]);
+}
+
+#[test]
+fn announced_text_is_sanitized_and_bounded() {
+    let mut driver = Driver::new();
+    let hostile = format!("\u{1b}]0;spoof\u{7}{}\u{1b}[31m", "y".repeat(5000));
+    driver.tick(
+        Some(hook("term-1", "needs your input", Some(&hostile))),
+        Instant::now(),
+    );
+    let said = driver.recorder.announcements();
+    let detail = said[0].detail.as_deref().unwrap();
+    assert!(detail.chars().count() <= ANNOUNCE_DETAIL_CHARS);
+    assert!(
+        !detail.contains('\u{1b}') && !detail.contains('\u{7}'),
+        "{detail:?}"
+    );
+    // Blank text is absence, not an empty string the pane would render.
+    let mut driver = Driver::new();
+    driver.tick(
+        Some(hook("term-2", "needs your input", Some("   "))),
+        Instant::now(),
+    );
+    assert_eq!(driver.recorder.announcements()[0].detail, None);
+}
+
+#[test]
+fn a_closing_worker_makes_the_announcement_it_holds() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "finished its work", None)), start);
+    admit(
+        hook("term-1", "stopped on an error", None),
+        start,
+        &mut driver.tracked,
+        &driver.counters,
+    );
+    flush(
+        start,
+        true,
+        &mut driver.tracked,
+        &mut driver.bucket,
+        &driver.host,
+        &driver.counters,
+        &driver.last_error,
+    );
+    let said = driver.recorder.announcements();
+    assert_eq!(said.last().and_then(|a| a.event), Some("error"));
+}
+
+#[test]
+fn a_held_announcement_survives_pruning_until_it_is_made() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "finished its work", None)), start);
+    admit(
+        hook("term-1", "needs your input", None),
+        start,
+        &mut driver.tracked,
+        &driver.counters,
+    );
+    prune(start + TRACK_TTL * 2, &mut driver.tracked);
+    assert!(driver.tracked.contains_key("term-1"));
+}
+
+/// The announcement as it crosses into the renderer. The renderer's contract
+/// test (`src/lib/terminal/sessionActivity.test.ts`) reads these two literals
+/// and parses them, so a change to the struct's shape fails here first and
+/// then shows the renderer the shape it must accept.
+const WIRE_HOOK: &str = r#"{"session":"term-1","channel":"hook","event":"permission_prompt","detail":"Bash: cargo test"}"#;
+const WIRE_SIGNAL: &str = r#"{"session":"term-1","channel":"bell","event":null,"detail":null}"#;
+
+#[test]
+fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
+    let hook = Attention {
+        session: "term-1".into(),
+        channel: "hook",
+        event: Some("permission_prompt"),
+        detail: Some("Bash: cargo test".into()),
+    };
+    assert_eq!(serde_json::to_string(&hook).unwrap(), WIRE_HOOK);
+    let signal = Attention {
+        session: "term-1".into(),
+        channel: "bell",
+        event: None,
+        detail: None,
+    };
+    assert_eq!(serde_json::to_string(&signal).unwrap(), WIRE_SIGNAL);
 }

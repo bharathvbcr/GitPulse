@@ -34,8 +34,18 @@ describe("TerminalDock", () => {
     // the pane ends the process. `mounted` latches true; hiding, a view
     // switch, and a repository tab switch all keep the component alive.
     expect(source).toContain("let mounted = $state(open)");
-    expect(source).toContain("if (open) mounted = true;");
+    expect(source).toContain("if (open || awaited.size > 0) mounted = true;");
     expect(source).toContain("class:hidden={!open}");
+  });
+
+  it("hosts a repository's panel, unseen, while a task terminal waits for it", () => {
+    // A launch from a task sheet must start its agent without opening the
+    // dock or showing the repository; the queued request is what asks for
+    // the panel. Matched by the same identity rule the panel consumes with.
+    expect(source).toContain("awaitedTabIds($repoStore.openTabs, $taskTerminalRequests, { caseInsensitive: isCaseInsensitiveFs() })");
+    expect(source).toMatch(/nextHostedTerminals\(\s*hostedIds,[\s\S]*?open,\s*awaited,\s*\)/);
+    const body = render(TerminalDock, { props: { open: false, onClose: () => {}, load: loader } }).body;
+    expect(body).not.toContain("data-terminal-dock");
   });
 
   it("keeps one panel per visited repository tab, keyed so a close cannot recycle a shell", () => {

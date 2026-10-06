@@ -4,7 +4,7 @@
   import { platformChord, shortcutKeyLabel, shortcutTextLabel } from "../ui/platformCopy";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
+  import { closeWithConfirmation, terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
@@ -431,7 +431,7 @@
   /** The Sessions list's close: the panel's question first, then stop the process. */
   async function closeListed(session: TerminalSessionRecord) {
     try {
-      if (await (session.confirmClose?.() ?? true)) await session.close();
+      await closeWithConfirmation(session);
     } catch (error: unknown) {
       validationError = formatError(error);
     }

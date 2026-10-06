@@ -21,7 +21,8 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
   import { isCaseInsensitiveFs } from "../repos/paths";
-  import { openTaskTerminal, queuedTerminalNote } from "../workbench/taskTerminal";
+  import { PERMISSION_LABELS } from "../terminal/agentDefaults";
+  import { showTaskTerminal, startTaskTerminal, queuedTerminalNote } from "../workbench/taskTerminal";
   import { bounded } from "../workbench/taskActions";
   import {
     PERMISSION_MODES,
@@ -33,7 +34,6 @@
     newID,
     prepareTaskRun,
     WorkbenchError,
-    type PermissionMode,
     type Repository,
     type RunPreparation,
     type TaskRun,
@@ -96,15 +96,6 @@
     /** True while a preparation outcome is unknown and must be retried as-is. */
     onPending?: (pending: boolean) => void;
   } = $props();
-
-  const PERMISSION_LABELS: Record<PermissionMode, string> = {
-    inspect: "Inspect and plan",
-    ask: "Ask for permissions",
-    edit: "Allow workspace edits",
-    auto_review: "Provider automatic review",
-    preapproved: "Preapproved actions only",
-    bypass: "Bypass permissions (advanced)",
-  };
 
   let repositoryId = $state(untrack(() => primaryRepositoryId));
   let checkout = $state("");
@@ -188,9 +179,14 @@
     } catch (cause) { error = explainError(cause); }
   }
 
-  /** True when the terminal is showing; false when it is queued for later. */
-  async function openTerminalFor(run: TaskRun): Promise<boolean> {
-    return (await openTaskTerminal(run)) === "opened";
+  /**
+   * Starts the attempt's terminal where the reader stands: true when it is
+   * starting now, false when it waits for its checkout to open. It never
+   * moves the reader. The sheet that launched it stays on screen, and the
+   * toast and the task's Agents pane offer the terminal instead.
+   */
+  async function startTerminalFor(run: TaskRun): Promise<boolean> {
+    return (await startTaskTerminal(run)) === "started";
   }
 
   /**
@@ -263,11 +259,14 @@
         onLaunched(started);
         return;
       }
-      note = "Opening the provider terminal…";
-      const shown = await openTerminalFor(run);
+      note = "Starting the agent's terminal…";
+      const started = await startTerminalFor(run);
       if (disposed) return;
-      note = shown ? "" : queuedTerminalNote(run.cwd);
-      toastStore.success(`${PROVIDER_LABELS[settings.provider]} requested for revision ${run.source_revision}.`);
+      note = started ? "" : queuedTerminalNote(run.cwd);
+      toastStore.success(
+        `${PROVIDER_LABELS[run.provider]} ${started ? "started" : "is waiting to start"} on revision ${run.source_revision}.`,
+        { label: "Show terminal", onClick: () => showTaskTerminal(run).then(() => undefined, (cause: unknown) => { toastStore.error(explainError(cause)); }) },
+      );
       onLaunched(run);
     } catch (cause) {
       if (disposed) return;
@@ -372,9 +371,10 @@
 
   <label>Permission mode
     <select class="gp-select" bind:value={settings.permission} disabled={locked} onchange={() => { acknowledged = false; }}>
-      {#each PERMISSION_MODES as mode (mode)}<option value={mode}>{PERMISSION_LABELS[mode]}</option>{/each}
+      {#each PERMISSION_MODES as mode (mode)}<option value={mode}>{PERMISSION_LABELS[mode].label}</option>{/each}
     </select>
   </label>
+  <p class="meta" data-testid="permission-detail">{PERMISSION_LABELS[settings.permission]?.detail ?? ""}</p>
   <p class="meta">These are requested settings. {settings.kind === "managed" ? `Manvi verifies the effective ${PROVIDER_LABELS[settings.provider]} settings before sending the task.` : "The provider handles requests in its own terminal."}</p>
   {#if settings.permission === "bypass"}
     <label class="ack">

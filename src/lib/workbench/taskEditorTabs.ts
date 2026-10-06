@@ -36,11 +36,11 @@ export interface TaskEditorTabDescriptor {
 
 export const TASK_TAB_HINT_DRAFT = "What the work is, how it is scheduled, and the model's help with it.";
 export const TASK_TAB_HINT_SAVED = "What the work is and how it is scheduled.";
-export const AGENT_TAB_HINT = "Hand this saved revision to a coding agent.";
+export const AGENT_TAB_HINT = "Start coding agents on this saved revision, and follow the ones working on it.";
 
 const ALL_SAVED: readonly TaskEditorTabDescriptor[] = Object.freeze([
   { id: "task", label: "Task", hint: TASK_TAB_HINT_SAVED },
-  { id: "agent", label: "Agent", hint: AGENT_TAB_HINT },
+  { id: "agent", label: "Agents", hint: AGENT_TAB_HINT },
 ]);
 
 const DRAFT_TAB: readonly TaskEditorTabDescriptor[] = Object.freeze([
@@ -108,12 +108,15 @@ export function editorTabHint(tab: TaskEditorTab, saved: boolean = true): string
 /**
  * A count beside a tab label, or 0 for none.
  *
- * Only counts things that already exist, never work the reader might do. Runs
- * on Agent is the whole list: suggestions used to badge the AI tab, and a
- * badge on the pane the reader is already looking at is noise, not
- * information — the assist's own heading says how many it has.
+ * Only counts things that already exist, never work the reader might do. On
+ * Agents that is the attempts working right now — prepared, starting,
+ * running or unresolved — not the whole history: launching no longer takes
+ * the reader to the agent's terminal, so the badge on the Task pane is how
+ * they know, while writing, that something is still working on this task.
+ * Suggestions used to badge the AI tab, and a badge on the pane the reader is
+ * already looking at is noise, not information.
  */
-export function editorTabBadge(tab: TaskEditorTab, counts: { runs?: number }): number {
-  const value = tab === "agent" ? counts.runs : 0;
+export function editorTabBadge(tab: TaskEditorTab, counts: { working?: number }): number {
+  const value = tab === "agent" ? counts.working : 0;
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.min(Math.floor(value), 99) : 0;
 }

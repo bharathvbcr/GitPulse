@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { decisionWrite, decisionQuestions, structuredDecisionAnswer, explainError, listAgentDecisions, saveAgentDecision, WorkbenchError, type AgentDecision, type DecisionQuestion, type DecisionWrite, type TaskRun } from "../workbench/client";
+  import { decisionWrite, decisionQuestions, structuredDecisionAnswer, explainError, listAgentDecisions, listPendingDecisions, saveAgentDecision, WorkbenchError, type AgentDecision, type DecisionQuestion, type DecisionWrite, type TaskRun } from "../workbench/client";
   let { run, refreshToken = 0, active = true }: { run: TaskRun; refreshToken?: number; active?: boolean } = $props();
   let rows = $state<AgentDecision[]>([]), total = $state(0), cursor = $state<string | null>(null);
   let loading = $state(false), busy = $state(false), error = $state("");
@@ -14,12 +14,21 @@
     if (loading || busy || pending || disposed || !active) return;
     loading = true;
     try {
-      const page = await listAgentDecisions(run.id, more ? cursor ?? undefined : undefined);
+      // The store lists a run's requests oldest first, so on a long run the
+      // ones waiting now sit pages behind those already answered. The first
+      // read leads with what is still pending; paging walks the history.
+      const [waiting, page] = await Promise.all([
+        more ? null : listPendingDecisions(run.id),
+        listAgentDecisions(run.id, more ? cursor ?? undefined : undefined),
+      ]);
       if (disposed) return;
-      if (page.items.some((item) => item.task_id !== run.task_id || item.repository_id !== run.repository_id || item.source_revision !== run.source_revision || item.session_id !== run.session_id)) throw new WorkbenchError("protocol_error", "A request does not belong to this run.");
-      const sets = Object.fromEntries(page.items.map((item) => [item.id, decisionQuestions(item)]));
+      const items = [...(waiting?.items ?? []), ...page.items];
+      if (items.some((item) => item.task_id !== run.task_id || item.repository_id !== run.repository_id || item.source_revision !== run.source_revision || item.session_id !== run.session_id)) throw new WorkbenchError("protocol_error", "A request does not belong to this run.");
+      const sets = Object.fromEntries(items.map((item) => [item.id, decisionQuestions(item)]));
       questions = more ? {...questions, ...sets} : sets;
-      rows = more ? [...new Map([...rows, ...page.items].map((item) => [item.id, item])).values()] : page.items;
+      // One row per request, in first-seen order: a pending request on the
+      // history page too keeps its place at the top.
+      rows = [...new Map([...(more ? rows : []), ...items].map((item) => [item.id, item])).values()];
       total = page.total; cursor = page.next_cursor; error = "";
     } catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) loading = false; }

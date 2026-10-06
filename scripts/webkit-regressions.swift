@@ -25,8 +25,12 @@ let webview = WKWebView(frame: frame, configuration: config)
 let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
 window.title = "GitPulse WebKit regression test"
 window.contentView = webview
-// A visible key window keeps WebKit's background timer throttling from
-// stretching the fixture's bounded waits beyond the runner deadline.
+// A visible window keeps WebKit's background timer throttling from
+// stretching the fixture's bounded waits beyond the runner deadline. Key
+// status is only requested: activation is cooperative, so another frontmost
+// app (or a concurrent run) can refuse it or take it back mid-run, leaving
+// `document.hasFocus()` false. A fixture whose waits depend on the product's
+// focus-gated polls has to say it is in front itself (see tasksChecks.js).
 window.makeKeyAndOrderFront(nil)
 if #available(macOS 14.0, *) { app.activate() }
 webview.load(URLRequest(url: url))

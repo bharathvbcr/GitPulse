@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampTerminalFontSize, macLineEditing, spawnGridSize, terminalSearchSummary, terminalViewChord } from "./viewControls";
+import { clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalSearchSummary, terminalViewChord } from "./viewControls";
 import { initialState, openTab, terminalTabDestination } from "./tabs";
 
 const key = (key: string, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
@@ -66,6 +66,19 @@ describe("terminal view controls", () => {
     expect(spawnGridSize({ rows: 40.7, cols: 120.2 })).toEqual({ rows: 40, cols: 120 });
     expect(spawnGridSize({ rows: 1e9, cols: 5000 })).toEqual({ rows: 1000, cols: 1000 });
     expect(JSON.stringify(spawnGridSize({ rows: NaN, cols: 80 }))).toBe('{"rows":24,"cols":80}');
+  });
+
+  it("ignores a measurement taken while the terminal has no box", () => {
+    // A task agent started with the dock closed measured 6 × 11 and laid its
+    // first screen out 11 columns wide.
+    expect(spawnGridSize({ rows: 6, cols: 11 }, false)).toEqual({ rows: 24, cols: 80 });
+    expect(spawnGridSize({ rows: 50, cols: 200 }, false)).toEqual({ rows: 24, cols: 80 });
+    expect(spawnGridSize({ rows: 6, cols: 11 }, true)).toEqual({ rows: 6, cols: 11 });
+    const box = (rects: number, width: number, height: number) => ({ getClientRects: () => ({ length: rects }), clientWidth: width, clientHeight: height });
+    expect(hasRenderedBox(box(1, 640, 300))).toBe(true);
+    expect(hasRenderedBox(box(0, 0, 0))).toBe(false);
+    expect(hasRenderedBox(box(1, 640, 0))).toBe(false);
+    expect(hasRenderedBox(null)).toBe(false);
   });
 
   it("bounds text size, including malformed and fractional requests", () => {

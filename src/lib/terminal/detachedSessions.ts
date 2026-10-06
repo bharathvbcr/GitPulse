@@ -24,7 +24,7 @@ import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
 import type { TerminalListing } from "./runResult";
-import { terminalSessions, type createSessionRegistry } from "./sessionRegistry";
+import { terminalSessions, type createSessionRegistry, type TerminalSessionRecord } from "./sessionRegistry";
 import { enqueueTaskTerminal } from "./taskLaunches";
 import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
 import { askConfirm } from "../stores/modalStore";
@@ -35,6 +35,15 @@ type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>
 type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive: boolean }) => Promise<boolean>;
 
 const KEY_PREFIX = "detached:";
+
+/**
+ * Whether a record is an adopted session rather than a tab's own. Its
+ * `reveal` hands the process over to a new tab instead of showing one, so a
+ * caller that wants "the tab running this" must not take it for one.
+ */
+export function isAdoptedSession(record: Pick<TerminalSessionRecord, "key">): boolean {
+  return record.key.startsWith(KEY_PREFIX);
+}
 
 /**
  * The question before stopping an adopted session. Always asked: it is
@@ -59,7 +68,7 @@ export function handOverDetachedRun(
   runId: string,
   registry: ReturnType<typeof createSessionRegistry> = terminalSessions,
 ): boolean {
-  const adopted = get(registry).find((record) => record.key.startsWith(KEY_PREFIX) && record.taskRunId === runId);
+  const adopted = get(registry).find((record) => isAdoptedSession(record) && record.taskRunId === runId);
   adopted?.reveal?.();
   return Boolean(adopted);
 }

@@ -88,7 +88,12 @@ task; the agent marks it Done or Review itself through the GitPulse MCP server.
 
 A task's agent gets the same notification flags as an agent tab (*Configure
 agent CLIs GitPulse launches* in the session notification settings), so one waiting on a permission prompt in a
-hidden tab still raises an alert. Which of Claude Code's settings files an
+hidden tab still raises an alert. The same notice also reaches the task's
+Agents pane, as `gitpulse-session-attention`: every agent notice is announced
+there within a second, whether or not a banner was shown (you were looking,
+banners are off, quiet hours), so the pane can say "Needs your permission"
+and what was asked. Typing into that terminal clears it; the terminal's own
+automatic replies (focus, cursor reports, mouse) do not. Which of Claude Code's settings files an
 agent loads is **Settings → Agents → Claude Code settings files** (user,
 project, local; all three — Claude Code's own default — until you change it).
 It applies to task attempts and new Claude tabs alike, as `--setting-sources`.

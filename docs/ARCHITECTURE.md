@@ -684,11 +684,37 @@ checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise
 identical clone substituted at the same path.
 
-`TaskHandoffForm.svelte` prepares a selected saved revision and opens a task-bound
-tab in the existing terminal dock. It is the single implementation of a handoff:
-`TaskAgentPanel.svelte` renders it in the task sheet's Agent pane above that
-task's run history, and `TaskHandoffSheet.svelte` renders it in a modal reached
-from a board card's context menu. The form resolves the working checkout from
+`TaskHandoffForm.svelte` prepares a selected saved revision and starts a
+task-bound tab in the existing terminal dock without changing what is on
+screen: `workbench/taskTerminal.ts::startTaskTerminal` queues the request and
+opens the checkout as a background repository tab, and `TerminalDock` hosts
+any open tab a queued task terminal waits for (`repoHosts.ts`, matched by
+`taskLaunches.ts::awaitedTabIds`), so the agent starts with the dock closed
+and the reader stays on the task. A terminal started out of sight spawns at
+24 × 80 rather than at what xterm measures inside `display: none`
+(`viewControls.ts::spawnGridSize`). Only `showTaskTerminal` — the pane's Show
+terminal and the launch toast's action — brings it on screen, through
+`focusTerminalSession`. It is the single implementation of a handoff:
+`TaskAgentPanel.svelte` renders it in the task sheet's Agents pane, which lists
+the attempts working now with the state of each one's terminal in this window
+(`workbench/taskSessions.ts` joins the store's run with the renderer's session
+registry and launch queue: running, starting, waiting for a slot, not
+connected) above the ended attempts. Live attempts are read per holding state
+(`client.ts::listLiveTaskRuns`), apart from the history page, and ordered by
+`taskSessions.ts::attemptUrgency`. Each session's glance (`agentGlance`) joins
+`terminal/sessionActivity.ts` — output recency and OSC title from the
+session's own output path, and the agent's last notice from the alerts
+worker's `gitpulse-session-attention` event, announced on its own 1 s
+coalescing whatever the banner policy decided — with the checkout's changed
+count from its open repository tab (`checkoutChanges`, null for any status
+not actually read). One attempt is judged in one place,
+`taskSessions.ts::monitorAttempt`; the board's cards read the same judgement
+per task (`taskAgentSummaries`) from `workbench/boardAgents.ts`, which reads
+every task's holding runs and their pending requests (pending-filtered, since
+the store lists a run's requests oldest first), polls only while one is live
+and in front, and wakes on `workbench-changed`. A failed read clears the
+marks. `TaskHandoffSheet.svelte` renders it
+in a modal reached from a board card's context menu. The form resolves the working checkout from
 the repository tabs GitPulse already has open (falling back to the folder beside
 the repository's git common directory, labelled as derived), re-reads the saved
 task and refuses a revision that moved, and locks every control while a

@@ -113,7 +113,9 @@
   let flash = $state<EnhancementField[]>([]);
   /** A suggestion is waiting on the Task pane; the tab dot is drawn from this. */
   let reviewable = $state(false);
-  let runCount = $state(0);
+  let workingCount = $state(0);
+  /** Of those, the ones asking for the reader; the badge turns to say so. */
+  let askingCount = $state(0);
   /** Display name of the engine the assist section would use; it owns the picker. */
   let assistName = $state(assistEngineName(DEFAULT_ASSIST_ENGINE));
   const tabs = $derived(editorTabs(Boolean(current)));
@@ -502,7 +504,7 @@
     >
       {#each tabs as entry, index (entry.id)}
         {@const props = tabProps(group, entry.id, tab === entry.id)}
-        {@const badge = editorTabBadge(entry.id, { runs: runCount })}
+        {@const badge = editorTabBadge(entry.id, { working: workingCount })}
         <button
           type="button"
           class="gp-seg-btn text-[11px]! py-1!"
@@ -525,9 +527,9 @@
             ></span>
           {/if}
           <span>{entry.label}</span>
-          {#if badge}<span class="tab-badge tabular-nums">{badge}</span>{/if}
+          {#if badge}{@const asking = entry.id === "agent" ? askingCount : 0}{@const said = asking ? `${badge} working now, ${asking} ${asking === 1 ? "needs" : "need"} you` : `${badge} working now`}<span class="tab-badge tabular-nums" data-asking={asking > 0 ? "true" : null} title={said} aria-label={said} data-testid="agents-working-badge">{badge}</span>{/if}
           <!-- A suggestion waiting to be reviewed lives on Task. The dot is
-               how the reader knows that while they are on Agent. -->
+               how the reader knows that while they are on Agents. -->
           {#if entry.id === "task" && reviewable}<span class="tab-dot" aria-label="Suggestion ready"></span>{/if}
         </button>
       {/each}
@@ -797,7 +799,8 @@
         {active}
         {dirty}
         disabled={saving || reloading || confirming || pending !== null || pendingDelete !== null || enhancementBusy}
-        onCount={(count) => { runCount = count; }}
+        onCount={(count) => { workingCount = count; }}
+        onAttention={(count) => { askingCount = count; }}
       />
     </div>
   {/if}
@@ -820,6 +823,7 @@
   .sheet-tabs{flex-shrink:0;margin:0 18px 8px;width:calc(100% - 36px)}
   .tab-hint{flex-shrink:0;margin:0 18px 10px;font-size:11px;color:rgb(var(--c-text-muted))}
   .tab-badge{margin-left:5px;padding:0 4px;border-radius:999px;font-size:9px;line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
+  .tab-badge[data-asking]{background:rgb(210 153 34 / 0.22);color:#d29922;font-weight:650}
   .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:999px;background:rgb(var(--c-accent));display:inline-block}
   .flash :is(input,textarea){animation:gp-task-flash 1.1s ease-out}
   @keyframes gp-task-flash{from{border-color:rgb(var(--c-accent));box-shadow:0 0 0 3px rgb(var(--c-accent) / 0.18)}to{border-color:rgb(var(--c-border));box-shadow:none}}

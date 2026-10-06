@@ -262,7 +262,9 @@ describe("a resumed conversation's tab", () => {
     const state = openTab(initialState(), "claude", resume);
     const tab = state.tabs.find((item) => item.id === state.activeId)!;
     expect(tab.launcher).toBe("claude");
-    expect(tab.resume).toEqual({ sessionId: SESSION, mode: "inspect" });
+    // It names the attempt it continues (so that task can list it) without
+    // becoming that attempt: `taskRunId`, which a close acts on, stays unset.
+    expect(tab.resume).toEqual({ sessionId: SESSION, mode: "inspect", runId: "run-1" });
     expect(tab.taskRunId).toBeUndefined();
     expect(tabLabel(tab)).toContain("(resumed)");
   });

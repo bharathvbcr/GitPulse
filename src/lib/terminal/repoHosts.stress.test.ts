@@ -199,4 +199,67 @@ describe("terminal hosting under churn", () => {
     for (let i = 0; i < 100; i += 1) hosted = step(world, hosted);
     expect(hosted.size).toBe(0);
   });
+
+  /**
+   * Task launches in the mix. A launch queues a request for a checkout and
+   * opens it as a background tab; the request is consumed when its panel
+   * mounts. Two rules must hold together under any interleaving: every open
+   * tab a request waits for IS hosted (otherwise the agent never starts and
+   * the reader, still on the task sheet, sees nothing happen), and nothing
+   * is hosted that neither the user nor a request asked for.
+   */
+  it("hosts every waited-for tab, and nothing nobody asked for, under churn", { timeout: 20_000 }, () => {
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const random = mulberry32(seed * 7919);
+      const all = Array.from({ length: MAX_OPEN_TABS }, (_, i) => `tab-${i}`);
+      const world: World = { openTabs: all.slice(0, 4), activeTabId: all[0], docks: new Set() };
+      const waiting = new Set<string>();
+      let hosted: ReadonlySet<string> = new Set<string>();
+      const asked = new Set<string>();
+
+      for (let i = 0; i < 400; i += 1) {
+        const roll = random();
+        const pick = () => all[Math.floor(random() * all.length)];
+        if (roll < 0.25) {
+          // A task launch: queue, then open the checkout in the background.
+          const target = pick();
+          waiting.add(target);
+          if (!world.openTabs.includes(target) && world.openTabs.length < MAX_OPEN_TABS) world.openTabs.push(target);
+        } else if (roll < 0.4) {
+          // The panel consumed a request (only a hosted panel can).
+          for (const id of waiting) if (hosted.has(id)) { waiting.delete(id); break; }
+        } else if (roll < 0.6) {
+          world.activeTabId = world.openTabs[Math.floor(random() * world.openTabs.length)] ?? null;
+        } else if (roll < 0.7 && world.activeTabId) {
+          world.docks.add(world.activeTabId);
+        } else if (roll < 0.85 && world.openTabs.length > 1) {
+          const victim = world.openTabs[Math.floor(random() * world.openTabs.length)];
+          world.openTabs = world.openTabs.filter((id) => id !== victim);
+          world.docks.delete(victim);
+          if (world.activeTabId === victim) world.activeTabId = world.openTabs[0] ?? null;
+        } else {
+          const candidate = pick();
+          if (!world.openTabs.includes(candidate) && world.openTabs.length < MAX_OPEN_TABS) world.openTabs.push(candidate);
+        }
+        if (world.activeTabId && world.docks.has(world.activeTabId)) asked.add(world.activeTabId);
+        for (const id of waiting) if (world.openTabs.includes(id)) asked.add(id);
+
+        hosted = nextHostedTerminals(
+          hosted,
+          world.openTabs,
+          world.activeTabId,
+          world.activeTabId !== null && world.docks.has(world.activeTabId),
+          waiting,
+        );
+        const where = `seed ${seed} step ${i}`;
+        for (const id of waiting) {
+          if (world.openTabs.includes(id)) expect(hosted.has(id), `${where}: ${id} waits but is not hosted`).toBe(true);
+        }
+        for (const id of hosted) {
+          expect(world.openTabs, `${where}: ${id} hosted after its tab closed`).toContain(id);
+          expect(asked, `${where}: ${id} hosted unasked`).toContain(id);
+        }
+      }
+    }
+  });
 });

@@ -118,7 +118,7 @@
 
     <footer>
       {#if prepared && !busy}
-        <span class="meta gate">Attempt prepared. Resume or cancel it from this task's Agent tab.</span>
+        <span class="meta gate">Attempt prepared. Resume or cancel it from this task's Agents tab.</span>
         <button type="button" class="gp-btn-primary" onclick={onClose}>Done</button>
       {:else}
         <span class="meta gate">{gate.ok ? `${shortcutTextLabel("⌘↩", $hostPlatform.os)} to launch` : gate.reason}</span>

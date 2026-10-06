@@ -150,6 +150,70 @@ impl Notice {
     }
 }
 
+/// The renderer event an [`Attention`] is emitted as.
+pub const ATTENTION_EVENT: &str = "gitpulse-session-attention";
+
+/// The shortest gap between two announcements for one session.
+///
+/// Announcements are state, not banners: they are not held for [`COALESCE`]
+/// (a permission prompt should show in the task's Agents pane at once), but a
+/// program ringing the bell in a loop must not become an event per ring, so
+/// within this gap the newest replaces the one still waiting.
+const ANNOUNCE_GAP: Duration = Duration::from_secs(1);
+
+/// The longest agent-supplied text an announcement carries.
+const ANNOUNCE_DETAIL_CHARS: usize = 240;
+
+/// What an agent session last asked for, as the renderer is told it.
+///
+/// A banner is one way to hear that an agent needs you; the task's Agents
+/// pane is another, and it needs the fact whether or not a banner was shown —
+/// a session the user was looking at, a notice inside quiet hours, banners
+/// turned off: each suppresses the banner and none of them changes what the
+/// agent is waiting for. So every agent notice is announced, ahead of policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Attention {
+    /// The GitPulse PTY session id the notice is keyed to.
+    pub session: String,
+    /// "hook" (the agent said why) or a terminal convention ("bell", "osc9"…),
+    /// which says only that something was signalled.
+    pub channel: &'static str,
+    /// Why, as the hook event that said so (one of [`bridge::EVENTS`]' names,
+    /// such as `permission_prompt`); absent for a terminal signal, which does
+    /// not say why. A name rather than the banner's phrase, so the renderer
+    /// decides on a closed vocabulary instead of matching display text.
+    pub event: Option<&'static str>,
+    /// What the agent itself said, sanitized and bounded.
+    pub detail: Option<String>,
+}
+
+impl Attention {
+    /// None for a notice the renderer can do nothing with: not an agent, or
+    /// a hook report from outside any GitPulse terminal (keyed `hook-…`, which
+    /// names no session a task attempt could own).
+    fn of(notice: &Notice) -> Option<Self> {
+        if !notice.is_agent || notice.key.starts_with("hook-") {
+            return None;
+        }
+        let bound = |text: &str| -> Option<String> {
+            let clean = scan::sanitize(text);
+            let clipped: String = clean.chars().take(ANNOUNCE_DETAIL_CHARS).collect();
+            (!clipped.trim().is_empty()).then_some(clipped)
+        };
+        Some(Self {
+            session: notice.key.clone(),
+            channel: notice.channel,
+            event: notice.reason.as_deref().and_then(|reason| {
+                bridge::EVENTS
+                    .iter()
+                    .find(|(_, phrase)| *phrase == reason)
+                    .map(|(name, _)| *name)
+            }),
+            detail: notice.detail.as_deref().and_then(bound),
+        })
+    }
+}
+
 /// The namespace every session banner's identifier begins with.
 pub const NATIVE_PREFIX: &str = "gitpulse.session.";
 
@@ -252,6 +316,9 @@ pub trait Host: Send + Sync + 'static {
     fn minute(&self) -> Option<u16> {
         policy::local_minute()
     }
+    /// Tells the renderer what an agent session asked for. Must not block:
+    /// it runs on the worker thread between deliveries.
+    fn announce(&self, _attention: &Attention) {}
 }
 
 struct Hub {
@@ -401,6 +468,16 @@ struct Tracked {
     last_sent: Option<Instant>,
     pending: Option<Notice>,
     touched: Instant,
+    /// When this session was last announced, for [`ANNOUNCE_GAP`].
+    last_announced: Option<Instant>,
+    /// The newest announcement not yet made.
+    unannounced: Option<Attention>,
+}
+
+impl Tracked {
+    fn holds_work(&self) -> bool {
+        self.pending.is_some() || self.unannounced.is_some()
+    }
 }
 
 /// A token bucket with whole-token refill.
@@ -472,15 +549,21 @@ fn run(
     }
 }
 
-/// The soonest a pending notice becomes due, or `None` when nothing is held.
+/// The soonest a held notice or announcement becomes due, or `None` when
+/// nothing is held.
 fn next_wake(tracked: &HashMap<String, Tracked>) -> Option<Duration> {
     let now = Instant::now();
-    tracked
+    let banners = tracked
         .values()
         .filter(|entry| entry.pending.is_some())
         .filter_map(|entry| entry.last_sent)
-        .map(|sent| (sent + COALESCE).saturating_duration_since(now))
-        .min()
+        .map(|sent| (sent + COALESCE).saturating_duration_since(now));
+    let announcements = tracked
+        .values()
+        .filter(|entry| entry.unannounced.is_some())
+        .filter_map(|entry| entry.last_announced)
+        .map(|said| (said + ANNOUNCE_GAP).saturating_duration_since(now));
+    banners.chain(announcements).min()
 }
 
 fn admit(
@@ -496,7 +579,7 @@ fn admit(
         // it is rather than vanishing into the gap between two totals.
         let victim = tracked
             .iter()
-            .min_by_key(|(_, entry)| (entry.pending.is_some(), entry.touched))
+            .min_by_key(|(_, entry)| (entry.holds_work(), entry.touched))
             .map(|(key, _)| key.clone());
         if let Some(stale) = victim {
             if tracked.remove(&stale).is_some_and(|e| e.pending.is_some()) {
@@ -508,8 +591,15 @@ fn admit(
         last_sent: None,
         pending: None,
         touched: now,
+        last_announced: None,
+        unannounced: None,
     });
     entry.touched = now;
+    // Newest wins: within the gap, what the agent asks for last is what it is
+    // waiting for.
+    if let Some(attention) = Attention::of(&notice) {
+        entry.unannounced = Some(attention);
+    }
     // A notice this one displaces was never shown and never judged. Counting
     // it is what lets the offered total be reconciled against the outcomes,
     // which is the only way to tell coalescing from a leak.
@@ -529,6 +619,7 @@ fn flush(
     counters: &Counters,
     last_error: &Mutex<Option<String>>,
 ) {
+    announce(now, final_pass, tracked, host);
     let due: Vec<String> = tracked
         .iter()
         .filter(|(_, entry)| {
@@ -592,9 +683,31 @@ fn flush(
     }
 }
 
+/// Makes every announcement whose gap has passed, ahead of banner policy.
+fn announce(
+    now: Instant,
+    final_pass: bool,
+    tracked: &mut HashMap<String, Tracked>,
+    host: &Arc<dyn Host>,
+) {
+    for entry in tracked.values_mut() {
+        let due = final_pass
+            || entry
+                .last_announced
+                .is_none_or(|said| now.saturating_duration_since(said) >= ANNOUNCE_GAP);
+        if !due {
+            continue;
+        }
+        if let Some(attention) = entry.unannounced.take() {
+            host.announce(&attention);
+            entry.last_announced = Some(now);
+        }
+    }
+}
+
 fn prune(now: Instant, tracked: &mut HashMap<String, Tracked>) {
     tracked.retain(|_, entry| {
-        entry.pending.is_some() || now.saturating_duration_since(entry.touched) < TRACK_TTL
+        entry.holds_work() || now.saturating_duration_since(entry.touched) < TRACK_TTL
     });
 }
 

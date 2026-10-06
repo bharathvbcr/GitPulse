@@ -44,6 +44,36 @@ before that tag is pushed.
 
 ### Changed
 
+- **Launching an agent keeps you on the task.** Starting an agent from a task
+  sheet, or from a board card's Send to agent, no longer switches to the
+  repository and opens its terminal dock — which closed the sheet you
+  launched from. The agent starts in the background. The launch toast and the
+  task's Agents pane each offer Show terminal for when you want to watch it.
+- **The task sheet's Agent tab is now Agents.** It leads with the attempts
+  working now, each showing what its terminal is doing in this window:
+  running, starting, waiting for a free terminal session, or not connected.
+  Show terminal, Stop agent (asked first, as the tab's × asks), and a resumed
+  conversation listed under the attempt it continues. Ended attempts follow,
+  under History. The tab's badge counts the attempts working now, not the
+  whole history.
+- **Every agent on a task, at a glance.** The Agents pane lists all the
+  attempts working on the task — read apart from the history, so an old one
+  is never paged off — most urgent first. Each line says what its agent last
+  told you (needs your permission or input, asking a question, finished,
+  stopped on an error, with what it asked), what it calls itself, and when it
+  last printed — "Output 4s ago", "Quiet for 3m", never "working" or "stuck",
+  which output cannot tell. Its checkout's uncommitted file count shows when
+  GitPulse has read it, and a managed attempt says how many requests wait for
+  you. The summary and the tab's badge count the agents that need you. An
+  agent still running after the window reloaded, whose terminal is not on
+  screen, says what it asked too.
+- **Board cards show the agents working on them.** A card carries how many
+  agents are working on its task, amber with "1 needs you" when one is asking
+  for you — judged exactly as the task's Agents pane judges it. The board
+  reads while an agent works and when a task changes; if it cannot read, it
+  says so and marks no card rather than keep old marks.
+- Permission modes in the handoff use the same names and descriptions as
+  Settings → Agents.
 - **Next/previous tab and the number keys follow the strip as drawn.** A
   folded stack is one stop, and a group's tabs are visited where the group is
   drawn. Moving, dragging and dropping a tab plan against the drawn strip too,
@@ -53,6 +83,17 @@ before that tag is pushed.
 
 ### Fixed
 
+- A repository opened in the background (a task agent's checkout, a restored
+  tab) no longer cancels the repository you were opening at that moment.
+- A terminal started while hidden opens at 24 × 80 instead of the 6 × 11 grid
+  measured inside a hidden dock, so an agent's first screen is not laid out
+  for 11 columns.
+- The handoff form read at most 50 attempts per state when working out which
+  checkouts already have an agent, below the 64 attempts that may be live at
+  once; it now reads 100 per state.
+- A managed agent's request review listed requests oldest first, 30 at a
+  time, so on a long run the ones waiting for you sat pages behind answered
+  ones. It now leads with the requests still pending.
 - **Group all by parent folder put every agent worktree in a "worktrees"
   group**, away from the repository it belongs to. Worktrees now join the group
   of the folder their repository lives in.

@@ -152,6 +152,15 @@ export async function listAgentDecisions(runID: string, cursor?: string): Promis
   const result = page(await request("decisions.list", { run_id: runID, limit: 30, ...(cursor ? { cursor } : {}) }), agentDecision);
   return result.items.every((item) => item.run_id === runID) ? result : invalid();
 }
+/**
+ * The first page of a run's requests still pending. The store lists a run's
+ * decisions oldest first, so an unfiltered first page of a long run is its
+ * oldest, long-answered requests, and the ones waiting now are past it.
+ */
+export async function listPendingDecisions(runID: string): Promise<Page<AgentDecision>> {
+  const result = page(await request("decisions.list", { run_id: runID, state: "pending", limit: 30 }), agentDecision);
+  return result.items.every((item) => item.run_id === runID && item.state === "pending") ? result : invalid();
+}
 
 export interface DecisionQuestion { id: string; question: string; options: {label: string; description: string}[] }
 export function decisionQuestions(source: AgentDecision): DecisionQuestion[] {
@@ -440,11 +449,36 @@ export async function listTaskRuns(taskID: string, cursor?: string): Promise<Pag
  * expiry are among them and are filtered by the caller's clock.
  */
 export async function listHoldingRuns(repositoryID: string): Promise<TaskRun[]> {
+  return (await holdingRuns({ repository_id: repositoryID }, (run) => run.repository_id === repositoryID)).runs;
+}
+/**
+ * Every attempt of one task that can hold a checkout — the agents working on
+ * it — independent of how far its history has been paged. `complete` is false
+ * when a state had more than one page, so a caller can say the list is a floor.
+ */
+export async function listLiveTaskRuns(taskID: string): Promise<{ runs: TaskRun[]; complete: boolean }> {
+  return holdingRuns({ task_id: taskID }, (run) => run.task_id === taskID);
+}
+/**
+ * Every attempt, across tasks, that can hold a checkout: what the board needs
+ * to mark the cards with agents working on them. Same paging as above.
+ */
+export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: boolean }> {
+  return holdingRuns({}, () => true);
+}
+/**
+ * Above the store's live-attempt ceiling (64), so the live states fit on one
+ * page; `prepared` can still overflow with expired rows, and `complete` says
+ * so. It was 50, under that ceiling: with more agents running than that in
+ * one repository, the handoff form could not see which checkouts they held.
+ */
+const HOLDING_PAGE = 100;
+async function holdingRuns(scope: { repository_id: string } | { task_id: string } | Record<string, never>, belongs: (run: TaskRun) => boolean): Promise<{ runs: TaskRun[]; complete: boolean }> {
   const pages = await Promise.all(["prepared", "starting", "running", "unresolved"].map(async (state) => {
-    const result = page(await request("runs.list", { repository_id: repositoryID, state, limit: 50, newest: true }), taskRun);
-    return result.items.every((run) => run.repository_id === repositoryID && run.state === state) ? result.items : invalid();
+    const result = page(await request("runs.list", { ...scope, state, limit: HOLDING_PAGE, newest: true }), taskRun);
+    return result.items.every((run) => belongs(run) && run.state === state) ? result : invalid();
   }));
-  return pages.flat();
+  return { runs: pages.flatMap((result) => result.items), complete: pages.every((result) => !result.has_more) };
 }
 export interface RunRelease { released: boolean; reason: string; run: TaskRun }
 /**

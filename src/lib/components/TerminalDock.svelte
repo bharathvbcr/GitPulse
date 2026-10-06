@@ -13,6 +13,8 @@
     fitTerminalDockHeight,
   } from "../terminal/dockMetrics";
   import { nextHostedTerminals } from "../terminal/repoHosts";
+  import { awaitedTabIds, taskTerminalRequests } from "../terminal/taskLaunches";
+  import { isCaseInsensitiveFs } from "../repos/paths";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { observeResize } from "../dom/observeResize";
@@ -50,8 +52,16 @@
   // effect below handles every later open, and nothing may set it back to
   // false while a shell is running.
   let mounted = $state(open);
+  /**
+   * Repository tabs a queued task terminal is waiting for. They are hosted
+   * with the dock closed, so an agent launched from a task sheet starts
+   * without taking the reader to the repository surface.
+   */
+  const awaited = $derived(
+    awaitedTabIds($repoStore.openTabs, $taskTerminalRequests, { caseInsensitive: isCaseInsensitiveFs() }),
+  );
   $effect(() => {
-    if (open) mounted = true;
+    if (open || awaited.size > 0) mounted = true;
   });
 
   /**
@@ -67,6 +77,7 @@
       $repoStore.openTabs.map((tab) => tab.id),
       $repoStore.activeTabId,
       open,
+      awaited,
     );
     if (next !== hostedIds) untrack(() => { hostedIds = next; });
   });

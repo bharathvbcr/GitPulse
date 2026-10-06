@@ -41,16 +41,33 @@ describe("the agent handoff has one implementation", () => {
     // and a branch. The host now owns both creation and rollback.
     expect(form).not.toContain("cmd_add_worktree");
     expect(form).toContain("worktree: true");
-    // Both places that open a task terminal share one implementation, which
-    // queues before opening so a superseded open cannot lose the terminal.
-    for (const [name, host] of [["TaskHandoffForm", form], ["TaskAgentPanel", panel]] as const) {
-      expect(host, name).toContain("openTaskTerminal(");
+    // Both places that start or show a task terminal share one implementation,
+    // which queues before opening so a superseded open cannot lose the
+    // terminal. The form only ever STARTS one: a launch must never take the
+    // reader off the sheet that launched it. Showing is the pane's button.
+    expect(form).toContain("startTaskTerminal(run)");
+    expect(form).not.toMatch(/await showTaskTerminal\(/);
+    expect(panel).toContain("showTaskTerminal(run)");
+    for (const [name, host] of [["TaskHandoffForm", form], ["TaskAgentPanel", panel], ["TaskHandoffSheet", sheet]] as const) {
       expect(host, name).not.toContain("enqueueTaskTerminal(");
       expect(host, name).not.toContain("repoStore.openRepo(");
+      expect(host, name).not.toContain("setGlobalSurface(");
+      expect(host, name).not.toContain("setTerminalOpen(");
     }
     // A checkout another agent holds forces the worktree, visibly.
     expect(form).toContain("const useWorktree = $derived(provisionWorktree || occupant !== null)");
     expect(form).toContain('cause.code === "checkout_busy"');
+  });
+
+  it("describes permission modes with the one table Settings and the terminal use", () => {
+    // The form and the pane each carried their own wording ("Allow workspace
+    // edits"), which disagreed with Settings → Agents ("Edit files") for the
+    // same mode. One table, and its detail line under the choice.
+    for (const [name, host] of [["TaskHandoffForm", form], ["TaskAgentPanel", panel]] as const) {
+      expect(host, name).toContain('import { PERMISSION_LABELS } from "../terminal/agentDefaults"');
+      expect(host, name).not.toMatch(/const PERMISSION_LABELS\s*:/);
+    }
+    expect(form).toContain('data-testid="permission-detail"');
   });
 
   it("re-reads the saved task and refuses a revision that moved", () => {
@@ -75,14 +92,14 @@ describe("the agent handoff has one implementation", () => {
     const launch = form.slice(form.indexOf("const run = await bounded(prepareTaskRun"));
     expect(launch.indexOf("onPrepared?.(run)")).toBeGreaterThan(-1);
     expect(launch.indexOf("onPrepared?.(run)")).toBeLessThan(launch.indexOf("launchManagedRun"));
-    expect(launch.indexOf("onPrepared?.(run)")).toBeLessThan(launch.indexOf("openTerminalFor"));
+    expect(launch.indexOf("onPrepared?.(run)")).toBeLessThan(launch.indexOf("startTerminalFor"));
     // The panel treats both signals the same way; it dedups on run id.
     expect(panel).toContain("onPrepared={launched}");
     expect(panel).toContain("runs.filter((item) => item.id !== run.id)");
     // The sheet stops offering a launch once one exists, so a failure after
     // preparation cannot be answered by making a second attempt.
     expect(sheet).toContain("{#if prepared && !busy}");
-    expect(sheet).toContain("Resume or cancel it from this task's Agent tab.");
+    expect(sheet).toContain("Resume or cancel it from this task's Agents tab.");
   });
 
   it("never lets bypass survive the attempt it was authorized for", () => {
@@ -99,7 +116,11 @@ describe("the agent handoff has one implementation", () => {
     // looked only at `state`, an expired preparation kept the form folded
     // away — so the one control that could recover the situation was hidden
     // behind a row that was already dead.
-    expect(panel).toContain("const live = $derived(runs.filter((run) => runHoldsCheckout(run, clock)))");
+    // The live rows are the monitored ones, and only runs that still hold
+    // their checkout are monitored; history is everything else.
+    expect(panel).toContain("const rows = allRuns.filter((run) => runHoldsCheckout(run, clock)).map(monitor);");
+    expect(panel).toContain("const live = $derived(monitored.map((row) => row.run));");
+    expect(panel).toContain("const ended = $derived(allRuns.filter((run) => !runHoldsCheckout(run, clock))");
     expect(panel).not.toMatch(/LIVE\.includes/);
     expect(panel).toContain("const formOpen = $derived(expandedForm ?? live.length === 0)");
     // Tailwind preflight's `[hidden]` has zero specificity; without this the
@@ -110,10 +131,15 @@ describe("the agent handoff has one implementation", () => {
   it("keeps polling scoped to runs that can still change", () => {
     expect(panel).toContain('["starting", "running"].includes(run.state)');
     expect(panel).toContain("run.expires_at * 1000 > clock");
+    // The working agents are read apart from the history page, so an old one
+    // can be on the live list alone. Polling read only the history page, and
+    // stopped while that agent was still running.
+    expect(panel).toContain("live: allRuns.some((run) =>");
+    expect(panel).not.toContain("live: runs.some(");
     expect(panel).toContain("readBackgroundDocument");
     expect(panel).toContain("nextTaskRunPollDelay");
     expect(panel).toContain("if (!active)");
-    expect(panel).toContain("runs.length >= 180");
+    expect(panel).toContain("runs.length >= MAX_LOADED_RUNS");
   });
 
   it("answers 'keep polling' and 'still live' from one instant", () => {

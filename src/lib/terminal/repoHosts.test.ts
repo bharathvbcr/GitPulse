@@ -63,3 +63,32 @@ describe("nextHostedTerminals", () => {
     expect(next).toEqual(new Set(["a", "b"]));
   });
 });
+
+/**
+ * A task terminal waiting for a repository hosts its panel without that
+ * repository, or its dock, being on screen — which is what lets a launch from
+ * a task sheet leave the reader on the sheet.
+ */
+describe("nextHostedTerminals with a waiting task terminal", () => {
+  it("hosts a tab that is neither active nor docked when a request waits for it", () => {
+    expect(nextHostedTerminals(new Set(), ["a", "b"], "a", false, ["b"])).toEqual(new Set(["b"]));
+  });
+
+  it("keeps the panel after the request is consumed, so the agent it started lives on", () => {
+    const hosted = nextHostedTerminals(new Set(), ["a", "b"], "a", false, ["b"]);
+    expect(nextHostedTerminals(hosted, ["a", "b"], "a", false, [])).toBe(hosted);
+  });
+
+  it("never hosts a waiting request's tab once that tab is closed", () => {
+    expect(nextHostedTerminals(new Set(["b"]), ["a"], "a", false, ["b"])).toEqual(new Set());
+  });
+
+  it("ignores a waiting id that is not an open tab", () => {
+    expect(nextHostedTerminals(new Set(), ["a"], "a", false, ["ghost"])).toEqual(new Set());
+  });
+
+  it("returns the same set when the waiting tab is already hosted", () => {
+    const hosted = new Set(["b"]);
+    expect(nextHostedTerminals(hosted, ["a", "b"], "a", false, new Set(["b"]))).toBe(hosted);
+  });
+});

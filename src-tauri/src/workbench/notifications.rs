@@ -393,6 +393,14 @@ impl crate::alerts::Host for SessionHost {
             .get_webview_window("main")
             .is_some_and(|window| window.is_focused().unwrap_or(false))
     }
+
+    /// A failed emit is logged, not retried: the next notice from the session
+    /// replaces this one, and the pane's own activity reading still stands.
+    fn announce(&self, attention: &crate::alerts::Attention) {
+        if let Err(error) = self.app.emit(crate::alerts::ATTENTION_EVENT, attention) {
+            log::warn!(target: "alerts", "session attention event: {error}");
+        }
+    }
 }
 
 /// The delivery host for [`crate::alerts::start`].

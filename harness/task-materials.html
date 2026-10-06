@@ -28,6 +28,7 @@
     import { mockIPC } from "@tauri-apps/api/mocks";
     import { mount } from "svelte";
     import TaskBoard from "../src/lib/components/TaskBoard.svelte";
+    import { noteForegroundFocus } from "../src/lib/runtime/foreground";
 
     const params = new URLSearchParams(location.search);
     const repositories = [{ id: "gitpulse", revision: 1, updated_at: 1, name: "GitPulse", identity_key: "/fixture/GitPulse", remote_url: null }];
@@ -112,6 +113,13 @@
     }, { shouldMockEvents: true });
     const { harnessStore } = await import("../src/lib/stores/harnessStore");
     void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "fixture-model" });
+    // The inbox reads only while the window is in front, and on WKWebView
+    // that means focused: `hasFocus()` is false with `visibilityState`
+    // "visible". The WebKit runner is an accessory app whose window never
+    // becomes key while another app holds focus, so the inbox never loaded
+    // there. The fixture models a person looking at the board, through the
+    // product's own focus record (as tasksChecks.js and task-runs.html do).
+    noteForegroundFocus(true);
     mount(TaskBoard, { target: document.getElementById("board"), props: params.has("repository") ? { repositoryPath: "/fixture/GitPulse" } : {} });
     const theme = document.getElementById("theme"), platform = document.getElementById("platform");
     theme.onchange = () => {

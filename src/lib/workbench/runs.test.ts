@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { cancelTaskRun, findConversation, listHoldingRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
+import { cancelTaskRun, findConversation, listHoldingRuns, listLiveTaskRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -92,6 +92,21 @@ describe("task attempt transport", () => {
     for (const call of native.mock.calls) expect(JSON.parse((call[1] as {input: string}).input)).toMatchObject({repository_id:"repo", newest:true});
     native.mockImplementation(async () => JSON.stringify({ok:true,items:[{...run, repository_id:"other"}],total:1,shown:1,has_more:false,next_cursor:null}));
     await expect(listHoldingRuns("repo")).rejects.toMatchObject({code:"protocol_error"});
+  });
+  it("lists every agent working on one task, whatever the history's paging, and says when a state overflowed", async () => {
+    native.mockImplementation(async (_command, args) => {
+      const input = JSON.parse((args as {input: string}).input) as {state: string; task_id: string; limit: number};
+      expect(input.limit).toBeGreaterThan(64);
+      const item = {...run, id: input.state, state: input.state, task_id: input.task_id};
+      const more = input.state === "prepared";
+      return JSON.stringify({ok:true,items:[item],total:more ? 101 : 1,shown:1,has_more:more,next_cursor:more ? "next" : null});
+    });
+    const live = await listLiveTaskRuns("task");
+    expect(live.runs.map((item) => item.state).sort()).toEqual(["prepared","running","starting","unresolved"]);
+    expect(live.complete).toBe(false);
+    for (const call of native.mock.calls) expect(JSON.parse((call[1] as {input: string}).input)).toMatchObject({task_id:"task", newest:true});
+    native.mockImplementation(async () => JSON.stringify({ok:true,items:[{...run, task_id:"other"}],total:1,shown:1,has_more:false,next_cursor:null}));
+    await expect(listLiveTaskRuns("task")).rejects.toMatchObject({code:"protocol_error"});
   });
   it("releases only what the host says it released, and passes a refusal's reason through", async () => {
     const released = {...run, state:"exited", outcome_uncertain:true, reason:"Reconciled: agent process 42 is no longer running"};

@@ -39,6 +39,12 @@
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { createBoardAgents } from "../workbench/boardAgents";
+  import { taskAgentSummaries, type TaskAgentSummary } from "../workbench/taskSessions";
+  import { terminalSessions } from "../terminal/sessionRegistry";
+  import { taskTerminalRequests } from "../terminal/taskLaunches";
+  import { terminalSessionLimit } from "../terminal/sessionLimit";
+  import { sessionActivity } from "../terminal/sessionActivity";
   import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction, type TaskChanges } from "../workbench/taskActions";
   import {
     MAX_TASK_TABS,
@@ -353,11 +359,42 @@
       void openTask(id);
     });
   });
+  // ---- Agents working on the cards ----------------------------------------
+  // The same reads and judgement as each task's Agents pane
+  // (`boardAgents.ts`), so a card marked "needs you" opens on a pane that
+  // says so too. Read only while the board is shown.
+  const boardAgents = createBoardAgents();
+  $effect(() => {
+    if (!active) { boardAgents.stop(); return; }
+    untrack(() => boardAgents.start());
+    return () => boardAgents.stop();
+  });
+  const agentsByTask = $derived.by((): ReadonlyMap<string, TaskAgentSummary> => {
+    const read = $boardAgents;
+    if (read.readAt === null) return new Map();
+    return taskAgentSummaries(read.runs, {
+      records: $terminalSessions,
+      requests: $taskTerminalRequests,
+      capacityFull: $terminalSessions.length >= $terminalSessionLimit,
+      activity: (sessionId) => $sessionActivity.get(sessionId),
+      pending: (runId) => read.pending.get(runId),
+      now: read.readAt,
+      clock: read.readAt,
+    });
+  });
+  /** "2 agents working · 1 needs you", or "at least …" when the read was a floor. */
+  function agentsTitle(summary: TaskAgentSummary): string {
+    const floor = $boardAgents.complete ? "" : "at least ";
+    const working = `${floor}${summary.working} ${summary.working === 1 ? "agent" : "agents"} working`;
+    return summary.asking ? `${working} · ${summary.asking} ${summary.asking === 1 ? "needs" : "need"} you` : working;
+  }
   onMount(() => {
     const listeners = createListenerTracker();
-    if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
+    const changed = () => { scheduleRefresh(); void boardAgents.refresh(); };
+    if (isTauri()) void listen("workbench-changed", changed).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     const onForeground = () => {
+      boardAgents.wake();
       if (readBackgroundDocument()) {
         clearTimeout(refreshTimer);
         refreshTimer = undefined;
@@ -1328,7 +1365,7 @@
             {#if completedCount > 0}<span class="gp-pill">{completedCount}</span>{/if}
           </button>
         {/if}
-        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
         <TaskViewMenu disabled={!initialized} />
         <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
@@ -1455,6 +1492,9 @@
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if issueProgress}<div class="banner" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
+    <!-- Cards carry no agent marks while this stands: an old reading would
+         claim agents nobody checked. -->
+    {#if $boardAgents.error}<p class="agents-unread" role="status" data-testid="board-agents-error">Agents working on these tasks could not be read: {$boardAgents.error}</p>{/if}
     <!-- Its own banner, not part of `error`: a board reload clears `error`,
          and the issue would still exist with nothing on screen to link it. -->
     {#each relinks as entry (entry.taskId)}<div class="banner error" role="alert" data-testid="task-issue-relink"><span>Issue #{entry.number} exists but is not linked to “{entry.title}”.</span><button type="button" class="gp-btn" disabled={busy} onclick={() => void retryIssueLink(entry)}>Link to #{entry.number}</button></div>{/each}
@@ -1475,6 +1515,7 @@
         {#each listCards as card (card.id)}
           {@const face = cardFace(card, repoName)}
           {@const chrome = cardChrome(card, now)}
+          {@const agents = agentsByTask.get(card.id)}
           <button
             type="button"
             class="row gp-card"
@@ -1494,6 +1535,7 @@
           >
             <span class="status">{STATUS_LABELS[card.status]}</span>
             <span class="row-title">{face.title}</span>
+            {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
             {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
             {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
             {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
@@ -1523,6 +1565,7 @@
               {#each visibleIn(status) as card (card.id)}
                 {@const face = cardFace(card, repoName)}
                 {@const chrome = cardChrome(card, now)}
+                {@const agents = agentsByTask.get(card.id)}
                 {#if insertBefore(status, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
                 <button
                   type="button"
@@ -1553,6 +1596,7 @@
                     <h3>{face.title}</h3>
                     {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
                   </div>
+                  {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
                   {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
                   {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
                     <div class="card-extra">
@@ -1751,6 +1795,11 @@
   .card.selected,.row.selected,.card.open,.row.open{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.45)}
   .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
   .open-mark{font-size:9px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-accent));flex-shrink:0;margin-top:2px}
+  /* Agents working on the card's task; amber when one needs the reader, as in the task's Agents pane. */
+  .agents-chip{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;flex-shrink:0;font-size:10px;font-weight:600;line-height:1;padding:2px 5px;border-radius:999px;color:rgb(var(--c-text-muted));background:rgb(var(--c-text-muted) / .12);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .agents-chip[data-asking]{color:#d29922;background:rgb(210 153 34 / .16)}
+  .agents-chip[data-tone="error"]{color:#dc6565;background:rgb(220 101 101 / .16)}
+  .card .agents-chip{margin-top:4px}
   .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
   /* Same token the sheet below uses (app.css): the strip and the sheet are
      one column and must not be able to disagree about its width. */

@@ -33,9 +33,10 @@ export function createSessionLifecycle(options: {
   reveal?: () => void;
   /** Panel-owned question before a close; see `TerminalSessionRecord.confirmClose`. */
   confirmClose?: () => Promise<boolean>;
-  /** See `TerminalSessionRecord.title` and `.taskRunId`. */
+  /** See `TerminalSessionRecord.title`, `.taskRunId` and `.continuesRunId`. */
   title?: string;
   taskRunId?: string;
+  continuesRunId?: string;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -130,6 +131,7 @@ export function createSessionLifecycle(options: {
         reveal: options.reveal, confirmClose: options.confirmClose,
         ...(options.title ? { title: options.title } : {}),
         ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
+        ...(options.continuesRunId ? { continuesRunId: options.continuesRunId } : {}),
       });
       state("starting");
       ready = await bus.prepare();

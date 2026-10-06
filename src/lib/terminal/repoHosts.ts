@@ -11,6 +11,15 @@
  * Opening the dock on a tab that has never hosted one adds it. Visiting a
  * tab while the dock is closed does not spawn a shell in the background.
  *
+ * One more thing hosts a panel: a task terminal waiting for that repository
+ * (`awaited`). Launching an agent from a task sheet used to drag the reader
+ * to the repository surface and open its dock, because only a shown dock
+ * could start the process — so starting an agent closed the sheet that
+ * launched it. A queued request is a request someone made, so its tab is
+ * hosted whether or not anything is on screen, and the panel starts the
+ * agent hidden. Nothing else is: a repository merely visited still latches
+ * nothing.
+ *
  * PTYs are process-global (`MAX_PTY_SESSIONS`). Keeping panels alive means
  * a switch no longer frees that budget; a spawn that would have succeeded
  * after a teardown may now hit the ceiling, and the existing spawn error
@@ -31,6 +40,12 @@ export function nextHostedTerminals(
    * which is per repository tab. Never a workspace-wide preference.
    */
   activeDockOpen: boolean,
+  /**
+   * Open tabs a queued task terminal is waiting for, from `awaitedTabIds`.
+   * Hosted at once and latched like any other, so the panel outlives the
+   * request it consumes.
+   */
+  awaited: Iterable<string> = [],
 ): Set<string> {
   const open = new Set(openTabIds);
   const next = new Set<string>();
@@ -39,6 +54,9 @@ export function nextHostedTerminals(
   }
   if (activeDockOpen && activeTabId && open.has(activeTabId)) {
     next.add(activeTabId);
+  }
+  for (const id of awaited) {
+    if (open.has(id)) next.add(id);
   }
   if (hosted instanceof Set && sameSet(hosted, next)) return hosted;
   return next;

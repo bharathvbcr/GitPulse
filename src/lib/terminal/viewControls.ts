@@ -73,11 +73,31 @@ export function macLineEditing(
   return null;
 }
 
-/** Rows and columns a fresh PTY may be opened at: whole, finite, at least 2. */
-export function spawnGridSize(dims: { rows?: number; cols?: number } | null | undefined): { rows: number; cols: number } {
+/**
+ * Rows and columns a fresh PTY may be opened at: whole, finite, at least 2.
+ *
+ * `rendered` is whether the terminal's element has a box at all. A terminal
+ * started out of sight — a task agent launched from its task sheet, into a
+ * dock nobody has opened — is measured inside `display: none`, and xterm's
+ * proposal there is not NaN but a confident small grid (6 × 11 was seen). An
+ * agent told it has 11 columns lays out its whole first screen for them, and
+ * that output stays wrapped in the scrollback after the dock is opened and
+ * the grid corrected. So an unrendered measurement is not used: the PTY
+ * starts at the conventional 24 × 80 and is refitted when it is first shown.
+ */
+export function spawnGridSize(
+  dims: { rows?: number; cols?: number } | null | undefined,
+  rendered = true,
+): { rows: number; cols: number } {
   const whole = (value: number | undefined, fallback: number) =>
     typeof value === "number" && Number.isFinite(value) ? Math.min(1000, Math.max(2, Math.floor(value))) : fallback;
+  if (!rendered) return { rows: 24, cols: 80 };
   return { rows: whole(dims?.rows, 24), cols: whole(dims?.cols, 80) };
+}
+
+/** Whether an element is laid out with a box (not inside `display: none`). */
+export function hasRenderedBox(element: { getClientRects(): { length: number }; clientWidth: number; clientHeight: number } | null | undefined): boolean {
+  return !!element && element.getClientRects().length > 0 && element.clientWidth > 0 && element.clientHeight > 0;
 }
 
 /** The addon caps highlighted results; a capped count is never a total. */

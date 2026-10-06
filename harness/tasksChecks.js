@@ -10,9 +10,13 @@ import TasksHost from "./TasksHost.svelte";
 import { requestTaskOpen, taskOpenRequest } from "../src/lib/workbench/taskOpen";
 import { themeStore } from "../src/lib/stores/themeStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
+import { noteForegroundFocus } from "../src/lib/runtime/foreground";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
+// Attempts holding a checkout and their requests, for the board's agent
+// marks. Empty until the checks for those marks fill them.
+let boardRuns = [], boardDecisions = [], boardRunsFail = false;
 const copies = [];
 Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { copies.push(text); } } });
 const preparedRuns = [], appleDrafts = [];
@@ -91,7 +95,15 @@ mockIPC(async (cmd, args) => {
   switch (args.method) {
     case "repositories.list": return JSON.stringify(page(repos));
     case "repositories.get": return JSON.stringify({ok:true, item: repos.find(repo => repo.id === input.id)});
-    case "runs.list": return JSON.stringify({ok:true, items:[], shown:0, total:0, has_more:false, next_cursor:null});
+    case "runs.list": {
+      if (boardRunsFail) throw {code:"store_error", message:"Fixture runs are unavailable"};
+      const items = boardRuns.filter(run => (!input.state || run.state === input.state) && (!input.task_id || run.task_id === input.task_id) && (!input.repository_id || run.repository_id === input.repository_id));
+      return JSON.stringify({ok:true, items, shown:items.length, total:items.length, has_more:false, next_cursor:null});
+    }
+    case "decisions.list": {
+      const items = boardDecisions.filter(item => item.run_id === input.run_id && (!input.state || item.state === input.state));
+      return JSON.stringify({ok:true, items, shown:items.length, total:items.length, has_more:false, next_cursor:null});
+    }
     case "runs.prepare_terminal": case "runs.prepare_managed": {
       preparedRuns.push(structuredClone(input));
       if (!acceptPreparation) throw {code:"store_error", message:"The tasks fixture does not start agents."};
@@ -238,6 +250,21 @@ void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "q
 window.addEventListener("error", e => crashes.push(e.message));
 window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
 const root = document.getElementById("app");
+// The board's polls (a running Manvi suggestion, for one) pause while the
+// window is in the background, and on WKWebView that means "not focused":
+// `document.hasFocus()` is false with `visibilityState` still "visible". The
+// WebKit runner is an accessory app whose window may never become key, or
+// becomes key and then loses it to another app mid-run; either way every
+// poll-gated wait timed out there. The fixture models a person looking at
+// the board, so it says so through the product's own focus record, and hands
+// focus back after a real window blur through the same `focus` event the
+// product listens for, which also re-arms its paused timers. The blur still
+// reaches every listener first; this only undoes it. The one background check
+// below sets `document.hidden`, which outranks both.
+noteForegroundFocus(true);
+window.addEventListener("blur", event => {
+  if (event.target === window) setTimeout(() => window.dispatchEvent(new Event("focus")), 0);
+});
 mount(TasksHost, {target: root});
 let confirmations = 0, confirmAnswer = true;
 const settle = async (ms = 30) => {
@@ -1676,6 +1703,41 @@ if (params.has("check")) {
         get(taskOpenRequest) === null && field("Title")?.value === before
         && /\S/.test(root.querySelector('[role="alert"]')?.textContent ?? ""));
       confirmAnswer = true; await click("Close task details"); await settle();
+    }
+
+    // The board marks each card with the agents working on its task, from
+    // the same reads and judgement as the task's Agents pane: how many, and
+    // whether one needs the reader. Nothing was read, nothing is marked.
+    {
+      const refreshBoard = async () => { root.querySelector('button[aria-label="Refresh"]').click(); await settle(200); };
+      const chip = id => root.querySelector(`[data-card-id="${id}"] [data-testid="card-agents"]`);
+      check("a card with no agent working carries no agent mark", !root.querySelector('[data-testid="card-agents"]'));
+      const now = Math.floor(Date.now() / 1000);
+      const base = {revision:1, updated_at:now, task_id:"task-1", source_revision:1, task_title:"Fixture", repository_id:repos[0].id, provider:"codex", permission_mode:"ask", cwd:"/fixture/GitPulse", created_at:now, expires_at:now + 600, exit_code:null, reason:"", outcome_uncertain:false};
+      boardRuns = [
+        {...base, id:"board-terminal", kind:"external_terminal", state:"running", session_id:"board-term"},
+        {...base, id:"board-managed", kind:"managed", state:"running", session_id:"board-managed-session", provider_state:"running", provider_thread_id:"thread", provider_turn_id:"turn"},
+        {...base, id:"board-ended", task_id:"task-3", kind:"external_terminal", state:"exited", session_id:null, exit_code:0},
+      ];
+      await refreshBoard();
+      await wait(() => chip("task-1"));
+      check("a card counts the agents working on its task, and only those",
+        chip("task-1").textContent.startsWith("2") && !chip("task-1").dataset.asking && !chip("task-3"));
+      const payload = '{"command":"cargo test"}';
+      const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload)))].map(b => b.toString(16).padStart(2, "0")).join("");
+      boardDecisions = [{id:"board-request", revision:1, updated_at:now, run_id:"board-managed", task_id:"task-1", source_revision:1, repository_id:repos[0].id, repository_revision:repos[0].revision, owner_id:"fixture", session_id:"board-managed-session", provider_thread_id:"thread", provider_turn_id:"turn", protocol_request_id:"s:board", provider:"codex", permission_mode:"ask", policy_revision:1, cwd:"/fixture/GitPulse", kind:"permission", payload, payload_digest:digest, created_at:now, expires_at:now + 300, state:"pending", decision:null, answer:null, actionable:true, reason:""}];
+      await refreshBoard();
+      await wait(() => chip("task-1")?.dataset.asking === "1");
+      check("a card whose agent is waiting on a request says it needs you",
+        chip("task-1").textContent.includes("1 needs you") && chip("task-1").dataset.tone === "needs-you");
+      boardRunsFail = true;
+      await refreshBoard();
+      await wait(() => root.querySelector('[data-testid="board-agents-error"]'));
+      check("a failed read clears the marks and says so, rather than keep old ones", !root.querySelector('[data-testid="card-agents"]'));
+      boardRunsFail = false; boardRuns = []; boardDecisions = [];
+      await refreshBoard();
+      await wait(() => !root.querySelector('[data-testid="board-agents-error"]'));
+      check("once every agent has ended, no card is marked", !root.querySelector('[data-testid="card-agents"]'));
     }
 
     check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);

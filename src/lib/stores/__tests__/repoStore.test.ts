@@ -3763,6 +3763,88 @@ describe("Overview repository-open destinations", () => {
     for (const tab of get(store).openTabs) await store.closeTab(tab.id);
   });
 
+  /**
+   * A background open is not navigation.
+   *
+   * A task agent's checkout is opened with `activate: false` so its terminal
+   * can start without taking the reader off the task sheet. It used to bump
+   * the navigation epoch all the same, so the repository the reader was
+   * opening at that moment lost both its activation and its destination.
+   */
+  it("lets a background open finish without cancelling the reader's own open", async () => {
+    const resolving = deferred<{ path: string; name: string; is_bare: boolean }>();
+    const hydrating = deferred<never>();
+    const { store } = makeStore(makeInvoke({
+      cmd_resolve_repo: async (_cmd, args) => args?.repoPath === "/mine" ? resolving.promise as never : { path: args?.repoPath, name: "agent", is_bare: false } as never,
+      cmd_get_status: async (_cmd, args) => args?.repoPath === "/mine" ? hydrating.promise : snapshotFor("/agent").statuses as never,
+    }));
+    const ready = vi.fn();
+    const mine = store.openRepo("/mine", { onReady: ready });
+    // The agent's checkout opens while the reader's is still resolving…
+    await store.openRepo("/agent", { activate: false });
+    resolving.resolve({ path: "/mine", name: "mine", is_bare: false });
+    await vi.waitFor(() => expect(get(store).currentPath).toBe("/mine"));
+    // …and again while it is hydrating.
+    await store.openRepo("/agent-2", { activate: false });
+    hydrating.resolve(snapshotFor("/mine").statuses as never);
+    expect(await mine).toBe(true);
+    expect(ready).toHaveBeenCalledWith("/mine");
+    expect(get(store).currentPath).toBe("/mine");
+    expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/agent", "/mine", "/agent-2"]);
+    for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+  });
+
+  it("lets the reader's newest open win however background opens interleave with it", { timeout: 30_000 }, async () => {
+    // Task launches open checkouts in the background while the reader opens
+    // repositories of their own. Randomized arrival and resolution order;
+    // the reader's newest open must end up in front with its destination
+    // run, and no background checkout may ever take the screen.
+    for (let seed = 1; seed <= 30; seed += 1) {
+      let state = seed;
+      const random = () => { state = (state * 1103515245 + 12345) % 2147483648; return state / 2147483648; };
+      const settle = () => new Promise<void>((resolve) => setTimeout(resolve, Math.floor(random() * 3)));
+      const { store } = makeStore(makeInvoke({
+        cmd_resolve_repo: async (_cmd, args) => { await settle(); const path = String(args?.repoPath); return { path, name: path, is_bare: false } as never; },
+        cmd_get_status: async (_cmd, args) => { await settle(); return snapshotFor(String(args?.repoPath)).statuses as never; },
+      }));
+      const opens: Promise<boolean>[] = [];
+      let newest: { path: string; ready: ReturnType<typeof vi.fn> } | null = null;
+      const background: string[] = [];
+      for (let i = 0; i < 10; i += 1) {
+        if (random() < 0.5) {
+          const path = `/agent-${seed}-${i}`;
+          background.push(path);
+          opens.push(store.openRepo(path, { activate: false }));
+        } else {
+          const ready = vi.fn();
+          newest = { path: `/mine-${seed}-${i}`, ready };
+          opens.push(store.openRepo(newest.path, { onReady: ready }));
+        }
+        if (random() < 0.6) await settle();
+      }
+      await Promise.all(opens);
+      const where = `seed ${seed}`;
+      if (newest) {
+        expect(get(store).currentPath, where).toBe(newest.path);
+        expect(newest.ready, where).toHaveBeenCalledWith(newest.path);
+      } else {
+        expect(get(store).currentPath, where).toBeNull();
+      }
+      for (const path of background) expect(get(store).openTabs.some((tab) => tab.path === path), where).toBe(true);
+      expect(background, where).not.toContain(get(store).currentPath);
+      for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+    }
+  });
+
+  it("never activates a background open, even when nothing else is open", async () => {
+    const { store } = makeStore();
+    const ready = vi.fn();
+    expect(await store.openRepo("/agent", { activate: false, onReady: ready })).toBe(true);
+    expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/agent"]);
+    expect(ready).not.toHaveBeenCalled();
+    for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+  });
+
   it("does not override a view chosen while the worktree is loading", async () => {
     const pending = deferred<never>();
     const { store } = makeStore(makeInvoke({ cmd_get_status: () => pending.promise }));

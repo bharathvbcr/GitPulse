@@ -23,6 +23,12 @@ export interface TerminalSessionRecord {
   title?: string;
   /** Set when the process is a task attempt's, which a close ends for good. */
   taskRunId?: string;
+  /**
+   * Set when the process continues an ended attempt's conversation. It names
+   * that attempt so the task can list the session, and nothing more: unlike
+   * `taskRunId`, closing it ends no attempt.
+   */
+  continuesRunId?: string;
   /** Stops the process without asking; the tab stays, showing that it ended. */
   close: () => Promise<void>;
   /**
@@ -83,6 +89,19 @@ export function sessionByNativeId(
 ): TerminalSessionRecord | null {
   if (!sessionId) return null;
   return records.find((record) => record.sessionId === sessionId) ?? null;
+}
+
+/**
+ * Stops a session from outside its tab — the Sessions list, a task's Agents
+ * pane — asking the tab's own question first. Resolves to whether it was
+ * stopped, so a declined question is not reported as a stop.
+ */
+export async function closeWithConfirmation(
+  record: Pick<TerminalSessionRecord, "close" | "confirmClose">,
+): Promise<boolean> {
+  if (!(await (record.confirmClose?.() ?? true))) return false;
+  await record.close();
+  return true;
 }
 
 /** Capacity belongs to the app, including starts and closes still in flight. */
