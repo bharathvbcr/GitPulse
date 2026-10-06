@@ -6,8 +6,19 @@ use gitpulse_lib::watcher::RepoFileWatcher;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs::{self, File};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+/// Printed by the child immediately before its first registration.
+const READY: &str = "GITPULSE_WATCH_PROBE_READY";
+/// Printed by the child after each registration it has retired.
+const COMPLETE: &str = "GITPULSE_WATCH_PROBE_COMPLETE";
+/// From spawn to READY: process start-up, which is not what these tests
+/// measure.
+const STARTUP: Duration = Duration::from_secs(30);
+/// From READY, or the previous registration, to the next one retiring: a
+/// shutdown hang. The `purge` fixture sleeps well past it.
+const REGISTRATION: Duration = Duration::from_secs(3);
 
 fn finish(child: &mut Child, deadline: Duration) -> std::process::ExitStatus {
     let until = Instant::now() + deadline;
@@ -63,6 +74,14 @@ fn probe(mode: &str) {
         "{}",
         fs::read_to_string(build_log).unwrap()
     );
+    // One probe child at a time. FSEventStreamStart blocks in its register
+    // RPC to fseventsd, and concurrent probes queue behind each other there:
+    // in one run, eight children started together finished at 0.8 s to 3.0 s,
+    // stacked by queue position, and the `source` probe registers 17 streams.
+    // A sibling's queue is not this probe's hang, and running them together
+    // saved no time.
+    static ONE_PROBE: Mutex<()> = Mutex::new(());
+    let _turn = ONE_PROBE.lock().unwrap_or_else(PoisonError::into_inner);
     let child_log = dir.path().join("child.log");
     let output = File::create(&child_log).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -77,38 +96,64 @@ fn probe(mode: &str) {
     // Each registration/retirement has the same three-second bound. The
     // source-failure case starts 17 real streams, so an aggregate three-second
     // deadline confuses successful repeated cleanup with a shutdown hang.
+    //
+    // The bound starts at the child's READY line, printed immediately before
+    // the first registration, not at spawn, so process start-up is never
+    // charged to a registration. Start-up gets its own generous bound and its
+    // own message, so a slow start is never reported as a hang.
+    let spawned = Instant::now();
+    let mut ready = None;
+    let mut window = spawned;
     let mut completed = 0;
-    let mut deadline = Instant::now() + Duration::from_secs(3);
+    let mut laps = Vec::new();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        let progress = fs::read_to_string(&child_log)
-            .unwrap()
-            .matches("GITPULSE_WATCH_PROBE_COMPLETE")
-            .count();
-        if progress > completed && progress <= 17 {
-            completed = progress;
-            deadline = Instant::now() + Duration::from_secs(3);
+        let log = fs::read_to_string(&child_log).unwrap();
+        let now = Instant::now();
+        if ready.is_none() && log.contains(READY) {
+            ready = Some(now - spawned);
+            window = now;
         }
-        if Instant::now() >= deadline {
+        let progress = log.matches(COMPLETE).count();
+        if ready.is_some() && progress > completed && progress <= 17 {
+            laps.push(now - window);
+            completed = progress;
+            window = now;
+        }
+        let bound = if ready.is_some() {
+            REGISTRATION
+        } else {
+            STARTUP
+        };
+        if now - window >= bound {
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!(
-                "{mode}: registration {completed} exceeded its deadline: {}",
-                fs::read_to_string(&child_log).unwrap()
-            );
+            let log = fs::read_to_string(&child_log).unwrap();
+            match ready {
+                None => panic!(
+                    "{mode}: the child never reached the probe within {STARTUP:?} of spawning: {log}"
+                ),
+                Some(ready) => panic!(
+                    "{mode}: registration {completed} exceeded {REGISTRATION:?} \
+                     (child ready {ready:?} after spawn; earlier registrations took {laps:?}): {log}"
+                ),
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    let log = fs::read_to_string(&child_log).unwrap();
+    assert!(status.success(), "{mode}: {log}");
+    // A child that exits cleanly without announcing itself ran no probe at
+    // all; that must not pass as a watcher that started and retired in time.
     assert!(
-        status.success(),
-        "{mode}: {}",
-        fs::read_to_string(&child_log).unwrap()
+        log.contains(READY),
+        "{mode}: the child exited without reaching the probe: {log}"
     );
     if mode == "source" {
         assert_eq!(
-            fs::read_to_string(child_log).unwrap().matches("GITPULSE_SHUTDOWN_SOURCE_FAULT").count(),
+            log.matches("GITPULSE_SHUTDOWN_SOURCE_FAULT").count(),
             17,
             "the initial registration and all 16 ownership probes must inject the shutdown allocation failure"
         );
@@ -121,6 +166,7 @@ fn watcher_fault_child() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
+    eprintln!("{READY}");
     let result = RepoFileWatcher::watch(dir.path());
     if mode == "start" || mode == "create" || mode == "source" {
         match result {
@@ -132,7 +178,7 @@ fn watcher_fault_child() {
                 panic!("native startup failure was reported as a ready watcher");
             }
         }
-        eprintln!("GITPULSE_WATCH_PROBE_COMPLETE");
+        eprintln!("{COMPLETE}");
         // Every public registration route must propagate errors and release
         // callback ownership, including the stream/context allocated before
         // native startup. Repetition catches retained failed generations.
@@ -153,7 +199,7 @@ fn watcher_fault_child() {
                 1,
                 "failed stream retained its callback"
             );
-            eprintln!("GITPULSE_WATCH_PROBE_COMPLETE");
+            eprintln!("{COMPLETE}");
         }
     } else {
         drop(result.expect("healthy stream must start"));

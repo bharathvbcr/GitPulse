@@ -806,6 +806,10 @@ pub async fn cmd_commit(
         };
         let policy = guard(&repo_path, &argv)?;
         let output = GitWriter::commit(&repo_path, &message, amend)?;
+        // After the commit landed, and unable to fail it: a local caller
+        // record of the type the user actually committed, when that setting
+        // is on and a low-confidence draft for this repository is pending.
+        crate::lappi::record_commit_outcome(&repo_path, &message);
         Ok(Guarded { policy, output })
     })
     .await
@@ -832,6 +836,7 @@ pub async fn cmd_quick_commit(
         let commit_policy = guard(&repo_path, &commit_argv)?;
         let policy = strictest_verdict(add_policy, commit_policy);
         let output = GitWriter::quick_commit(&repo_path, &message)?;
+        crate::lappi::record_commit_outcome(&repo_path, &message);
         Ok(Guarded { policy, output })
     })
     .await
@@ -4929,6 +4934,27 @@ pub async fn cmd_session_alerts_save(
             status: crate::alerts::status(),
             bridge_supported: cfg!(unix),
         })
+    })
+    .await
+}
+
+/// The two Lappi switches, with what recording has done this process.
+///
+/// Both default to off. The view travels with the switches for the same
+/// reason session alerts do: "recording on, nothing written" and "recording
+/// on, stopped at the store cap" look the same from a switch alone.
+#[tauri::command(async)]
+pub async fn cmd_lappi_settings() -> Result<crate::lappi::LappiView, String> {
+    off_thread(|| Ok(crate::lappi::view())).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_lappi_settings_save(
+    settings: crate::tool_config::LappiSettings,
+) -> Result<crate::lappi::LappiView, String> {
+    off_thread(move || {
+        crate::tool_config::set_lappi_settings(settings)?;
+        Ok(crate::lappi::view())
     })
     .await
 }

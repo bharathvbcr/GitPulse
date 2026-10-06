@@ -293,9 +293,9 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    // 245 since cmd_note_tab_activated (tab-switch credit) arrived; `bun run check:ipc` prints all three
+    // 247 since cmd_lappi_settings and cmd_lappi_settings_save arrived; `bun run check:ipc` prints all three
     // numbers, so a bump made without re-running it will not agree.
-    expect(found.size).toBe(245);
+    expect(found.size).toBe(247);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

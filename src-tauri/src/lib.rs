@@ -19,6 +19,7 @@ pub mod harness;
 pub mod hooks;
 pub mod host_platform;
 pub mod ingest;
+pub mod lappi;
 pub mod insights;
 pub mod ledger;
 pub mod limits;
@@ -464,6 +465,8 @@ pub fn run() {
             cmd_session_alerts,
             cmd_session_alerts_save,
             cmd_session_alerts_visible,
+            cmd_lappi_settings,
+            cmd_lappi_settings_save,
             cmd_tool_ladder,
             cmd_tool_preflight,
             cmd_tool_verify,

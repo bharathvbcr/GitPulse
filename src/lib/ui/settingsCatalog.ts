@@ -261,6 +261,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     requires: "appleIntelligence",
   },
   {
+    id: "lappi",
+    section: "agents",
+    label: "Lappi",
+    keywords: "lappi decision model commit type conventional ambiguous classifier suggest record caller data local held out privacy socket qd",
+  },
+  {
     id: "external-tools",
     section: "agents",
     label: "devmap and manvi",

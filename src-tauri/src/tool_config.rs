@@ -464,6 +464,42 @@ impl SessionAlertSettings {
     }
 }
 
+/// GitPulse's two Lappi switches (`docs/caller-contract.md` in Lappi-decision).
+///
+/// Both default to off and are independent: recording is not asking, and
+/// nothing recorded is ever sent anywhere. `LAPPI_COLLECT=0` in the
+/// environment forces recording off whatever this says (`crate::lappi`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LappiSettings {
+    /// "Ask Lappi on ambiguous commit types".
+    #[serde(default)]
+    pub ask_on_ambiguous_commit_type: bool,
+    /// "Record Lappi caller data (local only)".
+    #[serde(default)]
+    pub record_caller_data: bool,
+}
+
+impl LappiSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn lenient_lappi<'de, D>(deserializer: D) -> Result<LappiSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable lappi block, both Lappi switches stay off: {error}"
+        );
+        LappiSettings::default()
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolConfig {
     pub version: u32,
@@ -492,6 +528,16 @@ pub struct ToolConfig {
     /// why they are not in `agent_defaults`.
     #[serde(default, skip_serializing_if = "StoredAgentLaunch::is_empty")]
     pub agent_launch: StoredAgentLaunch,
+    /// Whether GitPulse asks Lappi and records caller data. Both off unless
+    /// the user turns them on; read leniently, like `agent_defaults`, and for
+    /// the same reason: a malformed block degrades to "off" on its own
+    /// rather than costing every other setting in the file.
+    #[serde(
+        default,
+        deserialize_with = "lenient_lappi",
+        skip_serializing_if = "LappiSettings::is_default"
+    )]
+    pub lappi: LappiSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -509,6 +555,7 @@ impl Default for ToolConfig {
             session_alerts: SessionAlertSettings::default(),
             agent_defaults: StoredAgentPermissions::default(),
             agent_launch: StoredAgentLaunch::default(),
+            lappi: LappiSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -962,6 +1009,22 @@ pub fn set_session_alerts(next: SessionAlertSettings) -> Result<(), String> {
     next.validate()?;
     let mut cfg = load()?;
     cfg.session_alerts = next;
+    save(&cfg)?;
+    Ok(())
+}
+
+/// The stored Lappi switches, or both off.
+///
+/// Any failure to read the config is "off": these gate an optional feature
+/// whose safe state is not running, so an unreadable file must never be what
+/// turns it on. The read error is surfaced through [`view`].
+pub fn lappi_settings() -> LappiSettings {
+    load().map(|cfg| cfg.lappi).unwrap_or_default()
+}
+
+pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
+    let mut cfg = load()?;
+    cfg.lappi = next;
     save(&cfg)?;
     Ok(())
 }

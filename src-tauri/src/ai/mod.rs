@@ -852,6 +852,11 @@ pub fn generate_commit_message(
             "Recent commit subjects could not be read ({error})."
         ));
     }
+    // Only a draft the classifier could not type, and only with the user's
+    // setting on: Lappi may pre-select that missing type and nothing else.
+    // Bounded by `lappi::ASK_DEADLINE`; this function already runs off the UI
+    // thread. With both Lappi settings off it reads only the cached config.
+    crate::lappi::consult_on_commit_type(repo_path, diff.as_bytes(), &mut draft);
 
     let explicit = usable_selection(selection);
     let (discovered, on_device) = if explicit.is_some() {

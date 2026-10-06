@@ -37,7 +37,14 @@ const NAME_CAP: usize = 5;
 const MENTION_CAP: usize = 64;
 const SMALL_CHANGE_LINES: u32 = 30;
 
-const KNOWN_TYPES: &[&str] = &[
+/// The conventional types this module will write, in this order.
+///
+/// The single owner: the Lappi request's option list (`crate::lappi`) and its
+/// admission check read this, so a type added here is offered and admitted in
+/// one place. The order is part of the Lappi request shape
+/// (`docs/caller-contract.md` §4 in Lappi-decision), so reordering it changes
+/// the prompt the model is served.
+pub(crate) const KNOWN_TYPES: &[&str] = &[
     "feat", "fix", "refactor", "docs", "test", "chore", "perf", "build", "ci", "style", "revert",
 ];
 
@@ -100,6 +107,59 @@ impl Tally {
     fn real_files(&self) -> usize {
         self.files.saturating_sub(self.unparsed)
     }
+
+    fn facts(&self) -> ClassifierFacts {
+        let real = self.real_files();
+        let typed_roles = self.tests + self.ci + self.deps + self.build + self.docs;
+        let typed_kinds = self.added + self.deleted + self.renamed + self.copied;
+        ClassifierFacts {
+            files: real,
+            unparsed: self.unparsed,
+            source: real.saturating_sub(typed_roles),
+            tests: self.tests,
+            ci: self.ci,
+            deps: self.deps,
+            build: self.build,
+            docs: self.docs,
+            added: self.added,
+            modified: real.saturating_sub(typed_kinds),
+            deleted: self.deleted,
+            renamed: self.renamed,
+            copied: self.copied,
+            binary: self.binary,
+            mode_only: self.mode_only,
+            style_only: self.style,
+            additions: self.additions,
+            deletions: self.deletions,
+        }
+    }
+}
+
+/// The counts [`classify`] decided from: structure, never content.
+///
+/// Carried on the draft so a caller record can say what the classifier saw
+/// without a copy of the patch (`docs/caller-contract.md` §5, "facts").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClassifierFacts {
+    /// Files the patch parsed into (unparsed fragments excluded).
+    pub files: usize,
+    pub unparsed: usize,
+    pub source: usize,
+    pub tests: usize,
+    pub ci: usize,
+    pub deps: usize,
+    pub build: usize,
+    pub docs: usize,
+    pub added: usize,
+    pub modified: usize,
+    pub deleted: usize,
+    pub renamed: usize,
+    pub copied: usize,
+    pub binary: usize,
+    pub mode_only: usize,
+    pub style_only: usize,
+    pub additions: u64,
+    pub deletions: u64,
 }
 
 /// The message, and the facts a model is allowed to phrase.
@@ -117,6 +177,11 @@ pub struct CommitDraft {
     pub brief: String,
     pub warnings: Vec<String>,
     pub high_confidence: bool,
+    /// The type the classifier settled on, whether or not the repository's
+    /// history made it a prefix. `None` exactly when the patch was ambiguous.
+    pub change_type: Option<&'static str>,
+    /// What the classifier counted.
+    pub facts: ClassifierFacts,
     pub conventional: bool,
     pub patch_truncated: bool,
     /// Bytes of patch this draft actually saw.
@@ -227,12 +292,60 @@ pub fn draft_change(
         brief,
         warnings,
         high_confidence: high,
+        change_type,
+        facts: tally.facts(),
         conventional,
         patch_truncated,
         patch_bytes: diff.len(),
         allows_breaking: contains_breaking_marker(diff),
     }
 }
+
+/// Pre-selects a type the classifier could not settle, from an outside suggestion.
+///
+/// Admission only (`docs/caller-contract.md` §3): the suggestion may fill the
+/// one gap the classifier left, and nothing else. It is refused, and the draft
+/// left byte-for-byte as it was, unless every one of these holds:
+///
+/// * `kind` is one of [`KNOWN_TYPES`], spelled exactly;
+/// * the classifier found no type and fixed no prefix;
+/// * the patch was read whole (a cut patch never gets a type here either);
+/// * the repository's history is conventional — the only condition under which
+///   [`draft_change`] itself would write a prefix, so a suggestion cannot
+///   produce a shape the classifier never would.
+///
+/// `high_confidence` stays false: a suggestion is not the classifier's
+/// certainty, and the draft is still the user's to edit.
+pub fn prefill_type(draft: &mut CommitDraft, kind: &str) -> bool {
+    let Some(known) = KNOWN_TYPES.iter().copied().find(|known| *known == kind) else {
+        return false;
+    };
+    if draft.change_type.is_some()
+        || draft.prefix.is_some()
+        || draft.high_confidence
+        || draft.patch_truncated
+        || !draft.conventional
+    {
+        return false;
+    }
+    let prefix = match &draft.scope {
+        Some(scope) => format!("{known}({scope}): "),
+        None => format!("{known}: "),
+    };
+    let subject = fit_subject(&prefix, &draft.subject);
+    draft.message = assemble(&subject, &draft.body);
+    draft.subject = subject;
+    draft.brief = draft.brief.replacen(
+        BRIEF_NO_PREFIX,
+        &format!("Keep this prefix exactly: {prefix}"),
+        1,
+    );
+    draft.prefix = Some(prefix);
+    true
+}
+
+/// The brief's line for a draft with no fixed prefix; [`prefill_type`] replaces it.
+const BRIEF_NO_PREFIX: &str = "No type prefix is fixed.";
 
 /// The on-device model may rephrase the subject. It may not change the facts.
 pub fn accept_on_device_subject(raw: &str, draft: &CommitDraft) -> Result<String, &'static str> {
@@ -600,7 +713,7 @@ fn build_brief(
     ));
     match prefix {
         Some(prefix) => lines.push(format!("Keep this prefix exactly: {prefix}")),
-        None => lines.push("No type prefix is fixed.".to_string()),
+        None => lines.push(BRIEF_NO_PREFIX.to_string()),
     }
     lines.push(format!(
         "Conventional history: {}.",
@@ -832,14 +945,15 @@ fn sanitize_scope(raw: &str) -> Option<String> {
     }
 }
 
-struct ParsedSubject<'a> {
-    kind: &'a str,
-    scope: Option<String>,
-    breaking: bool,
-    summary: &'a str,
+/// A conventional subject split into its parts. One parser for every reader.
+pub(crate) struct ParsedSubject<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) scope: Option<String>,
+    pub(crate) breaking: bool,
+    pub(crate) summary: &'a str,
 }
 
-fn split_conventional(subject: &str) -> Option<ParsedSubject<'_>> {
+pub(crate) fn split_conventional(subject: &str) -> Option<ParsedSubject<'_>> {
     let (head, summary) = subject.split_once(':')?;
     if !summary.starts_with(' ') {
         return None;
