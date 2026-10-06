@@ -171,8 +171,8 @@ pub(crate) fn judge_at(
         }
         if manvi_owner(run["owner_id"].as_str().unwrap_or("")).is_none() {
             return Verdict::Keep(format!(
-                "An older Manvi claimed it and its process cannot be identified; if it is never activated, it is released {} minutes after its claim.",
-                MANAGED_ACTIVATION_GRACE_SECS / 60
+                "An older Manvi claimed it and its process cannot be identified; {}",
+                abandonment(run)
             ));
         }
     }
@@ -186,8 +186,8 @@ pub(crate) fn judge_at(
                 "the Manvi process {manvi} that ran it has exited, and no agent process was recorded; a provider exits when the Manvi driving it does"
             )),
             Liveness::Alive => Verdict::Keep(format!(
-                "Manvi (pid {manvi}) is still running this attempt; if it is never activated, it is released {} minutes after its claim.",
-                MANAGED_ACTIVATION_GRACE_SECS / 60
+                "Manvi (pid {manvi}) is still running this attempt; {}",
+                abandonment(run)
             )),
             Liveness::Unknown(reason) => Verdict::Keep(format!(
                 "Could not check whether the Manvi process {manvi} running it is still alive: {reason}"
@@ -219,6 +219,19 @@ pub(crate) fn judge_at(
         Liveness::Unknown(reason) => Verdict::Keep(format!(
             "Could not check whether the GitPulse process {owner} that launched it is still running: {reason}"
         )),
+    }
+}
+
+/// When an unactivated managed attempt that is kept for now will be released
+/// — promised only where the grace rule in [`judge_at`] can actually fire.
+fn abandonment(run: &Value) -> String {
+    if run["kind"] == "managed" && run["claimed_at"].as_u64().is_some() {
+        format!(
+            "if it is never activated, it is released {} minutes after its claim.",
+            MANAGED_ACTIVATION_GRACE_SECS / 60
+        )
+    } else {
+        "it records no claim time, so nothing here can tell when it was abandoned.".into()
     }
 }
 

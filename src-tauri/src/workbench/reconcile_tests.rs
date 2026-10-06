@@ -599,12 +599,19 @@ fn an_unactivated_managed_attempt_is_released_by_what_manvi_guarantees() {
         at(&terminal, claimed + GRACE * 10),
         Verdict::Keep(_)
     ));
-    // Nor is one whose claim time is missing or not a number.
+    // Nor is one whose claim time is missing or not a number — and its
+    // reason does not promise a release the rule cannot deliver.
     for bad in [json!(null), json!("1800000000"), json!(-1)] {
         let mut run = managed("starting", LEGACY, claimed);
         run["claimed_at"] = bad.clone();
         assert!(
-            matches!(at(&run, claimed + GRACE * 10), Verdict::Keep(_)),
+            matches!(at(&run, claimed + GRACE * 10), Verdict::Keep(r) if r.contains("no claim time") && !r.contains("minutes")),
+            "{bad}"
+        );
+        let mut named = managed("starting", "manvi-4242-1700-ab12cd", claimed);
+        named["claimed_at"] = bad.clone();
+        assert!(
+            matches!(judge_at(&named, Some(false), no_child, |_, _| Liveness::Alive, claimed), Verdict::Keep(r) if r.contains("no claim time")),
             "{bad}"
         );
     }
