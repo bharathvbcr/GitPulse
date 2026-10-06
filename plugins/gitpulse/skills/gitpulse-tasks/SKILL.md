@@ -1,6 +1,6 @@
 ---
 name: gitpulse-tasks
-description: File, import, list, read, complete and delete tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, read a task's brief before implementing it, mark the task it was launched on done when the work is finished, or delete a duplicate or merged task with a recorded reason.
+description: File, import, list, read, complete, merge and delete tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, read a task's brief before implementing it, mark the task it was launched on done when the work is finished, merge duplicate tasks into one, or delete a task that should not exist, with a recorded reason.
 license: MIT
 compatibility: Requires the gitpulse-mcp binary on PATH, an absolute git repository path, and a repository the person has trusted in GitPulse.
 metadata:
@@ -23,12 +23,13 @@ window is shown otherwise.
 | `gitpulse_list_tasks` | read | List the board's tasks for a repository, in board order. |
 | `gitpulse_get_task` | read | Read one task with its canonical agent brief. |
 | `gitpulse_complete_task` | write | Move your task to `done` when the work is finished (or `review`, or `in_progress`), with a summary. |
-| `gitpulse_delete_task` | write, destructive | Delete a task card that should not exist — a duplicate, or one merged into another — with a reason. |
+| `gitpulse_delete_task` | write, destructive | Delete a task card that should not exist, with a reason. |
+| `gitpulse_merge_tasks` | write, destructive | Fold duplicate or overlapping tasks into one that stays, and delete the rest, with a reason. |
 
 Every write requires the repository to be **trusted** in GitPulse. An untrusted
 repository is refused with `untrusted_repository`; ask the person to open it in
 GitPulse and trust it. No write can start an agent run, and only
-`gitpulse_delete_task` removes a card.
+`gitpulse_delete_task` and `gitpulse_merge_tasks` remove a card.
 
 ## Before you file a task
 
@@ -49,7 +50,11 @@ fewest tasks that cover the work.
    so send its existing title, description and criteria **plus** yours. Every
    field you leave out — status, priority, severity, owner, due date, labels,
    logs — stays exactly as the card had it, as do its column position and links.
-4. File a new task only for work no open task covers.
+4. **Merge duplicates you find.** When the board already holds two or more
+   open tasks for one concern, fold them into one with
+   `gitpulse_merge_tasks` (see [Merging tasks](#merging-tasks)) rather than
+   filing another or deleting all but one.
+5. File a new task only for work no open task covers.
 
 `gitpulse_add_task` holds you to this. A new task that looks like open work —
 two shared title words, or one shared title word and a shared label that is not
@@ -91,7 +96,9 @@ with `already_exists`, so a retried call never makes a duplicate card. Pass
 filed with, or under a board `item_id`, which is how you extend a task the
 person made on the board. Its column position and links on the board are kept.
 A task the person deleted on the board stays deleted (`deleted_on_board`);
-choose another `task_id`.
+choose another `task_id`. A title or description the person **locked** on
+the card is theirs: an overwrite that would change it is refused with
+`field_locked`, and one that leaves it as it is goes through.
 
 | Parameter | Required | Rule |
 | --- | --- | --- |
@@ -173,6 +180,11 @@ frontmatter — what GitPulse's **Copy saved brief** produces, or a hand-written
 `gitpulse_list_tasks`. It returns the stored task and `brief`: the same Markdown
 GitPulse hands an agent it launches on that task. Work from that brief.
 
+A task that no longer exists says where it went: `task_merged` names the
+`item_id` its work was merged into (read that one instead), and
+`task_deleted` gives the reason it was deleted. `not_found` means the board
+never had it under this repository.
+
 ## Finishing a task
 
 When GitPulse launched you on a task, the brief's first lines name it:
@@ -199,13 +211,15 @@ verification passed, move it to `done`:
   reopened (`already_done`): ask the person.
 - Do not mark a task done that you did not finish, or whose verification failed.
   Say what is left instead, and use `review`.
+- If your task was merged into another while you worked, completing it is
+  refused with `task_merged`, naming the target. Report on that one instead.
 
 ## Deleting a task
 
 `gitpulse_delete_task` removes a card from the board — the same delete as the
-board's own **Delete**. Use it only for a task that should not exist: a
-duplicate, or one you merged into another. Never delete a task to finish it;
-move it to `done` instead.
+board's own **Delete**. Use it only for a task that should not exist. For a
+duplicate, use `gitpulse_merge_tasks` instead, which keeps its content on the
+card that stays. Never delete a task to finish it; move it to `done` instead.
 
 ```json
 {
@@ -228,8 +242,57 @@ move it to `done` instead.
   restore it.
 - A task linked to other repositories too is refused with `shared_task`, since
   deleting it here deletes it there. Ask the person.
+- A task an agent may still be working on — an attempt prepared, starting,
+  running, or with an unresolved outcome — is refused with `task_in_use`,
+  listing the attempts. Pass `even_if_running: true` only when that agent is
+  you, or the person asked for this.
 - The same call twice answers `unchanged`. A task of another repository is
   `not_found`.
+
+## Merging tasks
+
+`gitpulse_merge_tasks` folds duplicate or overlapping tasks into one task that
+stays, then deletes the others. Read every task with `gitpulse_get_task`
+first and choose as the target the one that best names the concern; a card
+the person made is usually the right one to keep.
+
+```json
+{
+  "repo_path": "/absolute/path/to/repo",
+  "into_task_id": "gp-auth-overhaul",
+  "sources": [{ "task_id": "gp-oauth-auth" }, { "task_id": "gp-passkeys", "expected_revision": 4 }],
+  "reason": "One concern: both are steps of the auth overhaul."
+}
+```
+
+- At most 25 sources per call. `reason` is required and is recorded on the
+  target and on every source.
+- The target keeps its title, status, owner and place on the board. Its
+  description gains a `## Merged from <item_id>: <title>` section per source,
+  with that task's status, priority and description. It gets the union of
+  every source's acceptance criteria and labels, and the most urgent
+  priority, highest severity and earliest due date among them; `escalated`
+  lists what changed. Source logs are not copied; they stay in each
+  source's history (`logs_kept_in_history` lists which had any).
+- Each source is then deleted, with the reason and the target named in its
+  history, so an agent asking after it gets `task_merged`. It is deleted only
+  at the revision that was copied: a source edited mid-merge is copied again
+  first, never lost.
+- Refused with **nothing written**: a source linked to another repository too
+  (`shared_task`), one an agent may still be working on (`task_in_use`,
+  unless `even_if_running: true`), a `done` target with an open source
+  (`target_done`), a target whose description the person locked
+  (`field_locked`), more than one task can hold (`merge_too_large`), a
+  source that is the target or is listed twice, and any `expected_revision`
+  that no longer matches (`revision_conflict`).
+- Each store write is its own transaction, so a merge can be interrupted or
+  overtaken by an edit. It then answers `ok: false`, `outcome: "partial"`,
+  with each source's `outcome` (`merged`, `already_merged`, `not_merged`)
+  and `next_step`. Run the **same call again** to finish: a section already
+  in the target is recognised and not copied twice. Every source's work is
+  on a live card throughout.
+- The same call after it finished answers `unchanged`. There is **no
+  unmerge** over MCP; only the person can restore a source.
 
 ## Guarantees
 

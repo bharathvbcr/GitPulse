@@ -301,6 +301,15 @@ plus the new, while its column, priority, owner, labels and logs stay as you
 left them — or, having read them, names every one to say its task is separate.
 Done cards never count. Importing a `tasks/` folder is not checked.
 
+An agent can merge duplicate cards into one with `gitpulse_merge_tasks`: the
+card that stays gains a `## Merged from …` section per merged card, their
+acceptance criteria and labels, and the most urgent priority, severity and due
+date among them, and the merged cards are deleted with the reason and the
+target in their history. An agent never deletes or merges away a card another
+agent is running, unless that agent is itself or you asked, and never changes
+a title or description you locked. An agent launched on a card that was
+merged or deleted is told where its work went.
+
 An agent can also delete a card, with `gitpulse_delete_task`, when the task
 should not exist — a duplicate, or one it merged into another. It must give a
 reason, which is added to the task's **Logs** before the delete, so the task's

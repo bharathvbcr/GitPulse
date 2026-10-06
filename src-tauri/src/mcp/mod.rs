@@ -16,9 +16,10 @@
 //!
 //! Nothing here writes git. The only writes are the task-board tools
 //! (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`,
-//! `gitpulse_delete_task`), which write the GitPulse task profile behind the
-//! repository trust gate. `gitpulse_delete_task` is the one destructive tool:
-//! a soft delete, annotated `destructiveHint: true`.
+//! `gitpulse_delete_task`, `gitpulse_merge_tasks`), which write the GitPulse
+//! task profile behind the repository trust gate. `gitpulse_delete_task` and
+//! `gitpulse_merge_tasks` are the destructive tools — both end in the store's
+//! soft delete — and are annotated `destructiveHint: true`.
 //! Any tool that would run a git mutation must go through
 //! `harness::guard_command`, and every writing tool must be added to the
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
@@ -711,6 +712,10 @@ fn build_tools() -> Vec<Value> {
                     "description": "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
                     "minimum": 1,
                     "maximum": 9_007_199_254_740_991_i64
+                },
+                "even_if_running": {
+                    "type": "boolean",
+                    "description": "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false"
                 }
             }),
             &["repo_path", "task_id", "reason"],
@@ -729,6 +734,68 @@ fn build_tools() -> Vec<Value> {
                     "sequence": { "type": ["integer", "null"] }
                 },
                 "required": ["ok", "outcome", "item_id", "status", "deleted", "revision", "reason_recorded", "repository"]
+            }),
+        ),
+        destructive_tool(
+            "gitpulse_merge_tasks",
+            "Merge tasks",
+            "Merge duplicate or overlapping tasks on the GitPulse task board into one that stays. Each source becomes a '## Merged from <item_id>' section of the target's description, with its status, priority and description; the target also gets every source's acceptance criteria and labels, the most urgent priority, highest severity and earliest due date among them, and a log block with your reason. Its title, status and owner stay. Then each source is deleted — the same soft delete as gitpulse_delete_task, with your reason in its history and the target named, so an agent launched on it is pointed at the target — and only at the revision that was copied, so no edit is ever lost with it. Source logs stay in each source's history. There is no unmerge over MCP; only the person can bring a source back. Refused, with nothing written: a source linked to another repository too (shared_task), one an agent may still be working on (task_in_use, unless even_if_running), a done target with an open source (target_done), a target whose description the person locked (field_locked), a merge too large for one task (merge_too_large). If it is interrupted or the board changes under it, it reports ok: false with outcome partial and every source's outcome; run the same call again to finish — nothing is copied twice. Idempotent: an already-merged source is reported as already_merged. Requires the repository to be trusted in GitPulse.",
+            json!({
+                "repo_path": repo_prop(),
+                "into_task_id": bounded_string_prop("The task that stays: its task_id or board item_id", 1, 128),
+                "into_expected_revision": {
+                    "type": "integer",
+                    "description": "Only merge if the target is still at this revision when the merge starts",
+                    "minimum": 1,
+                    "maximum": 9_007_199_254_740_991_i64
+                },
+                "sources": {
+                    "type": "array",
+                    "description": "The tasks to fold in and delete",
+                    "minItems": 1,
+                    "maxItems": crate::workbench::intake::MAX_MERGE_SOURCES,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": bounded_string_prop("Its task_id or board item_id", 1, 128),
+                            "expected_revision": {
+                                "type": "integer",
+                                "description": "Only merge if this task is still at this revision when the merge starts",
+                                "minimum": 1,
+                                "maximum": 9_007_199_254_740_991_i64
+                            }
+                        },
+                        "required": ["task_id"],
+                        "additionalProperties": false
+                    }
+                },
+                "reason": bounded_string_prop("Why these are one task, in a line or two; recorded on the target and on every source", 1, crate::workbench::intake::MAX_REASON_CHARS * 4),
+                "even_if_running": {
+                    "type": "boolean",
+                    "description": "Merge a source even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false"
+                }
+            }),
+            &["repo_path", "into_task_id", "sources", "reason"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "outcome": { "type": "string", "enum": ["merged", "unchanged", "partial"] },
+                    "item_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "status": { "type": "string" },
+                    "priority": { "type": "integer" },
+                    "revision": { "type": "integer" },
+                    "target_live": { "type": "boolean" },
+                    "repository": { "type": "object" },
+                    "sources": { "type": "array" },
+                    "added": { "type": "object" },
+                    "escalated": { "type": "array" },
+                    "logs_kept_in_history": { "type": "array" },
+                    "next_step": { "type": ["string", "null"] },
+                    "sequence": { "type": ["integer", "null"] }
+                },
+                "required": ["ok", "outcome", "item_id", "target_live", "repository", "sources", "added", "escalated", "logs_kept_in_history", "next_step"]
             }),
         ),
         tool(
@@ -850,7 +917,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task and gitpulse_delete_task — which a person sees on the GitPulse board. gitpulse_delete_task removes a card (soft, with a required reason kept in its history, and no undelete over MCP); use it only for a task that should not exist, never to finish one. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
+                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task, gitpulse_delete_task and gitpulse_merge_tasks — which a person sees on the GitPulse board. gitpulse_delete_task removes a card and gitpulse_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with gitpulse_merge_tasks rather than deleting all but one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -1172,6 +1239,39 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 task,
                 arguments["expected_revision"].as_i64(),
                 reason,
+                arguments["even_if_running"].as_bool().unwrap_or(false),
+            )
+            .map_err(workbench_message)
+        }
+        "gitpulse_merge_tasks" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let named = |task: &Value, revision: &Value| -> Result<_, String> {
+                Ok(crate::workbench::intake::MergeTask {
+                    task: task.as_str().ok_or("missing task_id")?.to_owned(),
+                    expected_revision: revision.as_i64(),
+                })
+            };
+            let into = named(
+                &arguments["into_task_id"],
+                &arguments["into_expected_revision"],
+            )?;
+            let sources = arguments["sources"]
+                .as_array()
+                .ok_or("missing sources")?
+                .iter()
+                .map(|source| named(&source["task_id"], &source["expected_revision"]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let reason = arguments["reason"].as_str().ok_or("missing reason")?;
+            // Reading, not creating: tasks to merge have to exist already.
+            let store = open_task_profile(false)?
+                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
+            crate::workbench::intake::merge_tasks(
+                &store,
+                repo,
+                &into,
+                &sources,
+                reason,
+                arguments["even_if_running"].as_bool().unwrap_or(false),
             )
             .map_err(workbench_message)
         }
@@ -2057,14 +2157,16 @@ mod tests {
                             | "gitpulse_import_tasks"
                             | "gitpulse_complete_task"
                             | "gitpulse_delete_task"
+                            | "gitpulse_merge_tasks"
                     ),
                     "unexpected mutating tool {name}"
                 );
-                // Deleting a card is the one destructive write, and it must
-                // say so: clients gate their approval prompt on this hint.
+                // Deleting a card, alone or by merging it into another, is
+                // the destructive write, and it must say so: clients gate
+                // their approval prompt on this hint.
                 assert_eq!(
                     tool["annotations"]["destructiveHint"],
-                    name == "gitpulse_delete_task",
+                    matches!(name, "gitpulse_delete_task" | "gitpulse_merge_tasks"),
                     "{name} has the wrong destructiveHint"
                 );
                 continue;
@@ -2649,6 +2751,10 @@ mod tests {
                 "`reason` is required (at most {} characters)",
                 grouped(crate::workbench::intake::MAX_REASON_CHARS)
             ),
+            format!(
+                "At most {} sources per call",
+                crate::workbench::intake::MAX_MERGE_SOURCES
+            ),
         ] {
             assert!(skill.contains(&claim), "SKILL.md does not state {claim:?}");
         }
@@ -2665,7 +2771,7 @@ mod tests {
                 (n.ends_with("_task") || n.ends_with("_tasks")) && n != "gitpulse_task_view"
             })
             .collect();
-        assert_eq!(task_tools.len(), 6, "{task_tools:?}");
+        assert_eq!(task_tools.len(), 7, "{task_tools:?}");
         for name in &task_tools {
             assert!(
                 skill.contains(&format!("| `{name}` |")),
@@ -2951,6 +3057,102 @@ mod tests {
             .clone()
     }
 
+    /// Through the real dispatch, on the profile the board reads: a filed
+    /// task folded into a card the person made, the argument schema enforced
+    /// before anything runs, and the same call again writing nothing.
+    #[test]
+    fn merging_over_mcp_folds_a_filed_task_into_the_persons_card() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (board, _) = board_task(profile.path(), &repo, "board-keep");
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-import", "title": "Importer survives a crash",
+                    "description": "token-dup", "acceptance_criteria": ["Keeps its cursor"],
+                    "reviewed_related": ["board-keep"] }),
+        );
+        assert!(!error, "{added}");
+
+        for (arguments, why) in [
+            (
+                json!({"repo_path": repo, "into_task_id": "board-keep", "sources": [], "reason": "r"}),
+                "no sources",
+            ),
+            (
+                json!({"repo_path": repo, "into_task_id": "board-keep", "sources": [{"task_id": "gp-dup-import", "force": true}], "reason": "r"}),
+                "unknown source field",
+            ),
+            (
+                json!({"repo_path": repo, "into_task_id": "board-keep", "sources": (0..=crate::workbench::intake::MAX_MERGE_SOURCES).map(|i| json!({"task_id": format!("t{i}")})).collect::<Vec<_>>(), "reason": "r"}),
+                "too many sources",
+            ),
+            (
+                json!({"repo_path": repo, "into_task_id": "board-keep", "sources": [{"task_id": "gp-dup-import"}]}),
+                "no reason",
+            ),
+            (
+                json!({"repo_path": repo, "into_task_id": "board-keep", "sources": [{"task_id": "gp-dup-import"}], "reason": "r", "even_if_running": "yes"}),
+                "string flag",
+            ),
+            (
+                json!({"repo_path": repo, "into_task_id": "board-keep", "sources": [{"task_id": "gp-dup-import", "expected_revision": "1"}], "reason": "r"}),
+                "string revision",
+            ),
+        ] {
+            let (error, message) = tool_json("gitpulse_merge_tasks", arguments);
+            assert!(
+                error && message.as_str().unwrap().starts_with("invalid arguments"),
+                "{why}: {message}"
+            );
+        }
+        assert!(
+            item_history(&board, added["item_id"].as_str().unwrap()).len() == 1,
+            "a refused call wrote nothing"
+        );
+
+        let call = json!({ "repo_path": repo, "into_task_id": "board-keep",
+                           "sources": [{"task_id": "gp-dup-import", "expected_revision": 1}],
+                           "reason": "Same importer work as the person's card." });
+        let (error, merged) = tool_json("gitpulse_merge_tasks", call.clone());
+        assert!(!error, "{merged}");
+        assert_eq!(
+            (merged["ok"].clone(), merged["outcome"].clone()),
+            (json!(true), json!("merged")),
+            "{merged:#}"
+        );
+        let kept = board
+            .board_request("items.get", r#"{"id":"board-keep"}"#)
+            .unwrap()["item"]
+            .clone();
+        assert!(
+            kept["description"].as_str().unwrap().contains("token-dup"),
+            "{kept}"
+        );
+        assert_eq!(
+            kept["acceptance_criteria"],
+            json!(["Resumes after a crash", "Keeps its cursor"])
+        );
+        assert_eq!(
+            (kept["status"].clone(), kept["owner"].clone()),
+            (json!("in_progress"), json!("@sam"))
+        );
+
+        let (error, gone) = tool_json(
+            "gitpulse_get_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-import" }),
+        );
+        let gone = gone.as_str().unwrap();
+        assert!(
+            error && gone.starts_with("task_merged:") && gone.contains("board-keep"),
+            "{gone}"
+        );
+
+        let (error, again) = tool_json("gitpulse_merge_tasks", call);
+        assert!(!error, "{again}");
+        assert_eq!(again["outcome"], "unchanged", "{again:#}");
+        assert_eq!(again["sources"][0]["outcome"], "already_merged");
+    }
+
     #[test]
     fn a_filed_task_deleted_by_its_task_id_leaves_the_board_and_stays_deleted() {
         let (dir, profile, repo) = task_fixture();
@@ -2997,8 +3199,13 @@ mod tests {
             "gitpulse_get_task",
             json!({ "repo_path": repo, "task_id": "gp-dup-login" }),
         );
+        // Not "no such task": an agent asking after it is told it was
+        // deleted, and why.
+        let gone = gone.as_str().unwrap();
         assert!(
-            error && gone.as_str().unwrap().contains("not_found"),
+            error
+                && gone.starts_with("task_deleted:")
+                && gone.contains("folded into gp-login-overhaul"),
             "{gone}"
         );
 

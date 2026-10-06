@@ -495,6 +495,41 @@ fn keep_unsent(fields: &mut Map<String, Value>, task: &ExternalTask, card: &Valu
     }
 }
 
+/// The fields a person locked on a card (title, description). A lock says the
+/// person's text stays as they wrote it; the board's Quick Enhance honours it,
+/// and so does every agent write: one that would change a locked field is
+/// refused rather than applied.
+fn locked_fields(item: &Value) -> Vec<&str> {
+    item["locked_fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+fn refuse_locked(
+    item: &Value,
+    id: &str,
+    fields: &Map<String, Value>,
+) -> Result<(), WorkbenchError> {
+    let changed: Vec<&str> = locked_fields(item)
+        .into_iter()
+        .filter(|field| {
+            fields
+                .get(*field)
+                .is_some_and(|value| *value != item[*field])
+        })
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(WorkbenchError::new(
+        "field_locked",
+        format!("The person locked the {} of task {id}, so an agent does not change it. Leave {} as it is, or ask them to unlock it.", changed.join(" and "), if changed.len() == 1 { "it" } else { "them" }),
+    ))
+}
+
 /// The live board item whose id is `key` itself, when it links `repository_id`:
 /// a key that is a board id rather than a filed task key.
 fn linked_board_item(
@@ -596,6 +631,7 @@ fn place_once(
             });
         }
         Some(item) => {
+            refuse_locked(item, &id, &fields)?;
             let same = fields.iter().all(|(key, value)| match key.as_str() {
                 "logs" => item["logs"].as_str().unwrap_or("") == value.as_str().unwrap_or(""),
                 _ => &item[key] == value,
@@ -905,6 +941,24 @@ pub(crate) fn add_task(
         let own = item_id(repository_id, &task.key);
         let creating = get_item(store, &own)?.is_none()
             && linked_board_item(store, repository_id, &task.key)?.is_none();
+        // A key that is the board id of a card deleted or merged away names
+        // that card, not a new one: filing under it would recreate exactly what
+        // was removed. Say where it went instead. (A deleted card under the
+        // key's derived id is `deleted_on_board`, below.)
+        if creating {
+            if let Some((gone, _)) = deleted_task(store, repository_id, &task.key)? {
+                if gone == task.key {
+                    return Err(find_live_task(store, repository_id, &task.key)
+                        .err()
+                        .unwrap_or_else(|| {
+                            WorkbenchError::new(
+                                "revision_conflict",
+                                format!("Task {gone} was just restored on the board; read it again before filing."),
+                            )
+                        }));
+                }
+            }
+        }
         if creating {
             let related = related_open_tasks(store, repository_id, &own, &task)?;
             let unreviewed: Vec<&Value> = related
@@ -1182,15 +1236,9 @@ pub(crate) fn get_task(
     repo_path: &str,
     task: &str,
 ) -> Result<Value, WorkbenchError> {
-    let local = resolve_for_agent(repo_path)?;
-    let repository = find(store, &local.identity)?.ok_or_else(|| {
-        WorkbenchError::new(
-            "not_found",
-            "This repository is not on the GitPulse board yet; no task has been filed under it.",
-        )
-    })?;
+    let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default();
-    let (id, item) = find_task(store, repository_id, task)?;
+    let (id, item) = find_live_task(store, repository_id, task)?;
     let brief = query(
         store,
         "items.brief.get",
@@ -1291,6 +1339,30 @@ fn append_log(logs: &str, block: &str) -> Option<String> {
     (joined.len() <= file_tasks::MAX_TASK_LOGS).then_some(joined)
 }
 
+/// The last block `marker` opens in `logs`: the last line that starts with
+/// `marker` and ends with ` ---`, and everything after it as the body. A note a
+/// person added after the block becomes part of that body, so the block no
+/// longer reads as this tool's own last write. A body that itself quotes the
+/// marker on a line of its own is not recognised and would be written again on
+/// a retry: a duplicate, never a write reported that did not happen.
+fn last_block<'a>(logs: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
+    let logs = logs.trim_end();
+    let start = logs.rfind(marker)?;
+    if start > 0 && !logs[..start].ends_with('\n') {
+        return None;
+    }
+    let (header, body) = logs[start..].split_once('\n')?;
+    header.ends_with(" ---").then_some((header, body))
+}
+
+/// Whether `logs` already ends with the block `marker` opens and `body` fills —
+/// exactly that body, as the last block. This is how a retry recognises its own
+/// earlier write. Text that merely ends the logs is not that block: matching it
+/// reported a summary or reason as recorded when it never was.
+fn ends_with_block(logs: &str, marker: &str, body: &str) -> bool {
+    last_block(logs, marker).is_some_and(|(_, last)| last == body.trim())
+}
+
 /// Statuses an agent may move its own task to. `done` is where a finished
 /// task goes (and is the board's archive); `review` hands it to a person;
 /// `in_progress` says work has started.
@@ -1341,16 +1413,10 @@ pub(crate) fn complete_task(
             format!("The summary exceeds {MAX_SUMMARY_CHARS} characters."),
         ));
     }
-    let local = resolve_for_agent(repo_path)?;
-    let repository = find(store, &local.identity)?.ok_or_else(|| {
-        WorkbenchError::new(
-            "not_found",
-            "This repository is not on the GitPulse board yet; no task has been filed under it.",
-        )
-    })?;
+    let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
     for _ in 0..2 {
-        let (id, item) = find_task(store, &repository_id, task)?;
+        let (id, item) = find_live_task(store, &repository_id, task)?;
         let revision = item["revision"].as_i64().unwrap_or_default();
         if expected_revision.is_some_and(|expected| expected != revision) {
             return Err(WorkbenchError::new(
@@ -1362,10 +1428,9 @@ pub(crate) fn complete_task(
         let logs = item["logs"].as_str().unwrap_or_default();
         let block = summary.map(|s| summary_block(status, s, now_millis()));
         // The marker carries a timestamp, so compare the summary text itself:
-        // the same summary already recorded under the same status is a retry.
+        // the same summary as the last block, under the same status, is a retry.
         let recorded = summary.is_some_and(|s| {
-            logs.contains(&format!("--- Agent moved this task to {status} ("))
-                && logs.trim_end().ends_with(s)
+            ends_with_block(logs, &format!("--- Agent moved this task to {status} ("), s)
         });
         let response = |outcome: &str, item: &Value, sequence: Option<u64>| {
             json!({
@@ -1423,16 +1488,52 @@ pub(crate) fn complete_task(
     ))
 }
 
-/// Bound on the reason an agent gives for deleting a task.
+/// Bound on the reason an agent gives for deleting or merging a task.
 pub(crate) const MAX_REASON_CHARS: usize = 1000;
 /// Opens the log block a deletion reason is recorded in. Present tense on
 /// purpose: the block is written before the delete, and if the delete is then
 /// refused the task is still there carrying it.
 const DELETION_MARKER: &str = "--- Agent is deleting this task (";
+/// Opens the log block a merged task carries as it is deleted. The target's
+/// item id follows, so a deleted task can say where its work went.
+const MERGE_MARKER: &str = "--- Agent merged this task into ";
+
+fn timestamp(at_ms: i64) -> String {
+    crate::ledger::ids::iso8601_utc(u64::try_from(at_ms).unwrap_or_default())
+}
 
 fn deletion_block(reason: &str, at_ms: i64) -> String {
-    let at = crate::ledger::ids::iso8601_utc(u64::try_from(at_ms).unwrap_or_default());
-    format!("{DELETION_MARKER}{at}) ---\n{reason}")
+    format!("{DELETION_MARKER}{}) ---\n{reason}", timestamp(at_ms))
+}
+
+/// A reason as both destructive tools require it: present, and bounded.
+fn check_reason<'a>(reason: &'a str, doing: &str) -> Result<&'a str, WorkbenchError> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("A reason is required: say why {doing}. It is kept in the task's history."),
+        ));
+    }
+    if reason.chars().count() > MAX_REASON_CHARS {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("The reason exceeds {MAX_REASON_CHARS} characters."),
+        ));
+    }
+    Ok(reason)
+}
+
+/// The board record of the repository an agent names, which has to exist
+/// already for any write but an add.
+fn board_repository(store: &Store, repo_path: &str) -> Result<Value, WorkbenchError> {
+    let local = resolve_for_agent(repo_path)?;
+    find(store, &local.identity)?.ok_or_else(|| {
+        WorkbenchError::new(
+            "not_found",
+            "This repository is not on the GitPulse board yet; no task has been filed under it.",
+        )
+    })
 }
 
 /// The last recorded revision of an item, deleted or not; `None` when the
@@ -1487,6 +1588,230 @@ fn deleted_task(
     Ok(None)
 }
 
+/// Where a deleted task's work went, as its last log block says.
+#[derive(Debug, PartialEq, Eq)]
+enum Gone {
+    Merged { into: String, reason: String },
+    Deleted { reason: Option<String> },
+}
+
+fn why_gone(body: &Value) -> Gone {
+    let logs = body["logs"].as_str().unwrap_or_default();
+    if let Some((header, reason)) = last_block(logs, MERGE_MARKER) {
+        if let Some(into) = header[MERGE_MARKER.len()..].split_whitespace().next() {
+            return Gone::Merged {
+                into: into.to_owned(),
+                reason: reason.to_owned(),
+            };
+        }
+    }
+    Gone::Deleted {
+        reason: last_block(logs, DELETION_MARKER).map(|(_, reason)| reason.to_owned()),
+    }
+}
+
+/// A live task by key or item id; a deleted one is named as deleted, with
+/// where its work went, rather than reported as never having existed. An
+/// agent launched on a task that was merged or deleted under it is told so.
+fn find_live_task(
+    store: &Store,
+    repository_id: &str,
+    task: &str,
+) -> Result<(String, Value), WorkbenchError> {
+    match find_task(store, repository_id, task) {
+        Err(error) if error.code == "not_found" => {
+            let Some((id, body)) = deleted_task(store, repository_id, task)? else {
+                return Err(error);
+            };
+            let title = body["title"].as_str().unwrap_or_default();
+            Err(match why_gone(&body) {
+                Gone::Merged { into, reason } => WorkbenchError::new(
+                    "task_merged",
+                    format!("Task {id} ({title:?}) was merged into {into}: {reason}\nIts work continues there; read it with gitpulse_get_task and task_id {into}."),
+                ),
+                Gone::Deleted { reason } => WorkbenchError::new(
+                    "task_deleted",
+                    match reason {
+                        Some(reason) => format!("Task {id} ({title:?}) was deleted: {reason}\nIt cannot be read or completed; ask the person whether the work is still wanted."),
+                        None => format!("Task {id} ({title:?}) was deleted on the board, with no reason recorded. It cannot be read or completed; ask the person whether the work is still wanted."),
+                    },
+                ),
+            })
+        }
+        found => found,
+    }
+}
+
+/// How many repositories other than `repository_id` a task is linked to.
+fn other_repositories(item: &Value, repository_id: &str) -> usize {
+    item["repository_ids"].as_array().map_or(0, |ids| {
+        ids.iter()
+            .filter(|v| v.as_str() != Some(repository_id))
+            .count()
+    })
+}
+
+/// Refuse a destructive write on a task other repositories see too: deleting
+/// it here would delete it there.
+fn refuse_shared(item: &Value, repository_id: &str) -> Result<(), WorkbenchError> {
+    let others = other_repositories(item, repository_id);
+    if others == 0 {
+        return Ok(());
+    }
+    Err(WorkbenchError::new(
+        "shared_task",
+        format!("Task {} is linked to {others} other repositor{} as well, and deleting it here would delete it there too. Ask the person to do this on the board.", item["id"].as_str().unwrap_or_default(), if others == 1 { "y" } else { "ies" }),
+    ))
+}
+
+/// Run states in which an agent may still be working on its task: prepared
+/// and not yet expired, starting, running, or unresolved (its outcome is
+/// uncertain, so its process may be alive).
+const LIVE_RUN_STATES: [&str; 4] = ["prepared", "starting", "running", "unresolved"];
+
+/// The live agent attempts on a task. `complete` is false when there were more
+/// than one page could show, which counts as in use: unread is not idle.
+pub(crate) struct LiveRuns {
+    pub runs: Vec<Value>,
+    pub complete: bool,
+}
+
+fn live_runs(store: &Store, task_id: &str) -> Result<LiveRuns, WorkbenchError> {
+    let now = now_millis() / 1000;
+    let mut runs = Vec::new();
+    let mut complete = true;
+    for state in LIVE_RUN_STATES {
+        let input = json!({"task_id": task_id, "state": state, "limit": 200});
+        let page = query(store, "runs.list", &input.to_string())?;
+        let items = page["items"]
+            .as_array()
+            .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid run page."))?;
+        runs.extend(
+            items
+                .iter()
+                .filter(|run| state != "prepared" || run["expires_at"].as_i64().unwrap_or(i64::MAX) > now)
+                .map(|run| json!({"run_id": run["id"], "state": run["state"], "provider": run["provider"]})),
+        );
+        complete &= page["has_more"] != true;
+    }
+    Ok(LiveRuns { runs, complete })
+}
+
+/// Refuse to delete a task an agent may still be working on, unless the
+/// caller said it knows: the running agent is itself, or the person asked.
+fn refuse_in_use(
+    store: &Store,
+    id: &str,
+    item: &Value,
+    even_if_running: bool,
+) -> Result<(), WorkbenchError> {
+    if even_if_running {
+        return Ok(());
+    }
+    let live = live_runs(store, id)?;
+    if live.runs.is_empty() && live.complete {
+        return Ok(());
+    }
+    let listed: Vec<String> = live
+        .runs
+        .iter()
+        .take(10)
+        .map(|run| {
+            format!(
+                "{} ({}, {})",
+                run["run_id"].as_str().unwrap_or_default(),
+                run["state"].as_str().unwrap_or_default(),
+                run["provider"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    Err(WorkbenchError::new(
+        "task_in_use",
+        format!(
+            "Task {id} ({:?}) has {}{} agent attempt{} that may still be working on it: {}. Removing it would pull the task out from under {}. If the running agent is you, or the person asked for this, call again with even_if_running: true.",
+            item["title"].as_str().unwrap_or_default(),
+            if live.complete { "" } else { "at least " },
+            live.runs.len().max(1),
+            if live.runs.len() == 1 { "" } else { "s" },
+            if listed.is_empty() { "more than one page of attempts".to_owned() } else { listed.join(", ") },
+            if live.runs.len() == 1 { "it" } else { "them" },
+        ),
+    ))
+}
+
+/// What removing one task came to.
+enum Removal {
+    /// Deleted; the store's receipt.
+    Deleted(Value),
+    /// The task changed under one of the two writes, so it was not deleted.
+    /// `recorded`: the block was written (and stays on the live task).
+    Changed { recorded: bool },
+}
+
+/// Record `block` as the task's last log block (unless `recorded` says it
+/// already is) and soft delete the task at the revision that write produced,
+/// through the store's own `items.delete` — the same delete as the board's.
+///
+/// `items.delete` takes no payload, so that is two writes, each conditional on
+/// the revision before it: a task that changes in between is left live and
+/// reported as [`Removal::Changed`], never deleted at a revision this call did
+/// not read. That is what lets a merge promise it deletes only the revision it
+/// copied.
+fn record_and_delete(
+    store: &Store,
+    id: &str,
+    item: &Value,
+    block: &str,
+    recorded: bool,
+    request: &str,
+) -> Result<Removal, WorkbenchError> {
+    let mut revision = item["revision"]
+        .as_i64()
+        .ok_or_else(|| WorkbenchError::new("protocol_error", "The task has no revision."))?;
+    if !recorded {
+        let logs = item["logs"].as_str().unwrap_or_default();
+        let joined = append_log(logs, block).ok_or_else(|| {
+            WorkbenchError::new(
+                "invalid_input",
+                format!("Task {id}'s logs are full, so the reason cannot be recorded; shorten the reason."),
+            )
+        })?;
+        let mut input = resend(item, id, revision, request);
+        input.insert("logs".into(), json!(joined));
+        match query(store, "items.put", &Value::Object(input).to_string()) {
+            Ok(saved) => {
+                revision = saved["item"]["revision"].as_i64().ok_or_else(|| {
+                    WorkbenchError::new(
+                        "protocol_error",
+                        "The store did not report the task's revision.",
+                    )
+                })?;
+            }
+            Err(error) if error.code == "revision_conflict" => {
+                return Ok(Removal::Changed { recorded: false })
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let input = json!({"id": id, "request_id": fresh_id(request), "expected_revision": revision});
+    match query(store, "items.delete", &input.to_string()) {
+        Ok(receipt) => {
+            // The receipt the board's own delete holds the store to.
+            if receipt["item"]["deleted"] != true
+                || receipt["item"]["revision"].as_i64() != Some(revision + 1)
+            {
+                return Err(WorkbenchError::new(
+                    "protocol_error",
+                    "The store's delete receipt does not show the task deleted at the next revision.",
+                ));
+            }
+            Ok(Removal::Deleted(receipt))
+        }
+        Err(error) if error.code == "revision_conflict" => Ok(Removal::Changed { recorded: true }),
+        Err(error) => Err(error),
+    }
+}
+
 /// Delete a board task on an agent's behalf, through the store's own
 /// `items.delete` — the same soft delete the board's Delete performs. The row
 /// and its revision history stay in the profile, the id is never reused, and
@@ -1494,41 +1819,24 @@ fn deleted_task(
 ///
 /// The reason is required and is recorded first, as a block appended to the
 /// task's logs; the deleted revision carries those logs, so the reason is in
-/// the task's history and in the deletion event itself. `items.delete` takes no
-/// payload of its own, so that is two store writes, not one: when the task
-/// changes between them nothing is deleted, the task keeps the reason block,
+/// the task's history and in the deletion event itself. When the task changes
+/// between the two writes nothing is deleted, the task keeps the reason block,
 /// and the call is refused (or, with no `expected_revision`, retried on top of
 /// the person's edit — the block is recognised and not appended twice).
 ///
-/// A task linked to more than this repository is refused: deleting it here
-/// would delete it from the others too. A task already deleted is `unchanged`.
+/// Refused: a task linked to more than this repository (deleting it here would
+/// delete it from the others too), and one an agent may still be working on
+/// unless `even_if_running`. A task already deleted is `unchanged`.
 pub(crate) fn delete_task(
     store: &Store,
     repo_path: &str,
     task: &str,
     expected_revision: Option<i64>,
     reason: &str,
+    even_if_running: bool,
 ) -> Result<Value, WorkbenchError> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err(WorkbenchError::new(
-            "invalid_input",
-            "A reason is required: say why this task is being deleted. It is kept in the task's history.",
-        ));
-    }
-    if reason.chars().count() > MAX_REASON_CHARS {
-        return Err(WorkbenchError::new(
-            "invalid_input",
-            format!("The reason exceeds {MAX_REASON_CHARS} characters."),
-        ));
-    }
-    let local = resolve_for_agent(repo_path)?;
-    let repository = find(store, &local.identity)?.ok_or_else(|| {
-        WorkbenchError::new(
-            "not_found",
-            "This repository is not on the GitPulse board yet; no task has been filed under it.",
-        )
-    })?;
+    let reason = check_reason(reason, "this task is being deleted")?;
+    let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
     let response =
         |outcome: &str, id: &str, item: &Value, recorded: bool, sequence: Option<u64>| {
@@ -1551,9 +1859,11 @@ pub(crate) fn delete_task(
             Err(error) if error.code == "not_found" => {
                 return match deleted_task(store, &repository_id, task)? {
                     Some((id, body)) => {
-                        let recorded = body["logs"].as_str().is_some_and(|logs| {
-                            logs.contains(DELETION_MARKER) && logs.trim_end().ends_with(reason)
-                        });
+                        let recorded = ends_with_block(
+                            body["logs"].as_str().unwrap_or_default(),
+                            DELETION_MARKER,
+                            reason,
+                        );
                         Ok(response("unchanged", &id, &body, recorded, None))
                     }
                     None => Err(error),
@@ -1561,64 +1871,24 @@ pub(crate) fn delete_task(
             }
             Err(error) => return Err(error),
         };
-        let mut revision = item["revision"].as_i64().unwrap_or_default();
+        let revision = item["revision"].as_i64().unwrap_or_default();
         if expected_revision.is_some_and(|expected| expected != revision) {
             return Err(WorkbenchError::new(
                 "revision_conflict",
                 format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before deleting it.", expected_revision.unwrap_or_default()),
             ));
         }
-        let others = item["repository_ids"].as_array().map_or(0, |ids| {
-            ids.iter()
-                .filter(|v| v.as_str() != Some(&repository_id))
-                .count()
-        });
-        if others > 0 {
-            return Err(WorkbenchError::new(
-                "shared_task",
-                format!("This task is linked to {others} other repositor{} as well, and deleting it here would delete it there too. Ask the person to delete it on the board.", if others == 1 { "y" } else { "ies" }),
-            ));
-        }
-        let logs = item["logs"].as_str().unwrap_or_default();
+        refuse_shared(&item, &repository_id)?;
+        refuse_in_use(store, &id, &item, even_if_running)?;
         // A retry after a refused delete finds its own reason already there.
-        let recorded = logs.contains(DELETION_MARKER) && logs.trim_end().ends_with(reason);
-        if !recorded {
-            let joined = append_log(logs, &deletion_block(reason, now_millis())).ok_or_else(|| {
-                WorkbenchError::new(
-                    "invalid_input",
-                    "The task's logs are full, so the reason cannot be recorded; shorten the reason.",
-                )
-            })?;
-            let mut input = resend(&item, &id, revision, "delete-reason");
-            input.insert("logs".into(), json!(joined));
-            match query(store, "items.put", &Value::Object(input).to_string()) {
-                Ok(saved) => {
-                    revision = saved["item"]["revision"].as_i64().ok_or_else(|| {
-                        WorkbenchError::new(
-                            "protocol_error",
-                            "The store did not report the task's revision.",
-                        )
-                    })?;
-                }
-                Err(error) if error.code == "revision_conflict" && expected_revision.is_none() => {
-                    continue
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let input =
-            json!({"id": id, "request_id": fresh_id("delete"), "expected_revision": revision});
-        match query(store, "items.delete", &input.to_string()) {
-            Ok(receipt) => {
-                // The receipt the board's own delete holds the store to.
-                if receipt["item"]["deleted"] != true
-                    || receipt["item"]["revision"].as_i64() != Some(revision + 1)
-                {
-                    return Err(WorkbenchError::new(
-                        "protocol_error",
-                        "The store's delete receipt does not show the task deleted at the next revision.",
-                    ));
-                }
+        let recorded = ends_with_block(
+            item["logs"].as_str().unwrap_or_default(),
+            DELETION_MARKER,
+            reason,
+        );
+        let block = deletion_block(reason, now_millis());
+        match record_and_delete(store, &id, &item, &block, recorded, "delete")? {
+            Removal::Deleted(receipt) => {
                 return Ok(response(
                     "deleted",
                     &id,
@@ -1627,16 +1897,21 @@ pub(crate) fn delete_task(
                     receipt["sequence"].as_u64(),
                 ));
             }
-            Err(error) if error.code == "revision_conflict" && expected_revision.is_none() => {
-                continue
-            }
-            Err(error) if error.code == "revision_conflict" => {
+            // A person saved it between our read and our write. Their
+            // content wins; delete again from what they saved.
+            Removal::Changed { .. } if expected_revision.is_none() => continue,
+            Removal::Changed { recorded: false } => {
                 return Err(WorkbenchError::new(
                     "revision_conflict",
-                    format!("The reason was recorded at revision {revision}, but the task changed before it could be deleted, so nothing was deleted. Re-read it with gitpulse_get_task and try again."),
+                    format!("The task changed after revision {revision} was read, so nothing was recorded or deleted. Re-read it with gitpulse_get_task and try again."),
                 ));
             }
-            Err(error) => return Err(error),
+            Removal::Changed { recorded: true } => {
+                return Err(WorkbenchError::new(
+                    "revision_conflict",
+                    "The reason was recorded, but the task changed before it could be deleted, so nothing was deleted. Re-read it with gitpulse_get_task and try again.",
+                ));
+            }
         }
     }
     Err(WorkbenchError::new(
@@ -1652,6 +1927,14 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+#[path = "intake_merge.rs"]
+mod merge;
+pub(crate) use merge::{merge_tasks, MergeTask, MAX_MERGE_SOURCES};
+
 #[cfg(test)]
 #[path = "intake_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "intake_merge_tests.rs"]
+mod merge_tests;

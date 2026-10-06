@@ -1,6 +1,6 @@
 use super::*;
 
-fn profile() -> (tempfile::TempDir, PathBuf) {
+pub(super) fn profile() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workbench.sqlite");
     (dir, path)
@@ -14,16 +14,16 @@ fn untrusted_repo() -> tempfile::TempDir {
     dir
 }
 
-fn git_repo() -> tempfile::TempDir {
+pub(super) fn git_repo() -> tempfile::TempDir {
     crate::test_support::git_repo()
 }
 
-fn registered(store: &Store, repo: &tempfile::TempDir) -> Value {
+pub(super) fn registered(store: &Store, repo: &tempfile::TempDir) -> Value {
     let local = resolve(repo.path().to_str().unwrap()).unwrap();
     register(store, &local, &fresh_id("repo"), &fresh_id("intake")).unwrap()["repository"].clone()
 }
 
-fn task(key: &str, title: &str) -> ExternalTask {
+pub(super) fn task(key: &str, title: &str) -> ExternalTask {
     ExternalTask {
         key: key.into(),
         title: title.into(),
@@ -31,7 +31,7 @@ fn task(key: &str, title: &str) -> ExternalTask {
     }
 }
 
-fn items(store: &Store, repository: &Value) -> Vec<Value> {
+pub(super) fn items(store: &Store, repository: &Value) -> Vec<Value> {
     let page = query(
         store,
         "items.list",
@@ -510,4 +510,268 @@ fn an_item_at_the_derived_id_that_belongs_elsewhere_is_never_replaced() {
     }
     let kept = query(&store, "items.get", &json!({"id": squatted}).to_string()).unwrap();
     assert_eq!(kept["item"]["title"], "Not yours");
+}
+
+// --- Audit: what an agent is told, what it may overwrite, what it may delete --
+
+pub(super) fn live(store: &Store, id: &str) -> Option<Value> {
+    get_item(store, id).unwrap()
+}
+
+/// A person's edit on the board: the item as read, `change` applied on top,
+/// saved at the revision it was read at. Returns the saved item.
+pub(super) fn person_edits(
+    store: &Store,
+    id: &str,
+    change: impl FnOnce(&mut Map<String, Value>),
+) -> Value {
+    let item = live(store, id).expect("live item");
+    let mut input = resend(&item, id, item["revision"].as_i64().unwrap(), "person");
+    change(&mut input);
+    query(store, "items.put", &Value::Object(input).to_string()).unwrap()["item"].clone()
+}
+
+/// An agent attempt prepared on `id`, as a launch leaves it before it starts:
+/// live for the next five minutes.
+pub(super) fn prepare_run(store: &Store, repo: &tempfile::TempDir, id: &str, run: &str) {
+    let item = live(store, id).unwrap();
+    let repository_id = item["primary_repository_id"].as_str().unwrap();
+    let repository = query(
+        store,
+        "repositories.get",
+        &json!({"id": repository_id}).to_string(),
+    )
+    .unwrap()["item"]
+        .clone();
+    let root = repo.path().canonicalize().unwrap();
+    let git = root.join(".git");
+    query(
+        store,
+        "runs.prepare",
+        &json!({
+            "id": run, "request_id": format!("prepare-{run}"), "expected_revision": 0,
+            "task_id": id, "source_revision": item["revision"], "repository_id": repository_id,
+            "repository_revision": repository["revision"], "provider": "claude",
+            "permission_mode": "ask", "cwd": root, "git_dir": git, "git_common_dir": git,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// A task on the board, placed directly: these tests are not about the
+/// related-task gate, and their titles deliberately overlap.
+pub(super) fn filed(store: &Store, repo: &tempfile::TempDir, key: &str, title: &str) -> String {
+    filed_with(store, repo, task(key, title))
+}
+
+pub(super) fn filed_with(store: &Store, repo: &tempfile::TempDir, task: ExternalTask) -> String {
+    let repository = registered(store, repo);
+    place(store, &repository, &task, false, now_millis())
+        .unwrap()
+        .item_id
+}
+
+/// A summary is "already recorded" only when it is the body of the last
+/// block this tool wrote. A person's note that merely ends with the same
+/// words used to make a retry report `summary_recorded: true` for a summary
+/// that was never written.
+#[test]
+fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-ship", "Ship the exporter");
+    complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        None,
+        Some("Exporter shipped"),
+    )
+    .unwrap();
+    person_edits(&store, &id, |input| {
+        let logs = input["logs"].as_str().unwrap().to_owned();
+        input.insert(
+            "logs".into(),
+            json!(format!("{logs}\n\nChecked by hand: release notes shipped")),
+        );
+    });
+
+    let again = complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        None,
+        Some("release notes shipped"),
+    )
+    .unwrap();
+    assert_eq!(again["outcome"], "updated", "{again}");
+    assert_eq!(again["summary_recorded"], true);
+    let logs = live(&store, &id).unwrap()["logs"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        logs.trim_end().ends_with("---\nrelease notes shipped"),
+        "the summary is its own block: {logs}"
+    );
+    // And the genuine retry is still recognised: no third block.
+    let retry = complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        None,
+        Some("release notes shipped"),
+    )
+    .unwrap();
+    assert_eq!(retry["outcome"], "unchanged");
+    assert_eq!(
+        logs.matches("--- Agent moved this task to done (").count(),
+        2
+    );
+}
+
+/// The same for a deletion reason: one that merely ends the logs was
+/// skipped, so the task was deleted with no deletion block at all.
+#[test]
+fn a_deletion_reason_is_written_as_its_own_block() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-dup", "Duplicate exporter card");
+    person_edits(&store, &id, |input| {
+        input.insert(
+            "logs".into(),
+            json!("--- Agent is deleting this task (2026-01-01T00:00:00Z) ---\nOlder attempt\n\nNote: duplicate of gp-ship"),
+        );
+    });
+    let deleted = delete_task(&store, repo_path, &id, None, "duplicate of gp-ship", false).unwrap();
+    assert_eq!(deleted["outcome"], "deleted");
+    let last = last_revision(&store, &id).unwrap().unwrap();
+    assert!(
+        last["logs"]
+            .as_str()
+            .unwrap()
+            .trim_end()
+            .ends_with("---\nduplicate of gp-ship"),
+        "{last}"
+    );
+}
+
+/// A field the person locked is theirs. An agent's overwrite used to replace
+/// it wholesale; it is now refused, and a write that leaves it as it is still
+/// goes through.
+#[test]
+fn an_overwrite_never_rewrites_a_field_the_person_locked() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let mut first = task("gp-lock", "Locked card");
+    first.description = "Exactly as the person wrote it".into();
+    add_task(&store, repo_path, first.clone(), false, &[]).unwrap();
+    let id = item_id(
+        find(&store, &resolve(repo_path).unwrap().identity)
+            .unwrap()
+            .unwrap()["id"]
+            .as_str()
+            .unwrap(),
+        "gp-lock",
+    );
+    person_edits(&store, &id, |input| {
+        input.insert("locked_fields".into(), json!(["description"]));
+    });
+
+    let mut rewrite = first.clone();
+    rewrite.description = "An agent's rewrite".into();
+    let error = add_task(&store, repo_path, rewrite, true, &[]).expect_err("refused");
+    assert_eq!(error.code, "field_locked", "{}", error.message);
+    assert_eq!(
+        live(&store, &id).unwrap()["description"],
+        "Exactly as the person wrote it"
+    );
+
+    let mut other = first.clone();
+    other.priority = Some(0);
+    let saved = add_task(&store, repo_path, other, true, &[]).unwrap();
+    assert_eq!(saved["outcome"], "updated");
+    assert_eq!(saved["priority"], 0);
+    assert_eq!(
+        live(&store, &id).unwrap()["description"],
+        "Exactly as the person wrote it"
+    );
+}
+
+/// Another agent's attempt on the task is live: deleting it would pull the
+/// task out from under that agent. Refused unless the caller says so.
+#[test]
+fn a_task_another_agent_is_running_is_not_deleted_by_default() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    // A finished attempt does not hold its task. (One live attempt per
+    // checkout, so it is prepared and cancelled first.)
+    let other = filed(&store, &repo, "gp-idle", "Card whose attempt was cancelled");
+    prepare_run(&store, &repo, &other, "run-idle");
+    query(
+        &store,
+        "runs.cancel",
+        &json!({"id": "run-idle", "request_id": "cancel-idle", "expected_revision": 1}).to_string(),
+    )
+    .unwrap();
+
+    let id = filed(&store, &repo, "gp-busy", "Card an agent is working on");
+    prepare_run(&store, &repo, &id, "run-busy");
+    let error = delete_task(&store, repo_path, &id, None, "duplicate", false).expect_err("refused");
+    assert_eq!(error.code, "task_in_use", "{}", error.message);
+    assert!(error.message.contains("run-busy"), "{}", error.message);
+    assert!(live(&store, &id).is_some());
+
+    assert_eq!(
+        delete_task(&store, repo_path, &other, None, "duplicate", false).unwrap()["outcome"],
+        "deleted"
+    );
+
+    // The caller who is that agent, or was asked by the person, says so.
+    let forced = delete_task(&store, repo_path, &id, None, "duplicate", true).unwrap();
+    assert_eq!(forced["outcome"], "deleted");
+}
+
+/// A launched agent whose task was deleted under it was told only that no
+/// such task exists. It is now told it was deleted, and why.
+#[test]
+fn an_agent_whose_task_was_deleted_is_told_so_and_why() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-gone", "Card that will be deleted");
+    delete_task(
+        &store,
+        repo_path,
+        &id,
+        None,
+        "Folded into the exporter card",
+        false,
+    )
+    .unwrap();
+
+    for error in [
+        complete_task(&store, repo_path, &id, "done", None, Some("did it")).expect_err("deleted"),
+        get_task(&store, repo_path, &id).expect_err("deleted"),
+    ] {
+        assert_eq!(error.code, "task_deleted", "{}", error.message);
+        assert!(
+            error.message.contains("Folded into the exporter card"),
+            "{}",
+            error.message
+        );
+    }
 }
