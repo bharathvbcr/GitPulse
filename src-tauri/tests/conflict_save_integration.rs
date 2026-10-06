@@ -12,6 +12,10 @@ fn fixture() -> TempDir {
     fixture_with_format("sha1")
 }
 fn fixture_with_format(format: &str) -> TempDir {
+    // These tests are about conflict-save behaviour, not the production spawn
+    // rate. Every test starts here and the suite shares one process gate, so
+    // a parallel run otherwise spends the burst and defers git mid-save.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().unwrap();
     let path = dir.path();
     run_git(

@@ -58,6 +58,11 @@ impl TestRepo {
     }
 
     fn init_with(extra_init_args: &[&str]) -> Self {
+        // These tests are about git operation behaviour, not the production
+        // spawn rate. Every test that reaches the gate starts here and the
+        // suite shares one process gate, so a parallel run otherwise spends
+        // the burst and defers git mid-operation.
+        gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
         let dir = TempDir::new().expect("tempdir");
         let mut args = vec!["init", "-b", "main"];
         args.extend_from_slice(extra_init_args);

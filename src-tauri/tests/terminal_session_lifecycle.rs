@@ -25,6 +25,10 @@ impl Drop for TerminalCleanup {
 }
 
 fn repo() -> tempfile::TempDir {
+    // These tests are about session lifetime, not the production spawn rate.
+    // Every test starts here, and the race below opens 128 sessions whose
+    // repository validation would otherwise queue behind the rate in one gate.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])

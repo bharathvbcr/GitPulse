@@ -493,6 +493,9 @@ fn hostile_repository_roots_are_refused_or_handled() {
 /// crashed.
 #[test]
 fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking() {
+    // Char-boundary safety, not the production spawn rate: one detail read per
+    // commit would otherwise run at the sustained rate once the burst is spent.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = dir.path();
     git_in(repo, &["init", "-q", "-b", "main"]);
@@ -564,6 +567,8 @@ fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking(
 /// text and whitespace, to catch offsets the systematic sweep does not name.
 #[test]
 fn randomized_multibyte_commit_bodies_never_panic() {
+    // Char-boundary safety, not the production spawn rate (see above).
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().expect("temp dir");
     let repo = dir.path();
     git_in(repo, &["init", "-q", "-b", "main"]);

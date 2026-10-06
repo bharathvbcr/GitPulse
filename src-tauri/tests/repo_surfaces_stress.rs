@@ -33,6 +33,11 @@ fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 fn init_repo() -> TempDir {
+    // These tests are about stash, remote and submodule behaviour under
+    // contention, not the production spawn rate. Every test starts here and
+    // the suite shares one process gate, so a parallel run otherwise spends
+    // the burst and defers git mid-listing.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     run_git(dir.path(), &["init", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "t@example.com"]);
