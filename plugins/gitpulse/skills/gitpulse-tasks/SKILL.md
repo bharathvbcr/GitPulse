@@ -32,10 +32,35 @@ GitPulse and trust it. No write can start an agent run, and only
 
 ## Before you file a task
 
-1. Call `gitpulse_list_tasks` with the absolute `repo_path` to see what is
-   already there, so you do not file a duplicate under a different `task_id`.
-2. `repository: null` in the answer means no task has ever been filed under
-   this repository. It does not mean its tasks are all done.
+A person reads every card on the board. Thirty narrow cards from one review are
+thirty things to triage; five that each own a concern are a plan. File the
+fewest tasks that cover the work.
+
+1. Call `gitpulse_list_tasks` with the absolute `repo_path` and read what is
+   already open. `repository: null` means no task has ever been filed under
+   this repository — not that its tasks are all done.
+2. **Group before you file.** When you have several findings, sort them by the
+   concern they share — the same subsystem, the same root cause, the same fix —
+   and file one task per concern, each finding an acceptance criterion. One
+   task per finding is the wrong shape.
+3. **Fold into an open task** when your work belongs to one: read it with
+   `gitpulse_get_task`, then call `gitpulse_add_task` with its `item_id` as
+   `task_id` and `overwrite: true`. Every field you send replaces the card's,
+   so send its existing title, description and criteria **plus** yours. Every
+   field you leave out — status, priority, severity, owner, due date, labels,
+   logs — stays exactly as the card had it, as do its column position and links.
+4. File a new task only for work no open task covers.
+
+`gitpulse_add_task` holds you to this. A new task that looks like open work —
+two shared title words, or one shared title word and a shared label that is not
+just that word again — is refused with `related_tasks_exist`, and nothing is
+filed. The refusal lists the related open tasks (`item_id`, status, title, and
+what they share). Read them, then either fold your work into one (step 3), or,
+when it is genuinely separate work, call again with `reviewed_related` naming
+**every** listed `item_id`. Naming some of them is refused again. A finished
+(`done`) task never counts, and an overwrite is never checked. The success
+answer carries `related_check`: how many related open tasks there were, how many
+open tasks were compared, and whether that was all of them (`scan_complete`).
 
 ## Filing a task
 
@@ -62,9 +87,11 @@ GitPulse and trust it. No write can start an agent run, and only
 
 `task_id` is the task's stable key. Filing the same `task_id` again is refused
 with `already_exists`, so a retried call never makes a duplicate card. Pass
-`overwrite: true` to replace the task's content; its column position and links
-on the board are kept. A task the person deleted on the board stays deleted
-(`deleted_on_board`); choose another `task_id`.
+`overwrite: true` to replace the task's content — under the `task_id` it was
+filed with, or under a board `item_id`, which is how you extend a task the
+person made on the board. Its column position and links on the board are kept.
+A task the person deleted on the board stays deleted (`deleted_on_board`);
+choose another `task_id`.
 
 | Parameter | Required | Rule |
 | --- | --- | --- |
@@ -83,7 +110,8 @@ on the board are kept. A task the person deleted on the board stays deleted
 | `planned_files` | no | At most 256. The board has no planned-files field, so they are kept as a `## Planned files` section of the description. |
 | `repositories` | no | Other related repository names, kept as a `## Related repositories` section. |
 | `logs` | no | Raw evidence kept verbatim, at most 256 KiB. |
-| `overwrite` | no | Replace an existing task's content. |
+| `overwrite` | no | Replace an existing task's content, by `task_id` or board `item_id`. |
+| `reviewed_related` | no | At most 25 `item_id`s: every task a `related_tasks_exist` refusal listed, once you have read them and judged this separate. |
 
 ## Importing briefs from `tasks/`
 
@@ -91,6 +119,10 @@ on the board are kept. A task the person deleted on the board stays deleted
 and puts each brief on the board under its key: the brief's `id`, else its file
 name. It is safe to run again. Briefs already on the board are left alone unless
 you pass `replace: true`.
+
+Import is the person's bulk path and is **not** checked for related open tasks.
+If you are the one writing the briefs, group them first, exactly as in
+[Before you file a task](#before-you-file-a-task): one brief per concern.
 
 Every file is accounted for. Each entry in `entries` has an `outcome`:
 `created`, `updated`, `unchanged`, `already_present`, `deleted_on_board`,

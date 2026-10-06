@@ -293,6 +293,14 @@ up as it does any external write. An agent never reopens a task that is already
 Done, and an agent without the GitPulse MCP server configured cannot move it at
 all — the card then stays where it was for you to move.
 
+An agent filing work keeps the board small. `gitpulse_add_task` refuses a new
+card while an open card looks like the same work (two shared title words, or one
+and a shared label), and lists those cards. The agent then folds its work into
+one of them — rewriting its title, description and criteria with the old content
+plus the new, while its column, priority, owner, labels and logs stay as you
+left them — or, having read them, names every one to say its task is separate.
+Done cards never count. Importing a `tasks/` folder is not checked.
+
 An agent can also delete a card, with `gitpulse_delete_task`, when the task
 should not exist — a duplicate, or one it merged into another. It must give a
 reason, which is added to the task's **Logs** before the delete, so the task's

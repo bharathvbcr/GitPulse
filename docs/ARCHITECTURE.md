@@ -670,6 +670,15 @@ with the reason and nothing deleted. A task already deleted is found through
 `items.history` (which, unlike `items.get`, still sees it) and answered
 `unchanged`; a task linked to other repositories is refused as `shared_task`.
 There is no undelete over MCP.
+`intake.rs::add_task` gates creation, never overwrite: `related_open_tasks`
+pages `items.list` one open column at a time (bounded at 2,000 open cards, with
+`scan_complete` reporting whether that was all of them) and treats a card as
+related when it shares two significant title words, or one and a label that is
+not that same word. Any related card not named in `reviewed_related` refuses the
+add as `related_tasks_exist`. `place` accepts a board item id as the key under
+`replace`, so related work can be folded into a card the person made on the
+board; `keep_unsent` keeps every field the call did not send, so a fold-in never
+resets the person's status, priority, owner, criteria or logs.
 Real Git tests cover linked worktrees, distinct clones, malformed/bare/unavailable
 checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise

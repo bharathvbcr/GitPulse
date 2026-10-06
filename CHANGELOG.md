@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Added
 
+- **Agents group work instead of filing a card per finding.**
+  `gitpulse_add_task` refuses a new task with `related_tasks_exist` while the
+  repository has open tasks that look like the same work, and lists them. The
+  agent folds its work into one — `overwrite: true` now also takes a board
+  `item_id`, so a card the person made can be extended — or names every listed
+  task in `reviewed_related` to say its task is separate. The gitpulse-tasks
+  skill, the tool description and the server instructions tell agents to read
+  the board and group findings by concern first. Overwrites and `tasks/`
+  imports are not gated.
 - **Agents can delete a board task.** `gitpulse_delete_task` on the GitPulse
   MCP server removes a card through the board's own `items.delete`, by its
   filed `task_id` or its board `item_id`, with a required reason that is

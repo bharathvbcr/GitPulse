@@ -461,6 +461,56 @@ fn get_item(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
     }
 }
 
+/// For an update to an existing card: every field `task` left unset keeps
+/// the card's value instead of `item_fields`' default. Without this, folding a
+/// line of work into a person's card would move it back to inbox, reset its
+/// priority, drop its criteria and owner, and clear its logs.
+fn keep_unsent(fields: &mut Map<String, Value>, task: &ExternalTask, card: &Value) {
+    let unsent = [
+        ("status", task.status.is_none()),
+        ("priority", task.priority.is_none()),
+        ("severity", task.severity.is_none()),
+        ("kind", task.kind.is_none()),
+        ("owner", task.owner.is_none()),
+        ("due_at", task.due.is_none()),
+        ("labels", task.labels.is_empty()),
+        ("acceptance_criteria", task.acceptance_criteria.is_empty()),
+        (
+            "description",
+            task.description.trim().is_empty()
+                && task.planned_files.is_empty()
+                && task.repositories.is_empty(),
+        ),
+        ("logs", task.logs.is_none()),
+    ];
+    for (key, keep) in unsent {
+        if !keep {
+            continue;
+        }
+        if card[key].is_null() {
+            fields.remove(key);
+        } else {
+            fields.insert(key.into(), card[key].clone());
+        }
+    }
+}
+
+/// The live board item whose id is `key` itself, when it links `repository_id`:
+/// a key that is a board id rather than a filed task key.
+fn linked_board_item(
+    store: &Store,
+    repository_id: &str,
+    key: &str,
+) -> Result<Option<Value>, WorkbenchError> {
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Ok(None);
+    }
+    Ok(get_item(store, key)?.filter(|item| links(item, repository_id)))
+}
+
 /// Put one task on the board under `repository` (a registered record).
 pub(crate) fn place(
     store: &Store,
@@ -484,7 +534,7 @@ fn place_once(
         .as_str()
         .ok_or_else(|| WorkbenchError::new("protocol_error", "Repository record has no id."))?;
     let repository_name = repository["name"].as_str().unwrap_or_default();
-    let fields = task
+    let mut fields = task
         .item_fields(repository_name)
         .map_err(|message| WorkbenchError::new("invalid_input", message))?;
     let id = item_id(repository_id, &task.key);
@@ -503,15 +553,13 @@ fn place_once(
     }
 
     // A brief exported from the board names the board's own id as its key.
-    // Importing it back must find that task, not mint a twin of it.
-    if current.is_none()
-        && task
-            .key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        if let Some(original) = get_item(store, &task.key)? {
-            if links(&original, repository_id) {
+    // Importing it back must find that task, not mint a twin of it — and with
+    // `replace`, its content is updated, which is how an agent folds new work
+    // into a card it found on the board. Such a card may be the person's, so
+    // only what the call actually sends changes; the rest stays as it was.
+    let (id, current) = match current {
+        None => match linked_board_item(store, repository_id, &task.key)? {
+            Some(original) if !replace => {
                 return Ok(Placed {
                     outcome: Outcome::AlreadyPresent,
                     item_id: task.key.clone(),
@@ -519,8 +567,14 @@ fn place_once(
                     sequence: None,
                 });
             }
-        }
-    }
+            Some(original) => {
+                keep_unsent(&mut fields, task, &original);
+                (task.key.clone(), Some(original))
+            }
+            None => (id, None),
+        },
+        current => (id, current),
+    };
 
     let mut input = fields.clone();
     input.insert("id".into(), json!(id));
@@ -622,17 +676,287 @@ fn repository_summary(repository: &Value) -> Value {
     json!({"id": repository["id"], "name": repository["name"]})
 }
 
+/// Words that appear in titles of every kind, so sharing one says nothing
+/// about two tasks being the same work.
+const GENERIC_WORDS: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "into",
+    "that",
+    "this",
+    "are",
+    "not",
+    "but",
+    "its",
+    "can",
+    "has",
+    "have",
+    "should",
+    "when",
+    "all",
+    "any",
+    "add",
+    "fix",
+    "make",
+    "use",
+    "new",
+    "task",
+    "support",
+    "update",
+    "implement",
+    "improve",
+    "allow",
+    "via",
+    "per",
+    "one",
+    "get",
+    "after",
+    "before",
+    "also",
+    "only",
+    "more",
+    "than",
+    "then",
+    "does",
+    "doesn",
+    "isn",
+    "won",
+    "which",
+    "there",
+    "their",
+    "them",
+    "out",
+    "now",
+    "still",
+];
+/// Bound on the related tasks one refusal names.
+pub(crate) const MAX_RELATED: usize = 25;
+/// Bound on the open tasks read to look for related ones.
+const MAX_SCANNED_TASKS: usize = 2000;
+
+/// The words of a title that can say what it is about: lowercased, three
+/// characters or more, a trailing plural `s` dropped, generic words removed.
+fn title_words(title: &str) -> std::collections::BTreeSet<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| w.chars().count() >= 3 && !GENERIC_WORDS.contains(&w.as_str()))
+        .map(|w| match w.strip_suffix('s') {
+            Some(stem)
+                if stem.chars().count() >= 4
+                    && !["ss", "us", "is"].iter().any(|end| w.ends_with(end)) =>
+            {
+                stem.to_owned()
+            }
+            _ => w,
+        })
+        .collect()
+}
+
+/// Open tasks of a repository that look like the same work as a task about
+/// to be filed: two shared title words, or one shared title word and a shared
+/// label that is not just that word again ("DevMap: …" labelled `devmap` on
+/// both sides is one coincidence, not two). Deliberately generous — a false
+/// match costs the agent one look and one `reviewed_related` entry; a missed
+/// one costs the person a duplicate card.
+pub(crate) struct Related {
+    pub tasks: Vec<Value>,
+    /// Open tasks compared, and whether that was every open task.
+    pub compared: usize,
+    pub complete: bool,
+}
+
+/// The board columns a task is still open in: every status but `done`.
+fn open_statuses() -> impl Iterator<Item = &'static str> {
+    file_tasks::STATUSES
+        .into_iter()
+        .filter(|status| *status != "done")
+}
+
+fn related_open_tasks(
+    store: &Store,
+    repository_id: &str,
+    exclude_id: &str,
+    task: &ExternalTask,
+) -> Result<Related, WorkbenchError> {
+    let words = title_words(&task.title);
+    let labels: std::collections::BTreeSet<String> = task
+        .labels
+        .iter()
+        .map(|l| l.trim().to_lowercase())
+        .collect();
+    let normalized = |title: &str| {
+        title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let own_title = normalized(&task.title);
+    let mut scored = Vec::new();
+    let mut compared = 0;
+    let mut complete = true;
+    // Column by column, so the bound is spent on open work and never on an
+    // archive of done cards.
+    'columns: for status in open_statuses() {
+        if compared >= MAX_SCANNED_TASKS {
+            complete = false;
+            break;
+        }
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut input = json!({"repository_id": repository_id, "status": status, "limit": 200});
+            if let Some(cursor) = &cursor {
+                input["cursor"] = json!(cursor);
+            }
+            let page = query(store, "items.list", &input.to_string())?;
+            let items = page["items"]
+                .as_array()
+                .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid task page."))?;
+            for item in items {
+                let id = item["id"].as_str().unwrap_or_default();
+                if id == exclude_id {
+                    continue;
+                }
+                compared += 1;
+                let title = item["title"].as_str().unwrap_or_default();
+                let shared_words: std::collections::BTreeSet<String> =
+                    title_words(title).intersection(&words).cloned().collect();
+                let shared_labels: Vec<String> = item["labels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|l| l.as_str().map(|l| l.trim().to_lowercase()))
+                    .filter(|l| labels.contains(l))
+                    .collect();
+                let distinct_labels = shared_labels
+                    .iter()
+                    .filter(|label| !title_words(label).is_subset(&shared_words))
+                    .count();
+                let same_title = normalized(title) == own_title;
+                if same_title
+                    || shared_words.len() >= 2
+                    || (!shared_words.is_empty() && distinct_labels > 0)
+                {
+                    let score =
+                        shared_words.len() + distinct_labels + usize::from(same_title) * 100;
+                    scored.push((
+                        score,
+                        json!({
+                            "item_id": id, "title": title, "status": item["status"],
+                            "revision": item["revision"],
+                            "shared_words": shared_words, "shared_labels": shared_labels,
+                        }),
+                    ));
+                }
+            }
+            if page["has_more"] != true {
+                break;
+            }
+            if compared >= MAX_SCANNED_TASKS {
+                complete = false;
+                break 'columns;
+            }
+            let next = page["next_cursor"]
+                .as_str()
+                .ok_or_else(|| WorkbenchError::new("protocol_error", "Missing task cursor."))?;
+            if cursor.as_deref() == Some(next) {
+                return Err(WorkbenchError::new(
+                    "protocol_error",
+                    "Task cursor did not advance.",
+                ));
+            }
+            cursor = Some(next.to_owned());
+        }
+    }
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+    Ok(Related {
+        tasks: scored.into_iter().map(|(_, task)| task).collect(),
+        compared,
+        complete,
+    })
+}
+
 /// Add one task for an agent. An existing key is refused unless `replace`.
+///
+/// A new task is refused with `related_tasks_exist` while the repository has
+/// open tasks that look like the same work, unless every one of them is named
+/// in `reviewed_related` — the agent saying it read them and this is separate.
+/// The point is the read: agents filed thirty-odd near-duplicates on one board
+/// when nothing made them look first. Folding work into an existing task is
+/// `replace` with that task's task_id or item_id, which this never gates.
 pub(crate) fn add_task(
     store: &Store,
     repo_path: &str,
     task: ExternalTask,
     replace: bool,
+    reviewed_related: &[String],
 ) -> Result<Value, WorkbenchError> {
     let local = resolve_for_agent(repo_path)?;
     // Validate before registering, so a bad request leaves no trace.
     task.item_fields(&local.name)
         .map_err(|message| WorkbenchError::new("invalid_input", message))?;
+    let mut related_seen = None;
+    if let Some(repository) = find(store, &local.identity)? {
+        let repository_id = repository["id"].as_str().unwrap_or_default();
+        let own = item_id(repository_id, &task.key);
+        let creating = get_item(store, &own)?.is_none()
+            && linked_board_item(store, repository_id, &task.key)?.is_none();
+        if creating {
+            let related = related_open_tasks(store, repository_id, &own, &task)?;
+            let unreviewed: Vec<&Value> = related
+                .tasks
+                .iter()
+                .filter(|t| {
+                    !reviewed_related
+                        .iter()
+                        .any(|r| t["item_id"].as_str() == Some(r.trim()))
+                })
+                .collect();
+            if !unreviewed.is_empty() {
+                let listed: Vec<String> = unreviewed
+                    .iter()
+                    .take(MAX_RELATED)
+                    .map(|t| {
+                        format!(
+                            "- {} [{}] {} (shared: {})",
+                            t["item_id"].as_str().unwrap_or_default(),
+                            t["status"].as_str().unwrap_or_default(),
+                            t["title"].as_str().unwrap_or_default(),
+                            t["shared_words"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .chain(t["shared_labels"].as_array().into_iter().flatten())
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                    .collect();
+                let more = unreviewed.len().saturating_sub(MAX_RELATED);
+                return Err(WorkbenchError::new(
+                    "related_tasks_exist",
+                    format!(
+                        "Not filed: this repository already has {} open task{} that may be the same work. Read {} with gitpulse_get_task first.\n{}{}\nIf this belongs in one of them, fold it in instead: call gitpulse_add_task with that task's item_id as task_id and overwrite: true, carrying its existing content plus yours. If it is genuinely separate, call again with reviewed_related listing every item_id above.",
+                        unreviewed.len(),
+                        if unreviewed.len() == 1 { "" } else { "s" },
+                        if unreviewed.len() == 1 { "it" } else { "them" },
+                        listed.join("\n"),
+                        if more > 0 { format!("\n…and {more} more; narrow the title or fold this into one of these.") } else { String::new() },
+                    ),
+                ));
+            }
+            related_seen = Some(json!({
+                "related_open_tasks": related.tasks.len(),
+                "open_tasks_compared": related.compared,
+                "scan_complete": related.complete,
+            }));
+        }
+    }
     let registered = register(store, &local, &fresh_id("repo"), &fresh_id("intake"))?;
     let repository = &registered["repository"];
     let placed = place(store, repository, &task, replace, now_millis())?;
@@ -665,6 +989,9 @@ pub(crate) fn add_task(
                     "repositories": task.repositories.iter().filter(|r| !r.eq_ignore_ascii_case(&local.name)).count(),
                 },
                 "sequence": placed.sequence,
+                // What the related-task check saw. Null when it did not run:
+                // an overwrite, or the repository's first task.
+                "related_check": related_seen,
             }))
         }
     }

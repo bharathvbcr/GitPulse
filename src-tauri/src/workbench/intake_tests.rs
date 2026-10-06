@@ -186,6 +186,39 @@ fn an_exported_board_brief_imported_back_finds_its_original() {
     assert_eq!(back.outcome, Outcome::AlreadyPresent);
     assert_eq!(back.item_id, original.item_id);
     assert_eq!(items(&store, &repository).len(), 1);
+
+    // With replace, the board id is the task to update — never a twin of it.
+    let replaced = place(
+        &store,
+        &repository,
+        &task(&original.item_id, "Original, with the merged work"),
+        true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(replaced.outcome, Outcome::Updated);
+    assert_eq!(replaced.item_id, original.item_id);
+    assert_eq!(
+        replaced.item.unwrap()["title"],
+        "Original, with the merged work"
+    );
+    assert_eq!(items(&store, &repository).len(), 1);
+}
+
+#[test]
+fn title_words_keep_what_a_title_is_about() {
+    let words = super::title_words("Fix: the DevMap resolver drops calls into other crates");
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    assert_eq!(
+        words,
+        vec!["call", "crate", "devmap", "drop", "other", "resolver"]
+    );
+    // Too short, generic, or only digits-and-noise: nothing to match on.
+    assert!(super::title_words("Task 12").is_empty());
+    assert!(super::title_words("Add support for it").is_empty());
+    // "status" and "class" keep their s; "process" is not "proces".
+    let kept = super::title_words("status class process");
+    assert!(kept.contains("status") && kept.contains("class") && kept.contains("process"));
 }
 
 #[test]
@@ -266,6 +299,7 @@ fn add_refuses_an_untrusted_repository_and_a_bad_request_registers_nothing() {
         untrusted.path().to_str().unwrap(),
         task("gp-a", "A"),
         false,
+        &[],
     )
     .unwrap_err();
     assert_eq!(error.code, "untrusted_repository");
@@ -276,6 +310,7 @@ fn add_refuses_an_untrusted_repository_and_a_bad_request_registers_nothing() {
         trusted.path().to_str().unwrap(),
         task("gp-a", ""),
         false,
+        &[],
     )
     .unwrap_err();
     assert_eq!(error.code, "invalid_input");
@@ -304,6 +339,7 @@ fn a_linked_worktree_files_under_the_same_repository() {
         worktree.to_str().unwrap(),
         task("gp-wt", "From a worktree"),
         false,
+        &[],
     )
     .unwrap();
     let main = registered(&store, &repo);
@@ -335,6 +371,7 @@ fn concurrent_writers_never_duplicate_or_lose_a_task() {
                         &repo_path,
                         task(&format!("gp-{k}"), &format!("Task {k}")),
                         false,
+                        &[],
                     ) {
                         Ok(v) => outcomes.push(v["outcome"].as_str().unwrap().to_string()),
                         Err(e) => outcomes.push(e.code),

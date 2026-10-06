@@ -529,7 +529,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_add_task",
             "Add task",
-            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate. Planned files are kept as a section of the description. Recorded in the board's event history.",
+            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. Planned files are kept as a section of the description. Recorded in the board's event history.",
             json!({
                 "repo_path": repo_prop(),
                 "title": bounded_string_prop("Task title: one line, at most 300 characters", 1, 1200),
@@ -553,8 +553,9 @@ fn build_tools() -> Vec<Value> {
                 "logs": bounded_string_prop("Raw logs or traces kept verbatim as evidence (up to 256 KiB)", 0, crate::tasks::file_tasks::MAX_TASK_LOGS),
                 "overwrite": {
                     "type": "boolean",
-                    "description": "Replace the content of the task already filed under this task_id (default false). Its column position and links are kept."
-                }
+                    "description": "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours."
+                },
+                "reviewed_related": string_array_prop("item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work", crate::workbench::intake::MAX_RELATED, 128)
             }),
             &["repo_path", "title"],
             json!({
@@ -569,7 +570,8 @@ fn build_tools() -> Vec<Value> {
                     "status": { "type": "string" },
                     "priority": { "type": "integer" },
                     "repository": { "type": "object" },
-                    "folded_into_description": { "type": "object" }
+                    "folded_into_description": { "type": "object" },
+                    "related_check": { "type": ["object", "null"] }
                 },
                 "required": ["ok", "outcome", "task_id", "item_id", "title", "status", "priority", "repository"]
             }),
@@ -848,7 +850,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task and gitpulse_delete_task — which a person sees on the GitPulse board. gitpulse_delete_task removes a card (soft, with a required reason kept in its history, and no undelete over MCP); use it only for a task that should not exist, never to finish one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
+                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task and gitpulse_delete_task — which a person sees on the GitPulse board. gitpulse_delete_task removes a card (soft, with a required reason kept in its history, and no undelete over MCP); use it only for a task that should not exist, never to finish one. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -1094,9 +1096,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 logs: text("logs"),
             };
             let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
+            let reviewed = parse_string_vec(&arguments["reviewed_related"]).unwrap_or_default();
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
-            crate::workbench::intake::add_task(&store, repo, task, overwrite)
+            crate::workbench::intake::add_task(&store, repo, task, overwrite, &reviewed)
                 .map_err(workbench_message)
         }
         "gitpulse_import_tasks" => {
@@ -2639,6 +2642,10 @@ mod tests {
             format!("at most {} bytes; default", ft::MAX_KIND_BYTES),
             format!("At most {} bytes. |", ft::MAX_OWNER_BYTES),
             format!(
+                "At most {} `item_id`s",
+                crate::workbench::intake::MAX_RELATED
+            ),
+            format!(
                 "`reason` is required (at most {} characters)",
                 grouped(crate::workbench::intake::MAX_REASON_CHARS)
             ),
@@ -3216,6 +3223,156 @@ mod tests {
                 "{expected}: {message}"
             );
         }
+    }
+
+    /// The defect this gate answers: agents filed one task per finding — 39 on
+    /// one board, 31 of which were later merged away — because nothing made
+    /// them read the board before adding to it.
+    #[test]
+    fn a_task_like_open_work_is_refused_until_it_is_folded_in_or_reviewed() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        // A finished task never gates; an unrelated one is listed nowhere.
+        let (error, done) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "dm-old", "title": "DevMap receiver attribution for method calls, first pass", "status": "done" }),
+        );
+        assert!(!error, "{done}");
+        assert_eq!(
+            done["related_check"],
+            Value::Null,
+            "the repository's first task has nothing to be checked against"
+        );
+        let (error, first) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "dm-crate-calls", "title": "DevMap: Rust calls into another crate get no caller edge", "labels": ["devmap", "resolver"] }),
+        );
+        assert!(!error, "{first}");
+        assert_eq!(
+            first["related_check"]["related_open_tasks"], 0,
+            "done work is not open work"
+        );
+        let first_id = first["item_id"].as_str().unwrap().to_owned();
+        let (error, unrelated) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "ci-windows", "title": "No Windows CI job runs the Go host tests" }),
+        );
+        assert!(!error, "{unrelated}");
+        assert_eq!(unrelated["related_check"]["related_open_tasks"], 0);
+        assert_eq!(unrelated["related_check"]["scan_complete"], true);
+        assert_eq!(
+            unrelated["related_check"]["open_tasks_compared"], 1,
+            "the done task is not compared"
+        );
+        // A shared subsystem prefix that is also the shared label is one
+        // coincidence, not two: every DevMap card would otherwise gate.
+        let (error, corpus) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "dm-corpus", "title": "DevMap: precision corpus is too thin", "labels": ["devmap"] }),
+        );
+        assert!(!error, "{corpus}");
+        assert_eq!(corpus["related_check"]["related_open_tasks"], 0);
+
+        // The same kind of finding again: refused, and told where it belongs.
+        let second = json!({ "repo_path": repo, "task_id": "dm-receiver", "title": "DevMap: method calls on a typed receiver get no caller edge", "labels": ["devmap"] });
+        let (error, refused) = tool_json("gitpulse_add_task", second.clone());
+        assert!(error, "{refused}");
+        let message = refused.as_str().unwrap();
+        assert!(message.starts_with("related_tasks_exist"), "{message}");
+        assert!(message.contains(&first_id), "{message}");
+        assert!(!message.contains("Windows"), "{message}");
+        assert!(message.contains("overwrite: true"), "{message}");
+        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert_eq!(listed["total"], 4, "a refusal files nothing");
+
+        // Reviewing something else does not count.
+        let mut wrong = second.clone();
+        wrong["reviewed_related"] = json!(["ft-0000"]);
+        let (error, still) = tool_json("gitpulse_add_task", wrong);
+        assert!(
+            error && still.as_str().unwrap().starts_with("related_tasks_exist"),
+            "{still}"
+        );
+
+        // Folding it in: the existing task, by its item_id, takes both.
+        let (error, folded) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo, "task_id": first_id, "overwrite": true,
+                "title": "DevMap: cross-crate and typed-receiver calls get no caller edge",
+                "labels": ["devmap", "resolver"],
+                "acceptance_criteria": ["`other_crate::f` gets an edge", "`recv.method()` on a typed receiver gets an edge"],
+            }),
+        );
+        assert!(!error, "{folded}");
+        assert_eq!(folded["outcome"], "updated");
+        assert_eq!(folded["item_id"], first_id.as_str());
+        assert_eq!(
+            folded["related_check"],
+            Value::Null,
+            "an overwrite is never gated"
+        );
+        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert_eq!(listed["total"], 4, "folded, not added");
+
+        // Or, having read it and judged it separate, filed with the review named.
+        let mut reviewed = second;
+        reviewed["reviewed_related"] = json!([first_id]);
+        let (error, filed) = tool_json("gitpulse_add_task", reviewed);
+        assert!(!error, "{filed}");
+        assert_eq!(filed["outcome"], "created");
+        assert_eq!(filed["related_check"]["related_open_tasks"], 1);
+    }
+
+    #[test]
+    fn related_work_folds_into_a_task_the_person_made_on_the_board() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "6a1d0c2e-board-made";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        // Every related task must be named; naming one of two is not enough.
+        let (error, _) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "imp-crash", "title": "Importer loses rows after a crash", "labels": ["import"], "reviewed_related": [id] }),
+        );
+        assert!(!error);
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "imp-resume", "title": "Importer should be resumable after a crash", "labels": ["import"], "reviewed_related": [id] }),
+        );
+        assert!(error, "{refused}");
+        let message = refused.as_str().unwrap();
+        assert!(message.contains("1 open task "), "{message}");
+        assert!(!message.contains(id), "{message}");
+
+        let (error, folded) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo, "task_id": id, "overwrite": true,
+                "title": "Make the importer resumable", "description": "Background\n\nAlso: resume must not re-import committed rows.",
+                "acceptance_criteria": ["Resumes after a crash", "Never re-imports a committed row"],
+            }),
+        );
+        assert!(!error, "{folded}");
+        assert_eq!(folded["outcome"], "updated");
+        let item = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert!(item["description"].as_str().unwrap().contains("re-import"));
+        assert_eq!(
+            item["acceptance_criteria"],
+            json!(["Resumes after a crash", "Never re-imports a committed row"])
+        );
+        assert_eq!(item["position"], 7, "where it sits on the board is kept");
+        assert_eq!(item["revision"], 2);
+        // What the agent did not send is the person's, and stays as they left it.
+        assert_eq!(item["status"], "in_progress");
+        assert_eq!(item["priority"], 1);
+        assert_eq!(item["severity"], "high");
+        assert_eq!(item["owner"], "@sam");
+        assert_eq!(item["labels"], json!(["import"]));
+        assert_eq!(item["logs"], "first trace");
     }
 
     #[test]
