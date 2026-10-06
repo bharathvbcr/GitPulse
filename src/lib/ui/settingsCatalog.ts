@@ -72,6 +72,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   { id: "agent-live-runs", section: "agents", label: "Agents running at once", keywords: "concurrent parallel simultaneous many multiple agents sessions tasks attempts at once limit capacity managed manvi worktree" },
   { id: "terminal-sessions", section: "agents", label: "Terminal sessions open at once", keywords: "terminal sessions shells tabs pty open at once concurrent parallel many limit capacity maximum console agent tabs task terminals" },
   { id: "agent-setting-sources", section: "agents", label: "Claude Code settings files", keywords: "claude settings sources setting-sources project local user settings.json settings.local.json hooks allow list permissions repository trust power advanced" },
+  { id: "agent-models", section: "agents", label: "Agent models", keywords: "model models claude antigravity agy codex grok opus sonnet haiku fable opusplan gemini effort reasoning thinking fallback advisor routing --model --effort --fallback-model advisorModel" },
   { id: "hygiene-defaults", section: "hygiene", label: "Hygiene defaults", keywords: "repository hygiene default retention days inherit override per repository shared cache review weekly all repositories scope storage preview" },
   { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {

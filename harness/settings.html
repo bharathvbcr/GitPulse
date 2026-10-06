@@ -96,15 +96,92 @@
       // with what was stored, so the panel shows the saved limit afterwards
       // and a refused value can be told apart from one that never left.
       let agentDefaults = { permission: {} };
+      // terminal_command::model_launchers / EFFORT_LEVELS, as the backend sends them.
+      const modelFields = {
+        agy: ["model", "effort"],
+        claude: ["model", "effort", "fallback", "advisor"],
+        codex: ["model"],
+        grok: ["model"],
+      };
+      const effortLevels = ["low", "medium", "high", "xhigh", "max"];
       const agentView = () => ({
         defaults: agentDefaults,
         modes: ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"],
         launchers: ["claude", "codex", "grok", "agy"],
+        model_fields: modelFields,
+        effort_levels: effortLevels,
+        model_listing: { agy: "listed", claude: "known" },
       });
+      // cmd_agent_models, shaped as agent_models.rs answers. The real `agy
+      // models` output (1.2.17) for agy; Claude's aliases plus one model from
+      // "the user's settings" for claude. `window.__gpAgyModels` switches the
+      // agy answer: "ok", "fail" (non-zero exit), "slow" (2 s), "throw".
+      window.__gpAgyModels = "ok";
+      window.__gpModelCalls = [];
+      const agyModels = [
+        ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
+        ["gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"],
+        ["gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"],
+        ["claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"],
+      ];
+      const claudeAliases = ["default", "best", "fable", "opus", "sonnet", "haiku", "opusplan", "fable[1m]", "opus[1m]", "sonnet[1m]"];
+      const catalogAnswer = (launcher, refresh) => {
+        const base = { launcher, fetched_at: Date.now(), cached: false, skipped: 0, truncated: false, error: null };
+        if (launcher === "claude") {
+          return {
+            ...base, listing: "known", command: null,
+            models: [...claudeAliases.map((id) => ({ id, label: null, source: "alias" })), { id: "claude-opus-5-5", label: null, source: "settings" }],
+          };
+        }
+        if (launcher !== "agy") throw `${launcher} has no model list GitPulse can read.`;
+        const mode = window.__gpAgyModels;
+        if (mode === "throw") throw "agy is not available on the terminal PATH.";
+        if (mode === "fail") return { ...base, listing: "listed", command: "agy models", models: [], error: "agy models exited with status 1: not signed in" };
+        return { ...base, listing: "listed", command: "agy models", cached: !refresh && window.__gpModelCalls.filter((c) => c.launcher === "agy").length > 1, models: agyModels.map(([id, label]) => ({ id, label, source: "cli" })) };
+      };
+      // terminal_command::validate_model_choice: a field the launcher does not
+      // take, a malformed name, an unknown level or a bad fallback list is
+      // refused, never dropped; an empty choice is stored as no entry.
+      const modelId = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]*$/;
+      const checkId = (what, id) => {
+        if (typeof id !== "string" || id.length === 0 || id.length > 160 || !modelId.test(id)) {
+          throw `The ${what} ${JSON.stringify(id)} is not a model name.`;
+        }
+      };
+      const canonicalModels = (models) => {
+        const out = {};
+        for (const [launcher, choice] of Object.entries(models ?? {})) {
+          const fields = modelFields[launcher];
+          if (!fields) throw `${launcher} does not take a model setting.`;
+          for (const key of Object.keys(choice)) {
+            if (!fields.includes(key)) throw `${launcher} does not take a ${key} setting.`;
+          }
+          if (choice.model !== undefined) checkId("model", choice.model);
+          if (choice.advisor !== undefined) checkId("advisor model", choice.advisor);
+          if (choice.effort !== undefined && !effortLevels.includes(choice.effort)) {
+            throw `${JSON.stringify(choice.effort)} is not an effort level.`;
+          }
+          if (choice.fallback !== undefined) {
+            const list = choice.fallback;
+            if (!Array.isArray(list) || list.length === 0 || list.length > 4) throw "Name between 1 and 4 fallback models.";
+            list.forEach((id, i) => {
+              checkId("fallback model", id);
+              if (list.indexOf(id) !== i) throw `The fallback model ${JSON.stringify(id)} is listed twice.`;
+            });
+          }
+          if (Object.keys(choice).length) out[launcher] = choice;
+        }
+        return out;
+      };
       window.__gpAgentDefaults = () => agentDefaults;
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
           if (cmd === "cmd_agent_defaults") return agentView();
+          if (cmd === "cmd_agent_models") {
+            window.__gpModelCalls.push({ ...args });
+            if (args?.launcher === "agy" && window.__gpAgyModels === "slow") await new Promise((r) => setTimeout(r, 2000));
+            return catalogAnswer(args?.launcher, args?.refresh === true);
+          }
           if (cmd === "cmd_agent_defaults_save") {
             const limit = args?.defaults?.max_live_runs;
             if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= 64)) {
@@ -127,6 +204,11 @@
               if (kept.length === 0) throw "Claude Code needs at least one settings source";
               if (kept.length === order.length) delete next.claude_setting_sources;
               else next.claude_setting_sources = kept;
+            }
+            if (next.models !== undefined) {
+              const models = canonicalModels(next.models);
+              if (Object.keys(models).length) next.models = models;
+              else delete next.models;
             }
             agentDefaults = next;
             return agentView();

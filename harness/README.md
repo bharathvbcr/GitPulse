@@ -408,6 +408,17 @@ three appliers `App.svelte` runs. `window.__gp` exposes the stores and
   `display: none` — the attribute alone is not enough, which is why app.css
   carries `[hidden] { display: none !important }`.
 
+**Agents → Agent models** runs against a mocked backend that applies the same
+save rules as `validate_model_choice` (`window.__gpAgentDefaults()` reads what
+was stored). `cmd_agent_models` answers like `agent_models.rs`: Claude's
+aliases plus one "settings" model, and for Antigravity the real `agy models`
+shape. Set `window.__gpAgyModels` to `"fail"` (an error answer), `"slow"` (2 s,
+to see the button lock and a second press start nothing), or `"throw"` (CLI not
+installed) before pressing **List models**; `window.__gpModelCalls` records
+every request. Check that only the Claude list loads when the pane opens, that
+a failed refresh keeps the last list, and that a stored Antigravity model the
+list lacks is flagged.
+
 ## Terminal
 
 The real-store workbench fixture also exposes **Activity inbox**. Use

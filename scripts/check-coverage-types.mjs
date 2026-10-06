@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 74 contracts over
- * 187 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 75 contracts over
+ * 189 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -202,6 +202,7 @@ export const CONTRACTS = Object.freeze([
   // a renamed field would empty the chooser rather than fail — leaving a panel
   // that offers nothing while reporting nothing wrong.
   { label: "agent-defaults", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "agentDefaultsStore.ts"), structs: ["AgentDefaultsView"] },
+  { label: "agent-models", rustPath: rust("workbench", "agent_models.rs"), tsPath: ts("terminal", "agentModelCatalog.ts"), structs: ["AgentModelOption", "AgentModelCatalog"] },
   // Per-repository DevCouncil setup, and the inventory behind it. These land
   // on every repository the user opens, so a rename that made `exclude` or
   // `workspace_registry` read as undefined would silently turn "we hid the
@@ -366,6 +367,11 @@ function normalizeRustType(type) {
   if (vector) return `${normalizeRustType(vector[1])}[]`;
   const array = /^\[(.*);\d+\]$/.exec(compact);
   if (array) return `${normalizeRustType(array[1])}[]`;
+  // A string-keyed map is a JSON object on the wire, whichever map type and
+  // module path wrote it. Only `String` keys: serde writes other key types
+  // as strings too, but TypeScript would then claim a key type it never gets.
+  const map = /^(?:BTreeMap|HashMap|IndexMap)<String,(.*)>$/.exec(stripTypePath(compact));
+  if (map) return `Record<string,${normalizeRustType(map[1])}>`;
   if (compact === "String" || compact === "&str" || compact === "str") return "string";
   if (compact === "bool") return "boolean";
   if (/^(?:u|i)(?:8|16|32|64|128|size)$/.test(compact) || /^(?:f32|f64)$/.test(compact)) {
@@ -435,6 +441,9 @@ function normalizeTsType(type) {
   if (array) return `${normalizeTsType(array[1])}[]`;
   const genericArray = /^Array<(.*)>$/.exec(compact);
   if (genericArray) return `${normalizeTsType(genericArray[1])}[]`;
+  // `Record<string, V>` and `{ [key: string]: V }` are the same JSON object.
+  const record = /^Record<string,(.*)>$/.exec(compact) ?? /^\{\[\w+:string\]:(.*?);?\}$/.exec(compact);
+  if (record) return `Record<string,${normalizeTsType(record[1])}>`;
   if (compact === "string" || compact === "boolean" || compact === "number" || compact === "null" || compact === "undefined") {
     return compact;
   }

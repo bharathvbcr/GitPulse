@@ -108,6 +108,113 @@ export interface AgentDefaults {
    * Absent means {@link DEFAULT_TERMINAL_SESSIONS}; see `sessionLimit.ts`.
    */
   max_terminal_sessions?: number;
+  /**
+   * Which model each agent CLI starts with, by launcher. Absent means the
+   * CLI's own choice; an entry is never stored empty. Names and levels only —
+   * which flag carries them is `model_control` in `terminal_command.rs`.
+   */
+  models?: Partial<Record<LauncherKind, ModelChoice>>;
+}
+
+/**
+ * One launcher's model settings. Mirrors `tool_config::ModelChoice`; which
+ * fields a launcher takes is the backend's `model_fields`, and a field it
+ * does not take is refused at save rather than left out of the launch.
+ */
+export interface ModelChoice {
+  model?: string;
+  effort?: EffortLevel;
+  fallback?: string[];
+  advisor?: string;
+}
+
+/**
+ * The model controls, in the order a settings row shows them. Mirrors
+ * `terminal_command::MODEL_FIELDS`; `agentDefaults.contract.test.ts` binds them.
+ */
+export const MODEL_FIELDS = ["model", "effort", "fallback", "advisor"] as const;
+export type ModelField = (typeof MODEL_FIELDS)[number];
+
+/** Reasoning-effort levels, least first. Mirrors `terminal_command::EFFORT_LEVELS`. */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Mirrors `terminal_command::MAX_FALLBACK_MODELS`. */
+export const MAX_FALLBACK_MODELS = 4;
+/** Mirrors `terminal_command::MAX_MODEL_ID_LEN`. */
+export const MAX_MODEL_ID_LEN = 160;
+
+/**
+ * The fields each launcher takes, used before the backend answers and in a
+ * browser preview. The backend derives the authoritative map from its flag
+ * table and sends it with the settings; the contract test binds the two.
+ */
+export const MODEL_FIELDS_BY_LAUNCHER: Readonly<Partial<Record<LauncherKind, readonly ModelField[]>>> = {
+  agy: ["model", "effort"],
+  claude: ["model", "effort", "fallback", "advisor"],
+  codex: ["model"],
+  grok: ["model"],
+};
+
+/**
+ * Advisor names a field offers before any list is fetched: the three Claude
+ * Code's own advisor message names. Suggestions only. Model and fallback
+ * suggestions come from the CLI's catalog (`agentModelCatalog.ts`), which owns
+ * Claude Code's aliases; a second copy here would be the one that drifts.
+ */
+export const MODEL_SUGGESTIONS: Readonly<Partial<Record<LauncherKind, Partial<Record<ModelField, readonly string[]>>>>> = {
+  claude: { advisor: ["fable", "opus", "sonnet"] },
+};
+
+/**
+ * Whether `id` has the shape of a model name — the same rule as
+ * `terminal_command::validate_model_id`. Shape only: whether the model
+ * exists is the CLI's to decide when it starts.
+ */
+export function isModelId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_MODEL_ID_LEN &&
+    /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]*$/.test(value)
+  );
+}
+
+export function isEffortLevel(value: unknown): value is EffortLevel {
+  return EFFORT_LEVELS.some((level) => level === value);
+}
+
+/**
+ * A model choice made safe to send or use: fields the launcher does not take
+ * are dropped, each value is dropped unless it has a valid shape, and a choice
+ * left with nothing is `null` — which is stored as no entry at all.
+ */
+export function sanitizeModelChoice(value: unknown, fields: readonly ModelField[]): ModelChoice | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const choice: ModelChoice = {};
+  if (fields.includes("model") && isModelId(raw.model)) choice.model = raw.model;
+  if (fields.includes("effort") && isEffortLevel(raw.effort)) choice.effort = raw.effort;
+  if (fields.includes("fallback") && Array.isArray(raw.fallback)) {
+    const list = raw.fallback.filter(isModelId);
+    const unique = list.filter((id, index) => list.indexOf(id) === index);
+    if (unique.length > 0 && unique.length <= MAX_FALLBACK_MODELS && unique.length === raw.fallback.length) {
+      choice.fallback = unique;
+    }
+  }
+  if (fields.includes("advisor") && isModelId(raw.advisor)) choice.advisor = raw.advisor;
+  return Object.keys(choice).length ? choice : null;
+}
+
+/**
+ * Splits what a reader typed into fallback models: commas or whitespace
+ * separate them, blanks are dropped. Validation is the caller's.
+ */
+export function parseFallbackList(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -181,6 +288,7 @@ export function requiresAcknowledgement(mode: PermissionMode | null): boolean {
 export function sanitizeAgentDefaults(
   value: unknown,
   supported: readonly LauncherKind[] = PERMISSION_LAUNCHERS,
+  modelFields: Readonly<Partial<Record<LauncherKind, readonly ModelField[]>>> = MODEL_FIELDS_BY_LAUNCHER,
 ): AgentDefaults {
   if (!value || typeof value !== "object") return { permission: {} };
   const raw = value as Partial<AgentDefaults>;
@@ -197,7 +305,39 @@ export function sanitizeAgentDefaults(
   if (isTerminalSessionLimit(raw.max_terminal_sessions)) sanitized.max_terminal_sessions = raw.max_terminal_sessions;
   const sources = canonicalSettingSources(raw.claude_setting_sources);
   if (sources) sanitized.claude_setting_sources = sources;
+  if (raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)) {
+    const models: Partial<Record<LauncherKind, ModelChoice>> = {};
+    for (const [launcher, choice] of Object.entries(raw.models)) {
+      const fields = modelFields[launcher as LauncherKind];
+      if (!fields) continue;
+      const clean = sanitizeModelChoice(choice, fields);
+      if (clean) models[launcher as LauncherKind] = clean;
+    }
+    if (Object.keys(models).length) sanitized.models = models;
+  }
   return sanitized;
+}
+
+/** The stored model choice for `launcher`, or an empty one. */
+export function modelChoiceOf(defaults: AgentDefaults, launcher: LauncherKind): ModelChoice {
+  return defaults.models?.[launcher] ?? {};
+}
+
+/**
+ * The defaults with `launcher`'s model choice replaced — removed when the
+ * choice is empty, so "the CLI's own choice" is stored as absence.
+ */
+export function withModelChoice(defaults: AgentDefaults, launcher: LauncherKind, choice: ModelChoice): AgentDefaults {
+  const models = { ...(defaults.models ?? {}) };
+  const kept = Object.fromEntries(
+    Object.entries(choice).filter(([, value]) => value !== undefined && value !== "" && !(Array.isArray(value) && value.length === 0)),
+  ) as ModelChoice;
+  if (Object.keys(kept).length) models[launcher] = kept;
+  else delete models[launcher];
+  const next: AgentDefaults = { ...defaults };
+  if (Object.keys(models).length) next.models = models;
+  else delete next.models;
+  return next;
 }
 
 /** Whether `value` is a limit the store accepts: a whole number in 1..=ceiling. */

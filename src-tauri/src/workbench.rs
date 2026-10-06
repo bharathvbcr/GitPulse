@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, State};
 
+pub(crate) mod agent_models;
 mod agent_worktree;
 mod conversation;
 pub(crate) mod external_changes;

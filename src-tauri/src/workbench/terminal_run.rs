@@ -103,29 +103,23 @@ pub(super) fn spawn<R: tauri::Runtime>(
     }
     let program = terminal_command::program(&source.provider)?;
     // Read once, so the flags the build is checked for are the flags it gets.
-    let notify = crate::tool_config::session_alerts().configure_agents;
-    let sources = crate::tool_config::agent_defaults().claude_setting_sources_arg();
+    let defaults = crate::tool_config::agent_defaults();
+    let sources = defaults.claude_setting_sources_arg();
+    let options = terminal_command::LaunchOptions {
+        notify: crate::tool_config::session_alerts().configure_agents,
+        setting_sources: sources.as_deref(),
+        model: defaults.model_for(&source.provider),
+    };
     terminal_command::check(
         &program,
         &source.cwd,
         &source.provider,
         &source.permission_mode,
-        notify,
-        sources.as_deref(),
+        &options,
     )?;
-    start(
-        app,
-        terminals,
-        state,
-        launch,
-        source,
-        program,
-        notify,
-        sources.as_deref(),
-    )
+    start(app, terminals, state, launch, source, program, options)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start<R: tauri::Runtime>(
     app: &AppHandle<R>,
     terminals: &TerminalSessions,
@@ -133,8 +127,7 @@ fn start<R: tauri::Runtime>(
     launch: Launch,
     source: Source,
     program: String,
-    notify: bool,
-    setting_sources: Option<&str>,
+    options: terminal_command::LaunchOptions<'_>,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     let brief = terminal_command::BriefFile::create(&source.brief.markdown)?;
     let args = terminal_command::arguments(
@@ -146,8 +139,7 @@ fn start<R: tauri::Runtime>(
         &terminal_command::Extras {
             run_id: Some(&source.id),
             brief_dir: Some(&brief.dir),
-            notify,
-            setting_sources,
+            launch: options,
         },
     )?;
     let stamp = SystemTime::now()
@@ -405,8 +397,7 @@ mod tests {
                 launch(),
                 source(&state),
                 program,
-                false,
-                None,
+                super::terminal_command::LaunchOptions::default(),
             )
             .unwrap();
             drop(first);
@@ -467,8 +458,7 @@ mod tests {
             launch(),
             source(&state),
             program,
-            false,
-            None,
+            super::terminal_command::LaunchOptions::default(),
         )
         .unwrap();
         let running = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -563,8 +553,7 @@ mod tests {
             launch(),
             source(&state),
             program,
-            false,
-            None,
+            super::terminal_command::LaunchOptions::default(),
         )
         .unwrap();
         state.shutdown();
@@ -609,8 +598,7 @@ mod tests {
                 .join("removed-provider")
                 .to_string_lossy()
                 .into_owned(),
-            false,
-            None,
+            super::terminal_command::LaunchOptions::default(),
         )
         .is_err());
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -644,8 +632,7 @@ mod tests {
             launch(),
             source(&state),
             program,
-            false,
-            None,
+            super::terminal_command::LaunchOptions::default(),
         )
         .is_err());
         received.recv_timeout(Duration::from_secs(5)).unwrap();
