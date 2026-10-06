@@ -11,8 +11,29 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Agents can merge duplicate board tasks.** `gitpulse_merge_tasks` folds up
+  to 25 tasks into one that stays: a `## Merged from …` section per task in its
+  description, the union of their acceptance criteria and labels, and the most
+  urgent priority, highest severity and earliest due date among them. The
+  merged tasks are then deleted with the reason and the target in their
+  history, each only at the revision that was copied, so an edit made
+  mid-merge is copied again rather than lost. An interrupted merge reports
+  what it finished and is completed by running it again. Like
+  `gitpulse_delete_task` it is a destructive write (`destructiveHint: true`),
+  behind the repository trust gate, with no unmerge over MCP.
+
 ### Changed
 
+- **Agents leave running and locked work alone.** `gitpulse_delete_task` and
+  `gitpulse_merge_tasks` refuse a task another agent may still be working on
+  (`task_in_use`) unless told the running agent is the caller, and
+  `gitpulse_add_task` with `overwrite` refuses to change a title or
+  description the person locked (`field_locked`).
+- **A deleted task says where it went.** Reading or completing a task that
+  was deleted or merged answers `task_deleted` with its reason, or
+  `task_merged` with the task it was merged into, instead of `not_found`.
 - **Branch churn survives a restart.** The per-branch line counts were
   measured again for every branch on every launch. They are now kept in
   `churn.v1.sqlite` in the platform cache directory. Each answer is keyed on
@@ -27,6 +48,15 @@ before that tag is pushed.
 
 ### Fixed
 
+- **A summary or deletion reason is reported as recorded only when it was.**
+  A retry treated any logs that merely ended with the same words as its own
+  earlier write, so `gitpulse_complete_task` answered `unchanged` with
+  `summary_recorded: true` for a summary never written, and
+  `gitpulse_delete_task` deleted a task without its reason block.
+- **Folding work into a card that was merged or deleted no longer files a
+  twin.** `gitpulse_add_task` with a removed card's board id as `task_id` made a
+  new card under that id; it now answers `task_merged` or `task_deleted`, naming
+  where the card went.
 - **`gitpulse-mcp --help` and `--version` answer and exit.** Any argument
   used to start the server, which then waited on the terminal's input
   forever. Any other argument now exits with status 2.

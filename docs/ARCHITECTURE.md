@@ -661,15 +661,39 @@ The agent moves its own task instead: `gitpulse_complete_task` (MCP,
 review or done, appends the agent's summary to the task logs, honours an
 `expected_revision`, never reopens a done task, and resolves the task through
 the same trusted-repository gate as the other task tools.
-`gitpulse_delete_task` (`intake.rs::delete_task`) is the one destructive task
-tool: it appends the required reason to the task's logs with `items.put`, then
-calls the store's own `items.delete` — the soft delete the board performs — so
-the deleted revision carries the reason. That is two store writes, because
+`gitpulse_delete_task` (`intake.rs::delete_task`) and `gitpulse_merge_tasks`
+(`intake_merge.rs::merge_tasks`) are the destructive task tools. Both remove a
+card through `intake.rs::record_and_delete`: the required reason is appended to
+the task's logs with `items.put`, then the store's own `items.delete` — the soft
+delete the board performs — runs at exactly the revision that write produced,
+so the deleted revision carries the reason. That is two store writes, because
 `items.delete` takes no payload; a change between them leaves the task live
-with the reason and nothing deleted. A task already deleted is found through
-`items.history` (which, unlike `items.get`, still sees it) and answered
-`unchanged`; a task linked to other repositories is refused as `shared_task`.
-There is no undelete over MCP.
+and nothing deleted. A task already deleted is found through `items.history`
+(which, unlike `items.get`, still sees it) and answered `unchanged`; a task
+linked to other repositories is refused as `shared_task`, and one with a live
+agent attempt (prepared and unexpired, starting, running or unresolved, read
+from `runs.list`) as `task_in_use` unless the caller passes `even_if_running`.
+There is no undelete over MCP. `find_live_task` answers a read or completion of
+a deleted task with `task_deleted` (its reason) or `task_merged` (the target,
+parsed from the merge block), not `not_found`.
+A merge cannot be one transaction — each store request is its own — so its
+order is the guarantee: the target is written first with a `## Merged from
+<item_id>` section per source (and the criteria and label unions, the most
+urgent priority, highest severity and earliest due date), and only then is each
+source deleted, conditionally on the revision whose content was copied. A
+source edited mid-merge fails that condition and is copied again; a target
+edited mid-merge is re-read and folded on top of; a target deleted mid-merge
+stops every further delete. Re-running a partial merge recognises sections by
+their text, so nothing is copied twice. Every check (reason, bounds, shared,
+live runs, a done target with open sources, a locked target description) runs
+before the first write, so a refusal writes nothing; any failure after the
+first write is reported as `partial` with every source's outcome, never as a
+bare error. `add_task` refuses a key that is the board id of a removed card
+(`task_merged` / `task_deleted`) rather than filing a twin under it.
+Agent overwrites honour the person's `locked_fields`: `place` refuses one that
+would change a locked title or description as `field_locked`. Retry detection
+(`ends_with_block`) matches only the last block a tool wrote, never text that
+merely ends the logs.
 `intake.rs::add_task` gates creation, never overwrite: `related_open_tasks`
 pages `items.list` one open column at a time (bounded at 2,000 open cards, with
 `scan_complete` reporting whether that was all of them) and treats a card as

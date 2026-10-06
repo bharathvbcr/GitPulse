@@ -510,7 +510,8 @@ mod tests {
                 "gitpulse_add_task",
                 "gitpulse_import_tasks",
                 "gitpulse_complete_task",
-                "gitpulse_delete_task"
+                "gitpulse_delete_task",
+                "gitpulse_merge_tasks"
             ])
         );
         assert_eq!(
