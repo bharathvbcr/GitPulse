@@ -15,10 +15,15 @@
 //!   it ("still running as pid N"); a probe that could not run keeps it too.
 //! - A run that never recorded a process is released only when the GitPulse
 //!   process that launched it is gone, or is this process and has already
-//!   written its final `unresolved`. A Manvi-owned attempt with no process is
-//!   released only when the Manvi process its owner names is gone (owners
-//!   are `manvi-{pid}-{nanos}-{token}` since Manvi 18fc2c6); one with an older
-//!   opaque owner is left alone, because nothing here can prove it ended.
+//!   written its final `unresolved`.
+//! - A managed attempt with no process is judged by what Manvi itself
+//!   guarantees, whichever Manvi claimed it: Manvi stops the provider before
+//!   it records an unactivated attempt `unresolved`, and gives up on any
+//!   attempt not activated within five minutes of its claim. So `unresolved`
+//!   releases, and so does `starting` once [`MANAGED_ACTIVATION_GRACE_SECS`]
+//!   have passed. Before that, an owner naming its Manvi
+//!   (`manvi-{pid}-{nanos}-{token}`, since Manvi 18fc2c6) releases as soon as
+//!   that Manvi is provably gone; an older, opaque owner waits out the grace.
 //! - A run whose PTY session this process still holds is never touched — its
 //!   observer may be about to record the real exit code, which is better
 //!   evidence than anything a reconciler has.
@@ -32,6 +37,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The states the store counts as holding a checkout, apart from `prepared`
 /// (which expires on its own and is ended with `cancel`).
 const HELD: [&str; 3] = ["starting", "running", "unresolved"];
+/// How long after its claim a managed attempt that recorded no process could
+/// still become active.
+///
+/// Manvi abandons a preparation not activated within five minutes, closing
+/// the provider before it writes `unresolved` (`serve/managed.go`, since that
+/// file's first commit), and the write itself is bounded at five seconds.
+/// Twice that, so a slow host or a clock step never releases an attempt its
+/// Manvi is still about to give up on. A run that is still `starting` past it
+/// was left by a Manvi that died, or whose final write failed after it had
+/// already stopped the provider.
+pub(crate) const MANAGED_ACTIVATION_GRACE_SECS: u64 = 10 * 60;
 /// Bounds one sweep: three states, at most this many pages of 200 each.
 const MAX_PAGES: usize = 8;
 const PAGE: u64 = 200;
@@ -67,13 +83,29 @@ fn manvi_owner(owner: &str) -> Option<(u32, u128)> {
     (opaque && parts.next().is_none()).then_some((pid, stamp))
 }
 
-/// The pure decision, with every observation injected so it can be driven
-/// through each branch without real processes.
+/// [`judge_at`] against the clock now.
 pub(crate) fn judge(
     run: &Value,
     tracked_here: Option<bool>,
     child: impl Fn(u32, &str) -> Liveness,
     owner_since: impl Fn(u32, u128) -> Liveness,
+) -> Verdict {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    judge_at(run, tracked_here, child, owner_since, now)
+}
+
+/// The pure decision, with every observation injected — the clock included,
+/// as the store's seconds — so it can be driven through each branch without
+/// real processes or waiting.
+pub(crate) fn judge_at(
+    run: &Value,
+    tracked_here: Option<bool>,
+    child: impl Fn(u32, &str) -> Liveness,
+    owner_since: impl Fn(u32, u128) -> Liveness,
+    now_secs: u64,
 ) -> Verdict {
     let state = run["state"].as_str().unwrap_or("");
     if !HELD.contains(&state) {
@@ -118,6 +150,32 @@ pub(crate) fn judge(
             )),
         };
     }
+    if run["kind"] == "managed" {
+        // No process was recorded, so this attempt was never activated: the
+        // store records one with the activation. What Manvi does with an
+        // unactivated attempt is the evidence, whichever build claimed it.
+        if state == "unresolved" {
+            return Verdict::Release(
+                "Manvi recorded it unresolved before any agent process was recorded; it stops the provider before writing that"
+                    .into(),
+            );
+        }
+        if let Some(claimed) = run["claimed_at"].as_u64() {
+            let waited = now_secs.saturating_sub(claimed);
+            if state == "starting" && waited >= MANAGED_ACTIVATION_GRACE_SECS {
+                return Verdict::Release(format!(
+                    "it was claimed {} minutes ago and never activated; Manvi stops the provider of any attempt not activated within five minutes",
+                    waited / 60
+                ));
+            }
+        }
+        if manvi_owner(run["owner_id"].as_str().unwrap_or("")).is_none() {
+            return Verdict::Keep(format!(
+                "An older Manvi claimed it and its process cannot be identified; if it is never activated, it is released {} minutes after its claim.",
+                MANAGED_ACTIVATION_GRACE_SECS / 60
+            ));
+        }
+    }
     if let Some((manvi, stamp)) = run["owner_id"].as_str().and_then(manvi_owner) {
         // Before activation a managed attempt has no provider pid; Manvi alone
         // knows its provider, and its jobs live only in its memory. So the
@@ -125,10 +183,11 @@ pub(crate) fn judge(
         // finish, and its provider lost the pipe it was driven over.
         return match owner_since(manvi, stamp) {
             Liveness::Gone => Verdict::Release(format!(
-                "the Manvi process {manvi} that ran it has exited, and no agent process was recorded; its provider lost its connection with it"
+                "the Manvi process {manvi} that ran it has exited, and no agent process was recorded; a provider exits when the Manvi driving it does"
             )),
             Liveness::Alive => Verdict::Keep(format!(
-                "Manvi (pid {manvi}) is still running this attempt; it ends an attempt that is never activated within five minutes."
+                "Manvi (pid {manvi}) is still running this attempt; if it is never activated, it is released {} minutes after its claim.",
+                MANAGED_ACTIVATION_GRACE_SECS / 60
             )),
             Liveness::Unknown(reason) => Verdict::Keep(format!(
                 "Could not check whether the Manvi process {manvi} running it is still alive: {reason}"

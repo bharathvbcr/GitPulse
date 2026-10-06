@@ -511,3 +511,164 @@ fn a_sweep_releases_an_attempt_whose_manvi_died_before_activation() {
     prepare(&state, &root, "after").unwrap();
     assert_eq!(state.reconcile_stale_runs().unwrap(), 0);
 }
+
+/// What a managed attempt looks like in the store before activation: kind
+/// `managed`, claimed at `claimed` (the store's seconds), no process.
+fn managed(state: &str, owner: &str, claimed: u64) -> Value {
+    json!({"id":"run","kind":"managed","state":state,"owner_id":owner,"claimed_at":claimed})
+}
+
+const LEGACY: &str = "0123456789abcdef0123456789abcdef";
+
+/// The defect: an attempt claimed by a Manvi from before 18fc2c6 records an
+/// owner naming no process, so when that Manvi died before activation the
+/// attempt held its checkout until someone pressed Release. What Manvi does
+/// with an unactivated attempt — any build of it — is the proof instead.
+#[test]
+fn an_unactivated_managed_attempt_is_released_by_what_manvi_guarantees() {
+    use super::{judge_at, MANAGED_ACTIVATION_GRACE_SECS as GRACE};
+    let claimed = 1_800_000_000;
+    let at = |run: &Value, now: u64| judge_at(run, Some(false), no_child, no_owner, now);
+
+    // An opaque owner: kept, with the time it will be released, until the
+    // grace has passed; then released. Its Manvi is never asked about.
+    let legacy = managed("starting", LEGACY, claimed);
+    for waited in [0, 60, GRACE - 1] {
+        assert!(
+            matches!(at(&legacy, claimed + waited), Verdict::Keep(r) if r.contains("older Manvi") && r.contains("10 minutes")),
+            "{waited}"
+        );
+    }
+    for waited in [GRACE, GRACE + 1, 30 * 24 * 3600] {
+        assert!(
+            matches!(at(&legacy, claimed + waited), Verdict::Release(r) if r.contains("never activated")),
+            "{waited}"
+        );
+    }
+    // A clock that reads earlier than the claim never releases.
+    assert!(matches!(at(&legacy, claimed - 3600), Verdict::Keep(_)));
+    assert!(matches!(at(&legacy, 0), Verdict::Keep(_)));
+
+    // Manvi stops the provider before recording an unactivated attempt
+    // unresolved, so that releases at once, whatever claimed it and however
+    // alive that Manvi still is.
+    for owner in [LEGACY, "manvi-4242-1700-ab12cd"] {
+        assert!(
+            matches!(at(&managed("unresolved", owner, claimed), claimed), Verdict::Release(r) if r.contains("unresolved")),
+            "{owner}"
+        );
+    }
+
+    // A Manvi that names itself and is alive past the grace: its own final
+    // write failed after it had stopped the provider. Released.
+    let named = managed("starting", "manvi-4242-1700-ab12cd", claimed);
+    assert!(matches!(
+        judge_at(
+            &named,
+            Some(false),
+            no_child,
+            |_, _| Liveness::Alive,
+            claimed + GRACE
+        ),
+        Verdict::Release(_)
+    ));
+    // Within the grace it is still its Manvi's to decide.
+    assert!(matches!(
+        judge_at(&named, Some(false), no_child, |_, _| Liveness::Alive, claimed + 60),
+        Verdict::Keep(r) if r.contains("still running")
+    ));
+    assert!(matches!(
+        judge_at(&named, Some(false), no_child, |_, _| Liveness::Gone, claimed + 60),
+        Verdict::Release(r) if r.contains("Manvi process 4242")
+    ));
+
+    // Activated: the recorded provider decides alone, past any grace.
+    let mut activated = managed("running", LEGACY, claimed);
+    activated["process_id"] = json!(79);
+    activated["process_start"] = json!("birth");
+    assert!(matches!(
+        judge_at(&activated, Some(false), |_, _| Liveness::Alive, no_owner, claimed + GRACE * 10),
+        Verdict::Keep(r) if r.contains("pid 79")
+    ));
+
+    // The rule is the managed lane's. A terminal attempt with the same owner
+    // shape and age is not released by it.
+    let mut terminal = managed("starting", LEGACY, claimed);
+    terminal["kind"] = json!("external_terminal");
+    assert!(matches!(
+        at(&terminal, claimed + GRACE * 10),
+        Verdict::Keep(_)
+    ));
+    // Nor is one whose claim time is missing or not a number.
+    for bad in [json!(null), json!("1800000000"), json!(-1)] {
+        let mut run = managed("starting", LEGACY, claimed);
+        run["claimed_at"] = bad.clone();
+        assert!(
+            matches!(at(&run, claimed + GRACE * 10), Verdict::Keep(_)),
+            "{bad}"
+        );
+    }
+}
+
+/// Against the real store: a managed claim records `claimed_at` in the
+/// seconds the grace is measured in, and an unactivated attempt its Manvi
+/// recorded unresolved is released by a sweep while its Manvi — this live
+/// process — still runs.
+#[test]
+fn a_sweep_releases_managed_attempts_by_their_recorded_claim_and_outcome() {
+    use super::{judge_at, MANAGED_ACTIVATION_GRACE_SECS as GRACE};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let state = host(&dir.path().join("profile.sqlite"));
+    seed(&state, &root);
+    let store = |method: &str, input: Value| {
+        state
+            .with_store(|store| query(store, method, &input.to_string()))
+            .unwrap()
+    };
+    state
+        .request(
+            "runs.prepare_managed",
+            &json!({"id":"managed","request_id":"prepare-managed","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"ask","repo_path":root}).to_string(),
+        )
+        .unwrap();
+    let owner = format!("manvi-{}-{}-ab12", std::process::id(), now());
+    store(
+        "runs.claim",
+        json!({"id":"managed","request_id":"claim","expected_revision":1,"kind":"managed","owner_id":owner,"session_id":"session"}),
+    );
+    let claimed = state.request("runs.get", r#"{"id":"managed"}"#).unwrap()["item"].clone();
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = claimed["claimed_at"].as_u64().expect("no claim time");
+    assert!(
+        at.abs_diff(secs) < 120,
+        "claimed_at {at} is not in seconds (now {secs})"
+    );
+    assert!(matches!(
+        judge_at(
+            &claimed,
+            Some(false),
+            no_child,
+            |_, _| Liveness::Alive,
+            at + GRACE
+        ),
+        Verdict::Release(_)
+    ));
+    // Within the grace, with its Manvi alive, a sweep keeps it.
+    assert_eq!(state.reconcile_stale_runs().unwrap(), 0);
+
+    store(
+        "runs.finish",
+        json!({"id":"managed","request_id":"finish","expected_revision":2,"owner_id":owner,"session_id":"session","outcome":"unresolved","reason":"managed preparation ended before activation","provider_state":"interrupted"}),
+    );
+    assert_eq!(state.reconcile_stale_runs().unwrap(), 1);
+    let item = state.request("runs.get", r#"{"id":"managed"}"#).unwrap()["item"].clone();
+    assert_eq!(item["state"], "exited", "{item}");
+    // The checkout takes a new attempt.
+    prepare(&state, &root, "after").unwrap();
+    assert_eq!(state.reconcile_stale_runs().unwrap(), 0);
+}
