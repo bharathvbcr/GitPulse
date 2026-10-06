@@ -168,3 +168,40 @@ describe("saveAgentDefaults", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 });
+
+describe("the terminal session limit", () => {
+  it("is mirrored from every state the store takes: loaded, saved and reset", async () => {
+    const { currentSessionLimit, DEFAULT_TERMINAL_SESSIONS } = await import("../terminal/sessionLimit");
+    expect(currentSessionLimit()).toBe(DEFAULT_TERMINAL_SESSIONS);
+    invoke.mockResolvedValueOnce({
+      defaults: { permission: {}, max_terminal_sessions: 48 },
+      modes: [...PERMISSION_MODES],
+      launchers: [...PERMISSION_LAUNCHERS],
+    });
+    await loadAgentDefaults();
+    expect(currentSessionLimit()).toBe(48);
+    invoke.mockResolvedValueOnce({
+      defaults: { permission: {}, max_terminal_sessions: 12 },
+      modes: [...PERMISSION_MODES],
+      launchers: [...PERMISSION_LAUNCHERS],
+    });
+    await saveAgentDefaults({ permission: {}, max_terminal_sessions: 12 });
+    expect(currentSessionLimit()).toBe(12);
+    // A value this build cannot use is the default, never a stale limit.
+    invoke.mockResolvedValueOnce({
+      defaults: { permission: {}, max_terminal_sessions: 4096 },
+      modes: [...PERMISSION_MODES],
+      launchers: [...PERMISSION_LAUNCHERS],
+    });
+    await saveAgentDefaults({ permission: {} });
+    expect(currentSessionLimit()).toBe(DEFAULT_TERMINAL_SESSIONS);
+    invoke.mockResolvedValueOnce({
+      defaults: { permission: {}, max_terminal_sessions: 64 },
+      modes: [...PERMISSION_MODES],
+      launchers: [...PERMISSION_LAUNCHERS],
+    });
+    await saveAgentDefaults({ permission: {}, max_terminal_sessions: 64 });
+    resetAgentDefaultsForTests();
+    expect(currentSessionLimit()).toBe(DEFAULT_TERMINAL_SESSIONS);
+  });
+});

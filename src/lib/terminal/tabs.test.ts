@@ -1,6 +1,6 @@
+import { DEFAULT_TERMINAL_SESSIONS, setTerminalSessionLimit } from "./sessionLimit";
 import { describe, expect, it } from "vitest";
 import {
-  MAX_TERMINAL_TABS,
   activateTab,
   canOpenTab,
   closeTab,
@@ -77,16 +77,32 @@ describe("terminal tab model", () => {
   it("refuses to open past the backend's session ceiling", () => {
     let state = initialState();
     while (canOpenTab(state)) state = openTab(state, "shell");
-    expect(state.tabs).toHaveLength(MAX_TERMINAL_TABS);
+    expect(state.tabs).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
     // Identity, not just length: "nothing happened" has to be observable.
     expect(openTab(state, "shell")).toBe(state);
+  });
+
+  it("stops at the user's limit, read when asked", () => {
+    try {
+      setTerminalSessionLimit(40);
+      let state = initialState();
+      while (canOpenTab(state)) state = openTab(state, "shell");
+      expect(state.tabs).toHaveLength(40);
+      // A reactive caller passes the limit it subscribed to.
+      expect(canOpenTab(state, 41)).toBe(true);
+      setTerminalSessionLimit(3);
+      expect(canOpenTab(initialState())).toBe(true);
+      expect(canOpenTab(openTab(openTab(initialState(), "shell"), "shell"))).toBe(false);
+    } finally {
+      setTerminalSessionLimit(undefined);
+    }
   });
 
   it("accepts more sessions than the old 16-process ceiling", () => {
     // The tab strip used to look like a four-tab control and the process
     // budget used to stop at 16. Opening past both is the point of the new
     // ceiling; a test that only filled 16 would still pass on the old cap.
-    expect(MAX_TERMINAL_TABS).toBeGreaterThan(16);
+    expect(DEFAULT_TERMINAL_SESSIONS).toBeGreaterThan(16);
     let state = initialState();
     for (let i = 0; i < 20; i += 1) state = openTab(state, "shell");
     expect(state.tabs).toHaveLength(21);

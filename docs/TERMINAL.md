@@ -39,10 +39,15 @@ listed with an explicit retry; it does not silently release a live process.
 
 A repository tab carries a terminal glyph while it holds live sessions, with a count
 past the first, so a shell running in a repository you are not looking at is still
-visible — and so the answer to "what is using the 32 slots" is on screen.
+visible — and so the answer to "what is using every slot" is on screen.
 
-The application allows 32 concurrent sessions across repositories, including
-starts and closes still in flight.
+How many sessions may be open at once across repositories, including starts
+and closes still in flight, is **Settings → Agents → Terminal sessions open at
+once**: 32 until you change it, up to 128. The toolbar's session count shows
+it (`12/32`). A change applies to the next session; lowering it closes
+nothing, and new sessions wait until enough close. The ceiling bounds each
+session's PTY pair, reader thread and 256 KiB output window, and stays well
+inside macOS's system-wide PTY allowance, which other terminals share.
 
 Use **Terminal tab options** to rename a tab, move it left or right, copy selected
 text, copy retained output, or export retained output through a native save dialog.

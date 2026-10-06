@@ -308,9 +308,9 @@ the profile is yours to choose: **Settings → Agents → Agents running at once
 from 1 to 64 (8 until you change it). It applies to the next launch, and a
 launch refused because the profile is full says where to raise it. Terminal
 and managed attempts count alike; Manvi's managed runner refuses only past the
-same 64. A terminal attempt also needs a free terminal session (32 across
-repositories), and when none is free its terminal waits, saying so, until one
-closes. Each attempt's terminal waits in its repository's dock if you navigate
+same 64. A terminal attempt also needs a free terminal session (**Terminal sessions
+open at once**, 32 across repositories unless you change it), and when none is
+free its terminal waits, saying so, until one closes or you raise the limit. Each attempt's terminal waits in its repository's dock if you navigate
 elsewhere while it opens.
 
 An attempt holds its checkout until its process is known to have ended. If

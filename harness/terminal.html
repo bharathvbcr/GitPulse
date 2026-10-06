@@ -137,7 +137,10 @@
       const { mount } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
-      const { MAX_TERMINAL_TABS } = await import("../src/lib/terminal/tabs.ts");
+      // The live limit (the default here, as nothing stored changes it), read
+      // rather than transcribed: a literal fills short and times out instead.
+      const { currentSessionLimit, setTerminalSessionLimit } = await import("../src/lib/terminal/sessionLimit.ts");
+      const SESSION_LIMIT = currentSessionLimit();
       const { TERMINAL_DOCK_MAX_HEIGHT } = await import("../src/lib/terminal/dockMetrics.ts");
       const Host = (await import("./TerminalHost.svelte")).default;
       await repoStore.openRepo("/fixture/Other");
@@ -427,11 +430,21 @@
             // over the tab strip for every check below.
             check("jumping closes the session list", () => !label("Sessions across repositories"));
           }
-          while (!button("New Shell session").disabled && report.spawned < MAX_TERMINAL_TABS + 4) {
+          while (!button("New Shell session").disabled && report.spawned < SESSION_LIMIT + 4) {
             button("New Shell session").click();
             await wait(40);
           }
-          check("global session limit spans both repositories", () => report.spawned === MAX_TERMINAL_TABS && button("New Shell session").disabled);
+          check("global session limit spans both repositories", () => report.spawned === SESSION_LIMIT && button("New Shell session").disabled);
+          check("the session count names the limit", () => document.body.textContent.includes(`${SESSION_LIMIT}/${SESSION_LIMIT}`));
+          // The limit is live: raising it in Settings frees a place at once
+          // (a waiting task terminal opens off the same `canCreate`), and
+          // lowering it again closes nothing.
+          setTerminalSessionLimit(SESSION_LIMIT + 1); await wait();
+          check("raising the limit frees a place at once",
+            () => !button("New Shell session").disabled && document.body.textContent.includes(`${SESSION_LIMIT}/${SESSION_LIMIT + 1}`));
+          setTerminalSessionLimit(undefined); await wait();
+          check("lowering it again closes nothing",
+            () => button("New Shell session").disabled && report.spawned === SESSION_LIMIT && report.killed === 0);
           // A task terminal arriving at the limit waits for a slot. It used
           // to wait without a word, so the agent seemed never to have started.
           {
@@ -440,7 +453,7 @@
             enqueueTaskTerminal(waiting); await wait();
             const notice = document.querySelector('[data-testid="terminal-waiting-for-capacity"]');
             check("a task terminal waiting for a free session says so, by name",
-              () => notice?.textContent.includes("Fix the importer") && notice.textContent.includes(`all ${MAX_TERMINAL_TABS}`) && report.spawned === MAX_TERMINAL_TABS);
+              () => notice?.textContent.includes("Fix the importer") && notice.textContent.includes(`all ${SESSION_LIMIT}`) && report.spawned === SESSION_LIMIT);
             consumeTaskTerminalRequest(waiting); await wait();
             check("and the notice goes with the request", () => !document.querySelector('[data-testid="terminal-waiting-for-capacity"]'));
           }

@@ -1,3 +1,4 @@
+import { setTerminalSessionLimit } from "../terminal/sessionLimit";
 import { writable, type Readable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
@@ -59,6 +60,11 @@ export const DEFAULT_AGENT_DEFAULTS_VIEW: AgentDefaultsState = {
 };
 
 const store = writable<AgentDefaultsState>(DEFAULT_AGENT_DEFAULTS_VIEW);
+
+// The terminal session limit is one of these defaults and is what the session
+// registry and the terminal panel stop at. Mirrored from every state this
+// store takes — loaded, saved or reset — so there is no second path to forget.
+store.subscribe((state) => setTerminalSessionLimit(state.defaults.max_terminal_sessions));
 
 let loaded = false;
 let inFlight: Promise<AgentDefaultsState> | null = null;

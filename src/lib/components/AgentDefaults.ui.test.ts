@@ -15,36 +15,50 @@ import { SETTINGS_CATALOG } from "../ui/settingsCatalog";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const panel = readFileSync(join(here, "AgentDefaultsSettings.svelte"), "utf8");
-const liveRuns = readFileSync(join(here, "AgentLiveRunsSetting.svelte"), "utf8");
+const limit = readFileSync(join(here, "AgentLimitSetting.svelte"), "utf8");
 const sources = readFileSync(join(here, "AgentSettingSourcesSetting.svelte"), "utf8");
 const session = readFileSync(join(here, "TerminalSession.svelte"), "utf8");
 const modal = readFileSync(join(here, "SettingsModal.svelte"), "utf8");
 
-describe("agents running at once", () => {
-  it("is findable by the words a reader would type, in its own wrapper", () => {
-    const entry = SETTINGS_CATALOG.find((row) => row.id === "agent-live-runs");
+describe("the two limits: agents running at once, terminal sessions open at once", () => {
+  /** The modal's usage of the shared control for one field, attributes and note. */
+  const usage = (field: string) => {
+    const at = modal.indexOf(`field="${field}"`);
+    expect(at, `${field} has no AgentLimitSetting`).toBeGreaterThan(0);
+    return modal.slice(modal.lastIndexOf("<AgentLimitSetting", at), modal.indexOf("</AgentLimitSetting>", at));
+  };
+
+  it.each([
+    ["agent-live-runs", "max_live_runs", ["concurrent", "parallel", "many", "sessions", "manvi"]],
+    ["terminal-sessions", "max_terminal_sessions", ["terminal", "shells", "tabs", "concurrent", "limit"]],
+  ])("%s is findable by the words a reader would type, in its own wrapper", (id, field, words) => {
+    const entry = SETTINGS_CATALOG.find((row) => row.id === id);
     expect(entry?.section).toBe("agents");
-    for (const word of ["concurrent", "parallel", "many", "sessions", "manvi"]) {
-      expect(entry?.keywords, `"${word}" does not find this setting`).toContain(word);
-    }
+    for (const word of words) expect(entry?.keywords, `"${word}" does not find ${id}`).toContain(word);
     // Its own wrapper in the modal: inside the permission panel's, a search
     // for "concurrent" hid it along with the permission rows.
-    expect(modal).toMatch(/data-setting="agent-live-runs"[^>]*>\s*<AgentLiveRunsSetting/);
-    expect(panel).not.toContain("max_live_runs");
+    expect(modal).toMatch(new RegExp(`data-setting="${id}"[^>]*>\\s*<AgentLimitSetting\\s+field="${field}"`));
+    expect(panel).not.toContain(field);
   });
 
-  it("takes its bounds from the store's constants, not a literal", () => {
-    // The capacity contract ties these to dc-store; a 64 or an 8 written
-    // here would be a third copy nothing checks.
-    expect(liveRuns).toContain("max={MAX_LIVE_RUNS}");
-    expect(liveRuns).toMatch(/\{MAX_LIVE_RUNS\}.*\{DEFAULT_LIVE_RUNS\}/s);
-    expect(liveRuns.replace(/<!--[\s\S]*?-->|\/\*[\s\S]*?\*\//g, "")).not.toMatch(/\b(64|8)\b(?![\d.])/);
+  it.each([
+    ["max_live_runs", "MAX_LIVE_RUNS", "DEFAULT_LIVE_RUNS", /\b(64|8)\b(?![\d.])/],
+    ["max_terminal_sessions", "MAX_TERMINAL_SESSIONS", "DEFAULT_TERMINAL_SESSIONS", /\b(128|32)\b(?![\d.])/],
+  ])("%s takes its bounds from the mirrored constants, not a literal", (field, max, fallback, literal) => {
+    // The contract tests tie these to Rust; a number written here would be a
+    // copy nothing checks.
+    const block = usage(field);
+    expect(block).toContain(`max={${max}}`);
+    expect(block).toContain(`fallback={${fallback}}`);
+    expect(block).toMatch(new RegExp(`\\{${max}\\}.*\\{${fallback}\\}`, "s"));
+    expect(block).not.toMatch(literal);
+    expect(limit.replace(/<!--[\s\S]*?-->|\/\*[\s\S]*?\*\//g, "")).not.toMatch(/\b(128|64|32|8)\b(?![\d.])/);
   });
 
-  it("stores the default as absence and carries the permission defaults through", () => {
-    expect(liveRuns).toContain("delete rest.max_live_runs");
-    expect(liveRuns).toContain("next === DEFAULT_LIVE_RUNS ? rest");
-    expect(liveRuns).toContain("const rest = { ...view.defaults };");
+  it("stores the default as absence and carries every other default through", () => {
+    expect(limit).toContain("delete rest[field]");
+    expect(limit).toContain("next === fallback ? rest");
+    expect(limit).toContain("const rest: AgentDefaults = { ...view.defaults };");
   });
 });
 

@@ -97,7 +97,18 @@ pub struct AgentDefaults {
     /// runs with `user` only; that is Manvi's decision, not this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_setting_sources: Option<Vec<String>>,
+    /// How many terminal sessions may be open at once across every
+    /// repository — shells, agent tabs and task terminals alike. Absent means
+    /// [`DEFAULT_TERMINAL_SESSIONS`]; the bound is [`MAX_TERMINAL_SESSIONS`].
+    /// The app applies it to its live session registry at start and on save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_terminal_sessions: Option<u32>,
 }
+
+/// Terminal sessions open at once when nothing is stored.
+pub const DEFAULT_TERMINAL_SESSIONS: u32 = crate::terminal::DEFAULT_PTY_SESSIONS as u32;
+/// The most a user may choose: the terminal module's resource ceiling.
+pub const MAX_TERMINAL_SESSIONS: u32 = crate::terminal::MAX_PTY_SESSIONS as u32;
 
 /// Claude Code's settings sources, in the order `--setting-sources` names
 /// them. Choosing all of them is the same as passing nothing.
@@ -143,6 +154,12 @@ impl AgentDefaults {
         self.max_live_runs.unwrap_or(DEFAULT_LIVE_RUNS)
     }
 
+    /// The terminal session limit to apply: the stored one, or the default.
+    pub fn terminal_sessions(&self) -> u32 {
+        self.max_terminal_sessions
+            .unwrap_or(DEFAULT_TERMINAL_SESSIONS)
+    }
+
     /// The value for `--setting-sources`, or `None` to pass nothing.
     pub fn claude_setting_sources_arg(&self) -> Option<String> {
         self.claude_setting_sources
@@ -173,6 +190,13 @@ impl AgentDefaults {
         if let Some(sources) = &self.claude_setting_sources {
             canonical_setting_sources(sources)?;
         }
+        if let Some(limit) = self.max_terminal_sessions {
+            if !(1..=MAX_TERMINAL_SESSIONS).contains(&limit) {
+                return Err(format!(
+                    "Terminal sessions open at once must be between 1 and {MAX_TERMINAL_SESSIONS}"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -201,6 +225,8 @@ pub struct StoredAgentLaunch {
     pub max_live_runs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_setting_sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_terminal_sessions: Option<u32>,
 }
 
 impl StoredAgentLaunch {
@@ -235,6 +261,7 @@ impl<'de> Deserialize<'de> for StoredAgentLaunch {
         Ok(Self {
             max_live_runs: field(&fields, "max_live_runs"),
             claude_setting_sources: field(&fields, "claude_setting_sources"),
+            max_terminal_sessions: field(&fields, "max_terminal_sessions"),
         })
     }
 }
@@ -701,6 +728,7 @@ pub fn agent_defaults() -> AgentDefaults {
         permission: cfg.agent_defaults.permission,
         max_live_runs: cfg.agent_launch.max_live_runs,
         claude_setting_sources: cfg.agent_launch.claude_setting_sources,
+        max_terminal_sessions: cfg.agent_launch.max_terminal_sessions,
     };
     defaults.permission.retain(|launcher, mode| {
         let ok = crate::workbench::terminal_command::validate_permission_default(launcher, mode)
@@ -729,6 +757,16 @@ pub fn agent_defaults() -> AgentDefaults {
         );
         defaults.max_live_runs = None;
     }
+    if let Some(limit) = defaults
+        .max_terminal_sessions
+        .filter(|limit| !(1..=MAX_TERMINAL_SESSIONS).contains(limit))
+    {
+        log::warn!(
+            target: "tool_config",
+            "ignoring stored terminal session limit {limit}: outside 1..={MAX_TERMINAL_SESSIONS}"
+        );
+        defaults.max_terminal_sessions = None;
+    }
     if let Some(sources) = defaults.claude_setting_sources.take() {
         defaults.claude_setting_sources =
             canonical_setting_sources(&sources).unwrap_or_else(|error| {
@@ -755,6 +793,7 @@ pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
     cfg.agent_launch = StoredAgentLaunch {
         max_live_runs: next.max_live_runs,
         claude_setting_sources: sources,
+        max_terminal_sessions: next.max_terminal_sessions,
     };
     save(&cfg)?;
     Ok(())
@@ -1081,6 +1120,91 @@ mod tests {
                 let read = agent_defaults();
                 assert_eq!(read.claude_setting_sources, None, "{raw} survived");
                 assert_eq!(read.live_runs(), 9, "{raw} took the limit with it");
+                assert_eq!(read.permission.get("claude").unwrap(), "edit", "{raw}");
+            }
+        });
+    }
+
+    /// How many terminal sessions may be open is the user's: stored where the
+    /// last release does not look, refused outside the terminal module's
+    /// bounds at save, and degraded alone when a hand-edited value is bad.
+    #[test]
+    fn the_terminal_session_limit_is_bounded_and_degrades_alone() {
+        assert_eq!(DEFAULT_TERMINAL_SESSIONS, 32);
+        assert_eq!(MAX_TERMINAL_SESSIONS, 128);
+        with_temp_config(|path| {
+            assert_eq!(
+                agent_defaults().terminal_sessions(),
+                DEFAULT_TERMINAL_SESSIONS
+            );
+            for limit in [1, 33, MAX_TERMINAL_SESSIONS] {
+                let defaults = AgentDefaults {
+                    max_terminal_sessions: Some(limit),
+                    ..AgentDefaults::default()
+                };
+                set_agent_defaults(defaults.clone()).unwrap();
+                assert_eq!(agent_defaults(), defaults);
+                assert_eq!(agent_defaults().terminal_sessions(), limit);
+            }
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                written["agent_launch"]["max_terminal_sessions"],
+                MAX_TERMINAL_SESSIONS
+            );
+            assert!(written["agent_defaults"]
+                .get("max_terminal_sessions")
+                .is_none());
+            for limit in [0, MAX_TERMINAL_SESSIONS + 1, u32::MAX] {
+                assert!(
+                    set_agent_defaults(AgentDefaults {
+                        max_terminal_sessions: Some(limit),
+                        ..AgentDefaults::default()
+                    })
+                    .is_err(),
+                    "{limit} was stored"
+                );
+            }
+            // The one path from the setting to the live registry, taken at
+            // startup and after every save: a clone the app handed to a lane
+            // sees it too.
+            let terminals = crate::terminal::TerminalSessions::default();
+            let lane = terminals.clone();
+            set_agent_defaults(AgentDefaults {
+                max_terminal_sessions: Some(48),
+                ..AgentDefaults::default()
+            })
+            .unwrap();
+            assert_eq!(terminals.apply_stored_limit(), 48);
+            assert_eq!(lane.session_limit(), 48);
+            set_agent_defaults(AgentDefaults::default()).unwrap();
+            assert_eq!(
+                terminals.apply_stored_limit(),
+                DEFAULT_TERMINAL_SESSIONS as usize
+            );
+            write_raw(path, "{ not json");
+            assert_eq!(
+                terminals.apply_stored_limit(),
+                DEFAULT_TERMINAL_SESSIONS as usize,
+                "an unreadable file must mean the default, not the last limit"
+            );
+            for raw in [
+                r#""max_terminal_sessions":0"#,
+                r#""max_terminal_sessions":129"#,
+                r#""max_terminal_sessions":"40""#,
+                r#""max_terminal_sessions":-1"#,
+                r#""max_terminal_sessions":2.5"#,
+            ] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"agent_defaults":{{"permission":{{"claude":"edit"}}}},"agent_launch":{{"max_live_runs":9,{raw}}}}}"#
+                    ),
+                );
+                let read = agent_defaults();
+                assert_eq!(read.max_terminal_sessions, None, "{raw} survived");
+                assert_eq!(read.terminal_sessions(), DEFAULT_TERMINAL_SESSIONS);
+                assert_eq!(read.live_runs(), 9, "{raw} took the agent limit with it");
                 assert_eq!(read.permission.get("claude").unwrap(), "edit", "{raw}");
             }
         });

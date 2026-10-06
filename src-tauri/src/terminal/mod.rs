@@ -42,7 +42,17 @@ const TERMINAL_ARGV_BYTES_CAP: usize = 128 * 1024;
 /// Interactive terminal resource bounds. The PTY is user-owned, but its IPC
 /// surface must not permit unbounded processes, allocations, or resize work.
 /// Public so frontend contract tests and native stress tests share one number.
-pub const MAX_PTY_SESSIONS: usize = 32;
+///
+/// How many sessions may be open at once is the user's
+/// (`tool_config::AgentDefaults::max_terminal_sessions`), held live on
+/// [`TerminalSessions`]: this many until they change it.
+pub const DEFAULT_PTY_SESSIONS: usize = 32;
+/// The most a user may choose. Each session is a PTY pair, a reader thread
+/// and an output window of `flow::OUTPUT_WINDOW` (256 KiB), so this bounds
+/// those at 256 descriptors, 128 threads and 32 MiB — and stays well inside
+/// macOS's system-wide PTY allowance (`kern.tty.ptmx_max`, 511 by default),
+/// which every other terminal on the machine shares.
+pub const MAX_PTY_SESSIONS: usize = 128;
 const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PTY_ROWS: u16 = 1_000;
 const MAX_PTY_COLS: u16 = 1_000;
@@ -155,10 +165,48 @@ struct SessionEntry {
 }
 
 /// Thread-safe registry of live PTY sessions.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct TerminalSessions {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     active_sessions: Arc<AtomicUsize>,
+    /// How many sessions may be open at once, in `1..=MAX_PTY_SESSIONS`.
+    /// Live rather than read per spawn, so a saved setting applies to the
+    /// next session and a test registry never depends on the machine's file.
+    limit: Arc<AtomicUsize>,
+}
+
+impl Default for TerminalSessions {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::default(),
+            active_sessions: Arc::default(),
+            limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
+        }
+    }
+}
+
+impl TerminalSessions {
+    /// How many sessions may be open at once right now.
+    pub fn session_limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire)
+    }
+
+    /// Applies the stored limit (`tool_config::AgentDefaults::max_terminal_sessions`)
+    /// to this registry: the one path from the setting to the sessions, taken
+    /// at startup and after every save. A file that cannot be read means the
+    /// default. Returns the limit now in force.
+    pub fn apply_stored_limit(&self) -> usize {
+        self.set_session_limit(crate::tool_config::agent_defaults().terminal_sessions() as usize);
+        self.session_limit()
+    }
+
+    /// Sets the limit for the next session, clamped to `1..=MAX_PTY_SESSIONS`.
+    /// Sessions already open past a lowered limit keep running; new ones wait
+    /// until enough close.
+    pub fn set_session_limit(&self, limit: usize) {
+        self.limit
+            .store(limit.clamp(1, MAX_PTY_SESSIONS), Ordering::Release);
+    }
 }
 
 struct SessionReservation {
@@ -175,9 +223,14 @@ fn reserve_session(state: &TerminalSessions) -> Result<SessionReservation, Strin
     state
         .active_sessions
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < MAX_PTY_SESSIONS).then_some(current + 1)
+            (current < state.session_limit()).then_some(current + 1)
         })
-        .map_err(|_| format!("Terminal session limit reached ({MAX_PTY_SESSIONS})"))?;
+        .map_err(|_| {
+            format!(
+                "Terminal session limit reached ({}). Close a session, or raise \"Terminal sessions open at once\" in Settings → Agents (up to {MAX_PTY_SESSIONS}).",
+                state.session_limit()
+            )
+        })?;
     Ok(SessionReservation {
         active_sessions: state.active_sessions.clone(),
     })
@@ -1573,7 +1626,7 @@ pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
         .collect();
     // Every session at once: each close waits for its own reader (a hangup
     // grace plus a reap), and quitting with a full dock one session after
-    // another cost that wait 32 times over. At most MAX_PTY_SESSIONS threads.
+    // another cost that wait once per session. At most MAX_PTY_SESSIONS threads.
     let failures = thread::scope(|scope| {
         let closes: Vec<_> = ids
             .iter()
@@ -4661,7 +4714,8 @@ mod tests {
     #[test]
     fn pty_session_reservations_are_globally_bounded() {
         let state = TerminalSessions::default();
-        let reservations: Vec<_> = (0..MAX_PTY_SESSIONS)
+        assert_eq!(state.session_limit(), DEFAULT_PTY_SESSIONS);
+        let reservations: Vec<_> = (0..DEFAULT_PTY_SESSIONS)
             .map(|_| reserve_session(&state).expect("within cap"))
             .collect();
         let err = reserve_session(&state).err().expect("cap must refuse");
@@ -4671,6 +4725,54 @@ mod tests {
             reserve_session(&state).is_ok(),
             "released slots must be reusable"
         );
+    }
+
+    /// The limit is the user's and applies to the next session: raised, the
+    /// sessions past the old limit open; lowered below what is open, those
+    /// keep running and nothing new opens until enough close. Clones share
+    /// it, because the app hands clones to every lane. It never leaves
+    /// `1..=MAX_PTY_SESSIONS`, whatever it is asked for.
+    #[test]
+    fn the_session_limit_is_the_users_and_applies_to_the_next_session() {
+        let state = TerminalSessions::default();
+        let lane = state.clone();
+        state.set_session_limit(DEFAULT_PTY_SESSIONS + 8);
+        assert_eq!(lane.session_limit(), DEFAULT_PTY_SESSIONS + 8);
+        let mut held: Vec<_> = (0..DEFAULT_PTY_SESSIONS + 8)
+            .map(|_| reserve_session(&lane).expect("a raised limit refused"))
+            .collect();
+        let refused = reserve_session(&lane).err().expect("past the raised limit");
+        assert!(
+            refused.contains(&format!("({})", DEFAULT_PTY_SESSIONS + 8)),
+            "{refused}"
+        );
+        assert!(refused.contains("Settings"), "{refused}");
+
+        state.set_session_limit(4);
+        assert!(
+            reserve_session(&lane).is_err(),
+            "opened past a lowered limit"
+        );
+        held.truncate(4);
+        assert!(reserve_session(&lane).is_err(), "4 open of 4 must refuse");
+        held.truncate(3);
+        held.push(reserve_session(&lane).expect("a closed session freed its place"));
+        drop(held);
+
+        for (asked, kept) in [
+            (0, 1),
+            (1, 1),
+            (MAX_PTY_SESSIONS, MAX_PTY_SESSIONS),
+            (usize::MAX, MAX_PTY_SESSIONS),
+        ] {
+            state.set_session_limit(asked);
+            assert_eq!(state.session_limit(), kept, "{asked}");
+        }
+        let all: Vec<_> = (0..MAX_PTY_SESSIONS)
+            .map(|_| reserve_session(&state).expect("within the ceiling"))
+            .collect();
+        assert!(reserve_session(&state).is_err());
+        drop(all);
     }
 
     // -- agent session attention ----------------------------------------------

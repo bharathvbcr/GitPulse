@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { nextHostedTerminals } from "./repoHosts";
-import { MAX_TERMINAL_TABS } from "./tabs";
+import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
 import { MAX_OPEN_TABS } from "../repos/tabModel";
 
 /**
@@ -129,7 +129,7 @@ describe("terminal hosting under churn", () => {
     // never by the number they visited.
     //
     // The two ceilings move independently, so this pins the shape rather than
-    // either constant. It used to assert MAX_OPEN_TABS > MAX_TERMINAL_TABS,
+    // either constant. It used to assert MAX_OPEN_TABS > DEFAULT_TERMINAL_SESSIONS,
     // true while the caps were 24 and 16; raising the session cap to 32 made
     // that premise false and the assertion failed on a rule that had not
     // changed. Guarding on `invited` is what actually keeps the run
@@ -145,7 +145,7 @@ describe("terminal hosting under churn", () => {
       hosted = step(world, hosted);
     }
     expect(hosted).toEqual(new Set(invited));
-    expect(hosted.size).toBeLessThanOrEqual(MAX_TERMINAL_TABS);
+    expect(hosted.size).toBeLessThanOrEqual(DEFAULT_TERMINAL_SESSIONS);
   });
 
   it("drops panels for closed tabs even in a burst that closes most of the workspace", () => {

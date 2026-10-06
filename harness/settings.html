@@ -110,6 +110,10 @@
             if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= 64)) {
               throw "Agents running at once must be between 1 and 64";
             }
+            const sessions = args?.defaults?.max_terminal_sessions;
+            if (sessions !== undefined && !(Number.isInteger(sessions) && sessions >= 1 && sessions <= 128)) {
+              throw "Terminal sessions open at once must be between 1 and 128";
+            }
             // tool_config::canonical_setting_sources: known names, at least
             // one, canonical order, and every source stored as absence.
             const order = ["user", "project", "local"];

@@ -72,7 +72,9 @@
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
-  import AgentLiveRunsSetting from "./AgentLiveRunsSetting.svelte";
+  import AgentLimitSetting from "./AgentLimitSetting.svelte";
+  import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
+  import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
   import AgentSettingSourcesSetting from "./AgentSettingSourcesSetting.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   import HygieneDefaultsPanel from "./HygieneDefaultsPanel.svelte";
@@ -1235,7 +1237,31 @@
                   <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
-                  <AgentLiveRunsSetting active={isOpen && activeSection === "agents"} />
+                  <AgentLimitSetting
+                    field="max_live_runs"
+                    label="Agents running at once"
+                    testid="agent-live-runs"
+                    max={MAX_LIVE_RUNS}
+                    fallback={DEFAULT_LIVE_RUNS}
+                    active={isOpen && activeSection === "agents"}
+                  >
+                    Task attempts that may be live together, across every repository — up to {MAX_LIVE_RUNS}, {DEFAULT_LIVE_RUNS} unless you change it.
+                    Each checkout still runs one at a time; a busy one gives the next attempt its own worktree.
+                    Terminal attempts also need a free terminal session.
+                  </AgentLimitSetting>
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="terminal-sessions" hidden={!shown("terminal-sessions")}>
+                  <AgentLimitSetting
+                    field="max_terminal_sessions"
+                    label="Terminal sessions open at once"
+                    testid="terminal-sessions"
+                    max={MAX_TERMINAL_SESSIONS}
+                    fallback={DEFAULT_TERMINAL_SESSIONS}
+                    active={isOpen && activeSection === "agents"}
+                  >
+                    Shells, agent tabs and task terminals that may be open together, across every repository — up to {MAX_TERMINAL_SESSIONS}, {DEFAULT_TERMINAL_SESSIONS} unless you change it.
+                    Applies to the next session. Lowering it closes nothing; new sessions wait until enough close.
+                  </AgentLimitSetting>
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
                   <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />

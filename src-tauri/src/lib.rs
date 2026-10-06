@@ -138,6 +138,9 @@ pub fn run() {
             // processes are provably gone, off the startup path.
             {
                 use tauri::Manager as _;
+                // The user's terminal session limit, before any window can
+                // open a session. A file this cannot read keeps the default.
+                app.state::<terminal::TerminalSessions>().apply_stored_limit();
                 let state = app.state::<workbench::WorkbenchState>().inner().clone();
                 state.attach_terminals(app.state::<terminal::TerminalSessions>().inner().clone());
                 if let Err(error) = std::thread::Builder::new()

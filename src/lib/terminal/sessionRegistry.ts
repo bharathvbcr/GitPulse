@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import { MAX_TERMINAL_TABS } from "./tabs";
+import { currentSessionLimit } from "./sessionLimit";
 
 export interface TerminalSessionRecord {
   key: string;
@@ -94,7 +94,8 @@ export function createSessionRegistry() {
     subscribe: store.subscribe,
     reserve(record: TerminalSessionRecord) {
       if (records.has(record.key)) throw new Error("This terminal already owns a session slot");
-      if (records.size >= MAX_TERMINAL_TABS) throw new Error(`All ${MAX_TERMINAL_TABS} terminal sessions are in use across repositories`);
+      const limit = currentSessionLimit();
+      if (records.size >= limit) throw new Error(`All ${limit} terminal sessions are in use across repositories`);
       records.set(record.key, record);
       publish();
       let released = false;

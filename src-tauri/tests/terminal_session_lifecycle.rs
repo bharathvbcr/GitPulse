@@ -501,7 +501,7 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
     gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
     // Every slot came back: the cap can be filled again from empty.
     let mut held = Vec::new();
-    for _ in 0..gitpulse_lib::terminal::MAX_PTY_SESSIONS {
+    for _ in 0..h.state.session_limit() {
         held.push(
             spawn_session(
                 h.app.handle(),

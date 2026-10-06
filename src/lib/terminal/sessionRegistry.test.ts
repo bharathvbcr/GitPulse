@@ -6,7 +6,7 @@ import {
   sessionsByRepo,
   type TerminalSessionRecord,
 } from "./sessionRegistry";
-import { MAX_TERMINAL_TABS } from "./tabs";
+import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS, currentSessionLimit, setTerminalSessionLimit } from "./sessionLimit";
 
 function record(overrides: Partial<TerminalSessionRecord> = {}): TerminalSessionRecord {
   return {
@@ -66,14 +66,35 @@ describe("terminal session registry", () => {
 
   it("rejects reservations above the terminal capacity", () => {
     const registry = createSessionRegistry();
-    for (let index = 0; index < MAX_TERMINAL_TABS; index += 1) {
+    for (let index = 0; index < DEFAULT_TERMINAL_SESSIONS; index += 1) {
       registry.reserve(record({ key: String(index) }));
     }
 
-    expect(() => registry.reserve(record({ key: String(MAX_TERMINAL_TABS + 1) }))).toThrow(
-      `All ${MAX_TERMINAL_TABS} terminal sessions are in use across repositories`,
+    expect(() => registry.reserve(record({ key: String(DEFAULT_TERMINAL_SESSIONS + 1) }))).toThrow(
+      `All ${DEFAULT_TERMINAL_SESSIONS} terminal sessions are in use across repositories`,
     );
-    expect(get(registry)).toHaveLength(MAX_TERMINAL_TABS);
+    expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
+  });
+
+  it("stops at the user's live limit and names it", () => {
+    const registry = createSessionRegistry();
+    try {
+      setTerminalSessionLimit(DEFAULT_TERMINAL_SESSIONS + 6);
+      for (let index = 0; index < DEFAULT_TERMINAL_SESSIONS + 6; index += 1) registry.reserve(record({ key: String(index) }));
+      expect(() => registry.reserve(record({ key: "over" }))).toThrow(`All ${DEFAULT_TERMINAL_SESSIONS + 6} terminal sessions`);
+      // Lowered below what is open: nothing new opens until enough close.
+      setTerminalSessionLimit(4);
+      expect(() => registry.reserve(record({ key: "lowered" }))).toThrow("All 4 terminal sessions");
+      // A value the backend would not accept falls back to the default.
+      for (const bad of [0, MAX_TERMINAL_SESSIONS + 1, 2.5, "40", null]) {
+        setTerminalSessionLimit(bad);
+        expect(currentSessionLimit(), String(bad)).toBe(DEFAULT_TERMINAL_SESSIONS);
+      }
+      setTerminalSessionLimit(MAX_TERMINAL_SESSIONS);
+      expect(currentSessionLimit()).toBe(MAX_TERMINAL_SESSIONS);
+    } finally {
+      setTerminalSessionLimit(undefined);
+    }
   });
 
   it("carries a reveal through status updates, so a jump target survives a restart", () => {

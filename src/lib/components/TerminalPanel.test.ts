@@ -144,7 +144,10 @@ describe("TerminalPanel tab strip", () => {
 
   it("disables opening past the ceiling and says why", () => {
     expect(source).toContain("disabled={!repoPath || !canCreate}");
-    expect(source).toContain("${MAX_TERMINAL_TABS} terminal sessions are open");
+    expect(source).toContain("${$terminalSessionLimit} terminal sessions are open");
+    // The user's live limit, so raising it in Settings opens a waiting task
+    // terminal at once instead of when a session next closes.
+    expect(source).toContain("canOpenTab(tabState, $terminalSessionLimit) && $terminalSessions.length < $terminalSessionLimit");
   });
 
   it("routes chords through the shared parser rather than inline key tests", () => {

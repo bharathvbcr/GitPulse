@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { createSessionLifecycle, type SessionTransport } from "./sessionLifecycle";
 import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
-import { MAX_TERMINAL_TABS } from "./tabs";
+import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
 
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
@@ -305,8 +305,8 @@ describe("terminal lifecycle races", () => {
     const sessions = Array.from({ length: 100 }, (_, i) =>
       fixture({ spawn: async () => ({ id: `native-${i}`, shell: "/bin/sh", cwd: "/repo" }) }, registry, String(i)));
     await Promise.all(sessions.map((f) => f.owner.start()));
-    expect(get(registry)).toHaveLength(MAX_TERMINAL_TABS);
-    expect(sessions.reduce((n, f) => n + f.transport.spawn.mock.calls.length, 0)).toBe(MAX_TERMINAL_TABS);
+    expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
+    expect(sessions.reduce((n, f) => n + f.transport.spawn.mock.calls.length, 0)).toBe(DEFAULT_TERMINAL_SESSIONS);
     for (const f of sessions) f.owner.dispose(); await flush(); expect(get(registry)).toHaveLength(0);
   });
 });

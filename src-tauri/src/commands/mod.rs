@@ -4839,10 +4839,16 @@ pub struct AgentDefaultsView {
 
 #[tauri::command(async)]
 pub async fn cmd_agent_defaults_save(
+    terminals: State<'_, crate::terminal::TerminalSessions>,
     defaults: crate::tool_config::AgentDefaults,
 ) -> Result<AgentDefaultsView, String> {
+    let terminals = terminals.inner().clone();
     off_thread(move || {
         crate::tool_config::set_agent_defaults(defaults)?;
+        // Applied to the live registry here, so the next session obeys the
+        // saved limit without a restart. Read back rather than taken from
+        // the input, so the registry holds exactly what was stored.
+        terminals.apply_stored_limit();
         Ok(AgentDefaultsView {
             defaults: crate::tool_config::agent_defaults(),
             modes: crate::workbench::terminal_command::PERMISSION_MODES

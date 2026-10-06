@@ -6,6 +6,7 @@
  * without a PTY, a webview, or an xterm instance behind it.
  */
 
+import { currentSessionLimit } from "./sessionLimit";
 import { isImeComposition } from "../keyboard/imeGuard";
 import type { PermissionMode } from "./agentDefaults";
 
@@ -21,15 +22,6 @@ export const LAUNCHERS: readonly { kind: LauncherKind; label: string }[] = [
   { kind: "agy", label: "Antigravity" },
 ];
 
-/**
- * Ceiling on open tabs, equal to the backend's `MAX_PTY_SESSIONS`.
- *
- * Deliberately the same number rather than a smaller "safe" one: a UI that
- * stopped short would make a reachable backend refusal unreachable, and a UI
- * that ran past it would surface that refusal as an unexplained spawn error.
- * `tabs.contract.test.ts` reads the Rust constant and fails if the two drift.
- */
-export const MAX_TERMINAL_TABS = 32;
 
 export interface TerminalTab {
   id: string;
@@ -124,8 +116,12 @@ export function initialState(launcher: LauncherKind = "shell", task?: TaskLaunch
   return openTab({ tabs: [], activeId: null }, launcher, task);
 }
 
-export function canOpenTab(state: TabState): boolean {
-  return state.tabs.length < MAX_TERMINAL_TABS;
+/**
+ * Whether one more tab fits under the session limit. A reactive caller passes
+ * `$terminalSessionLimit` so it re-evaluates when the user changes the limit.
+ */
+export function canOpenTab(state: TabState, limit: number = currentSessionLimit()): boolean {
+  return state.tabs.length < limit;
 }
 
 /** What the panel knows about where a pane stands. */

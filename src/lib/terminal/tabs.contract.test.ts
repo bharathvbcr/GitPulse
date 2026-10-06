@@ -11,27 +11,34 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { LAUNCHERS, MAX_TERMINAL_TABS } from "./tabs";
+import { LAUNCHERS } from "./tabs";
+import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "./sessionLimit";
 import { DEFAULT_SESSION_ALERT_SETTINGS } from "../stores/sessionAlertsStore";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const rust = readFileSync(join(repoRoot, "src-tauri", "src", "terminal", "mod.rs"), "utf8");
 const toolConfig = readFileSync(join(repoRoot, "src-tauri", "src", "tool_config.rs"), "utf8");
 
-describe("terminal tab ceiling", () => {
-  it("matches MAX_PTY_SESSIONS in the Rust terminal module", () => {
-    const match = rust.match(/const MAX_PTY_SESSIONS:\s*usize\s*=\s*(\d+)\s*;/);
+describe("terminal session limit", () => {
+  it.each([
+    ["DEFAULT_PTY_SESSIONS", DEFAULT_TERMINAL_SESSIONS],
+    ["MAX_PTY_SESSIONS", MAX_TERMINAL_SESSIONS],
+  ])("matches %s in the Rust terminal module", (name, mirrored) => {
+    const match = rust.match(new RegExp(`const ${name}:\\s*usize\\s*=\\s*(\\d+)\\s*;`));
     // A rename or a reshaped declaration must fail loudly here rather than
     // silently stop checking anything — an unfindable constant is not a
     // matching one.
-    expect(match, "MAX_PTY_SESSIONS declaration not found in src-tauri/src/terminal/mod.rs").not
-      .toBeNull();
-    expect(MAX_TERMINAL_TABS).toBe(Number(match?.[1]));
+    expect(match, `${name} declaration not found in src-tauri/src/terminal/mod.rs`).not.toBeNull();
+    expect(mirrored).toBe(Number(match?.[1]));
   });
 
-  it("is the ceiling the reservation actually enforces", () => {
+  it("is the user's live limit that the reservation actually enforces", () => {
     // The constant existing is not the same as it gating anything.
-    expect(rust).toContain("(current < MAX_PTY_SESSIONS).then_some(current + 1)");
+    expect(rust).toContain("(current < state.session_limit()).then_some(current + 1)");
+    expect(rust).toContain(".store(limit.clamp(1, MAX_PTY_SESSIONS), Ordering::Release)");
+    // The stored setting is bounded by the same two numbers, not copies.
+    expect(toolConfig).toContain("DEFAULT_TERMINAL_SESSIONS: u32 = crate::terminal::DEFAULT_PTY_SESSIONS as u32;");
+    expect(toolConfig).toContain("MAX_TERMINAL_SESSIONS: u32 = crate::terminal::MAX_PTY_SESSIONS as u32;");
   });
 });
 

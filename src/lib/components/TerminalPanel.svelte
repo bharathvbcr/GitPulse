@@ -5,6 +5,8 @@
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
+  import { terminalSessionLimit } from "../terminal/sessionLimit";
+  import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
   import { taskTerminalRequests, consumeTaskTerminalRequest, requestFor } from "../terminal/taskLaunches";
@@ -50,7 +52,6 @@
   import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
-    MAX_TERMINAL_TABS,
     activateTab,
     canOpenTab,
     closeTab,
@@ -141,6 +142,9 @@
 
   onMount(() => {
     inputEl?.focus();
+    // The session limit is an agent default; read it before the first
+    // session so the panel stops where the backend does.
+    void loadAgentDefaults().catch(() => {});
     return () => {
       if (copiedResetTimer !== null) {
         clearTimeout(copiedResetTimer);
@@ -190,8 +194,10 @@
   let renameValue = $state("");
   let tabStatuses = $state<Record<string, string>>({});
   let unread = $state(new Set<string>());
-  const canCreate = $derived(canOpenTab(tabState) && $terminalSessions.length < MAX_TERMINAL_TABS);
-  const capacityTitle = $derived(canCreate ? "New terminal session" : `All ${MAX_TERMINAL_TABS} terminal sessions are open — close one in Sessions`);
+  // Reads the live limit, so raising it in Settings lets a waiting task
+  // terminal open at once rather than when a session next closes.
+  const canCreate = $derived(canOpenTab(tabState, $terminalSessionLimit) && $terminalSessions.length < $terminalSessionLimit);
+  const capacityTitle = $derived(canCreate ? "New terminal session" : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
   let shortcutsOpen = $state(false);
   let focusTabStrip = false;
   const tabExtras = $derived.by(() => {
@@ -844,7 +850,7 @@
           <span>Clear</span>
         </button>
       {/if}
-      <button type="button" class="gp-icon-btn text-[10px]!" aria-label="All terminal sessions" aria-expanded={sessionListOpen} title="Sessions across repositories" onclick={() => { const next = !sessionListOpen; closeChrome(); sessionListOpen = next; }}>{$terminalSessions.length}/{MAX_TERMINAL_TABS}</button>
+      <button type="button" class="gp-icon-btn text-[10px]!" aria-label="All terminal sessions" aria-expanded={sessionListOpen} title="Sessions across repositories" onclick={() => { const next = !sessionListOpen; closeChrome(); sessionListOpen = next; }}>{$terminalSessions.length}/{$terminalSessionLimit}</button>
       <button type="button" class="gp-icon-btn" aria-label="Terminal shortcuts" aria-expanded={shortcutsOpen} title="Terminal shortcuts" onclick={() => { const next = !shortcutsOpen; closeChrome(); shortcutsOpen = next; }}><Keyboard size={13} /></button>
       {#if onToggleExpanded}
         <button type="button" class="gp-icon-btn" aria-label={expanded ? "Restore terminal size" : "Expand terminal"} title={expanded ? "Restore terminal size" : "Expand terminal"} onclick={onToggleExpanded}>
@@ -903,7 +909,7 @@
   {/if}
   {#if waitingForCapacity && mode === "shell"}
     <div class="px-3 py-1.5 border-b border-border/60 text-[11px] text-amber-300 bg-amber-500/10" role="status" data-testid="terminal-waiting-for-capacity">
-      {waitingForCapacity.title} is waiting to open here: all {MAX_TERMINAL_TABS} terminal sessions are in use. Close one in Sessions and it opens.
+      {waitingForCapacity.title} is waiting to open here: all {$terminalSessionLimit} terminal sessions are in use. Close one in Sessions, or raise the limit in Settings → Agents, and it opens.
     </div>
   {/if}
   {#if shortcutsOpen}
