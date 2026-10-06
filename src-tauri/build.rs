@@ -120,6 +120,9 @@ fn compile_apple_intelligence() {
     let deployment = "26.0";
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let library = out.join("libgitpulse_apple_intelligence.a");
+    // A build script is its own single-threaded process, which cannot link
+    // the crate it builds and has no other thread to inherit a pipe from.
+    #[allow(clippy::disallowed_methods)]
     let status = std::process::Command::new(&swiftc)
         .args(["-sdk", &sdk])
         .args(["-target", &format!("{arch}-apple-macosx{deployment}")])
@@ -155,6 +158,9 @@ fn compile_apple_intelligence() {
 
 /// One `xcrun` lookup, or None when the toolchain cannot answer.
 fn xcrun(args: &[&str]) -> Option<String> {
+    // A build script is its own single-threaded process, which cannot link
+    // the crate it builds and has no other thread to inherit a pipe from.
+    #[allow(clippy::disallowed_methods)]
     let output = std::process::Command::new("xcrun")
         .args(args)
         .output()

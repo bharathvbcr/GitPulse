@@ -3,6 +3,7 @@ use gitpulse_lib::diff::{
     ConflictResolutionChoice,
 };
 use gitpulse_lib::engine::git_cli::{git, git_with_stdin};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use tempfile::TempDir;
 mod common;
@@ -421,14 +422,14 @@ fn atomic_resolution_preserves_extended_attributes() {
     assert!(std::process::Command::new("/usr/bin/xattr")
         .args(["-w", "com.gitpulse.conflict-test", "keep-me"])
         .arg(&path)
-        .status()
+        .status_locked()
         .unwrap()
         .success());
     save(&dir, &load(&dir)).unwrap();
     let result = std::process::Command::new("/usr/bin/xattr")
         .args(["-p", "com.gitpulse.conflict-test"])
         .arg(&path)
-        .output()
+        .output_locked()
         .unwrap();
     assert!(result.status.success());
     assert_eq!(result.stdout, b"keep-me\n");

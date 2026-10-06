@@ -7,6 +7,7 @@
 //! that the command exited zero.
 
 use gitpulse_lib::engine::repo_op::{self, OperationAction, OperationKind};
+use gitpulse_lib::procguard::LockedSpawn;
 
 /// Drives a recovery verb with a judge that records the argv and approves it.
 ///
@@ -103,7 +104,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .status()
+        .status_locked()
         .expect("git");
     assert!(status.success(), "git {args:?} failed");
     if args.first() == Some(&"init") {
@@ -119,7 +120,7 @@ fn run_git_allow_failure(cwd: &Path, args: &[&str]) {
         .current_dir(cwd)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
-        .output()
+        .output_locked()
         .expect("git");
 }
 
@@ -127,7 +128,7 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .output_locked()
         .expect("git");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

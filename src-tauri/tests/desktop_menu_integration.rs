@@ -9,6 +9,7 @@
 use gitpulse_lib::desktop::{
     cmd_take_pending_open, handle_menu_event, queue_and_emit_open, DesktopState,
 };
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use tauri::Manager;
@@ -77,7 +78,7 @@ fn init_repo(dir: &Path) {
         let out = Command::new("git")
             .args(&args)
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("git on PATH");
         assert!(out.status.success(), "git {args:?} failed");
     }

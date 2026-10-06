@@ -1,3 +1,4 @@
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::analyzer::LocCounter;
 use gitpulse_lib::diff::{
@@ -16,7 +17,7 @@ fn init_repo_with_base_file() -> tempfile::TempDir {
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git");
         assert!(
             out.status.success(),
@@ -27,7 +28,7 @@ fn init_repo_with_base_file() -> tempfile::TempDir {
     let _ = StdCommand::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     common::trust_repo(dir.path());
     git(&["config", "user.name", "t"]);
@@ -99,7 +100,7 @@ fn selective_staging_applies_a_valid_patch_to_the_index() {
     let staged = StdCommand::new("git")
         .args(["show", ":lib.rs"])
         .current_dir(repo.path())
-        .output()
+        .output_locked()
         .expect("read index");
     assert!(staged.status.success());
     let text = String::from_utf8_lossy(&staged.stdout);
@@ -150,7 +151,7 @@ fn selective_staging_rejects_hostile_patches_before_git_runs() {
         let out = StdCommand::new("git")
             .args(["diff", "--cached", "--name-only"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("diff");
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
@@ -661,7 +662,7 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git");
         assert!(
             out.status.success(),
@@ -672,7 +673,7 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
     let _ = StdCommand::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     common::trust_repo(dir.path());
     // Windows installs git with core.autocrlf=true in its system config, so a
@@ -697,7 +698,7 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
         StdCommand::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )

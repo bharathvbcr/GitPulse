@@ -1230,6 +1230,7 @@ const LOCAL_SCAN_TIMEOUT_MS: i64 = 1_500;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1328,7 +1329,7 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@e")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@e")
-                .output()
+                .output_locked()
                 .expect("git runs");
         };
         run(&["init", "-b", "main"]);
@@ -1415,7 +1416,7 @@ mod tests {
         std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git init");
         crate::test_support::trust_repo(dir.path());
         let error = generate_commit_message(
@@ -1586,7 +1587,7 @@ mod tests {
             std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(repo.path())
-                .output()
+                .output_locked()
                 .expect("rev-parse runs")
                 .stdout,
         )

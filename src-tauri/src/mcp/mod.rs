@@ -1555,6 +1555,7 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     fn modern_meta() -> Value {
         json!({
@@ -2189,7 +2190,7 @@ mod tests {
         let repo = dir.path().to_string_lossy().into_owned();
         let init = std::process::Command::new("git")
             .args(["init", "-q", &repo])
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(init.status.success(), "git init failed");
 
@@ -2447,7 +2448,7 @@ mod tests {
         let repo = dir.path().to_string_lossy().into_owned();
         let init = std::process::Command::new("git")
             .args(["init", "-q", &repo])
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(init.status.success(), "git init failed");
         let profile = tempfile::tempdir().expect("profile dir");
@@ -2918,7 +2919,7 @@ mod tests {
         let other_repo = other.path().to_string_lossy().into_owned();
         assert!(std::process::Command::new("git")
             .args(["init", "-q", &other_repo])
-            .status()
+            .status_locked()
             .unwrap()
             .success());
         crate::test_support::trust_repo(other.path());
@@ -3152,7 +3153,7 @@ mod tests {
         let other_repo = other.path().to_string_lossy().into_owned();
         assert!(std::process::Command::new("git")
             .args(["init", "-q", &other_repo])
-            .status()
+            .status_locked()
             .unwrap()
             .success());
         crate::test_support::trust_repo(other.path());

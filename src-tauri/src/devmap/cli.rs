@@ -1181,6 +1181,7 @@ fn omitted_preview_file(path: &str) -> PreviewFileResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     /// A warning devmap emits and GitPulse has never heard of must still be
     /// shown.
@@ -1511,7 +1512,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir.path());
@@ -2223,7 +2224,7 @@ exit 2
         let out = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(out.status.success());
         crate::test_support::trust_repo(repo.path());
@@ -2268,7 +2269,7 @@ printf '%s\n' '{\"ok\":true}'
         let out = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(out.status.success());
         crate::test_support::trust_repo(repo.path());

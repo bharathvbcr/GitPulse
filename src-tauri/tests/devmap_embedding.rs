@@ -1,5 +1,6 @@
 //! Consumer contracts shared by the database, map and graph adapters.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::{codeintel, devmap};
 use serde_json::json;
@@ -11,7 +12,7 @@ fn repository() -> tempfile::TempDir {
     let result = std::process::Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(root.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(
         result.status.success(),

@@ -3836,6 +3836,7 @@ fn relativize_or_suffix(repo: &Path, reported: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::analyzer::language::LanguageInfo;
+    use crate::procguard::LockedSpawn;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -5252,7 +5253,7 @@ src/main.go:4.1,4.8 1 0
         let built = std::process::Command::new("python3")
             .args(["-m", "venv", ".venv"])
             .current_dir(repo.path())
-            .status();
+            .status_locked();
         match built {
             Ok(status) if status.success() => {}
             _ => return, // no usable python3 on this host
@@ -6309,7 +6310,7 @@ src/main.go:4.1,4.8 1 0
             let status = Command::new("touch")
                 .args(["-t", "202601010000"])
                 .arg(path)
-                .status()
+                .status_locked()
                 .expect("touch -t available on test platform");
             assert!(status.success());
         };

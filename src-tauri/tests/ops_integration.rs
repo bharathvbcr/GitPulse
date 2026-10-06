@@ -6,6 +6,7 @@
 //! be destructive, so the refusals matter as much as the happy paths — and the
 //! module had no integration test at all, only inline unit tests.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 
 use gitpulse_lib::ops::{
@@ -20,7 +21,7 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("git must be on PATH")
 }
 

@@ -1915,6 +1915,7 @@ pub fn preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     #[test]
     fn a_reader_refuses_a_store_bound_to_another_worktree() {
@@ -1998,7 +1999,7 @@ mod tests {
         let status = command
             .env("DEVMAP_HOME", home.path())
             .env("GITPULSE_DEVMAP_HOME_CHILD", home.path())
-            .status()
+            .status_locked()
             .expect("run isolated test process");
         assert!(
             status.success(),
@@ -2032,7 +2033,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(
             output.status.success(),

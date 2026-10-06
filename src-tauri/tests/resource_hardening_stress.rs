@@ -9,6 +9,7 @@
 use gitpulse_lib::engine::budget;
 use gitpulse_lib::engine::git_cli;
 use gitpulse_lib::engine::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +21,7 @@ fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("git");
     assert!(
         out.status.success(),
@@ -45,7 +46,7 @@ fn repo_with(dir: &Path, name: &str, first: &str, second: &str) -> String {
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("rev-parse");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -53,7 +54,7 @@ fn repo_with(dir: &Path, name: &str, first: &str, second: &str) -> String {
 fn rss_bytes() -> u64 {
     let out = Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
+        .output_locked()
         .expect("ps");
     String::from_utf8_lossy(&out.stdout)
         .trim()

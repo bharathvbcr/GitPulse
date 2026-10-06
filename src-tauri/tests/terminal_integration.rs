@@ -7,6 +7,7 @@
 //! refused before a process starts. These run against real repositories and
 //! real child processes.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{run_manvi_action, run_terminal, ManviActionKind};
 use std::fs;
 use std::path::Path;
@@ -17,7 +18,7 @@ fn run_git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(dir)
-        .status()
+        .status_locked()
         .expect("git must be on PATH");
     assert!(status.success(), "git {args:?} failed");
     if args.first() == Some(&"init") {

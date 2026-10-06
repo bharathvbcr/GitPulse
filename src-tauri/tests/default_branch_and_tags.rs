@@ -1,4 +1,5 @@
 use gitpulse_lib::engine::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -49,7 +50,7 @@ fn seed_remote_head(repo: &TestRepo, remote: &str, target: &str) {
         Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo.dir.path())
-            .output()
+            .output_locked()
             .expect("rev-parse")
             .stdout,
     )
@@ -162,7 +163,7 @@ fn tags_are_newest_first_by_creatordate() {
             .args(["tag", "-a", name, "-m", name])
             .current_dir(repo.dir.path())
             .env("GIT_COMMITTER_DATE", date)
-            .output()
+            .output_locked()
             .expect("spawn git tag");
         assert!(
             output.status.success(),

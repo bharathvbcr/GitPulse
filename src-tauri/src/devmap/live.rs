@@ -706,6 +706,7 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use serde_json::json;
 
     /// A build the gate would not start is a deferral, not a failed refresh:
@@ -1162,7 +1163,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(repo.path());
@@ -1256,7 +1257,7 @@ exit 2
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(repo.path());
@@ -1317,7 +1318,7 @@ exit 2
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(repo.path());
@@ -1375,7 +1376,7 @@ exit 2
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(repo.path());
@@ -1451,7 +1452,7 @@ exit 2
         assert!(std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git init")
             .status
             .success());

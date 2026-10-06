@@ -3573,6 +3573,7 @@ pub fn repo_name_from_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::procguard::LockedSpawn;
     #[test]
     fn background_priority_restores_after_nested_work_errors_and_panic() {
         use super::{current_admission, Admission};
@@ -4559,7 +4560,7 @@ mod tests {
             .args(["worktree", "add", "-b", "gitpulse-link"])
             .arg(&work_path)
             .current_dir(main.path())
-            .output()
+            .output_locked()
             .expect("spawn git worktree");
         assert!(
             output.status.success(),
@@ -4990,7 +4991,7 @@ mod tests {
             Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
             Some(home.path().as_os_str()),
         );
-        let out = cmd.output().expect("spawn git");
+        let out = cmd.output_locked().expect("spawn git");
         assert!(
             out.status.success(),
             "pre-commit hook could not resolve a fallback-dir helper: {}{}",
@@ -5304,7 +5305,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .status_locked()
                 .is_err();
             if refused {
                 refused_at = Some(bytes);
@@ -6160,7 +6161,7 @@ mod tests {
             let pid = pid.trim();
             let probe = Command::new("kill")
                 .args(["-0", pid])
-                .status()
+                .status_locked()
                 .expect("kill -0");
             assert!(
                 !probe.success(),
@@ -7360,7 +7361,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("init")
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir);
@@ -7469,6 +7470,7 @@ mod tests {
 #[cfg(test)]
 mod admission_scope_tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     fn leak(gate: SpawnGate) -> &'static SpawnGate {
         Box::leak(Box::new(gate))

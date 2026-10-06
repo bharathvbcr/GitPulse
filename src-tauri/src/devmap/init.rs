@@ -357,12 +357,13 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     fn git(repo: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(repo)
-            .output()
+            .output_locked()
             .expect("git");
         assert!(out.status.success(), "git {args:?}: {out:?}");
     }
@@ -402,7 +403,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git status");
         assert_eq!(
             String::from_utf8_lossy(&status.stdout).trim(),
@@ -502,7 +503,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&linked)
-            .output()
+            .output_locked()
             .expect("git status");
         assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
         git(
@@ -533,7 +534,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git status");
         assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
     }
@@ -552,7 +553,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git status");
         assert!(
             String::from_utf8_lossy(&status.stdout).contains("vendor/"),
@@ -631,7 +632,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(repo.path())
-            .output()
+            .output_locked()
             .expect("git status");
         assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
     }

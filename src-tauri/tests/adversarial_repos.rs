@@ -14,6 +14,7 @@ use gitpulse_lib::engine::git_cli::resolve_git_dir;
 use gitpulse_lib::engine::git_cli::sandbox_join_canonical;
 use gitpulse_lib::engine::git_writer::validate_ref_name;
 use gitpulse_lib::engine::{GitReader, GitWriter};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::File;
 use std::path::Path;
 use std::process::Command;
@@ -34,7 +35,7 @@ fn git_in(dir: &Path, args: &[&str]) {
         ])
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("spawn git");
     assert!(
         output.status.success(),
@@ -111,7 +112,7 @@ fn no_trailing_newline_commit_round_trips_cleanly() {
     let out = Command::new("git")
         .args(["diff", "--shortstat", "HEAD~1", "HEAD"])
         .current_dir(repo.path())
-        .output()
+        .output_locked()
         .unwrap();
     let stat = String::from_utf8_lossy(&out.stdout).to_string();
     let churn = DiffChurn::parse_shortstat(&stat);

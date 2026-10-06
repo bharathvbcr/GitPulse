@@ -247,6 +247,7 @@ pub fn view(repo_path: &str) -> GrantView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     #[cfg(unix)]
     fn real_repo() -> tempfile::TempDir {
@@ -254,7 +255,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["init", "--quiet"])
             .arg(dir.path())
-            .status()
+            .status_locked()
             .expect("run git init");
         assert!(status.success(), "git init failed");
         dir

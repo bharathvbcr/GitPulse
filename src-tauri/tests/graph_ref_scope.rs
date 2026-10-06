@@ -13,6 +13,7 @@
 //! graph width (440px, ~14 lanes) 21 of those rows drew their node off-canvas
 //! and appeared to have no node at all.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 
 use std::process::Command;
@@ -35,7 +36,7 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
         .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
-        .output()
+        .output_locked()
         .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
     assert!(
         out.status.success(),
@@ -165,7 +166,7 @@ fn every_scope_labels_every_ref_it_walks() {
             .args(["rev-list", "--no-walk"])
             .args(gitpulse_lib::graph::history_rev_args(scope))
             .current_dir(&repo)
-            .output()
+            .output_locked()
             .expect("rev-list tips");
         let labelled: std::collections::HashSet<&str> =
             payload.refs.iter().map(|r| r.commit_id.as_str()).collect();

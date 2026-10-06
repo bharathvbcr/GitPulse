@@ -5,6 +5,7 @@
 //! the check prints why and returns, so machines without it still pass; when
 //! it is present, the assertions must hold against its genuine output.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::analyzer::deps::{DepsScanner, ScanOptions};
 use std::fs;
@@ -17,7 +18,7 @@ fn git_repo() -> TempDir {
     let status = Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     assert!(status.success());
     common::trust_repo(dir.path());
@@ -36,7 +37,7 @@ fn git_add(dir: &Path, rel: &str) {
     let status = Command::new("git")
         .args(["add", rel])
         .current_dir(dir)
-        .status()
+        .status_locked()
         .expect("git add");
     assert!(status.success());
 }
@@ -215,7 +216,7 @@ fn live_cargo_audit_reports_time_rustsec() {
         .args(["generate-lockfile"])
         .env("CARGO_NET_OFFLINE", "false")
         .current_dir(repo.path())
-        .status();
+        .status_locked();
     if !matches!(resolved, Ok(s) if s.success()) {
         eprintln!("skip: could not generate Cargo.lock (offline?)");
         return;
@@ -288,7 +289,7 @@ fn live_npm_audit_reports_lodash_advisories() {
             "--no-audit",
         ])
         .current_dir(repo.path())
-        .status();
+        .status_locked();
     if !matches!(locked, Ok(s) if s.success()) {
         eprintln!("skip: could not generate package-lock.json (offline?)");
         return;
@@ -366,7 +367,7 @@ fn live_govulncheck_reports_xtext_module_findings() {
         .args(["mod", "tidy"])
         .env("GOFLAGS", "-mod=mod")
         .current_dir(repo.path())
-        .status();
+        .status_locked();
     git_add(repo.path(), "go.mod");
     if repo.path().join("go.sum").exists() {
         git_add(repo.path(), "go.sum");

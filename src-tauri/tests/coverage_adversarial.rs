@@ -3,6 +3,7 @@
 //! concurrent hammering. Complements the parser-level corpus in
 //! coverage_stress.rs by attacking what sits AROUND the parsers.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use std::fs;
@@ -19,7 +20,7 @@ fn git_repo() -> TempDir {
     let status = Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     assert!(status.success());
     common::trust_repo(dir.path());
@@ -65,7 +66,7 @@ fn fifo_artifact_is_skipped_not_blocking() {
     let fifo = repo.path().join("lcov.info");
     let status = Command::new("mkfifo")
         .arg(&fifo)
-        .status()
+        .status_locked()
         .expect("mkfifo available");
     assert!(status.success());
 

@@ -7,6 +7,7 @@
 //! the identity pins or the failure message need to change, and nothing fails
 //! when only six of them are.
 
+use crate::procguard::LockedSpawn;
 pub(crate) mod env;
 
 use std::fs;
@@ -108,7 +109,8 @@ pub(crate) fn coverage_relaxed(duration: Duration) -> Duration {
 /// production code spawning outside the gated seam.
 #[cfg(test)]
 pub(crate) fn git_in(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args([
             "-c",
             "user.name=GitPulse",
@@ -119,8 +121,14 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         ])
         .args(args)
         .current_dir(dir)
-        .output()
-        .expect("spawn git");
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Spawned under the inheritance lock like every production child: this
+    // runs on test threads beside code whose pipes are not yet close-on-exec,
+    // and a child forked in that window keeps their ends for its lifetime.
+    let child = command.spawn_locked().expect("spawn git");
+    let output = child.wait_with_output().expect("wait for git");
     assert!(
         output.status.success(),
         "git {args:?} failed: {}",
@@ -149,7 +157,7 @@ pub(crate) fn git_repo() -> TempDir {
     let status = Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     assert!(status.success());
     trust_repo(dir.path());
@@ -226,6 +234,30 @@ mod tests {
         );
         assert_ne!(guard.path(), src.as_path());
         assert_eq!(guard.path().parent(), src.parent());
+    }
+
+    /// A fixture git spawns under the inheritance lock, so it cannot inherit
+    /// a pipe another test thread has not yet made close-on-exec. Checked by
+    /// holding the lock: the spawn must wait for it.
+    #[test]
+    fn fixture_git_waits_for_the_inheritance_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            crate::procguard::with_inheritance_lock(|| {
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        });
+        held_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        super::git_in(dir.path(), &["--version"]);
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "spawned while the lock was held ({:?})",
+            started.elapsed()
+        );
+        holder.join().unwrap();
     }
 
     #[test]

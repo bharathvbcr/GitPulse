@@ -6,6 +6,7 @@
 
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use gitpulse_lib::engine::git_cli::{git_text, git_text_partial, git_with_stdin, MAX_OUTPUT_BYTES};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +18,7 @@ fn git_repo() -> TempDir {
     let status = Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git init");
     assert!(status.success());
     common::trust_repo(dir.path());
@@ -640,7 +641,7 @@ fn adversarial_fifo_manifest_does_not_block_planning() {
     let fifo = repo.path().join("pipe");
     assert!(Command::new("mkfifo")
         .arg(&fifo)
-        .status()
+        .status_locked()
         .expect("mkfifo")
         .success());
     std::os::unix::fs::symlink(&fifo, repo.path().join("a/Cargo.toml")).expect("symlink");

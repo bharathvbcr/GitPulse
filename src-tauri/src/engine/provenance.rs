@@ -272,6 +272,7 @@ pub fn compute_freshness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::process::Command;
     use tempfile::tempdir;
 
@@ -280,22 +281,22 @@ mod tests {
         Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git init");
         Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git config");
         Command::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git config");
         Command::new("git")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("initial commit");
         crate::test_support::trust_repo(dir.path());
         dir
@@ -309,7 +310,7 @@ mod tests {
         let head = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(path)
-            .output()
+            .output_locked()
             .expect("rev-parse");
         let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
 
@@ -335,6 +336,7 @@ mod tests {
 #[cfg(test)]
 mod freshness_honesty_tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::process::Command;
 
     fn repo_with_commits(n: usize) -> tempfile::TempDir {
@@ -343,7 +345,7 @@ mod freshness_honesty_tests {
             let out = Command::new("git")
                 .args(args)
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
@@ -363,7 +365,7 @@ mod freshness_honesty_tests {
         let out = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("git");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
@@ -411,7 +413,7 @@ mod freshness_honesty_tests {
         let out = Command::new("git")
             .args(["rev-parse", "HEAD~3"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git");
         let old = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
@@ -456,7 +458,7 @@ mod freshness_honesty_tests {
         let out = Command::new("git")
             .args(["notes", &format!("--ref={VERIFICATION_NOTES_REF}"), "list"])
             .current_dir(repo)
-            .output()
+            .output_locked()
             .expect("git");
         assert!(out.status.success());
         assert!(
@@ -843,6 +845,7 @@ pub fn freshness_batch_within(
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::process::Command;
 
     struct Repo(tempfile::TempDir);
@@ -875,7 +878,7 @@ mod batch_tests {
             let out = Command::new("git")
                 .args(args)
                 .current_dir(self.path())
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(out.status.success(), "git {args:?}: {out:?}");
         }
@@ -884,7 +887,7 @@ mod batch_tests {
             let out = Command::new("git")
                 .args(["rev-parse", spec])
                 .current_dir(self.path())
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(out.status.success(), "rev-parse {spec}: {out:?}");
             String::from_utf8_lossy(&out.stdout).trim().to_string()

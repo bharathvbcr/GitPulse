@@ -1,5 +1,6 @@
 use super::{judge, manvi_owner, native_owner, Verdict};
 use crate::engine::git_cli::{git_global, git_text};
+use crate::procguard::LockedSpawn;
 use crate::workbench::process_birth::{self, Liveness};
 use crate::workbench::{query, Inner, WorkbenchState};
 use serde_json::{json, Value};
@@ -229,7 +230,7 @@ fn reaped() -> (u32, String) {
     let mut child = std::process::Command::new("sh")
         .args(["-c", "read line"])
         .stdin(std::process::Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     let pid = child.id();
     let birth = process_birth::read(pid).unwrap();
@@ -291,7 +292,7 @@ fn a_live_agent_keeps_its_checkout_and_says_so() {
     let mut agent = std::process::Command::new("sh")
         .args(["-c", "read line"])
         .stdin(std::process::Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     let pid = agent.id();
     let birth = process_birth::read(pid).unwrap();

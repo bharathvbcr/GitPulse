@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use gitpulse_lib::procguard::LockedSpawn;
     use objc2::exception::{catch, throw, Exception};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Imp, Method, Sel};
@@ -131,7 +132,7 @@ mod macos {
             let mut child = Command::new(std::env::current_exe().expect("test executable"))
                 .arg(format!("--probe={case}"))
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_locked()
                 .expect("spawn native probe");
             let deadline = Instant::now() + Duration::from_secs(30);
             let status = loop {

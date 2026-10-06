@@ -363,6 +363,47 @@ pub fn with_inheritance_lock<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// Creating a child from a [`Command`] without registering it: for tests,
+/// benches and the build script's tools, which start children beside code
+/// whose pipes are not yet close-on-exec.
+///
+/// `clippy.toml` forbids [`Command::spawn`], [`Command::output`] and
+/// [`Command::status`] everywhere; production children go through [`spawn`],
+/// and everything else through these, so every fork in the process takes the
+/// same lock. A test that forked without it could keep another test's pipe end
+/// for its lifetime — one did, and a pipe whose reader had been dropped stayed
+/// writable.
+pub trait LockedSpawn {
+    /// [`Command::spawn`] under [`with_inheritance_lock`].
+    fn spawn_locked(&mut self) -> io::Result<Child>;
+    /// [`Command::output`] under [`with_inheritance_lock`], with its defaults:
+    /// stdin closed, stdout and stderr captured. Unlike `output`, these replace
+    /// any stdio the caller set; a caller that sets its own uses
+    /// [`LockedSpawn::spawn_locked`] and waits itself.
+    fn output_locked(&mut self) -> io::Result<std::process::Output>;
+    /// [`Command::status`] under [`with_inheritance_lock`]: the child inherits
+    /// stdio, as with `status`.
+    fn status_locked(&mut self) -> io::Result<std::process::ExitStatus>;
+}
+
+impl LockedSpawn for Command {
+    #[allow(clippy::disallowed_methods)]
+    fn spawn_locked(&mut self) -> io::Result<Child> {
+        with_inheritance_lock(|| self.spawn())
+    }
+
+    fn output_locked(&mut self) -> io::Result<std::process::Output> {
+        self.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        self.spawn_locked()?.wait_with_output()
+    }
+
+    fn status_locked(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.spawn_locked()?.wait()
+    }
+}
+
 /// Spawns `cmd` as a killable process group and registers the result.
 ///
 /// This is the only supported way to start a child that must not outlive us;
@@ -386,6 +427,9 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     let _admitted = crate::repository_trust::check_command(cmd)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     sys::prepare(cmd);
+    // The seam every production child passes through: the one call to
+    // `Command::spawn` that `clippy.toml` permits outside `LockedSpawn`.
+    #[allow(clippy::disallowed_methods)]
     let mut child = with_inheritance_lock(|| cmd.spawn())?;
     let slot: Slot = Arc::new(Entry {
         label: label.to_string(),
@@ -840,6 +884,16 @@ mod sys {
         }
     }
 
+    /// A pipe whose ends are both close-on-exec before any process can be
+    /// created: `pipe` and the two `fcntl` calls run under the inheritance
+    /// lock, which every spawn takes. One line, because `tests/spawn_seam.rs`
+    /// checks that a `pipe` names the lock where it is made.
+    #[rustfmt::skip]
+    fn cloexec_pipe(fds: &mut [libc::c_int; 2]) -> bool {
+        // SAFETY: `pipe` fills `fds` on success, and `fcntl` on those is defined.
+        super::with_inheritance_lock(|| unsafe { libc::pipe(fds.as_mut_ptr()) == 0 && fds.iter().all(|&fd| libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0) })
+    }
+
     pub(super) fn install_signal_handlers() -> SignalGuard {
         if INSTALLED.swap(true, Ordering::SeqCst) {
             return SignalGuard {
@@ -848,19 +902,20 @@ mod sys {
             };
         }
 
-        let mut fds = [0 as libc::c_int; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        // Children must not inherit the wake pipe: a long-lived one holding the
+        // write end would keep it open past our own exit.
+        let mut fds: [libc::c_int; 2] = [-1; 2];
+        if !cloexec_pipe(&mut fds) {
             let why = io::Error::last_os_error();
+            for fd in fds.into_iter().filter(|fd| *fd >= 0) {
+                // SAFETY: a descriptor `pipe` created here and handed to no one.
+                unsafe { libc::close(fd) };
+            }
             INSTALLED.store(false, Ordering::SeqCst);
             return SignalGuard {
                 installed: Vec::new(),
                 skipped: vec![format!("wake pipe could not be created: {why}")],
             };
-        }
-        // Children must not inherit the wake pipe: a long-lived one holding the
-        // write end would keep it open past our own exit.
-        for fd in fds {
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
 
         // SAFETY: `fds[0]` is a fresh pipe end this function owns and never
@@ -945,7 +1000,7 @@ mod sys {
 #[cfg(any(windows, test))]
 fn run_tree_killer(cmd: &mut Command, timeout: Duration) -> io::Result<bool> {
     let started = Instant::now();
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn_locked()?;
     let failure = loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status.success()),
@@ -1636,6 +1691,58 @@ mod tests {
              inheritance lock for {HELD:?}, so it created a process inside \
              someone else's pre-FD_CLOEXEC window"
         );
+    }
+
+    /// The same for children nothing registers: every way `LockedSpawn`
+    /// creates one waits for the lock.
+    #[test]
+    fn locked_spawns_wait_behind_the_inheritance_lock() {
+        const HELD: Duration = Duration::from_millis(300);
+        type Create = fn(&mut Command) -> io::Result<()>;
+        let creators: [(&str, Create); 3] = [
+            ("spawn_locked", |cmd| cmd.spawn_locked()?.wait().map(drop)),
+            ("output_locked", |cmd| cmd.output_locked().map(drop)),
+            ("status_locked", |cmd| cmd.status_locked().map(drop)),
+        ];
+        for (name, create) in creators {
+            let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                with_inheritance_lock(|| {
+                    taken_tx.send(()).unwrap();
+                    std::thread::sleep(HELD);
+                })
+            });
+            taken_rx.recv().unwrap();
+            let mut cmd = Command::new("true");
+            let started = Instant::now();
+            create(&mut cmd).expect(name);
+            let waited = started.elapsed();
+            holder.join().expect("holder");
+            assert!(
+                waited >= HELD / 2,
+                "{name} took {waited:?} while the lock was held for {HELD:?}"
+            );
+        }
+    }
+
+    /// `output_locked` has `output`'s defaults: stdin closed, both streams
+    /// captured.
+    #[cfg(unix)]
+    #[test]
+    fn output_locked_closes_stdin_and_captures_both_streams() {
+        // A stdin the caller pointed at a file is replaced, as documented:
+        // `cat` must read nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in");
+        std::fs::write(&input, "in").unwrap();
+        let out = Command::new("sh")
+            .args(["-c", "cat; printf out; printf err >&2"])
+            .stdin(std::fs::File::open(&input).unwrap())
+            .output_locked()
+            .expect("sh");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"out");
+        assert_eq!(out.stderr, b"err");
     }
 
     /// Windows is the case where nothing can be armed. It must say so, not

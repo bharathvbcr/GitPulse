@@ -2016,6 +2016,7 @@ pub fn select_rung_for_test(rungs: &[RungStatus]) -> Option<InstallRung> {
 
 #[cfg(test)]
 mod tests {
+    use crate::procguard::LockedSpawn;
     #[test]
     fn audit_schema_numbers_cannot_wrap_into_supported_versions() {
         let value = serde_json::json!({"expected_schema_version": 4294967315_i64, "code_graph_schema_version": 4294967298_i64});
@@ -2244,7 +2245,7 @@ mod tests {
             assert!(Command::new("git")
                 .args(["init", "-q"])
                 .arg(&repo)
-                .status()
+                .status_locked()
                 .unwrap()
                 .success());
             std::fs::create_dir_all(repo.join("manvi/cmd/manvi")).unwrap();
@@ -2258,7 +2259,7 @@ mod tests {
                 assert!(Command::new("git")
                     .args(["init", "-q"])
                     .arg(&checkout)
-                    .status()
+                    .status_locked()
                     .unwrap()
                     .success());
             }

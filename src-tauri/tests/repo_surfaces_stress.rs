@@ -9,6 +9,7 @@
 use gitpulse_lib::engine::stash::{self, StashAction};
 use gitpulse_lib::engine::submodules::{self, SubmoduleChange};
 use gitpulse_lib::engine::{remotes, RemoteChange};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -20,7 +21,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .args(args)
         .current_dir(cwd)
         .env("GIT_EDITOR", "true")
-        .output()
+        .output_locked()
         .expect("git");
     assert!(
         out.status.success(),
@@ -329,7 +330,7 @@ fn a_remote_name_that_prefixes_another_keeps_its_own_refs() {
         &Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )
@@ -459,7 +460,7 @@ fn renaming_moves_tracking_refs_with_the_remote() {
         &Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )

@@ -300,6 +300,7 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::process::Command;
 
     fn init_repo() -> tempfile::TempDir {
@@ -319,7 +320,7 @@ mod tests {
             for (k, v) in env {
                 cmd.env(k, v);
             }
-            let out = cmd.output().expect("git helper");
+            let out = cmd.output_locked().expect("git helper");
             assert!(
                 out.status.success(),
                 "git {args:?} failed: {}",
@@ -364,7 +365,7 @@ mod tests {
                     format!("2026-01-{:02}T00:00:00Z", i + 1),
                 )
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .expect("git tag");
             assert!(
                 out.status.success(),
@@ -406,7 +407,7 @@ mod tests {
                     format!("2026-{month:02}-{day:02}T00:00:00Z"),
                 )
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .expect("git tag");
             assert!(
                 out.status.success(),

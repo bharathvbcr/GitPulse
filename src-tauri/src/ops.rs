@@ -499,6 +499,7 @@ pub fn prepare_release(repo_path: &str, tag: &str, message: &str) -> Result<Rele
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::path::Path;
     use std::process::Command;
 
@@ -510,7 +511,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "gitpulse@example.test")
             .env("GIT_COMMITTER_NAME", "GitPulse Test")
             .env("GIT_COMMITTER_EMAIL", "gitpulse@example.test")
-            .output()
+            .output_locked()
             .expect("git should run");
         assert!(
             output.status.success(),
@@ -669,7 +670,7 @@ mod tests {
             let out = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD:payload.txt"])
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .expect("rev-parse");
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };

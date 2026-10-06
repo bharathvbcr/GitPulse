@@ -14,6 +14,7 @@
 #![cfg(unix)]
 
 use gitpulse_lib::procguard;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -84,7 +85,7 @@ fn untrusted_repository(dir: &Path) {
     let status = Command::new("git")
         .args(["init", "-q"])
         .arg(dir)
-        .status()
+        .status_locked()
         .expect("git init");
     assert!(status.success(), "could not build the decoy repository");
 }

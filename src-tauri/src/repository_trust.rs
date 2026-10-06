@@ -1236,6 +1236,7 @@ fn admit_directory(_cmd: &mut std::process::Command, _cwd: &Path) -> Result<Admi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     #[cfg(windows)]
     #[test]
@@ -1258,7 +1259,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(dir.path())
-            .status()
+            .status_locked()
             .unwrap();
         assert!(status.success());
         dir
@@ -1384,7 +1385,7 @@ mod tests {
             ])
             .args(args)
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("spawn git");
         assert!(
             output.status.success(),
@@ -1644,7 +1645,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["init", "-q", "--bare"])
             .arg(&bare_path)
-            .status()
+            .status_locked()
             .unwrap();
         assert!(status.success());
         let bare = identity(bare_path.to_str().unwrap()).unwrap();
@@ -1682,7 +1683,7 @@ mod tests {
                 outer.path().join("borrowed-gitdir").display()
             ))
             .arg(&separate)
-            .status()
+            .status_locked()
             .unwrap();
         assert!(status.success());
         let separate = identity(separate.to_str().unwrap()).unwrap();
@@ -1902,7 +1903,7 @@ mod tests {
         fs::rename(&admitted_path, &moved).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &admitted_path).unwrap();
 
-        let output = cmd.output().expect("spawn pwd");
+        let output = cmd.output_locked().expect("spawn pwd");
         let ran_in = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
             .canonicalize()
             .unwrap();
@@ -1942,7 +1943,7 @@ mod tests {
         let init = std::process::Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .current_dir(&checkout)
-            .status()
+            .status_locked()
             .expect("git init");
         assert!(init.success());
         crate::test_support::trust_repo(&checkout);
@@ -1965,7 +1966,7 @@ mod tests {
                         cwd.display()
                     )
                 });
-                let output = cmd.output().expect("spawn pwd");
+                let output = cmd.output_locked().expect("spawn pwd");
                 let ran_in = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
                     .canonicalize()
                     .unwrap();
@@ -2023,7 +2024,7 @@ mod tests {
         let mut cmd = std::process::Command::new("/bin/pwd");
         cmd.current_dir(alias.join("inner"));
         let _admission = check_command(&mut cmd).expect("a symlinked ancestor is not an attack");
-        let output = cmd.output().expect("spawn pwd");
+        let output = cmd.output_locked().expect("spawn pwd");
         assert_eq!(
             PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
                 .canonicalize()
@@ -2046,7 +2047,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(&original)
-            .status()
+            .status_locked()
             .unwrap();
         assert!(status.success());
 

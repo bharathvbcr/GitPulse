@@ -679,6 +679,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     #[test]
     fn probe_indices_match_probe_order() {

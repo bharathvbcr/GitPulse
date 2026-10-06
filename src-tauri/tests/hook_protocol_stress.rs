@@ -17,6 +17,7 @@
 //! is why the harness failure modes below stand up deliberately broken `manvi`
 //! executables rather than mocking a verdict.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -49,7 +50,7 @@ fn ask(subcommand: &str, payload: &[u8], env: &[(&str, &Path)]) -> Answer {
         command.env(key, value);
     }
     let started = Instant::now();
-    let mut child = command.spawn().expect("spawn gitpulse-hook");
+    let mut child = command.spawn_locked().expect("spawn gitpulse-hook");
 
     // Written from a thread: a payload larger than the pipe buffer would
     // deadlock a parent that writes it all before reading any output.

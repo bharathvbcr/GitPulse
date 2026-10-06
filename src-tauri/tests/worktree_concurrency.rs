@@ -2,6 +2,7 @@
 //! dir rather than colliding, and lock/unlock/prune must be live-tested.
 
 use gitpulse_lib::engine::{worktree, GitWriter};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
@@ -20,7 +21,7 @@ fn git_in(dir: &Path, args: &[&str]) {
         ])
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("spawn git");
     assert!(
         output.status.success(),
@@ -90,7 +91,7 @@ fn concurrent_mutations_from_linked_worktrees_all_land() {
     let listed = Command::new("git")
         .args(["branch", "--list"])
         .current_dir(main.path())
-        .output()
+        .output_locked()
         .unwrap();
     let stdout = String::from_utf8(listed.stdout).unwrap();
     for i in 0..PER_SIDE {

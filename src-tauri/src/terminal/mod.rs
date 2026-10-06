@@ -2773,6 +2773,7 @@ pub(crate) fn validate_manvi_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use tempfile::TempDir;
 
     #[test]
@@ -2903,7 +2904,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir);
@@ -3357,7 +3358,7 @@ mod tests {
         let built = std::process::Command::new("python3")
             .args(["-m", "venv", ".venv"])
             .current_dir(repo)
-            .status();
+            .status_locked();
         match built {
             Ok(status) if status.success() => {}
             _ => return, // no usable python3 on this host

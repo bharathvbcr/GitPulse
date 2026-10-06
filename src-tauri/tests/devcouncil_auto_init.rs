@@ -18,6 +18,7 @@
 //! Skipped loudly, never silently: without an installed `devmap` this test
 //! prints why and returns rather than passing on an absence.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 
 use gitpulse_lib::devmap;
@@ -28,7 +29,7 @@ fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)
-        .output()
+        .output_locked()
         .expect("git");
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
@@ -37,7 +38,7 @@ fn porcelain(repo: &Path) -> String {
     let out = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(repo)
-        .output()
+        .output_locked()
         .expect("git status");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

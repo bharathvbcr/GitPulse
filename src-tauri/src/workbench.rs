@@ -653,6 +653,7 @@ pub async fn cmd_workbench_register_repository(
 #[cfg(test)]
 mod tests {
     use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT};
+    use crate::procguard::LockedSpawn;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1112,7 +1113,7 @@ done
                 .current_dir(cwd)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args(args)
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(
                 output.status.success(),

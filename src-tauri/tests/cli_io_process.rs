@@ -1,4 +1,5 @@
 //! Exercise inherited OS streams at the real executable boundary.
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::{self, File};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -35,7 +36,7 @@ fn hook_bounds_an_open_input_pipe_without_emitting_a_decision() {
         .stdin(Stdio::piped())
         .stdout(File::create(&output).unwrap())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     // Keep stdin open without EOF: a host disconnect deadline cannot depend
     // on a newline, valid JSON, or the host closing its descriptor.
@@ -63,7 +64,7 @@ fn hook_identity_answers_without_waiting_for_stdin() {
         .stdin(Stdio::piped())
         .stdout(File::create(&output).unwrap())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     let held_input = child.stdin.take().unwrap();
     assert_eq!(wait(&mut child, Duration::from_secs(8)).code(), Some(0));
@@ -95,7 +96,7 @@ fn an_unknown_argument_stays_silent_rather_than_answering_like_an_identity() {
         .stdin(Stdio::null())
         .stdout(File::create(&output).unwrap())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     assert_eq!(wait(&mut child, Duration::from_secs(8)).code(), Some(0));
     assert!(fs::read(output).unwrap().is_empty());
@@ -166,7 +167,7 @@ fn daemon_output_failure_has_a_controlled_exit_instead_of_panicking_or_hanging()
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(1));
     drop(held_reader);
@@ -189,7 +190,7 @@ fn argument_errors_keep_their_exit_contract_when_stderr_is_closed() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
-            .spawn()
+            .spawn_locked()
             .unwrap();
         drop(reader);
         assert_eq!(
@@ -210,7 +211,7 @@ fn mcp_stops_when_the_host_keeps_stdout_open_but_stops_reading() {
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     child
         .stdin
@@ -236,7 +237,7 @@ fn mcp_output_failure_interrupts_an_idle_input_reader() {
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let request = serde_json::json!({

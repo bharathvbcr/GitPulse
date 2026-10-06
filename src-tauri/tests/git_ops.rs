@@ -5,6 +5,7 @@ use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write
 use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
 use gitpulse_lib::github::parse_github_remote_url;
 use gitpulse_lib::graph::{LaneSolver, RefScope};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ fn shared_fixture_can_commit_without_global_identity() {
         .env_remove("GIT_AUTHOR_EMAIL")
         .env_remove("GIT_COMMITTER_NAME")
         .env_remove("GIT_COMMITTER_EMAIL")
-        .output()
+        .output_locked()
         .unwrap();
     assert!(
         output.status.success(),
@@ -146,7 +147,7 @@ fn release_selected_file_commit_preserves_unrelated_index() {
     let indexed = Command::new("git")
         .args(["show", ":unrelated.txt"])
         .current_dir(repo.dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(indexed.status.success());
     assert_eq!(indexed.stdout, b"staged unrelated\n");
@@ -166,7 +167,7 @@ fn release_selected_file_commit_treats_wildcards_literally() {
     let files = Command::new("git")
         .args(["ls-tree", "--name-only", "HEAD"])
         .current_dir(repo.dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(files.status.success());
     assert_eq!(files.stdout, b"*\n");
@@ -183,7 +184,7 @@ fn release_amend_without_message_retains_the_previous_message() {
     let output = Command::new("git")
         .args(["log", "-1", "--format=%s"])
         .current_dir(repo.dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"preserve this message\n");
@@ -449,7 +450,7 @@ fn history_survives_0x01_byte_inside_commit_subject() {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
+        .output_locked()
         .expect("spawn hostile commit");
     assert!(
         output.status.success(),
@@ -494,7 +495,7 @@ fn history_survives_0x01_byte_inside_author_name() {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
+        .output_locked()
         .expect("spawn hostile-author commit");
     assert!(
         output.status.success(),
@@ -1539,7 +1540,7 @@ fn test_get_commit_details_surfaces_missing_blob_failure() {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD:data.bin"])
         .current_dir(repo.dir.path())
-        .output()
+        .output_locked()
         .expect("rev-parse");
     assert!(output.status.success());
     let blob_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1572,7 +1573,7 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .output_locked()
         .expect("spawn git");
     assert!(
         output.status.success(),
@@ -1691,7 +1692,7 @@ fn deleted_branch_tip_is_durable_for_restore_after_toast_death() {
     let missing = std::process::Command::new("git")
         .args(["rev-parse", "--verify", "refs/heads/feature"])
         .current_dir(repo.dir.path())
-        .output()
+        .output_locked()
         .expect("spawn");
     assert!(
         !missing.status.success(),
@@ -2193,7 +2194,7 @@ fn run_git_expect_failure(cwd: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
+        .output_locked()
         .expect("spawn git");
     assert!(
         !output.status.success(),
@@ -2276,7 +2277,7 @@ fn run_git_with_identities(cwd: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_NAME", "Cy Committer")
         .env("GIT_COMMITTER_EMAIL", "cy@committers.invalid")
         .env("GIT_COMMITTER_DATE", "2022-06-07T08:09:10+00:00")
-        .output()
+        .output_locked()
         .expect("spawn git");
     assert!(
         output.status.success(),
@@ -2633,7 +2634,7 @@ fn release_unmerged_entries_are_not_reported_as_staged_changes() {
     let merge = Command::new("git")
         .args(["merge", "feature"])
         .current_dir(repo.dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(!merge.status.success());
     let statuses = GitReader::get_status(&repo.path_str()).unwrap();

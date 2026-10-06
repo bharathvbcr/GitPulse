@@ -6,6 +6,7 @@
 //! MCP client fail to parse the first response. This test launches the real
 //! binary twice and reads the wire.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -47,7 +48,7 @@ fn speak_once() -> Vec<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GITPULSE_LOG_DIR", log_dir.path())
-        .spawn()
+        .spawn_locked()
         .unwrap_or_else(|e| panic!("spawn {}: {e}", mcp_bin()));
 
     let mut stdin = child.stdin.take().expect("stdin");

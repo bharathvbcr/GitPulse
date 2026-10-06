@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::storage::{scan_storage, ReclaimConfidence, ReclaimSafety};
 use std::fs;
@@ -50,7 +51,7 @@ impl TempRepo {
             .current_dir(&self.root)
             .env("GIT_CONFIG_PARAMETERS", "")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
+            .output_locked()
             .expect("spawn git");
         assert!(
             out.status.success(),
@@ -237,6 +238,7 @@ fn budget_attacks_report_truncation_honestly() {
 
 mod bare_and_worktrees {
     use super::*;
+    use gitpulse_lib::procguard::LockedSpawn;
 
     /// A bare repository scans cleanly: no worktree sections, git internals
     /// still fully present.
@@ -256,7 +258,7 @@ mod bare_and_worktrees {
                 bare.to_str().unwrap(),
             ])
             .env("GIT_CONFIG_PARAMETERS", "")
-            .output()
+            .output_locked()
             .unwrap();
         assert!(
             out.status.success(),

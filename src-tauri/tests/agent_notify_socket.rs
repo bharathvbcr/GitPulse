@@ -14,6 +14,7 @@
 
 #![cfg(unix)]
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
@@ -84,7 +85,7 @@ fn report_through_socket(
     if let Some(agent) = agent {
         command.env(gitpulse_lib::hooks::AGENT_KIND_ENV, agent);
     }
-    let mut child = command.spawn().expect("spawn gitpulse-hook");
+    let mut child = command.spawn_locked().expect("spawn gitpulse-hook");
     child
         .stdin
         .take()
@@ -206,7 +207,7 @@ fn a_socket_that_is_not_there_costs_the_turn_nothing() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .and_then(|mut child| {
             child
                 .stdin

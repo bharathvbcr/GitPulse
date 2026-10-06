@@ -3,6 +3,7 @@
 #![cfg(unix)]
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, kill_session, resize_session, spawn_session, write_to_session,
     TerminalSessions,
@@ -46,7 +47,7 @@ fn repo() -> tempfile::TempDir {
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
         .arg(dir.path())
-        .status()
+        .status_locked()
         .unwrap()
         .success());
     common::trust_repo(dir.path());

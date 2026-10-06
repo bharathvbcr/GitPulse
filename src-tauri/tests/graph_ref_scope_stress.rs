@@ -11,6 +11,7 @@
 //! asks git and compares. Every rule encoded twice — once in a Rust prefix
 //! test, once in a git option — is a rule that can drift.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 
 use std::collections::{BTreeSet, HashSet};
@@ -33,7 +34,7 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
         .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
-        .output()
+        .output_locked()
         .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
     assert!(
         out.status.success(),
@@ -321,7 +322,7 @@ fn a_ref_mirror_cannot_produce_an_unbounded_decoration_list() {
         .args(["update-ref", "--stdin"])
         .current_dir(dir.path())
         .stdin(std::process::Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("update-ref --stdin");
     {
         use std::io::Write;
@@ -568,7 +569,7 @@ fn a_thousand_checkpoints_do_not_reach_the_named_graph() {
         .args(["update-ref", "--stdin"])
         .current_dir(path)
         .stdin(std::process::Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("update-ref --stdin");
     {
         use std::io::Write;

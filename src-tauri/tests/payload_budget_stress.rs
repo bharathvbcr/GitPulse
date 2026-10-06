@@ -9,6 +9,7 @@
 
 use gitpulse_lib::engine::budget;
 use gitpulse_lib::engine::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -17,7 +18,7 @@ fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("git");
     assert!(
         out.status.success(),
@@ -60,7 +61,7 @@ fn huge_diff_repo(lines: usize, width: usize) -> (TempDir, String) {
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(path)
-        .output()
+        .output_locked()
         .expect("rev-parse");
     let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (dir, oid)

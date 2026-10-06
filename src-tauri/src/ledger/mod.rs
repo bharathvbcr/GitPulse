@@ -2501,6 +2501,7 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     thread_local! {
         /// Ledger queries this thread has issued through [`read_after`] or
@@ -2576,7 +2577,7 @@ mod tests {
         let status = std::process::Command::new("git")
             .args(["init", "--quiet"])
             .arg(dir.path())
-            .status()
+            .status_locked()
             .expect("run git init");
         assert!(status.success(), "git init failed");
         dir

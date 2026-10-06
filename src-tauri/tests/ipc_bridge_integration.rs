@@ -11,6 +11,7 @@
 //! the real path: `invoke_handler` dispatch, serde deserialization of the body,
 //! the command, then serialization of the response.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::json;
 use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
@@ -216,7 +217,7 @@ fn a_successful_result_arrives_unwrapped_on_the_success_channel() {
     let status = std::process::Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
-        .status()
+        .status_locked()
         .expect("git on PATH");
     assert!(status.success());
 
@@ -237,7 +238,7 @@ fn repo_with_change() -> tempfile::TempDir {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git on PATH");
         assert!(
             out.status.success(),
@@ -388,7 +389,7 @@ fn repo_with_a_hidden_commit() -> tempfile::TempDir {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git on PATH");
         assert!(
             out.status.success(),
@@ -401,7 +402,7 @@ fn repo_with_a_hidden_commit() -> tempfile::TempDir {
     let head = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir.path())
-        .output()
+        .output_locked()
         .expect("git on PATH");
     let oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
     // Park the tip under a custom namespace and rewind main off it, so the
@@ -721,7 +722,7 @@ fn a_write_escaping_the_repository_is_refused_across_the_bridge() {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(&repo)
-            .output()
+            .output_locked()
             .expect("git on PATH");
         assert!(out.status.success(), "git {args:?}");
     };
@@ -795,7 +796,7 @@ fn head_of(repo: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
-        .output()
+        .output_locked()
         .expect("git on PATH");
     assert!(out.status.success(), "rev-parse failed");
     String::from_utf8_lossy(&out.stdout).trim().to_string()

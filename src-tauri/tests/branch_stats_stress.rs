@@ -1,4 +1,5 @@
 use gitpulse_lib::engine::{BranchInfo, GitReader};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
@@ -7,7 +8,7 @@ fn run_git(dir: &Path, args: &[&str]) {
     let out = StdCommand::new("git")
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
     assert!(
         out.status.success(),
@@ -143,7 +144,7 @@ fn rev_parse(dir: &Path, rev: &str) -> String {
     let out = StdCommand::new("git")
         .args(["rev-parse", rev])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("rev-parse");
     assert!(out.status.success());
     String::from_utf8(out.stdout).unwrap().trim().to_string()
@@ -157,7 +158,7 @@ fn create_refs(dir: &Path, specs: impl IntoIterator<Item = (String, String)>) {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("spawn update-ref");
     {
         let mut stdin = child.stdin.take().expect("stdin");

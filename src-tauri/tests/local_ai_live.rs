@@ -8,6 +8,7 @@
 //! skip on stderr when it is not enabled, so a run without a model server never
 //! looks like a run that passed.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
 
 use gitpulse_lib::ai::{self, AiSelection};
@@ -41,7 +42,7 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
+        .output_locked()
         .expect("git runs");
     assert!(
         out.status.success(),

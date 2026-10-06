@@ -15,6 +15,7 @@
 //! JSON-RPC message per line**, **every request carrying an id is answered
 //! exactly once**, and **no input kills the server**.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -101,7 +102,7 @@ impl Server {
             command.env(key, value);
         }
         let mut child = command
-            .spawn()
+            .spawn_locked()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", mcp_bin()));
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
@@ -378,7 +379,7 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
     let init = Command::new("git")
         .args(["init", "-q"])
         .arg(&repo)
-        .status()
+        .status_locked()
         .unwrap();
     assert!(init.success());
     let executable = std::env::current_exe()
@@ -389,7 +390,7 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
     assert!(Command::new("git")
         .current_dir(&repo)
         .args(["config", "core.fsmonitor", &monitor])
-        .status()
+        .status_locked()
         .unwrap()
         .success());
     process_trust::approve(&repo, &home);

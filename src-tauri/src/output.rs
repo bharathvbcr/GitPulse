@@ -184,12 +184,18 @@ mod tests {
     fn a_closed_pipe_disables_the_sink_without_retrying() {
         use std::fs::File;
         use std::os::fd::FromRawFd;
-        let mut descriptors = [-1; 2];
-        // SAFETY: pipe initializes two owned descriptors on success.
-        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
-        let reader = unsafe { File::from_raw_fd(descriptors[0]) };
-        let writer = unsafe { File::from_raw_fd(descriptors[1]) };
-        drop(reader);
+        // The read end must be gone everywhere, not only here: a child another
+        // test spawns between `pipe` and the drop would inherit it (it is not
+        // close-on-exec) and keep the pipe writable. The lock keeps every
+        // spawn out of that window.
+        let writer = crate::procguard::with_inheritance_lock(|| {
+            let mut descriptors = [-1; 2];
+            // SAFETY: pipe initializes two owned descriptors on success.
+            assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+            let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+            drop(reader);
+            unsafe { File::from_raw_fd(descriptors[1]) }
+        });
         let output =
             BoundedOutput::new(writer, "closed-pipe-test", 16, Duration::from_secs(1)).unwrap();
         assert_eq!(

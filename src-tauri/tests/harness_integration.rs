@@ -6,6 +6,7 @@
 //! NOT wired into any workflow; set `GITPULSE_REQUIRE_MANVI=1` yourself to turn
 //! the binary's absence into a hard failure.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
 
 use gitpulse_lib::graph::{list_ref_decorations, RefKind, RefScope};
@@ -20,7 +21,7 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
+        .output_locked()
         .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {}", args, e));
     assert!(
         status.status.success(),
@@ -91,7 +92,7 @@ fn detached_head_is_still_reported() {
         Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap()
             .stdout,
     )
@@ -198,7 +199,7 @@ fn the_sidecar_never_writes_into_the_users_repository() {
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(dir.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&dirty.stdout).trim(),

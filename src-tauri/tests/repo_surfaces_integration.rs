@@ -11,6 +11,7 @@ use gitpulse_lib::engine::repo_op;
 use gitpulse_lib::engine::stash::{self, StashAction};
 use gitpulse_lib::engine::submodules::{self, SubmoduleChange, SubmoduleState};
 use gitpulse_lib::engine::{remotes, GitWriter, RemoteChange, ResetMode};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -26,7 +27,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "T")
         .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
+        .output_locked()
         .expect("git");
     assert!(
         out.status.success(),
@@ -48,7 +49,7 @@ fn try_git(cwd: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "T")
         .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
+        .output_locked()
         .expect("git");
 }
 
@@ -56,7 +57,7 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .output_locked()
         .expect("git");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

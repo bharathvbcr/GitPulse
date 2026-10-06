@@ -190,6 +190,7 @@ fn configure_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     #[test]
     fn plist_escapes_paths_and_uses_only_explicit_headless_arguments() {
         let xml = plist("/Applications/A & <B> \"C\" 'D'.app/Contents/MacOS/gitpulse");
@@ -204,7 +205,7 @@ mod tests {
             assert!(std::process::Command::new("/usr/bin/plutil")
                 .arg("-lint")
                 .arg(file.path())
-                .status()
+                .status_locked()
                 .unwrap()
                 .success());
         }

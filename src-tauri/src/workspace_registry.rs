@@ -375,6 +375,7 @@ pub fn link_candidates(registry_root: &str) -> Result<WorkspaceLinksResult, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::fs;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
@@ -404,7 +405,7 @@ mod tests {
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .status()
+            .status_locked()
             .expect("git init");
         assert!(status.success(), "git init failed in {}", dir.display());
         if trust {

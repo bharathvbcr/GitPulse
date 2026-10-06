@@ -1,5 +1,6 @@
 //! Exercise OS stream failures outside libtest's stderr capture and panic hook.
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -145,7 +146,7 @@ fn run_probe(mode: &str, stderr_kind: StderrKind) {
         .stdin(Stdio::piped())
         .stdout(File::create(&output_path).expect("probe output"))
         .stderr(stderr)
-        .spawn()
+        .spawn_locked()
         .expect("spawn probe");
     if stderr_kind == StderrKind::BrokenPipe {
         drop(child.stderr.take());
@@ -216,7 +217,7 @@ fn mcp_keeps_serving_after_stderr_disconnects_and_exits_cleanly() {
         .stdin(Stdio::piped())
         .stdout(File::create(&output).expect("wire output"))
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("spawn MCP");
     drop(child.stderr.take());
     let mut input = child.stdin.take().expect("MCP stdin");
@@ -275,7 +276,7 @@ fn simultaneous_processes_preserve_complete_shared_log_records() {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
+                .spawn_locked()
                 .unwrap(),
         );
     }
@@ -362,7 +363,7 @@ fn panic_diagnostics_never_bypass_redaction_on_stderr() {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     // Drain while the child runs: a file-backed stderr on Windows never
     // showed the hook, and an unread pipe can fill on a long backtrace.
@@ -418,7 +419,7 @@ fn unsafe_log_path_probe(kind: &str) {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     child.stdin.take().unwrap().write_all(b"x").unwrap();
     assert!(wait_for_probe(&mut child).success(), "{kind}");

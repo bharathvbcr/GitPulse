@@ -21,6 +21,7 @@
 
 use gitpulse_lib::desktop::shell::resolve_worktree_path;
 use gitpulse_lib::engine::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -133,7 +134,7 @@ fn import_commits(repo: &Path, messages: &[String]) -> Vec<String> {
         .arg(format!("--export-marks={}", marks_path.display()))
         .current_dir(repo)
         .stdin(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("git fast-import must run");
 
     // Recent and strictly increasing, so a reader that only looks at a window
@@ -218,7 +219,7 @@ fn git_in(dir: &Path, args: &[&str]) {
         ])
         .args(args)
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("git must run");
     assert!(
         out.status.success(),

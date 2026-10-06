@@ -1,0 +1,15 @@
+# A child must be created under `procguard::with_inheritance_lock`.
+#
+# macOS has no `pipe2`, so every pipe std creates is `pipe()` followed by
+# `fcntl(FD_CLOEXEC)`, and a process forked on another thread in between keeps
+# that pipe for its whole life. A stolen write end means the owner never reads
+# to EOF; a stolen read end keeps a closed pipe writable. Production spawns go
+# through `procguard::spawn`, which takes the lock. Everything else — tests,
+# benches, tools — goes through `procguard::LockedSpawn`, which takes the
+# same lock. These three methods are the only ways to create a child from a
+# `Command`, so banning them leaves no unlocked fork the compiler cannot see.
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "spawn under the inheritance lock: procguard::spawn, or LockedSpawn::spawn_locked" },
+    { path = "std::process::Command::output", reason = "spawn under the inheritance lock: LockedSpawn::output_locked" },
+    { path = "std::process::Command::status", reason = "spawn under the inheritance lock: LockedSpawn::status_locked" },
+]

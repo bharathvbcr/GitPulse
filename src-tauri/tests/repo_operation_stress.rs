@@ -7,6 +7,7 @@
 //! repository is clean while it is mid-rebase.
 
 use gitpulse_lib::engine::repo_op::{self, OperationAction, OperationKind};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -20,7 +21,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .current_dir(cwd)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
-        .output()
+        .output_locked()
         .expect("git");
     assert!(
         out.status.success(),
@@ -39,7 +40,7 @@ fn try_git(cwd: &Path, args: &[&str]) {
         .current_dir(cwd)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
-        .output()
+        .output_locked()
         .expect("git");
 }
 
@@ -47,7 +48,7 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .output_locked()
         .expect("git");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

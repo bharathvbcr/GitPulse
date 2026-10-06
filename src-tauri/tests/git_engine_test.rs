@@ -1,3 +1,4 @@
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::engine::{GitReader, GitWriter};
 use std::fs::File;
@@ -12,7 +13,7 @@ fn create_temp_git_repo() -> TempDir {
     let init = Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(path)
-        .output()
+        .output_locked()
         .expect("git init failed");
     assert!(init.status.success());
     common::trust_repo(dir.path());
@@ -20,14 +21,14 @@ fn create_temp_git_repo() -> TempDir {
     let config_email = Command::new("git")
         .args(["config", "user.email", "test@gitpulse.dev"])
         .current_dir(path)
-        .output()
+        .output_locked()
         .expect("git config email failed");
     assert!(config_email.status.success());
 
     let config_name = Command::new("git")
         .args(["config", "user.name", "GitPulse Tester"])
         .current_dir(path)
-        .output()
+        .output_locked()
         .expect("git config name failed");
     assert!(config_name.status.success());
 
@@ -269,7 +270,7 @@ fn test_language_stats_skip_oversized_files_without_reading() {
     let tracked = Command::new("git")
         .args(["ls-files", "--cached", "huge.rs"])
         .current_dir(repo.path())
-        .output()
+        .output_locked()
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&tracked.stdout).trim(),

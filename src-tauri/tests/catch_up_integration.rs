@@ -11,6 +11,7 @@
 //! phase was built: 886 transcripts, 0 unreadable lines, 193 events attributed
 //! to one repository, and a second pass that added nothing.
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 
 use gitpulse_lib::{ingest, ledger};
@@ -25,7 +26,7 @@ fn catch_up_attributes_real_history() {
         let out = Command::new("git")
             .current_dir(&repo)
             .args(args)
-            .output()
+            .output_locked()
             .expect("git exec");
         assert!(out.status.success(), "git failed: {:?}", out);
     };

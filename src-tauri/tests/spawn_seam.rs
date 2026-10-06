@@ -152,11 +152,65 @@ fn no_production_code_spawns_outside_the_gated_seam() {
 /// those into `procguard::spawn`. The PTY is the other creator, and it is
 /// invisible to that check: it builds a `CommandBuilder`, not a `Command`.
 /// It is also the one whose children live for hours, so a theft there is not
-/// repaid in the next millisecond. Asserted by shape rather than trusted:
-/// `openpty` and `spawn_command` must name the lock on their own line.
+/// repaid in the next millisecond. A raw `libc::pipe` is the third: it is not
+/// close-on-exec at all until its own `fcntl` calls run. Asserted by shape
+/// rather than trusted: each must name the lock on its own line.
+/// Every child created from a `Command` — tests, benches and tools included —
+/// takes the inheritance lock, because `clippy.toml` bans the three `std`
+/// methods that create one and the only sanctioned ways round the ban are
+/// `procguard::spawn` and `procguard::LockedSpawn`. This keeps the ban from
+/// being deleted, and keeps the exemptions to the sites that were reviewed:
+/// one test that forked without the lock kept another test's pipe open.
+#[test]
+fn every_command_spawn_is_banned_outside_the_locked_seams() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config = std::fs::read_to_string(root.join("clippy.toml")).expect("clippy.toml");
+    for method in ["spawn", "output", "status"] {
+        let path = format!("\"std::process::Command::{method}\"");
+        assert!(config.contains(&path), "clippy.toml no longer bans {path}");
+    }
+
+    let mut files = vec![root.join("build.rs")];
+    for dir in ["src", "tests", "benches"] {
+        collect_rs(&root.join(dir), &mut files);
+    }
+    // Split so this file does not match itself.
+    const EXEMPTION: &str = concat!("#[allow(clippy::", "disallowed_methods)]");
+    let mut exemptions: BTreeMap<String, usize> = BTreeMap::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read source");
+        let count = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with(EXEMPTION))
+            .count();
+        if count > 0 {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            exemptions.insert(rel, count);
+        }
+    }
+    let expected: BTreeMap<String, usize> = [
+        // A build script is its own single-threaded process.
+        ("build.rs", 2),
+        // `procguard::spawn` and `LockedSpawn::spawn_locked`, both under the lock.
+        ("src/procguard/mod.rs", 2),
+    ]
+    .into_iter()
+    .map(|(file, count)| (file.to_string(), count))
+    .collect();
+    assert_eq!(
+        exemptions, expected,
+        "a new exemption from the spawn ban: route the child through \
+         procguard::spawn or procguard::LockedSpawn instead"
+    );
+}
+
 #[test]
 fn pty_creation_runs_under_the_inheritance_lock() {
-    const CREATORS: &[&str] = &[".openpty(", ".spawn_command("];
+    const CREATORS: &[&str] = &[".openpty(", ".spawn_command(", "libc::pipe("];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs(&root, &mut files);
@@ -184,16 +238,16 @@ fn pty_creation_runs_under_the_inheritance_lock() {
 
     assert!(
         unguarded.is_empty(),
-        "these create a process or a PTY descriptor outside \
+        "these create a process, a PTY or a pipe descriptor outside \
          `procguard::with_inheritance_lock`, so they can be handed — or hand \
          away — a descriptor that is not yet `FD_CLOEXEC`: {unguarded:?}",
     );
     // A scan that found nothing to check must not read like a scan that found
     // everything guarded.
     assert_eq!(
-        guarded, 2,
-        "expected the PTY's `openpty` and `spawn_command` and nothing else; \
-         found {guarded} guarded creation sites"
+        guarded, 3,
+        "expected the PTY's `openpty` and `spawn_command` and procguard's wake \
+         pipe, and nothing else; found {guarded} guarded creation sites"
     );
 }
 

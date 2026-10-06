@@ -1,3 +1,4 @@
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 use gitpulse_lib::storage::{scan_storage, ReclaimSafety};
 use std::{fs, process::Command};
@@ -8,7 +9,7 @@ fn untracked_environments_agent_state_and_scratch_are_not_safe_cleanup() {
     assert!(Command::new("git")
         .args(["init", "-q"])
         .current_dir(root.path())
-        .status()
+        .status_locked()
         .unwrap()
         .success());
     common::trust_repo(root.path());
@@ -47,7 +48,7 @@ fn capped_artifact_inventory_never_looks_complete_to_a_global_cleaner() {
     assert!(Command::new("git")
         .args(["init", "-q"])
         .current_dir(root.path())
-        .status()
+        .status_locked()
         .unwrap()
         .success());
     common::trust_repo(root.path());

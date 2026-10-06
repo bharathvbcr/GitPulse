@@ -2988,6 +2988,7 @@ pub async fn cmd_get_head_id(repo_path: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     /// `git init` + one commit, plus an untracked file on disk.
     fn repo_with_tracked_and_untracked() -> tempfile::TempDir {
@@ -3000,7 +3001,7 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@e")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@e")
-                .output()
+                .output_locked()
                 .expect("git runs");
         };
         run(&["init", "-b", "main"]);
@@ -3198,7 +3199,7 @@ mod tests {
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(args)
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .expect("spawn git");
             assert!(
                 output.status.success(),
@@ -3230,7 +3231,7 @@ mod tests {
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .current_dir(cwd)
-            .output()
+            .output_locked()
             .expect("spawn git");
         assert!(
             output.status.success(),
@@ -3283,14 +3284,14 @@ mod tests {
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .unwrap();
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         };
         let detached = std::process::Command::new("git")
             .args(["checkout", "-q", "--detach"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap();
         assert!(
             detached.status.success(),
@@ -3335,14 +3336,14 @@ mod tests {
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(["commit", "--amend", "-m", "A\n\nbody of A"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap();
         assert!(output.status.success());
         let c_a = {
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .unwrap();
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         };
@@ -5041,6 +5042,7 @@ pub async fn cmd_provenance_freshness_batch(
 mod assemble_tests {
     use super::*;
     use crate::graph::{MAINLINE_COLOR, MAINLINE_COLUMN};
+    use crate::procguard::LockedSpawn;
 
     #[test]
     fn slow_command_is_visible_in_diagnostics_without_recording_its_payload() {
@@ -5327,7 +5329,7 @@ mod assemble_tests {
                 ])
                 .args(args)
                 .current_dir(main.path())
-                .output()
+                .output_locked()
                 .expect("spawn git");
             assert!(
                 output.status.success(),

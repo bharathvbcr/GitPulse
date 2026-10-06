@@ -1,4 +1,5 @@
 //! Real persistent fixture approvals, isolated from the developer's profile.
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 
@@ -14,7 +15,7 @@ pub fn approve(repo: &Path, home: &Path) {
         .env("APPDATA", home.join("AppData"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("GITPULSE_TEST_GRANT_REPO", repo)
-        .status()
+        .status_locked()
         .unwrap();
     assert!(status.success(), "isolated fixture approval failed");
 }

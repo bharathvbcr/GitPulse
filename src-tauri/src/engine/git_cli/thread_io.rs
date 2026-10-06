@@ -290,6 +290,7 @@ mod tests {
     #[cfg(unix)]
     use super::{InputFeed, OutputDrains};
     use crate::engine::git_cli::SpawnPermit;
+    use crate::procguard::LockedSpawn;
     use std::io;
     use std::sync::Arc;
     use std::thread;
@@ -303,7 +304,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let permit = permit();
         let output = OutputDrains::new(

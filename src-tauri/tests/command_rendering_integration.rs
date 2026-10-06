@@ -17,6 +17,7 @@
 #![cfg(unix)]
 
 use gitpulse_lib::harness::render_command;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::process::Command;
 
 /// Parse a rendered command line with a real shell and return its argv.
@@ -27,7 +28,7 @@ fn shell_parse(rendered: &str) -> Vec<String> {
     let script = format!("printf '%s\\0' {rendered}");
     let out = Command::new("bash")
         .args(["-c", &script])
-        .output()
+        .output_locked()
         .expect("bash must be on PATH");
     assert!(
         out.status.success(),

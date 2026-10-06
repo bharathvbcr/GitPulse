@@ -1,6 +1,7 @@
 //! Inject failures at the actual macOS filesystem-event boundary.
 #![cfg(target_os = "macos")]
 
+use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::watcher::RepoFileWatcher;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs::{self, File};
@@ -55,7 +56,7 @@ fn probe(mode: &str) {
         .arg(define)
         .stderr(output.try_clone().unwrap())
         .stdout(output)
-        .spawn()
+        .spawn_locked()
         .unwrap();
     assert!(
         finish(&mut compiler, Duration::from_secs(20)).success(),
@@ -71,7 +72,7 @@ fn probe(mode: &str) {
         .stdin(Stdio::null())
         .stderr(output.try_clone().unwrap())
         .stdout(output)
-        .spawn()
+        .spawn_locked()
         .unwrap();
     // Each registration/retirement has the same three-second bound. The
     // source-failure case starts 17 real streams, so an aggregate three-second

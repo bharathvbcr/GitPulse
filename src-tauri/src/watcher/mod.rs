@@ -1086,6 +1086,7 @@ fn retire_sessions(mut sessions: Vec<WatchSession>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
@@ -1098,7 +1099,7 @@ mod tests {
         } else {
             cmd.args(["-b", "main"]);
         }
-        let output = cmd.current_dir(dir).output().expect("spawn git");
+        let output = cmd.current_dir(dir).output_locked().expect("spawn git");
         assert!(
             output.status.success(),
             "git init failed: {}",
@@ -1127,7 +1128,7 @@ mod tests {
             .args(["worktree", "add", "-b", "gitpulse-link"])
             .arg(&work_path)
             .current_dir(main.path())
-            .output()
+            .output_locked()
             .expect("spawn git worktree");
         assert!(
             output.status.success(),
@@ -1843,7 +1844,7 @@ mod tests {
         let output = Command::new("git")
             .arg("init")
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
 
@@ -2838,7 +2839,7 @@ mod tests {
                 let _ = Command::new("git")
                     .args(["fsmonitor--daemon", "stop"])
                     .current_dir(&self.0)
-                    .output();
+                    .output_locked();
             }
         }
         let git = |root: &Path, args: &[&str]| {
@@ -2846,7 +2847,7 @@ mod tests {
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
                 .args(args)
                 .current_dir(root)
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(
                 out.status.success(),
@@ -2959,7 +2960,7 @@ mod tests {
                 let _ = Command::new("git")
                     .args(["fsmonitor--daemon", "stop"])
                     .current_dir(&self.0)
-                    .output();
+                    .output_locked();
             }
         }
         let status = |root: &Path| {
@@ -2967,7 +2968,7 @@ mod tests {
                 .args(["status", "--porcelain=v2"])
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .current_dir(root)
-                .output()
+                .output_locked()
                 .expect("git status");
             assert!(
                 out.status.success(),
@@ -2981,7 +2982,7 @@ mod tests {
         let enabled = Command::new("git")
             .args(["config", "core.fsmonitor", "true"])
             .current_dir(&root)
-            .output()
+            .output_locked()
             .expect("git config");
         assert!(enabled.status.success());
         // Start the daemon outside the measured window; its first run creates

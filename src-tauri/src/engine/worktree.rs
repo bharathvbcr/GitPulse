@@ -1126,6 +1126,7 @@ pub fn prune_worktree_argv() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
 
     #[test]
@@ -1874,7 +1875,7 @@ some-future-field whatever
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(
                 out.status.success(),
@@ -2130,27 +2131,27 @@ some-future-field whatever
         // git init -b main
         let _ = std::process::Command::new("git")
             .args(["init", "-b", "main", repo_path])
-            .output()
+            .output_locked()
             .expect("git init");
         let _ = std::process::Command::new("git")
             .args(["config", "user.email", "test@gitpulse.local"])
             .current_dir(repo_path)
-            .output();
+            .output_locked();
         let _ = std::process::Command::new("git")
             .args(["config", "user.name", "GitPulse Tester"])
             .current_dir(repo_path)
-            .output();
+            .output_locked();
 
         let readme = dir.path().join("README.md");
         std::fs::write(&readme, "hello\n").unwrap();
         let _ = std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(repo_path)
-            .output();
+            .output_locked();
         let _ = std::process::Command::new("git")
             .args(["commit", "-m", "initial commit"])
             .current_dir(repo_path)
-            .output();
+            .output_locked();
         crate::test_support::trust_repo(dir.path());
 
         // Add linked worktree
@@ -2169,11 +2170,11 @@ some-future-field whatever
         let _ = std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(wt_path)
-            .output();
+            .output_locked();
         let _ = std::process::Command::new("git")
             .args(["commit", "-m", "feature commit"])
             .current_dir(wt_path)
-            .output();
+            .output_locked();
 
         // Merge and teardown
         let res =

@@ -1777,6 +1777,7 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     /// Git words an empty commit two ways depending on tree state:
     /// "nothing to commit, working tree clean" and "nothing added to commit
@@ -1968,7 +1969,7 @@ mod tests {
             let output = std::process::Command::new("git")
                 .args(["config", key, value])
                 .current_dir(dir)
-                .output()
+                .output_locked()
                 .expect("git config");
             assert!(
                 output.status.success(),
@@ -1983,7 +1984,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         configure_identity(dir.path());
@@ -1994,7 +1995,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["config", "core.autocrlf", "false"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git config");
         assert!(output.status.success());
         std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
@@ -2002,7 +2003,7 @@ mod tests {
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(["add", "--", "tracked.txt"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git add");
         assert!(output.status.success());
         let output = std::process::Command::new("git")
@@ -2016,7 +2017,7 @@ mod tests {
                 "init",
             ])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git commit");
         assert!(
             output.status.success(),
@@ -2031,7 +2032,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
-            .output()
+            .output_locked()
             .unwrap_or_else(|err| panic!("spawn git {}: {err}", args.join(" ")));
         assert!(
             output.status.success(),
@@ -2048,7 +2049,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
-            .output()
+            .output_locked()
             .map_err(|err| format!("spawn git {}: {err}", args.join(" ")))?;
         if !output.status.success() {
             return Err(format!(
@@ -2069,7 +2070,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init --bare");
         assert!(
             output.status.success(),
@@ -2127,7 +2128,7 @@ mod tests {
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(["add", "--", file])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git add");
         assert!(output.status.success());
         let output = std::process::Command::new("git")
@@ -2141,7 +2142,7 @@ mod tests {
                 msg,
             ])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git commit");
         assert!(
             output.status.success(),
@@ -2151,7 +2152,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("rev-parse");
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
@@ -2160,7 +2161,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["log", "-1", "--format=%B"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git log");
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
@@ -2226,7 +2227,7 @@ mod tests {
         let branch = std::process::Command::new("git")
             .args(["symbolic-ref", "--short", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap();
         assert_eq!(
             String::from_utf8(branch.stdout).unwrap().trim(),
@@ -2307,7 +2308,7 @@ mod tests {
                                     let landed = std::process::Command::new("git")
                                         .args(["show", &format!("HEAD:{file}")])
                                         .current_dir(std::path::Path::new(&path))
-                                        .output()
+                                        .output_locked()
                                         .expect("git show HEAD:path");
                                     if landed.status.success()
                                         && String::from_utf8_lossy(&landed.stdout) == content
@@ -2341,7 +2342,7 @@ mod tests {
                 let log = std::process::Command::new("git")
                     .args(["log", "--format=%H", "-S", &needle, "--", &file])
                     .current_dir(dir.path())
-                    .output()
+                    .output_locked()
                     .unwrap();
                 let stdout = String::from_utf8(log.stdout).unwrap();
                 let hits: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -2394,7 +2395,7 @@ mod tests {
         let log = std::process::Command::new("git")
             .args(["log", "--format=%s"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .unwrap();
         let stdout = String::from_utf8(log.stdout).unwrap();
         assert_eq!(
@@ -2469,7 +2470,7 @@ mod tests {
         let show = std::process::Command::new("git")
             .args(["show", "--name-only", "--pretty=format:", "HEAD"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("git show");
         let names = String::from_utf8(show.stdout).unwrap();
         assert!(

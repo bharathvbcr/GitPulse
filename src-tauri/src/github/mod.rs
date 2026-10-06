@@ -1868,6 +1868,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
 #[cfg(test)]
 mod tests {
 
+    use crate::procguard::LockedSpawn;
     #[test]
     fn earliest_review_picks_the_first_submitted_one() {
         let reviews = Some(vec![
@@ -2080,7 +2081,7 @@ mod tests {
         let ok = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .map(|out| out.status.success())
             .unwrap_or(false);
         if !ok {

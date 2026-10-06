@@ -23,6 +23,7 @@
 // integration tests here use, and keeps the two from drifting apart again.
 #![cfg(unix)]
 
+use gitpulse_lib::procguard::LockedSpawn;
 mod common;
 
 use gitpulse_lib::devmap;
@@ -34,7 +35,7 @@ fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)
-        .output()
+        .output_locked()
         .expect("git");
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
@@ -104,7 +105,7 @@ fn a_live_daemon_answers_and_a_dead_one_is_reported_rather_than_assumed() {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_locked()
             .expect("spawn devmap serve"),
     );
 

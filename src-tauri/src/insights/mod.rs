@@ -1693,6 +1693,7 @@ pub fn mcp_info() -> McpInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::fs;
 
     use crate::test_support::git_in;
@@ -1858,7 +1859,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", email)
             .env("GIT_COMMITTER_EMAIL", email)
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("spawn git commit");
         assert!(
             output.status.success(),

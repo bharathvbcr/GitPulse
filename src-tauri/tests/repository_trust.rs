@@ -3,6 +3,7 @@
 #![cfg(unix)]
 
 use gitpulse_lib::engine::git_reader::GitReader;
+use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::{engine::git_cli, repository_trust};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -12,7 +13,7 @@ fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo)
-        .output()
+        .output_locked()
         .expect("spawn fixture git");
     assert!(
         output.status.success(),
@@ -60,7 +61,7 @@ fn global_probes_do_not_inherit_repository_configuration() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "global_probe_subprocess", "--ignored"])
         .current_dir(&nested)
-        .output()
+        .output_locked()
         .unwrap();
     assert!(
         output.status.success(),
@@ -676,7 +677,7 @@ fn a_pre_repository_approval_loses_every_worktree_until_it_is_extended() {
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("GITPULSE_E2E_MAIN", repo.path())
         .env("GITPULSE_E2E_WORKTREE", &linked)
-        .status()
+        .status_locked()
         .unwrap();
     assert!(status.success(), "isolated end-to-end run failed");
 }
@@ -868,7 +869,7 @@ fn trust_persistence_restart_with_device_drift_honours_checkout_and_worktree() {
         repo.path(),
         Some(&linked),
     )
-    .status()
+    .status_locked()
     .unwrap();
     assert!(grant.success(), "process 1 did not record the approval");
     drift_stored_devices(&trust_store(home.path()));
@@ -878,7 +879,7 @@ fn trust_persistence_restart_with_device_drift_honours_checkout_and_worktree() {
         repo.path(),
         Some(&linked),
     )
-    .status()
+    .status_locked()
     .unwrap();
     assert!(
         restarted.success(),
@@ -938,7 +939,7 @@ fn trust_persistence_repeated_grant_kill_restart_never_loses_an_approval() {
             None,
         )
         .env("GITPULSE_E2E_READY", &ready)
-        .spawn()
+        .spawn_locked()
         .unwrap();
         let started = std::time::Instant::now();
         while !ready.exists() {
@@ -961,7 +962,7 @@ fn trust_persistence_repeated_grant_kill_restart_never_loses_an_approval() {
             repo.path(),
             None,
         )
-        .status()
+        .status_locked()
         .unwrap();
         assert!(
             check.success(),

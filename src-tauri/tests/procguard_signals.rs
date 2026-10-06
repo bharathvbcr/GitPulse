@@ -12,6 +12,7 @@
 //! asserting nothing.
 #![cfg(unix)]
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -154,7 +155,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .output_locked()
         .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
     assert!(
         out.status.success(),
@@ -171,7 +172,7 @@ fn alive(pid: i32) -> bool {
 fn describe(pid: i32) -> String {
     Command::new("ps")
         .args(["-o", "pid,ppid,pgid,stat,command", "-p", &pid.to_string()])
-        .output()
+        .output_locked()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|e| format!("(ps failed: {e})"))
 }
@@ -236,7 +237,7 @@ fn sigterm_reaps_the_git_child_and_its_grandchild() {
         .stdout(Stdio::from(fixture.create("stdout")))
         .stderr(Stdio::from(fixture.create("stderr")));
     fixture.shim(&mut command);
-    let mut daemon = command.spawn().expect("spawn gitpulsed");
+    let mut daemon = command.spawn_locked().expect("spawn gitpulsed");
 
     // Without this the test could pass because the fixture never worked: a
     // child that was already gone is not evidence of a child that was reaped.
@@ -278,7 +279,7 @@ fn closing_stdin_reaps_a_git_child_a_worker_left_running() {
         .stdout(Stdio::piped())
         .stderr(Stdio::from(fixture.create("stderr")));
     fixture.shim(&mut command);
-    let mut server = command.spawn().expect("spawn gitpulse-mcp");
+    let mut server = command.spawn_locked().expect("spawn gitpulse-mcp");
     let mut stdin = server.stdin.take().expect("stdin");
     let stdout = server.stdout.take().expect("stdout");
     // Drained on its own thread: a server blocked writing stdout stops reading
@@ -345,7 +346,7 @@ fn every_shim_invocation_blocks_and_records_itself() {
         command.arg("-c").arg(format!("git {label}"));
         fixture.shim(&mut command);
         command.stdout(Stdio::null()).stderr(Stdio::null());
-        children.push(command.spawn().expect("spawn shell"));
+        children.push(command.spawn_locked().expect("spawn shell"));
     }
 
     let deadline = Instant::now() + SPAWN_WAIT;
@@ -387,7 +388,7 @@ fn the_shim_is_what_path_resolves_git_to() {
     let mut command = Command::new("sh");
     command.arg("-c").arg("command -v git");
     fixture.shim(&mut command);
-    let out = command.output().expect("which git");
+    let out = command.output_locked().expect("which git");
     let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(
         resolved,

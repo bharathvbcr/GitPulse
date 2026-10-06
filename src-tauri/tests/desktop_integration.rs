@@ -7,6 +7,7 @@
 //! here against real on-disk layouts rather than mocked paths.
 
 use gitpulse_lib::desktop::cmd_resolve_git_root;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -16,7 +17,7 @@ fn run_git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(dir)
-        .status()
+        .status_locked()
         .expect("git must be on PATH");
     assert!(status.success(), "git {args:?} failed");
     if args.first() == Some(&"init") {

@@ -237,6 +237,7 @@ compile_error!("Task terminal process identity requires a platform adapter");
 #[cfg(test)]
 mod tests {
     use super::{probe, read, running_since, Liveness};
+    use crate::procguard::LockedSpawn;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now() -> u128 {
@@ -271,7 +272,7 @@ mod tests {
             } else {
                 &[][..]
             })
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let pid = child.id();
         let id = read(pid).unwrap_or_default();

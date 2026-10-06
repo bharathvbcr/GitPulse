@@ -3727,6 +3727,7 @@ fn leading_major(s: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     // `Command` is used by every case; `fs` and `TempDir` only by the
     // `#[cfg(unix)]` ones, so ungated they are unused imports on Windows.
     #[cfg(unix)]
@@ -3741,7 +3742,7 @@ mod tests {
         let status = Command::new("git")
             .args(["add", rel])
             .current_dir(dir)
-            .status()
+            .status_locked()
             .expect("git add");
         assert!(status.success());
     }

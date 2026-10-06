@@ -15,6 +15,7 @@
 // used by four of the five reads as dead in the fifth.
 #![allow(dead_code)]
 
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 
@@ -31,7 +32,7 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
+        .output_locked()
         .expect("spawn git");
     assert!(
         output.status.success(),

@@ -4095,6 +4095,7 @@ fn b64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
 
     #[test]
     fn status_keeps_an_already_running_fsmonitor_daemon() {
@@ -4146,7 +4147,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("git init");
         assert!(output.status.success());
         let rs = dir.join("app.rs");
@@ -4154,7 +4155,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("git add");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir);
@@ -4417,7 +4418,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test User")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
+            .output_locked()
             .expect("spawn git")
     }
 
@@ -4543,7 +4544,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("spawn git hash-object");
         hash.stdin
             .take()
@@ -4574,7 +4575,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("spawn git mktree");
         tree.stdin
             .take()
@@ -4611,7 +4612,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("spawn git update-index");
         writeln!(
             index.stdin.take().expect("update-index stdin"),
@@ -4766,7 +4767,7 @@ mod tests {
         let out = std::process::Command::new("git")
             .args(["rev-parse", rev])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("spawn git rev-parse");
         assert!(out.status.success(), "git rev-parse {rev} failed");
         String::from_utf8(out.stdout).unwrap().trim().to_string()
@@ -5146,7 +5147,7 @@ mod tests {
             std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .unwrap()
                 .stdout,
         )
@@ -5160,7 +5161,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_locked()
             .expect("spawn update-ref");
         {
             let stdin = stdin_cmd.stdin.as_mut().expect("stdin pipe");
@@ -5403,7 +5404,7 @@ mod tests {
         let out = std::process::Command::new("git")
             .args(["rev-parse", rev])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .unwrap();
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap().trim().to_string()
@@ -5439,7 +5440,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_locked()
             .expect("spawn update-ref");
         {
             let mut stdin = stdin_cmd.stdin.take().expect("stdin");
@@ -5532,7 +5533,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("init")
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir.path());
@@ -5560,7 +5561,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("init")
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir.path());
@@ -5587,7 +5588,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("init")
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir.path());
@@ -5595,7 +5596,7 @@ mod tests {
         let add = std::process::Command::new("git")
             .args(["add", "--", "__main__.py"])
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git add");
         assert!(
             add.status.success(),
@@ -5925,7 +5926,7 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("init")
             .current_dir(dir.path())
-            .output()
+            .output_locked()
             .expect("spawn git init");
         assert!(output.status.success());
         crate::test_support::trust_repo(dir.path());
@@ -6616,7 +6617,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test User")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
+            .output_locked()
             .expect("spawn merge");
         assert!(!merged.status.success(), "fixture needs a real conflict");
         std::fs::write(dir.path().join("main.txt"), "resolved\n").unwrap();
@@ -6642,7 +6643,7 @@ mod tests {
         let out = std::process::Command::new("git")
             .args(["rev-parse", &format!("{oid}^@")])
             .current_dir(dir)
-            .output()
+            .output_locked()
             .expect("rev-parse parents");
         assert!(out.status.success());
         String::from_utf8_lossy(&out.stdout)
@@ -6715,7 +6716,7 @@ mod tests {
                 .args(args)
                 .current_dir(dir)
                 .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
+                .output_locked()
                 .expect("git spawn");
             assert!(
                 out.status.success(),
@@ -6733,7 +6734,7 @@ mod tests {
             &std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(dir.path())
-                .output()
+                .output_locked()
                 .expect("rev-parse")
                 .stdout,
         )
@@ -6912,7 +6913,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_locked()
             .expect("spawn update-index");
         {
             let stdin = child.stdin.as_mut().expect("stdin pipe");

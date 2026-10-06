@@ -4,6 +4,7 @@
 
 use gitpulse_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
 use gitpulse_lib::engine::GitWriter;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
@@ -52,7 +53,7 @@ impl TestRepo {
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test User")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
+            .output_locked()
             .expect("spawn git");
         assert!(
             output.status.success(),

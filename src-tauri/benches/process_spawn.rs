@@ -30,6 +30,7 @@
 // touches none of it. Ungated, all of it is dead code on Windows and fails
 // clippy's `-D warnings` there.
 #[cfg(unix)]
+use gitpulse_lib::procguard::LockedSpawn;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -60,7 +61,7 @@ fn trivial() -> Command {
 /// samples and every row measures the same amount of work.
 #[cfg(unix)]
 fn spawn_and_reap(cmd: &mut Command) {
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = cmd.spawn_locked().expect("spawn");
     let _ = child.wait();
 }
 

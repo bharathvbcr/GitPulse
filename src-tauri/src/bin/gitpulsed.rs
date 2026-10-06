@@ -353,6 +353,7 @@ fn write_output(bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitpulse_lib::procguard::LockedSpawn;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
@@ -562,7 +563,7 @@ mod tests {
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(repo.path())
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
@@ -611,7 +612,7 @@ mod tests {
                 ])
                 .args(args)
                 .current_dir(repo.path())
-                .output()
+                .output_locked()
                 .expect("git");
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };

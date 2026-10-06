@@ -10,6 +10,7 @@ use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::engine::git_writer::{
     validate_clone_url, validate_oid_or_revision, validate_ref_name, GitWriter,
 };
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ fn init_repo(dir: &std::path::Path) {
     let output = std::process::Command::new("git")
         .arg("init")
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("spawn git init");
     assert!(
         output.status.success(),
@@ -40,7 +41,7 @@ fn init_repo(dir: &std::path::Path) {
         let _ = std::process::Command::new("git")
             .args(["config", k, v])
             .current_dir(dir)
-            .output();
+            .output_locked();
     }
 }
 
@@ -51,7 +52,7 @@ fn commit_file(dir: &std::path::Path, file: &str, content: &str, msg: &str) {
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(["add", "--", file])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("spawn git add");
     assert!(output.status.success());
     let output = std::process::Command::new("git")
@@ -65,7 +66,7 @@ fn commit_file(dir: &std::path::Path, file: &str, content: &str, msg: &str) {
             msg,
         ])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("spawn git commit");
     assert!(
         output.status.success(),
@@ -79,7 +80,7 @@ fn porcelain(dir: &std::path::Path) -> String {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("spawn git status");
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -249,7 +250,7 @@ fn git_cli_strips_planted_git_config_parameters() {
     let output = std::process::Command::new("git")
         .args(["config", "--local", "user.name", "LOCAL_NAME"])
         .current_dir(dir.path())
-        .output()
+        .output_locked()
         .expect("spawn git config");
     assert!(output.status.success());
 
@@ -261,7 +262,7 @@ fn git_cli_strips_planted_git_config_parameters() {
     let control = std::process::Command::new("git")
         .args(["config", "user.name"])
         .current_dir(dir.path())
-        .output()
+        .output_locked()
         .expect("spawn control git");
     let control_name = String::from_utf8_lossy(&control.stdout).trim().to_string();
 
@@ -465,7 +466,7 @@ fn failed_clone_removes_partial_git_dir_and_reports_cleanup() {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD^{tree}"])
         .current_dir(src.path())
-        .output()
+        .output_locked()
         .expect("rev-parse HEAD^{{tree}}");
     assert!(output.status.success());
     let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
