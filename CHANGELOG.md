@@ -11,6 +11,26 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- **Branch churn survives a restart.** The per-branch line counts were
+  measured again for every branch on every launch. They are now kept in
+  `churn.v1.sqlite` in the platform cache directory. Each answer is keyed on
+  everything besides its two commits that can change a diff: the diff
+  config, replace refs, `shallow`, `info/grafts`, the attributes files
+  outside the worktree, and the git version. A move of the default branch
+  still measures every branch again.
+- **A branch's churn is measured with that branch's own `.gitattributes`.**
+  It used to read the checked-out worktree's, so an uncommitted attributes
+  edit changed the numbers shown for every other branch. A git that rejects
+  `--attr-source` measures churn as before and keeps it in memory only.
+
+### Fixed
+
+- **`gitpulse-mcp --help` and `--version` answer and exit.** Any argument
+  used to start the server, which then waited on the terminal's input
+  forever. Any other argument now exits with status 2.
+
 ## [1.4.0] - 2026-10-06
 
 Agents that start in the background with a pane showing every one at work,
