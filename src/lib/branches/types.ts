@@ -241,6 +241,38 @@ export interface MergeTeardownResult {
   commits_merged: number;
   worktree_removed: boolean;
   branch_deleted: boolean;
+  /** A `post_merge` hook failed after the merge and teardown had happened. */
+  hook_error: string | null;
+}
+
+/**
+ * A worktree that exists, and what of its optional setup did not happen.
+ * Mirrors `engine::worktree::WorktreeCreated`.
+ */
+export interface WorktreeCreated {
+  path: string;
+  /** Copying build caches from the main checkout failed as a whole. */
+  cache_error: string | null;
+  /** A `post_create` hook failed, timed out, or was refused. */
+  hook_error: string | null;
+}
+
+/**
+ * What to tell the reader after a worktree operation succeeded with a step
+ * left undone: one sentence per step, empty when there is nothing to say.
+ */
+export function worktreeSetupNotices(
+  done: { cache_error?: string | null; hook_error?: string | null },
+  when: "create" | "merge",
+): string[] {
+  const notices: string[] = [];
+  if (done.cache_error) notices.push(`The worktree was created, but its build caches were not copied: ${done.cache_error}`);
+  if (done.hook_error) {
+    notices.push(when === "create"
+      ? `The worktree was created, but its post_create hook did not finish, so it may not be set up: ${done.hook_error}`
+      : `The merge and teardown finished, but the post_merge hook did not: ${done.hook_error}`);
+  }
+  return notices;
 }
 
 export interface ReflinkResult {

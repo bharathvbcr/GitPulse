@@ -167,7 +167,7 @@ pub(super) fn provision(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     crate::harness::guard_command(selected, &refs)
         .map_err(|e| WorkbenchError::new("policy_refused", e))?;
-    crate::engine::worktree::add_worktree_extended(
+    let created = crate::engine::worktree::add_worktree_extended(
         selected,
         &path_text,
         Some(&branch),
@@ -176,12 +176,35 @@ pub(super) fn provision(
         true,
     )
     .map_err(refused)?;
-    Ok(Provisioned {
+    let provisioned = Provisioned {
         source: selected.into(),
         path: path_text,
         branch,
         created: true,
-    })
+    };
+    if let Some(cache) = created.cache_error {
+        // Caches only save a rebuild; the agent can work without them.
+        log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
+    }
+    if let Some(hook) = created.hook_error {
+        // The repository's own setup did not finish (dependencies, seeds), so
+        // an agent started here would work in a tree its owners say is not
+        // ready — and nothing would tell it. The attempt does not start, and
+        // the tree made for it goes, exactly as when the store refuses it.
+        let cleanup = discard(&provisioned)
+            .err()
+            .map(|e| {
+                format!(
+                    " The worktree could not be removed and is still at {} on branch {}: {e}",
+                    provisioned.path, provisioned.branch
+                )
+            })
+            .unwrap_or_default();
+        return Err(refused(format!(
+            "The repository's post_create hook failed in the new worktree, so the agent was not started: {hook}.{cleanup}"
+        )));
+    }
+    Ok(provisioned)
 }
 
 /// Undoes `provision` after the store refused the attempt. A worktree a retry
@@ -206,7 +229,63 @@ pub(super) fn discard(provisioned: &Provisioned) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::slug;
+    use super::{provision, slug};
+    use crate::engine::git_cli::{git_global, git_text};
+
+    /// The repository's own setup failed in the new tree, so the agent does
+    /// not start there, and the tree and branch made for it are removed. The
+    /// failure used to be discarded: the agent started in a tree whose
+    /// dependencies were never installed, and nothing said so.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_setup_hook_refuses_the_agent_and_removes_its_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        git_global(&["init", "-b", "main", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&root);
+        std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
+        std::fs::write(
+            root.join(".gitpulse/hooks.json"),
+            r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#,
+        )
+        .unwrap();
+        git_text(&root, &["add", "."]).unwrap();
+        git_text(
+            &root,
+            &[
+                "-c",
+                "user.name=Workbench Test",
+                "-c",
+                "user.email=workbench@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "hooks",
+            ],
+        )
+        .unwrap();
+        let Err(refused) = provision(root.to_str().unwrap(), "f00dcafe-1", "Preserve E42") else {
+            panic!("an agent worktree whose setup hook failed was provisioned");
+        };
+        assert_eq!(refused.code, "worktree_unavailable");
+        assert!(
+            refused.message.contains("post_create") && refused.message.contains("npm ci failed"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            !refused.message.contains("could not be removed"),
+            "{}",
+            refused.message
+        );
+        let left = std::fs::read_dir(root.join(".gitpulse/worktrees"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(left, 0, "the refused attempt's worktree was left behind");
+        let branches = git_text(&root, &["branch", "--list", "gitpulse/*"]).unwrap();
+        assert!(branches.trim().is_empty(), "branch left behind: {branches}");
+    }
 
     #[test]
     fn slugs_are_branch_and_path_safe_and_bounded() {

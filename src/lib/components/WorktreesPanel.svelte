@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { MergeTeardownResult, WorktreeInfo, WorktreeRouteInfo } from "../branches/types";
+  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
+  import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
   import { loadWorktreeTasks } from "../tasks/bindings";
   import { loadTaskScopes } from "../tasks/scopes";
@@ -221,7 +222,7 @@
     isCreating = true;
     error = null;
     try {
-      await invoke("cmd_add_worktree", {
+      const created = await invoke<Guarded<WorktreeCreated>>("cmd_add_worktree", {
         repoPath: repo,
         targetPath,
         newBranch: branch || null,
@@ -230,6 +231,9 @@
         cowCaches,
       });
       createCompleted = true;
+      // Created, but not everything it was asked to do happened. Said now,
+      // while the reader still knows which worktree they just made.
+      for (const notice of worktreeSetupNotices(created.output, "create")) toastStore.warning(notice);
       harnessStore.recordAction({
         repoPath: repo,
         kind: "worktree",
@@ -355,9 +359,10 @@
       harnessStore.recordAction({
         repoPath: repo,
         kind: "worktree-remove",
-        label: `Merged ${wt.branch ?? wt.name} into main (${res.output.commits_merged} commits) & teardown`,
+        label: `Merged ${wt.branch ?? wt.name} into ${res.output.target_branch} (${res.output.commits_merged} commits) & teardown`,
         ok: true,
       });
+      for (const notice of worktreeSetupNotices(res.output, "merge")) toastStore.warning(notice);
       if ($repoStore.currentPath !== repo) return;
       if ($repoStore.currentPath === wt.path) {
         const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);

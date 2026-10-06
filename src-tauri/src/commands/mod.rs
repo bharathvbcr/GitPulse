@@ -2220,7 +2220,7 @@ pub async fn cmd_add_worktree(
     start_point: Option<String>,
     detach: bool,
     cow_caches: Option<bool>,
-) -> Result<Guarded<String>, String> {
+) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, String> {
     off_thread(move || {
         let argv_owned = crate::engine::worktree::add_worktree_argv(
             &target_path,
@@ -2319,18 +2319,25 @@ pub async fn cmd_worktree_merge_teardown(
 ) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
     off_thread(move || {
         let is_squash = squash.unwrap_or(false);
-        let branch = target_branch.as_deref().unwrap_or("main");
-        let argv_owned = crate::engine::worktree::merge_teardown_argv(branch, is_squash);
-        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
-        let policy = guard(&repo_path, &refs)?;
+        // Each step is judged as it runs, with what runs (see the engine's
+        // doc). The verdict reported is the merge's: the first mutation, and
+        // the one the rest depend on.
+        let mut policy = None;
+        let mut gate = |args: &[&str]| -> Result<(), String> {
+            let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+            let verdict = guard(&repo_path, &argv)?;
+            policy.get_or_insert(verdict);
+            Ok(())
+        };
         let result = crate::engine::worktree::merge_and_teardown_worktree(
             &repo_path,
             &worktree_path,
             target_branch.as_deref(),
             is_squash,
+            &mut gate,
         )?;
         Ok(Guarded {
-            policy,
+            policy: policy.ok_or("The merge ran without being judged by the policy gate.")?,
             output: result,
         })
     })

@@ -91,7 +91,6 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["PreviewOutcome", { reason: "devmap preview batch; pending CONTRACTS row" }],
   ["RepoMapLoad", { reason: "repo map panel load; pending CONTRACTS row" }],
   ["SearchHit", { reason: "MarkDev / vault search hit; pending CONTRACTS row" }],
-  ["MergeTeardownResult", { reason: "worktree merge-teardown result; mirrored in src/lib/branches/types.ts" }],
   ["ReflinkResult", { reason: "worktree CoW clone result; mirrored in src/lib/branches/types.ts" }],
   ["SyntaxHighlightSpan", { reason: "syntax highlight IPC; pending CONTRACTS row" }],
   ["ToolConfigView", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],

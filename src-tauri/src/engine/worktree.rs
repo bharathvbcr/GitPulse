@@ -753,6 +753,23 @@ pub fn add_worktree(
     Ok(target_path.to_string())
 }
 
+/// A worktree that exists, and what of its optional setup did not happen.
+///
+/// The worktree itself is the result: once `git worktree add` succeeded it is
+/// on disk, so a later step failing must not read as "not created". But it
+/// must not read as "fully set up" either — both errors were discarded, so a
+/// `post_create` hook that failed (dependencies never installed) left a tree
+/// that looked ready and was not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeCreated {
+    pub path: String,
+    /// Copying build caches from the main checkout failed as a whole.
+    /// Individual cache directories that fail are logged and skipped there.
+    pub cache_error: Option<String>,
+    /// A `post_create` hook failed, timed out, or was refused.
+    pub hook_error: Option<String>,
+}
+
 /// Creates a linked worktree with optional Copy-on-Write cache cloning and lifecycle hooks.
 pub fn add_worktree_extended(
     repo_path: &str,
@@ -761,15 +778,20 @@ pub fn add_worktree_extended(
     start_point: Option<&str>,
     detach: bool,
     cow_caches: bool,
-) -> Result<String, String> {
-    let created = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
+) -> Result<WorktreeCreated, String> {
+    let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
+    let mut created = WorktreeCreated {
+        path,
+        cache_error: None,
+        hook_error: None,
+    };
     if cow_caches {
         let repo = validate_repo(repo_path)?;
         let target = Path::new(target_path);
-        let _ = reflink_ignored_caches(&repo, target);
+        created.cache_error = reflink_ignored_caches(&repo, target).err();
         let hooks = load_worktree_hooks(&repo);
         let branch_name = new_branch.unwrap_or("");
-        let _ = execute_worktree_hooks(
+        created.hook_error = execute_worktree_hooks(
             &repo,
             target,
             &hooks.post_create,
@@ -778,7 +800,8 @@ pub fn add_worktree_extended(
                 ("GITPULSE_BRANCH", branch_name),
                 ("GITPULSE_WORKTREE_PATH", target_path),
             ],
-        );
+        )
+        .err();
     }
     Ok(created)
 }
@@ -791,15 +814,28 @@ pub struct MergeTeardownResult {
     pub commits_merged: usize,
     pub worktree_removed: bool,
     pub branch_deleted: bool,
+    /// A `post_merge` hook failed, timed out, or was refused. The merge and
+    /// the teardown had already happened; this says the cleanup after them
+    /// did not, where it used to be discarded.
+    pub hook_error: Option<String>,
 }
 
 /// Merges a worktree branch into target_branch (defaulting to main/master) in the primary
 /// repository checkout, tears down the worktree cleanly, and prunes the merged branch.
+///
+/// `gate` is asked about each git command before it runs, with git's
+/// arguments as they actually run (no leading `git`): the merge of *this
+/// worktree's* branch, the squash commit, the forced worktree removal and the
+/// branch deletion. The caller used to ask once, up front, about
+/// `merge --ff-only <target>` — a command this never ran, and spelled without
+/// the program, so it was judged as a program named `merge` — and the three
+/// later mutations were not asked about at all.
 pub fn merge_and_teardown_worktree(
     repo_path: &str,
     worktree_path: &str,
     target_branch: Option<&str>,
     squash: bool,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
 ) -> Result<MergeTeardownResult, String> {
     let family = resolve_worktree_family(repo_path, worktree_path)?;
     if family.worktree == family.anchor {
@@ -814,6 +850,29 @@ pub fn merge_and_teardown_worktree(
     let branch = branch_raw.trim().to_string();
     if branch.is_empty() || branch == "HEAD" {
         return Err("Worktree has a detached HEAD; cannot merge an unbranched checkout".into());
+    }
+
+    let default_target = if git_text(&repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
+        "main"
+    } else if git_text(&repo, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
+        "master"
+    } else {
+        "main"
+    };
+    let target = target_branch.unwrap_or(default_target);
+    validate_ref_name(target)?;
+
+    // The merge runs in the main checkout, onto whatever it has checked out.
+    // It used to run there regardless and then report `target`: a main
+    // checkout on another branch took the merge, and the panel said "main".
+    let current = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|head| head.trim().to_string())
+        .unwrap_or_default();
+    if current != target {
+        return Err(format!(
+            "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
+            if current.is_empty() { "a detached HEAD".to_string() } else { current }
+        ));
     }
 
     // 2. Pre-merge hooks
@@ -838,15 +897,6 @@ pub fn merge_and_teardown_worktree(
         ));
     }
 
-    let default_target = if git_text(&repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
-        "main"
-    } else if git_text(&repo, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
-        "master"
-    } else {
-        "main"
-    };
-    let target = target_branch.unwrap_or(default_target);
-
     // Count commits being merged
     let count_stdout = git_text(
         &repo,
@@ -862,31 +912,53 @@ pub fn merge_and_teardown_worktree(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        let merge = merge_teardown_argv(&branch, squash);
+        let merge: Vec<&str> = merge.iter().map(String::as_str).collect();
+        gate(&merge)?;
         if squash {
-            git_text(&repo, &["merge", "--squash", &branch])?;
-            let commit_msg = format!("Merge branch '{branch}' (squashed)");
-            let _ = git_text(&repo, &["commit", "-m", &commit_msg]);
-        } else {
-            if let Err(ff_err) = git_text(&repo, &["merge", "--ff-only", &branch]) {
-                let commit_msg = format!("Merge branch '{branch}' into {target}");
-                git_text(&repo, &["merge", &branch, "-m", &commit_msg])
-                    .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
+            git_text(&repo, &merge)?;
+            // `git merge` refuses to start over staged changes, so whatever is
+            // staged now is the squash. Nothing staged means the branch's
+            // changes are already on the target and there is nothing to
+            // commit — not a failure.
+            let staged = git_text(&repo, &["diff", "--cached", "--name-only"])?;
+            if !staged.trim().is_empty() {
+                let commit_msg = format!("Merge branch '{branch}' (squashed)");
+                let commit = ["commit", "-m", commit_msg.as_str()];
+                gate(&commit)?;
+                // Fail closed before anything is torn down. This was
+                // discarded, and the next steps removed the worktree and
+                // force-deleted the branch whose work was never committed.
+                git_text(&repo, &commit).map_err(|e| {
+                    format!(
+                        "The squashed changes of {branch} are staged on {target} but could not be committed: {e}. \
+                         The worktree and the branch were kept. Commit the staged changes, or undo them with `git reset --merge`."
+                    )
+                })?;
             }
+        } else if let Err(ff_err) = git_text(&repo, &merge) {
+            let commit_msg = format!("Merge branch '{branch}' into {target}");
+            let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
+            gate(&merge)?;
+            git_text(&repo, &merge)
+                .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
         }
     }
 
     // 5. Remove worktree
-    remove_worktree(repo_path, &worktree.to_string_lossy(), true)?;
+    let worktree_text = worktree.to_string_lossy().to_string();
+    let remove = remove_worktree_argv(&worktree_text, true);
+    // That builder spells the program; the gate takes git's arguments.
+    let remove: Vec<&str> = remove.iter().skip(1).map(String::as_str).collect();
+    gate(&remove)?;
+    remove_worktree(repo_path, &worktree_text, true)?;
 
     // 6. Delete merged branch
-    let branch_deleted = git_text(
-        &repo,
-        &["branch", if squash { "-D" } else { "-d" }, &branch],
-    )
-    .is_ok();
+    let delete = ["branch", if squash { "-D" } else { "-d" }, branch.as_str()];
+    let branch_deleted = gate(&delete).is_ok() && git_text(&repo, &delete).is_ok();
 
     // 7. Post-merge hooks
-    let _ = execute_worktree_hooks(
+    let hook_error = execute_worktree_hooks(
         &repo,
         &repo,
         &hooks.post_merge,
@@ -895,7 +967,8 @@ pub fn merge_and_teardown_worktree(
             ("GITPULSE_BRANCH", &branch),
             ("GITPULSE_TARGET_BRANCH", target),
         ],
-    );
+    )
+    .err();
 
     Ok(MergeTeardownResult {
         merged_branch: branch,
@@ -903,10 +976,11 @@ pub fn merge_and_teardown_worktree(
         commits_merged,
         worktree_removed: true,
         branch_deleted,
+        hook_error,
     })
 }
 
-/// The exact argv [`merge_and_teardown_worktree`] would execute, for policy gating.
+/// Git's arguments for the merge step of [`merge_and_teardown_worktree`].
 pub fn merge_teardown_argv(branch: &str, squash: bool) -> Vec<String> {
     if squash {
         vec!["merge".into(), "--squash".into(), branch.into()]
@@ -1790,6 +1864,265 @@ some-future-field whatever
         assert_eq!(squash, vec!["merge", "--squash", "feature-1"]);
     }
 
+    /// A trusted repository on `main` with one commit, and a linked worktree
+    /// on `feature-x` holding one more commit. Returns (repo dir, worktree
+    /// dir); both are trusted.
+    fn teardown_fixture(hooks: Option<&str>) -> (tempfile::TempDir, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(repo, &["init", "-b", "main", "."]);
+        git(repo, &["config", "user.email", "test@gitpulse.local"]);
+        git(repo, &["config", "user.name", "GitPulse Tester"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        if let Some(hooks) = hooks {
+            std::fs::create_dir_all(repo.join(".gitpulse")).unwrap();
+            std::fs::write(repo.join(".gitpulse/hooks.json"), hooks).unwrap();
+        }
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "initial commit"]);
+        crate::test_support::trust_repo(repo);
+        let wt = tempfile::tempdir().expect("wt tempdir");
+        let created = add_worktree_extended(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("feature-x"),
+            None,
+            false,
+            false,
+        )
+        .expect("created worktree");
+        assert_eq!(created.path, wt.path().to_str().unwrap());
+        crate::test_support::trust_repo(wt.path());
+        std::fs::write(wt.path().join("feature.txt"), "lane work\n").unwrap();
+        git(wt.path(), &["add", "."]);
+        git(wt.path(), &["commit", "-m", "feature commit"]);
+        (dir, wt)
+    }
+
+    fn allow_all(_: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        git_text(
+            repo,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .is_ok()
+    }
+
+    /// The worktree exists once `git worktree add` succeeded, so a failed
+    /// setup step must not read as "not created" — nor, as it did when both
+    /// errors were discarded, as "fully set up".
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_post_create_hook_is_reported_with_the_worktree_it_left() {
+        let (dir, _) = teardown_fixture(Some(
+            r#"{"worktree":{"post_create":["echo setup broke >&2; exit 3"]}}"#,
+        ));
+        let wt = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("feature-y"),
+            None,
+            false,
+            true,
+        )
+        .expect("the worktree itself was created");
+        let hook = created.hook_error.expect("the failed hook was reported");
+        assert!(
+            hook.contains("post_create") && hook.contains("setup broke"),
+            "{hook}"
+        );
+        assert!(wt.path().join("README.md").exists());
+        // Without cow_caches nothing optional runs, and nothing is reported.
+        let plain = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            plain.path().to_str().unwrap(),
+            Some("feature-z"),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!((created.cache_error, created.hook_error), (None, None));
+    }
+
+    /// The merge runs in the main checkout, onto what it has checked out. On
+    /// another branch it used to merge there and report "main".
+    #[test]
+    fn teardown_refuses_when_the_main_checkout_is_not_on_the_target() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        git_text(repo, &["switch", "-c", "elsewhere"]).unwrap();
+        let mut asked = Vec::new();
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            &mut |args: &[&str]| {
+                asked.push(args.join(" "));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(refused.contains("is on elsewhere, not main"), "{refused}");
+        assert!(
+            asked.is_empty(),
+            "a refused teardown asked the gate about {asked:?}"
+        );
+        assert!(
+            !repo.join("feature.txt").exists(),
+            "the merge reached the wrong branch"
+        );
+        assert!(wt.path().join("feature.txt").exists() && branch_exists(repo, "feature-x"));
+    }
+
+    /// A squash whose commit fails must stop before anything is torn down:
+    /// the commit's result was discarded, and the next steps removed the
+    /// worktree and force-deleted the branch whose work was never committed.
+    #[cfg(unix)]
+    #[test]
+    fn a_squash_whose_commit_fails_keeps_the_worktree_and_the_branch() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let hook = repo.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho refusing this commit >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            true,
+            &mut allow_all,
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("could not be committed") && refused.contains("git reset --merge"),
+            "{refused}"
+        );
+        assert!(
+            wt.path().join("feature.txt").exists(),
+            "the worktree was removed"
+        );
+        assert!(
+            branch_exists(repo, "feature-x"),
+            "the unmerged branch was deleted"
+        );
+        let staged = git_text(repo, &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(
+            staged.trim(),
+            "feature.txt",
+            "the squash should be left staged to finish or undo"
+        );
+    }
+
+    /// The gate is asked about what runs, in order, with the worktree's own
+    /// branch — and a refusal at any step stops there. It was asked once
+    /// about `merge --ff-only main`, a command this never ran.
+    #[test]
+    fn teardown_asks_the_gate_about_each_command_it_runs() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let wt_path = wt
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut asked = Vec::new();
+        merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            true,
+            &mut |args: &[&str]| {
+                asked.push(args.join(" "));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            asked,
+            [
+                "merge --squash feature-x".to_string(),
+                "commit -m Merge branch 'feature-x' (squashed)".to_string(),
+                format!("worktree remove --force {wt_path}"),
+                "branch -D feature-x".to_string(),
+            ]
+        );
+
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            &mut |args: &[&str]| {
+                if args.first() == Some(&"worktree") {
+                    Err("policy: worktree removal denied".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(refused.contains("worktree removal denied"), "{refused}");
+        assert!(
+            repo.join("feature.txt").exists(),
+            "the merge before the refusal stands"
+        );
+        assert!(
+            wt.path().join("feature.txt").exists(),
+            "a refused removal removed the worktree"
+        );
+        assert!(
+            branch_exists(repo, "feature-x"),
+            "a refused removal still deleted the branch"
+        );
+    }
+
+    /// The merge and teardown happened; a post_merge hook that failed after
+    /// them is said, not discarded.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_post_merge_hook_is_reported_after_a_completed_teardown() {
+        let (dir, wt) = teardown_fixture(Some(
+            r#"{"worktree":{"post_merge":["echo cleanup broke >&2; exit 4"]}}"#,
+        ));
+        let result = merge_and_teardown_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            &mut allow_all,
+        )
+        .unwrap();
+        assert!(result.worktree_removed && result.branch_deleted);
+        let hook = result.hook_error.expect("the failed hook was reported");
+        assert!(
+            hook.contains("post_merge") && hook.contains("cleanup broke"),
+            "{hook}"
+        );
+    }
+
     #[test]
     fn test_merge_and_teardown_lifecycle() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1826,7 +2159,8 @@ some-future-field whatever
         let created =
             add_worktree_extended(repo_path, wt_path, Some("feature-x"), None, false, false)
                 .expect("created worktree");
-        assert_eq!(created, wt_path);
+        assert_eq!(created.path, wt_path);
+        assert_eq!((created.cache_error, created.hook_error), (None, None));
         crate::test_support::trust_repo(wt_dir.path());
 
         // Add commit in worktree
@@ -1842,8 +2176,10 @@ some-future-field whatever
             .output();
 
         // Merge and teardown
-        let res = merge_and_teardown_worktree(repo_path, wt_path, Some("main"), false)
-            .expect("merged and torn down");
+        let res =
+            merge_and_teardown_worktree(repo_path, wt_path, Some("main"), false, &mut allow_all)
+                .expect("merged and torn down");
+        assert_eq!(res.hook_error, None);
         assert_eq!(res.merged_branch, "feature-x");
         assert_eq!(res.target_branch, "main");
         assert_eq!(res.commits_merged, 1);

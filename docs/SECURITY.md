@@ -331,6 +331,15 @@ flowchart TD
   most 1 MiB of its output, and has its whole process tree killed at the
   deadline, so a hung hook cannot hang worktree creation. The deadline limits
   duration, not authority: a trusted hook still runs with the user's rights.
+- A hook that fails, times out or is refused is reported, never discarded: the
+  Worktrees panel says the worktree exists but was not set up, a teardown says
+  its `post_merge` cleanup did not run, and an agent's worktree whose
+  `post_create` failed is removed and the agent is not started.
+- Merge & teardown asks the policy gate about every git command it runs, as it
+  runs it: the merge of the worktree's own branch, the squash commit, the forced
+  worktree removal and the branch deletion. It refuses when the main checkout is
+  not on the target branch, and a squash whose commit fails stops before the
+  worktree or branch is touched.
 
 ### Opt-In Release Checks
 - Automatic application release checks are off by default; GitPulse does not

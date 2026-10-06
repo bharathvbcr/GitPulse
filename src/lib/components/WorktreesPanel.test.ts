@@ -115,7 +115,8 @@ describe("WorktreesPanel removal safety", () => {
 
   it("freezes worktree creation inputs before invoking the backend", () => {
     const body = source.slice(source.indexOf("async function create"), source.indexOf("function removeArmTitle"));
-    const invoke = body.indexOf('await invoke("cmd_add_worktree"');
+    const invoke = body.indexOf('("cmd_add_worktree"');
+    expect(invoke, "the create call").toBeGreaterThan(-1);
     for (const declaration of [
       "const targetPath = newPath.trim();",
       "const branch = newBranch.trim();",
