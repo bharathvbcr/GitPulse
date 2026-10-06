@@ -16,7 +16,7 @@ import { sidebarRowHeight } from "../src/lib/sidebar/metrics";
 import ToastContainer from "../src/lib/components/ToastContainer.svelte";
 const params = new URLSearchParams(location.search);
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
-const results = [], crashes = [], merges = [], copies = [], unexpected = [];
+const results = [], crashes = [], merges = [], copies = [], unexpected = [], transfers = [];
 let current = "main", failMerge = false, pendingMerge = null, operation = null, probeFailed = false, copyFailed = false;
 // Churn and divergence are derived from the name so they are stable across
 // runs but non-zero: every branch used to arrive as all-zeros, so the row's
@@ -68,6 +68,8 @@ const fixture = {
   cmd_repository_trust: () => ({path:REPO,git_dir:`${REPO}/.git`,common_dir:`${REPO}/.git`,identity:"fixture",scope:"repository",worktrees:2}),
   cmd_task_view: () => ({available:false,store_path:"",leases:[],error:""}),
   cmd_worktree_task: () => null,
+  cmd_push: a => {transfers.push({kind:"push",branch:a.branch});return "";},
+  cmd_pull: a => {transfers.push({kind:"pull",branch:a.branch});return "";},
   cmd_merge_branch: async a => {merges.push(a);if(pendingMerge)await new Promise(resolve => {pendingMerge(resolve);});if(failMerge)throw Error("Fixture merge failed");return "Merged";},
 };
 window.__TAURI_INTERNALS__ = {invoke:async(cmd,args) => {if(fixture[cmd])return fixture[cmd](args);if(cmd.startsWith("plugin:event|"))return 1;unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
@@ -235,6 +237,18 @@ if(params.has("check")) {
     check("context menu opens review without merging",merges.length===0&&dialog());
     check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[type="checkbox"]').checked);
     await click("Cancel");
+    // A menu action closes the menu first, and the branch it acts on is a
+    // `{@const}` derived from that menu. Read after the close, it re-derives
+    // from a null menu and throws inside the click: nothing is pushed, and
+    // the error escapes as an uncaught exception.
+    const crashesBeforeTransfer=crashes.length;
+    for(const kind of ["Push","Pull"]){
+      sourceRow.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();
+      await click(kind);await settle();
+    }
+    check(`menu Push and Pull act on the branch the menu was opened for (${crashes.slice(crashesBeforeTransfer).join(" | ")})`,
+      crashes.length===crashesBeforeTransfer&&transfers.length===2
+      &&transfers.every(t=>t.branch==="feature/branch-selection")&&transfers[0].kind==="push"&&transfers[1].kind==="pull");
     await click("Merge branches");
     check("picker opens without mutating",dialog()&&merges.length===0);
     check("search receives initial focus",document.activeElement?.id==="merge-branch-search");

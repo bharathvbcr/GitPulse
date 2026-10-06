@@ -1,6 +1,7 @@
 use crate::analyzer::deps::severity_rank;
 use crate::engine::git_cli::{
-    capture_command, git_text, run_command_in, validate_repo, CapturedOutput,
+    capture_command, classify_tool_probe, git_text, run_command_in, validate_repo, CapturedOutput,
+    ToolProbe,
 };
 pub mod actions;
 use serde::{Deserialize, Serialize};
@@ -184,7 +185,8 @@ impl GitHubRunsReport {
 /// Every failure path returns `checked: false` with a reason. A poll that
 /// cannot reach `gh` must never look like a poll that found nothing.
 pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
-    let cli_present = gh_cli_present();
+    let gh = probe_gh_cli();
+    let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(remote)) => remote,
         Ok(None) => {
@@ -196,12 +198,8 @@ pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
         }
         Err(error) => return GitHubRunsReport::unavailable(cli_present, None, error),
     };
-    if !cli_present {
-        return GitHubRunsReport::unavailable(
-            false,
-            Some(&remote),
-            "GitHub CLI (`gh`) is not installed or not on PATH".to_string(),
-        );
+    if let Some(reason) = gh_unavailable_reason(&gh) {
+        return GitHubRunsReport::unavailable(cli_present, Some(&remote), reason);
     }
     match list_workflow_runs(&remote) {
         Ok((runs, truncated)) => GitHubRunsReport {
@@ -455,10 +453,50 @@ fn split_owner_repo(host_and_path: &str, strip_port: bool) -> Option<GitHubRepoR
 /// `cmd_github_context`. Routing through `capture_command` gives the probe the
 /// same hard timeout and output caps every other subprocess gets; success is
 /// treated as presence.
+/// What `gh --version` says about the GitHub CLI. No working directory, so a
+/// not-found can only mean the program (see [`is_spawn_not_found`]).
+///
+/// [`is_spawn_not_found`]: crate::engine::git_cli::is_spawn_not_found
+pub(crate) fn probe_gh_cli() -> ToolProbe {
+    classify_tool_probe(
+        "gh",
+        capture_command("gh", &["--version"], None, Duration::from_secs(10), &[]),
+    )
+}
+
+/// True only when `gh` answered. A probe that hung, failed or never ran is
+/// not presence.
 pub fn gh_cli_present() -> bool {
-    capture_command("gh", &["--version"], None, Duration::from_secs(10), &[])
-        .map(|o| o.success)
-        .unwrap_or(false)
+    matches!(probe_gh_cli(), ToolProbe::Present(_))
+}
+
+const GH_NOT_INSTALLED: &str = "GitHub CLI (`gh`) is not installed or not on PATH";
+
+/// Why GitHub could not be asked, worded from what the probe observed —
+/// `None` when `gh` is usable.
+///
+/// "Not installed" is said only when the OS found no program. A probe shed
+/// under load, or one that started and failed, gets its own reason: the
+/// Health panel turns the absent case into "install gh", which is wrong
+/// advice for someone whose `gh` is on PATH and whose machine was busy.
+pub(crate) fn gh_unavailable_reason(probe: &ToolProbe) -> Option<String> {
+    match probe {
+        ToolProbe::Present(_) => None,
+        ToolProbe::NotFound(_) => Some(GH_NOT_INSTALLED.to_string()),
+        ToolProbe::FoundButFailed(detail) => Some(format!(
+            "GitHub CLI (`gh`) was found but could not be run: {detail}"
+        )),
+        ToolProbe::NotRun(detail) => {
+            Some(format!("GitHub CLI (`gh`) could not be checked: {detail}"))
+        }
+    }
+}
+
+/// The wire `cli_present` for a probe: false only for a confirmed absence,
+/// because every surface reads false as "install gh". The reason travels in
+/// the report's error beside it.
+pub(crate) fn gh_cli_reported_present(probe: &ToolProbe) -> bool {
+    !matches!(probe, ToolProbe::NotFound(_))
 }
 
 /// True for hosts GitHub actually serves: `github.com`, any subdomain of it,
@@ -1007,20 +1045,16 @@ const ALERT_DISPLAY_LIMIT: usize = 50;
 /// `available: false` and an explicit reason, so the UI can distinguish "no
 /// open alerts" from "could not check".
 pub fn load_dependabot_alerts(repo_path: &str) -> DependabotReport {
-    let cli_present = gh_cli_present();
+    let gh = probe_gh_cli();
+    let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(r)) => r,
         // Not an error: a local-only repository simply has no Dependabot data.
         Ok(None) => return unavailable_dependabot(cli_present, false, String::new(), None),
         Err(e) => return unavailable_dependabot(cli_present, false, String::new(), Some(e)),
     };
-    if !cli_present {
-        return unavailable_dependabot(
-            false,
-            true,
-            remote.slug(),
-            Some("GitHub CLI (`gh`) is not installed or not on PATH".into()),
-        );
+    if let Some(reason) = gh_unavailable_reason(&gh) {
+        return unavailable_dependabot(cli_present, true, remote.slug(), Some(reason));
     }
     match list_dependabot_alerts(&remote) {
         Ok((alerts, truncated)) => DependabotReport {
@@ -1336,19 +1370,15 @@ fn alert_from_json(row: &Value) -> DependabotAlertInfo {
 /// an explicit reason. A 403 ("Advanced Security is not enabled") or missing
 /// `security_events` scope must never look like "no open alerts".
 pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
-    let cli_present = gh_cli_present();
+    let gh = probe_gh_cli();
+    let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(r)) => r,
         Ok(None) => return unavailable_code_scanning(cli_present, false, String::new(), None),
         Err(e) => return unavailable_code_scanning(cli_present, false, String::new(), Some(e)),
     };
-    if !cli_present {
-        return unavailable_code_scanning(
-            false,
-            true,
-            remote.slug(),
-            Some("GitHub CLI (`gh`) is not installed or not on PATH".into()),
-        );
+    if let Some(reason) = gh_unavailable_reason(&gh) {
+        return unavailable_code_scanning(cli_present, true, remote.slug(), Some(reason));
     }
     match list_code_scanning_alerts(&remote) {
         Ok((alerts, truncated)) => CodeScanningReport {
@@ -1519,8 +1549,8 @@ pub fn checkout_pull_request(
     number: u64,
 ) -> Result<String, String> {
     let repo = validate_repo(repo_path)?;
-    if !gh_cli_present() {
-        return Err("GitHub CLI (`gh`) is not installed or not on PATH".into());
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason);
     }
     let args = pr_checkout_argv(remote, number)?;
     let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
@@ -1638,8 +1668,8 @@ pub fn create_issue(
 ) -> Result<String, String> {
     validate_issue_payload(title, body, labels)?;
     let repo = validate_repo(repo_path)?;
-    if !gh_cli_present() {
-        return Err("GitHub CLI (`gh`) is not installed or not on PATH".into());
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason);
     }
 
     let args = issue_create_argv(remote, title, body, labels);
@@ -1650,7 +1680,8 @@ pub fn create_issue(
 }
 
 pub fn load_github_context(repo_path: &str) -> GitHubContext {
-    let cli_present = gh_cli_present();
+    let gh = probe_gh_cli();
+    let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -1701,10 +1732,10 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         }
     };
 
-    if !cli_present {
+    if let Some(reason) = gh_unavailable_reason(&gh) {
         return GitHubContext {
             available: false,
-            cli_present: false,
+            cli_present,
             host: remote.host.clone(),
             owner: remote.owner.clone(),
             repo: remote.name.clone(),
@@ -1720,7 +1751,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             releases: Vec::new(),
             releases_truncated: false,
             releases_error: None,
-            error: Some("GitHub CLI (`gh`) is not installed or not on PATH".into()),
+            error: Some(reason),
             warnings: Vec::new(),
         };
     }
@@ -2067,6 +2098,90 @@ mod tests {
             "an untrusted repository must be refused by the trust gate, not \
              reported as having no runs; got: {reason}"
         );
+    }
+
+    /// The warning from the field: `gh` on PATH and answering 403s either
+    /// side of it, and one poll in between saying "`gh` is not installed".
+    /// Its presence probe had not run — the machine was shedding background
+    /// spawns — and every caller read any probe failure as absence, so the
+    /// Health panel told the reader to install a tool they had.
+    #[test]
+    fn a_gh_probe_that_never_ran_is_not_reported_as_not_installed() {
+        let dir = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/gitpulse.git",
+            ],
+        );
+        let path = dir.path().to_str().unwrap();
+        // Only `gh --version` is refused; the remote is still read.
+        let (runs, context, dependabot, scanning, workflows) =
+            crate::engine::git_cli::with_forced_spawn_failure_of("--version", || {
+                (
+                    load_workflow_runs_report(path),
+                    load_github_context(path),
+                    load_dependabot_alerts(path),
+                    load_code_scanning_alerts(path),
+                    actions::load_workflows_report(path),
+                )
+            });
+        let answers = [
+            ("runs", runs.cli_present, runs.error.clone()),
+            ("context", context.cli_present, context.error.clone()),
+            (
+                "dependabot",
+                dependabot.cli_present,
+                dependabot.error.clone(),
+            ),
+            (
+                "code scanning",
+                scanning.cli_present,
+                scanning.error.clone(),
+            ),
+            ("workflows", workflows.cli_present, workflows.error.clone()),
+        ];
+        for (surface, cli_present, error) in answers {
+            let error =
+                error.unwrap_or_else(|| panic!("{surface}: a probe that never ran must say why"));
+            assert!(
+                !error.contains("not installed"),
+                "{surface}: a refused probe is not an absent CLI; got: {error}"
+            );
+            assert!(
+                error.contains("could not be checked"),
+                "{surface}: the reason must say the check did not run; got: {error}"
+            );
+            assert!(
+                cli_present,
+                "{surface}: cli_present=false is read as \"install gh\" and must mean only that"
+            );
+        }
+        assert!(
+            !runs.checked,
+            "a poll whose probe never ran is not a checked poll"
+        );
+        assert!(
+            !context.available
+                && !dependabot.available
+                && !scanning.available
+                && !workflows.available
+        );
+        // The alert surfaces classify the reason too: a probe that never ran
+        // is neither a missing CLI nor an HTTP failure GitHub returned.
+        for (surface, reason) in [
+            ("dependabot", dependabot.unavailable_reason),
+            ("code scanning", scanning.unavailable_reason),
+        ] {
+            assert_eq!(
+                reason,
+                Some(GithubUnavailableReason::Unknown),
+                "{surface}: a refused probe must not read as CliMissing, Forbidden or Transport"
+            );
+        }
     }
 
     #[test]

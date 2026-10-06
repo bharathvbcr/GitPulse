@@ -22,8 +22,8 @@ use crate::analyzer::cargo_supply::{
 };
 use crate::analyzer::language::LanguageDetector;
 use crate::engine::git_cli::{
-    capture_command_with_env, git_text, resolve_spawn_program_with, sandbox_join,
-    sandbox_join_canonical, validate_repo, CapturedOutput,
+    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_with,
+    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, ToolProbe,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -473,21 +473,16 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
         .and_then(|probe| probe.version())
         .is_some();
     if needs_bun && !bun_cli_present {
-        let detail = match bun_probe.as_ref() {
-            Some(ToolProbe::FoundButFailed(detail)) => {
-                format!(" bun was found but could not be run: {detail}.")
-            }
-            _ => String::new(),
-        };
-        push_issue(
-            &mut issues,
-            "warning",
-            "bun_missing",
-            format!(
-                "bun is not installed or not on PATH; bun.lock was not audited. npm audit cannot read a Bun lockfile.{detail}"
+        let message = match bun_probe.as_ref() {
+            Some(ToolProbe::FoundButFailed(detail)) => format!(
+                "bun was found but could not be run: {detail}. bun.lock was not audited; npm audit cannot read a Bun lockfile."
             ),
-            None,
-        );
+            Some(ToolProbe::NotRun(detail)) => format!(
+                "bun could not be checked: {detail}. bun.lock was not audited; npm audit cannot read a Bun lockfile."
+            ),
+            _ => "bun is not installed or not on PATH; bun.lock was not audited. npm audit cannot read a Bun lockfile.".to_string(),
+        };
+        push_issue(&mut issues, "warning", "bun_missing", message, None);
     }
 
     if !manifests.is_empty() && !npm_cli_present {
@@ -498,11 +493,20 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
         // check in that case, so the warning must not say the vulnerability
         // scan did not run.
         if only_bun {
+            let cause = match &npm_probe {
+                ToolProbe::FoundButFailed(detail) => {
+                    format!("npm was found but could not be run: {detail}")
+                }
+                ToolProbe::NotRun(detail) => format!("npm could not be checked: {detail}"),
+                ToolProbe::Present(_) | ToolProbe::NotFound(_) => {
+                    "npm is not installed or not on PATH".to_string()
+                }
+            };
             push_issue(
                 &mut issues,
                 "info",
                 "npm_missing",
-                "npm is not installed or not on PATH; outdated checks did not run. Vulnerabilities in bun.lock are checked with bun audit when bun is on PATH.".into(),
+                format!("{cause}; outdated checks did not run. Vulnerabilities in bun.lock are checked with bun audit when bun is on PATH."),
                 None,
             );
         } else {
@@ -2128,81 +2132,20 @@ fn run_json_cli(cwd: &Path, program: &str, args: &[&str], env: &ScanEnv) -> Resu
     Ok(trimmed.to_string())
 }
 
-/// What a CLI version probe concluded.
-///
-/// Three outcomes, deliberately distinct. Collapsing "ran but failed" into
-/// "not found" is what made a GUI-launched scan report
-/// "`npm is not installed`" while `/opt/homebrew/bin/npm` existed — its
-/// shebang interpreter was missing, which is a completely different problem
-/// with a different fix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ToolProbe {
-    /// Probe exited 0 and printed a non-empty first stdout line.
-    Present(String),
-    /// Nothing spawnpable resolved anywhere on PATH or in the fallback dirs;
-    /// carries the raw spawn error text.
-    NotFound(String),
-    /// The binary was found and launched but could not report a version:
-    /// non-zero exit (with stderr tail), timeout (naming the limit), or empty
-    /// output. Carries the diagnosis.
-    FoundButFailed(String),
-}
-
-impl ToolProbe {
-    fn version(&self) -> Option<&str> {
-        match self {
-            ToolProbe::Present(version) => Some(version),
-            _ => None,
-        }
-    }
-}
-
 /// Probes `program args` under `env`'s PATH/home view and classifies the run.
 ///
 /// Every spawn goes through [`capture_scanner_command`], so probes resolve
 /// exactly like production spawns: PATH first, then the GUI-launch fallback
-/// dirs. The error-string classification mirrors `run_bounded`'s wording:
-/// spawn failures start with `"Failed to spawn "`; timeouts read
-/// `"{program} timed out after {n}s"` (the limit is already in the message).
+/// dirs. The classification is [`classify_tool_probe`]'s, shared with the
+/// `gh` probe: collapsing "ran but failed" into "not found" is what made a
+/// GUI-launched scan report "`npm is not installed`" while
+/// `/opt/homebrew/bin/npm` existed with its shebang interpreter missing, and
+/// collapsing "never started" into it blamed a busy machine on the toolchain.
 fn probe_tool_version(program: &str, args: &[&str], env: &ScanEnv, timeout: Duration) -> ToolProbe {
-    let out = capture_scanner_command(env, program, args, None, timeout, &[]);
-    match out {
-        Ok(out) => {
-            let stdout = out.stdout_text();
-            let line = stdout.lines().next().unwrap_or("").trim();
-            if out.success && !line.is_empty() {
-                ToolProbe::Present(line.to_string())
-            } else {
-                ToolProbe::FoundButFailed(found_but_failed_detail(program, &out))
-            }
-        }
-        Err(e) => {
-            if e.starts_with("Failed to spawn ") {
-                ToolProbe::NotFound(e)
-            } else {
-                // Timeout ("… timed out after …s"), truncation cap, wait
-                // failure: the program was there, the run went wrong.
-                ToolProbe::FoundButFailed(e)
-            }
-        }
-    }
-}
-
-/// Diagnosis for a finished run that yielded no usable version line.
-///
-/// Success is checked before stdout so a non-zero exit can never be promoted
-/// to "present" by incidental output; a mute stderr falls back to naming the
-/// exit status rather than leaving an unexplained failure.
-fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> String {
-    if out.success {
-        return format!("{program} produced no version output");
-    }
-    let err = out.stderr_text();
-    if err.is_empty() {
-        format!("{program} exited {} without a diagnosis", out.status_code)
-    } else {
-        err
-    }
+    classify_tool_probe(
+        program,
+        capture_scanner_command(env, program, args, None, timeout, &[]),
+    )
 }
 
 /// First version line a probe reported, if any. Thin wrapper kept so the
@@ -2244,6 +2187,11 @@ fn npm_missing_message(npm_probe: &ToolProbe, node_probe: &ToolProbe, env: &Scan
                 "npm was found{location} but could not be run: {detail}. Vulnerability and outdated checks did not run; local lockfile and engine checks still apply."
             )
         }
+        // Never started, so whether npm is installed is unknown — and saying
+        // it is not would send the reader to fix a toolchain that is fine.
+        ToolProbe::NotRun(detail) => format!(
+            "npm could not be checked: {detail}. Vulnerability and outdated checks did not run; local lockfile and engine checks still apply."
+        ),
     };
     let node_note = match node_probe {
         ToolProbe::NotFound(_) => " The Node.js interpreter (`node`) was not found either — npm is a script that needs `node` to run, so install Node.js."
@@ -5109,7 +5057,7 @@ not-json-at-all
 
     // -- scanner failure surfacing ---------------------------------------------
 
-    use crate::engine::git_cli::CapturedOutput;
+    use crate::engine::git_cli::{found_but_failed_detail, CapturedOutput};
 
     fn captured(status: i32, success: bool, stdout: &str, stderr: &str) -> CapturedOutput {
         CapturedOutput {

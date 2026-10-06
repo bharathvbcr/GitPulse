@@ -10,7 +10,10 @@
 //! these subcommands inherit only `--repo` (verified against gh 2.95.0), not
 //! the separate `--hostname` flag the older repo-context calls use.
 
-use super::{discover_github_remote, gh_cli_present, GitHubRepoRef, MAX_GH_ERROR_BYTES};
+use super::{
+    discover_github_remote, gh_cli_reported_present, gh_unavailable_reason, probe_gh_cli,
+    GitHubRepoRef, MAX_GH_ERROR_BYTES,
+};
 use crate::engine::git_cli::{capture_command, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
 use serde::{Deserialize, Serialize};
@@ -290,7 +293,8 @@ fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
 /// [`super::load_github_context`] does: every preventing condition comes back
 /// as an unavailable report with an explicit reason, never as "no workflows".
 pub fn load_workflows_report(repo_path: &str) -> WorkflowsReport {
-    let cli_present = gh_cli_present();
+    let gh = probe_gh_cli();
+    let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -301,11 +305,8 @@ pub fn load_workflows_report(repo_path: &str) -> WorkflowsReport {
         }
         Err(e) => return WorkflowsReport::unavailable(cli_present, Some(e)),
     };
-    if !cli_present {
-        return WorkflowsReport::unavailable(
-            false,
-            Some("GitHub CLI (`gh`) is not installed or not on PATH".into()),
-        );
+    if let Some(reason) = gh_unavailable_reason(&gh) {
+        return WorkflowsReport::unavailable(cli_present, Some(reason));
     }
     match list_workflows(&remote) {
         Ok((workflows, truncated)) => WorkflowsReport {

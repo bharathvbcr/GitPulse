@@ -16,6 +16,11 @@ const results = [], crashes = [], writes = [], unknown = [];
 const copies = [];
 Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { copies.push(text); } } });
 const preparedRuns = [], appleDrafts = [];
+// Off, the store refuses every preparation. On, it accepts one and starts a
+// managed attempt, which is the only way a handoff's success path — the host
+// closing the sheet from inside the form's own launch — is exercised.
+let acceptPreparation = false;
+const fixtureRuns = new Map();
 const issueCalls = [];
 // `issueFailOnCall` aims a failure at one call of a run (1-based over every
 // call so far); 0 fails them all. `holdIssue` parks a creation mid-run.
@@ -89,7 +94,17 @@ mockIPC(async (cmd, args) => {
     case "runs.list": return JSON.stringify({ok:true, items:[], shown:0, total:0, has_more:false, next_cursor:null});
     case "runs.prepare_terminal": case "runs.prepare_managed": {
       preparedRuns.push(structuredClone(input));
-      throw {code:"store_error", message:"The tasks fixture does not start agents."};
+      if (!acceptPreparation) throw {code:"store_error", message:"The tasks fixture does not start agents."};
+      const now = Math.floor(Date.now() / 1000);
+      const run = { kind: args.method === "runs.prepare_managed" ? "managed" : "external_terminal", id: input.id, revision: 1, updated_at: 1, task_id: input.task_id, source_revision: input.source_revision, task_title: tasks.find(task => task.id === input.task_id)?.title ?? "", repository_id: input.repository_id, provider: input.provider, permission_mode: input.permission_mode, state: "prepared", cwd: input.repo_path, created_at: now, expires_at: now + 300, session_id: null, exit_code: null, reason: "", outcome_uncertain: false };
+      fixtureRuns.set(run.id, run);
+      return JSON.stringify({ok: true, item: run});
+    }
+    case "runs.launch_managed": {
+      const run = fixtureRuns.get(input.id);
+      if (!run) throw {code:"not_found", message:"Fixture has no such attempt"};
+      Object.assign(run, { state: "running", revision: run.revision + 1, session_id: "managed-session", provider_state: "running", provider_thread_id: "managed-thread", provider_turn_id: "managed-turn", effective_configuration: JSON.stringify({sandbox: {type: "readOnly"}, approvalPolicy: "on-request"}), output: "", output_truncated: false });
+      return JSON.stringify({ok: true, item: run});
     }
     case "workspaces.list": return JSON.stringify(page(workspaces));
     case "workspaces.get": return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
@@ -1537,6 +1552,39 @@ if (params.has("check")) {
       button("Launch in Codex", sheet()).disabled === (sheet().querySelector(".gate").textContent.trim() !== launchHint));
     sheet().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
     check("Escape closes the handoff without preparing a run", !sheet() && preparedRuns.length === 0);
+    // A launch that succeeds closes the sheet from inside the form's launch:
+    // `onLaunched` nulls the board's handoff while `launch()` is still on the
+    // stack, and the component is not destroyed until the next flush. A read
+    // of a prop after that callback dereferenced the null handoff and crashed
+    // the Tasks pane after every successful board launch.
+    acceptPreparation = true;
+    const crashesBeforeLaunch = crashes.length;
+    await openMenu("task-11"); button("Send to agent…", menu()).click(); await settle();
+    [...menu().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Codex")).click(); await settle(250);
+    [...sheet().querySelectorAll('[role="group"][aria-label="Connection"] button')].find(el => el.textContent.trim() === "Managed")?.click(); await settle();
+    const startManaged = button("Start managed Codex", sheet());
+    check(`the sheet offers a managed start once the gate is open (${sheet()?.querySelector(".gate")?.textContent.trim()})`, Boolean(startManaged) && !startManaged.disabled);
+    startManaged.click();
+    try { await wait(() => !sheet() || crashes.length > crashesBeforeLaunch); }
+    catch { throw Error(`the launch neither closed the sheet nor crashed: ${sheet()?.textContent.trim().slice(-500)} / prepared=${preparedRuns.length}`); }
+    await settle(100);
+    check(`a successful launch closes the sheet without crashing the board (${crashes.slice(crashesBeforeLaunch).join(" | ")})`,
+      !sheet() && crashes.length === crashesBeforeLaunch && preparedRuns.length === 1 && fixtureRuns.size === 1
+      && [...fixtureRuns.values()][0].state === "running");
+    // Again, pressed twice in one tick — the button and ⌘↩
+    // reach the same `launch()`. One attempt, one close, and still no crash.
+    await openMenu("task-11"); button("Send to agent…", menu()).click(); await settle();
+    [...menu().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Codex")).click(); await settle(250);
+    [...sheet().querySelectorAll('[role="group"][aria-label="Connection"] button')].find(el => el.textContent.trim() === "Managed")?.click(); await settle();
+    button("Start managed Codex", sheet()).click();
+    sheet().dispatchEvent(new KeyboardEvent("keydown", {key: "Enter", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true}));
+    try { await wait(() => !sheet() || crashes.length > crashesBeforeLaunch); }
+    catch { throw Error(`the second launch neither closed the sheet nor crashed: ${sheet()?.textContent.trim().slice(-500)}`); }
+    await settle(100);
+    check(`a second launch, pressed twice at once, prepares one attempt and closes cleanly (${crashes.slice(crashesBeforeLaunch).join(" | ")})`,
+      !sheet() && crashes.length === crashesBeforeLaunch && preparedRuns.length === 2 && fixtureRuns.size === 2
+      && preparedRuns[1].task_id === "task-11" && preparedRuns[1].id !== preparedRuns[0].id);
+    acceptPreparation = false;
 
 
     // ---- Which model writes the text ------------------------------------

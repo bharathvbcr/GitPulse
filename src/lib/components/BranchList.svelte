@@ -1346,7 +1346,7 @@
         {pinnedNames.has(b.name) ? "Unpin branch" : "Pin branch"}
       </button>
       {#if !b.is_current}
-        <button role="menuitem" class="gp-menu-item" onclick={() => { closeMenu(); checkoutName(localNameFor(b)); }}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = localNameFor(b); closeMenu(); checkoutName(name); }}>
           <GitBranch size={12} /> Checkout
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, false)}>
@@ -1363,10 +1363,10 @@
         <button role="menuitem" class="gp-menu-item" onclick={() => void runRename(b)}>
           <Pencil size={12} /> Rename…
         </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => { closeMenu(); void repoStore.push(undefined, b.name); }}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = b.name; closeMenu(); void repoStore.push(undefined, name); }}>
           <Upload size={12} /> Push
         </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => { closeMenu(); void repoStore.pull(undefined, b.name); }}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => { const name = b.name; closeMenu(); void repoStore.pull(undefined, name); }}>
           <Download size={12} /> Pull
         </button>
         {#if !b.is_current}
@@ -1389,7 +1389,7 @@
       {/if}
     {:else if menu.tag}
       {@const t = menu.tag}
-      <button role="menuitem" class="gp-menu-item" onclick={() => { closeMenu(); checkoutName(t.name); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); checkoutName(name); }}>
         <GitBranch size={12} /> Checkout
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); selectRef(name); }}>

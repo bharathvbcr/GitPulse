@@ -571,9 +571,13 @@ export function classifyCoverageFailure(
   if (GO_MISSING_MODULE.test(output)) {
     return { kind: "go_missing_module" };
   }
+  // Absence only. The host marks a spawn the OS refused because nothing was
+  // there (`: no such program:`); every other "Failed to spawn" — too many
+  // open files, an argument list too long, a busy fork — is a machine that
+  // could not start a program, and "install it" is the wrong advice.
   if (
     /No such file or directory \(os error 2\)/i.test(output) ||
-    /Failed to spawn \S+/i.test(output)
+    /Failed to spawn \S+: no such program:/i.test(output)
   ) {
     return { kind: "generator_missing" };
   }

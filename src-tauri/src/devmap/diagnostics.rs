@@ -46,6 +46,12 @@ pub(super) struct CommandLog {
     lines: usize,
     stages: usize,
     oversized: bool,
+    /// The run was asked for `--json`. Only then is stdout a report whose
+    /// fields belong in the log, and only then is unparseable stdout a fault:
+    /// `serve --print-socket-path` prints a bare path by contract, and logging
+    /// "expected value at line 1 column 1" beside `"ok":true` put an error
+    /// into every diagnostics report that was not one.
+    expects_json: bool,
 }
 
 impl CommandLog {
@@ -76,6 +82,7 @@ impl CommandLog {
             lines: 0,
             stages: 0,
             oversized: false,
+            expects_json: args.iter().any(|arg| arg == "--json"),
         };
         log.record(json!({"event": "started", "repository": repo.to_string_lossy(), "repository_path_lossy": repo.to_str().is_none(), "binary": binary.path,
             "lookup": binary.lookup, "args": args, "deadline_ms": deadline.as_millis()}));
@@ -154,8 +161,12 @@ impl CommandLog {
                 // The complete captured stderr is redacted before the existing
                 // logger bounds it. It preserves errors after sampled progress.
                 event["stderr"] = json!(String::from_utf8_lossy(&run.stderr));
-                match serde_json::from_slice::<Value>(&run.stdout) {
-                    Ok(report) => {
+                match self
+                    .expects_json
+                    .then(|| serde_json::from_slice::<Value>(&run.stdout))
+                {
+                    None => {}
+                    Some(Ok(report)) => {
                         for key in [
                             "error",
                             "diagnostic_context",
@@ -171,7 +182,7 @@ impl CommandLog {
                             }
                         }
                     }
-                    Err(error) => event["json_error"] = json!(error.to_string()),
+                    Some(Err(error)) => event["json_error"] = json!(error.to_string()),
                 }
             }
             Err(error) => {
@@ -266,6 +277,55 @@ mod tests {
         assert!(text.contains("\"stage\":2"));
         assert!(text.contains("\"ok\":false"));
         assert!(!text.contains("PRIVATE_QUERY_OUTPUT"));
+    }
+
+    fn finished(args: &[&str], stdout: &[u8]) -> String {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let log = CommandLog::start(
+            &ResolvedDevmap {
+                path: "/diagnostics/devmap".into(),
+                lookup: DevmapLookup::PathSearch,
+            },
+            Path::new("/diagnostics/repo"),
+            &args,
+            Duration::from_secs(5),
+        );
+        let id = log.id.clone();
+        log.finish(
+            &Ok(BoundedRun {
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+                success: true,
+                status_code: 0,
+                incomplete: None,
+                stderr_incomplete: None,
+                cancelled: false,
+            }),
+            None,
+        );
+        entries(&id)
+    }
+
+    /// `serve --print-socket-path` answers with a path, not a report. Parsing
+    /// it as JSON logged a parse error on every successful run, so each
+    /// diagnostics report carried an error that was not one.
+    #[test]
+    fn plain_text_output_is_not_logged_as_a_json_failure() {
+        let text = finished(
+            &["serve", "--print-socket-path", "--root", "/repo"],
+            b"/tmp/devmap-1a2b.sock\n",
+        );
+        assert!(text.contains("\"ok\":true"), "{text}");
+        assert!(!text.contains("json_error"), "{text}");
+
+        // Where a report was asked for, unparseable output still says so.
+        let text = finished(&["status", "--json"], b"not json\n");
+        assert!(text.contains("json_error"), "{text}");
+        let text = finished(&["status", "--json"], br#"{"generation_id":7}"#);
+        assert!(
+            text.contains("\"generation_id\":7") && !text.contains("json_error"),
+            "{text}"
+        );
     }
 
     #[test]
