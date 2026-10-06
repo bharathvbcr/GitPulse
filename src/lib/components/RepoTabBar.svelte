@@ -2,8 +2,7 @@
   import { onMount, untrack } from "svelte";
   import { repoStore, type OpenRepoTab } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
-  import { dropReorderIndex } from "../repos/tabModel";
+  import { isCaseInsensitiveFs, displayName, identityKey, isPathAmong } from "../repos/paths";
   import { portal } from "../dom/portal";
   import { isTauri } from "../platform";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -22,6 +21,7 @@
     Folder,
     FolderGit2,
     FolderOpen,
+    Layers,
     LayoutGrid,
     ListChecks,
     SquareTerminal,
@@ -31,7 +31,12 @@
     computeTabLayout,
     normalizeGroupName,
     type GroupHeaderItem,
+    type StackHeaderItem,
+    type TabItem,
   } from "../repos/tabGroups";
+  import { planDrop, unitForTab, unitIds, type StripUnit } from "../repos/stripNav";
+  import { checkoutName } from "../repos/repoFamily";
+  import { expandedStacks, lastUsedCheckouts, setStackExpanded } from "../repos/stackState";
   import {
     lookupGroupColor,
     normalizeTabColor,
@@ -73,34 +78,75 @@
   let stripMenu = $state<{ x: number; y: number } | null>(null);
   let stripMenuEl: HTMLDivElement | undefined = $state();
   let stripMenuOpener: HTMLElement | null = null;
+  let stackMenu = $state<{ x: number; y: number; key: string } | null>(null);
+  let stackMenuEl: HTMLDivElement | undefined = $state();
+  let stackMenuOpener: HTMLElement | null = null;
   let recentsOpen = $state(false);
   let recentsTriggerEl: HTMLButtonElement | undefined = $state();
   let recentsEl: HTMLDivElement | undefined = $state();
-  let dragFromId = $state<string | null>(null);
+  // What is being dragged: a tab, or a folded worktree stack with every
+  // checkout in it.
+  let dragFrom = $state<StripUnit | null>(null);
   let dragHoverGroup = $state<string | null>(null);
   let dragHoverGroupTimer: ReturnType<typeof setTimeout> | null = null;
-  // Where a dragged tab would land. `before` picks the left/right half of the
-  // hovered tab; null means "no useful insertion point" and hides the bar.
-  let dropTarget = $state<{ index: number; before: boolean } | null>(null);
+  // Where a dragged unit would land. `before` picks the left/right half of the
+  // hovered unit; null means "no allowed insertion point" and hides the bar.
+  let dropTarget = $state<{ unit: string; before: boolean } | null>(null);
   let scroller: HTMLDivElement | undefined = $state();
   let moveAnnouncement = $state("");
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
+  const identity = (path: string) => identityKey(path, pathOpts);
   const hideTabStrip = $derived(
     $interfaceStore.autoHideRepoTabs && $repoStore.openTabs.length <= 1,
   );
 
+  /**
+   * The strip as drawn. Every move, drop and shortcut reads this one value,
+   * so what the reader sees and what an action does cannot disagree.
+   */
   const tabLayout = $derived(
     computeTabLayout(
       $repoStore.openTabs,
       $repoStore.collapsedGroups,
       terminalCounts,
       $repoStore.groupColors,
+      {
+        enabled: $interfaceStore.stackWorktreeTabs,
+        expanded: $expandedStacks,
+        lastUsed: lastUsedCheckouts(),
+        identity,
+      },
     ),
   );
 
   const groupHeadersByName = $derived(
     new Map(tabLayout.groups.map((g) => [g.group, g])),
   );
+
+  const stackHeadersByKey = $derived(
+    new Map(tabLayout.stacks.map((s) => [s.key, s])),
+  );
+
+  function unitKey(unit: StripUnit): string {
+    return unit.kind === "tab" ? `tab:${unit.id}` : `stack:${unit.key}`;
+  }
+
+  function stackMembers(info: StackHeaderItem): OpenRepoTab[] {
+    const byId = new Map($repoStore.openTabs.map((tab) => [tab.id, tab]));
+    return info.tabIds.map((id) => byId.get(id)).filter((tab): tab is OpenRepoTab => tab !== undefined);
+  }
+
+  function memberOf(info: StackHeaderItem, tab: OpenRepoTab) {
+    return checkoutName(tab.path, tab.label, info.root, identity);
+  }
+
+  function stackAriaLabel(info: StackHeaderItem): string {
+    const member = memberOf(info, info.current);
+    const where = member.primary ? "primary checkout" : `worktree ${member.name}`;
+    const branch = info.current.currentBranch ? ` on ${info.current.currentBranch}` : "";
+    const changes = info.isDirty ? ", uncommitted changes" : "";
+    return `${info.label}, ${where}${branch}, ${info.tabCount} checkouts${changes}`;
+  }
 
   const collapsedGroupSet = $derived(
     new Set($repoStore.collapsedGroups),
@@ -120,23 +166,9 @@
     $repoStore.openTabs.filter((t) => !normalizeGroupName(t.group)),
   );
 
-  function isFirstInGroup(tab: { group?: string | null }, index: number): boolean {
-    const group = normalizeGroupName(tab.group);
-    if (!group) return false;
-    const firstIndex = $repoStore.openTabs.findIndex(
-      (t) => normalizeGroupName(t.group) === group,
-    );
-    return index === firstIndex;
-  }
-
   function isTabInCollapsedGroup(tab: { group?: string | null }): boolean {
     const group = normalizeGroupName(tab.group);
     return group !== null && collapsedGroupSet.has(group);
-  }
-
-  function getGroupInfo(rawGroup: string | null | undefined): GroupHeaderItem | undefined {
-    const group = normalizeGroupName(rawGroup);
-    return group ? groupHeadersByName.get(group) : undefined;
   }
 
   function inheritedColorNote(group: string | null | undefined): string | null {
@@ -190,17 +222,61 @@
     }
   }
 
+  /** The control that opened whichever popup is showing, for focus to return to. */
+  function currentOpener(): HTMLElement | null {
+    if (menu) return menuOpener;
+    if (recentsOpen) return recentsTriggerEl ?? null;
+    if (groupMenu) return groupMenuOpener;
+    if (stackMenu) return stackMenuOpener;
+    if (stripMenu) return stripMenuOpener;
+    return null;
+  }
+
   function closeMenu(options?: { restoreFocus?: boolean }) {
-    const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl : groupMenu ? groupMenuOpener : stripMenu ? stripMenuOpener : null;
+    const opener = currentOpener();
     menu = null;
     recentsOpen = false;
     groupMenu = null;
+    stackMenu = null;
     stripMenu = null;
     menuOpener = null;
     groupMenuOpener = null;
+    stackMenuOpener = null;
     stripMenuOpener = null;
     if (options?.restoreFocus && opener?.isConnected) {
       window.setTimeout(() => opener.focus(), 0);
+    }
+  }
+
+  function openStackMenu(e: MouseEvent, info: StackHeaderItem) {
+    e.preventDefault();
+    e.stopPropagation();
+    const trigger = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
+    // A click on the switcher anchors under it; a right-click opens at the pointer.
+    const box = e.type === "click" ? trigger?.getBoundingClientRect() : null;
+    const wasOpen = stackMenu?.key === info.key;
+    closeMenu();
+    if (wasOpen && e.type === "click") return;
+    stackMenuOpener =
+      trigger?.closest<HTMLElement>("[data-stack-shell]")?.querySelector<HTMLElement>("[data-stack-head]") ?? trigger;
+    stackMenu = box
+      ? { x: box.left, y: box.bottom + 4, key: info.key }
+      : { x: e.clientX, y: e.clientY, key: info.key };
+  }
+
+  async function confirmCloseCheckouts(info: StackHeaderItem, keepId: string | null) {
+    const ids = info.tabIds.filter((id) => id !== keepId);
+    closeMenu();
+    if (ids.length === 0) return;
+    const confirmed = await askConfirm({
+      title: keepId ? `Close other checkouts of ${info.label}` : `Close every checkout of ${info.label}`,
+      message: `Close ${ids.length} ${info.label} ${ids.length === 1 ? "tab" : "tabs"}? The worktrees stay on disk; only the tabs close.`,
+      confirmLabel: keepId ? "Close others" : "Close all",
+      destructive: true,
+    });
+    if (!confirmed) return;
+    for (const id of ids) {
+      await repoStore.closeTab(id);
     }
   }
 
@@ -306,6 +382,14 @@
     }
   });
 
+  // A stack stops being one when it drops to a single checkout; its switcher
+  // must not outlive it pointing at tabs that are now drawn on their own.
+  $effect(() => {
+    if (stackMenu && !stackHeadersByKey.has(stackMenu.key)) {
+      untrack(() => { stackMenu = null; });
+    }
+  });
+
   function onContext(e: MouseEvent, id: string) {
     e.preventDefault();
     menuOpener = e.currentTarget instanceof HTMLElement
@@ -314,6 +398,7 @@
     menu = { x: e.clientX, y: e.clientY, id };
     recentsOpen = false;
     groupMenu = null;
+    stackMenu = null;
     stripMenu = null;
   }
 
@@ -322,6 +407,7 @@
     groupMenuOpener = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
     groupMenu = { x: e.clientX, y: e.clientY, group };
     menu = null;
+    stackMenu = null;
     stripMenu = null;
     recentsOpen = false;
   }
@@ -329,7 +415,10 @@
   function onStripContext(e: MouseEvent) {
     if (
       e.target instanceof Element &&
-      (e.target.closest("[data-tab-id]") || e.target.closest("[data-group-header]") || e.target.closest("button"))
+      (e.target.closest("[data-tab-id]") ||
+        e.target.closest("[data-group-header]") ||
+        e.target.closest("[data-stack-shell]") ||
+        e.target.closest("button"))
     ) {
       return;
     }
@@ -338,6 +427,7 @@
     stripMenu = { x: e.clientX, y: e.clientY };
     menu = null;
     groupMenu = null;
+    stackMenu = null;
     recentsOpen = false;
   }
 
@@ -359,6 +449,14 @@
     revision: menu?.id,
     dismiss: { inside: "[data-repo-menu]", resize: true, escape: "none" as const },
     onDismiss: () => closeMenu(),
+  });
+
+  const stackMenuDismissal = $derived({
+    anchor: { kind: "point" as const, x: stackMenu?.x ?? 0, y: stackMenu?.y ?? 0 },
+    estimate: { width: 288, height: 240 },
+    revision: stackMenu ? `${stackMenu.key}@${stackMenu.x},${stackMenu.y}` : undefined,
+    dismiss: { inside: "[data-stack-menu], [data-stack-switch]", resize: true, escape: "none" as const },
+    onDismiss: () => { stackMenu = null; stackMenuOpener = null; },
   });
 
   const stripMenuDismissal = $derived({
@@ -426,13 +524,16 @@
     if (stripMenu && stripMenuEl) focusPopup(stripMenuEl);
   });
 
+  $effect(() => {
+    if (stackMenu && stackMenuEl) focusPopup(stackMenuEl);
+  });
+
   function handlePopupKeydown(e: KeyboardEvent) {
     if (e.key === "Tab") {
       e.preventDefault();
       const popup = e.currentTarget;
       if (popup instanceof HTMLElement) {
-        const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl ?? null : groupMenu ? groupMenuOpener : stripMenu ? stripMenuOpener : null;
-        focusAdjacentToMenuOpener(popup, opener, e.shiftKey);
+        focusAdjacentToMenuOpener(popup, currentOpener(), e.shiftKey);
       }
       closeMenu();
       return;
@@ -468,7 +569,7 @@
     if (isImeComposition(e)) return;
     // Escape closes any open tab menu, regardless of where focus sits —
     // same window-listener pattern as ViewTabBar.
-    if (e.key === "Escape" && (menu || recentsOpen || groupMenu || stripMenu)) {
+    if (e.key === "Escape" && (menu || recentsOpen || groupMenu || stackMenu || stripMenu)) {
       e.preventDefault();
       closeMenu({ restoreFocus: true });
       return;
@@ -518,14 +619,14 @@
       dragHoverGroupTimer = null;
     }
     dragHoverGroup = null;
-    dragFromId = null;
+    dragFrom = null;
     dropTarget = null;
   }
 
   function onGroupDragOver(e: DragEvent, group: string, isCollapsed: boolean) {
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    if (dragFromId === null) return;
+    if (dragFrom === null) return;
     if (isCollapsed) {
       if (dragHoverGroup !== group) {
         if (dragHoverGroupTimer) clearTimeout(dragHoverGroupTimer);
@@ -550,11 +651,12 @@
   function onGroupDrop(e: DragEvent, group: string) {
     e.preventDefault();
     e.stopPropagation();
-    if (dragFromId !== null) {
-      const id = dragFromId;
-      repoStore.setTabGroup(id, group);
+    if (dragFrom !== null) {
+      // A folded stack carries every checkout in it into the group.
+      const ids = unitIds(tabLayout, dragFrom);
+      for (const id of ids) repoStore.setTabGroup(id, group);
       repoStore.setGroupCollapsed(group, false);
-      announceMove(id);
+      if (ids[0]) announceMove(ids[0]);
     }
     endDrag();
   }
@@ -588,28 +690,37 @@
     match?.focus();
   }
 
+  /**
+   * Position among the strip's stops — what the reader counts on screen. A
+   * folded stack is one stop, so "position 3 of 4" matches the picture.
+   */
   function announceMove(id: string) {
-    const tabs = $repoStore.openTabs;
-    const index = tabs.findIndex((tab) => tab.id === id);
-    const tab = index >= 0 ? tabs[index] : undefined;
+    const tab = $repoStore.openTabs.find((item) => item.id === id);
     if (!tab) return;
-    moveAnnouncement = `Moved ${tab.label} to position ${index + 1} of ${tabs.length}`;
+    const unit = unitForTab(tabLayout, id);
+    const stops = tabLayout.visibleItems.filter((item) => item.kind !== "group-header");
+    const index = stops.findIndex((item) =>
+      unit?.kind === "stack" ? item.kind === "stack-header" && item.key === unit.key : item.id === id,
+    );
+    const name = unit?.kind === "stack" ? stackHeadersByKey.get(unit.key)?.label ?? tab.label : tab.label;
+    moveAnnouncement = index >= 0
+      ? `Moved ${name} to position ${index + 1} of ${stops.length}`
+      : `Moved ${name}`;
   }
 
-  function moveFocusedTabTo(id: string, toIndex: number) {
-    const before = $repoStore.openTabs.map((tab) => tab.id).join("\0");
-    repoStore.moveTab(id, toIndex);
-    if (before === $repoStore.openTabs.map((tab) => tab.id).join("\0")) return;
+  /** After a move the store applied: say where it landed and keep focus on it. */
+  function afterMove(moved: boolean, id: string) {
+    if (!moved) return;
     announceMove(id);
     window.setTimeout(() => focusTabById(id), 0);
+  }
+
+  function moveFocusedTabTo(id: string, edge: "start" | "end") {
+    afterMove(repoStore.moveTabToEdge(id, edge), id);
   }
 
   function moveFocusedTabBy(id: string, delta: number) {
-    const before = $repoStore.openTabs.map((tab) => tab.id).join("\0");
-    repoStore.moveTabBy(id, delta);
-    if (before === $repoStore.openTabs.map((tab) => tab.id).join("\0")) return;
-    announceMove(id);
-    window.setTimeout(() => focusTabById(id), 0);
+    afterMove(repoStore.moveTabBy(id, delta), id);
   }
 
   function tabIdUnderFocus(): string | null {
@@ -617,6 +728,48 @@
     const shell = focused instanceof Element ? focused.closest("[data-tab-id]") : null;
     if (shell instanceof HTMLElement && shell.dataset.tabId) return shell.dataset.tabId;
     return $repoStore.openTabs.find((tab) => tab.isActive)?.id ?? null;
+  }
+
+  function setExpanded(info: StackHeaderItem, open: boolean) {
+    setStackExpanded(info.key, open);
+    const focusId = info.current.id;
+    window.setTimeout(() => {
+      const head = scroller?.querySelector<HTMLElement>(`[data-stack-head="${CSS.escape(info.key)}"]`);
+      (open ? scroller?.querySelector<HTMLElement>(`[role="tab"][data-tab-id="${CSS.escape(focusId)}"]`) : head)?.focus();
+    }, 0);
+  }
+
+  /**
+   * A folded stack's header is a tab: Enter/Space activate the checkout it
+   * shows (the button's own click), ArrowDown opens the switcher, and the
+   * plus/minus keys unfold or fold it — the group head's ArrowLeft/Right are
+   * already the tablist's roving keys here.
+   */
+  function onStackKeydown(e: KeyboardEvent, info: StackHeaderItem) {
+    // Alt+Enter is the one chorded key here. Anything else held down belongs
+    // to someone else — Cmd+= / Cmd+- are the zoom accelerators.
+    const bare = !e.metaKey && !e.ctrlKey && !e.altKey;
+    if ((bare && e.key === "ArrowDown") || (e.key === "Enter" && e.altKey && !e.metaKey && !e.ctrlKey)) {
+      e.preventDefault();
+      const trigger = (e.currentTarget as HTMLElement | null)
+        ?.closest<HTMLElement>("[data-stack-shell]")
+        ?.querySelector<HTMLElement>("[data-stack-switch]");
+      const box = trigger?.getBoundingClientRect();
+      closeMenu();
+      stackMenuOpener = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
+      stackMenu = { x: box?.left ?? 0, y: (box?.bottom ?? 0) + 4, key: info.key };
+      return;
+    }
+    if (!bare) return;
+    if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      setExpanded(info, true);
+      return;
+    }
+    if (e.key === "-" && info.isExpanded) {
+      e.preventDefault();
+      setExpanded(info, false);
+    }
   }
 
   /**
@@ -641,7 +794,7 @@
     if (e.ctrlKey || e.altKey || e.metaKey) return;
     const key = e.key as RovingKey;
     if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Home" && key !== "End") return;
-    const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index], [data-group-head]") ?? [];
+    const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index], [data-group-head], [data-stack-head]") ?? [];
     if (tabs.length === 0) return;
     const current = Array.from(tabs).findIndex((el) => el === document.activeElement);
     const next = nextRovingIndex(current, tabs.length, key);
@@ -653,7 +806,7 @@
   async function closeTabFromKeyboard(id: string, index: number) {
     await repoStore.closeTab(id);
     window.setTimeout(() => {
-      const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index]") ?? [];
+      const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index], [data-stack-head][role='tab']") ?? [];
       (tabs[Math.min(index, tabs.length - 1)] ?? scroller)?.focus();
     }, 0);
   }
@@ -694,16 +847,18 @@
 
   /**
    * Container-level dragover: one handler computes the insertion point for
-   * whatever tab (or gap) is under the pointer, so the indicator can't go
-   * stale between child elements. Adjacent-to-self positions are no-op moves
-   * and show nothing.
+   * whatever unit (or gap) is under the pointer, so the indicator can't go
+   * stale between child elements. The bar is drawn only where `planDrop`
+   * says the drop would do something allowed — the indicator and the drop
+   * ask the same function.
    */
-  function onTabDragStart(e: DragEvent, id: string) {
-    if (e.target instanceof Element && e.target.closest("[data-tab-close]")) {
+  function onUnitDragStart(e: DragEvent, unit: StripUnit) {
+    if (e.target instanceof Element && e.target.closest("[data-tab-close], [data-stack-switch]")) {
       e.preventDefault();
       return;
     }
-    dragFromId = id;
+    dragFrom = unit;
+    const id = unit.kind === "tab" ? unit.id : unitIds(tabLayout, unit)[0] ?? "";
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", id);
@@ -711,41 +866,39 @@
     }
   }
 
+  function unitAt(target: EventTarget | null): { unit: StripUnit; el: HTMLElement } | null {
+    const el = target instanceof Element ? target.closest<HTMLElement>("[data-drop-unit]") : null;
+    if (!el) return null;
+    if (el.dataset.dropStack) return { unit: { kind: "stack", key: el.dataset.dropStack }, el };
+    if (el.dataset.tabId) return { unit: { kind: "tab", id: el.dataset.tabId }, el };
+    return null;
+  }
+
+  function planAt(e: DragEvent) {
+    if (dragFrom === null) return null;
+    const hit = unitAt(e.target);
+    if (!hit) return null;
+    const rect = hit.el.getBoundingClientRect();
+    const before = e.clientX < rect.left + rect.width / 2;
+    const plan = planDrop(tabLayout, dragFrom, hit.unit, before);
+    return plan ? { plan, unit: hit.unit, before } : null;
+  }
+
   function onScrollerDragOver(e: DragEvent) {
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    if (dragFromId === null) return;
-    const fromIndex = $repoStore.openTabs.findIndex((tab) => tab.id === dragFromId);
-    const tabEl = e.target instanceof Element ? e.target.closest("[data-tab-shell-index]") : null;
-    if (!(tabEl instanceof HTMLElement) || tabEl.dataset.tabShellIndex === undefined) {
-      dropTarget = null;
-      return;
-    }
-    const index = Number(tabEl.dataset.tabShellIndex);
-    if (!Number.isInteger(index) || fromIndex < 0) {
-      dropTarget = null;
-      return;
-    }
-    const rect = tabEl.getBoundingClientRect();
-    const before = e.clientX < rect.left + rect.width / 2;
-    if (dropReorderIndex(fromIndex, index, before) === null) {
-      dropTarget = null;
-      return;
-    }
-    dropTarget = { index, before };
+    const found = planAt(e);
+    dropTarget = found ? { unit: unitKey(found.unit), before: found.before } : null;
   }
 
   function onScrollerDrop(e: DragEvent) {
     e.preventDefault();
-    if (dragFromId !== null && dropTarget) {
-      const fromIndex = $repoStore.openTabs.findIndex((tab) => tab.id === dragFromId);
-      const { index, before } = dropTarget;
-      const adjusted = dropReorderIndex(fromIndex, index, before);
-      if (adjusted !== null) {
-        const id = dragFromId;
-        repoStore.moveTab(id, adjusted);
-        announceMove(id);
-      }
+    const found = planAt(e);
+    const source = dragFrom;
+    if (found && source) {
+      const ids = unitIds(tabLayout, source);
+      const regroup = found.plan.group !== undefined ? { ids, group: found.plan.group } : undefined;
+      if (repoStore.arrangeTabs(found.plan.order, regroup) && ids[0]) announceMove(ids[0]);
     }
     endDrag();
   }
@@ -835,6 +988,257 @@
   {/if}
 {/snippet}
 
+{#snippet repoTab(item: TabItem)}
+  {@const tab = item.tab}
+  {@const index = item.index}
+  {@const colorInfo = tabColorInfo(tab)}
+  {@const dropHere = dropTarget?.unit === `tab:${tab.id}`}
+  <div
+    role="presentation"
+    data-tab-id={tab.id}
+    data-tab-shell-index={index}
+    data-drop-unit
+    data-stack-member={item.stack ?? undefined}
+    data-tab-color={colorInfo.color ?? undefined}
+    data-tab-color-source={colorInfo.source ?? undefined}
+    title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}${colorInfo.color ? `\n${colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group`}` : ""}`}
+    draggable="true"
+    onauxclick={(e) => {
+      if (e.button === 1) {
+        e.preventDefault();
+        void repoStore.closeTab(tab.id);
+      }
+    }}
+    oncontextmenu={(e) => onContext(e, tab.id)}
+    ondragstart={(e) => onUnitDragStart(e, { kind: "tab", id: tab.id })}
+    ondragend={endDrag}
+    class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFrom?.kind === 'tab' && dragFrom.id === tab.id
+      ? 'opacity-60'
+      : ''} {dropHere ? 'border-accent/50' : ''} {repoTabChrome(tab)}"
+  >
+    {#if dropHere && dropTarget}
+      <span
+        aria-hidden="true"
+        class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
+          ? 'left-[-3px]'
+          : 'right-[-3px]'}"
+      ></span>
+    {/if}
+    {#if colorInfo.color}
+      <span
+        aria-hidden="true"
+        class="ml-1.5 w-[3px] self-stretch my-1.5 rounded-full shrink-0"
+        style:background-color={TAB_COLOR_INK[colorInfo.color]}
+      ></span>
+    {/if}
+    <button
+    type="button"
+    role="tab"
+      tabindex={tab.isActive ? 0 : -1}
+      aria-selected={tab.isActive}
+      aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"
+      data-active-repo={tab.isActive ? "true" : "false"}
+      data-tab-index={index}
+      data-tab-id={tab.id}
+      onclick={() => selectRepoTab(tab.id)}
+      onkeydown={(e) => {
+        if (e.key === "p" || e.key === "P") {
+          e.preventDefault();
+          repoStore.pinTab(tab.id, !tab.pinned);
+        } else if (e.key === "Delete") {
+          e.preventDefault();
+          void closeTabFromKeyboard(tab.id, index);
+        }
+      }}
+      ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
+      class="h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+    >
+      {#if tab.pinned}
+        <Pin size={10} class="text-accent shrink-0" />
+      {:else}
+        <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
+      {/if}
+      <span class="whitespace-nowrap font-medium">{tab.label}</span>
+      {#if colorInfo.color}
+        <span class="sr-only">{colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group color`}</span>
+      {/if}
+      {#if tab.currentBranch}
+        <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
+      {/if}
+      {#if tab.conflictedCount > 0}
+        <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
+      {/if}
+      {#if terminalCounts.get(tab.path)}
+        <!-- Not a button: the tab itself is the way in, and a second
+             click target inside a tab is how a close gets mis-hit. -->
+        <span
+          class="shrink-0 inline-flex items-center gap-0.5 text-accent"
+          title={terminalCounts.get(tab.path) === 1
+            ? `1 terminal session running in ${tab.label}`
+            : `${terminalCounts.get(tab.path)} terminal sessions running in ${tab.label}`}
+        >
+          <SquareTerminal size={10} aria-hidden="true" />
+          {#if (terminalCounts.get(tab.path) ?? 0) > 1}
+            <span class="text-[9px] font-medium tabular-nums">{terminalCounts.get(tab.path)}</span>
+          {/if}
+          <!-- `title` on a non-focusable span is not reliably
+               announced; the tab's accessible name carries it. -->
+          <span class="sr-only">{terminalCounts.get(tab.path)} terminal sessions running</span>
+        </span>
+      {/if}
+    </button>
+    {#if tab.isDirty}
+      <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
+        title="Preview uncommitted changes in {tab.label}" aria-label="Preview uncommitted changes in {tab.label}"
+        onclick={() => void repoStore.previewUncommitted(tab.path)}>
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
+      </button>
+    {/if}
+    <button
+      type="button"
+      tabindex="-1"
+      data-tab-close
+      title="Close"
+      aria-label={`Close ${tab.label}`}
+      onclick={(e) => {
+        e.stopPropagation();
+        void repoStore.closeTab(tab.id);
+      }}
+      class="ml-auto p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background hover:text-rose-400 {tab.isActive ? 'opacity-100' : ''}"
+    >
+      <X size={11} />
+    </button>
+  </div>
+{/snippet}
+
+{#snippet stackHead(info: StackHeaderItem)}
+  {@const current = info.current}
+  {@const member = memberOf(info, current)}
+  {@const colorInfo = tabColorInfo(current)}
+  {@const dropHere = dropTarget?.unit === `stack:${info.key}`}
+  {@const switcherOpen = stackMenu?.key === info.key}
+  <!-- One header for every checkout of a repository. Folded, it is a tab for
+       the checkout it shows plus a switcher for the rest; unfolded, it is a
+       label in front of the checkouts' own tabs. -->
+  <div
+    role="presentation"
+    data-stack-shell={info.key}
+    data-drop-unit
+    data-drop-stack={info.key}
+    data-stack-expanded={info.isExpanded ? "true" : "false"}
+    data-tab-color={!info.isExpanded ? colorInfo.color ?? undefined : undefined}
+    title={`${info.label} — ${info.tabCount} checkouts of ${info.root}\nShowing ${member.primary ? "the primary checkout" : member.name}${current.currentBranch ? ` on ${current.currentBranch}` : ""}\nDrag to move them together · ↓ for the switcher · + to show each as a tab`}
+    draggable="true"
+    ondragstart={(e) => onUnitDragStart(e, { kind: "stack", key: info.key })}
+    ondragend={endDrag}
+    oncontextmenu={(e) => openStackMenu(e, info)}
+    class="group relative flex items-center shrink-0 rounded-full border cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {info.isExpanded
+      ? groupChrome(info)
+      : repoTabChrome({ isActive: info.hasActiveTab })} {dragFrom?.kind === 'stack' && dragFrom.key === info.key
+      ? 'opacity-60'
+      : ''} {dropHere ? 'border-accent/50' : ''}"
+  >
+    {#if dropHere && dropTarget}
+      <span
+        aria-hidden="true"
+        class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
+          ? 'left-[-3px]'
+          : 'right-[-3px]'}"
+      ></span>
+    {/if}
+    {#if info.isExpanded}
+      <button
+        type="button"
+        class="h-7 pl-2 pr-2.5 flex items-center gap-1.5 rounded-full text-[11px] font-medium focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+        aria-expanded="true"
+        aria-label={`${info.label}, ${info.tabCount} checkouts shown as tabs. Fold them into one tab`}
+        data-stack-head={info.key}
+        tabindex="-1"
+        onclick={() => setExpanded(info, false)}
+        onkeydown={(e) => onStackKeydown(e, info)}
+      >
+        <ChevronDown size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary" />
+        <Layers size={11} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
+        <span class="whitespace-nowrap">{info.label}</span>
+        <span class="text-[10px] tabular-nums font-mono opacity-70">({info.tabCount})</span>
+      </button>
+    {:else}
+      {#if colorInfo.color}
+        <span
+          aria-hidden="true"
+          class="ml-1.5 w-[3px] self-stretch my-1.5 rounded-full shrink-0"
+          style:background-color={TAB_COLOR_INK[colorInfo.color]}
+        ></span>
+      {/if}
+      <button
+        type="button"
+        role="tab"
+        tabindex={info.hasActiveTab ? 0 : -1}
+        aria-selected={info.hasActiveTab}
+        aria-label={stackAriaLabel(info)}
+        aria-keyshortcuts="Enter ArrowDown + Control+Shift+ArrowLeft Control+Shift+ArrowRight"
+        data-stack-head={info.key}
+        data-tab-id={current.id}
+        data-active-repo={info.hasActiveTab ? "true" : "false"}
+        onclick={() => selectRepoTab(current.id)}
+        onkeydown={(e) => onStackKeydown(e, info)}
+        class="h-7 pl-2.5 pr-1 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+      >
+        <Layers size={11} class="shrink-0 {current.error ? 'text-rose-400' : 'text-accent'}" />
+        <span class="whitespace-nowrap font-medium">{info.label}</span>
+        {#if member.primary}
+          {#if current.currentBranch}
+            <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{current.currentBranch}</span>
+          {/if}
+        {:else}
+          <span class="whitespace-nowrap text-[10px] font-mono opacity-80 max-w-40 truncate" data-stack-current>{member.name}</span>
+        {/if}
+        {#if info.conflictedCount > 0}
+          <span class="text-amber-400 shrink-0" title="{info.conflictedCount} conflicted files across {info.label}">{info.conflictedCount}</span>
+        {/if}
+        {#if info.terminalCount > 0}
+          <span
+            class="shrink-0 inline-flex items-center gap-0.5 text-accent"
+            title={`${info.terminalCount} terminal session${info.terminalCount === 1 ? "" : "s"} running across ${info.label}`}
+          >
+            <SquareTerminal size={10} aria-hidden="true" />
+            {#if info.terminalCount > 1}
+              <span class="text-[9px] font-medium tabular-nums">{info.terminalCount}</span>
+            {/if}
+          </span>
+        {/if}
+      </button>
+      {#if current.isDirty}
+        <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
+          tabindex="-1"
+          title="Preview uncommitted changes in {member.name}" aria-label="Preview uncommitted changes in {member.name}"
+          onclick={() => void repoStore.previewUncommitted(current.path)}>
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
+        </button>
+      {/if}
+      <button
+        type="button"
+        tabindex="-1"
+        data-stack-switch={info.key}
+        aria-haspopup="menu"
+        aria-expanded={switcherOpen}
+        aria-controls={switcherOpen ? "repo-stack-menu" : undefined}
+        aria-label={`Switch checkout of ${info.label} (${info.tabCount} open)`}
+        title={`${info.tabCount} checkouts of ${info.label} — switch, show as tabs, or close`}
+        onclick={(e) => openStackMenu(e, info)}
+        class="mr-1 h-5 pl-1.5 pr-1 flex items-center gap-0.5 rounded-full border border-border/60 bg-background/60 text-[10px] font-mono tabular-nums hover:border-accent/50 hover:text-accent {switcherOpen ? 'border-accent/60 text-accent' : ''}"
+      >
+        <span>{info.tabCount}</span>
+        {#if info.isDirty && !current.isDirty}
+          <!-- Another checkout has changes: say so without naming which until asked. -->
+          <span class="w-1 h-1 rounded-full bg-amber-400" aria-hidden="true"></span>
+        {/if}
+        <ChevronDown size={10} class="shrink-0" />
+      </button>
+    {/if}
+  </div>
+{/snippet}
+
   <div class="gp-glass gp-repo-tabs relative z-20 h-11 bg-surface border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
@@ -891,126 +1295,13 @@
         ondrop={onScrollerDrop}
         oncontextmenu={onStripContext}
       >
-        {#each $repoStore.openTabs as tab, index (tab.id)}
-          {@const colorInfo = tabColorInfo(tab)}
-          {#if isFirstInGroup(tab, index)}
-            {@render groupHead(getGroupInfo(tab.group))}
-          {/if}
-          {#if !isTabInCollapsedGroup(tab)}
-          <div
-            role="presentation"
-            data-tab-id={tab.id}
-            data-tab-shell-index={index}
-            data-tab-color={colorInfo.color ?? undefined}
-            data-tab-color-source={colorInfo.source ?? undefined}
-            title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}${colorInfo.color ? `\n${colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group`}` : ""}`}
-            draggable="true"
-            onauxclick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault();
-                void repoStore.closeTab(tab.id);
-              }
-            }}
-            oncontextmenu={(e) => onContext(e, tab.id)}
-            ondragstart={(e) => onTabDragStart(e, tab.id)}
-            ondragend={endDrag}
-            class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFromId === tab.id
-              ? 'opacity-60'
-              : ''} {dropTarget?.index === index ? 'border-accent/50' : ''} {repoTabChrome(tab)}"
-          >
-            {#if dropTarget?.index === index}
-              <span
-                aria-hidden="true"
-                class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
-                  ? 'left-[-3px]'
-                  : 'right-[-3px]'}"
-              ></span>
-            {/if}
-            {#if colorInfo.color}
-              <span
-                aria-hidden="true"
-                class="ml-1.5 w-[3px] self-stretch my-1.5 rounded-full shrink-0"
-                style:background-color={TAB_COLOR_INK[colorInfo.color]}
-              ></span>
-            {/if}
-            <button
-            type="button"
-            role="tab"
-              tabindex={tab.isActive ? 0 : -1}
-              aria-selected={tab.isActive}
-              aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"
-              data-active-repo={tab.isActive ? "true" : "false"}
-              data-tab-index={index}
-              data-tab-id={tab.id}
-              onclick={() => selectRepoTab(tab.id)}
-              onkeydown={(e) => {
-                if (e.key === "p" || e.key === "P") {
-                  e.preventDefault();
-                  repoStore.pinTab(tab.id, !tab.pinned);
-                } else if (e.key === "Delete") {
-                  e.preventDefault();
-                  void closeTabFromKeyboard(tab.id, index);
-                }
-              }}
-              ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
-              class="h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
-            >
-              {#if tab.pinned}
-                <Pin size={10} class="text-accent shrink-0" />
-              {:else}
-                <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
-              {/if}
-              <span class="whitespace-nowrap font-medium">{tab.label}</span>
-              {#if colorInfo.color}
-                <span class="sr-only">{colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group color`}</span>
-              {/if}
-              {#if tab.currentBranch}
-                <span class="whitespace-nowrap text-[10px] font-mono opacity-80 hidden sm:inline">{tab.currentBranch}</span>
-              {/if}
-              {#if tab.conflictedCount > 0}
-                <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
-              {/if}
-              {#if terminalCounts.get(tab.path)}
-                <!-- Not a button: the tab itself is the way in, and a second
-                     click target inside a tab is how a close gets mis-hit. -->
-                <span
-                  class="shrink-0 inline-flex items-center gap-0.5 text-accent"
-                  title={terminalCounts.get(tab.path) === 1
-                    ? `1 terminal session running in ${tab.label}`
-                    : `${terminalCounts.get(tab.path)} terminal sessions running in ${tab.label}`}
-                >
-                  <SquareTerminal size={10} aria-hidden="true" />
-                  {#if (terminalCounts.get(tab.path) ?? 0) > 1}
-                    <span class="text-[9px] font-medium tabular-nums">{terminalCounts.get(tab.path)}</span>
-                  {/if}
-                  <!-- `title` on a non-focusable span is not reliably
-                       announced; the tab's accessible name carries it. -->
-                  <span class="sr-only">{terminalCounts.get(tab.path)} terminal sessions running</span>
-                </span>
-              {/if}
-            </button>
-            {#if tab.isDirty}
-              <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
-                title="Preview uncommitted changes in {tab.label}" aria-label="Preview uncommitted changes in {tab.label}"
-                onclick={() => void repoStore.previewUncommitted(tab.path)}>
-                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
-              </button>
-            {/if}
-            <button
-              type="button"
-              tabindex="-1"
-              data-tab-close
-              title="Close"
-              aria-label={`Close ${tab.label}`}
-              onclick={(e) => {
-                e.stopPropagation();
-                void repoStore.closeTab(tab.id);
-              }}
-              class="ml-auto p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background hover:text-rose-400 {tab.isActive ? 'opacity-100' : ''}"
-            >
-              <X size={11} />
-            </button>
-          </div>
+        {#each tabLayout.visibleItems as item (`${item.kind}:${item.id}`)}
+          {#if item.kind === "group-header"}
+            {@render groupHead(item)}
+          {:else if item.kind === "stack-header"}
+            {@render stackHead(item)}
+          {:else}
+            {@render repoTab(item)}
           {/if}
         {/each}
       </div>
@@ -1149,10 +1440,8 @@
 {#if menu}
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}
   {#if tab}
-    {@const tabIndex = $repoStore.openTabs.findIndex((item) => item.id === tab.id)}
-    {@const lastIndex = $repoStore.openTabs.length - 1}
-    {@const canMoveLeft = tabIndex > 0}
-    {@const canMoveRight = tabIndex >= 0 && tabIndex < lastIndex}
+    {@const canMoveLeft = repoStore.canMoveTab(tab.id, -1)}
+    {@const canMoveRight = repoStore.canMoveTab(tab.id, 1)}
     <div
       bind:this={menuEl}
       use:portal={"body"}
@@ -1206,7 +1495,7 @@
         aria-disabled={!canMoveLeft}
         onclick={() => {
           if (!canMoveLeft) return;
-          moveFocusedTabTo(tab.id, 0);
+          moveFocusedTabTo(tab.id, "start");
           closeMenu();
         }}
       >
@@ -1218,7 +1507,7 @@
         aria-disabled={!canMoveRight}
         onclick={() => {
           if (!canMoveRight) return;
-          moveFocusedTabTo(tab.id, lastIndex);
+          moveFocusedTabTo(tab.id, "end");
           closeMenu();
         }}
       >
@@ -1457,6 +1746,112 @@
   {/if}
 {/if}
 
+{#if stackMenu}
+  {@const info = stackHeadersByKey.get(stackMenu.key)}
+  {#if info}
+    {@const members = stackMembers(info)}
+    <div
+      bind:this={stackMenuEl}
+      use:portal={"body"}
+      use:popover={stackMenuDismissal}
+      id="repo-stack-menu"
+      data-stack-menu={info.key}
+      role="menu"
+      aria-label={`Checkouts of ${info.label}`}
+      tabindex="-1"
+      onkeydown={handlePopupKeydown}
+      class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu gp-pop text-[11px] text-textPrimary flex flex-col"
+      style="z-index: {LAYERS.MENU}"
+    >
+      <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0 font-medium truncate" title={info.root}>
+        {info.label} · {info.tabCount} checkouts
+      </div>
+      <div class="overflow-y-auto overscroll-contain min-h-0 max-h-[min(22rem,calc(100vh-10rem))] space-y-0.5">
+        {#each members as tab (tab.id)}
+          {@const name = memberOf(info, tab)}
+          <div class="flex items-center gap-1 px-0.5" data-stack-member-row={tab.id}>
+            <button
+              type="button"
+              role="menuitem"
+              aria-current={tab.isActive ? "true" : undefined}
+              class="flex-1 min-w-0 px-2 py-1.5 text-left rounded-lg transition-colors hover:bg-surfaceHover {tab.isActive ? 'bg-accent/10 text-accent' : ''}"
+              title={tab.path}
+              onclick={() => {
+                // Read before closing: the menu's values derive from its state.
+                const id = tab.id;
+                closeMenu();
+                selectRepoTab(id);
+              }}
+            >
+              <div class="flex items-center gap-1.5 min-w-0">
+                <span class="truncate font-medium">{name.primary ? `${name.name} (primary)` : name.name}</span>
+                {#if name.agent}
+                  <span class="gp-pill !px-1.5 !py-0 shrink-0 text-[9px]" title="Worktree created by {name.agent}">{name.agent}</span>
+                {/if}
+                {#if tab.isDirty}
+                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" title="Uncommitted changes"></span>
+                  <span class="sr-only">uncommitted changes</span>
+                {/if}
+                {#if tab.conflictedCount > 0}
+                  <span class="text-amber-400 shrink-0 font-mono" title="{tab.conflictedCount} conflicted files">{tab.conflictedCount}</span>
+                {/if}
+                {#if terminalCounts.get(tab.path)}
+                  <span class="shrink-0 inline-flex items-center gap-0.5 text-accent" title="{terminalCounts.get(tab.path)} terminal sessions running">
+                    <SquareTerminal size={10} aria-hidden="true" />
+                    <span class="text-[9px] tabular-nums">{terminalCounts.get(tab.path)}</span>
+                  </span>
+                {/if}
+              </div>
+              <div class="truncate text-[10px] text-textMuted font-mono">
+                {tab.currentBranch ?? (tab.error ? "unavailable" : tab.isLoading ? "loading…" : "detached")}
+              </div>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              aria-label={`Close ${name.name}`}
+              title="Close this tab (the worktree stays on disk)"
+              class="p-1 rounded-full text-textMuted hover:text-rose-400 hover:bg-surfaceHover shrink-0"
+              onclick={() => {
+                const id = tab.id;
+                // The focused row goes with the tab; put focus back in the
+                // menu so arrow keys keep working (the menu closes itself if
+                // the stack dissolves).
+                void repoStore.closeTab(id).then(() => {
+                  if (stackMenuEl?.isConnected) focusPopup(stackMenuEl);
+                });
+              }}
+            >
+              <X size={11} />
+            </button>
+          </div>
+        {/each}
+      </div>
+      <span class="gp-menu-sep" aria-hidden="true"></span>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          const target = info;
+          const open = !info.isExpanded;
+          closeMenu();
+          setExpanded(target, open);
+        }}
+      >
+        {info.isExpanded ? "Fold into one tab" : "Show each checkout as a tab"}
+      </button>
+      {#if info.tabCount > 1}
+        <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => { const target = info; void confirmCloseCheckouts(target, target.current.id); }}>
+          Close other checkouts…
+        </button>
+      {/if}
+      <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => { const target = info; void confirmCloseCheckouts(target, null); }}>
+        Close all {info.tabCount} checkouts…
+      </button>
+    </div>
+  {/if}
+{/if}
+
 {#if stripMenu}
   <div
     bind:this={stripMenuEl}
@@ -1479,6 +1874,13 @@
       </button>
     {/if}
     <span class="gp-menu-sep" aria-hidden="true"></span>
+    <button
+      role="menuitem"
+      class="gp-menu-item"
+      onclick={() => { interfaceStore.setStackWorktreeTabs(!$interfaceStore.stackWorktreeTabs); closeStripMenu(); }}
+    >
+      {$interfaceStore.stackWorktreeTabs ? "Give every worktree its own tab" : "Stack worktrees of one repository"}
+    </button>
     <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.groupByParentFolder(); closeStripMenu(); }}>
       Group all by parent folder
     </button>

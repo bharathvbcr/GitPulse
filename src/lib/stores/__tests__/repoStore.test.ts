@@ -1079,12 +1079,13 @@ describe("repoStore tabs", () => {
       await store.openRepo("/r/c");
       const activeId = get(store).activeTabId;
       const first = get(store).openTabs[0];
-      store.moveTab(first.id, 2);
+      store.moveTabToEdge(first.id, "end");
       expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/c", "/r/a"]);
       expect(get(store).activeTabId).toBe(activeId);
       store.moveTabBy(first.id, -1);
       expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/a", "/r/c"]);
-      store.moveTab("missing", 0);
+      store.moveTabBy("missing", 1);
+      store.moveTabToEdge("missing", "start");
       store.moveTabBy(first.id, 0);
       expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/a", "/r/c"]);
       vi.advanceTimersByTime(300);

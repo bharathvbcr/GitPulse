@@ -155,6 +155,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tab strip repositories single hide chrome",
   },
   {
+    id: "stack-worktree-tabs",
+    section: "layout",
+    label: "Stack worktree tabs",
+    keywords: "tab strip worktrees agents repository checkouts stack group switcher fatigue clutter",
+  },
+  {
     id: "language-bar",
     section: "layout",
     label: "Language mix",

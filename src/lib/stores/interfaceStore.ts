@@ -104,6 +104,8 @@ export interface InterfacePrefs {
   showHeaderActionLabels: boolean;
   /** Drop the repository tab strip while a single repository is open. */
   autoHideRepoTabs: boolean;
+  /** Draw the worktrees of one repository as one tab with a switcher. */
+  stackWorktreeTabs: boolean;
   /** Keep a status icon available; closing the window hides it while enabled. */
   showStatusIcon: boolean;
   /** Hide the Dock icon while the main window is closed and the status icon is on. */
@@ -268,6 +270,7 @@ const DEFAULTS: InterfacePrefs = {
   statusBarMode: "full",
   showHeaderActionLabels: true,
   autoHideRepoTabs: false,
+  stackWorktreeTabs: true,
   showStatusIcon: false,
   hideDockWhenClosed: true,
   statusIconCounts: false,
@@ -399,6 +402,7 @@ function readPrefs(): InterfacePrefs {
         DEFAULTS.showHeaderActionLabels,
       ),
       autoHideRepoTabs: bool(parsed.autoHideRepoTabs, DEFAULTS.autoHideRepoTabs),
+      stackWorktreeTabs: bool(parsed.stackWorktreeTabs, DEFAULTS.stackWorktreeTabs),
       showStatusIcon: parsed.showStatusIcon === true,
       hideDockWhenClosed: bool(parsed.hideDockWhenClosed, DEFAULTS.hideDockWhenClosed),
       statusIconCounts: parsed.statusIconCounts === true,
@@ -535,6 +539,7 @@ function createInterfaceStore() {
     setHideDockWhenClosed: (hide: boolean) => patch({ hideDockWhenClosed: hide }),
     setStatusIconCounts: (show: boolean) => patch({ statusIconCounts: show }),
     setAutoHideRepoTabs: (hide: boolean) => patch({ autoHideRepoTabs: hide }),
+    setStackWorktreeTabs: (stack: boolean) => patch({ stackWorktreeTabs: stack }),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),
     /** Adds or removes one view from the header's hidden list. */

@@ -38,6 +38,11 @@ pub struct ResolvedRepo {
     pub path: String,
     pub name: String,
     pub is_bare: bool,
+    /// Canonical common Git directory: one value shared by every checkout of
+    /// a repository, which is how the tab strip knows two tabs are worktrees
+    /// of the same thing. `None` when the metadata could not be read — a
+    /// tab with an unknown family stands alone rather than joining a guess.
+    pub common_dir: Option<String>,
 }
 
 /// Admits an explicitly trusted Git work tree or bare repository.
@@ -113,10 +118,14 @@ pub fn resolve_repo(repo_path: &str) -> Result<ResolvedRepo, String> {
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "repo".to_string());
+    let common_dir = resolve_git_common_dir(&canonical)
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned());
     Ok(ResolvedRepo {
         path: canonical.to_string_lossy().into_owned(),
         name,
         is_bare,
+        common_dir,
     })
 }
 
@@ -4455,6 +4464,34 @@ mod tests {
         assert!(resolved.is_bare);
         assert_eq!(resolved.path, canonical.to_string_lossy());
         assert!(!resolved.name.is_empty());
+    }
+
+    #[test]
+    fn resolve_repo_names_one_common_dir_for_every_checkout_of_a_repository() {
+        let (main, _work_parent, work_path) = init_linked_worktree();
+        let primary = resolve_repo(&main.path().to_string_lossy()).expect("resolve primary");
+        let linked = resolve_repo(&work_path.to_string_lossy()).expect("resolve linked");
+        let expected = main
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".git")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(primary.common_dir.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            linked.common_dir, primary.common_dir,
+            "a linked worktree belongs to the repository it was added from"
+        );
+        assert_ne!(linked.path, primary.path);
+
+        let other = init_test_repo(false);
+        let unrelated = resolve_repo(&other.path().to_string_lossy()).expect("resolve other");
+        assert_ne!(unrelated.common_dir, primary.common_dir);
+
+        let bare = init_test_repo(true);
+        let resolved = resolve_repo(&bare.path().to_string_lossy()).expect("resolve bare");
+        assert_eq!(resolved.common_dir.as_deref(), Some(resolved.path.as_str()));
     }
 
     #[test]

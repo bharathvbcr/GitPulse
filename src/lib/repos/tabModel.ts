@@ -359,24 +359,6 @@ export function activateAt(ws: WorkspaceTabs, index: number): WorkspaceTabs {
   return { ...ws, activeId: targetId, collapsedGroups };
 }
 
-export function activateNext(ws: WorkspaceTabs): WorkspaceTabs {
-  if (ws.tabs.length === 0) return ws;
-  const index = Math.max(0, ws.tabs.findIndex((tab) => tab.id === ws.activeId));
-  const next = (index + 1) % ws.tabs.length;
-  const targetId = ws.tabs[next].id;
-  const collapsedGroups = expandGroupForTab(ws, targetId);
-  return { ...ws, activeId: targetId, collapsedGroups };
-}
-
-export function activatePrev(ws: WorkspaceTabs): WorkspaceTabs {
-  if (ws.tabs.length === 0) return ws;
-  const index = Math.max(0, ws.tabs.findIndex((tab) => tab.id === ws.activeId));
-  const prev = (index - 1 + ws.tabs.length) % ws.tabs.length;
-  const targetId = ws.tabs[prev].id;
-  const collapsedGroups = expandGroupForTab(ws, targetId);
-  return { ...ws, activeId: targetId, collapsedGroups };
-}
-
 export function reorderTab(ws: WorkspaceTabs, fromIndex: number, toIndex: number): WorkspaceTabs {
   if (
     fromIndex === toIndex ||
@@ -401,36 +383,6 @@ export function moveTabTo(ws: WorkspaceTabs, id: string, toIndex: number): Works
   const fromIndex = ws.tabs.findIndex((tab) => tab.id === id);
   if (fromIndex < 0) return ws;
   return reorderTab(ws, fromIndex, toIndex);
-}
-
-/** Adjacent step. Past-the-end deltas are no-ops, same as `reorderTab`. */
-export function moveTabBy(ws: WorkspaceTabs, id: string, delta: number): WorkspaceTabs {
-  const fromIndex = ws.tabs.findIndex((tab) => tab.id === id);
-  if (fromIndex < 0 || delta === 0 || !Number.isInteger(delta)) return ws;
-  return reorderTab(ws, fromIndex, fromIndex + delta);
-}
-
-/**
- * Drop onto a tab's left (`before`) or right half: the index `reorderTab`
- * should receive, or null when the drop would not change order (self or the
- * immediate neighbor gap).
- */
-export function dropReorderIndex(
-  fromIndex: number,
-  targetIndex: number,
-  before: boolean,
-): number | null {
-  if (
-    fromIndex < 0 ||
-    targetIndex < 0 ||
-    !Number.isInteger(fromIndex) ||
-    !Number.isInteger(targetIndex)
-  ) {
-    return null;
-  }
-  const insertAt = before ? targetIndex : targetIndex + 1;
-  if (insertAt === fromIndex || insertAt === fromIndex + 1) return null;
-  return insertAt > fromIndex ? insertAt - 1 : insertAt;
 }
 
 export function pinTab(ws: WorkspaceTabs, id: string, pinned: boolean): WorkspaceTabs {
@@ -487,8 +439,26 @@ function pushFrontUnique(list: string[], value: string, cap: number): string[] {
 }
 
 /**
- * Assigns or clears a group for the given tab id.
+ * Puts the tabs in exactly `orderedIds`. Anything that is not a permutation
+ * of the open tabs — a stale id, a missing one, a duplicate — is refused and
+ * the workspace returned unchanged, so a plan computed against an older strip
+ * cannot drop or duplicate a tab.
  */
+export function arrangeTabs(ws: WorkspaceTabs, orderedIds: readonly string[]): WorkspaceTabs {
+  if (orderedIds.length !== ws.tabs.length) return ws;
+  const byId = new Map(ws.tabs.map((tab) => [tab.id, tab]));
+  const tabs: TabRecord[] = [];
+  const seen = new Set<string>();
+  for (const id of orderedIds) {
+    const tab = byId.get(id);
+    if (!tab || seen.has(id)) return ws;
+    seen.add(id);
+    tabs.push(tab);
+  }
+  if (tabs.every((tab, index) => tab === ws.tabs[index])) return ws;
+  return { ...ws, tabs };
+}
+
 /**
  * Sets or clears one tab's own color. An unknown value is refused and the
  * workspace is returned unchanged. Null clears.
@@ -647,9 +617,16 @@ export function closeGroup(
  * Automatically groups open tabs by their parent folder name.
  * Tabs in the same parent folder are clustered together.
  */
-export function groupByParentFolder(ws: WorkspaceTabs): WorkspaceTabs {
+export function groupByParentFolder(
+  ws: WorkspaceTabs,
+  repositoryRoot: (tab: TabRecord) => string | null | undefined = () => null,
+): WorkspaceTabs {
   const mapped = ws.tabs.map((tab) => {
-    const parent = parentFolderName(tab.path);
+    // A worktree is grouped by where its repository lives, not by the
+    // directory it was checked out into: every agent worktree sits under some
+    // `.claude/worktrees/`, and grouping by that put them all in one
+    // "worktrees" group, away from the repository they belong to.
+    const parent = parentFolderName(repositoryRoot(tab) || tab.path);
     return {
       ...tab,
       group: parent ?? null,

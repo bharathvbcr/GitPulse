@@ -11,6 +11,33 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Stacked worktree tabs.** Every checkout of one repository — the primary
+  checkout and its worktrees, agent worktrees included — now shares one tab
+  with a switcher instead of taking a tab each, so five agent worktrees no
+  longer push every other repository off the strip. The tab carries the
+  combined uncommitted, conflict and terminal badges of all its checkouts.
+  Stacks can be unfolded in place, are turned off under Settings → Layout, and
+  respect your own groups. Membership is read from Git's common directory by
+  the backend (`ResolvedRepo.common_dir`), so a checkout it cannot read stands
+  alone rather than joining a guess.
+
+### Changed
+
+- **Next/previous tab and the number keys follow the strip as drawn.** A
+  folded stack is one stop, and a group's tabs are visited where the group is
+  drawn. Moving, dragging and dropping a tab plan against the drawn strip too,
+  so a move can no longer swap with a tab you cannot see.
+- **A worktree opened while its repository is open lands next to it**, not at
+  the far end of the strip. Restoring a workspace keeps its saved order.
+
+### Fixed
+
+- **Group all by parent folder put every agent worktree in a "worktrees"
+  group**, away from the repository it belongs to. Worktrees now join the group
+  of the folder their repository lives in.
+
 ## [1.4.0] - 2026-10-05
 
 Stale-branch cleanup with backups, a secret scan that never reads a partial

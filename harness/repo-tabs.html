@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Repository tab strip checks</title>
+    <style>
+      body { margin: 0; background: rgb(11 14 23); }
+      #stage { width: 1280px; }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      const unexpected = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      // Three repositories. GitPulse has its primary checkout and two agent
+      // worktrees (one with uncommitted work); Api has a hand-made worktree
+      // beside it; Site stands alone. Every checkout reports the common
+      // directory of the repository it belongs to, as the backend does.
+      const MAIN = "/code/devtools/GitPulse";
+      const WT_A = `${MAIN}/.claude/worktrees/handoff-fix`;
+      const WT_B = `${MAIN}/.claude/worktrees/agent-models`;
+      const SITE = "/code/web/site";
+      const API = "/code/devtools/Api";
+      const API_FEATURE = "/code/devtools/Api-feature";
+      const COMMON = {
+        [MAIN]: `${MAIN}/.git`, [WT_A]: `${MAIN}/.git`, [WT_B]: `${MAIN}/.git`,
+        [SITE]: `${SITE}/.git`, [API]: `${API}/.git`, [API_FEATURE]: `${API}/.git`,
+      };
+      const BRANCH = {
+        [MAIN]: "main", [WT_A]: "fix/handoff-sheet-launch-crash", [WT_B]: "feat/agent-model-launch",
+        [SITE]: "main", [API]: "main", [API_FEATURE]: "feature/rate-limits",
+      };
+      const branch = (name) => ({
+        name, is_current: true, is_remote: false, remote_name: null, tip_commit_id: "abc123456789",
+        is_default: name === "main", is_gone: false, last_commit_timestamp: 1700000000,
+        last_author: "Alex", last_summary: "Work",
+      });
+      const dirty = new Set([WT_A]);
+      const fixtures = {
+        cmd_resolve_repo: (a) => ({
+          path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: COMMON[a.repoPath] ?? null,
+        }),
+        cmd_list_branches: (a) => [branch(BRANCH[a.repoPath] ?? "main")],
+        cmd_get_status: (a) => dirty.has(a.repoPath)
+          ? [{ path: "src/a.ts", is_staged: false, status_code: "M", is_conflicted: false, additions: 1, deletions: 1 }]
+          : [],
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_repo_operation: () => null,
+        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_watch_repo: () => null,
+        cmd_unwatch_repo: () => null,
+        cmd_set_recent_menu: () => null,
+        // Never fetched: the honest answer for a fixture with no FETCH_HEAD.
+        cmd_last_fetch_at: () => null,
+        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_devcouncil_init: (a) => ({
+          repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], devmap_available: false,
+        }),
+        cmd_devmap_maybe_refresh: () => ({
+          decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null,
+        }),
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => {
+          if (cmd.startsWith("plugin:")) return 1;
+          if (fixtures[cmd]) return fixtures[cmd](args ?? {});
+          unexpected.push(cmd);
+          return null;
+        },
+        transformCallback: (cb) => cb,
+      };
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { createChecks } = await import("./checks.ts");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
+      const { resetStackState } = await import("../src/lib/repos/stackState.ts");
+      const RepoTabBar = (await import("../src/lib/components/RepoTabBar.svelte")).default;
+
+      const { results, check, stopped } = createChecks();
+      const wait = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+      const settle = async () => { await tick(); await wait(); await tick(); };
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const strip = () => $('[role="tablist"][aria-label="Open repositories"]');
+      const shells = () => $$("[data-stack-shell]", strip());
+      const pills = () => $$("[data-tab-shell-index]", strip());
+      const stackShell = (label) => shells().find((el) => el.textContent.includes(label));
+      const head = (label) => $("[data-stack-head]", stackShell(label));
+      const switcher = (label) => $("[data-stack-switch]", stackShell(label));
+      const menu = () => $("[data-stack-menu]");
+      const activePath = () => get(repoStore).openTabs.find((t) => t.isActive)?.path;
+      const order = () => get(repoStore).openTabs.map((t) => t.path);
+      const key = (target, init) => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+      const drag = (type, target, x, transfer) => {
+        const rect = target.getBoundingClientRect();
+        target.dispatchEvent(new DragEvent(type, {
+          bubbles: true, cancelable: true, dataTransfer: transfer,
+          clientX: x === "left" ? rect.left + 2 : rect.right - 2, clientY: rect.top + rect.height / 2,
+        }));
+      };
+
+      const report_ = () => {
+        $("#result").textContent = results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
+      };
+
+      (async () => {
+        try {
+          resetStackState();
+          interfaceStore.setStackWorktreeTabs(true);
+          interfaceStore.setAutoHideRepoTabs(false);
+          mount(RepoTabBar, { target: $("#stage") });
+          // Opened in the order agents and people actually do it: the
+          // worktrees arrive after unrelated repositories.
+          for (const path of [MAIN, SITE, WT_A, API, WT_B, API_FEATURE]) {
+            await repoStore.openRepo(path, { activate: path === MAIN });
+          }
+          await repoStore.activateTab(get(repoStore).openTabs.find((t) => t.path === MAIN).id);
+          await settle();
+
+          // ---- the strip draws repositories, not checkouts --------------
+          check("the repository tablist renders", () => !!strip());
+          check("six open checkouts draw as three things on the strip", () =>
+            shells().length === 2 && pills().length === 1);
+          check("a new worktree opened beside its repository, not at the far end", () =>
+            JSON.stringify(order()) === JSON.stringify([MAIN, WT_A, WT_B, SITE, API, API_FEATURE]));
+          check("the GitPulse stack names the repository and counts its checkouts", () =>
+            head("GitPulse").textContent.includes("GitPulse") && switcher("GitPulse").textContent.trim().startsWith("3"));
+          check("the folded stack is the selected tab while its primary checkout is active", () =>
+            head("GitPulse").getAttribute("role") === "tab" && head("GitPulse").getAttribute("aria-selected") === "true");
+          check("the strip keeps exactly one roving tab stop", () =>
+            $$('[role="tab"]', strip()).filter((el) => el.tabIndex === 0).length === 1);
+          check("a hidden checkout's uncommitted work still shows on the folded stack", () =>
+            !!$("span.bg-amber-400", switcher("GitPulse")));
+          check("the folded stack is one line high", () =>
+            stackShell("GitPulse").getBoundingClientRect().height <= 32);
+          check("the strip fits its container without a horizontal scroll", () =>
+            strip().scrollWidth <= strip().clientWidth + 1);
+
+          // ---- the switcher ---------------------------------------------
+          switcher("GitPulse").click();
+          await settle();
+          check("the switcher opens a menu of the repository's checkouts", () =>
+            !!menu() && $$("[data-stack-member-row]", menu()).length === 3);
+          check("the switcher trigger reports its open state", () =>
+            switcher("GitPulse").getAttribute("aria-expanded") === "true");
+          check("checkouts are named by session, the primary marked, the agent named apart", () => {
+            const rows = $$("[data-stack-member-row]", menu()).map((row) => row.textContent);
+            return rows[0].includes("GitPulse (primary)") && rows[1].includes("handoff-fix") &&
+              rows[1].includes("claude") && rows[1].includes("fix/handoff-sheet-launch-crash");
+          });
+          check("the active checkout is marked current in the switcher", () =>
+            $('[aria-current="true"]', menu())?.closest("[data-stack-member-row]")?.dataset.stackMemberRow ===
+              get(repoStore).openTabs.find((t) => t.path === MAIN).id);
+          check("the switcher opens inside the window", () => {
+            const box = menu().getBoundingClientRect();
+            return box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight;
+          });
+          $$("[data-stack-member-row] [role=menuitem]", menu())[2].click();
+          await settle();
+          check("choosing a checkout activates it and closes the switcher", () =>
+            activePath() === WT_A && !menu());
+          check("the folded stack now shows that checkout by name", () =>
+            $("[data-stack-current]", stackShell("GitPulse"))?.textContent.trim() === "handoff-fix");
+          check("the stack's accessible name says which checkout it stands for", () =>
+            head("GitPulse").getAttribute("aria-label").includes("worktree handoff-fix"));
+
+          // ---- keyboard ---------------------------------------------------
+          head("GitPulse").focus();
+          key(head("GitPulse"), { key: "ArrowDown" });
+          await settle();
+          check("ArrowDown on the stack opens the switcher", () => !!menu());
+          check("focus moves into the switcher", () => menu().contains(document.activeElement));
+          key(menu(), { key: "Escape" });
+          await settle(); await wait(20);
+          check("Escape closes the switcher and returns focus to the stack", () =>
+            !menu() && document.activeElement === head("GitPulse"));
+
+          // Zoom accelerators pass through; the bare keys fold and unfold.
+          const zoom = !key(head("GitPulse"), { key: "=", metaKey: true });
+          const zoomOut = !key(head("GitPulse"), { key: "-", ctrlKey: true });
+          await settle();
+          check("Cmd/Ctrl with +/- is left to the zoom accelerators", () =>
+            !zoom && !zoomOut && $$("[data-stack-member]", strip()).length === 0);
+          key(head("GitPulse"), { key: "+" });
+          await settle();
+          check("+ unfolds the focused stack", () =>
+            head("GitPulse").getAttribute("aria-expanded") === "true" && $$("[data-stack-member]", strip()).length === 3);
+          head("GitPulse").focus();
+          key(head("GitPulse"), { key: "-" });
+          await settle(); await wait(20);
+          check("- folds it again and focus stays on the stack", () =>
+            $$("[data-stack-member]", strip()).length === 0 && document.activeElement === head("GitPulse"));
+
+          key(head("GitPulse"), { key: "ArrowRight", ctrlKey: true, shiftKey: true });
+          await settle();
+          check("Ctrl+Shift+→ moves the whole stack past the next repository", () =>
+            JSON.stringify(order()) === JSON.stringify([SITE, MAIN, WT_A, WT_B, API, API_FEATURE]));
+          check("the move is announced by its place on the strip", () =>
+            $('[role="status"][aria-live="polite"]').textContent.includes("GitPulse to position 2 of 3"));
+
+          // ---- unfold / fold ---------------------------------------------
+          switcher("GitPulse").click();
+          await settle();
+          $$("button[role=menuitem]", menu()).find((el) => el.textContent.includes("Show each checkout as a tab")).click();
+          await settle();
+          const unfolded = () => $$('[data-stack-member]', strip());
+          check("unfolding draws a header and each checkout's own tab", () =>
+            head("GitPulse").getAttribute("aria-expanded") === "true" && unfolded().length === 3);
+          check("unfolded checkouts follow their header on the strip", () => {
+            const all = $$("[data-stack-shell], [data-tab-shell-index]", strip());
+            const at = all.indexOf(stackShell("GitPulse"));
+            return all.slice(at + 1, at + 4).every((el) => el.hasAttribute("data-stack-member"));
+          });
+          const unfoldedWidth = stackShell("GitPulse").getBoundingClientRect().width +
+            unfolded().reduce((sum, el) => sum + el.getBoundingClientRect().width, 0);
+
+          // A drop of an outside tab onto an unfolded checkout is refused: no bar.
+          const transfer = new DataTransfer();
+          drag("dragstart", pills().find((el) => el.textContent.includes("site")), "left", transfer);
+          drag("dragover", unfolded()[1], "left", transfer);
+          await settle();
+          check("dragging another repository onto a checkout shows no drop bar", () =>
+            !$("span.bg-accent.shadow-glow", strip()));
+          drag("dragend", pills().find((el) => el.textContent.includes("site")), "left", transfer);
+          await settle();
+
+          head("GitPulse").click();
+          await settle();
+          check("clicking the unfolded header folds it back into one tab", () =>
+            unfolded().length === 0 && head("GitPulse").getAttribute("role") === "tab");
+          check("folded, the repository takes less room than its checkouts did", () =>
+            stackShell("GitPulse").getBoundingClientRect().width < unfoldedWidth / 2);
+
+          // ---- drag a whole stack ---------------------------------------
+          const carry = new DataTransfer();
+          drag("dragstart", stackShell("GitPulse"), "left", carry);
+          drag("dragover", pills().find((el) => el.textContent.includes("site")), "left", carry);
+          await settle();
+          check("dragging the stack over a repository shows where it will land", () =>
+            !!$("span.bg-accent.shadow-glow", pills().find((el) => el.textContent.includes("site"))));
+          drag("drop", pills().find((el) => el.textContent.includes("site")), "left", carry);
+          await settle();
+          check("dropping the stack moves every checkout together", () =>
+            JSON.stringify(order()) === JSON.stringify([MAIN, WT_A, WT_B, SITE, API, API_FEATURE]));
+
+          // ---- the preference ---------------------------------------------
+          interfaceStore.setStackWorktreeTabs(false);
+          await settle();
+          check("with stacking off every checkout gets its own tab again", () =>
+            shells().length === 0 && pills().length === 6);
+          interfaceStore.setStackWorktreeTabs(true);
+          await settle();
+          check("turning stacking back on restores both stacks", () => shells().length === 2);
+
+          // ---- a stack of one dissolves ------------------------------------
+          switcher("Api").click();
+          await settle();
+          const apiRows = $$("[data-stack-member-row]", menu());
+          check("the Api switcher lists the hand-made worktree by its directory", () =>
+            apiRows.length === 2 && apiRows[1].textContent.includes("Api-feature") && !apiRows[1].textContent.includes("claude"));
+          $('[aria-label="Close Api-feature"]', menu()).click();
+          await settle(); await wait(60);
+          check("closing down to one checkout dissolves the stack and its switcher", () =>
+            shells().length === 1 && !menu() && pills().some((el) => el.textContent.includes("Api")));
+          // The switcher must be gone, not merely undrawn: reopening the
+          // worktree re-forms the stack, and a lingering open state would pop
+          // the old menu back up on its own.
+          await repoStore.openRepo(API_FEATURE, { activate: false });
+          await settle();
+          check("reopening the worktree re-forms the stack without resurrecting its switcher", () =>
+            shells().length === 2 && !menu());
+
+          // ---- right-click ---------------------------------------------------
+          const box = head("GitPulse").getBoundingClientRect();
+          head("GitPulse").dispatchEvent(new MouseEvent("contextmenu", {
+            bubbles: true, cancelable: true, clientX: box.left + 8, clientY: box.top + 8,
+          }));
+          await settle();
+          check("right-clicking the stack opens its switcher at the pointer", () => {
+            const m = menu()?.getBoundingClientRect();
+            return !!m && Math.abs(m.left - (box.left + 8)) < 40;
+          });
+          key(menu(), { key: "Escape" });
+          await settle();
+
+          check("every IPC call had a fixture", () => unexpected.length === 0);
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report_();
+        } catch (error) {
+          stopped(error);
+          report_();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      })();
+    </script>
+  </body>
+</html>
