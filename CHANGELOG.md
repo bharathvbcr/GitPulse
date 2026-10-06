@@ -11,6 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-06
+
+Agents that start in the background with a pane showing every one at work,
+stacked worktree tabs, a model choice per agent, one agent guidance in every
+handoff, and board tools that delete and merge tasks and make agents group work
+before filing — plus stale-branch cleanup with backups, a secret scan that never
+reads a partial scan as clean, worktree cache sync and named local routes,
+symbol-level collision notes, Markdown rendered by MarkDev, terminals that
+report what they are running, coloured tabs, timers that stop in the
+background, Bun for installs and scripts, and git spawns admitted by class so
+a refresh storm can no longer starve the actions you asked for, with branch
+churn kept across restarts.
+
 ### Added
 
 - **Agents can merge duplicate board tasks.** `gitpulse_merge_tasks` folds up
@@ -23,57 +36,6 @@ before that tag is pushed.
   what it finished and is completed by running it again. Like
   `gitpulse_delete_task` it is a destructive write (`destructiveHint: true`),
   behind the repository trust gate, with no unmerge over MCP.
-
-### Changed
-
-- **Agents leave running and locked work alone.** `gitpulse_delete_task` and
-  `gitpulse_merge_tasks` refuse a task another agent may still be working on
-  (`task_in_use`) unless told the running agent is the caller, and
-  `gitpulse_add_task` with `overwrite` refuses to change a title or
-  description the person locked (`field_locked`).
-- **A deleted task says where it went.** Reading or completing a task that
-  was deleted or merged answers `task_deleted` with its reason, or
-  `task_merged` with the task it was merged into, instead of `not_found`.
-- **Branch churn survives a restart.** The per-branch line counts were
-  measured again for every branch on every launch. They are now kept in
-  `churn.v1.sqlite` in the platform cache directory. Each answer is keyed on
-  everything besides its two commits that can change a diff: the diff
-  config, replace refs, `shallow`, `info/grafts`, the attributes files
-  outside the worktree, and the git version. A move of the default branch
-  still measures every branch again.
-- **A branch's churn is measured with that branch's own `.gitattributes`.**
-  It used to read the checked-out worktree's, so an uncommitted attributes
-  edit changed the numbers shown for every other branch. A git that rejects
-  `--attr-source` measures churn as before and keeps it in memory only.
-
-### Fixed
-
-- **A summary or deletion reason is reported as recorded only when it was.**
-  A retry treated any logs that merely ended with the same words as its own
-  earlier write, so `gitpulse_complete_task` answered `unchanged` with
-  `summary_recorded: true` for a summary never written, and
-  `gitpulse_delete_task` deleted a task without its reason block.
-- **Folding work into a card that was merged or deleted no longer files a
-  twin.** `gitpulse_add_task` with a removed card's board id as `task_id` made a
-  new card under that id; it now answers `task_merged` or `task_deleted`, naming
-  where the card went.
-- **`gitpulse-mcp --help` and `--version` answer and exit.** Any argument
-  used to start the server, which then waited on the terminal's input
-  forever. Any other argument now exits with status 2.
-
-## [1.4.0] - 2026-10-06
-
-Agents that start in the background with a pane showing every one at work,
-stacked worktree tabs, a model choice per agent, one agent guidance in every
-handoff, and board tools that delete tasks and make agents group work before
-filing — plus stale-branch cleanup with backups, a secret scan that never
-reads a partial scan as clean, worktree cache sync and named local routes,
-symbol-level collision notes, Markdown rendered by MarkDev, terminals that
-report what they are running, coloured tabs, timers that stop in the
-background, Bun for installs and scripts, and git spawns admitted by class so
-a refresh storm can no longer starve the actions you asked for.
-
-### Added
 
 - **Agents group work instead of filing a card per finding.**
   `gitpulse_add_task` refuses a new task with `related_tasks_exist` while the
@@ -175,6 +137,26 @@ a refresh storm can no longer starve the actions you asked for.
 
 ### Changed
 
+- **Agents leave running and locked work alone.** `gitpulse_delete_task` and
+  `gitpulse_merge_tasks` refuse a task another agent may still be working on
+  (`task_in_use`) unless told the running agent is the caller, and
+  `gitpulse_add_task` with `overwrite` refuses to change a title or
+  description the person locked (`field_locked`).
+- **A deleted task says where it went.** Reading or completing a task that
+  was deleted or merged answers `task_deleted` with its reason, or
+  `task_merged` with the task it was merged into, instead of `not_found`.
+- **Branch churn survives a restart.** The per-branch line counts were
+  measured again for every branch on every launch. They are now kept in
+  `churn.v1.sqlite` in the platform cache directory. Each answer is keyed on
+  everything besides its two commits that can change a diff: the diff
+  config, replace refs, `shallow`, `info/grafts`, the attributes files
+  outside the worktree, and the git version. A move of the default branch
+  still measures every branch again.
+- **A branch's churn is measured with that branch's own `.gitattributes`.**
+  It used to read the checked-out worktree's, so an uncommitted attributes
+  edit changed the numbers shown for every other branch. A git that rejects
+  `--attr-source` measures churn as before and keeps it in memory only.
+
 - **Every agent handoff carries the same agent guidance.** A task's brief now
   opens with an `## Agent guidance` section from the task store — read the
   repository's own instructions first, orient with GitPulse, DevMap and
@@ -269,6 +251,30 @@ a refresh storm can no longer starve the actions you asked for.
   before failing instead of stopping at the first.
 
 ### Fixed
+
+- **Many open tabs no longer starve GitPulse's own git budget.** Every open
+  tab ran a full refresh on each of its own file events, so with about ten
+  repositories open the shared spawn budget stayed spent and the reads you
+  asked for were deferred under load for seconds. Background tabs now refresh
+  at most every 30 seconds each, a hidden window catches up when shown, a tab
+  switch is credited like the action it is, and ref listings, history walks,
+  status, branch and worktree counts and provenance notes each cost one git
+  process where they cost one per branch, worktree or note. Two panels asking
+  for the same worktree listing share one scan. Git is started past Apple's
+  `/usr/bin/git` shim when a real git is installed, and an idle `gitpulse-mcp`
+  no longer wakes ten times a second.
+- **A summary or deletion reason is reported as recorded only when it was.**
+  A retry treated any logs that merely ended with the same words as its own
+  earlier write, so `gitpulse_complete_task` answered `unchanged` with
+  `summary_recorded: true` for a summary never written, and
+  `gitpulse_delete_task` deleted a task without its reason block.
+- **Folding work into a card that was merged or deleted no longer files a
+  twin.** `gitpulse_add_task` with a removed card's board id as `task_id` made a
+  new card under that id; it now answers `task_merged` or `task_deleted`, naming
+  where the card went.
+- **`gitpulse-mcp --help` and `--version` answer and exit.** Any argument
+  used to start the server, which then waited on the terminal's input
+  forever. Any other argument now exits with status 2.
 
 - A repository opened in the background (a task agent's checkout, a restored
   tab) no longer cancels the repository you were opening at that moment.
