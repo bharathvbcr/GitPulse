@@ -12,6 +12,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Crockford base32, the ULID alphabet: no I, L, O or U.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+/// FNV-1a 64 over raw bytes: a digest that is the same in every build.
+///
+/// For keys that are persisted. `std::collections::hash_map::DefaultHasher`
+/// promises no stable algorithm, so a Rust release could re-key everything
+/// written under it. Not a security boundary: callers either re-check the
+/// identity they looked up, or accept a 2^-64 collision.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// Milliseconds since the Unix epoch, saturating at 0 for clocks before it.
 pub fn now_millis() -> u64 {
     SystemTime::now()

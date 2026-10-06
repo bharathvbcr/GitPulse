@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+// Record filenames use this so a Rust release that changes
+// `std::collections::hash_map::DefaultHasher` cannot orphan approvals.
+use crate::ledger::ids::fnv1a64;
+
 pub const REQUIRED: &str = "REPOSITORY_TRUST_REQUIRED";
 /// The Worktrees-panel control this refusal points at, spelled exactly as the
 /// button is labelled.
@@ -810,19 +814,6 @@ pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result
         grants.insert(granted.repository.path.clone(), granted);
         Ok(())
     }
-}
-
-/// FNV-1a 64 over raw bytes. Record filenames use this so a Rust release that
-/// changes `std::collections::hash_map::DefaultHasher` cannot orphan approvals.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
 
 /// Filename digest written before record names moved to [`fnv1a64`].
