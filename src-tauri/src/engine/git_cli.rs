@@ -1263,6 +1263,112 @@ pub(crate) fn is_slot_wait_timeout(err: &str) -> bool {
 
 const SLOT_WAIT_SUFFIX: &str = "s waiting for a process slot";
 
+/// The phrase a spawn error carries when the OS found nothing to run — the
+/// only failure that answers "is this tool installed?" with no. Every other
+/// spawn failure (too many open files, an argument list too long, a busy
+/// fork, a refused trust check) says the system could not start a program,
+/// which is not evidence the program is missing.
+///
+/// With a working directory set, a missing directory reports the same OS
+/// error, so a presence probe passes none.
+const SPAWN_NOT_FOUND_MARKER: &str = ": no such program: ";
+
+/// The error text for a failed `spawn`, formatted in one place so
+/// [`is_spawn_not_found`] can only match what this wrote.
+fn spawn_error(label: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("Failed to spawn {label}{SPAWN_NOT_FOUND_MARKER}{error}")
+    } else {
+        format!("Failed to spawn {label}: {error}")
+    }
+}
+
+/// True when `err` is a spawn the OS refused because nothing exists at that
+/// program name.
+pub(crate) fn is_spawn_not_found(err: &str) -> bool {
+    err.starts_with("Failed to spawn ") && err.contains(SPAWN_NOT_FOUND_MARKER)
+}
+
+/// What a `tool --version` run says about the tool.
+///
+/// Four answers, because "no" has to be earned. Only the OS failing to find
+/// the program is [`ToolProbe::NotFound`]; a run that started and went wrong
+/// is [`ToolProbe::FoundButFailed`]; a run that never started — deferred
+/// under load, no process slot in time, a spawn the system refused — is
+/// [`ToolProbe::NotRun`], which says nothing about whether the tool exists.
+/// Reporting either of the last two as "not installed" names a cause nobody
+/// observed: GitPulse told a user with `gh` on PATH to install it, because
+/// its probe had been shed while the machine was busy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolProbe {
+    /// Exited 0 and printed a non-empty first stdout line.
+    Present(String),
+    /// The OS found nothing at that name; carries the spawn error text.
+    NotFound(String),
+    /// Found and started, but no version came back: non-zero exit (with its
+    /// stderr), a timeout after start, empty output. Carries the diagnosis.
+    FoundButFailed(String),
+    /// Never started, for a reason other than absence. Carries the reason.
+    NotRun(String),
+}
+
+impl ToolProbe {
+    pub(crate) fn version(&self) -> Option<&str> {
+        match self {
+            ToolProbe::Present(version) => Some(version),
+            _ => None,
+        }
+    }
+}
+
+/// Classifies one probe run. `result` is what [`capture_command`] (or a
+/// seam over it) returned for `program`.
+pub(crate) fn classify_tool_probe(
+    program: &str,
+    result: Result<CapturedOutput, String>,
+) -> ToolProbe {
+    match result {
+        Ok(out) => {
+            let stdout = out.stdout_text();
+            let line = stdout.lines().next().unwrap_or("").trim();
+            if out.success && !line.is_empty() {
+                ToolProbe::Present(line.to_string())
+            } else {
+                ToolProbe::FoundButFailed(found_but_failed_detail(program, &out))
+            }
+        }
+        Err(error) if is_spawn_not_found(&error) => ToolProbe::NotFound(error),
+        Err(error)
+            if is_deferred_under_load(&error)
+                || is_slot_wait_timeout(&error)
+                || error.starts_with("Failed to spawn ")
+                || error.contains("cancelled before spawn") =>
+        {
+            ToolProbe::NotRun(error)
+        }
+        // A timeout after start, an output cap, a failed wait: the program
+        // was there and the run went wrong.
+        Err(error) => ToolProbe::FoundButFailed(error),
+    }
+}
+
+/// Diagnosis for a finished run that yielded no usable version line.
+///
+/// Success is checked before stdout so a non-zero exit can never be promoted
+/// to "present" by incidental output; a mute stderr falls back to naming the
+/// exit status rather than leaving an unexplained failure.
+pub(crate) fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> String {
+    if out.success {
+        return format!("{program} produced no version output");
+    }
+    let err = out.stderr_text();
+    if err.is_empty() {
+        format!("{program} exited {} without a diagnosis", out.status_code)
+    } else {
+        err
+    }
+}
+
 pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
     match refusal {
         Refusal::Cancelled => format!("{label} cancelled before spawn"),
@@ -2916,8 +3022,8 @@ fn run_admitted_inner(
     // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
     // shutdown path — takes this child and everything it forked down with it
     // instead of orphaning them. See [`crate::procguard`].
-    let (mut child, guard) = crate::procguard::spawn(cmd, label)
-        .map_err(|e| format!("Failed to spawn {}: {}", label, e))?;
+    let (mut child, guard) =
+        crate::procguard::spawn(cmd, label).map_err(|e| spawn_error(label, &e))?;
     #[cfg(test)]
     spawn_log::record(cmd);
 
@@ -4318,6 +4424,88 @@ mod tests {
         // characters at the head of the tail.
         let prefix = "é".repeat(5000); // 2 bytes each
         assert!(!byte_tail(prefix.as_bytes(), 9999).starts_with('\u{FFFD}'));
+    }
+
+    /// "Not installed" has to be earned: only the OS failing to find the
+    /// program says it. A spawn refused under load said it too, which is how
+    /// the Health panel told a user with `gh` on PATH to install it.
+    #[test]
+    fn a_tool_probe_says_not_found_only_when_the_os_found_nothing() {
+        // A real spawn of a name that resolves nowhere: the one "no".
+        let missing = capture_command_with_env(
+            "gitpulse-no-such-tool-7f3a",
+            &["--version"],
+            None,
+            Duration::from_secs(5),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            None,
+        );
+        match classify_tool_probe("gitpulse-no-such-tool-7f3a", missing) {
+            ToolProbe::NotFound(error) => {
+                assert!(
+                    error.starts_with("Failed to spawn gitpulse-no-such-tool-7f3a"),
+                    "{error}"
+                );
+                assert!(is_spawn_not_found(&error), "{error}");
+            }
+            other => panic!("a program that is nowhere is not found, got {other:?}"),
+        }
+
+        // Shed under load, refused by the rate limit, no slot in time,
+        // cancelled: none of these started anything, so none is an absence.
+        for refusal in [
+            Refusal::Shed,
+            Refusal::Refused {
+                waited: Duration::from_millis(1500),
+            },
+            Refusal::TimedOut {
+                deadline: Duration::from_secs(2),
+            },
+            Refusal::Cancelled,
+        ] {
+            let error = refusal_message("gh", refusal);
+            assert!(
+                matches!(
+                    classify_tool_probe("gh", Err(error.clone())),
+                    ToolProbe::NotRun(_)
+                ),
+                "{error}"
+            );
+        }
+
+        // A spawn the OS refused for a reason other than absence.
+        for error in [
+            "Failed to spawn gh: Too many open files (os error 24)",
+            "Failed to spawn gh: Argument list too long (os error 7)",
+            "Failed to spawn gh: Resource temporarily unavailable (os error 35)",
+        ] {
+            assert!(!is_spawn_not_found(error), "{error}");
+            assert!(
+                matches!(
+                    classify_tool_probe("gh", Err(error.to_string())),
+                    ToolProbe::NotRun(_)
+                ),
+                "{error}"
+            );
+        }
+
+        // The forced-failure seam the gh regression test uses is a spawn
+        // refusal too, through the real gate.
+        let forced = with_forced_spawn_failure(|| {
+            capture_command("gh", &["--version"], None, Duration::from_secs(5), &[])
+        });
+        assert!(matches!(
+            classify_tool_probe("gh", forced),
+            ToolProbe::NotRun(_)
+        ));
+
+        // Started and then ran out of time: found, and failed.
+        let hung = format!("gh{TIMEOUT_MARKER}10s");
+        assert!(matches!(
+            classify_tool_probe("gh", Err(hung)),
+            ToolProbe::FoundButFailed(_)
+        ));
     }
 
     /// The formatter in `run_bounded` and the matcher behind `run_captured`

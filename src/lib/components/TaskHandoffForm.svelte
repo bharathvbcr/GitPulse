@@ -203,6 +203,12 @@
    */
   export async function launch() {
     if (!gate.ok || busy) return;
+    // Read once, before anything is handed back. `onLaunched` lets the host
+    // drop this form — the board's sheet nulls the state its props come from —
+    // and the component outlives that call until the next flush, so a prop
+    // read after it (the `finally` below) dereferences a host that is gone.
+    // `disposed` cannot guard that window: it is set on destroy, not on hand-back.
+    const repository = selected;
     busy = true; error = ""; note = "";
     try {
       if (!pending) {
@@ -213,7 +219,7 @@
         if (latest.revision !== revision) {
           throw new Error("This task changed since it was loaded. Reload the saved task and launch its latest revision.");
         }
-        const repo = await bounded(getRepository(selected));
+        const repo = await bounded(getRepository(repository));
         if (disposed) return;
         // The host makes the worktree, inside the same step that prepares the
         // attempt, and removes it again if the attempt is refused.
@@ -276,7 +282,7 @@
     } finally {
       if (!disposed) busy = false;
       // Whatever happened, this repository's occupancy may have changed.
-      if (!disposed) void loadHolding(selected);
+      if (!disposed) void loadHolding(repository);
     }
   }
 </script>

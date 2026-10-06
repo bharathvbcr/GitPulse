@@ -652,6 +652,26 @@ describe("formatFailedCoverageDiagnostics", () => {
     ).toContain("not installed");
   });
 
+  it("names a missing generator only when the OS found nothing to run", () => {
+    // The host marks a spawn the OS refused for absence; any other spawn
+    // failure means the system could not start a program that may well be
+    // installed, and "install pytest" is the wrong advice for a busy machine.
+    expect(
+      coverageFailureHint(
+        "pytest --cov --cov-report=xml",
+        "Failed to spawn pytest: no such program: No such file or directory (os error 2)",
+      ),
+    ).toContain("not installed");
+    for (const detail of [
+      "Failed to spawn pytest: Too many open files (os error 24)",
+      "Failed to spawn pytest: Argument list too long (os error 7)",
+      "Failed to spawn pytest: Resource temporarily unavailable (os error 35)",
+    ]) {
+      expect(classifyCoverageFailure("pytest --cov", detail)).toBeNull();
+      expect(coverageFailureHint("pytest --cov", detail) ?? "").not.toContain("not installed");
+    }
+  });
+
   it("hints when MANVI refused an unallowlisted generator", () => {
     expect(
       coverageFailureHint(

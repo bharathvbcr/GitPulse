@@ -31,7 +31,7 @@
   import type { OpenTabRef } from "../workbench/openMembership";
 
   let {
-    card,
+    card: openedCard,
     settings: initialSettings,
     repositories,
     openTabs = [],
@@ -48,6 +48,10 @@
 
   // One snapshot per opening: the sheet owns its own working copy, so a board
   // refresh underneath it cannot re-point a launch that is being configured.
+  // The card is held the same way. The host closes the sheet by nulling the
+  // state `card` is read from, and this component outlives that until the
+  // next flush; a getter left pointing at it would hand the form a null task.
+  const card = untrack(() => openedCard);
   const opened = untrack(() => reconcileHandoff(initialSettings));
   let settings = $state<HandoffSettings>(opened);
   let gate = $state<HandoffGate>({ ok: false, reason: "" });
