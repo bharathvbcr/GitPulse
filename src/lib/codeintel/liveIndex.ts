@@ -41,6 +41,22 @@ export const LIVE_INDEX_DEBOUNCE_MS = 200;
 /** Busy writers get at most 30 paced retries before requiring a new request. */
 export const LIVE_INDEX_BUSY_RETRIES = 30;
 
+/** Longest wait between two asks of a busy writer. */
+export const LIVE_INDEX_BUSY_RETRY_MAX_MS = 30_000;
+
+/**
+ * Wait before busy retry `attempt` (1-based): 1 s, doubling, capped at
+ * {@link LIVE_INDEX_BUSY_RETRY_MAX_MS}. The retries used to run at the queue's
+ * fixed one-second rest, which asked the backend once a second for exactly as
+ * long as a build held the writer, and gave up after ~30 s on a build that
+ * routinely takes minutes. Backing off spends six asks on the first half
+ * minute and stretches the same 30-retry budget across ~13 minutes.
+ */
+export function busyRetryDelayMs(attempt: number): number {
+  const step = Number.isFinite(attempt) ? Math.max(1, Math.floor(attempt)) : 1;
+  return Math.min(1_000 * 2 ** Math.min(step - 1, 30), LIVE_INDEX_BUSY_RETRY_MAX_MS);
+}
+
 export type LiveIndexPhase = "idle" | "scheduled" | "running" | "ready" | "skipped" | "failed";
 
 export interface LiveIndexSnapshot {
@@ -186,7 +202,8 @@ export function createLiveIndex(opts?: {
     }
     if (outcome.decision === "skip_building") {
       const retries = busyRetries.get(repoPath) ?? 0;
-      const retrying = retries < LIVE_INDEX_BUSY_RETRIES && queue.enqueue(repoPath);
+      const retrying = retries < LIVE_INDEX_BUSY_RETRIES &&
+        queue.enqueue(repoPath, { delayMs: busyRetryDelayMs(retries + 1) });
       if (retrying) busyRetries.set(repoPath, retries + 1);
       else {
         forgetRetries(repoPath);

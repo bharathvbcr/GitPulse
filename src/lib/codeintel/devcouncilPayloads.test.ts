@@ -24,7 +24,7 @@ describe("parseInitReport", () => {
     exclude: { status: "added", file: "/a/.git/info/exclude", pattern: "/.devmap/" },
     workspace_registry: "/a/.devmap/workspace.json",
     workspace_reason: null,
-    skipped_untrusted: [],
+    skipped_untrusted: [], skipped_unavailable: [],
     devmap_available: true,
   };
 
@@ -54,6 +54,14 @@ describe("parseInitReport", () => {
     expect(() => parseInitReport({ ...good, skipped_untrusted: undefined })).toThrow(/skipped_untrusted/);
     expect(() => parseInitReport({ ...good, skipped_untrusted: null })).toThrow(/skipped_untrusted/);
     expect(() => parseInitReport({ ...good, skipped_untrusted: [1] })).toThrow(/skipped_untrusted/);
+  });
+
+  it("keeps unregistrable tabs with their reasons and rejects a missing list", () => {
+    const parsed = parseInitReport({ ...good, skipped_unavailable: ["/gone: missing"] });
+    expect(parsed.skipped_unavailable).toEqual(["/gone: missing"]);
+    expect(() => parseInitReport({ ...good, skipped_unavailable: undefined })).toThrow(/skipped_unavailable/);
+    expect(() => parseInitReport({ ...good, skipped_unavailable: null })).toThrow(/skipped_unavailable/);
+    expect(() => parseInitReport({ ...good, skipped_unavailable: [1] })).toThrow(/skipped_unavailable/);
   });
 
   it("normalizes an absent registry to null rather than undefined", () => {

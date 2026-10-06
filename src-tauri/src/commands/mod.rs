@@ -1747,6 +1747,14 @@ pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, St
     }
 }
 
+/// The user switched to this repository's tab: credit the hydrate that follows
+/// like the user action it is, so it is not deferred behind background
+/// refreshes. Trust-checked like any read; runs no Git.
+#[tauri::command(async)]
+pub async fn cmd_note_tab_activated(repo_path: String) -> Result<(), String> {
+    off_thread(move || crate::engine::git_cli::note_tab_activated(&repo_path)).await
+}
+
 #[tauri::command(async)]
 pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, String> {
     off_thread(move || {
@@ -2203,11 +2211,18 @@ pub async fn cmd_revoke_repository_trust(repo_path: String) -> Result<(), String
 // Linked worktrees: how agents parallelize, so they are first-class here.
 // ---------------------------------------------------------------------------
 
+/// `depth` is what the caller reads: the Work view reads dirty counts only,
+/// and asking it for the full scan cost diff stats, divergence and routes for
+/// every worktree on every refresh. Absent means `full`, the panel's answer.
 #[tauri::command(async)]
-pub async fn cmd_list_worktrees(repo_path: String) -> Result<Vec<WorktreeInfo>, String> {
+pub async fn cmd_list_worktrees(
+    repo_path: String,
+    depth: Option<crate::engine::worktree::ScanDepth>,
+) -> Result<Vec<WorktreeInfo>, String> {
     // Spawns one `git status` per worktree (capped), so it belongs on the
     // blocking pool like every other reader.
-    off_thread(move || crate::engine::worktree::list_worktrees(&repo_path)).await
+    let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Full);
+    off_thread(move || crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)).await
 }
 
 /// Creates a linked worktree, after the command gate has judged the exact

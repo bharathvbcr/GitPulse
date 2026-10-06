@@ -64,11 +64,11 @@ const policy={status:"unchecked",checked:false,target:"fixture",rule:"",severity
 const fixture={
  cmd_resolve_repo:a=>({path:a.path,name:"GitPulse",is_bare:false}),
  cmd_list_branches:()=>[],cmd_get_status:()=>[...files.map(path=>({path,status_code:"UU",is_staged:false,is_conflicted:true,additions:0,deletions:0})),...[...stagedFiles].map(path=>({path,status_code:"M ",is_staged:true,is_conflicted:false,additions:1,deletions:0}))],
- cmd_last_fetch_at: () => null, cmd_list_tags:()=>({tags:[],truncated:false}),cmd_stash_list: () => ({ entries: [], truncated: false }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,cmd_list_repo_files:()=>files,
+ cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null, cmd_list_tags:()=>({tags:[],truncated:false}),cmd_stash_list: () => ({ entries: [], truncated: false }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,cmd_list_repo_files:()=>files,
  cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
  cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
  cmd_workspace_sync:()=>({repos:[]}),
- cmd_devcouncil_init:()=>({repo:"/fixture",state_dir:"/fixture/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],devmap_available:false}),
+ cmd_devcouncil_init:()=>({repo:"/fixture",state_dir:"/fixture/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false}),
  cmd_devmap_maybe_refresh:()=>({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
  cmd_repo_operation:()=>({kind:"Merge",current_step:null,total_steps:null,head_ref:"main",incoming_ref:"feature/workspace",conflicted_paths:files,conflicted_total:files.length,available:files.length?["abort"]:["continue","abort"]}),
  cmd_conflict_snapshot:a=>{if(failedRead){failedRead=false;throw Error("Fixture read failed");}const snapshot=makeSnapshot(a.repoPath,a.filePath);if(delayedRead){const callback=delayedRead;delayedRead=null;return new Promise(resolve=>callback(()=>resolve(snapshot)));}return snapshot;},

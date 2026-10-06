@@ -731,13 +731,35 @@ impl Log for RingLogger {
     }
 
     fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
+        if !self.enabled(record.metadata()) || !admits_origin(record) {
             return;
         }
         self.write_entry(record.level(), record.target(), &record.args().to_string());
     }
 
     fn flush(&self) {}
+}
+
+/// Debug and trace are for this app's own code. A dependency's debug output is
+/// narration nobody here asked for: the `ignore` walker reports every path it
+/// whitelists, and with `globset` it wrote 2,312 of the 2,609 debug lines in
+/// one debug-build hook log.
+///
+/// Decided by `module_path`, not `target`: our code often logs under a short
+/// custom target (`hooks`, `desktop`), while the module path of a record always
+/// names the crate the macro was written in. A record that carries no module
+/// path was built by hand, and is kept.
+fn admits_origin(record: &Record) -> bool {
+    record.level() <= Level::Info || record.module_path().is_none_or(is_first_party_module)
+}
+
+/// Every crate this repository builds is named `gitpulse*`: the library, the
+/// app, and the `gitpulsed`, `gitpulse-mcp` and `gitpulse-hook` binaries.
+fn is_first_party_module(module_path: &str) -> bool {
+    module_path
+        .split("::")
+        .next()
+        .is_some_and(|root| root.starts_with("gitpulse"))
 }
 
 fn configured_level() -> LevelFilter {
@@ -1124,6 +1146,35 @@ mod tests {
         );
         assert!(diagnostic_tail(usize::MAX).len() <= TAIL_MAX_LINES);
         assert_eq!(messages_of(&diagnostic_tail(1)), vec!["g4"]);
+    }
+
+    /// A dependency's debug narration is dropped even when debug is on; ours
+    /// is kept whatever target it logs under, and a dependency's warning is
+    /// never dropped.
+    #[test]
+    fn debug_from_a_dependency_is_dropped_but_its_warnings_are_kept() {
+        let logger = RingLogger::new(LevelFilter::Debug);
+        let log = |level: Level, module: Option<&'static str>, message: &str| {
+            logger.log(
+                &Record::builder()
+                    .level(level)
+                    .target("t")
+                    .module_path_static(module)
+                    .args(format_args!("{message}"))
+                    .build(),
+            );
+        };
+        log(Level::Debug, Some("ignore::walk"), "whitelisting");
+        log(Level::Trace, Some("globset"), "glob");
+        log(Level::Debug, Some("gitpulse_lib::hooks"), "ours");
+        log(Level::Debug, Some("gitpulse_hook"), "hook binary");
+        log(Level::Debug, None, "hand built");
+        log(Level::Info, Some("ignore::walk"), "info");
+        log(Level::Warn, Some("globset"), "careful");
+        assert_eq!(
+            messages_of(&logger.snapshot_tail(10)),
+            vec!["ours", "hook binary", "hand built", "info", "careful"]
+        );
     }
 
     #[test]

@@ -351,6 +351,54 @@ describe("loadGithubAlerts production cache", () => {
     ).toHaveLength(1);
   });
 
+  // Regression: a check the spawn gate deferred was cached as the answer, so
+  // the repository showed a failed check until the entry happened to be
+  // evicted, though nothing had been examined.
+  it("does not cache a check that was only deferred under load", async () => {
+    vi.useFakeTimers();
+    try {
+      // The IPC layer already retries a deferral with backoff; only when
+      // every attempt was deferred does one reach this cache.
+      let deferring = true;
+      let calls = 0;
+      mockGithubInvoke({
+        codeScanning: async () => {
+          calls += 1;
+          if (deferring) {
+            throw new Error(
+              "gh deferred under load after 2.036s: the git spawn rate limit admitted nothing sooner",
+            );
+          }
+          return codeScanningReport();
+        },
+      });
+      const first = loadGithubAlerts("/deferred");
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const deferred = await first;
+      expect(deferred.codeScanningRequestFailed).toBe(true);
+      expect(githubAlertsCache.get("/deferred")).toBeUndefined();
+      const attempts = calls;
+
+      deferring = false;
+      const retried = await loadGithubAlerts("/deferred");
+      expect(calls).toBe(attempts + 1);
+      expect(retried.codeScanningRequestFailed).toBe(false);
+      expect(githubAlertsCache.get("/deferred")?.codeScanningRequestFailed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still caches a real failure, which a retry would only repeat", async () => {
+    mockGithubInvoke({
+      codeScanning: async () => {
+        throw new Error("You are not authorized to read code scanning alerts. (HTTP 403)");
+      },
+    });
+    await loadGithubAlerts("/forbidden");
+    expect(githubAlertsCache.get("/forbidden")?.codeScanningRequestFailed).toBe(true);
+  });
+
   it("does not let a superseded fetch overwrite a later refresh", async () => {
     const resolvers: Array<(value: DependabotReport) => void> = [];
     mockGithubInvoke({
@@ -386,9 +434,55 @@ describe("maybeNotifyGithubAlerts", () => {
       notify: vi.fn(),
       onError: vi.fn(),
       notified: new Map<string, string>(),
+      failuresReported: new Map<string, string>(),
       ...overrides,
     };
   }
+
+  // Regression: a cached 403 was re-reported on every tab activation, so one
+  // unexaminable check became a stream of identical diagnostics warnings.
+  it("reports one failure once per repository until it changes or clears", async () => {
+    const forbidden = snapshot({
+      dependabot: dependabotReport({}, []),
+      codeScanning: codeScanningReport({ available: false, error: "HTTP 403" }),
+    });
+    const other = snapshot({
+      dependabot: dependabotReport({}, []),
+      codeScanning: codeScanningReport({ available: false, error: "HTTP 500" }),
+    });
+    const healthy = snapshot({ dependabot: dependabotReport({}, []) });
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce(forbidden)
+      .mockResolvedValueOnce(forbidden)
+      .mockResolvedValueOnce(forbidden)
+      .mockResolvedValueOnce(other)
+      .mockResolvedValueOnce(healthy)
+      .mockResolvedValueOnce(forbidden);
+    const d = deps({ load });
+    for (let i = 0; i < 6; i += 1) await maybeNotifyGithubAlerts(d);
+    expect(d.onError.mock.calls.map((call) => call[0])).toEqual([
+      "HTTP 403",
+      "HTTP 500",
+      // Re-armed by the healthy check in between.
+      "HTTP 403",
+    ]);
+  });
+
+  it("keeps each repository's reported failure separate", async () => {
+    const forbidden = snapshot({
+      dependabot: dependabotReport({}, []),
+      codeScanning: codeScanningReport({ available: false, error: "HTTP 403" }),
+    });
+    const failuresReported = new Map<string, string>();
+    const a = deps({ repoPath: "/a", load: vi.fn().mockResolvedValue(forbidden), failuresReported });
+    const b = deps({ repoPath: "/b", load: vi.fn().mockResolvedValue(forbidden), failuresReported });
+    await maybeNotifyGithubAlerts(a);
+    await maybeNotifyGithubAlerts(b);
+    await maybeNotifyGithubAlerts(a);
+    expect(a.onError).toHaveBeenCalledTimes(1);
+    expect(b.onError).toHaveBeenCalledTimes(1);
+  });
 
   it("makes no request while the preference is off", async () => {
     const d = deps({ enabled: false });

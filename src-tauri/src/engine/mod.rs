@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod churn_store;
 pub mod cow_clone;
 pub mod deadbranch;
 pub mod git_cli;
@@ -6,6 +7,7 @@ pub mod git_reader;
 pub mod git_writer;
 pub mod portless;
 pub mod provenance;
+pub mod ref_cache;
 pub mod remotes;
 pub mod repo_op;
 pub mod stash;

@@ -114,7 +114,15 @@ import {
   shouldRunStatusPoll,
   statusesEqual,
 } from "../repos/statusPoll";
-import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+import {
+  bindForegroundChanges,
+  readBackgroundDocument,
+  readHiddenDocument,
+} from "../runtime/foreground";
+import {
+  WATCHER_REFRESH_DEBOUNCE_MS,
+  createWatcherRefreshPolicy,
+} from "../repos/watcherRefresh";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
 import { beginGeneration } from "../async/guard";
@@ -520,14 +528,15 @@ const PERSIST_DEBOUNCE_MS = 300;
 export const STATS_DRAIN_MAX_BATCHES = 64;
 /** Publish coalesced stats every N batches (and always on the final drain). */
 export const STATS_PUBLISH_EVERY = 8;
-/** Trailing window that collapses watcher-event storms into one refresh. */
-const WATCHER_REFRESH_DEBOUNCE_MS = 200;
 /**
  * Watcher events for a repo are dropped for this long after one of our own
  * mutations succeeds there: they are echoes of the mutation's own `.git`
  * writes, and honoring them means every mutation costs TWO full refreshes.
- * The window exceeds Rust DEBOUNCE_MAX_WAIT=2000ms plus this file's 200ms
- * watcher debounce, so a real echo can never slip past it. Trade-off: an
+ * The window exceeds Rust DEBOUNCE_MAX_WAIT=2000ms plus the 200ms watcher
+ * debounce (WATCHER_REFRESH_DEBOUNCE_MS), so a real echo can never slip past
+ * it. The check runs when the event arrives, before the refresh policy
+ * delays anything, so a background tab's longer wait does not widen it.
+ * Trade-off: an
  * unrelated external change landing inside the window is picked up by the
  * next status poll or later watcher event instead of refreshing immediately —
  * accepted, because it halves per-mutation load.
@@ -1432,7 +1441,28 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
   }
 
+  /**
+   * Tells the backend the user just brought `path` to the front, so the
+   * hydrate that follows is admitted like the user action it is instead of
+   * queuing behind background refreshes (`cmd_note_tab_activated`). Only for
+   * activations a person caused: restore and background opens stay ordinary
+   * reads, or a restart would hand every restored tab a free burst.
+   *
+   * Best effort. A refusal here is the same refusal the hydrate meets next,
+   * and the hydrate is what reports it.
+   */
+  async function noteTabActivated(path: string): Promise<void> {
+    try {
+      await invokeFn("cmd_note_tab_activated", { repoPath: path });
+    } catch {
+      /* reported by the hydrate that follows */
+    }
+  }
+
   async function unwatch(path: string) {
+    // A refresh still owed to a repo nobody watches would run against a
+    // session that is gone, or worse, one reopened since.
+    watcherRefreshPolicy.forget(path);
     try {
       await invokeFn("cmd_unwatch_repo", { repoPath: path });
     } catch {
@@ -1687,6 +1717,31 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     timer();
   }
 
+  // Which watcher events may cost a refresh, and when: the active tab of a
+  // shown window at once, background tabs on a bounded schedule, nothing while
+  // hidden. See watcherRefresh.ts for why the cost had to stop scaling with
+  // the number of busy tabs.
+  const watcherRefreshPolicy = createWatcherRefreshPolicy({
+    now: () => Date.now(),
+    setTimer: (run, delayMs) => setTimeout(run, delayMs),
+    clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    isActive: (path) => {
+      const active = activeSession();
+      return !!active && sameRepo(active.path, path, options);
+    },
+    isHidden: readHiddenDocument,
+    refresh: (path) => void store.refresh(path),
+  });
+  let unbindRefreshVisibility: (() => void) | null = null;
+  function bindRefreshVisibility(): void {
+    if (unbindRefreshVisibility !== null || typeof document === "undefined") return;
+    unbindRefreshVisibility = bindForegroundChanges(
+      document,
+      typeof window === "undefined" ? null : window,
+      () => watcherRefreshPolicy.onVisibilityChange(),
+    );
+  }
+
   const mutationActivity = writable<Record<string, string[]>>({});
   const mutations = new Map<number, { path: string; kind: string }>();
   let mutationSequence = 0;
@@ -1938,6 +1993,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // for a repository that never got a watcher.
       const watchState = await watch(path);
       applyToSession(opened.id, session.generation, { watch: watchState });
+      if (shouldPresent && !extras.keepEpoch) await noteTabActivated(path);
       await hydrate(opened.id, path, session.generation);
       const latest = internal.sessions[opened.id];
       if (
@@ -2027,6 +2083,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         publish();
         const watchState = await watch(path);
         applyToSession(id, activation.generation, { watch: watchState });
+        watcherRefreshPolicy.onActivated(path);
+        await noteTabActivated(path);
         await hydrate(id, path, activation.generation);
         const after = internal.sessions[id];
         if (after && after.generation === activation.generation && !after.trustRequired) {
@@ -2058,6 +2116,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       putSession({ ...activation, isLoading: !session.hasHydrated });
       publish();
       revealGraph(activation);
+      watcherRefreshPolicy.onActivated(session.path);
+      // `force` is restore presenting a saved tab, not a person clicking it.
+      if (!extras.force) await noteTabActivated(session.path);
       await hydrate(id, session.path, activation.generation);
       ensureStatusPoll();
       flushPersist();
@@ -2397,10 +2458,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // change inside the window is picked up by the next poll or event.
       const echoUntil = mutationEchoUntil.get(session.path);
       if (echoUntil !== undefined && Date.now() < echoUntil) return;
-      scheduleWatcherRefresh(
-        session.path,
-        () => void store.refresh(session.path),
-      );
+      bindRefreshVisibility();
+      watcherRefreshPolicy.onChange(session.path);
     },
     restoreWorkspace: async () => {
       stopStatusPoll();

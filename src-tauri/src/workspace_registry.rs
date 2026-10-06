@@ -38,6 +38,11 @@ pub struct WorkspaceSnapshot {
     /// skipped, and the registry file itself does not store that fact.
     /// Not a grant and not a finding — these paths were not examined.
     pub skipped_untrusted: Vec<String>,
+    /// Open-tab paths `sync_open_tabs` left out because they could not be
+    /// registered at all — gone from disk, or no longer a repository — each
+    /// as `path: reason`. Empty on [`list`], for the same reason as
+    /// [`Self::skipped_untrusted`].
+    pub skipped_unavailable: Vec<String>,
 }
 
 /// Outcome of registering one repository.
@@ -114,6 +119,7 @@ fn snapshot_of(
     root: &Path,
     workspace: &Workspace,
     skipped_untrusted: Vec<String>,
+    skipped_unavailable: Vec<String>,
 ) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         version: workspace.version,
@@ -121,6 +127,7 @@ fn snapshot_of(
         registry_path: workspace_path(root).to_string_lossy().into_owned(),
         repos: workspace.repos.iter().map(to_entry).collect(),
         skipped_untrusted,
+        skipped_unavailable,
     }
 }
 
@@ -220,7 +227,7 @@ fn suffix_label(root: &Path, depth: usize) -> String {
 pub fn list(registry_root: &str) -> Result<WorkspaceSnapshot, String> {
     let root = resolve_registry_root(registry_root)?;
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
-    Ok(snapshot_of(&root, &workspace, Vec::new()))
+    Ok(snapshot_of(&root, &workspace, Vec::new(), Vec::new()))
 }
 
 /// Register one repository under the registry rooted at `registry_root`.
@@ -274,8 +281,15 @@ pub fn unregister(registry_root: &str, name: &str) -> Result<WorkspaceUnregister
 ///
 /// A member [`crate::repository_trust::refused`] by trust is omitted and
 /// named on [`WorkspaceSnapshot::skipped_untrusted`]. Registering a member
-/// runs no Git, so leaving one out widens nothing. Every other member error
-/// (missing path, not a repository) still fails the call before any write.
+/// runs no Git, so leaving one out widens nothing.
+///
+/// A member that cannot be registered at all — a tab whose worktree was
+/// deleted, a path that is no longer a repository — is omitted the same way
+/// and named, with its reason, on [`WorkspaceSnapshot::skipped_unavailable`].
+/// It used to fail the whole call, and because the frontend re-syncs on every
+/// tab change, one removed worktree tab left every other open repository
+/// without cross-repository search until that tab was closed. A path that
+/// does not exist cannot be searched, so leaving it out loses nothing.
 ///
 /// The registry host is not a member that can be skipped. The file is written
 /// into that repository, so a refused host returns the trust error and writes
@@ -288,6 +302,7 @@ pub fn sync_open_tabs(
     let mut members = Vec::with_capacity(repo_paths.len());
     let mut seen = HashSet::new();
     let mut skipped_untrusted = Vec::new();
+    let mut skipped_unavailable = Vec::new();
     let mut skipped_keys = HashSet::new();
     for path in repo_paths {
         match resolve_member_root(path) {
@@ -297,13 +312,16 @@ pub fn sync_open_tabs(
                     members.push(member);
                 }
             }
-            Err(error) if crate::repository_trust::refused(&error) => {
-                let key = path.to_lowercase();
-                if skipped_keys.insert(key) {
+            Err(error) => {
+                if !skipped_keys.insert(path.to_lowercase()) {
+                    continue;
+                }
+                if crate::repository_trust::refused(&error) {
                     skipped_untrusted.push(path.clone());
+                } else {
+                    skipped_unavailable.push(format!("{path}: {error}"));
                 }
             }
-            Err(error) => return Err(error),
         }
     }
     // Always include the registry host itself so a search from an open tab
@@ -332,7 +350,7 @@ pub fn sync_open_tabs(
     sync_result?;
 
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
-    let mut snap = snapshot_of(&root, &workspace, skipped_untrusted);
+    let mut snap = snapshot_of(&root, &workspace, skipped_untrusted, skipped_unavailable);
     snap.registry_path = written.to_string_lossy().into_owned();
     Ok(snap)
 }
@@ -534,31 +552,85 @@ mod tests {
         let _ = fs::remove_dir_all(&untrusted);
     }
 
+    /// Regression: a tab whose worktree had been deleted failed the whole
+    /// sync, and the frontend re-syncs on every tab change, so every other
+    /// open repository lost cross-repository search ("has no registry") until
+    /// that one tab was closed. An unregistrable member is now left out and
+    /// named — and still never passed off as a trust refusal.
     #[test]
-    fn sync_open_tabs_still_fails_when_a_member_path_is_missing() {
+    fn sync_open_tabs_skips_a_member_that_is_gone_or_not_a_repository() {
         let host = scratch("miss-host");
         let kept = scratch("miss-trusted");
+        let plain = scratch("miss-plain-dir");
         init_git_repo(&host);
         init_git_repo(&kept);
+        fs::create_dir_all(&plain).unwrap();
         let missing = host.join("does-not-exist");
+        let missing_path = missing.to_string_lossy().into_owned();
+        let plain_path = plain.to_string_lossy().into_owned();
 
-        let err = sync_open_tabs(
+        let snap = sync_open_tabs(
             host.to_str().unwrap(),
             &[
                 kept.to_string_lossy().into_owned(),
-                missing.to_string_lossy().into_owned(),
+                missing_path.clone(),
+                plain_path.clone(),
+                // The same dead tab twice is still one entry.
+                missing_path.clone(),
             ],
         )
-        .expect_err("a missing path is not a trust refusal");
-        assert!(
-            !crate::repository_trust::refused(&err),
-            "a missing path must stay a hard error: {err}"
-        );
-        assert!(
-            !workspace_path(&host).is_file(),
-            "a non-trust member error must not write the registry"
-        );
+        .expect("an unregistrable member must not abort the registry write");
 
+        let roots: HashSet<_> = snap
+            .repos
+            .iter()
+            .map(|entry| Path::new(&entry.root).canonicalize().expect("root"))
+            .collect();
+        assert_eq!(
+            roots,
+            HashSet::from([host.canonicalize().unwrap(), kept.canonicalize().unwrap()]),
+        );
+        assert!(workspace_path(&host).is_file(), "the registry is written");
+        assert!(
+            snap.skipped_untrusted.is_empty(),
+            "a missing path is not a trust refusal: {:?}",
+            snap.skipped_untrusted
+        );
+        assert_eq!(
+            snap.skipped_unavailable.len(),
+            2,
+            "{:?}",
+            snap.skipped_unavailable
+        );
+        assert!(snap.skipped_unavailable[0].starts_with(&format!("{missing_path}: ")));
+        assert!(snap.skipped_unavailable[1].starts_with(&format!("{plain_path}: ")));
+        // Each names a reason, not only the path.
+        assert!(snap
+            .skipped_unavailable
+            .iter()
+            .all(|entry| entry.len() > entry.find(": ").unwrap() + 2));
+
+        // A later read does not re-decide who was skipped.
+        let listed = list(host.to_str().unwrap()).expect("list");
+        assert!(listed.skipped_unavailable.is_empty());
+
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&kept);
+        let _ = fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn sync_open_tabs_still_fails_when_the_registry_host_is_missing() {
+        let host = scratch("miss-host-itself");
+        let kept = scratch("miss-host-member");
+        init_git_repo(&kept);
+        let gone = host.join("gone");
+        let err = sync_open_tabs(
+            gone.to_str().unwrap(),
+            &[kept.to_string_lossy().into_owned()],
+        )
+        .expect_err("the file lives in the host, so a missing host writes nothing");
+        assert!(!crate::repository_trust::refused(&err), "{err}");
         let _ = fs::remove_dir_all(&host);
         let _ = fs::remove_dir_all(&kept);
     }

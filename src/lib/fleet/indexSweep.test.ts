@@ -23,7 +23,7 @@ function init(overrides: Partial<InitReport> = {}): InitReport {
     exclude: { status: "added", file: "/w/a/.git/info/exclude", pattern: "/.devmap/" },
     workspace_registry: "/w/a/.devmap/workspace.json",
     workspace_reason: null,
-    skipped_untrusted: [],
+    skipped_untrusted: [], skipped_unavailable: [],
     devmap_available: true,
     ...overrides,
   };

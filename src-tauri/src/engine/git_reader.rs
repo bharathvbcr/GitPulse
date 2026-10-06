@@ -1,17 +1,19 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
+use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
 use crate::engine::git_cli::{
     self, git, git_text, git_text_capped, git_text_shared, sandbox_join, sandbox_join_canonical,
     sandbox_join_entry, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
+use crate::engine::ref_cache::{self, FileIdentity};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_STAT_TARGETS: usize = 96;
@@ -24,10 +26,6 @@ const TAG_LIST_CAP: usize = 400;
 
 /// Commit graph ref decoration tag ceiling: newest-first, capped so massive tag histories do not bloat the graph payload.
 pub const REFS_TAG_CAP: usize = 200;
-
-/// Bound for the process-wide churn memo. Entries are content-addressed by
-/// oids so they cannot go stale; the cap only bounds memory.
-const CHURN_CACHE_CAPACITY: usize = 8192;
 
 /// Hard ceiling for reading one file from disk or from a Git object.
 ///
@@ -480,8 +478,9 @@ impl GitReader {
             format.push(')');
         }
         let format_arg = format!("--format={format}");
-        let listed = git_text_shared(
+        let listed = ref_cache::git_text(
             &repo,
+            BRANCH_NAMESPACES,
             &[
                 "for-each-ref",
                 format_arg.as_str(),
@@ -608,7 +607,6 @@ impl GitReader {
     /// through the oid-keyed churn cache so repeat calls are cheap.
     pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
         let repo = validate_repo(repo_path)?;
-        let repo_key = repo.to_string_lossy().into_owned();
         let DefaultBase {
             remote,
             remote_head: origin_head,
@@ -619,8 +617,9 @@ impl GitReader {
         // Cheap listing only: refnames and tips, no history walks here.
         // Refnames and object ids cannot contain NULs, so %00 fields stay
         // aligned where \x01 could be split by hostile ref-adjacent content.
-        let stdout = git_text_shared(
+        let stdout = ref_cache::git_text(
             &repo,
+            BRANCH_NAMESPACES,
             &[
                 "for-each-ref",
                 "--format=%(refname)%00%(objectname)",
@@ -704,7 +703,7 @@ impl GitReader {
         }
 
         let (updates, computed, cached, capped, compute_failures) =
-            compute_eligible_churn(&repo, &repo_key, &base_oid, eligible);
+            compute_eligible_churn(&repo, &base_oid, eligible);
 
         Ok(BranchStatsReport {
             compared_to,
@@ -718,9 +717,11 @@ impl GitReader {
 
     pub fn head_id(repo_path: &str) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
-        Ok(git_text_shared(&repo, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_string())
+        Ok(
+            ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string(),
+        )
     }
 
     /// Short name of the repository's default branch: the primary remote's
@@ -828,7 +829,16 @@ impl GitReader {
         }
         // The graph, the history list and the AI context ask for the same
         // page at once after a change; queued identical walks share a child.
-        let stdout = git_text_shared(&repo, &args)?;
+        // The walk is a function of the refs it starts from and of objects,
+        // which never change, so a refresh caused by a working-tree edit is
+        // answered without a walk. A named revision or `--all` may start
+        // anywhere in the ref store, every worktree's HEAD included.
+        let namespaces: &[&str] = if revision.is_some() || scope == RefScope::All {
+            &[ref_cache::ALL_REFS]
+        } else {
+            &crate::graph::ref_scope::NAMED_REF_PATTERNS
+        };
+        let stdout = ref_cache::git_text(&repo, namespaces, &args)?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -925,31 +935,47 @@ impl GitReader {
         // on every git child, so this status does not rewrite the index and
         // re-trigger the watcher.
         let stdout = git_text_shared(&repo, Self::STATUS_ARGV)?;
+        let records = parse_status_records(stdout.as_bytes());
+        // Each numstat is read only for the rows below that look it up, so a
+        // tree with nothing staged never needs the cached one, and a clean
+        // tree needs neither: the status poll of an idle tab is one process,
+        // not three. Skipping is not guessing: no row reads an answer that
+        // was not asked for.
+        let rows = || records.iter().map(|r| (r.index_status, r.work_status));
+        let reads_index = rows().any(|(index, work)| status_kind(index, work).staged);
+        let reads_work = rows().any(|(index, work)| status_kind(index, work).work_changed);
         // numstat failures are surfaced, not laundered into "zero churn": a
         // broken diff must fail the report rather than fabricate numbers, and
         // records that decode but carry unparseable counts ride their row as
         // an explicit warning instead of reading as fact.
-        let numstat_work =
-            parse_numstat_with_issues(&git_text_shared(&repo, &["diff", "--numstat", "-z"])?);
-        let numstat_index = parse_numstat_with_issues(&git_text_shared(
-            &repo,
-            &["diff", "--cached", "--numstat", "-z"],
-        )?);
+        let numstat_work = if reads_work {
+            parse_numstat_with_issues(&git_text_shared(&repo, &["diff", "--numstat", "-z"])?)
+        } else {
+            NumstatParse::default()
+        };
+        let numstat_index = if reads_index {
+            parse_numstat_with_issues(&git_text_shared(
+                &repo,
+                &["diff", "--cached", "--numstat", "-z"],
+            )?)
+        } else {
+            NumstatParse::default()
+        };
 
         let mut statuses = Vec::new();
-        for record in parse_status_records(stdout.as_bytes()) {
+        for record in records {
             let RawStatusRecord {
                 index_status,
                 work_status,
                 path,
                 old_path,
             } = record;
-            let is_conflicted = index_status == 'U'
-                || work_status == 'U'
-                || (index_status == 'A' && work_status == 'A')
-                || (index_status == 'D' && work_status == 'D');
-            let is_staged = !is_conflicted && index_status != ' ' && index_status != '?';
-            let is_untracked = index_status == '?' && work_status == '?';
+            let StatusKind {
+                conflicted: is_conflicted,
+                staged: is_staged,
+                untracked: is_untracked,
+                work_changed: is_work_changed,
+            } = status_kind(index_status, work_status);
 
             // Staged churn from numstat_index (for files with changes staged in index)
             let (staged_add, staged_del) = if is_staged {
@@ -970,7 +996,7 @@ impl GitReader {
                 } else {
                     (0, 0)
                 }
-            } else if work_status != ' ' && work_status != '?' {
+            } else if is_work_changed {
                 numstat_work
                     .churn
                     .get(&path)
@@ -992,7 +1018,7 @@ impl GitReader {
                     }
                 }
             }
-            if work_status != ' ' && work_status != '?' {
+            if is_work_changed {
                 for (warned_path, reason) in &numstat_work.issues {
                     if warned_path == &path || old_path.as_deref() == Some(warned_path) {
                         warnings.push(reason.clone());
@@ -1406,8 +1432,9 @@ impl GitReader {
             format.push(')');
         }
         let format_arg = format!("--format={format}");
-        let listed = git_text_shared(
+        let listed = ref_cache::git_text(
             &repo,
+            &["refs/tags"],
             &["tag", "-l", "--sort=-creatordate", format_arg.as_str()],
         );
         // Older git (<2.42) rejects the ahead-behind atom outright: retry once
@@ -2419,17 +2446,25 @@ pub(crate) fn parse_pulse_stream(
 /// Priority: `checkout.defaultRemote`, the current branch's configured
 /// upstream remote, a lone configured remote, else "origin".
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
-    if let Ok(configured) = git_text(repo, &["config", "--get", "checkout.defaultRemote"]) {
+    // One read of the effective config answers what used to be two
+    // `config --get` processes and, usually, `git remote` too. A failed read
+    // is "not set", as each failed `--get` was; the spawn gate's failure
+    // counter is what marks the answer unclean (see `default_base`).
+    let config = config_snapshot(repo).unwrap_or_default();
+    if let Some(configured) = config.get("checkout.defaultremote") {
         let trimmed = configured.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    if let Ok(branch) = git_text(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+    if let Ok(branch) = ref_cache::git_text(
+        repo,
+        &["refs/heads"],
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    ) {
         let branch = branch.trim();
         if !branch.is_empty() {
-            let key = format!("branch.{branch}.remote");
-            if let Ok(upstream) = git_text(repo, &["config", "--get", key.as_str()]) {
+            if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
                 let trimmed = upstream.trim();
                 if !trimmed.is_empty() {
                     return trimmed.to_string();
@@ -2437,17 +2472,73 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
             }
         }
     }
-    if let Ok(remotes) = git_text(repo, &["remote"]) {
-        let names: Vec<&str> = remotes
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if let [only] = names.as_slice() {
-            return (*only).to_string();
+    let configured = configured_remotes(&config);
+    let names: Vec<String> = if configured.is_empty() || has_legacy_remotes(repo) {
+        // `git remote` also lists `.git/remotes` and `.git/branches` entries,
+        // which no config key names; only it can count those.
+        match git_text(repo, &["remote"]) {
+            Ok(remotes) => remotes
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            Err(_) => Vec::new(),
         }
+    } else {
+        configured
+    };
+    if let [only] = names.as_slice() {
+        return only.clone();
     }
     "origin".to_string()
+}
+
+/// The effective config as `git config --list -z` prints it, last value of a
+/// key winning as it does for `git config --get`. Section and variable names
+/// arrive lowercased; a subsection keeps its case (`branch.Feature.remote`).
+pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, String> {
+    let text = ref_cache::git_text(repo, &[], &["config", "--list", "-z"])?;
+    Ok(parse_config_list(&text))
+}
+
+fn parse_config_list(text: &str) -> HashMap<String, String> {
+    text.split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('\n') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            // A key with no `=` at all, which `--get` prints as empty.
+            None => (entry.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// Remote names configured as `remote.<name>.<key>`, deduplicated. A name
+/// may itself contain dots, so it is everything between the section and the
+/// last component.
+fn configured_remotes(config: &HashMap<String, String>) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .keys()
+        .filter_map(|key| {
+            let rest = key.strip_prefix("remote.")?;
+            let (name, _variable) = rest.rsplit_once('.')?;
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Whether the repository still has pre-config remote definitions, which
+/// `git remote` lists and no config key shows.
+fn has_legacy_remotes(repo: &Path) -> bool {
+    let Ok((_private, common)) = crate::repository_trust::git_directories(repo) else {
+        return true;
+    };
+    ["remotes", "branches"].iter().any(|dir| {
+        std::fs::read_dir(common.join(dir)).is_ok_and(|mut entries| entries.next().is_some())
+    })
 }
 
 /// The primary remote, its HEAD symref, and the default base it resolves to:
@@ -2594,13 +2685,6 @@ struct MemoizedBase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DefaultBaseStamp(Vec<(std::path::PathBuf, Option<FileIdentity>)>);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FileIdentity {
-    inode: u64,
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
 impl DefaultBaseStamp {
     /// `None` when the git directories cannot be resolved: no stamp means no
     /// memo, never a stamp that matches by accident.
@@ -2624,39 +2708,17 @@ impl DefaultBaseStamp {
             dirs.truncate(64);
             paths.extend(dirs);
         }
-        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-            paths.push(home.join(".gitconfig"));
-            paths.push(home.join(".config").join("git").join("config"));
-        }
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
-            paths.push(xdg.join("git").join("config"));
-        }
+        paths.extend(ref_cache::user_config_paths());
         Some(Self(
             paths
                 .into_iter()
                 .map(|path| {
-                    let identity = std::fs::metadata(&path).ok().map(|meta| FileIdentity {
-                        inode: file_inode(&meta),
-                        len: meta.len(),
-                        modified: meta.modified().ok(),
-                    });
+                    let identity = FileIdentity::at(&path);
                     (path, identity)
                 })
                 .collect(),
         ))
     }
-}
-
-#[cfg(unix)]
-fn file_inode(meta: &std::fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::ino(meta)
-}
-
-/// Windows has no stable inode through `std`; size and mtime still move on
-/// every lockfile rename git performs.
-#[cfg(not(unix))]
-fn file_inode(_meta: &std::fs::Metadata) -> u64 {
-    0
 }
 
 /// Remote-tracking refname whose symref target marks the default branch.
@@ -2700,7 +2762,10 @@ fn pick_default_branch(local_names: &[String], remote_head: Option<&str>, remote
 const TAG_LIST_FORMAT: &str =
     "%(refname:short)%00%(objectname)%00%(contents:subject)%00%(*objectname)";
 
-const BRANCH_LIST_FORMAT: &str = "%(HEAD)%00%(refname)%00%(objectname)%00%(upstream:track)%00%(upstream:short)%00%(committerdate:unix)%00%(authorname)%00%(contents:subject)";
+/// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
+const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
+
+const BRANCH_LIST_FORMAT: &str ="%(HEAD)%00%(refname)%00%(objectname)%00%(upstream:track)%00%(upstream:short)%00%(committerdate:unix)%00%(authorname)%00%(contents:subject)";
 
 /// Resolves the default branch to (short name, commit oid) without needing
 /// the local ref list, so callers can use it before listing refs.
@@ -2816,7 +2881,7 @@ fn strip_remote_prefix<'a>(name: &'a str, remote: Option<&str>) -> &'a str {
 /// — pinned by `branch_refs_always_yield_two_counts` rather than assumed. It
 /// shares this parser anyway: two spellings of one atom is how the lenient
 /// side comes to mean "merged" for a branch nobody measured.
-fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
+pub(crate) fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
     let mut fields = raw.split_ascii_whitespace();
     let ahead = fields.next()?;
     let behind = fields.next()?;
@@ -2834,136 +2899,30 @@ struct BranchStatTarget {
     remote_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ComputedBranchChurn {
-    additions: usize,
-    deletions: usize,
-    files_changed: usize,
-    commits_ahead: usize,
-    commits_behind: usize,
-}
-
-const ZERO_CHURN: ComputedBranchChurn = ComputedBranchChurn {
-    additions: 0,
-    deletions: 0,
-    files_changed: 0,
-    commits_ahead: 0,
-    commits_behind: 0,
-};
-
-type ChurnKey = (String, String, String);
-
-/// Content-addressed memo for branch churn keyed by (repo path, base oid, tip
-/// oid): churn depends only on the two trees, so entries cannot go stale — a
-/// force-moved branch simply misses on its new tip.
-///
-/// Recency is a monotonic sequence, not a linear `retain` scan: re-insert is
-/// O(1) under the mutex (push a new order node, bump seq). Eviction pops
-/// stale order nodes until it finds a seq that still matches the map.
-struct ChurnCache {
-    capacity: usize,
-    seq: u64,
-    entries: HashMap<ChurnKey, (u64, ComputedBranchChurn)>,
-    order: VecDeque<(ChurnKey, u64)>,
-}
-
-impl ChurnCache {
-    fn new() -> Self {
-        Self {
-            capacity: CHURN_CACHE_CAPACITY,
-            seq: 0,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn get(&self, key: &ChurnKey) -> Option<ComputedBranchChurn> {
-        self.entries.get(key).map(|(_, value)| *value)
-    }
-
-    /// Inserts a value, refreshing the key's recency and evicting oldest-seq
-    /// keys past the capacity bound.
-    fn insert(&mut self, key: ChurnKey, value: ComputedBranchChurn) {
-        self.seq = self.seq.wrapping_add(1);
-        let seq = self.seq;
-        self.entries.insert(key.clone(), (seq, value));
-        self.order.push_back((key, seq));
-        self.evict_overflow();
-    }
-
-    fn evict_overflow(&mut self) {
-        while self.entries.len() > self.capacity {
-            let Some((key, seq)) = self.order.pop_front() else {
-                break;
-            };
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|(stored, _)| *stored == seq)
-            {
-                self.entries.remove(&key);
-            }
-        }
-        // Re-inserts leave stale order nodes; compact before the deque can
-        // grow without bound under a hot key.
-        if self.order.len() > self.capacity.saturating_mul(2) {
-            let mut live = VecDeque::with_capacity(self.entries.len());
-            for (key, seq) in self.order.drain(..) {
-                if self
-                    .entries
-                    .get(&key)
-                    .is_some_and(|(stored, _)| *stored == seq)
-                {
-                    live.push_back((key, seq));
-                }
-            }
-            self.order = live;
-        }
-    }
-}
-
-fn churn_cache() -> MutexGuard<'static, ChurnCache> {
-    static CACHE: OnceLock<Mutex<ChurnCache>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| Mutex::new(ChurnCache::new()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Looks up cache in bulk, computes unique uncached tips (capped), stores
-/// results, and returns an update per eligible branch we have a value for.
-/// The fifth tuple element counts attempted walks that FAILED — branches
-/// which will be missing from `updates` through error, not through capping.
+/// Looks up the churn store in bulk, computes unique uncached tips (capped),
+/// keeps the results, and returns an update per eligible branch we have a
+/// value for. The fifth tuple element counts attempted walks that FAILED —
+/// branches which will be missing from `updates` through error, not through
+/// capping.
 #[allow(clippy::type_complexity)]
 fn compute_eligible_churn(
     repo: &Path,
-    repo_key: &str,
     base_oid: &str,
     eligible: Vec<BranchStatTarget>,
 ) -> (Vec<BranchStatsUpdate>, usize, usize, bool, usize) {
-    let mut cached_hits: HashMap<String, ComputedBranchChurn> = HashMap::new();
-    let mut unique_uncached: Vec<String> = Vec::new();
-    let mut seen_miss: HashSet<String> = HashSet::new();
-
-    {
-        let cache = churn_cache();
-        for target in &eligible {
-            let tip = target.tip_commit_id.as_str();
-            if cached_hits.contains_key(tip) || seen_miss.contains(tip) {
-                continue;
-            }
-            let key = (
-                repo_key.to_string(),
-                base_oid.to_string(),
-                target.tip_commit_id.clone(),
-            );
-            if let Some(hit) = cache.get(&key) {
-                cached_hits.insert(target.tip_commit_id.clone(), hit);
-            } else if seen_miss.insert(target.tip_commit_id.clone()) {
-                unique_uncached.push(target.tip_commit_id.clone());
-            }
+    let inputs = churn_store::Inputs::read(repo, base_oid);
+    let mut unique_tips: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for target in &eligible {
+        if seen.insert(target.tip_commit_id.as_str()) {
+            unique_tips.push(target.tip_commit_id.clone());
         }
     }
+    let cached_hits = churn_store::lookup(&inputs, base_oid, &unique_tips);
+    let mut unique_uncached: Vec<String> = unique_tips
+        .into_iter()
+        .filter(|tip| !cached_hits.contains_key(tip))
+        .collect();
 
     let remaining_after = unique_uncached
         .len()
@@ -2977,21 +2936,30 @@ fn compute_eligible_churn(
     // in ~200 ms is still ~80 starts a second. It also ran them on rayon
     // workers, which do not inherit the caller's admission class. The gate's
     // rate cap is the backstop; this walk must not spend the burst in one tick.
-    let computed_map: HashMap<String, ComputedBranchChurn> = unique_uncached
+    // Every uncached tip's ahead/behind in one listing, where each tip used to
+    // cost its own `rev-list`; a tip the listing does not answer walks.
+    let counts = if unique_uncached.is_empty() {
+        HashMap::new()
+    } else {
+        tip_counts_against(repo, base_oid).unwrap_or_default()
+    };
+    let computed_map: HashMap<String, Churn> = unique_uncached
         .into_iter()
-        .filter_map(|tip| compute_branch_churn(repo, base_oid, &tip).map(|churn| (tip, churn)))
+        .filter_map(|tip| {
+            let pin = inputs.pin(&tip);
+            compute_branch_churn(
+                repo,
+                base_oid,
+                &tip,
+                counts.get(&tip).copied(),
+                pin.as_deref(),
+            )
+            .map(|churn| (tip, churn))
+        })
         .collect();
     let compute_failures = attempted.saturating_sub(computed_map.len());
 
-    {
-        let mut cache = churn_cache();
-        for (tip, churn) in &computed_map {
-            cache.insert(
-                (repo_key.to_string(), base_oid.to_string(), tip.clone()),
-                *churn,
-            );
-        }
-    }
+    churn_store::keep(repo, &inputs, base_oid, &computed_map);
 
     let mut updates = Vec::with_capacity(eligible.len());
     let mut computed = 0;
@@ -3022,11 +2990,47 @@ fn compute_eligible_churn(
     (updates, computed, cached, capped, compute_failures)
 }
 
+/// Ahead/behind of every branch and remote-tracking tip against `base_oid`,
+/// keyed by tip oid, from one `for-each-ref`. `None` when git cannot answer
+/// (the atom needs 2.42), which leaves each tip to its own walk.
+fn tip_counts_against(repo: &Path, base_oid: &str) -> Option<HashMap<String, (usize, usize)>> {
+    validate_oid(base_oid).ok()?;
+    let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
+    let text = ref_cache::git_text(
+        repo,
+        BRANCH_NAMESPACES,
+        &[
+            "for-each-ref",
+            format.as_str(),
+            "refs/heads/",
+            "refs/remotes/",
+        ],
+    )
+    .ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| {
+                let (tip, counts) = line.split_once('\0')?;
+                Some((tip.to_string(), parse_ahead_behind_pair(counts)?))
+            })
+            .collect(),
+    )
+}
+
 /// Computes diff churn between two validated ref names or full oids via
-/// `<base>...<tip>` (two git processes). Returns None when either side fails
-/// validation or git rejects the walk. Identical oids are mathematically
-/// zero — no subprocess is spawned.
-fn compute_branch_churn(repo: &Path, base: &str, branch: &str) -> Option<ComputedBranchChurn> {
+/// `<base>...<tip>`: one `diff --shortstat`, plus a `rev-list` for the commit
+/// counts unless `counts` (ahead, behind) already carries them. `pin` is the
+/// global option that reads attributes from the tip (see
+/// [`churn_store`]). Returns None when either side fails validation or git
+/// rejects the walk. Identical oids are mathematically zero — no subprocess is
+/// spawned.
+fn compute_branch_churn(
+    repo: &Path,
+    base: &str,
+    branch: &str,
+    counts: Option<(usize, usize)>,
+    pin: Option<&str>,
+) -> Option<Churn> {
     if validate_ref_name(base).is_err() || validate_ref_name(branch).is_err() {
         return None;
     }
@@ -3034,11 +3038,19 @@ fn compute_branch_churn(repo: &Path, base: &str, branch: &str) -> Option<Compute
         return Some(ZERO_CHURN);
     }
     let spec = format!("{}...{}", base, branch);
-    let shortstat = git_text(repo, &["diff", "--shortstat", &spec]).ok()?;
+    let mut args: Vec<&str> = pin.into_iter().collect();
+    args.extend(["diff", "--shortstat", spec.as_str()]);
+    let shortstat = git_text(repo, &args).ok()?;
     let churn = DiffChurn::parse_shortstat(&shortstat);
-    let counts = git_text(repo, &["rev-list", "--left-right", "--count", &spec]).ok()?;
-    let (behind, ahead) = git_cli::parse_left_right_count(&counts);
-    Some(ComputedBranchChurn {
+    let (ahead, behind) = match counts {
+        Some(known) => known,
+        None => {
+            let walked = git_text(repo, &["rev-list", "--left-right", "--count", &spec]).ok()?;
+            let (behind, ahead) = git_cli::parse_left_right_count(&walked);
+            (ahead, behind)
+        }
+    };
+    Some(Churn {
         additions: churn.additions,
         deletions: churn.deletions,
         files_changed: churn.files_changed,
@@ -3875,12 +3887,38 @@ fn parse_numstat(stdout: &str) -> HashMap<String, (usize, usize)> {
 /// whose numbers could not be trusted. Mirrors the coverage scanner's
 /// skip/skip-reason pattern: a row that would silently read as 0±0 carries
 /// the reason instead of laundering a broken diff into fact.
+#[derive(Default)]
 struct NumstatParse {
     churn: HashMap<String, (usize, usize)>,
     /// (path, reason) for every record whose add/del fields were not usable.
     /// Unattributable garbage (no recoverable path) cannot ride on any row
     /// and is dropped here — documented limitation, not hidden data.
     issues: Vec<(String, String)>,
+}
+
+/// How one porcelain row reads, decided once for both the numstat choice and
+/// the row itself so the two cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusKind {
+    conflicted: bool,
+    staged: bool,
+    untracked: bool,
+    /// A working-tree change, whose churn `git diff --numstat` measures. An
+    /// untracked row's `?` is not one: its lines are counted from the file.
+    work_changed: bool,
+}
+
+fn status_kind(index_status: char, work_status: char) -> StatusKind {
+    let conflicted = index_status == 'U'
+        || work_status == 'U'
+        || (index_status == 'A' && work_status == 'A')
+        || (index_status == 'D' && work_status == 'D');
+    StatusKind {
+        conflicted,
+        staged: !conflicted && index_status != ' ' && index_status != '?',
+        untracked: index_status == '?' && work_status == '?',
+        work_changed: work_status != ' ' && work_status != '?',
+    }
 }
 
 fn parse_numstat_with_issues(stdout: &str) -> NumstatParse {
@@ -4830,6 +4868,12 @@ mod tests {
         assert_eq!(resolve_default_remote(empty.path()), "origin");
     }
 
+    /// The one process every default-base computation starts and no cache can
+    /// answer: the primary remote's HEAD symref. The config reads before it go
+    /// through the ref cache, so counting them would count cache misses, not
+    /// computations.
+    const DEFAULT_BASE_MARKER: &str = "refs/remotes/origin/HEAD";
+
     /// One `hydrate` asks `list_branches`, `list_tags` and `branch_stats` in
     /// parallel, and each resolved the default base itself: five git processes
     /// apiece, measured at ~3x per refresh. Unchanged repository state must be
@@ -4843,7 +4887,7 @@ mod tests {
         let lookups = || {
             crate::engine::git_cli::spawn_log::spawns_in(&repo)
                 .iter()
-                .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+                .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
                 .count()
         };
         let before = lookups();
@@ -4888,7 +4932,7 @@ mod tests {
         let lookups = || {
             crate::engine::git_cli::spawn_log::spawns_in(&repo)
                 .iter()
-                .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+                .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
                 .count()
         };
         let refused = crate::engine::git_cli::with_forced_spawn_failure(|| default_base(&repo));
@@ -4955,7 +4999,7 @@ mod tests {
             move || {
                 crate::engine::git_cli::spawn_log::spawns_in(&repo)
                     .iter()
-                    .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+                    .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
                     .count()
             }
         };
@@ -5092,7 +5136,7 @@ mod tests {
         }
         let lookups = crate::engine::git_cli::spawn_log::spawns_in(&repo)
             .iter()
-            .filter(|argv| argv.iter().any(|arg| arg == "checkout.defaultRemote"))
+            .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
             .count();
         assert_eq!(lookups, 1);
     }
@@ -5322,56 +5366,6 @@ mod tests {
         assert_eq!(parse_ahead_behind_pair("2 1 0"), None);
         assert_eq!(parse_ahead_behind_pair("a b"), None);
         assert_eq!(parse_ahead_behind_pair("-1 2"), None);
-    }
-
-    #[test]
-    fn test_churn_cache_evicts_oldest_and_refreshes_on_reinsert() {
-        let churn = |additions| ComputedBranchChurn {
-            additions,
-            deletions: 0,
-            files_changed: 0,
-            commits_ahead: 0,
-            commits_behind: 0,
-        };
-        let key = |name: &str| (name.to_string(), "base".to_string(), "tip".to_string());
-        let mut cache = ChurnCache::new();
-        cache.capacity = 2;
-
-        cache.insert(key("a"), churn(1));
-        cache.insert(key("b"), churn(2));
-        cache.insert(key("b"), churn(22)); // re-insert refreshes recency
-        cache.insert(key("c"), churn(3)); // evicts "a"
-        assert!(cache.get(&key("a")).is_none());
-        assert_eq!(cache.get(&key("b")).map(|c| c.additions), Some(22));
-        assert_eq!(cache.get(&key("c")).map(|c| c.additions), Some(3));
-
-        cache.insert(key("d"), churn(4)); // evicts "b" (oldest after refresh)
-        assert!(cache.get(&key("b")).is_none());
-        assert!(cache.get(&key("c")).is_some());
-        assert!(cache.get(&key("d")).is_some());
-    }
-
-    #[test]
-    fn test_churn_cache_reinsert_stays_bounded() {
-        let mut cache = ChurnCache::new();
-        cache.capacity = 4;
-        let key = |i: usize| (format!("r{i}"), "base".to_string(), "tip".to_string());
-        for i in 0..10_000 {
-            cache.insert(key(i % 3), ZERO_CHURN);
-        }
-        assert!(cache.entries.len() <= 4);
-        assert!(
-            cache.order.len() <= 8,
-            "order grew to {}",
-            cache.order.len()
-        );
-
-        let mut full = ChurnCache::new();
-        for i in 0..CHURN_CACHE_CAPACITY + 400 {
-            full.insert((format!("repo-{i}"), "b".into(), "t".into()), ZERO_CHURN);
-        }
-        assert_eq!(full.entries.len(), CHURN_CACHE_CAPACITY);
-        assert!(full.order.len() <= CHURN_CACHE_CAPACITY * 2);
     }
 
     #[test]
@@ -7350,5 +7344,268 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             capped.is_mttr_approximation && full.is_mttr_approximation,
             "the restore time stays a heuristic either way; truncation is the added caveat"
         );
+    }
+
+    /// The two numstats run only when a row reads them, and skipping them
+    /// changes no number: every state below is checked against its expected
+    /// churn as well as against the processes it started.
+    #[test]
+    fn status_runs_only_the_numstats_its_rows_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("b.txt"), "x\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        let path = root.to_str().unwrap();
+        let numstats = || -> (usize, usize) {
+            let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
+            let cached = spawned
+                .iter()
+                .filter(|argv| {
+                    argv.iter().any(|a| a == "--numstat") && argv.iter().any(|a| a == "--cached")
+                })
+                .count();
+            let work = spawned
+                .iter()
+                .filter(|argv| {
+                    argv.iter().any(|a| a == "--numstat") && !argv.iter().any(|a| a == "--cached")
+                })
+                .count();
+            (work, cached)
+        };
+        let row = |rows: &[FileStatus], name: &str| -> (usize, usize, usize, usize) {
+            let r = rows.iter().find(|r| r.path == name).expect(name);
+            (
+                r.staged_additions.unwrap(),
+                r.staged_deletions.unwrap(),
+                r.unstaged_additions.unwrap(),
+                r.unstaged_deletions.unwrap(),
+            )
+        };
+
+        // Clean: neither.
+        let before = numstats();
+        assert!(GitReader::get_status(path).unwrap().is_empty());
+        assert_eq!(numstats(), before, "a clean tree ran a numstat");
+
+        // Untracked only: its lines are counted from the file, not a diff.
+        std::fs::write(root.join("new.txt"), "1\n2\n3\n").unwrap();
+        let before = numstats();
+        let rows = GitReader::get_status(path).unwrap();
+        assert_eq!(row(&rows, "new.txt"), (0, 0, 3, 0));
+        assert_eq!(numstats(), before, "untracked files need no numstat");
+
+        // Unstaged edit: the working numstat only.
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let before = numstats();
+        let rows = GitReader::get_status(path).unwrap();
+        assert_eq!(row(&rows, "a.txt"), (0, 0, 1, 0));
+        assert_eq!(numstats(), (before.0 + 1, before.1));
+
+        // Staged and unstaged: both.
+        crate::test_support::git_in(&root, &["add", "a.txt"]);
+        std::fs::write(root.join("b.txt"), "").unwrap();
+        let before = numstats();
+        let rows = GitReader::get_status(path).unwrap();
+        assert_eq!(row(&rows, "a.txt"), (1, 0, 0, 0));
+        assert_eq!(row(&rows, "b.txt"), (0, 0, 0, 1));
+        assert_eq!(numstats(), (before.0 + 1, before.1 + 1));
+
+        // Staged only: the cached numstat only.
+        std::fs::write(root.join("b.txt"), "x\n").unwrap();
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        let before = numstats();
+        let rows = GitReader::get_status(path).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(row(&rows, "a.txt"), (1, 0, 0, 0));
+        assert_eq!(numstats(), (before.0, before.1 + 1));
+    }
+
+    /// A conflicted row reads the working numstat although nothing is staged.
+    #[test]
+    fn a_conflicted_row_still_reads_the_working_numstat() {
+        assert!(status_kind('U', 'U').work_changed);
+        assert!(!status_kind('U', 'U').staged);
+        assert!(status_kind('A', 'A').conflicted);
+        assert!(!status_kind('?', '?').work_changed);
+        assert!(!status_kind('M', ' ').work_changed);
+        assert!(status_kind('M', ' ').staged);
+        assert!(status_kind(' ', 'M').work_changed);
+        assert!(!status_kind(' ', 'M').staged);
+    }
+
+    /// Cold branch stats: the commit counts come from one listing instead of a
+    /// `rev-list` per tip, they are what `rev-list` says, and a git that cannot
+    /// answer the listing gets the same numbers from the walks.
+    #[test]
+    fn branch_stats_reads_counts_from_one_listing_and_falls_back_to_walks() {
+        let build = || {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+            std::fs::write(root.join("base.txt"), "0\n").unwrap();
+            crate::test_support::git_in(&root, &["add", "."]);
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+            for (n, extra) in [(1, 1), (2, 3), (3, 2)] {
+                let branch = format!("topic-{n}");
+                crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+                for c in 0..extra {
+                    std::fs::write(root.join(format!("{branch}-{c}.txt")), "x\ny\n").unwrap();
+                    crate::test_support::git_in(&root, &["add", "."]);
+                    crate::test_support::git_in(
+                        &root,
+                        &["commit", "-q", "-m", &format!("{branch} {c}")],
+                    );
+                }
+            }
+            crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+            std::fs::write(root.join("base.txt"), "1\n").unwrap();
+            crate::test_support::git_in(&root, &["commit", "-q", "-am", "main moves"]);
+            (dir, root)
+        };
+        let walked_counts = |root: &Path, branch: &str| -> (usize, usize) {
+            let text = git_cli::git_text(
+                root,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("main...{branch}"),
+                ],
+            )
+            .unwrap();
+            let (behind, ahead) = git_cli::parse_left_right_count(&text);
+            (ahead, behind)
+        };
+        let summary = |report: &BranchStatsReport| -> Vec<(String, usize, usize, usize)> {
+            let mut rows: Vec<_> = report
+                .updates
+                .iter()
+                .map(|u| {
+                    (
+                        u.name.clone(),
+                        u.commits_ahead_of_base,
+                        u.commits_behind_base,
+                        u.additions,
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        let rev_lists = |root: &Path| {
+            git_cli::spawn_log::spawns_in(root)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "rev-list"))
+                .count()
+        };
+
+        let (_one, listed_root) = build();
+        let listed = GitReader::branch_stats(listed_root.to_str().unwrap()).unwrap();
+        assert_eq!(listed.computed, 3);
+        assert_eq!(
+            rev_lists(&listed_root),
+            0,
+            "a cold tip walked for its counts"
+        );
+        for (name, ahead, behind, _) in summary(&listed) {
+            assert_eq!(
+                (ahead, behind),
+                walked_counts(&listed_root, &name),
+                "{name}"
+            );
+        }
+
+        let (_two, walked_root) = build();
+        let base = git_cli::git_text(&walked_root, &["rev-parse", "main"]).unwrap();
+        let format = format!("--format=%(objectname)%00%(ahead-behind:{})", base.trim());
+        let walked = git_cli::with_forced_spawn_failure_of(&format, || {
+            GitReader::branch_stats(walked_root.to_str().unwrap())
+        })
+        .unwrap();
+        assert_eq!(
+            rev_lists(&walked_root),
+            3,
+            "one walk per tip when the listing fails"
+        );
+        assert_eq!(summary(&listed), summary(&walked));
+    }
+
+    /// What `git remote` would say, read from one config listing: a legacy
+    /// `.git/remotes` file still sends the count through `git remote`, a dotted
+    /// remote name is one name, and a branch subsection keeps its case.
+    #[test]
+    fn the_default_remote_reads_one_config_listing_and_still_sees_legacy_remotes() {
+        let dir = init_repo_with_remotes(&["upstream"], "Feature");
+        let repo = dir.path().canonicalize().unwrap();
+        let config_reads = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "config" || a == "remote"))
+                .count()
+        };
+        let before = config_reads();
+        assert_eq!(resolve_default_remote(&repo), "upstream");
+        assert_eq!(
+            config_reads() - before,
+            1,
+            "one config listing, no `git remote`"
+        );
+
+        git_in(&repo, &["config", "branch.Feature.remote", "fork.example"]);
+        git_in(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork.example",
+                "https://example.invalid/x.git",
+            ],
+        );
+        assert_eq!(
+            resolve_default_remote(&repo),
+            "fork.example",
+            "subsection case kept"
+        );
+        git_in(&repo, &["config", "--unset", "branch.Feature.remote"]);
+        assert_eq!(
+            resolve_default_remote(&repo),
+            "origin",
+            "two remotes, neither chosen"
+        );
+        git_in(&repo, &["remote", "remove", "fork.example"]);
+        assert_eq!(resolve_default_remote(&repo), "upstream");
+
+        // A legacy remote file: whether `git remote` counts it depends on the
+        // git (2.56 does not), so the answer must be whatever this git says,
+        // and it is `git remote` that is asked.
+        let legacy = repo.join(".git/remotes");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old"), "URL: https://example.invalid/old.git\n").unwrap();
+        let listed = crate::engine::git_cli::git_text(&repo, &["remote"]).unwrap();
+        let names: Vec<&str> = listed.lines().filter(|l| !l.trim().is_empty()).collect();
+        let expected = match names.as_slice() {
+            [only] => only.trim().to_string(),
+            _ => "origin".to_string(),
+        };
+        let remote_listings = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.last().is_some_and(|a| a == "remote"))
+                .count()
+        };
+        let before = remote_listings();
+        assert_eq!(resolve_default_remote(&repo), expected);
+        assert_eq!(remote_listings() - before, 1, "`git remote` was asked");
+    }
+
+    #[test]
+    fn config_listings_parse_last_value_wins_and_valueless_keys() {
+        let parsed = parse_config_list("core.bare\nfalse\0checkout.defaultremote\na\0checkout.defaultremote\nb\0flag.only\0remote.a.b.c.url\nx\0");
+        assert_eq!(parsed["checkout.defaultremote"], "b");
+        assert_eq!(parsed["flag.only"], "");
+        assert_eq!(configured_remotes(&parsed), vec!["a.b.c".to_string()]);
     }
 }

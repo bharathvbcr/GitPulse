@@ -18,7 +18,7 @@
 //! object id directly (git allows it there), so it addresses the exact commit
 //! and needs no index at all.
 
-use crate::engine::git_cli::{git_text, git_text_capped_shared, validate_repo};
+use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::DiffPayload;
 use crate::engine::git_writer::{repo_mutation_lock, validate_oid};
 use serde::{Deserialize, Serialize};
@@ -151,8 +151,9 @@ pub fn list(repo_path: &str) -> Result<StashList, String> {
 }
 
 fn list_in(repo: &Path) -> Result<StashList, String> {
-    let (raw, incomplete) = git_text_capped_shared(
+    let (raw, incomplete) = crate::engine::ref_cache::git_text_capped(
         repo,
+        &["refs/stash", "logs/refs/stash"],
         &[
             "stash",
             "list",

@@ -128,7 +128,7 @@
           case "cmd_branch_stats": return {};
           case "cmd_repo_operation": return null;
           case "cmd_workspace_sync": return null;
-          case "cmd_devcouncil_init": return {repo:args?.repoPath??"/fixture/GitPulse",state_dir:"/fixture/GitPulse/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],devmap_available:false};
+          case "cmd_devcouncil_init": return {repo:args?.repoPath??"/fixture/GitPulse",state_dir:"/fixture/GitPulse/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false};
           case "cmd_devmap_maybe_refresh": return {decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null};
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }

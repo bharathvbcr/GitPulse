@@ -747,3 +747,43 @@ mod process_trust;
 fn slow_status_fixture() {
     std::thread::sleep(Duration::from_secs(1));
 }
+
+/// The kernel's count of interrupt wakeups for `pid` — the figure Activity
+/// Monitor's "Idle Wake Ups" is built from.
+#[cfg(target_os = "macos")]
+fn interrupt_wakeups(pid: u32) -> u64 {
+    // SAFETY: `info` is a plain-data struct the kernel fills; the pointer is
+    // valid for the call and the flavor matches the struct's version.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            i32::try_from(pid).expect("pid fits"),
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+        )
+    };
+    assert_eq!(rc, 0, "proc_pid_rusage({pid})");
+    info.ri_interrupt_wkups
+}
+
+/// Regression: the watchdog and the input loop each slept a fixed 100 ms and
+/// woke whatever was pending — about 194 wakeups every 10 s per idle server,
+/// measured, with one server per agent session (74 alive on one host). Both
+/// now block until something happens: a request, a deadline, a broken wire.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_idle_server_does_not_wake_on_a_timer() {
+    let server = Server::start(&[]);
+    // Let startup (logging, limits, thread creation) settle first.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let pid = server.child.id();
+    let before = interrupt_wakeups(pid);
+    std::thread::sleep(Duration::from_secs(3));
+    let woke = interrupt_wakeups(pid) - before;
+    // The two ticks cost ~58 over three seconds; blocking waits cost ~0. The
+    // bound leaves room for stray scheduler noise, not for a periodic timer.
+    assert!(woke < 15, "an idle server woke {woke} times in 3s");
+    // And it still serves after the quiet stretch.
+    let (responses, _) = server.finish();
+    assert!(responses.is_empty(), "nothing was asked: {responses:?}");
+}

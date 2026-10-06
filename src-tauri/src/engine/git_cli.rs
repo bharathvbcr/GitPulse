@@ -324,6 +324,14 @@ fn git_command_with_env(
             .then(|| find_in_dirs("git", &dirs))
             .flatten()
     });
+    #[cfg(target_os = "macos")]
+    let program = program.map(|resolved| {
+        past_xcrun_git_shim(
+            resolved,
+            &REAL_GIT_DIRS.map(PathBuf::from),
+            &developer_dirs(),
+        )
+    });
     let mut cmd = Command::new(program.as_deref().unwrap_or_else(|| Path::new("git")));
     // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
     // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
@@ -473,7 +481,7 @@ fn git_captured_inner(
     stdin_bytes: Option<&[u8]>,
 ) -> Result<BoundedRun, String> {
     crate::repository_trust::require(repo)?;
-    let label = format!("git {}", args.first().unwrap_or(&""));
+    let label = format!("git {}", subcommand(args));
     run_bounded(
         git_command(Some(repo), args),
         &label,
@@ -675,6 +683,75 @@ fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
             .map(|name| dir.join(name))
             .find(|candidate| is_executable_file(candidate))
     })
+}
+
+/// Apple's `/usr/bin/git` is not git. It is the `xcrun` shim, which works out
+/// the active developer directory and then execs the real binary under it, on
+/// every call. `benches/process_spawn.rs` times `git rev-parse HEAD` with the
+/// child environment set here, interleaved: on an M-series host the shim's
+/// p50 was 7.9 ms, Homebrew's git 4.2 ms (-47%) and the developer-tools
+/// binary the shim execs 3.3 ms (-59%). Homebrew's is preferred anyway: it is
+/// the git a user installed on purpose, and usually newer. Every git read
+/// GitPulse makes is a spawn, so the shim roughly doubled the cost of each.
+/// SIP keeps `/usr/bin` read-only, so this path is always the shim.
+#[cfg(target_os = "macos")]
+const XCRUN_GIT_SHIM: &str = "/usr/bin/git";
+
+/// Package-manager directories whose `git` is preferred over the shim:
+/// Homebrew on Apple silicon, then Homebrew on Intel and other `/usr/local`
+/// installs. Deliberately not every GUI fallback directory — a stray `git` in
+/// `~/.cargo/bin` or `~/go/bin` is not one the user chose as their git.
+#[cfg(target_os = "macos")]
+const REAL_GIT_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// The developer directories `xcrun` itself would consult, most specific
+/// first: `DEVELOPER_DIR`, then the `xcode-select` choice (a symlink, so no
+/// spawn is needed to read it), then the Command Line Tools default.
+#[cfg(target_os = "macos")]
+fn developer_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("DEVELOPER_DIR").filter(|dir| !dir.is_empty()) {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Ok(dir) = std::fs::read_link("/var/db/xcode_select_link") {
+        dirs.push(dir);
+    }
+    dirs.push(PathBuf::from("/Library/Developer/CommandLineTools"));
+    dirs
+}
+
+/// `resolved`, unless it is the `xcrun` shim and a real git is installed:
+/// then a package-manager git from `real_git_dirs`, else the binary the shim
+/// would have exec'd from the first of `developer_dirs` that holds one. A
+/// git found earlier on `PATH` than `/usr/bin` is the user's choice and is
+/// returned untouched; so is the shim when no real git exists, because then
+/// the shim is what offers to install the developer tools.
+#[cfg(target_os = "macos")]
+fn past_xcrun_git_shim(
+    resolved: PathBuf,
+    real_git_dirs: &[PathBuf],
+    developer_dirs: &[PathBuf],
+) -> PathBuf {
+    let shim = Path::new(XCRUN_GIT_SHIM);
+    if resolved != shim {
+        return resolved;
+    }
+    let packaged = real_git_dirs.iter().map(|dir| dir.join("git"));
+    // `DEVELOPER_DIR` may name the `Xcode.app` bundle as well as its
+    // `Contents/Developer`; `xcrun` accepts both, so both are tried.
+    let developer = developer_dirs.iter().flat_map(|dir| {
+        [
+            dir.join("usr/bin/git"),
+            dir.join("Contents/Developer/usr/bin/git"),
+        ]
+    });
+    // A candidate that is a link back to the shim would cost exactly what the
+    // shim does, so it is judged by where it leads, not by its own name.
+    packaged
+        .chain(developer)
+        .filter(|candidate| candidate.is_absolute() && is_executable_file(candidate))
+        .find(|candidate| std::fs::canonicalize(candidate).is_ok_and(|target| target != shim))
+        .unwrap_or(resolved)
 }
 
 /// Executable suffixes tried on Windows, in the order `CreateProcess`'
@@ -1257,6 +1334,31 @@ const TIMEOUT_MARKER: &str = " timed out after ";
 /// declining to start more work under load, not git failing: it must never
 /// carry [`TIMEOUT_MARKER`], or every reader of the error calls it a hang.
 const DEFERRED_MARKER: &str = " deferred under load after ";
+
+/// The git command `args` runs, past any global options before it, for the
+/// labels that name a spawn in the gate's report and in errors. The first
+/// argument named `-c` for every read that set a config value, and an
+/// `--attr-source=<oid>` would have put an object id where a command belongs.
+pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    /// Global options whose value is the next argument.
+    const TAKES_VALUE: [&str; 6] = [
+        "-c",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+    ];
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if TAKES_VALUE.contains(arg) {
+            rest.next();
+        } else if !arg.starts_with('-') {
+            return arg;
+        }
+    }
+    ""
+}
 
 /// True when `err` is the gate declining to start a child under load. The
 /// command may succeed if asked again once load falls; it did not run.
@@ -1894,6 +1996,23 @@ fn grant_post_action_credit(repo: &Path, now: Instant) {
     );
 }
 
+/// Credits the reads a tab activation is about to make in `repo_path`, exactly
+/// as a mutation's follow-up refresh is credited. Trust-checked through
+/// [`validate_repo`] first, which also yields the canonical path the spawn
+/// side matches the credit on; an untrusted or missing repository earns none.
+///
+/// Switching tabs is a user action, but its hydrate is all reads, so it ran
+/// `Reactive` and queued behind whatever refresh traffic was spending the rate
+/// budget — the click the user was waiting on lost to work nobody was looking
+/// at. The same bounded credit keeps a scripted stream of activations from
+/// becoming unmetered: [`POST_ACTION_CREDIT_SPAWNS`] per activation, for
+/// [`POST_ACTION_CREDIT_WINDOW`], and only in that one repository.
+pub(crate) fn note_tab_activated(repo_path: &str) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
+    grant_post_action_credit(&repo, Instant::now());
+    Ok(())
+}
+
 /// Spends one credit for a spawn whose working directory is `cwd`.
 fn take_post_action_credit(cwd: &Path, now: Instant) -> bool {
     let mut credits = post_action_credits()
@@ -1996,6 +2115,93 @@ struct GateState {
     /// Decisions that could not consult the shared budget and fell back to
     /// this process's own (a lock held past its patience, an I/O error).
     shared_fallbacks: u64,
+    /// Admitted children by what they were (`git status`, `gh`, ...). The
+    /// class totals said the budget was spent; this says on what, which is
+    /// the question every refusal raised and no log could answer.
+    by_label: LabelCounts,
+}
+
+/// Admissions per spawn label, bounded so a stream of novel labels cannot
+/// grow it: past [`LabelCounts::MAX_LABELS`] distinct labels, the rest are
+/// counted under [`LabelCounts::OTHER`].
+#[derive(Default)]
+struct LabelCounts {
+    counts: HashMap<String, u64>,
+}
+
+impl LabelCounts {
+    const MAX_LABELS: usize = 64;
+    const OTHER: &'static str = "other";
+    /// Labels printed per report; the rest are summed into one figure.
+    const REPORTED: usize = 8;
+
+    fn note(&mut self, label: &str) {
+        let key = report_label(label);
+        if let Some(count) = self.counts.get_mut(&key) {
+            *count += 1;
+            return;
+        }
+        let key = if self.counts.len() >= Self::MAX_LABELS {
+            Self::OTHER.to_string()
+        } else {
+            key
+        };
+        *self.counts.entry(key).or_insert(0) += 1;
+    }
+
+    /// `top: git status=310 git for-each-ref=220 ... rest=41`, largest first,
+    /// ties by name so the line is stable.
+    fn report(&self) -> String {
+        if self.counts.is_empty() {
+            return "top: none".to_string();
+        }
+        let mut rows: Vec<(&String, &u64)> = self.counts.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let shown: Vec<String> = rows
+            .iter()
+            .take(Self::REPORTED)
+            .map(|(label, count)| format!("{label}={count}"))
+            .collect();
+        let rest: u64 = rows
+            .iter()
+            .skip(Self::REPORTED)
+            .map(|(_, count)| **count)
+            .sum();
+        if rest == 0 {
+            format!("top: {}", shown.join(" "))
+        } else {
+            format!("top: {} rest={rest}", shown.join(" "))
+        }
+    }
+}
+
+/// A spawn label reduced to what may be written to a diagnostics log: its
+/// first two words, each kept only if it looks like a program or subcommand
+/// name. A label is caller-built and could carry a path or a ref name; those
+/// become `…`, so attribution can never leak repository contents.
+fn report_label(label: &str) -> String {
+    let words: Vec<&str> = label
+        .split_whitespace()
+        .take(2)
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word.len() <= 32
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && !word.starts_with('.');
+            if plain {
+                word
+            } else {
+                "…"
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        "…".to_string()
+    } else {
+        words.join(" ")
+    }
 }
 
 impl SpawnGate {
@@ -2258,7 +2464,10 @@ impl SpawnGate {
             // A refused waiter must release its reservation.
             self.released.notify_all();
             if refusal != Refusal::Cancelled {
-                log_refusals(&counters, &sharing);
+                // Rendered only when the throttle lets a line out: refusals
+                // come in storms, and sorting the labels under the gate lock
+                // for every one would tax exactly the path being diagnosed.
+                log_refusals(&counters, &sharing, || self.label_report());
             }
             return Err(refusal);
         }
@@ -2275,6 +2484,24 @@ impl SpawnGate {
             gate: self,
             background,
         })
+    }
+
+    /// The `top: ...` attribution line, rendered under a brief lock.
+    fn label_report(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_label
+            .report()
+    }
+
+    /// Attributes one admitted child to its label for the gate report.
+    fn note_admitted_label(&self, label: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_label
+            .note(label);
     }
 
     fn note_coalesced(&self, class: Admission) {
@@ -2625,7 +2852,7 @@ fn close_shared_read(key: &SharedReadKey, flight: &Arc<SharedRead>) {
 /// failed action was a deferred refresh, shed background work or a timeout,
 /// and how much was admitted meanwhile. A real log entry rather than a line
 /// appended at export: the export's "empty log" verdict must stay true.
-fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str) {
+fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str, top: impl FnOnce() -> String) {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let now = Instant::now();
     {
@@ -2637,7 +2864,12 @@ fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str) {
         }
         *last = Some(now);
     }
-    log::warn!(target: "spawn_gate", "{}", format_gate_report(counters, sharing));
+    log::warn!(
+        target: "spawn_gate",
+        "{} | {}",
+        format_gate_report(counters, sharing),
+        top()
+    );
 }
 
 /// A decision that fell back to this process's own budget, logged with the
@@ -3018,6 +3250,7 @@ fn run_admitted_inner(
         })
         .map_err(|refusal| refusal_message(label, refusal))?,
     );
+    gate.note_admitted_label(label);
     on_admitted();
 
     // Slot wait is already bounded by `queue_deadline`. The child then gets
@@ -3300,7 +3533,7 @@ fn git_run_capped(
 /// still queued at the spawn gate share one child (see [`run_read_shared`]).
 /// Never for a command that can write — refs, index, config or worktree.
 pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let sub = args.first().unwrap_or(&"");
+    let sub = subcommand(args);
     let (bytes, incomplete) = git_run_inner(
         Some(repo),
         args,
@@ -3339,7 +3572,7 @@ fn git_run_inner(
     if let Some(repo) = repo {
         crate::repository_trust::require(repo)?;
     }
-    let sub = args.first().unwrap_or(&"");
+    let sub = subcommand(args);
     let label = format!("git {}", sub);
     let started = Instant::now();
     let mut attempts = 0;
@@ -3401,7 +3634,7 @@ fn git_timeout(
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
-    let sub = args.first().unwrap_or(&"");
+    let sub = subcommand(args);
     let (stdout, incomplete) = git_run(repo, args, timeout, stdin_bytes)?;
     if let Some(reason) = incomplete {
         return Err(incomplete_is_failure(sub, reason));
@@ -3770,6 +4003,91 @@ mod tests {
             assert!(report.contains(class.name()), "{report}");
         }
         assert!(report.ends_with("| budget=per-process"), "{report}");
+    }
+
+    #[test]
+    fn spawn_report_labels_never_carry_a_path_or_ref() {
+        for (label, expected) in [
+            ("git status", "git status"),
+            ("git for-each-ref", "git for-each-ref"),
+            ("gh", "gh"),
+            ("devmap status --json", "devmap status"),
+            ("git /Users/someone/private-repo", "git …"),
+            ("git refs/heads/secret-branch", "git …"),
+            ("git ../escape", "git …"),
+            ("git .hidden", "git …"),
+            ("git name with spaces", "git name"),
+            ("", "…"),
+            ("   ", "…"),
+            (&"x".repeat(33), "…"),
+            ("git sübcommand", "git …"),
+        ] {
+            assert_eq!(super::report_label(label), expected, "{label:?}");
+        }
+    }
+
+    #[test]
+    fn spawn_report_attribution_is_bounded_ordered_and_sums_the_rest() {
+        let mut counts = super::LabelCounts::default();
+        assert_eq!(counts.report(), "top: none");
+        for _ in 0..5 {
+            counts.note("git status");
+        }
+        for _ in 0..3 {
+            counts.note("git for-each-ref");
+        }
+        counts.note("gh");
+        counts.note("git /tmp/a");
+        counts.note("git /tmp/b");
+        // Sanitized labels merge rather than counting each path separately.
+        assert_eq!(
+            counts.report(),
+            "top: git status=5 git for-each-ref=3 git …=2 gh=1"
+        );
+
+        // A stream of novel labels cannot grow the map past its bound.
+        for i in 0..10_000 {
+            counts.note(&format!("tool{i}"));
+        }
+        assert!(counts.counts.len() <= super::LabelCounts::MAX_LABELS + 1);
+        let total: u64 = counts.counts.values().sum();
+        assert_eq!(total, 5 + 3 + 1 + 2 + 10_000, "no admission is dropped");
+        let report = counts.report();
+        assert!(report.starts_with("top: other="), "{report}");
+        assert!(report.contains(" rest="), "{report}");
+        // One `label=count` per reported label, plus `rest=`; labels may
+        // themselves contain a space ("git status"), so count the `=`.
+        assert_eq!(
+            report.matches('=').count(),
+            super::LabelCounts::REPORTED + 1,
+            "{report}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_spawns_are_attributed_to_their_label() {
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(4)));
+        for label in ["git status", "git status", "git log"] {
+            let mut cmd = Command::new("/usr/bin/true");
+            run_with_gate(
+                &mut cmd,
+                label,
+                Duration::from_secs(10),
+                None,
+                1024,
+                &mut (),
+                gate,
+            )
+            .expect("spawn");
+        }
+        let report = gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_label
+            .report();
+        assert_eq!(report, "top: git status=2 git log=1");
     }
 
     #[test]
@@ -4374,6 +4692,38 @@ mod tests {
         }
     }
 
+    /// A spawn is named by its command, not by the first global option before
+    /// it: the gate's report and every error used to say `git -c`.
+    #[test]
+    fn a_spawn_is_named_by_its_command_past_global_options() {
+        assert_eq!(subcommand(&["diff", "--shortstat"]), "diff");
+        assert_eq!(subcommand(&["-c", "core.quotepath=off", "diff"]), "diff");
+        assert_eq!(subcommand(&["--attr-source=0123abcd", "diff"]), "diff");
+        assert_eq!(subcommand(&["--no-pager", "-C", "/x", "log"]), "log");
+        assert_eq!(subcommand(&["-c"]), "");
+        assert_eq!(subcommand(&[]), "");
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-q"]);
+        crate::test_support::trust_repo(dir.path());
+        // `--quiet` makes git print nothing, so the error is the one built
+        // from the spawn's own name.
+        let err = git_text(
+            dir.path(),
+            &[
+                "-c",
+                "core.quotepath=off",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "no-such-ref",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("git rev-parse"), "{err}");
+        assert!(!err.contains("git -c"), "{err}");
+    }
+
     #[test]
     fn test_validate_repo_rejects_empty() {
         assert!(validate_repo("").is_err());
@@ -4584,7 +4934,10 @@ mod tests {
         } else {
             cmd.args(["-b", "main"]);
         }
-        let output = cmd.current_dir(dir.path()).output().expect("spawn git");
+        let output = cmd
+            .current_dir(dir.path())
+            .output_locked()
+            .expect("spawn git");
         assert!(
             output.status.success(),
             "git init failed: {}",
@@ -4923,6 +5276,120 @@ mod tests {
             .unwrap();
         let cmd = git_command_with_env(None, &["status"], Some(&path), None);
         assert_eq!(cmd.get_program(), second.join("git"));
+    }
+
+    /// Regression: a Finder-launched GitPulse inherits `/usr/bin:/bin:...`,
+    /// so every git read was spawned through Apple's `xcrun` shim at more
+    /// than twice the cost of the binary it execs, even with Homebrew's git
+    /// installed. Driven through the real launch path on this host.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn git_launch_never_spawns_through_the_xcrun_shim_when_a_real_git_exists() {
+        let shim = PathBuf::from(XCRUN_GIT_SHIM);
+        let real_exists = past_xcrun_git_shim(
+            shim.clone(),
+            &REAL_GIT_DIRS.map(PathBuf::from),
+            &developer_dirs(),
+        ) != shim;
+        let gui_path = std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin");
+        let cmd = git_command_with_env(None, &["--version"], Some(gui_path), None);
+        let program = Path::new(cmd.get_program());
+        if real_exists {
+            assert_ne!(
+                program,
+                Path::new(XCRUN_GIT_SHIM),
+                "spawned through the shim"
+            );
+            let out = std::process::Command::new(program)
+                .arg("--version")
+                .output_locked()
+                .expect("the chosen git runs");
+            assert!(out.status.success());
+            assert!(String::from_utf8_lossy(&out.stdout).starts_with("git version "));
+        } else {
+            assert_eq!(program, Path::new(XCRUN_GIT_SHIM));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn xcrun_shim_bypass_prefers_packaged_then_developer_git_and_nothing_else() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let exe = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let shim = PathBuf::from(XCRUN_GIT_SHIM);
+        let brew = root.join("brew");
+        let local = root.join("local");
+        let xcode = root.join("Xcode.app");
+        let clt = root.join("CommandLineTools");
+        let packaged = [brew.clone(), local.clone()];
+
+        // Nothing real installed: the shim stays, since it is what offers to
+        // install the developer tools.
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, std::slice::from_ref(&clt)),
+            shim
+        );
+
+        // Developer tools only; `DEVELOPER_DIR` may name the bundle itself.
+        exe(&xcode.join("Contents/Developer/usr/bin/git"));
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, &[xcode.clone(), clt.clone()]),
+            xcode.join("Contents/Developer/usr/bin/git")
+        );
+        exe(&clt.join("usr/bin/git"));
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, &[clt.clone(), xcode.clone()]),
+            clt.join("usr/bin/git"),
+            "developer dirs are tried in the order xcrun consults them"
+        );
+
+        // A packaged git outranks the developer tools, in directory order.
+        exe(&local.join("git"));
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, std::slice::from_ref(&clt)),
+            local.join("git")
+        );
+        exe(&brew.join("git"));
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, std::slice::from_ref(&clt)),
+            brew.join("git")
+        );
+
+        // A git the user put ahead of /usr/bin on PATH is never second-guessed.
+        let chosen = root.join("chosen/git");
+        assert_eq!(
+            past_xcrun_git_shim(chosen.clone(), &packaged, std::slice::from_ref(&clt)),
+            chosen
+        );
+
+        // Not executable, a directory, or a link back to the shim: skipped.
+        std::fs::set_permissions(brew.join("git"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(local.join("git")).unwrap();
+        std::fs::create_dir(local.join("git")).unwrap();
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, std::slice::from_ref(&clt)),
+            clt.join("usr/bin/git")
+        );
+        std::fs::remove_file(brew.join("git")).unwrap();
+        symlink(&shim, brew.join("git")).unwrap();
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &packaged, std::slice::from_ref(&clt)),
+            clt.join("usr/bin/git"),
+            "a link to the shim costs what the shim does"
+        );
+
+        // Relative entries resolve against the cwd, so they are never used.
+        let relative = [PathBuf::from("relative")];
+        assert_eq!(
+            past_xcrun_git_shim(shim.clone(), &relative, &[PathBuf::from("rel")]),
+            shim
+        );
     }
 
     #[cfg(unix)]
@@ -7704,6 +8171,48 @@ mod admission_scope_tests {
             extra <= refill,
             "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit (refill allows {refill})"
         );
+    }
+
+    /// Regression: a tab switch is a user action whose hydrate is all reads,
+    /// so it ran Reactive and was deferred behind refresh traffic for tabs
+    /// nobody was looking at. Activation now earns the post-action credit.
+    #[cfg(unix)]
+    #[test]
+    fn a_tab_activation_admits_its_hydrate_when_the_budget_is_spent() {
+        let dir = crate::test_support::git_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        reactive_spawn_in(gate, &repo).expect("the one token");
+        assert!(reactive_spawn_in(gate, &repo).is_err(), "budget spent");
+
+        note_tab_activated(repo.to_str().unwrap()).expect("activation");
+        for i in 0..POST_ACTION_CREDIT_SPAWNS {
+            reactive_spawn_in(gate, &repo)
+                .unwrap_or_else(|e| panic!("activation read {i} refused: {e}"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tab_activation_earns_nothing_for_an_untrusted_or_missing_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let untrusted = dir.path().canonicalize().unwrap();
+        // Not `test_support::git_in`: its `init` approves the fixture.
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&untrusted)
+            .status_locked()
+            .expect("git init");
+        assert!(status.success());
+        let refused = note_tab_activated(untrusted.to_str().unwrap()).unwrap_err();
+        assert!(crate::repository_trust::refused(&refused), "{refused}");
+        assert!(!take_post_action_credit(&untrusted, Instant::now()));
+
+        let missing = untrusted.join("gone");
+        assert!(note_tab_activated(missing.to_str().unwrap()).is_err());
+        assert!(!take_post_action_credit(&missing, Instant::now()));
+        assert!(note_tab_activated("relative/path").is_err());
+        assert!(note_tab_activated("").is_err());
     }
 
     #[test]

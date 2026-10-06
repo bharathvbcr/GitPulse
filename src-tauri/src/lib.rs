@@ -67,6 +67,9 @@ pub fn context<R: tauri::Runtime>() -> tauri::Context<R> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Only the app keeps branch churn on disk; agent servers, hooks and test
+    // processes, which never reach `run()`, keep it in memory.
+    engine::churn_store::persist_in_this_process();
     logging::init();
     #[cfg(not(test))]
     logging::install_panic_hook();
@@ -303,6 +306,7 @@ pub fn run() {
             cmd_stash_save,
             cmd_stash_pop,
             cmd_repo_operation,
+            cmd_note_tab_activated,
             cmd_last_fetch_at,
             cmd_repo_operation_action,
             cmd_stash_list,

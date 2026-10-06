@@ -273,7 +273,10 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     let ledger_status = crate::ledger::bindings::repository_status_readonly(repo)
         .map_err(|error| error.to_string())?;
     let codeintel_status = crate::codeintel::status(repo);
-    let worktrees = match crate::engine::worktree::list_worktrees(repo) {
+    let worktrees = match crate::engine::worktree::list_worktrees_scanned(
+        repo,
+        crate::engine::worktree::ScanDepth::Dirty,
+    ) {
         Ok(list) => {
             let total = list.len();
             let items: Vec<Value> = list

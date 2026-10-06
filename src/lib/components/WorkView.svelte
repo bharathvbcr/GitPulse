@@ -133,8 +133,10 @@
     previousRepo = repo;
     previousGeneration = generation;
     // A repo switch hydrates from cache so the last join is on screen
-    // immediately; a generation bump (status poll, mutation, watcher)
-    // refreshes in place so "clean" cannot outlive the working tree.
+    // immediately; a generation bump refreshes in place so "clean" cannot
+    // outlive the working tree. Only activation bumps it (re-activating this
+    // tab, or revealing it when a neighbour closes) — `refresh()`, the status
+    // poll and watcher events never do (repoStore `bumped()`).
     if (repoChanged) {
       const cached = repo ? workCache.get(repo) : undefined;
       untrack(() => {

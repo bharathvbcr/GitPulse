@@ -251,7 +251,7 @@ describe("codeintel client", () => {
       registry_root: "/a",
       registry_path: "/a/.devmap/workspace.json",
       repos: [{ name: "a", root: "/a", db: ".devmap/codeintel/devmap.sqlite", db_path: "/a/.devmap/codeintel/devmap.sqlite" }],
-      skipped_untrusted: [],
+      skipped_untrusted: [], skipped_unavailable: [],
     });
     await syncWorkspaceTabs("/a", ["/a", "/b"]);
     expect(invoke).toHaveBeenCalledWith("cmd_workspace_sync", {
@@ -277,7 +277,7 @@ describe("codeintel client", () => {
       semantic: true,
     });
 
-    vi.mocked(invoke).mockResolvedValueOnce({ version: 1, registry_root: "/a", registry_path: "/a/.devmap/workspace.json", repos: [], skipped_untrusted: [] });
+    vi.mocked(invoke).mockResolvedValueOnce({ version: 1, registry_root: "/a", registry_path: "/a/.devmap/workspace.json", repos: [], skipped_untrusted: [], skipped_unavailable: [] });
     await listWorkspaceRepos("/a");
     expect(invoke).toHaveBeenCalledWith("cmd_workspace_list", { registryRoot: "/a" });
 

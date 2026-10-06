@@ -569,6 +569,35 @@ pub fn default_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// Where the platform keeps GitPulse state that can be rebuilt at any time:
+/// deleting it costs recomputation, never data. Derived from the per-user
+/// home like [`default_config_dir`], never `temp_dir()`, which agent hosts
+/// commonly make private per process.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("GitPulse")
+        })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("GitPulse").join("Cache"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .map(|base| base.join("gitpulse"))
+    }
+}
+
 pub fn config_path() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var(TOOL_CONFIG_ENV) {
         if explicit.is_empty() {

@@ -13,7 +13,7 @@
 use crate::engine::git_cli::{git, git_captured, git_captured_with_stdin, validate_repo};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub const VERIFICATION_NOTES_REF: &str = "refs/notes/gitpulse/verification";
@@ -133,10 +133,167 @@ fn read_note<T: DeserializeOwned>(
             reason.describe()
         ));
     }
-    let text = String::from_utf8_lossy(&run.stdout);
+    decode_note(notes_ref, commit_sha, &run.stdout)
+}
+
+/// A note's bytes as this app's JSON. One owner for `notes show` and for a
+/// blob read in a batch, so the two can never disagree about a note.
+fn decode_note<T: DeserializeOwned>(
+    notes_ref: &str,
+    commit_sha: &str,
+    bytes: &[u8],
+) -> Result<Option<T>, String> {
+    let text = String::from_utf8_lossy(bytes);
     serde_json::from_str::<T>(text.trim())
         .map(Some)
         .map_err(|e| format!("the note on {notes_ref} for {commit_sha} did not decode: {e}"))
+}
+
+/// Reads note blobs in one `git cat-file --batch`, where each noted commit used
+/// to cost a `git notes show`.
+///
+/// Every answer is taken by the size git declares, never by lines: a note may
+/// hold any byte, newlines included. A blob git reports missing, an answer that
+/// names another object, and a stream that stops short are each an `Err` for
+/// the blobs they leave unread, never an empty note.
+fn read_note_blobs(repo: &Path, oids: &[String]) -> HashMap<String, Result<Vec<u8>, String>> {
+    let mut answers: HashMap<String, Result<Vec<u8>, String>> = HashMap::new();
+    let mut sent: Vec<&str> = Vec::new();
+    let mut query = String::new();
+    for oid in oids {
+        if answers.contains_key(oid) || sent.contains(&oid.as_str()) {
+            continue;
+        }
+        let shaped = matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit());
+        if !shaped {
+            answers.insert(oid.clone(), Err(format!("{oid:?} is not a note blob id")));
+            continue;
+        }
+        query.push_str(oid);
+        query.push('\n');
+        sent.push(oid);
+    }
+    if sent.is_empty() {
+        return answers;
+    }
+    let run = match git_captured_with_stdin(repo, &["cat-file", "--batch"], query.as_bytes()) {
+        Ok(run) => run,
+        Err(e) => {
+            unread(
+                &mut answers,
+                &sent,
+                &format!("could not run git cat-file: {e}"),
+            );
+            return answers;
+        }
+    };
+    if !run.success {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        unread(
+            &mut answers,
+            &sent,
+            &format!("git cat-file --batch failed: {stderr}"),
+        );
+        return answers;
+    }
+    if let Some(reason) = &run.incomplete {
+        unread(
+            &mut answers,
+            &sent,
+            &format!("git cat-file {}", reason.describe()),
+        );
+        return answers;
+    }
+
+    read_batch_answers(&run.stdout, &sent, &mut answers);
+    answers
+}
+
+/// Where a body of the declared `size` starting at `pos` ends, if the stream
+/// holds all of it and the newline git writes after it. A size is the
+/// stream's own claim, so it is never trusted to fit in `usize` arithmetic.
+fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
+    let end = pos.checked_add(size.parse::<usize>().ok()?)?;
+    (out.get(end) == Some(&b'\n')).then_some(end)
+}
+
+/// Marks every blob in `rest` unread for the same reason.
+fn unread(answers: &mut HashMap<String, Result<Vec<u8>, String>>, rest: &[&str], why: &str) {
+    for oid in rest {
+        answers.insert((*oid).to_string(), Err(why.to_string()));
+    }
+}
+
+/// Splits a `cat-file --batch` stream into the answers to `sent`, in order.
+/// Once the stream is out of step with its questions, nothing after that
+/// point is attributed to any of them.
+fn read_batch_answers(
+    out: &[u8],
+    sent: &[&str],
+    answers: &mut HashMap<String, Result<Vec<u8>, String>>,
+) {
+    let mut pos = 0usize;
+    for (index, oid) in sent.iter().enumerate() {
+        let Some(end) = out[pos..].iter().position(|&b| b == b'\n') else {
+            unread(
+                answers,
+                &sent[index..],
+                "git cat-file answered nothing for this note",
+            );
+            return;
+        };
+        let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
+        pos += end + 1;
+        let fields: Vec<&str> = header.split(' ').collect();
+        if fields.first() != Some(oid) {
+            // Every later answer is now out of step with its question.
+            unread(
+                answers,
+                &sent[index..],
+                &format!("git cat-file answered {header:?} for note blob {oid}"),
+            );
+            return;
+        }
+        let answer = match fields.as_slice() {
+            [_, "blob", size] => match body_end(out, pos, size) {
+                Some(end) => {
+                    let content = out[pos..end].to_vec();
+                    pos = end + 1;
+                    Ok(content)
+                }
+                None => {
+                    unread(
+                        answers,
+                        &sent[index..],
+                        &format!("git cat-file cut the note blob {oid} short"),
+                    );
+                    return;
+                }
+            },
+            [_, "missing"] => Err(format!(
+                "the note blob {oid} is missing from this repository"
+            )),
+            [_, kind, size] => match body_end(out, pos, size) {
+                // Skipped by its size so the next answer stays in step.
+                Some(end) => {
+                    pos = end + 1;
+                    Err(format!("{oid} is a {kind}, not a note blob"))
+                }
+                None => {
+                    unread(
+                        answers,
+                        &sent[index..],
+                        &format!("git cat-file answered {header:?}"),
+                    );
+                    return;
+                }
+            },
+            _ => Err(format!(
+                "git cat-file answered {header:?} for note blob {oid}"
+            )),
+        };
+        answers.insert((*oid).to_string(), answer);
+    }
 }
 
 /// Appends or replaces a verification note for a commit.
@@ -222,51 +379,20 @@ pub fn compute_freshness(
         Err(e) => return ProvenanceFreshness::unexamined(commit_sha, e),
     };
 
-    // Resolved before anything is measured or read. A revision this repository
-    // cannot name has no note to read and no distance to measure, and there is
-    // no half-answer worth spending two subprocesses on: it is unexamined, and
-    // says so.
-    let sha = match resolve_rev(&repo, commit_sha) {
-        Ok(sha) => sha,
-        Err(reason) => return ProvenanceFreshness::unexamined(commit_sha, reason),
-    };
-
-    // Every failure yields `None` with a reason, never 0 — see
-    // `measure_distance`, which owns that rule for both this and the batch
-    // path so the two can never drift into disagreeing about it. A base that
-    // will not resolve costs the distance and nothing else: the notes on this
-    // commit are still real, and still readable.
-    let (distance, unmeasured_reason) = match resolve_base(&repo, base_branch) {
-        Ok(base) => measure_distance(&repo, &sha, &base),
-        Err(reason) => (None, reason),
-    };
-
-    let confidence = distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32));
-    let is_fresh = distance == Some(0);
-
-    // `git notes show` exits non-zero both for "this commit has no note" and
-    // for "the notes ref could not be read", so the read alone cannot tell the
-    // two apart. Listing the refs can, and that distinction is the difference
-    // between an unverified commit and an unexamined one.
-    let listable = noted_commits(&repo, VERIFICATION_NOTES_REF).is_ok()
-        && noted_commits(&repo, SESSION_NOTES_REF).is_ok();
-    let verification = read_note::<VerificationNote>(&repo, VERIFICATION_NOTES_REF, &sha);
-    let session = read_note::<SessionEpisodeNote>(&repo, SESSION_NOTES_REF, &sha);
-    // A read that failed is not an absence. Folding it into `None` while still
-    // claiming the notes were readable is precisely the lie this flag exists
-    // to prevent, so either failing read clears it.
-    let notes_readable = listable && verification.is_ok() && session.is_ok();
-
-    ProvenanceFreshness {
-        commit_sha: commit_sha.to_string(),
-        distance,
-        confidence,
-        is_fresh,
-        unmeasured_reason,
-        notes_readable,
-        verification: verification.unwrap_or(None),
-        session: session.unwrap_or(None),
-    }
+    // The batch's own rows, asked for one revision, with a commit that
+    // carries no note measured rather than skipped (see [`Unnoted`]). One
+    // owner is what keeps the two paths from disagreeing; it also reads a
+    // note only where the listing says there is one, and resolves the base
+    // in the same `cat-file` as the commit.
+    let asked = [commit_sha.to_string()];
+    let mut row = freshness_rows(&repo, &asked, base_branch, 1, Unnoted::Measure)
+        .pop()
+        .unwrap_or_else(|| {
+            ProvenanceFreshness::unexamined(commit_sha, "the measurement answered nothing")
+        });
+    // Answered under the caller's own spelling, as this path always has.
+    row.commit_sha = commit_sha.to_string();
+    row
 }
 
 #[cfg(test)]
@@ -611,7 +737,7 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
 /// Returns `Err` when the listing itself failed. A ref that does not exist yet
 /// is not a failure — it is a repository where nothing has been noted, and
 /// answers an empty set.
-fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashSet<String>, String> {
+fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>, String> {
     let ref_arg = ref_arg(notes_ref);
     let run = git_captured(repo, &["notes", &ref_arg, "list"])?;
 
@@ -619,7 +745,7 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashSet<String>, String
         let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
         // "no note found" / a missing ref is absence, not failure.
         if stderr.contains("Cannot load notes ref") || stderr.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(HashMap::new());
         }
         return Err(format!("git notes list failed: {stderr}"));
     }
@@ -633,11 +759,12 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashSet<String>, String
         ));
     }
 
+    // `<note blob> <annotated commit>`, one per line.
     Ok(String::from_utf8_lossy(&run.stdout)
         .lines()
         .filter_map(|line| {
             line.split_once(' ')
-                .map(|(_, commit)| commit.trim().to_string())
+                .map(|(blob, commit)| (commit.trim().to_string(), blob.trim().to_string()))
         })
         .collect())
 }
@@ -746,18 +873,65 @@ pub fn freshness_batch_within(
                 .collect()
         }
     };
-    let resolved = resolve_revisions(&repo, revisions, MAX_RESOLVED_PER_BATCH);
+    freshness_rows(&repo, revisions, base_branch, budget, Unnoted::Skip)
+}
+
+/// What a row does with a commit that carries no provenance note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unnoted {
+    /// Answer it unmeasured: the branch and pull-request lists badge many
+    /// rows, and a commit nobody verified has no verification to decay.
+    Skip,
+    /// Measure it anyway: one commit is in front of the reader, and "how far
+    /// has the base moved since this" is a fair question either way.
+    Measure,
+}
+
+/// Resolves `revisions` and the base in one `git cat-file` when the batch has
+/// room for one more line, which it does for every request short of the
+/// resolution cap.
+fn resolve_with_base(
+    repo: &Path,
+    revisions: &[String],
+    base_branch: Option<&str>,
+) -> (Vec<Result<String, String>>, Result<String, String>) {
+    if revisions.len() >= MAX_RESOLVED_PER_BATCH {
+        return (
+            resolve_revisions(repo, revisions, MAX_RESOLVED_PER_BATCH),
+            resolve_base(repo, base_branch),
+        );
+    }
+    let base_name = base_branch.unwrap_or(DEFAULT_BASE);
+    let mut asked = revisions.to_vec();
+    asked.push(base_name.to_string());
+    let mut answers = resolve_revisions(repo, &asked, MAX_RESOLVED_PER_BATCH);
+    let base = answers
+        .pop()
+        .unwrap_or_else(|| Err(format!("git cat-file answered nothing for {base_name:?}")))
+        .map_err(|reason| {
+            format!("not measured: base {base_name:?} could not be resolved: {reason}")
+        });
+    (answers, base)
+}
+
+/// The rows both [`compute_freshness`] and [`freshness_batch`] answer with.
+fn freshness_rows(
+    repo: &Path,
+    revisions: &[String],
+    base_branch: Option<&str>,
+    budget: usize,
+    unnoted: Unnoted,
+) -> Vec<ProvenanceFreshness> {
     // One base for the whole batch, resolved once. Every row measured against
-    // an unresolvable base reports the same reason rather than a number, which
-    // is what keeps the batch's answer identical to the single-commit path's.
-    let base = resolve_base(&repo, base_branch);
+    // an unresolvable base reports the same reason rather than a number.
+    let (resolved, base) = resolve_with_base(repo, revisions, base_branch);
 
     // A failed listing is carried into every entry's reason rather than
     // silently becoming an empty set: "this repository has no verification
     // notes" and "we could not read its notes" are different facts, and only
     // the first one means the commits are genuinely unverified.
-    let verified = noted_commits(&repo, VERIFICATION_NOTES_REF);
-    let sessioned = noted_commits(&repo, SESSION_NOTES_REF);
+    let verified = noted_commits(repo, VERIFICATION_NOTES_REF);
+    let sessioned = noted_commits(repo, SESSION_NOTES_REF);
     let listing_error = match (&verified, &sessioned) {
         (Err(e), _) | (_, Err(e)) => Some(e.clone()),
         _ => None,
@@ -765,65 +939,129 @@ pub fn freshness_batch_within(
     let verified = verified.unwrap_or_default();
     let sessioned = sessioned.unwrap_or_default();
 
+    // First pass: what each row needs. Notes are not read yet, so every blob
+    // the measured rows need can be fetched in one process below.
     let mut measured = 0usize;
-    resolved
+    let plans: Vec<RowPlan> = resolved
         .into_iter()
         .zip(revisions)
         .map(|(resolution, rev)| {
             let sha = match resolution {
                 Ok(sha) => sha,
-                Err(reason) => return ProvenanceFreshness::unexamined(rev.clone(), reason),
+                Err(reason) => {
+                    return RowPlan::Done(Box::new(ProvenanceFreshness::unexamined(
+                        rev.clone(),
+                        reason,
+                    )))
+                }
             };
 
-            let has_verification = verified.contains(&sha);
-            let has_session = sessioned.contains(&sha);
+            // Without a listing, which commits carry a note is unknown. The
+            // batch cannot measure what it cannot select; a single commit is
+            // still measured and both notes asked for directly, but the
+            // answer never claims the notes were read.
+            let (verification, session) = match (&listing_error, unnoted) {
+                (Some(err), Unnoted::Skip) => {
+                    return RowPlan::Done(Box::new(ProvenanceFreshness::unexamined(
+                        sha,
+                        err.clone(),
+                    )))
+                }
+                (Some(_), Unnoted::Measure) => (NoteSource::Ask, NoteSource::Ask),
+                (None, _) => (
+                    NoteSource::listed(verified.get(&sha)),
+                    NoteSource::listed(sessioned.get(&sha)),
+                ),
+            };
 
-            if let Some(err) = &listing_error {
-                return ProvenanceFreshness::unexamined(sha, err.clone());
-            }
-
-            if !has_verification && !has_session {
-                return ProvenanceFreshness::unmeasured(
+            if verification == NoteSource::Absent
+                && session == NoteSource::Absent
+                && unnoted == Unnoted::Skip
+            {
+                return RowPlan::Done(Box::new(ProvenanceFreshness::unmeasured(
                     sha,
                     "not measured: this commit carries no provenance note",
-                );
+                )));
             }
 
             if measured >= budget {
-                return ProvenanceFreshness::unmeasured(
+                return RowPlan::Done(Box::new(ProvenanceFreshness::unmeasured(
                     sha,
                     format!("not measured: past this request's budget of {budget} noted commits"),
-                );
+                )));
             }
             measured += 1;
+            RowPlan::Measure {
+                sha,
+                verification,
+                session,
+            }
+        })
+        .collect();
 
+    // Second pass: every listed note blob the measured rows read, at once.
+    let wanted: Vec<String> = plans
+        .iter()
+        .flat_map(|plan| match plan {
+            RowPlan::Measure {
+                verification,
+                session,
+                ..
+            } => [verification.blob(), session.blob()],
+            RowPlan::Done(_) => [None, None],
+        })
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    let blobs = if wanted.is_empty() {
+        HashMap::new()
+    } else {
+        read_note_blobs(repo, &wanted)
+    };
+
+    // Third pass: measure and assemble.
+    plans
+        .into_iter()
+        .map(|plan| {
+            let (sha, verification, session) = match plan {
+                RowPlan::Done(row) => return *row,
+                RowPlan::Measure {
+                    sha,
+                    verification,
+                    session,
+                } => (sha, verification, session),
+            };
             let (distance, unmeasured_reason) = match &base {
-                Ok(base) => measure_distance(&repo, &sha, base),
+                Ok(base) => measure_distance(repo, &sha, base),
                 Err(reason) => (None, reason.clone()),
             };
             // The listing says these notes are there. A read that fails now is
             // a note we could not get at, so the entry says the notes were not
             // readable rather than handing back a `None` that reads as "this
             // commit was never verified".
-            let verification = if has_verification {
-                read_note::<VerificationNote>(&repo, VERIFICATION_NOTES_REF, &sha)
-            } else {
-                Ok(None)
-            };
-            let session = if has_session {
-                read_note::<SessionEpisodeNote>(&repo, SESSION_NOTES_REF, &sha)
-            } else {
-                Ok(None)
-            };
-            let unreadable = match (&verification, &session) {
-                (Err(e), _) | (_, Err(e)) => Some(e.clone()),
+            let verification =
+                verification.read::<VerificationNote>(repo, VERIFICATION_NOTES_REF, &sha, &blobs);
+            let session = session.read::<SessionEpisodeNote>(repo, SESSION_NOTES_REF, &sha, &blobs);
+            let unreadable = match (&listing_error, &verification, &session) {
+                (Some(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Some(e.clone()),
                 _ => None,
             };
             if let Some(reason) = unreadable {
+                // One commit in front of the reader keeps the note that was
+                // read: a broken sessions ref does not make a verification
+                // that loaded any less real, and `notes_readable: false` says
+                // the rest is missing. A badge row keeps neither, as it
+                // always has.
+                let (verification, session) = match unnoted {
+                    Unnoted::Measure => (verification.unwrap_or(None), session.unwrap_or(None)),
+                    Unnoted::Skip => (None, None),
+                };
                 return ProvenanceFreshness {
                     distance,
                     confidence: distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32)),
                     is_fresh: distance == Some(0),
+                    verification,
+                    session,
                     ..ProvenanceFreshness::unexamined(sha, reason)
                 };
             }
@@ -840,6 +1078,63 @@ pub fn freshness_batch_within(
             }
         })
         .collect()
+}
+
+/// One row before its notes are read.
+enum RowPlan {
+    /// Boxed: a finished row is several times the size of a plan to measure.
+    Done(Box<ProvenanceFreshness>),
+    Measure {
+        sha: String,
+        verification: NoteSource,
+        session: NoteSource,
+    },
+}
+
+/// Where one row's note comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NoteSource {
+    /// The listing says there is none.
+    Absent,
+    /// The listing names the blob it lives in.
+    Blob(String),
+    /// No listing to consult: ask `git notes show` directly.
+    Ask,
+}
+
+impl NoteSource {
+    fn listed(blob: Option<&String>) -> Self {
+        blob.map_or(Self::Absent, |oid| Self::Blob(oid.clone()))
+    }
+
+    fn blob(&self) -> Option<&str> {
+        match self {
+            Self::Blob(oid) => Some(oid),
+            Self::Absent | Self::Ask => None,
+        }
+    }
+
+    fn read<T: DeserializeOwned>(
+        &self,
+        repo: &Path,
+        notes_ref: &str,
+        sha: &str,
+        blobs: &HashMap<String, Result<Vec<u8>, String>>,
+    ) -> Result<Option<T>, String> {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Ask => read_note(repo, notes_ref, sha),
+            Self::Blob(oid) => match blobs.get(oid) {
+                Some(Ok(bytes)) => decode_note(notes_ref, sha, bytes),
+                Some(Err(reason)) => Err(format!(
+                    "the note on {notes_ref} for {sha} could not be read: {reason}"
+                )),
+                None => Err(format!(
+                    "the note on {notes_ref} for {sha} was not read: its blob was never asked for"
+                )),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1100,7 +1395,7 @@ mod batch_tests {
         let repo = Repo::new(1);
         assert_eq!(
             noted_commits(repo.path(), VERIFICATION_NOTES_REF),
-            Ok(std::collections::HashSet::new())
+            Ok(std::collections::HashMap::new())
         );
     }
 
@@ -1396,6 +1691,207 @@ mod batch_tests {
             f.unmeasured_reason.contains("no-such-base"),
             "the reason must name the base that could not be resolved, got {:?}",
             f.unmeasured_reason
+        );
+    }
+
+    /// Opening one commit used to cost seven processes: the commit and the
+    /// base resolved separately, both notes refs listed, both notes asked for
+    /// whether or not the listing had them, and the distance. A note the
+    /// listing does not have is no longer asked for, and the base rides the
+    /// commit's `cat-file`.
+    #[test]
+    fn a_single_commit_spends_a_process_only_on_what_it_reads() {
+        let repo = Repo::new(3);
+        let root = repo.path().canonicalize().unwrap();
+        let spawned = || crate::engine::git_cli::spawn_log::spawns_in(&root);
+
+        let unnoted = repo.rev("HEAD~1");
+        let before = spawned().len();
+        let answer = compute_freshness(repo.as_str(), &unnoted, Some("main"));
+        assert_eq!(
+            answer.distance,
+            Some(1),
+            "an unnoted commit is still measured here"
+        );
+        assert!(answer.notes_readable);
+        let used = &spawned()[before..];
+        assert_eq!(used.len(), 4, "{used:?}");
+        assert!(
+            !used.iter().any(|argv| argv.iter().any(|a| a == "show")),
+            "{used:?}"
+        );
+
+        repo.verify("HEAD~2", "passed");
+        let noted = repo.rev("HEAD~2");
+        let before = spawned().len();
+        let answer = compute_freshness(repo.as_str(), &noted, Some("main"));
+        assert!(answer.verification.is_some());
+        let used = &spawned()[before..];
+        let count = |needle: &str| {
+            used.iter()
+                .filter(|argv| argv.iter().any(|a| a == needle))
+                .count()
+        };
+        // The note the listing has, read by the blob it named.
+        assert_eq!(count("show"), 0, "{used:?}");
+        assert_eq!(count("--batch"), 1, "{used:?}");
+        assert_eq!(used.len(), 5, "{used:?}");
+    }
+
+    /// Answers are taken by size, so a note holding newlines, a fake header
+    /// line or a NUL cannot shift the next answer. A missing blob and an
+    /// object that is not a blob are reported, and the stream stays in step
+    /// past both.
+    /// Streams no working git prints: an answer naming another object, a size
+    /// past the end of memory, and a stream that stops between answers. Each
+    /// leaves its blob and every later one unread rather than misattributed,
+    /// and none panics.
+    #[test]
+    fn a_batch_stream_out_of_step_attributes_nothing_after_the_fault() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let sent = [a.as_str(), b.as_str(), c.as_str()];
+        let read = |stream: &[u8]| {
+            let mut answers = HashMap::new();
+            read_batch_answers(stream, &sent, &mut answers);
+            assert_eq!(answers.len(), 3, "every blob is answered");
+            answers
+        };
+
+        let swapped = format!("{a} blob 2\nhi\n{c} blob 2\nno\n{b} blob 2\nno\n");
+        let answers = read(swapped.as_bytes());
+        assert_eq!(answers[&a], Ok(b"hi".to_vec()));
+        for oid in [&b, &c] {
+            let err = answers[oid].as_ref().unwrap_err();
+            assert!(err.contains("answered") && err.contains(&c), "{oid}: {err}");
+        }
+
+        let huge = format!("{a} blob {}\nhi\n", usize::MAX);
+        let answers = read(huge.as_bytes());
+        assert!(answers[&a].as_ref().unwrap_err().contains("short"));
+        let huge_tree = format!("{a} tree {}\nhi\n", usize::MAX);
+        let answers = read(huge_tree.as_bytes());
+        assert!(answers[&a].as_ref().is_err_and(|e| e.contains("answered")));
+
+        let stopped = format!("{a} missing\n{b} blob 1\nx\n");
+        let answers = read(stopped.as_bytes());
+        assert!(answers[&a].as_ref().unwrap_err().contains("missing"));
+        assert_eq!(answers[&b], Ok(b"x".to_vec()));
+        assert!(answers[&c].as_ref().unwrap_err().contains("nothing"));
+    }
+
+    #[test]
+    fn note_blobs_are_read_by_size_and_every_failure_is_named() {
+        let repo = Repo::new(2);
+        let write_blob = |content: &[u8]| -> String {
+            let mut child = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(repo.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn_locked()
+                .unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(content).unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let tricky =
+            b"line one\n0000000000000000000000000000000000000000 blob 3\nabc\n\0tail".to_vec();
+        let plain = b"{\"x\":1}".to_vec();
+        let a = write_blob(&tricky);
+        let b = write_blob(&plain);
+        let commit = repo.rev("HEAD");
+        let missing = "1".repeat(40);
+        let asked = vec![
+            a.clone(),
+            missing.clone(),
+            commit.clone(),
+            b.clone(),
+            "not-an-oid\nHEAD".to_string(),
+            a.clone(),
+        ];
+        let got = read_note_blobs(repo.path(), &asked);
+        assert_eq!(got[&a], Ok(tricky));
+        assert_eq!(
+            got[&b],
+            Ok(plain),
+            "the answer after a non-blob kept its place"
+        );
+        assert!(got[&missing].as_ref().unwrap_err().contains("missing"));
+        assert!(got[&commit].as_ref().unwrap_err().contains("is a commit"));
+        assert!(got["not-an-oid\nHEAD"]
+            .as_ref()
+            .unwrap_err()
+            .contains("not a note blob id"));
+        assert_eq!(got.len(), 5, "a repeated id is asked once");
+    }
+
+    /// Many noted commits: every note is read in one process, and each one is
+    /// exactly what `git notes show` says it is.
+    #[test]
+    fn a_batch_reads_every_note_in_one_process_and_matches_notes_show() {
+        let repo = Repo::new(6);
+        for n in 0..5 {
+            repo.verify(
+                &format!("HEAD~{n}"),
+                if n % 2 == 0 { "passed" } else { "failed" },
+            );
+        }
+        let revs: Vec<String> = (0..6).map(|n| repo.rev(&format!("HEAD~{n}"))).collect();
+        let root = repo.path().canonicalize().unwrap();
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+        let rows = freshness_batch(repo.as_str(), &revs, Some("main"));
+        let used = crate::engine::git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let count = |needle: &str| {
+            used.iter()
+                .filter(|argv| argv.iter().any(|a| a == needle))
+                .count()
+        };
+        assert_eq!(count("--batch"), 1, "{used:?}");
+        assert_eq!(count("show"), 0, "{used:?}");
+        for (row, rev) in rows.iter().zip(&revs) {
+            let shown = read_verification_note(repo.as_str(), rev).unwrap();
+            assert_eq!(row.verification, shown, "{rev}");
+            assert!(row.notes_readable);
+        }
+        assert!(
+            rows[5].verification.is_none(),
+            "the unnoted commit stays unnoted"
+        );
+    }
+
+    /// A broken sessions ref beside a readable verification note. The single
+    /// commit keeps the verification it read and says the notes were not all
+    /// readable; the badge row keeps neither, as each did before the two
+    /// shared one owner. One change: the single commit now names the failure
+    /// in `unmeasured_reason`, where it used to leave the reason empty.
+    #[test]
+    fn a_broken_sessions_ref_keeps_the_single_commits_verification_only() {
+        let repo = Repo::new(2);
+        repo.verify("HEAD", "passed");
+        let sha = repo.rev("HEAD");
+        let refs = repo.path().join(".git/refs/notes/gitpulse");
+        std::fs::create_dir_all(&refs).expect("mkdir");
+        std::fs::write(
+            refs.join("sessions"),
+            "0000000000000000000000000000000000000001\n",
+        )
+        .expect("write ref");
+
+        let single = compute_freshness(repo.as_str(), &sha, Some("main"));
+        assert!(!single.notes_readable);
+        assert!(single.verification.is_some(), "{single:?}");
+        assert_eq!(single.distance, Some(0));
+        assert!(!single.unmeasured_reason.is_empty(), "the failure is named");
+
+        let row = freshness_batch(repo.as_str(), std::slice::from_ref(&sha), Some("main"))
+            .pop()
+            .expect("one");
+        assert!(!row.notes_readable);
+        assert!(row.verification.is_none(), "{row:?}");
+        assert_eq!(
+            row.distance, None,
+            "a badge row cannot select without a listing"
         );
     }
 }

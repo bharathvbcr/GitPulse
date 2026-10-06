@@ -116,7 +116,8 @@ export async function loadWork(
       (v) => ({ ok: true as const, v }),
       (e) => ({ ok: false as const, e }),
     ),
-    call<WorktreeInfo[]>("cmd_list_worktrees", { repoPath }).then(
+    // Dirty counts are all this view reads; the full scan is the panel's.
+    call<WorktreeInfo[]>("cmd_list_worktrees", { repoPath, depth: "dirty" }).then(
       (v) => ({ ok: true as const, v }),
       (e) => ({ ok: false as const, e }),
     ),

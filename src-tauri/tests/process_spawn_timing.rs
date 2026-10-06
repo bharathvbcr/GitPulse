@@ -28,7 +28,9 @@ fn bare() -> Duration {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawning the no-op should succeed");
+    let mut child = cmd
+        .spawn_locked()
+        .expect("spawning the no-op should succeed");
     let status = child.wait().expect("waiting on the no-op should succeed");
     assert!(status.success());
     started.elapsed()

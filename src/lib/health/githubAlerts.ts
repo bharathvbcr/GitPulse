@@ -10,6 +10,7 @@
  * Serious means critical or high after {@link normalizeSeverity}, so CodeQL
  * `error` is high and an unknown spelling is info, never a silent promotion.
  */
+import { isDeferredUnderLoad } from "../async/deferral";
 import { invoke } from "../ipc/invoke";
 import { createRepoPanelCache } from "../panels/repoPanelCache";
 import { formatError } from "../ui/formatError";
@@ -86,6 +87,13 @@ function codeScanningTransportFailure(error: string): CodeScanningReport {
   return { ...githubUnavailableEnvelope(error), alerts: [] };
 }
 
+/** Either half failed only because the spawn gate deferred it under load. */
+function wasDeferredUnderLoad(snapshot: GithubAlertsSnapshot): boolean {
+  return [snapshot.dependabot.error, snapshot.codeScanning.error].some(
+    (error) => typeof error === "string" && isDeferredUnderLoad(error),
+  );
+}
+
 function snapshotFromSettled(
   depSettled: PromiseSettledResult<DependabotReport>,
   csSettled: PromiseSettledResult<CodeScanningReport>,
@@ -150,8 +158,10 @@ export function loadGithubAlerts(
     if (pending) return pending;
   }
   const pending = fetchGithubAlerts(repoPath, commands, now).then((snapshot) => {
-    // A slower launch fetch must not overwrite a later Health refresh.
-    if (inflight.get(repoPath) === pending) {
+    // A slower launch fetch must not overwrite a later Health refresh. A
+    // check the spawn gate deferred never ran, so it is not a result to keep:
+    // cached, it stood in for the real answer until the entry was evicted.
+    if (inflight.get(repoPath) === pending && !wasDeferredUnderLoad(snapshot)) {
       githubAlertsCache.set(repoPath, snapshot);
     }
     return snapshot;
@@ -343,6 +353,12 @@ export interface GithubNotifyDeps {
   onError: (message: string) => void;
   /** Per-session fingerprints; injected so tests do not share global memory. */
   notified?: Map<string, string>;
+  /**
+   * Per-session failure already reported for each repository. A cached
+   * failure re-read on every tab activation is the same unexamined check, not
+   * a new one; the diagnostics panel filled with copies of one 403.
+   */
+  failuresReported?: Map<string, string>;
 }
 
 /**
@@ -361,9 +377,18 @@ export async function maybeNotifyGithubAlerts(
   const snapshot = await deps.load(deps.repoPath);
   const message = describeSeriousGithubAlerts(snapshot);
   const failure = githubCheckFailed(snapshot);
+  const reported = deps.failuresReported ?? defaultFailuresReported;
+  // Once per distinct failure per repository; a check that succeeds again
+  // re-arms it, so a later recurrence is reported afresh.
+  const reportFailure = (text: string) => {
+    if (reported.get(deps.repoPath) === text) return;
+    reported.set(deps.repoPath, text);
+    deps.onError(text);
+  };
+  if (!failure) reported.delete(deps.repoPath);
   if (message === null) {
     if (failure) {
-      deps.onError(failure);
+      reportFailure(failure);
       return "failed";
     }
     if (!snapshot.dependabot.available && !snapshot.codeScanning.available) {
@@ -379,8 +404,9 @@ export async function maybeNotifyGithubAlerts(
   deps.notify(snapshot, message);
   // The other half still has to say it did not run; otherwise Health is the
   // only place a partial failure is visible.
-  if (failure) deps.onError(failure);
+  if (failure) reportFailure(failure);
   return "notified";
 }
 
 const defaultNotified = new Map<string, string>();
+const defaultFailuresReported = new Map<string, string>();

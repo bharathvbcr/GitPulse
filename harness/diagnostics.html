@@ -29,7 +29,7 @@
     cmd_resolve_repo: a => ({path:a.path,name:"diagnostics",is_bare:false}),
     cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({tags:[],truncated:false}),
     cmd_repo_operation: () => null, cmd_stash_list: () => ({ entries: [], truncated: false }), cmd_watch_repo: () => null,
-    cmd_last_fetch_at: () => null,
+    cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null,
     cmd_unwatch_repo: () => null, cmd_list_repo_files: () => ["A.md", "B.md"],
     cmd_get_commit_graph: () => ({nodes:[],edges:[],total_commits:0,truncated:false}),
     cmd_get_file_blame: a => defer("blame",a),
@@ -57,7 +57,7 @@
       exclude: { status: "already_ignored", source: "harness" },
       workspace_registry: null,
       workspace_reason: null,
-      skipped_untrusted: [],
+      skipped_untrusted: [], skipped_unavailable: [],
       devmap_available: false,
     }),
     cmd_devmap_maybe_refresh: () => ({

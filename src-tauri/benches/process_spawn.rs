@@ -183,6 +183,81 @@ fn main() {
         (resolved.p50.as_secs_f64() / bare.p50.as_secs_f64() - 1.0) * 100.0
     );
     std::hint::black_box(&resident);
+
+    #[cfg(target_os = "macos")]
+    git_binaries(&cwd);
+}
+
+/// Apple's `/usr/bin/git` against the binaries `git_command` now picks past
+/// it. Samples are interleaved — one spawn of each candidate per round — so
+/// load that drifts during the run lands on every row alike instead of on
+/// whichever ran last; `min` is reported because it is the least
+/// load-sensitive figure on a shared host.
+#[cfg(target_os = "macos")]
+fn git_binaries(cwd: &std::path::Path) {
+    let candidates: Vec<&str> = [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+        "/Library/Developer/CommandLineTools/usr/bin/git",
+    ]
+    .into_iter()
+    .filter(|path| std::path::Path::new(path).is_file())
+    .collect();
+    // The environment `git_command` gives every child. `LC_ALL=C` is not
+    // incidental here: without it Homebrew's git initialises gettext from its
+    // own `libintl`, and measured that way it looked barely faster than the
+    // shim — a cost the app never pays.
+    let spawn = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(["-c", "core.quotepath=false", "rev-parse", "HEAD"])
+            .env("LC_ALL", "C")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = cmd.output_locked().expect("spawn git");
+        assert!(out.status.success(), "{program} rev-parse HEAD failed");
+    };
+    for program in &candidates {
+        for _ in 0..WARMUP / 4 {
+            spawn(program);
+        }
+    }
+    let mut samples: Vec<Vec<Duration>> = vec![Vec::with_capacity(SAMPLES); candidates.len()];
+    for _ in 0..SAMPLES / 2 {
+        for (index, program) in candidates.iter().enumerate() {
+            let started = Instant::now();
+            spawn(program);
+            samples[index].push(started.elapsed());
+        }
+    }
+    println!(
+        "\n`git rev-parse HEAD`, {} interleaved rounds\n",
+        SAMPLES / 2
+    );
+    println!("{:<58}  {:>10}  {:>10}  {:>10}", "", "min", "p50", "p95");
+    let shim_p50 = {
+        let mut shim = samples[0].clone();
+        shim.sort_unstable();
+        shim[shim.len() / 2]
+    };
+    for (program, mut row) in candidates.iter().zip(samples) {
+        row.sort_unstable();
+        let p50 = row[row.len() / 2];
+        println!(
+            "{:<58}  {:>10.3?}  {:>10.3?}  {:>10.3?}   {:+.1}% p50 vs /usr/bin/git",
+            program,
+            row[0],
+            p50,
+            row[row.len() * 95 / 100],
+            (p50.as_secs_f64() / shim_p50.as_secs_f64() - 1.0) * 100.0
+        );
+    }
+    println!();
 }
 
 #[cfg(not(unix))]

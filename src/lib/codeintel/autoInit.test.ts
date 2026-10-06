@@ -9,7 +9,7 @@ function report(overrides: Partial<InitReport> = {}): InitReport {
     exclude: { status: "added", file: "/a/.git/info/exclude", pattern: "/.devmap/" },
     workspace_registry: "/a/.devmap/workspace.json",
     workspace_reason: null,
-    skipped_untrusted: [],
+    skipped_untrusted: [], skipped_unavailable: [],
     devmap_available: true,
     ...overrides,
   };
@@ -218,6 +218,32 @@ describe("autoInit", () => {
       "devcouncil-init",
       "/a: cross-repository search omitted untrusted repositories — /untrusted",
     );
+    index.reset();
+  });
+
+  it("names a tab the registry could not register instead of losing the registry", async () => {
+    const warn = vi.fn();
+    const index = createAutoInit({
+      debounceMs: 0,
+      warn,
+      initialize: async () =>
+        report({
+          skipped_untrusted: ["/untrusted"],
+          skipped_unavailable: ["/gone: Cannot access path '/gone'"],
+        }),
+    });
+    index.setScope(scope("/a", ["/a", "/gone", "/untrusted"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/a").report?.workspace_registry).toBe("/a/.devmap/workspace.json");
+    expect(warn).toHaveBeenCalledWith(
+      "devcouncil-init",
+      "/a: cross-repository search omitted untrusted repositories — /untrusted",
+    );
+    expect(warn).toHaveBeenCalledWith(
+      "devcouncil-init",
+      "/a: cross-repository search omitted open tabs it could not register — /gone: Cannot access path '/gone'",
+    );
+    expect(warn).not.toHaveBeenCalledWith("devcouncil-init", expect.stringContaining("has no registry"));
     index.reset();
   });
 

@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::git_cli::{git_text, git_text_shared, validate_repo};
+use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::REFS_TAG_CAP;
 use crate::graph::ref_scope::{self, HiddenHistory, RefScope};
 
@@ -120,7 +120,10 @@ pub fn probe_hidden_history(repo_path: &str) -> Result<HiddenHistory, String> {
     let max_count = format!("--max-count={}", HIDDEN_PROBE_CAP);
     let mut args: Vec<&str> = vec!["rev-list", max_count.as_str(), "--all", "--not"];
     args.extend_from_slice(ref_scope::history_rev_args(RefScope::Named));
-    let stdout = git_text(&repo, &args)?;
+    // Both reads are functions of the whole ref store (`--all` includes every
+    // worktree's HEAD), so an edit that moves no ref costs neither.
+    let all_refs: &[&str] = &[crate::engine::ref_cache::ALL_REFS];
+    let stdout = crate::engine::ref_cache::git_text(&repo, all_refs, &args)?;
     let commits = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -130,8 +133,9 @@ pub fn probe_hidden_history(repo_path: &str) -> Result<HiddenHistory, String> {
     }
 
     let count_arg = format!("--count={}", HIDDEN_REF_SCAN_CAP);
-    let listed = git_text(
+    let listed = crate::engine::ref_cache::git_text(
         &repo,
+        all_refs,
         &[
             "for-each-ref",
             "--format=%(refname)",
@@ -160,16 +164,21 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
         "for-each-ref",
         "--format=%(objectname)%00%(refname)%00%(objecttype)%00%(*objectname)%00%(creatordate:unix)%01",
     ];
-    for_each_ref.extend_from_slice(ref_scope::decoration_patterns(scope));
-    let raw = git_text_shared(&repo, &for_each_ref)?;
+    let patterns = ref_scope::decoration_patterns(scope);
+    for_each_ref.extend_from_slice(patterns);
+    let raw = crate::engine::ref_cache::git_text(&repo, patterns, &for_each_ref)?;
 
     // A detached HEAD makes this exit 1, which is an answer: no current
     // branch. A refusal is not, and used to render the graph with no HEAD
     // branch label at all, so it fails the listing with its own cause.
     let failures = crate::engine::git_cli::process_failures();
-    let current_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let current_branch = crate::engine::ref_cache::git_text(
+        &repo,
+        &["refs/heads"],
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
     if crate::engine::git_cli::process_failures() != failures {
         return Err(crate::engine::git_cli::last_process_failure()
             .unwrap_or_else(|| "the current-branch lookup produced no answer".into()));

@@ -62,12 +62,12 @@
         cmd_unwatch_repo: () => null,
         cmd_set_recent_menu: () => null,
         // Never fetched: the honest answer for a fixture with no FETCH_HEAD.
-        cmd_last_fetch_at: () => null,
+        cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null,
         cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
         cmd_workspace_sync: () => ({ repos: [] }),
         cmd_devcouncil_init: (a) => ({
           repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
-          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], devmap_available: false,
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false,
         }),
         cmd_devmap_maybe_refresh: () => ({
           decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null,

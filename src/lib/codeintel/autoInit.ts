@@ -192,11 +192,19 @@ export function createAutoInit(opts?: {
           "devcouncil-init",
           `${activeKey}: cross-repository search has no registry — ${report.workspace_reason}`,
         );
-      } else if (report.skipped_untrusted.length > 0) {
-        warn(
-          "devcouncil-init",
-          `${activeKey}: cross-repository search omitted untrusted repositories — ${report.skipped_untrusted.join(", ")}`,
-        );
+      } else {
+        if (report.skipped_untrusted.length > 0) {
+          warn(
+            "devcouncil-init",
+            `${activeKey}: cross-repository search omitted untrusted repositories — ${report.skipped_untrusted.join(", ")}`,
+          );
+        }
+        if (report.skipped_unavailable.length > 0) {
+          warn(
+            "devcouncil-init",
+            `${activeKey}: cross-repository search omitted open tabs it could not register — ${report.skipped_unavailable.join("; ")}`,
+          );
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

@@ -40,9 +40,14 @@ struct Answer {
 
 /// Run one hook to completion, killing it if it outlives [`HANG`].
 fn ask(subcommand: &str, payload: &[u8], env: &[(&str, &Path)]) -> Answer {
+    // A debug-build hook logs at debug level, and without a directory of its
+    // own it wrote every line of this suite into the developer's real
+    // `~/Library/Logs/GitPulse/gitpulse-hook.log`.
+    let logs = tempfile::tempdir().expect("hook log dir");
     let mut command = Command::new(HOOK);
     command
         .arg(subcommand)
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

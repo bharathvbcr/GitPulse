@@ -55,6 +55,41 @@ export function readBackgroundDocument(): boolean {
   return isBackgroundDocument(document);
 }
 
+/**
+ * True only when `doc` is hidden — minimised or on another Space — not when
+ * it merely lacks focus. The narrower question for work whose result someone
+ * may still be looking at: GitPulse on a second display while the user types
+ * elsewhere is unfocused but in plain view. A null document is not hidden.
+ */
+export function isHiddenDocument(doc: ForegroundDocument | null | undefined): boolean {
+  if (doc == null) return false;
+  return doc.hidden === true || doc.visibilityState === "hidden";
+}
+
+/** {@link isHiddenDocument} for the live document. */
+export function readHiddenDocument(): boolean {
+  if (typeof document === "undefined") return false;
+  return isHiddenDocument(document);
+}
+
+/**
+ * Resolves once the live document is not hidden: at once when it already is
+ * shown, or when this process has no DOM; otherwise on the first
+ * `visibilitychange` that shows it. Work that only matters to someone looking
+ * waits here instead of spending the spawn budget on a minimised window.
+ */
+export function whenDocumentShown(): Promise<void> {
+  if (typeof document === "undefined" || !readHiddenDocument()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onChange = () => {
+      if (readHiddenDocument()) return;
+      document.removeEventListener("visibilitychange", onChange);
+      resolve();
+    };
+    document.addEventListener("visibilitychange", onChange);
+  });
+}
+
 const wrappers = new WeakMap<() => void, Map<string, { target: EventTarget; wrapped: () => void }>>();
 
 /**

@@ -217,7 +217,10 @@ fn permission_denied_artifact_reports_reason() {
 #[cfg(unix)]
 unsafe fn libc_geteuid() -> u32 {
     // Avoid a libc dependency: read euid from a fresh process.
-    let output = Command::new("id").args(["-u"]).output().expect("id -u");
+    let output = Command::new("id")
+        .args(["-u"])
+        .output_locked()
+        .expect("id -u");
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()

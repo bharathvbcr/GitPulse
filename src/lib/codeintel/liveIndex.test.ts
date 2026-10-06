@@ -7,7 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createLiveIndex } from "./liveIndex";
+import { busyRetryDelayMs, createLiveIndex } from "./liveIndex";
 import type { LiveRefreshOutcome } from "./types";
 
 const warnings = vi.hoisted(() => vi.fn());
@@ -109,11 +109,32 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
+  it("backs off a busy writer instead of asking once a second", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("skip_building"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/busy");
+    // Asks at 0, 1, 3, 7, 15 and 31 s: a fixed one-second rest asked ~30 times.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(6);
+    // Still retrying where the fixed rest had already given up.
+    expect(index.get("/busy").phase).toBe("scheduled");
+    index.reset();
+  });
+
+  it("schedules busy retries 1 s apart, doubling, capped", () => {
+    expect([1, 2, 3, 4, 5, 6, 30, 1e9].map(busyRetryDelayMs))
+      .toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
+    expect(busyRetryDelayMs(0)).toBe(1_000);
+    expect(busyRetryDelayMs(Number.NaN)).toBe(1_000);
+  });
+
   it("bounds busy retries and reports failure without inventing a publication", async () => {
     const maybeRefresh = vi.fn(async () => outcome("skip_building"));
     const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
     index.onRepoChanged("/busy");
-    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
     expect(maybeRefresh.mock.calls.length).toBeGreaterThan(1);
     expect(maybeRefresh.mock.calls.length).toBeLessThanOrEqual(31);
     expect(index.get("/busy").phase).toBe("failed");

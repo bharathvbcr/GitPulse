@@ -67,7 +67,11 @@ fn scale() -> u64 {
 /// the loop had got. Read-only, and built only on the failure path.
 fn repo_state(dir: &Path) -> String {
     let read = |args: &[&str]| -> String {
-        match Command::new("git").args(args).current_dir(dir).output() {
+        match Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+        {
             Ok(out) => {
                 let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !out.status.success() {

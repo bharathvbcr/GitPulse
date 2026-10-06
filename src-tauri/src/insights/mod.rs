@@ -17,7 +17,9 @@ use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
-use crate::engine::worktree::{self, agent_kind, agent_layout, changed_paths, WorktreeInfo};
+use crate::engine::worktree::{
+    self, agent_kind, agent_layout, changed_paths, ScanDepth, WorktreeInfo,
+};
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -602,7 +604,7 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
 /// load-sensitive test of git rather than of this function.
 fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) -> InsightsSnapshot {
     let started = Instant::now();
-    let listed = worktree::list_worktrees(repo_path);
+    let listed = worktree::list_worktrees_scanned(repo_path, ScanDepth::Dirty);
     let mut deadline_expired = false;
     let (worktrees, agents) = match &listed {
         Ok(list) => {
@@ -612,8 +614,9 @@ fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) ->
                 .take(max_worktrees)
                 .map(|info| {
                     // Sequential on purpose: `repo_op::detect` spawns several
-                    // git processes per worktree, and 64 of those at once is
-                    // the spawn storm this deadline exists to bound.
+                    // git processes for each worktree parked mid-operation,
+                    // and 64 of those at once is the spawn storm this
+                    // deadline exists to bound.
                     if started.elapsed() >= deadline {
                         deadline_expired = true;
                         return summarise_worktree(info, String::new(), false);
@@ -1292,7 +1295,7 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
 /// afterwards on the first overlapping path only — see
 /// [`entity_collision::enrich_first_item`].
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
-    match worktree::list_worktrees(repo_path) {
+    match worktree::list_worktrees_lite(repo_path) {
         Ok(list) => entity_collision::enrich_first_item(collision_from_list(&list)),
         Err(error) => empty_collisions(error),
     }
@@ -1510,13 +1513,18 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
         .map(|op| format!("{:?}", op.kind))
         .unwrap_or_default();
 
-    let (worktree, worktree_ok, worktree_error) = match worktree::list_worktrees(repo_path) {
-        Ok(list) => match list.iter().find(|w| same_path(&w.path, &target)) {
-            Some(found) => (
-                summarise_worktree(found, operation_kind, operation_ok),
-                true,
-                String::new(),
-            ),
+    // Only the target's dirty count is read, so only the target is scanned:
+    // a full listing scanned up to 32 worktrees to describe one.
+    let (worktree, worktree_ok, worktree_error) = match worktree::list_worktrees_lite(repo_path) {
+        Ok(list) => match list.into_iter().find(|w| same_path(&w.path, &target)) {
+            Some(mut found) => {
+                worktree::scan_dirty(&mut found);
+                (
+                    summarise_worktree(&found, operation_kind, operation_ok),
+                    true,
+                    String::new(),
+                )
+            }
             // Registered a moment ago and gone from the listing now, or a git
             // that prints a path neither form of comparison matches. Either
             // way the row below is not something git said.
@@ -2808,5 +2816,60 @@ mod tests {
         assert!(info.plugin_manifest_json.contains("\"mcpServers\""));
         assert!(info.plugin_mcp_json.contains("\"gitpulse\""));
         assert!(!info.plugin_mcp_json.contains("$schema"));
+    }
+
+    /// The collision check, the change context and the snapshot read paths,
+    /// branches and dirty counts. None of them may pay for the diff stats and
+    /// divergence a full worktree listing measures: the collision check alone
+    /// runs on every Work refresh.
+    #[test]
+    fn insight_reads_never_run_the_full_worktree_measurements() {
+        let main = init_repo();
+        let root = main.path().canonicalize().unwrap();
+        let repo = root.to_str().unwrap();
+        fs::create_dir_all(root.join(".claude/worktrees")).unwrap();
+        let mut cwds = vec![root.clone()];
+        for name in ["session-a", "session-b"] {
+            let wt = root.join(".claude/worktrees").join(name);
+            worktree::add_worktree(
+                repo,
+                wt.to_str().unwrap(),
+                Some(&format!("agent/{name}")),
+                Some("main"),
+                false,
+            )
+            .expect("add worktree");
+            crate::test_support::trust_repo(&wt);
+            cwds.push(wt.canonicalize().unwrap());
+        }
+        fs::write(root.join("shared.txt"), "main-edit").unwrap();
+        fs::write(cwds[1].join("shared.txt"), "agent-edit").unwrap();
+        let measured = |cwds: &[std::path::PathBuf]| {
+            cwds.iter()
+                .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
+                .filter(|argv| {
+                    argv.iter()
+                        .any(|arg| arg == "--shortstat" || arg == "rev-list" || arg == "--verify")
+                })
+                .count()
+        };
+
+        let risk = collision_risk(repo);
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.overlapping_files, 1, "{risk:?}");
+        assert_eq!(measured(&cwds), 0, "collision_risk");
+
+        let context = change_context(repo, cwds[1].to_str());
+        assert!(context.worktree_ok, "{context:?}");
+        assert_eq!(context.worktree.dirty_files, Some(1));
+        assert_eq!(measured(&cwds), 0, "change_context");
+
+        let snapshot = snapshot(repo);
+        assert!(snapshot
+            .worktrees
+            .items
+            .iter()
+            .all(|w| w.dirty_files.is_some()));
+        assert_eq!(measured(&cwds), 0, "snapshot");
     }
 }

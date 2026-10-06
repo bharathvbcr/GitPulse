@@ -23,7 +23,7 @@
 
 use std::io::{self, BufReader, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use gitpulse_lib::mcp::{self, Accepted, Era, JsonRpcRequest, JsonRpcResponse, Ready};
@@ -50,8 +50,18 @@ const CALL_BUDGET_ENV: &str = "GITPULSE_MCP_CALL_TIMEOUT_MS";
 /// the disk can answer must be refused, not absorbed.
 const MAX_IN_FLIGHT: usize = 32;
 
-/// How often the watchdog looks for requests that have outlived their budget.
-const WATCHDOG_TICK: Duration = Duration::from_millis(100);
+/// Longest the watchdog sleeps with nothing pending, so a broken wire still
+/// ends its thread eventually. Everything else wakes it: a new request
+/// notifies it, and a pending one bounds its sleep by its own deadline.
+///
+/// It used to wake every 100 ms whatever was pending, as did the input loop.
+/// One server per agent session, and 74 of them were alive on one host after
+/// three days — about 1,500 timer wakeups a second spent watching nothing.
+const WATCHDOG_IDLE_RECHECK: Duration = Duration::from_secs(30);
+
+/// Grace past the budget for the shutdown drain, so a worker the watchdog
+/// already answered for has time to release its slot.
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 /// Polling interval for the two places that wait on `in_flight`: shutdown
 /// drain, and the concurrency ceiling. Both are off the hot path.
@@ -71,6 +81,9 @@ fn call_budget() -> Duration {
 struct Wire {
     out: Result<gitpulse_lib::output::BoundedOutput, io::Error>,
     broken: AtomicBool,
+    /// The input loop's channel, poked when the wire breaks so a reader
+    /// blocked waiting for the host wakes at once instead of polling the flag.
+    input_wake: Mutex<Option<mpsc::SyncSender<io::Result<Vec<u8>>>>>,
 }
 
 impl Wire {
@@ -83,6 +96,23 @@ impl Wire {
                 Duration::from_secs(1),
             ),
             broken: AtomicBool::new(false),
+            input_wake: Mutex::new(None),
+        }
+    }
+
+    /// Records that nothing more can be written, then wakes the input loop.
+    ///
+    /// The flag is set first, so a reader that misses the poke (its channel
+    /// was full) finds it on its next pass instead of blocking for good.
+    fn mark_broken(&self) {
+        self.broken.store(true, Ordering::Release);
+        if let Ok(guard) = self.input_wake.lock() {
+            if let Some(sender) = guard.as_ref() {
+                let _ = sender.try_send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stdout unavailable; input cancelled",
+                )));
+            }
         }
     }
 
@@ -119,13 +149,13 @@ impl Wire {
             Ok(out) => out,
             Err(error) => {
                 log::error!(target: "mcp", "stdout worker could not start: {error}");
-                self.broken.store(true, Ordering::Relaxed);
+                self.mark_broken();
                 return false;
             }
         };
         if let Err(error) = out.write(format!("{line}\n").as_bytes()) {
             log::warn!(target: "mcp", "stdout failed: {error}; stopping without retry");
-            self.broken.store(true, Ordering::Relaxed);
+            self.mark_broken();
             return false;
         }
         true
@@ -141,21 +171,44 @@ struct Pending {
     timeout_response: JsonRpcResponse,
 }
 
+/// The requests the watchdog holds deadlines for, and what wakes it.
+#[derive(Default)]
+struct Watchlist {
+    queue: Mutex<Vec<Pending>>,
+    /// Notified on every new entry, so the watchdog re-plans its sleep.
+    changed: Condvar,
+}
+
+impl Watchlist {
+    /// Registers `entry`; false when the lock is poisoned and it was not.
+    fn push(&self, entry: Pending) -> bool {
+        let Ok(mut queue) = self.queue.lock() else {
+            return false;
+        };
+        queue.push(entry);
+        drop(queue);
+        self.changed.notify_one();
+        true
+    }
+}
+
 /// Answers any request past its deadline and drops it from the registry.
 ///
-/// One thread for the whole process, rather than a timer per request.
-fn spawn_watchdog(pending: Arc<Mutex<Vec<Pending>>>, wire: Arc<Wire>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(WATCHDOG_TICK);
-        if wire.broken.load(Ordering::Relaxed) {
+/// One thread for the whole process, rather than a timer per request. It
+/// sleeps until the earliest unanswered deadline — or, with none, until a new
+/// request arrives — so an idle server costs no wakeups and an overdue
+/// request is answered at its deadline rather than up to a tick late.
+fn spawn_watchdog(watchlist: Arc<Watchlist>, wire: Arc<Wire>) {
+    std::thread::spawn(move || {
+        let Ok(mut queue) = watchlist.queue.lock() else {
             return;
-        }
-        let mut expired: Vec<JsonRpcResponse> = Vec::new();
-        {
-            let Ok(mut queue) = pending.lock() else {
+        };
+        loop {
+            if wire.broken.load(Ordering::Acquire) {
                 return;
-            };
+            }
             let now = Instant::now();
+            let mut expired: Vec<JsonRpcResponse> = Vec::new();
             queue.retain(|entry| {
                 if entry.answered.load(Ordering::Acquire) {
                     return false;
@@ -173,13 +226,33 @@ fn spawn_watchdog(pending: Arc<Mutex<Vec<Pending>>>, wire: Arc<Wire>) {
                 }
                 false
             });
-        }
-        for response in &expired {
-            log::warn!(target: "mcp", "abandoned a request past its budget: {}", response.id);
-            // The work keeps running; `in_flight` is released by the worker when
-            // it eventually finishes, so an abandoned call still occupies a slot
-            // and a storm of them is refused rather than piling up.
-            let _ = wire.send(response);
+            if !expired.is_empty() {
+                // Never write to the wire holding the lock a dispatch needs.
+                drop(queue);
+                for response in &expired {
+                    log::warn!(target: "mcp", "abandoned a request past its budget: {}", response.id);
+                    // The work keeps running; `in_flight` is released by the
+                    // worker when it eventually finishes, so an abandoned call
+                    // still occupies a slot and a storm of them is refused
+                    // rather than piling up.
+                    let _ = wire.send(response);
+                }
+                queue = match watchlist.queue.lock() {
+                    Ok(queue) => queue,
+                    Err(_) => return,
+                };
+                continue;
+            }
+            let sleep = queue
+                .iter()
+                .map(|entry| entry.deadline.saturating_duration_since(now))
+                .min()
+                .unwrap_or(WATCHDOG_IDLE_RECHECK)
+                .min(WATCHDOG_IDLE_RECHECK);
+            queue = match watchlist.changed.wait_timeout(queue, sleep) {
+                Ok((queue, _)) => queue,
+                Err(_) => return,
+            };
         }
     });
 }
@@ -188,24 +261,21 @@ fn spawn_watchdog(pending: Arc<Mutex<Vec<Pending>>>, wire: Arc<Wire>) {
 fn dispatch(
     ready: Ready,
     wire: Arc<Wire>,
-    pending: Arc<Mutex<Vec<Pending>>>,
+    watchlist: Arc<Watchlist>,
     in_flight: Arc<AtomicUsize>,
     budget: Duration,
 ) {
     let answered = Arc::new(AtomicBool::new(false));
     let timeout_response = ready.timed_out(budget);
     let panicked = ready.panicked();
-    {
-        let Ok(mut queue) = pending.lock() else {
-            let _ = wire.send(&panicked);
-            in_flight.fetch_sub(1, Ordering::AcqRel);
-            return;
-        };
-        queue.push(Pending {
-            deadline: Instant::now() + budget,
-            answered: Arc::clone(&answered),
-            timeout_response,
-        });
+    if !watchlist.push(Pending {
+        deadline: Instant::now() + budget,
+        answered: Arc::clone(&answered),
+        timeout_response,
+    }) {
+        let _ = wire.send(&panicked);
+        in_flight.fetch_sub(1, Ordering::AcqRel);
+        return;
     }
 
     let worker_answered = Arc::clone(&answered);
@@ -314,9 +384,34 @@ struct HostInput {
 impl HostInput {
     fn new(wire: Arc<Wire>) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(2);
+        if let Ok(mut wake) = wire.input_wake.lock() {
+            *wake = Some(sender.clone());
+        }
         std::thread::Builder::new()
             .name("gitpulse-mcp-stdin".into())
             .spawn(move || {
+                // `Wire` keeps a sender clone to wake the reader, so the
+                // channel cannot report this worker's death by disconnecting.
+                // Whatever ends the loop — EOF, an error, a panic — the reader
+                // must still get a last message, or it blocks for good.
+                //
+                // A blocking `send`, not `try_send`: with the channel full the
+                // poke would be dropped and the reader, once it drained the
+                // queued chunks, would wait forever. Blocking cannot deadlock —
+                // it waits only while the reader has chunks left to take, and
+                // fails at once if the reader is gone.
+                struct LastWord(Option<mpsc::SyncSender<io::Result<Vec<u8>>>>);
+                impl Drop for LastWord {
+                    fn drop(&mut self) {
+                        if let Some(sender) = self.0.take() {
+                            let _ = sender.send(Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "stdin worker stopped without EOF",
+                            )));
+                        }
+                    }
+                }
+                let mut last_word = LastWord(Some(sender.clone()));
                 let stdin = io::stdin();
                 let mut input = stdin.lock();
                 let mut bytes = [0; 8192];
@@ -326,7 +421,12 @@ impl HostInput {
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(error) => (Err(error), true),
                     };
-                    if sender.send(message).is_err() || done {
+                    let delivered = sender.send(message).is_ok();
+                    if delivered && done {
+                        // The terminal message (EOF or the error) is out.
+                        last_word.0 = None;
+                    }
+                    if !delivered || done {
                         break;
                     }
                 }
@@ -355,12 +455,14 @@ impl Read for HostInput {
             if count > 0 {
                 return Ok(count);
             }
-            match self.receiver.recv_timeout(WATCHDOG_TICK) {
+            // Blocks until the host sends something or the wire breaks:
+            // `Wire::mark_broken` sends into this same channel. The flag check
+            // above covers the poke it could not deliver to a full channel.
+            match self.receiver.recv() {
                 Ok(Ok(chunk)) if chunk.is_empty() => return Ok(0),
                 Ok(Ok(chunk)) => self.buffered = io::Cursor::new(chunk),
                 Ok(Err(error)) => return Err(error),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(mpsc::RecvError) => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "stdin worker stopped without EOF",
@@ -374,9 +476,9 @@ impl Read for HostInput {
 fn serve(wire: Arc<Wire>) -> Stop {
     let mut era = Era::Unknown;
     let budget = call_budget();
-    let pending: Arc<Mutex<Vec<Pending>>> = Arc::new(Mutex::new(Vec::new()));
+    let watchlist = Arc::new(Watchlist::default());
     let in_flight = Arc::new(AtomicUsize::new(0));
-    spawn_watchdog(Arc::clone(&pending), Arc::clone(&wire));
+    spawn_watchdog(Arc::clone(&watchlist), Arc::clone(&wire));
 
     let input = match HostInput::new(Arc::clone(&wire)) {
         Ok(input) => input,
@@ -384,7 +486,7 @@ fn serve(wire: Arc<Wire>) -> Stop {
     };
     let mut reader = BufReader::new(input);
 
-    let stop = read_loop(&mut reader, &wire, &mut era, &pending, &in_flight, budget);
+    let stop = read_loop(&mut reader, &wire, &mut era, &watchlist, &in_flight, budget);
     if wire.broken.load(Ordering::Relaxed) {
         return Stop::ClientGone;
     }
@@ -417,11 +519,11 @@ fn wait_for_slot(in_flight: &AtomicUsize, budget: Duration) -> bool {
 
 /// Give accepted requests a bounded chance to finish before the process exits.
 ///
-/// The grace is the call budget plus a tick, because a request that has already
+/// The grace is the call budget plus [`DRAIN_GRACE`], because a request that has already
 /// outlived its budget was answered by the watchdog and its worker is only
 /// still running to release its slot.
 fn drain_in_flight(in_flight: &AtomicUsize, budget: Duration) {
-    let deadline = Instant::now() + budget + WATCHDOG_TICK;
+    let deadline = Instant::now() + budget + DRAIN_GRACE;
     while in_flight.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         std::thread::sleep(SLOT_POLL);
     }
@@ -431,7 +533,7 @@ fn read_loop<R: std::io::BufRead>(
     reader: &mut R,
     wire: &Arc<Wire>,
     era: &mut Era,
-    pending: &Arc<Mutex<Vec<Pending>>>,
+    watchlist: &Arc<Watchlist>,
     in_flight: &Arc<AtomicUsize>,
     budget: Duration,
 ) -> Stop {
@@ -503,7 +605,7 @@ fn read_loop<R: std::io::BufRead>(
                 dispatch(
                     ready,
                     Arc::clone(wire),
-                    Arc::clone(pending),
+                    Arc::clone(watchlist),
                     Arc::clone(in_flight),
                     budget,
                 );

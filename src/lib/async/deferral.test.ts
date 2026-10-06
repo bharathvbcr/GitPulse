@@ -12,7 +12,9 @@ import {
   MAX_DEFERRED_RETRIES,
   deferredRetryDelayMs,
   isDeferredUnderLoad,
+  jitteredRetryDelayMs,
   outcomeUnknown,
+  RETRY_JITTER,
   RUN_TIMEOUT_MARKER,
   SLOT_WAIT_SUFFIX,
 } from "./deferral";
@@ -68,5 +70,22 @@ describe("deferred-under-load marker", () => {
     }
     expect(Math.max(...delays)).toBe(30_000);
     expect(deferredRetryDelayMs(0)).toBe(deferredRetryDelayMs(1));
+  });
+
+  it("jitters only upward, within its bound, whatever the random source says", () => {
+    for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES; attempt += 1) {
+      const base = deferredRetryDelayMs(attempt);
+      for (const draw of [0, 0.3, 0.999999, 1, -5, 7, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const delay = jitteredRetryDelayMs(attempt, () => draw);
+        expect(delay, `attempt ${attempt}, draw ${draw}`).toBeGreaterThanOrEqual(base);
+        expect(delay, `attempt ${attempt}, draw ${draw}`).toBeLessThanOrEqual(
+          Math.round(base * (1 + RETRY_JITTER)),
+        );
+        expect(Number.isInteger(delay)).toBe(true);
+      }
+      expect(jitteredRetryDelayMs(attempt, () => 0)).toBe(base);
+    }
+    // The first retry still clears the gate's 2 s queue budget.
+    expect(jitteredRetryDelayMs(1, () => 0)).toBeGreaterThan(2_000);
   });
 });

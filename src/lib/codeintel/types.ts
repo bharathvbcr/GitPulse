@@ -697,6 +697,7 @@ export function parseInitReport(value: unknown, command = "devcouncil"): InitRep
     workspace_registry: optionalString(value.workspace_registry) ?? null,
     workspace_reason: optionalString(value.workspace_reason) ?? null,
     skipped_untrusted: requiredStringList(value.skipped_untrusted, command, "skipped_untrusted"),
+    skipped_unavailable: requiredStringList(value.skipped_unavailable, command, "skipped_unavailable"),
     devmap_available: value.devmap_available === true,
   };
 }
@@ -888,6 +889,12 @@ export interface InitReport {
    * with `workspace_registry` null, not an entry here.
    */
   skipped_untrusted: string[];
+  /**
+   * Open tabs left out of a written registry because they could not be
+   * registered at all — gone from disk, no longer a repository — each as
+   * `path: reason`. One such tab used to fail the whole sync.
+   */
+  skipped_unavailable: string[];
   devmap_available: boolean;
 }
 
@@ -1034,6 +1041,8 @@ export interface WorkspaceSnapshot {
   repos: WorkspaceRepoEntry[];
   /** Open-tab paths this sync skipped because trust refused them. Empty on list. */
   skipped_untrusted: string[];
+  /** Open-tab paths this sync could not register, as `path: reason`. Empty on list. */
+  skipped_unavailable: string[];
 }
 
 export interface WorkspaceRegisterResult {

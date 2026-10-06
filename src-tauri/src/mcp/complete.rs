@@ -173,7 +173,7 @@ fn scan_worktrees() -> Vec<String> {
     let Some(root) = cwd.to_str() else {
         return Vec::new();
     };
-    match crate::engine::worktree::list_worktrees(root) {
+    match crate::engine::worktree::list_worktrees_lite(root) {
         Ok(worktrees) => worktrees.into_iter().map(|w| w.path).collect(),
         // Not a repository, or the scan failed. Either way there is nothing to
         // suggest; the client sees an empty list, which is what it would see

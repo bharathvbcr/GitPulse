@@ -31,13 +31,13 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["244 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["245 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (244 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (245 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -199,7 +199,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +244 Registered Handlers
+        +245 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -326,7 +326,7 @@ Optional tool installation uses this same runner with cancellation and bounded
 progress callbacks. See the [archived subprocess audit](archive/SUBPROCESS_DIAGNOSTICS_AUDIT.md)
 for contracts, regression evidence and platform verification limits.
 
-- **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers. Also owns dead-branch evaluation and safe deletion planning (`deadbranch.rs`), copy-on-write worktree cache sync via APFS clonefile / Linux FICLONE (`cow_clone.rs`), portless and deterministic worktree route matching (`portless.rs`), and repository-trust-gated lifecycle hooks (`worktree_hooks.rs`).
+- **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers. Also owns dead-branch evaluation and safe deletion planning (`deadbranch.rs`), copy-on-write worktree cache sync via APFS clonefile / Linux FICLONE (`cow_clone.rs`), portless and deterministic worktree route matching (`portless.rs`), and repository-trust-gated lifecycle hooks (`worktree_hooks.rs`). Repeated reads are answered from two caches. `ref_cache.rs` serves ref listings, the config listing and history walks from a file stamp of the ref store, and keeps them in memory only. `churn_store.rs` keeps branch churn across restarts in `churn.v1.sqlite`, under the platform cache directory (`~/Library/Caches/GitPulse`, `%LOCALAPPDATA%\GitPulse\Cache` or `$XDG_CACHE_HOME/gitpulse`). It measures with the tip's own attributes (`--attr-source=<tip>`) and keys each answer on the diff config, replace refs, `shallow`, `info/grafts`, the attributes files outside the worktree and the git version. The file holds commit ids, counts and 64-bit hashes, never a path. Only the app writes it; deleting it costs recomputation.
 - **`graph/`**: Native commit-history lane solver — stable columns by interval allocation, a pinned mainline (the default branch's first-parent chain holds column 0 for the whole window), history simplification for server-side commit filters (a dropped commit hands its lineage to its children, git-style, so a filtered graph stays connected and the mainline re-anchors on the chain's first survivor), parent-child edge layout, and nogap lookback bounds.
 - **`analyzer/`**: 
   - `language.rs`: Multi-language classifier (60+ languages), GitHub Linguist color mappings, and fast line-of-code breakdown.
@@ -426,8 +426,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 244 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1319 data fields, over 189 structs, in 75 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 245 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1320 data fields, over 189 structs, in 75 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 

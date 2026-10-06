@@ -11,7 +11,9 @@ use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 /// Canonical address of one checkout inside a linked-worktree family.
 ///
@@ -490,28 +492,24 @@ fn status_paths(bytes: &[u8]) -> Vec<String> {
 /// scanned" in this type — so a caller cannot mistake an unscanned worktree
 /// for a clean one.
 pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
-    let repo = validate_repo(repo_path)?;
-    let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
-    Ok(parse_worktree_porcelain(&stdout)
-        .into_iter()
-        .enumerate()
-        .map(|(idx, entry)| WorktreeInfo {
-            name: display_name(&entry.path),
-            is_main: idx == 0,
-            dirty_files: None,
-            diff_stat: None,
-            main_divergence: None,
-            active_routes: Vec::new(),
-            scan_note: None,
-            path: entry.path,
-            head: entry.head,
-            branch: entry.branch,
-            is_bare: entry.is_bare,
-            is_detached: entry.is_detached,
-            is_locked: entry.is_locked,
-            is_prunable: entry.is_prunable,
-        })
-        .collect())
+    list_worktrees_scanned(repo_path, ScanDepth::Listing)
+}
+
+/// How much of each worktree a listing measures. Every level past
+/// [`ScanDepth::Listing`] costs git children per worktree, so a caller asks
+/// for what it reads and no more: the collision check reads paths and
+/// branches, and used to pay for diff stats, divergence and routes it threw
+/// away, on every Work refresh.
+/// Ordered shallowest first, so a shared scan takes the deepest ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanDepth {
+    /// One `git worktree list`; every count is `None` ("not scanned").
+    Listing,
+    /// Adds the dirty-file count (`git status`) for each scanned worktree.
+    Dirty,
+    /// Adds diff stats, divergence from main/master, and portless routes.
+    Full,
 }
 
 /// Measures uncommitted line insertions/deletions in a worktree.
@@ -548,20 +546,60 @@ pub fn parse_shortstat(text: &str) -> Option<WorktreeDiffStat> {
 /// Measures commit divergence (ahead/behind count) compared to default branch (`main` or `master`).
 pub fn measure_main_divergence(repo: &Path, branch: Option<&str>) -> Option<WorktreeDivergence> {
     let b = branch?;
-    if b == "main" || b == "master" {
-        return Some(WorktreeDivergence {
-            ahead: 0,
-            behind: 0,
-        });
+    if is_main_name(b) {
+        return Some(WorktreeDivergence::default());
     }
-    let default_ref = if git_text(repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
-        "main"
-    } else if git_text(repo, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
-        "master"
-    } else {
+    divergence_from(repo, &main_ref(repo), b)
+}
+
+fn is_main_name(branch: &str) -> bool {
+    branch == "main" || branch == "master"
+}
+
+/// Which of `main` / `master` a repository's divergence is measured from.
+/// One answer per listing: it is a property of the repository, and asking it
+/// once per worktree cost two processes a worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MainRef {
+    Found(&'static str),
+    Absent,
+    /// The lookup itself failed; carries why, so a scan can say so rather
+    /// than reading "no main branch".
+    Unread(String),
+}
+
+fn main_ref(repo: &Path) -> MainRef {
+    let listed = crate::engine::ref_cache::git_text(
+        repo,
+        &["refs/heads"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/main",
+            "refs/heads/master",
+        ],
+    );
+    match listed {
+        // The patterns also match `refs/heads/main/<x>`, so only an exact
+        // line names the branch itself.
+        Ok(text) => {
+            let has = |name: &str| text.lines().any(|line| line == name);
+            if has("refs/heads/main") {
+                MainRef::Found("main")
+            } else if has("refs/heads/master") {
+                MainRef::Found("master")
+            } else {
+                MainRef::Absent
+            }
+        }
+        Err(reason) => MainRef::Unread(reason),
+    }
+}
+
+fn divergence_from(repo: &Path, main: &MainRef, b: &str) -> Option<WorktreeDivergence> {
+    let MainRef::Found(default_ref) = main else {
         return None;
     };
-
     let stdout = git_text(
         repo,
         &[
@@ -578,12 +616,288 @@ pub fn measure_main_divergence(repo: &Path, branch: Option<&str>) -> Option<Work
     Some(WorktreeDivergence { ahead, behind })
 }
 
+/// What a listing measures divergence against: main/master, and every scanned
+/// branch's counts from one `for-each-ref` when that could be read.
+struct Base {
+    main: MainRef,
+    /// `None` when the batch was not asked or did not answer; each worktree
+    /// then measures itself, as it always did.
+    batch: Option<HashMap<String, WorktreeDivergence>>,
+}
+
+impl Base {
+    fn none() -> Self {
+        Self {
+            main: MainRef::Absent,
+            batch: None,
+        }
+    }
+}
+
+/// Every branch's divergence from main in one `for-each-ref`, where the scan
+/// used to run one `rev-list` per worktree. The `ahead-behind` atom needs git
+/// 2.42; an older git, or any other failure, answers `None` and each worktree
+/// falls back to its own `rev-list`.
+///
+/// A pattern matches its whole namespace (`refs/heads/main` also selects
+/// `refs/heads/main/x`), so a row counts only when its refname is exactly a
+/// branch that was asked for.
+fn batch_divergence(
+    repo: &Path,
+    main: &MainRef,
+    branches: &[&str],
+) -> Option<HashMap<String, WorktreeDivergence>> {
+    let MainRef::Found(main_name) = main else {
+        return None;
+    };
+    if branches.is_empty() {
+        return Some(HashMap::new());
+    }
+    let format = format!("--format=%(refname)%00%(ahead-behind:refs/heads/{main_name})");
+    let patterns: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+    let mut args = vec!["for-each-ref", format.as_str()];
+    args.extend(patterns.iter().map(String::as_str));
+    let text = crate::engine::ref_cache::git_text(repo, &["refs/heads"], &args).ok()?;
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let Some((refname, counts)) = line.split_once('\0') else {
+            continue;
+        };
+        let Some(branch) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if !branches.contains(&branch) {
+            continue;
+        }
+        if let Some((ahead, behind)) = crate::engine::git_reader::parse_ahead_behind_pair(counts) {
+            out.insert(branch.to_string(), WorktreeDivergence { ahead, behind });
+        }
+    }
+    Some(out)
+}
+
 /// Lists every worktree of the repository, main entry first, with dirty-file
 /// counts, diff deltas, and detected portless routes for the worktrees closest to the front.
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
+    list_worktrees_scanned(repo_path, ScanDepth::Full)
+}
+
+/// Lists every worktree, measuring each scanned one to `depth`.
+///
+/// Identical asks share one scan. The sidebar's worktree panel and the Work
+/// view both list on every activation, a few milliseconds apart, and each
+/// used to scan every worktree. A caller joins a listing only while it has not
+/// started reading — so no caller is ever handed an answer older than its own
+/// request — and a caller arriving while one is reading waits for the one
+/// follow-up listing everyone who arrived meanwhile shares. The shared scan
+/// is as deep as its deepest caller asked. `Listing` depth is one process and
+/// never waits for a scan.
+pub fn list_worktrees_scanned(
+    repo_path: &str,
+    depth: ScanDepth,
+) -> Result<Vec<WorktreeInfo>, String> {
+    if depth == ScanDepth::Listing {
+        return scan_listing(repo_path, depth);
+    }
+    // Validated before joining, so a refusal is this caller's own answer.
+    let repo = validate_repo(repo_path)?;
+    let key = FlightKey {
+        repo,
+        class: crate::engine::git_cli::current_admission(),
+    };
+    let (flight, leader, previous) = {
+        let mut lanes = flight_lanes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let lane = lanes.entry(key.clone()).or_default();
+        match &lane.open {
+            Some(open) => {
+                let mut state = open.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.depth = state.depth.max(depth);
+                drop(state);
+                (Arc::clone(open), false, None)
+            }
+            None => {
+                let flight = Arc::new(Flight::new(depth));
+                lane.open = Some(Arc::clone(&flight));
+                (flight, true, lane.running.clone())
+            }
+        }
+    };
+    if !leader {
+        return flight.wait();
+    }
+
+    // Let the other asks of the same moment arrive. Waiting out a listing
+    // already reading serves the same purpose, and is required anyway: this
+    // one must read after it.
+    match previous {
+        Some(running) => {
+            let _ = running.wait();
+        }
+        None => std::thread::sleep(gather_window()),
+    }
+    let depth = {
+        let mut lanes = flight_lanes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let lane = lanes.entry(key.clone()).or_default();
+        lane.open = None;
+        lane.running = Some(Arc::clone(&flight));
+        let state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.depth
+    };
+
+    /// Publishes whatever the leader ended with and frees the lane, so a
+    /// leader that panics cannot strand the callers waiting on it.
+    struct Land<'a> {
+        key: &'a FlightKey,
+        flight: &'a Arc<Flight>,
+        outcome: Option<Result<Vec<WorktreeInfo>, String>>,
+    }
+    impl Drop for Land<'_> {
+        fn drop(&mut self) {
+            let outcome = self.outcome.take().unwrap_or_else(|| {
+                Err("the shared worktree listing ended without a result".into())
+            });
+            {
+                let mut lanes = flight_lanes()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(lane) = lanes.get_mut(self.key) {
+                    if lane
+                        .running
+                        .as_ref()
+                        .is_some_and(|r| Arc::ptr_eq(r, self.flight))
+                    {
+                        lane.running = None;
+                    }
+                    if lane.running.is_none() && lane.open.is_none() {
+                        lanes.remove(self.key);
+                    }
+                }
+            }
+            self.flight.publish(outcome);
+        }
+    }
+    let mut land = Land {
+        key: &key,
+        flight: &flight,
+        outcome: None,
+    };
+    let outcome = scan_listing(repo_path, depth);
+    #[cfg(test)]
+    before_publish_hook();
+    land.outcome = Some(outcome.clone());
+    drop(land);
+    outcome
+}
+
+/// How long the first ask of a listing waits for the others of its moment.
+const GATHER_WINDOW: Duration = Duration::from_millis(20);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FlightKey {
+    repo: PathBuf,
+    /// A background caller never shares a user-facing one's scan, nor the
+    /// other way round: the class decides what the gate may refuse.
+    class: crate::engine::git_cli::Admission,
+}
+
+#[derive(Default)]
+struct Lane {
+    /// Still gathering: joinable.
+    open: Option<Arc<Flight>>,
+    /// Reading: not joinable; the next ask waits for it.
+    running: Option<Arc<Flight>>,
+}
+
+struct Flight {
+    state: Mutex<FlightState>,
+    done: Condvar,
+}
+
+struct FlightState {
+    depth: ScanDepth,
+    result: Option<Result<Vec<WorktreeInfo>, String>>,
+}
+
+impl Flight {
+    fn new(depth: ScanDepth) -> Self {
+        Self {
+            state: Mutex::new(FlightState {
+                depth,
+                result: None,
+            }),
+            done: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<Vec<WorktreeInfo>, String> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.result.is_none() {
+            state = self
+                .done
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state
+            .result
+            .clone()
+            .unwrap_or_else(|| Err("the shared worktree listing was lost".into()))
+    }
+
+    fn publish(&self, outcome: Result<Vec<WorktreeInfo>, String>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.result = Some(outcome);
+        self.done.notify_all();
+    }
+}
+
+fn flight_lanes() -> &'static Mutex<HashMap<FlightKey, Lane>> {
+    static LANES: OnceLock<Mutex<HashMap<FlightKey, Lane>>> = OnceLock::new();
+    LANES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(test))]
+fn gather_window() -> Duration {
+    GATHER_WINDOW
+}
+
+#[cfg(test)]
+thread_local! {
+    static GATHER_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn gather_window() -> Duration {
+    GATHER_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(GATHER_WINDOW)
+}
+
+#[cfg(test)]
+fn before_publish_hook() {
+    BEFORE_PUBLISH.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+/// One listing with no sharing: what [`list_worktrees_scanned`] runs.
+fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
     let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
     let parsed = parse_worktree_porcelain(&stdout);
+    if depth == ScanDepth::Listing {
+        return Ok(parsed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, entry)| info_from(idx, entry, WorktreeScan::default()))
+            .collect());
+    }
 
     let scan_targets: Vec<usize> = parsed
         .iter()
@@ -597,6 +911,27 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
     // starts in the default admission class, so the scans of a listing asked
     // for as background work were promoted to refresh traffic.
     let class = crate::engine::git_cli::current_admission();
+    // Asked once for the whole listing, and only when some scanned branch
+    // is measured against it.
+    let needs_main = depth == ScanDepth::Full
+        && scan_targets.iter().any(|&idx| {
+            parsed[idx]
+                .branch
+                .as_deref()
+                .is_some_and(|branch| !is_main_name(branch))
+        });
+    let base = if needs_main {
+        let main = main_ref(&repo);
+        let branches: Vec<&str> = scan_targets
+            .iter()
+            .filter_map(|&idx| parsed[idx].branch.as_deref())
+            .filter(|branch| !is_main_name(branch))
+            .collect();
+        let batch = batch_divergence(&repo, &main, &branches);
+        Base { main, batch }
+    } else {
+        Base::none()
+    };
     let mut metrics: HashMap<usize, WorktreeScan> = HashMap::new();
     for wave in scan_targets.chunks(DIRTY_SCAN_FAN_OUT) {
         std::thread::scope(|scope| {
@@ -605,8 +940,11 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
                 .map(|&idx| {
                     let entry = &parsed[idx];
                     let repo = &repo;
+                    let base = &base;
                     let handle = scope.spawn(move || {
-                        crate::engine::git_cli::with_admission(class, || scan_worktree(repo, entry))
+                        crate::engine::git_cli::with_admission(class, || {
+                            scan_worktree(repo, entry, depth, base)
+                        })
                     });
                     (idx, handle)
                 })
@@ -633,24 +971,55 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
                 }),
                 ..WorktreeScan::default()
             });
-            WorktreeInfo {
-                name: display_name(&entry.path),
-                is_main: idx == 0,
-                dirty_files: scan.dirty,
-                diff_stat: scan.diff_stat,
-                main_divergence: scan.divergence,
-                active_routes: scan.routes,
-                scan_note: scan.note,
-                path: entry.path,
-                head: entry.head,
-                branch: entry.branch,
-                is_bare: entry.is_bare,
-                is_detached: entry.is_detached,
-                is_locked: entry.is_locked,
-                is_prunable: entry.is_prunable,
-            }
+            info_from(idx, entry, scan)
         })
         .collect())
+}
+
+fn info_from(idx: usize, entry: ParsedWorktree, scan: WorktreeScan) -> WorktreeInfo {
+    WorktreeInfo {
+        name: display_name(&entry.path),
+        is_main: idx == 0,
+        dirty_files: scan.dirty,
+        diff_stat: scan.diff_stat,
+        main_divergence: scan.divergence,
+        active_routes: scan.routes,
+        scan_note: scan.note,
+        path: entry.path,
+        head: entry.head,
+        branch: entry.branch,
+        is_bare: entry.is_bare,
+        is_detached: entry.is_detached,
+        is_locked: entry.is_locked,
+        is_prunable: entry.is_prunable,
+    }
+}
+
+/// Fills in the dirty-file count of one listed worktree, as a
+/// [`ScanDepth::Dirty`] listing would have, without scanning its siblings.
+pub fn scan_dirty(info: &mut WorktreeInfo) {
+    let entry = ParsedWorktree {
+        path: info.path.clone(),
+        branch: info.branch.clone(),
+        is_bare: info.is_bare,
+        ..ParsedWorktree::default()
+    };
+    let scan = if info.is_bare {
+        WorktreeScan {
+            note: Some("bare entry: no working tree to scan".into()),
+            ..WorktreeScan::default()
+        }
+    } else {
+        // The repository path is read only at `Full` depth.
+        scan_worktree(
+            Path::new(&info.path),
+            &entry,
+            ScanDepth::Dirty,
+            &Base::none(),
+        )
+    };
+    info.dirty_files = scan.dirty;
+    info.scan_note = scan.note;
 }
 
 /// What one worktree's scan measured, and why anything is missing.
@@ -663,7 +1032,12 @@ struct WorktreeScan {
     note: Option<String>,
 }
 
-fn scan_worktree(repo: &Path, entry: &ParsedWorktree) -> WorktreeScan {
+fn scan_worktree(
+    repo: &Path,
+    entry: &ParsedWorktree,
+    depth: ScanDepth,
+    base: &Base,
+) -> WorktreeScan {
     let dir = Path::new(&entry.path);
     if !dir.is_dir() {
         return WorktreeScan {
@@ -684,13 +1058,39 @@ fn scan_worktree(repo: &Path, entry: &ParsedWorktree) -> WorktreeScan {
             }
         }
     };
+    let dirty = Some(count_status_entries(status.as_bytes()));
+    if depth != ScanDepth::Full {
+        return WorktreeScan {
+            dirty,
+            ..WorktreeScan::default()
+        };
+    }
+    let branch = entry.branch.as_deref();
+    let divergence = branch.and_then(|b| {
+        if is_main_name(b) {
+            Some(WorktreeDivergence::default())
+        } else if let Some(batch) = &base.batch {
+            // A branch the batch did not list is not a ref (unborn), which
+            // its own `rev-list` could not measure either.
+            batch.get(b).cloned()
+        } else {
+            divergence_from(repo, &base.main, b)
+        }
+    });
     let mut scan = WorktreeScan {
-        dirty: Some(count_status_entries(status.as_bytes())),
+        dirty,
         diff_stat: measure_diff_stat(dir),
-        divergence: measure_main_divergence(repo, entry.branch.as_deref()),
-        routes: detect_worktree_routes(&entry.path, entry.branch.as_deref()),
+        divergence,
+        routes: detect_worktree_routes(&entry.path, branch),
         note: None,
     };
+    // The listing's one main/master lookup failed outside this scan's
+    // failure window, so it is named here or not at all.
+    if let (MainRef::Unread(reason), Some(b)) = (&base.main, branch) {
+        if !is_main_name(b) {
+            scan.note = Some(format!("some measurements were not taken: {reason}"));
+        }
+    }
     if crate::engine::git_cli::process_failures() != failures {
         scan.note = Some(format!(
             "some measurements were not taken: {}",
@@ -1447,7 +1847,7 @@ some-future-field whatever
         };
         let repo = main.path().canonicalize().unwrap();
         let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
-            scan_worktree(&repo, &entry)
+            scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none())
         });
         assert_eq!(scan.dirty, Some(0));
         assert_eq!(scan.diff_stat, None);
@@ -1457,7 +1857,7 @@ some-future-field whatever
             "{note}"
         );
         assert!(note.contains("forced by test"), "{note}");
-        let whole = scan_worktree(&repo, &entry);
+        let whole = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none());
         assert_eq!(whole.note, None);
         assert!(whole.diff_stat.is_some());
     }
@@ -2193,5 +2593,372 @@ some-future-field whatever
         let worktrees = list_worktrees(repo_path).expect("worktrees");
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
+    }
+
+    fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {
+        cwds.iter()
+            .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
+            .filter(|argv| argv.iter().any(|arg| arg == needle))
+            .count()
+    }
+
+    /// The main/master lookup is a property of the repository: one per
+    /// listing, not two processes for every worktree.
+    #[test]
+    fn a_full_listing_looks_up_main_once_whatever_the_worktree_count() {
+        let (main, _parent, linked) = repo_with_worktrees(5);
+        let root = main.path().canonicalize().unwrap();
+        let listed = list_worktrees(root.to_str().unwrap()).expect("list");
+        assert_eq!(listed.len(), 6);
+        let mut cwds = linked.clone();
+        cwds.push(root.clone());
+        assert_eq!(spawned_with(&cwds, "--verify"), 0, "per-worktree probes");
+        assert_eq!(
+            spawned_with(&cwds, "rev-list"),
+            0,
+            "per-worktree divergence walks"
+        );
+        assert_eq!(
+            spawned_with(std::slice::from_ref(&root), "refs/heads/main"),
+            1
+        );
+        // And what it measures is what git measures.
+        for info in &listed[1..] {
+            let branch = info.branch.as_deref().unwrap();
+            let counts = crate::engine::git_cli::git_text(
+                &root,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("main...{branch}"),
+                ],
+            )
+            .unwrap();
+            let mut parts = counts.split_whitespace();
+            let behind: usize = parts.next().unwrap().parse().unwrap();
+            let ahead: usize = parts.next().unwrap().parse().unwrap();
+            let measured = info.main_divergence.as_ref().expect("measured");
+            assert_eq!((measured.ahead, measured.behind), (ahead, behind));
+            assert_eq!(info.scan_note, None);
+        }
+    }
+
+    /// When the batch cannot answer (an older git rejects the atom), each
+    /// worktree measures itself and the numbers are the same.
+    #[test]
+    fn a_batch_that_cannot_answer_falls_back_to_each_worktrees_own_walk() {
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        let root = main.path().canonicalize().unwrap();
+        // Two commits on one agent branch, so the counts are not all zero.
+        for n in 0..2 {
+            std::fs::write(linked[1].join(format!("w{n}.txt")), "x").unwrap();
+            git_in(&linked[1], &["add", "."]);
+            git_in(&linked[1], &["commit", "-q", "-m", &format!("w{n}")]);
+        }
+        let batched = list_worktrees(root.to_str().unwrap()).expect("list");
+        let format = "--format=%(refname)%00%(ahead-behind:refs/heads/main)";
+        let before = spawned_with(std::slice::from_ref(&root), "rev-list");
+        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(format, || {
+            list_worktrees(root.to_str().unwrap())
+        })
+        .expect("list");
+        assert_eq!(
+            spawned_with(std::slice::from_ref(&root), "rev-list") - before,
+            3,
+            "one walk per agent worktree"
+        );
+        let counts = |list: &[WorktreeInfo]| -> Vec<Option<WorktreeDivergence>> {
+            list.iter().map(|w| w.main_divergence.clone()).collect()
+        };
+        assert_eq!(counts(&batched), counts(&walked));
+        assert_eq!(
+            batched[2].main_divergence,
+            Some(WorktreeDivergence {
+                ahead: 2,
+                behind: 0
+            })
+        );
+    }
+
+    /// `refs/heads/main/x` is matched by the `refs/heads/main` pattern but is
+    /// not a branch named main; master is the base then.
+    #[test]
+    fn main_is_an_exact_branch_name_not_a_prefix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "master"]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git_in(dir.path(), &["branch", "main/feature"]);
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(main_ref(&root), MainRef::Found("master"));
+        git_in(dir.path(), &["branch", "-q", "-m", "master", "trunk"]);
+        assert_eq!(main_ref(&root), MainRef::Absent);
+    }
+
+    /// A lookup that could not run is named on every worktree it would have
+    /// measured, not read as "no main branch".
+    #[test]
+    fn a_failed_main_lookup_is_named_on_the_worktrees_it_left_unmeasured() {
+        let (main, _parent, _linked) = repo_with_worktrees(2);
+        let root = main.path().canonicalize().unwrap();
+        let listed = crate::engine::git_cli::with_forced_spawn_failure_of("for-each-ref", || {
+            list_worktrees(root.to_str().unwrap())
+        })
+        .expect("list");
+        assert_eq!(listed[0].scan_note, None, "main itself needs no lookup");
+        for info in &listed[1..] {
+            assert_eq!(info.main_divergence, None);
+            let note = info.scan_note.as_deref().unwrap_or_default();
+            assert!(note.contains("forced by test"), "{note}");
+        }
+    }
+
+    /// Each depth runs what it reads and nothing past it.
+    #[test]
+    fn each_scan_depth_spawns_only_what_it_measures() {
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        let root = main.path().canonicalize().unwrap();
+        let mut cwds = linked.clone();
+        cwds.push(root.clone());
+
+        let listing = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Listing).unwrap();
+        assert!(listing.iter().all(|w| w.dirty_files.is_none()));
+        assert_eq!(spawned_with(&cwds, "status"), 0);
+
+        let dirty = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Dirty).unwrap();
+        assert!(dirty.iter().all(|w| w.dirty_files == Some(0)));
+        assert!(dirty
+            .iter()
+            .all(|w| w.diff_stat.is_none() && w.main_divergence.is_none()));
+        assert_eq!(spawned_with(&cwds, "status"), 4);
+        assert_eq!(spawned_with(&cwds, "--shortstat"), 0);
+        assert_eq!(spawned_with(&cwds, "rev-list"), 0);
+        assert_eq!(spawned_with(&cwds, "for-each-ref"), 0);
+    }
+
+    /// Filling in one worktree scans that worktree only.
+    #[test]
+    fn scanning_one_listed_worktree_leaves_its_siblings_alone() {
+        let (main, _parent, linked) = repo_with_worktrees(2);
+        std::fs::write(linked[1].join("new.txt"), "x").unwrap();
+        let mut listed = list_worktrees_lite(main.path().to_str().unwrap()).unwrap();
+        let mut target = listed.remove(2);
+        scan_dirty(&mut target);
+        assert_eq!(target.dirty_files, Some(1));
+        assert_eq!(target.scan_note, None);
+        let others = [main.path().canonicalize().unwrap(), linked[0].clone()];
+        assert_eq!(spawned_with(&others, "status"), 0);
+    }
+
+    /// The wire names are the variant names in lowercase, and nothing else:
+    /// a misspelt depth is refused rather than read as some other depth.
+    #[test]
+    fn scan_depth_reads_only_its_own_lowercase_names() {
+        let read = |text: &str| serde_json::from_str::<ScanDepth>(text);
+        assert_eq!(read(r#""listing""#).unwrap(), ScanDepth::Listing);
+        assert_eq!(read(r#""dirty""#).unwrap(), ScanDepth::Dirty);
+        assert_eq!(read(r#""full""#).unwrap(), ScanDepth::Full);
+        for wrong in [r#""Dirty""#, r#""deep""#, r#""""#, "1", "null"] {
+            assert!(read(wrong).is_err(), "{wrong} was accepted");
+        }
+    }
+
+    /// `worktree list` processes run in `root`.
+    fn listings_in(root: &Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(root)
+            .iter()
+            .filter(|argv| {
+                argv.iter().any(|a| a == "list") && argv.iter().any(|a| a == "--porcelain")
+            })
+            .count()
+    }
+
+    /// Whether a listing of `root` is gathering callers right now.
+    fn gathering(root: &Path) -> bool {
+        let key = FlightKey {
+            repo: validate_repo(root.to_str().unwrap()).unwrap(),
+            class: crate::engine::git_cli::current_admission(),
+        };
+        let lanes = flight_lanes().lock().unwrap();
+        lanes.get(&key).is_some_and(|lane| lane.open.is_some())
+    }
+
+    /// How many callers share the listing of `root` that is gathering.
+    fn sharing(root: &Path) -> usize {
+        let key = FlightKey {
+            repo: validate_repo(root.to_str().unwrap()).unwrap(),
+            class: crate::engine::git_cli::current_admission(),
+        };
+        let lanes = flight_lanes().lock().unwrap();
+        // The lane and the leader hold one reference each; every joiner, one.
+        lanes
+            .get(&key)
+            .and_then(|lane| lane.open.as_ref())
+            .map_or(0, |open| Arc::strong_count(open) - 1)
+    }
+
+    fn as_json(listed: &[WorktreeInfo]) -> serde_json::Value {
+        serde_json::to_value(listed).unwrap()
+    }
+
+    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !ready() {
+            assert!(started.elapsed() < Duration::from_secs(10), "never {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Starts a listing that gathers for `window` before reading.
+    fn lead(
+        root: &Path,
+        depth: ScanDepth,
+        window: Duration,
+    ) -> std::thread::JoinHandle<Result<Vec<WorktreeInfo>, String>> {
+        let path = root.to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            GATHER_OVERRIDE.with(|cell| cell.set(Some(window)));
+            list_worktrees_scanned(&path, depth)
+        })
+    }
+
+    /// The sidebar and the Work view ask for the same listing on every
+    /// activation; asks that arrive together share one scan, which is as deep
+    /// as the deepest of them.
+    #[test]
+    fn concurrent_listings_share_one_scan_at_the_deepest_depth() {
+        let (main, _parent, linked) = repo_with_worktrees(3);
+        let root = main.path().canonicalize().unwrap();
+        let before = listings_in(&root);
+        let leader = lead(&root, ScanDepth::Dirty, Duration::from_secs(2));
+        wait_until("gathering", || gathering(&root));
+        let joiners: Vec<_> = [ScanDepth::Full, ScanDepth::Dirty, ScanDepth::Full]
+            .into_iter()
+            .map(|depth| {
+                let path = root.to_str().unwrap().to_string();
+                std::thread::spawn(move || list_worktrees_scanned(&path, depth))
+            })
+            .collect();
+        wait_until("every caller joined", || sharing(&root) == 4);
+        let mut answers = vec![leader.join().unwrap().expect("leader")];
+        for joiner in joiners {
+            answers.push(joiner.join().unwrap().expect("joiner"));
+        }
+        assert_eq!(listings_in(&root) - before, 1, "one shared listing");
+        let mut cwds = linked.clone();
+        cwds.push(root.clone());
+        assert_eq!(
+            spawned_with(&cwds, "status"),
+            linked.len() + 1,
+            "one status per worktree"
+        );
+        for listed in &answers {
+            assert_eq!(as_json(listed), as_json(&answers[0]));
+            // The Dirty leader was raised to Full by its joiners.
+            assert!(
+                listed[1..].iter().all(|w| w.main_divergence.is_some()),
+                "{listed:?}"
+            );
+        }
+        assert!(!gathering(&root), "the lane was left open");
+    }
+
+    /// A caller arriving while a listing is reading never receives it: it
+    /// waits for the next one, which reads after it arrived.
+    #[test]
+    fn a_listing_already_reading_is_never_handed_to_a_later_caller() {
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let root = main.path().canonicalize().unwrap();
+        let before = listings_in(&root);
+        let (computed_tx, computed_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let path = root.to_str().unwrap().to_string();
+        let early = std::thread::spawn(move || {
+            GATHER_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
+            BEFORE_PUBLISH.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    computed_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }));
+            });
+            list_worktrees_scanned(&path, ScanDepth::Dirty)
+        });
+        computed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first listing read");
+        // The worktree changes after the first listing read it.
+        std::fs::write(linked[0].join("late.txt"), "late").unwrap();
+        let path = root.to_str().unwrap().to_string();
+        let late = std::thread::spawn(move || list_worktrees_scanned(&path, ScanDepth::Dirty));
+        wait_until("queued behind the reading listing", || gathering(&root));
+        // It does not read alongside the first: one scan of a repository at a
+        // time.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            listings_in(&root) - before,
+            1,
+            "the later listing read early"
+        );
+        release_tx.send(()).unwrap();
+        let early = early.join().unwrap().expect("early");
+        let late = late.join().unwrap().expect("late");
+        assert_eq!(early[1].dirty_files, Some(0), "read before the change");
+        assert_eq!(
+            late[1].dirty_files,
+            Some(1),
+            "the late caller saw the change"
+        );
+    }
+
+    /// A background listing never rides a user-facing one, nor the other way
+    /// round, and a `Listing`-depth ask never waits for a scan.
+    #[test]
+    fn listings_share_only_within_one_admission_class_and_depth_listing_never_waits() {
+        use crate::engine::git_cli::{with_admission, Admission};
+        let (main, _parent, _linked) = repo_with_worktrees(1);
+        let root = main.path().canonicalize().unwrap();
+        let before = listings_in(&root);
+        let leader = lead(&root, ScanDepth::Dirty, Duration::from_millis(500));
+        wait_until("gathering", || gathering(&root));
+        let path = root.to_str().unwrap().to_string();
+        let started = std::time::Instant::now();
+        let bare = list_worktrees_scanned(&path, ScanDepth::Listing).expect("listing");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "a bare listing waited {:?}",
+            started.elapsed()
+        );
+        assert!(bare.iter().all(|w| w.dirty_files.is_none()));
+        let background = std::thread::spawn(move || {
+            with_admission(Admission::Background, || {
+                list_worktrees_scanned(&path, ScanDepth::Dirty)
+            })
+        });
+        background.join().unwrap().expect("background");
+        leader.join().unwrap().expect("leader");
+        assert_eq!(
+            listings_in(&root) - before,
+            3,
+            "bare, background and reactive each listed"
+        );
+    }
+
+    /// A failed listing reaches every caller sharing it, and frees the lane.
+    #[test]
+    fn a_failed_shared_listing_fails_every_caller_and_frees_the_lane() {
+        let (main, _parent, _linked) = repo_with_worktrees(0);
+        let root = main.path().canonicalize().unwrap();
+        let leader = lead(&root, ScanDepth::Dirty, Duration::from_millis(300));
+        wait_until("gathering", || gathering(&root));
+        let path = root.to_str().unwrap().to_string();
+        let joiner = std::thread::spawn(move || list_worktrees_scanned(&path, ScanDepth::Full));
+        wait_until("the joiner joined", || sharing(&root) == 2);
+        // Break the repository while the listing gathers.
+        std::fs::write(root.join(".git/HEAD"), "garbage\n").unwrap();
+        let led = leader.join().unwrap();
+        let joined = joiner.join().unwrap();
+        let led = led.expect_err("the broken repository listed");
+        assert_eq!(Err(led), joined.map(|listed| as_json(&listed)));
+        assert!(!gathering(&root));
     }
 }

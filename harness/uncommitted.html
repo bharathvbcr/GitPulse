@@ -34,13 +34,13 @@ const fixtures={
  cmd_change_index:a=>{indexWrites.push(a);return {policy:null,output:a.filePaths.length};},
  cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
  cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),cmd_workspace_sync:()=>({repos:[]}),
- cmd_devcouncil_init:()=>({repo:"/workspace/alpha",state_dir:"/workspace/alpha/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],devmap_available:false}),
+ cmd_devcouncil_init:()=>({repo:"/workspace/alpha",state_dir:"/workspace/alpha/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false}),
  cmd_devmap_maybe_refresh:()=>({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
  cmd_get_file_diff:a=>{calls.push(a);return {text:patch(a.filePath,`${a.repoPath} ${a.isStaged?"staged":"unstaged"} modification`),truncated:false};},
  cmd_get_commit_diff:()=>({text:patch("old.ts","old commit content"),truncated:false}),
  cmd_get_commit_files:()=>[{path:"old.ts",status_code:"M",additions:1,deletions:1}],
  cmd_get_language_stats:()=>({stats:[],truncated:false}),
- cmd_last_fetch_at:()=>null,
+ cmd_last_fetch_at:()=>null,cmd_note_tab_activated:()=>null,
  cmd_get_file_content:()=>"fixture content",
  // CodeintelResponse::unavailable still carries a freshness object; without one
  // parseCodeintelResponse throws and DiffViewer reports "impact request failed"

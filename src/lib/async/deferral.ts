@@ -51,3 +51,27 @@ export function deferredRetryDelayMs(attempt: number): number {
 
 /** Consecutive deferrals after which the deferral is shown as the error. */
 export const MAX_DEFERRED_RETRIES = 5;
+
+/** The largest fraction a retry delay may be lengthened by. */
+export const RETRY_JITTER = 0.5;
+
+/**
+ * {@link deferredRetryDelayMs} lengthened by up to {@link RETRY_JITTER} of
+ * itself, never shortened, so a retry still cannot land inside the window
+ * that refused it.
+ *
+ * Without it every call declined by one storm came back on the same
+ * millisecond — a refresh is several commands, a restore is one per tab — met
+ * the same empty budget, was declined together again, and so on down the
+ * whole backoff in lockstep. Spreading them lets the budget refill between
+ * arrivals instead of being asked for all at once.
+ *
+ * `random` is a source in [0, 1); anything outside, or not a number, is
+ * clamped rather than trusted.
+ */
+export function jitteredRetryDelayMs(attempt: number, random: () => number): number {
+  const base = deferredRetryDelayMs(attempt);
+  const raw = random();
+  const unit = Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 1) : 0;
+  return Math.round(base * (1 + RETRY_JITTER * unit));
+}

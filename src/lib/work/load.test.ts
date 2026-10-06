@@ -325,6 +325,14 @@ describe("loadWork", () => {
     expect(commands).toContain("cmd_grants_view");
     expect(commands).toContain("cmd_repo_operation");
   });
+
+  it("asks for dirty counts only, not the panel's full worktree scan", async () => {
+    const invoke = fakeInvoke(baseAnswers());
+    await loadWork("/repo", { invoke: invoke as never });
+    const asked = invoke.mock.calls.filter((c) => c[0] === "cmd_list_worktrees");
+    expect(asked).toHaveLength(1);
+    expect(asked[0][1]).toEqual({ repoPath: "/repo", depth: "dirty" });
+  });
 });
 
 

@@ -19,15 +19,16 @@
 //!
 //! * **Per-worktree, not per-repo.** `MERGE_HEAD` and friends live in the
 //!   linked worktree's own git dir, never the common dir shared with the main
-//!   checkout. Resolution goes through `git rev-parse --git-path`, which
-//!   answers for the worktree the command ran in. Joining `--git-common-dir`
-//!   instead would report the main checkout's merge inside every worktree.
+//!   checkout. The probes are joined onto the worktree's private git dir
+//!   (what `git rev-parse --git-path` answers for them, checked against git in
+//!   the tests). Joining the common dir instead would report the main
+//!   checkout's merge inside every worktree.
 //! * **Absence of evidence is never reported as evidence.** A control file
 //!   that cannot be read is recorded as a warning on the detected operation,
 //!   not silently treated as missing. A detection that could not run must not
 //!   be indistinguishable from one that ran and found nothing.
 
-use crate::engine::git_cli::{git_text, git_text_shared, validate_repo};
+use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_writer::repo_mutation_lock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -206,44 +207,23 @@ pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
     }))
 }
 
-/// Resolves every probe path in ONE `git rev-parse` call.
+/// Resolves every probe path without starting git.
 ///
-/// `--git-path` is repeatable and emits one line per request, in order, and it
-/// answers for the worktree the command ran in — which is what makes this
-/// correct inside linked worktrees. Doing it per-path would cost six process
-/// spawns on every status refresh.
+/// This used to be one `git rev-parse --git-path` per probe set — a spawn on
+/// every refresh of every tab, spent on arithmetic. `--git-path` only rewrites
+/// a name onto the common directory when the name is on git's shared list
+/// (`refs`, `logs`, `objects`, `config`, `worktrees`, ...; `common_list` in
+/// git's `path.c`). Every name in [`PROBE_ORDER`] is per-worktree state, so
+/// each resolves to the worktree's own git directory — `.git/` for the main
+/// worktree, `.git/worktrees/<name>/` for a linked one, the repository itself
+/// when bare. `control_paths_match_git_rev_parse` holds this against git in
+/// all three layouts.
 fn resolve_control_paths(repo: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut args: Vec<&str> = Vec::with_capacity(1 + PROBE_ORDER.len() * 2);
-    args.push("rev-parse");
-    for probe in PROBE_ORDER {
-        args.push("--git-path");
-        args.push(probe);
-    }
-    let raw = git_text_shared(repo, &args)?;
-    let mut resolved: Vec<PathBuf> = raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| absolutize(repo, line))
-        .collect();
-    if resolved.len() != PROBE_ORDER.len() {
-        return Err(format!(
-            "git rev-parse --git-path returned {} paths for {} probes",
-            resolved.len(),
-            PROBE_ORDER.len()
-        ));
-    }
-    resolved.shrink_to_fit();
-    Ok(resolved)
-}
-
-fn absolutize(repo: &Path, raw: &str) -> PathBuf {
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repo.join(path)
-    }
+    let (private, _common) = crate::repository_trust::git_directories(repo)?;
+    Ok(PROBE_ORDER
+        .iter()
+        .map(|probe| private.join(probe))
+        .collect())
 }
 
 /// Picks the operation kind from which control paths exist.
@@ -933,5 +913,86 @@ mod tests {
         assert_eq!(describe_oid(dir.path(), ""), None);
         assert_eq!(describe_oid(dir.path(), "refs/heads/main"), None);
         assert_eq!(describe_oid(dir.path(), &"a".repeat(65)), None);
+    }
+
+    /// The probe paths are computed, no longer asked of `git rev-parse
+    /// --git-path`; git stays the oracle in every layout that resolves them
+    /// differently.
+    #[test]
+    fn control_paths_match_git_rev_parse() {
+        use crate::test_support::git_in;
+        let main = crate::test_support::git_repo();
+        let root = main.path().canonicalize().unwrap();
+        git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        let holder = tempfile::tempdir().unwrap();
+        let linked = holder.path().canonicalize().unwrap().join("linked");
+        git_in(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = bare_dir.path().canonicalize().unwrap();
+        git_in(&bare, &["init", "--bare", "-q"]);
+
+        // Probe files mostly do not exist, so compare through their parent.
+        let normal = |path: PathBuf| -> PathBuf {
+            let parent = path.parent().unwrap().canonicalize().unwrap();
+            parent.join(path.file_name().unwrap())
+        };
+        for repo in [&root, &linked, &bare] {
+            let ours: Vec<PathBuf> = resolve_control_paths(repo)
+                .expect("computed paths")
+                .into_iter()
+                .map(normal)
+                .collect();
+            let mut args = vec!["rev-parse"];
+            for probe in PROBE_ORDER {
+                args.push("--git-path");
+                args.push(probe);
+            }
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output_locked()
+                .expect("git rev-parse");
+            assert!(out.status.success());
+            let theirs: Vec<PathBuf> = String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let path = Path::new(line);
+                    normal(if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        repo.join(path)
+                    })
+                })
+                .collect();
+            assert_eq!(ours, theirs, "layout at {}", repo.display());
+        }
+        // A linked worktree's state is its own, not the main worktree's.
+        assert_ne!(
+            resolve_control_paths(&linked).unwrap(),
+            resolve_control_paths(&root).unwrap()
+        );
+    }
+
+    /// Detection spawns nothing on an idle repository any more.
+    #[test]
+    fn detecting_an_idle_repository_starts_no_process() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        assert!(detect(&root).unwrap().is_none());
+        // The log is keyed by working directory and this repository is fresh,
+        // so nothing a concurrent test spawns can land here.
+        let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
+        assert!(spawned.is_empty(), "spawned: {spawned:?}");
     }
 }

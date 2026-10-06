@@ -5,9 +5,10 @@ import {
 } from "@tauri-apps/api/core";
 import {
   MAX_DEFERRED_RETRIES,
-  deferredRetryDelayMs,
   isDeferredUnderLoad,
+  jitteredRetryDelayMs,
 } from "../async/deferral";
+import { whenDocumentShown } from "../runtime/foreground";
 
 /**
  * The one IPC entry point the frontend uses.
@@ -27,6 +28,13 @@ import {
  * While a call is waiting to retry, an identical call (same command, same
  * arguments) joins it instead of starting a second chain, so a poller cannot
  * stack retries behind one another.
+ *
+ * Two more things keep retries from feeding the load that caused them. Each
+ * delay is jittered upward (`jitteredRetryDelayMs`), so the calls one storm
+ * declined do not all come back on the same millisecond into the same empty
+ * budget. And a retry waits while the window is hidden: nobody can see its
+ * answer, and the spawn budget it would spend is shared with every agent
+ * session on the machine.
  */
 type Raw = <T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions) => Promise<T>;
 /** Exactly what the caller passed after `cmd`, forwarded with the same arity. */
@@ -35,6 +43,10 @@ type Rest = [args?: InvokeArgs, options?: InvokeOptions];
 export type DeferralRetryOptions = {
   /** Stand-in for `setTimeout`-based sleeping, for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Jitter source in [0, 1); `() => 0` gives the bare backoff schedule. */
+  random?: () => number;
+  /** Resolves when a retry may run; defaults to "the window is shown". */
+  whenShown?: () => Promise<void>;
 };
 
 function messageOf(error: unknown): string {
@@ -70,6 +82,8 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 /** Wraps `raw` so a deferral is retried with the shared backoff. */
 export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) {
   const sleep = options.sleep ?? defaultSleep;
+  const random = options.random ?? Math.random;
+  const whenShown = options.whenShown ?? whenDocumentShown;
   const retrying = new Map<string, Promise<unknown>>();
 
   /**
@@ -89,7 +103,8 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   async function retry<T>(cmd: string, rest: Rest, first: unknown): Promise<T> {
     let last = first;
     for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES; attempt += 1) {
-      await sleep(deferredRetryDelayMs(attempt));
+      await sleep(jitteredRetryDelayMs(attempt, random));
+      await whenShown();
       try {
         return await call<T>(cmd, rest);
       } catch (error) {

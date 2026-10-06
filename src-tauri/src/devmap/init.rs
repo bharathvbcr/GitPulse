@@ -299,6 +299,10 @@ pub struct InitReport {
     /// written at all. A refused host is not a skipped member: the file has
     /// to live in the host, so that failure is [`Self::workspace_reason`].
     pub skipped_untrusted: Vec<String>,
+    /// Open tabs left out of a written registry because they could not be
+    /// registered at all (gone from disk, no longer a repository), each as
+    /// `path: reason`. Empty when nothing was skipped or nothing was written.
+    pub skipped_unavailable: Vec<String>,
     /// `devmap` resolved to a binary. Initialization still runs its ignore
     /// hygiene without one — it costs nothing and the directory may already
     /// exist from another host — but it will not create state for a tool that
@@ -321,6 +325,7 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
     let mut workspace_registry = None;
     let mut workspace_reason = None;
     let mut skipped_untrusted = Vec::new();
+    let mut skipped_unavailable = Vec::new();
     if open_repos.is_empty() {
         workspace_reason = Some("no open repositories to register".into());
     } else if !devmap_available && !state_dir.is_dir() {
@@ -338,6 +343,7 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
             Ok(snapshot) => {
                 workspace_registry = Some(snapshot.registry_path);
                 skipped_untrusted = snapshot.skipped_untrusted;
+                skipped_unavailable = snapshot.skipped_unavailable;
             }
             Err(reason) => workspace_reason = Some(reason),
         }
@@ -350,6 +356,7 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
         workspace_registry,
         workspace_reason,
         skipped_untrusted,
+        skipped_unavailable,
         devmap_available,
     })
 }

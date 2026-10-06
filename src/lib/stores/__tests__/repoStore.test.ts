@@ -3,6 +3,7 @@ import { get, writable } from "svelte/store";
 import { createRepoStore, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, pathsTrustedForBackground, type BranchInfo, type InvokeFn } from "../repoStore";
 import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
 import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
+import { BACKGROUND_REFRESH_MIN_MS, WATCHER_REFRESH_DEBOUNCE_MS } from "../../repos/watcherRefresh";
 import { noteEventLoopDelay, resetEventLoopDelay } from "../../runtime/loadCadence";
 import { resetForegroundFocus } from "../../runtime/foreground";
 import type { FilterState } from "../filterStore";
@@ -12,6 +13,7 @@ import { promptState, completePrompt, cancelPrompt } from "../modalStore";
 import { autoInit } from "../../codeintel/autoInit";
 import * as workspaceSync from "../../codeintel/workspaceSync";
 import { withDeferralRetry } from "../../ipc/invoke";
+import { jitteredRetryDelayMs } from "../../async/deferral";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -172,6 +174,7 @@ function makeInvoke(overrides: Partial<Record<string, InvokeFn>> = {}): InvokeFn
     if (cmd === "cmd_branch_stats") return statsFor(String(args?.repoPath)) as never;
     if (cmd === "cmd_watch_repo") return String(args?.repoPath) as never;
     if (cmd === "cmd_unwatch_repo") return undefined as never;
+    if (cmd === "cmd_note_tab_activated") return undefined as never;
     if (cmd === "cmd_set_recent_menu") return undefined as never;
     if (cmd === "cmd_get_file_diff")
       return { text: `diff ${args?.filePath}`, truncated: false } as never;
@@ -478,7 +481,9 @@ describe("a snapshot deferred under load", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(snapshots, "retried inside the gate's own queue budget").toBe(afterOpen);
 
-    await vi.advanceTimersByTimeAsync(1_500);
+    // The first retry lands between the bare backoff and its jittered bound.
+    const latestFirstRetry = jitteredRetryDelayMs(1, () => 1);
+    await vi.advanceTimersByTimeAsync(latestFirstRetry - 2_000);
     await opening;
     const recovered = get(store);
     expect(snapshots).toBeGreaterThan(afterOpen);
@@ -2035,6 +2040,166 @@ describe("repoStore watcher coalescing", () => {
 
     expect(loaded["/r/storm-x"]).toBe(1);
     expect(loaded["/r/storm-y"]).toBe(1);
+  });
+
+  // Regression: every open tab refreshed in full on each of its own events,
+  // so two background repos with agents writing spent the app's entire spawn
+  // budget on tabs nobody was looking at. A background tab now refreshes at
+  // most once per BACKGROUND_REFRESH_MIN_MS; the active tab is unchanged.
+  it("bounds a busy background tab's refreshes while the active tab stays live", async () => {
+    vi.useFakeTimers();
+    const loaded: Record<string, number> = {};
+    const { store } = makeStore(countingLoads(loaded));
+    await store.openRepo("/r/busy-bg");
+    await store.openRepo("/r/active");
+    loaded["/r/busy-bg"] = 0;
+    loaded["/r/active"] = 0;
+
+    // An agent writing in both every two seconds, for two minutes.
+    for (let t = 0; t < 120_000; t += 2_000) {
+      await store.handleRepoChanged("/r/busy-bg");
+      await store.handleRepoChanged("/r/active");
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+    await vi.advanceTimersByTimeAsync(BACKGROUND_REFRESH_MIN_MS);
+
+    expect(loaded["/r/active"]).toBe(60);
+    // Was 60; now at most one per floor, and the last event is still paid.
+    expect(loaded["/r/busy-bg"]).toBeGreaterThanOrEqual(1);
+    expect(loaded["/r/busy-bg"]).toBeLessThanOrEqual(
+      1 + Math.ceil(150_000 / BACKGROUND_REFRESH_MIN_MS),
+    );
+  });
+
+  it("lets an activation's hydrate stand in for a background tab's owed refresh", async () => {
+    vi.useFakeTimers();
+    const loaded: Record<string, number> = {};
+    const { store } = makeStore(countingLoads(loaded));
+    await store.openRepo("/r/owed");
+    await store.openRepo("/r/front");
+    await store.handleRepoChanged("/r/owed");
+    await vi.advanceTimersByTimeAsync(WATCHER_REFRESH_DEBOUNCE_MS);
+    await store.handleRepoChanged("/r/owed");
+    loaded["/r/owed"] = 0;
+
+    const owedId = get(store).openTabs.find((tab) => tab.path === "/r/owed")!.id;
+    await store.activateTab(owedId);
+    expect(loaded["/r/owed"]).toBe(1);
+    await vi.advanceTimersByTimeAsync(4 * BACKGROUND_REFRESH_MIN_MS);
+    expect(loaded["/r/owed"]).toBe(1);
+  });
+
+  it("never refreshes a tab closed with a refresh still owed", async () => {
+    vi.useFakeTimers();
+    const loaded: Record<string, number> = {};
+    const { store } = makeStore(countingLoads(loaded));
+    await store.openRepo("/r/closing");
+    await store.openRepo("/r/stays");
+    await store.handleRepoChanged("/r/closing");
+    await vi.advanceTimersByTimeAsync(WATCHER_REFRESH_DEBOUNCE_MS);
+    await store.handleRepoChanged("/r/closing");
+    loaded["/r/closing"] = 0;
+
+    const id = get(store).openTabs.find((tab) => tab.path === "/r/closing")!.id;
+    await store.closeTab(id);
+    await vi.advanceTimersByTimeAsync(4 * BACKGROUND_REFRESH_MIN_MS);
+    expect(loaded["/r/closing"]).toBe(0);
+  });
+
+  /** Commands in call order, with the repository each was for. */
+  function recording(base: InvokeFn = makeInvoke()) {
+    const log: Array<[string, string]> = [];
+    const invoke: InvokeFn = async (cmd, args) => {
+      log.push([cmd, String(args?.repoPath ?? "")]);
+      return base(cmd, args);
+    };
+    return { invoke, log };
+  }
+
+  // Regression: a tab switch's hydrate ran as an ordinary read and queued
+  // behind background refreshes; the click now earns the post-action credit
+  // before its first read.
+  it("credits a user's activation before its hydrate, and nothing a restore or background open does", async () => {
+    const { invoke, log } = recording();
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/first");
+    const opened = log.map(([cmd]) => cmd);
+    expect(opened.indexOf("cmd_note_tab_activated")).toBeGreaterThan(-1);
+    expect(opened.indexOf("cmd_note_tab_activated")).toBeLessThan(opened.indexOf("cmd_list_branches"));
+
+    log.length = 0;
+    await store.openRepo("/r/agent-checkout", { activate: false });
+    expect(log.length, "the background open did its own work").toBeGreaterThan(0);
+    expect(
+      log.some(([cmd]) => cmd === "cmd_note_tab_activated"),
+      "a background open is not a user action",
+    ).toBe(false);
+    await store.openRepo("/r/second");
+    log.length = 0;
+    const firstId = get(store).openTabs.find((tab) => tab.path === "/r/first")!.id;
+    await store.activateTab(firstId);
+    const clicked = log.filter(([, repo]) => repo === "/r/first").map(([cmd]) => cmd);
+    expect(clicked[0], "the note precedes every read of the click").toBe("cmd_note_tab_activated");
+
+    log.length = 0;
+    await store.activateTab(firstId, { force: true });
+    expect(log.length, "the forced activation hydrated").toBeGreaterThan(0);
+    expect(log.some(([cmd]) => cmd === "cmd_note_tab_activated"), "restore presents, nobody clicked").toBe(false);
+  });
+
+  it("hydrates anyway when the activation note fails", async () => {
+    const base = makeInvoke({
+      cmd_note_tab_activated: async () => {
+        throw new Error("REPOSITORY_TRUST_REQUIRED: explicit approval required");
+      },
+    });
+    const { invoke, log } = recording(base);
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/note-fails");
+    expect(log.some(([cmd]) => cmd === "cmd_list_branches")).toBe(true);
+    expect(get(store).error).toBeNull();
+  });
+
+  it("spends nothing while the window is hidden and pays once when shown", async () => {
+    vi.useFakeTimers();
+    const listeners = new Map<string, Set<() => void>>();
+    const fakeDocument = {
+      hidden: false,
+      visibilityState: "visible",
+      hasFocus: () => true,
+      addEventListener: (type: string, fn: () => void) => {
+        (listeners.get(type) ?? listeners.set(type, new Set()).get(type)!).add(fn);
+      },
+      removeEventListener: (type: string, fn: () => void) => listeners.get(type)?.delete(fn),
+    };
+    vi.stubGlobal("document", fakeDocument);
+    try {
+      const loaded: Record<string, number> = {};
+      const { store } = makeStore(countingLoads(loaded));
+      await store.openRepo("/r/hidden");
+      // The first event binds the visibility listener.
+      await store.handleRepoChanged("/r/hidden");
+      await vi.advanceTimersByTimeAsync(WATCHER_REFRESH_DEBOUNCE_MS);
+      loaded["/r/hidden"] = 0;
+
+      fakeDocument.hidden = true;
+      fakeDocument.visibilityState = "hidden";
+      for (let i = 0; i < 300; i += 1) {
+        await store.handleRepoChanged("/r/hidden");
+        await vi.advanceTimersByTimeAsync(2_000);
+      }
+      expect(loaded["/r/hidden"]).toBe(0);
+
+      fakeDocument.hidden = false;
+      fakeDocument.visibilityState = "visible";
+      for (const fn of listeners.get("visibilitychange") ?? []) fn();
+      await vi.advanceTimersByTimeAsync(WATCHER_REFRESH_DEBOUNCE_MS);
+      expect(loaded["/r/hidden"]).toBe(1);
+      await vi.advanceTimersByTimeAsync(4 * BACKGROUND_REFRESH_MIN_MS);
+      expect(loaded["/r/hidden"]).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
