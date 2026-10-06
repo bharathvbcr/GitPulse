@@ -12,10 +12,19 @@
 //!
 //! # Idempotence
 //!
-//! Both replays run on every open, so both must be safe to run twice. Each
-//! source is watermarked by what is already in the ledger: transcripts by the
-//! newest `session.*` timestamp for the repo, the reflog by the newest
-//! `reflog.*` object already recorded. Re-running adds nothing.
+//! Both replays run on every open, so both must be safe to run twice. The
+//! reflog is keyed by the `reflog.*` objects already recorded. Transcripts are
+//! keyed by how many bytes of each file this worktree has consumed, committed
+//! in the same transaction as the events read from those bytes. Re-running
+//! adds nothing, and a pass cut short by its deadline resumes exactly where it
+//! stopped.
+//!
+//! Transcripts were once watermarked by the newest `session.*` row instead.
+//! That compared an agent's timestamps against the ledger's *write* time, so
+//! any call older than the last catch-up was taken as already read: a pass cut
+//! short, a terminal spawn, or a line still being written lost events for
+//! good. A worktree with no such row had no watermark at all and re-read the
+//! whole corpus on every call.
 
 pub mod transcript;
 
@@ -64,11 +73,6 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
-/// The newest timestamp already recorded for a source family in this repo.
-///
-/// The watermark is what makes a replay idempotent. It is read from the ledger
-/// rather than stored beside it, so it cannot drift from what was actually
-/// written.
 fn event_belongs_to_worktree(
     event: &crate::ledger::LedgerEvent,
     ledger_repo: &str,
@@ -81,27 +85,30 @@ fn event_belongs_to_worktree(
     }
 }
 
-fn watermark(ledger_repo: &str, worktree_path: &str, prefix: &str) -> String {
+/// When the newest transcript row for this worktree was written, as the
+/// pre-offset watermark computed it — or empty when there is none.
+///
+/// Read once per worktree, to freeze the line the old scheme had drawn. Only
+/// actions a transcript produces count: `session.spawn` is GitPulse opening a
+/// terminal, and letting it count is how a spawn used to hide agent work.
+fn legacy_watermark(ledger_repo: &str, worktree_path: &str) -> Result<String, String> {
     let mut cursor = 0i64;
     let mut newest = String::new();
-    while let Ok(page) = ledger::tail(ledger_repo, cursor, 1000) {
-        if page.is_empty() {
-            break;
-        }
+    loop {
+        let page = ledger::tail(ledger_repo, cursor, 1000).map_err(|e| e.to_string())?;
         for event in &page {
             if event_belongs_to_worktree(event, ledger_repo, worktree_path)
-                && event.action.starts_with(prefix)
+                && transcript::ACTIONS.contains(&event.action.as_str())
                 && event.ts_utc > newest
             {
                 newest = event.ts_utc.clone();
             }
         }
-        cursor = page[page.len() - 1].id;
-        if page.len() < 1000 {
-            break;
+        match page.last() {
+            Some(last) if page.len() == 1000 => cursor = last.id,
+            _ => return Ok(newest),
         }
     }
-    newest
 }
 
 /// Replays agent transcripts for `repo_path`.
@@ -123,8 +130,22 @@ fn ingest_transcripts_into_bounded(
     worktree_path: &str,
     deadline: Option<std::time::Instant>,
 ) -> CatchUp {
+    ingest_transcripts_until(ledger_repo, worktree_path, &mut |_| {
+        deadline.is_some_and(|d| std::time::Instant::now() >= d)
+    })
+}
+
+/// The pass itself, stopped when `expired` says so.
+///
+/// `expired` sees the pass's progress so far. Production budgets ignore it and
+/// read the clock; a test stops the pass at a chosen point of progress, which a
+/// wall-clock deadline cannot do deterministically.
+fn ingest_transcripts_until(
+    ledger_repo: &str,
+    worktree_path: &str,
+    expired: &mut dyn FnMut(&CatchUp) -> bool,
+) -> CatchUp {
     let mut out = CatchUp::default();
-    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let Some(root) = transcript_root() else {
         out.error = "no home directory, so transcripts cannot be located".into();
         return out;
@@ -135,41 +156,84 @@ fn ingest_transcripts_into_bounded(
         return out;
     }
 
-    let since = watermark(ledger_repo, worktree_path, "session.");
-    let since_ms = iso_to_millis(&since);
+    let progress = match ledger::transcript_progress(ledger_repo, worktree_path) {
+        Ok(progress) => progress,
+        Err(e) => {
+            out.error = format!("transcript progress could not be read: {e}");
+            return out;
+        }
+    };
+    let baseline = match progress.baseline {
+        Some(baseline) => baseline,
+        None => match legacy_watermark(ledger_repo, worktree_path).and_then(|since| {
+            ledger::freeze_transcript_baseline(ledger_repo, worktree_path, &since)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(baseline) => baseline,
+            Err(e) => {
+                out.error = format!("transcript baseline could not be set: {e}");
+                return out;
+            }
+        },
+    };
+    let baseline_ms = iso_to_millis(&baseline);
     let task_id = crate::ledger::bindings::resolve(ledger_repo, worktree_path)
         .ok()
         .flatten();
     let mut files = Vec::new();
-    collect_jsonl(&root, &mut files, 0);
+    let listed_all = collect_jsonl(&root, &mut files, 0);
+    let mut listed = std::collections::HashSet::new();
+    let mut pending = Vec::new();
     for path in files {
-        if expired() {
+        if expired(&out) {
             out.truncated = true;
             break;
         }
-        // A transcript not modified since the watermark cannot hold an event
-        // newer than it, so reading it can only reproduce work already done.
-        //
-        // This is soundness, not a heuristic: the watermark is the newest
-        // session timestamp already in the ledger, and a file's events cannot
-        // postdate its last write. Without it, catch-up re-read the whole
-        // corpus on every repo open — 886 files and 54 seconds on the machine
-        // this was measured on, for 0 new rows.
-        if since_ms > 0 && !modified_since(&path, since_ms) {
+        let file_key = ledger::transcript_key(&path);
+        listed.insert(file_key.clone());
+        let from = progress.offsets.get(&file_key).copied();
+        let Ok(len) = std::fs::metadata(&path).map(|meta| meta.len()) else {
+            out.skipped_lines += 1;
             continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        };
+        // `floor` applies only to a transcript this worktree has never read
+        // under offsets: calls at or before the frozen baseline were the old
+        // watermark's to record, and reading them again would duplicate them.
+        let (start, floor) = match from {
+            // Nothing appended since the last read. This is what keeps a
+            // worktree no agent touched from re-reading the corpus every call.
+            Some(done) if done == len => continue,
+            Some(done) if done < len => (done, None),
+            // Shorter than what was read: rewritten rather than appended to.
+            // Read it again — a duplicate row is recoverable, a lost one is not.
+            Some(_) => (0, None),
+            // Untouched since the baseline: the old watermark already read it.
+            None if baseline_ms > 0 && !modified_since(&path, baseline_ms) => continue,
+            None => (0, (!baseline.is_empty()).then_some(baseline.as_str())),
+        };
+        let Ok(bytes) = read_range(&path, start, len) else {
             // A transcript being written right now can fail a read; the next
-            // open picks it up. Counted so the gap is visible.
+            // pass picks it up. Counted so the gap is visible.
             out.skipped_lines += 1;
             continue;
         };
         out.transcripts += 1;
-        for line in content.lines() {
-            if expired() {
+        // Only whole lines. A last line with no newline yet may still be being
+        // written; it is left for the pass that sees it finished.
+        let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let mut consumed = 0usize;
+        let mut drafts = Vec::new();
+        for raw in bytes[..whole].split_inclusive(|b| *b == b'\n') {
+            if expired(&out) {
                 out.truncated = true;
                 break;
             }
+            consumed += raw.len();
+            let Ok(line) = std::str::from_utf8(raw) else {
+                out.skipped_lines += 1;
+                continue;
+            };
+            let line = line.trim_end_matches(['\n', '\r']);
             if line.trim().is_empty() {
                 continue;
             }
@@ -188,48 +252,130 @@ fn ingest_transcripts_into_bounded(
                 if !transcript::belongs_to(&call, worktree_path) {
                     continue;
                 }
-                if !since.is_empty() && call.ts_utc <= since {
+                if floor.is_some_and(|floor| call.ts_utc.as_str() <= floor) {
                     continue;
                 }
-                let detail = serde_json::json!({
-                    "source": "transcript",
-                    "tool": call.tool,
-                    "transcript_version": call.version,
-                    "git_branch": call.git_branch,
-                })
-                .to_string();
-                if ledger::record(Draft {
-                    repo_path: ledger_repo.to_string(),
-                    worktree_path: (ledger_repo != worktree_path)
-                        .then(|| worktree_path.to_string()),
-                    action: call.action().to_string(),
-                    object: Some(call.object()),
-                    session_id: Some(call.session_id.clone()),
-                    task_id: task_id.clone(),
-                    // Derived from observation, not self-reported: this row
-                    // exists because a transcript recorded the call, not
-                    // because an agent announced it.
-                    actor_kind: Some(ActorKind::Agent),
-                    actor_id: Some("claude-code".into()),
-                    outcome: Some(Outcome::Ok),
-                    // No verdict: GitPulse's gate never saw this action. That
-                    // is emphatically not the same as an action that passed,
-                    // and the absence is what says so.
-                    verdict_json: None,
-                    detail_json: Some(detail),
-                    ..Default::default()
-                })
-                .is_some()
-                {
-                    out.recorded += 1;
-                }
+                drafts.push(transcript_draft(
+                    &call,
+                    ledger_repo,
+                    worktree_path,
+                    &task_id,
+                ));
+            }
+        }
+        let to = start + consumed as u64;
+        if from != Some(to) && !(from.is_none() && to == 0) {
+            let has_events = !drafts.is_empty();
+            pending.push(ledger::TranscriptAdvance {
+                file_key,
+                from,
+                to,
+                drafts,
+            });
+            // Events are committed as soon as their transcript is read, so a
+            // deadline never discards them. Offset-only advances are batched:
+            // a first read of a corpus holding nothing for this worktree is
+            // thousands of them.
+            if (has_events || pending.len() >= ADVANCE_BATCH)
+                && !commit(ledger_repo, worktree_path, &mut pending, &mut out)
+            {
+                return out;
             }
         }
         if out.truncated {
             break;
         }
     }
+    if !commit(ledger_repo, worktree_path, &mut pending, &mut out) {
+        return out;
+    }
+    // Forget transcripts that are gone, but only on a pass that saw the whole
+    // corpus: a file missing from a partial listing may still exist, and
+    // forgetting its offset would replay it.
+    if listed_all && !out.truncated {
+        let gone: Vec<String> = progress
+            .offsets
+            .into_keys()
+            .filter(|key| !listed.contains(key))
+            .collect();
+        if let Err(e) = ledger::forget_transcripts(ledger_repo, worktree_path, &gone) {
+            out.error = format!("vanished transcripts could not be forgotten: {e}");
+        }
+    }
     out
+}
+
+/// Offset-only advances held before one commit.
+const ADVANCE_BATCH: usize = 512;
+
+/// Commits `pending`, emptying it. False, with the error in `out`, when the
+/// ledger refused it — the pass stops there rather than read further into
+/// events it could not keep.
+fn commit(
+    ledger_repo: &str,
+    worktree_path: &str,
+    pending: &mut Vec<ledger::TranscriptAdvance>,
+    out: &mut CatchUp,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    match ledger::advance_transcripts(ledger_repo, worktree_path, std::mem::take(pending)) {
+        Ok(recorded) => {
+            out.recorded += recorded;
+            true
+        }
+        Err(e) => {
+            out.error = format!("transcript events could not be recorded: {e}");
+            false
+        }
+    }
+}
+
+/// The bytes of `path` in `start..len`. Bounded by the length observed before
+/// the read, so a transcript growing under the reader is not chased.
+fn read_range(path: &std::path::Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(len.saturating_sub(start))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn transcript_draft(
+    call: &transcript::ToolCall,
+    ledger_repo: &str,
+    worktree_path: &str,
+    task_id: &Option<String>,
+) -> Draft {
+    let detail = serde_json::json!({
+        "source": "transcript",
+        "tool": call.tool,
+        "transcript_version": call.version,
+        "git_branch": call.git_branch,
+    })
+    .to_string();
+    Draft {
+        repo_path: ledger_repo.to_string(),
+        worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
+        action: call.action().to_string(),
+        object: Some(call.object()),
+        session_id: Some(call.session_id.clone()),
+        task_id: task_id.clone(),
+        // Derived from observation, not self-reported: this row exists because
+        // a transcript recorded the call, not because an agent announced it.
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("claude-code".into()),
+        outcome: Some(Outcome::Ok),
+        // No verdict: GitPulse's gate never saw this action. That is
+        // emphatically not the same as an action that passed, and the absence
+        // is what says so.
+        verdict_json: None,
+        detail_json: Some(detail),
+        ..Default::default()
+    }
 }
 
 /// Epoch milliseconds for an ISO-8601 timestamp, or 0 when it cannot be read.
@@ -299,26 +445,36 @@ fn modified_since(path: &std::path::Path, since_ms: u64) -> bool {
 ///
 /// The bound is not decoration: the transcript root is user-controlled, and a
 /// symlink loop under it would otherwise hang repo open forever.
-fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+///
+/// Returns whether `out` is the whole corpus: false when a directory could not
+/// be read or the file cap cut the walk short. Beyond the depth bound counts as
+/// complete — those files are never listed, so never have an offset to lose.
+fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) -> bool {
     const MAX_DEPTH: usize = 4;
     const MAX_FILES: usize = 5000;
-    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
-        return;
+    if depth > MAX_DEPTH {
+        return true;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return false;
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl(&path, out, depth + 1);
+            complete &= collect_jsonl(&path, out, depth + 1);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            out.push(path);
             if out.len() >= MAX_FILES {
-                return;
+                return false;
             }
+            out.push(path);
         }
     }
+    complete
 }
 
 /// Replays git's own reflog into the ledger.
@@ -705,6 +861,401 @@ mod tests {
             out.error.contains("truncated"),
             "truncated must be named in error, got {:?}",
             out.error
+        );
+    }
+
+    /// Moves a fixture's mtime an hour into the past, so a pass that ran just
+    /// after writing it is not inside `modified_since`'s one-second slack.
+    fn backdate(path: &std::path::Path) {
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+    }
+
+    fn backdate_all(dir: &std::path::Path) {
+        let mut files = Vec::new();
+        collect_jsonl(dir, &mut files, 0);
+        for f in &files {
+            backdate(f);
+        }
+    }
+
+    #[test]
+    fn a_worktree_with_no_attributed_work_does_not_reread_the_corpus() {
+        // A checkout no agent has touched has no `session.*` row to anchor a
+        // skip on. The corpus is still the same corpus the last pass read, and
+        // reading it again on every call can only find the same nothing. On a
+        // real machine that is a 5 s budget burned on every catch-up, forever.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            transcript_fixture(
+                tdir.path(),
+                "/somewhere/else",
+                &format!("F{i}"),
+                "2026-09-01T12:00:00.000Z",
+                &format!("/somewhere/else/a{i}.rs"),
+            );
+        }
+        backdate_all(tdir.path());
+
+        let (first, second) = with_transcript_root(tdir.path(), || {
+            (ingest_transcripts(repo), ingest_transcripts(repo))
+        });
+        assert_eq!(first.transcripts, 20, "the first pass must read the corpus");
+        assert_eq!(first.recorded, 0);
+        assert_eq!(
+            second.transcripts, 0,
+            "nothing changed since the first pass, yet the second re-read {} files",
+            second.transcripts
+        );
+    }
+
+    #[test]
+    fn a_truncated_pass_does_not_lose_what_it_never_reached() {
+        // Two transcripts, each holding one edit to this repository. The first
+        // pass is stopped right after it records one of them. The edit in the
+        // file it never reached is still owed, and the next pass must deliver it.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        for (session, file) in [("A", "a.rs"), ("B", "b.rs")] {
+            transcript_fixture(
+                tdir.path(),
+                repo,
+                session,
+                "2026-09-01T12:00:00.000Z",
+                &format!("{repo}/src/{file}"),
+            );
+        }
+        backdate_all(tdir.path());
+
+        let (first, second, third) = with_transcript_root(tdir.path(), || {
+            let first = ingest_transcripts_until(repo, repo, &mut |out| out.recorded >= 1);
+            (first, ingest_transcripts(repo), ingest_transcripts(repo))
+        });
+        assert!(first.truncated, "the first pass was meant to be cut short");
+        assert_eq!(first.recorded, 1);
+        assert_eq!(
+            second.recorded, 1,
+            "the edit in the transcript the truncated pass never reached was dropped"
+        );
+        assert_eq!(third.recorded, 0, "a completed catch-up must be idempotent");
+        let sessions: Vec<_> = ledger::tail(repo, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.session_id)
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            2,
+            "expected one row per edit, got {sessions:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_spawn_does_not_hide_transcript_work() {
+        // `session.spawn` is GitPulse opening a terminal, not a transcript
+        // replay. It says nothing about which transcript calls have been read.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        transcript_fixture(
+            tdir.path(),
+            repo,
+            "S1",
+            "2026-09-01T12:00:00.000Z",
+            &format!("{repo}/src/a.rs"),
+        );
+        ledger::record(Draft {
+            repo_path: repo.to_string(),
+            actor_kind: Some(ActorKind::Human),
+            actor_id: Some("/bin/zsh".into()),
+            session_id: Some("pty-1".into()),
+            action: "session.spawn".into(),
+            object: Some("/bin/zsh".into()),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("spawn row");
+
+        let out = with_transcript_root(tdir.path(), || ingest_transcripts(repo));
+        assert_eq!(
+            out.recorded, 1,
+            "a terminal opened in GitPulse hid an agent edit from catch-up"
+        );
+    }
+
+    fn assistant_line(repo: &str, session: &str, ts: &str, file: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": session,
+            "timestamp": ts,
+            "version": "2.1.241",
+            "cwd": repo,
+            "message": { "content": [
+                { "type": "tool_use", "name": "Edit", "input": { "file_path": file } }
+            ]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_line_still_being_written_is_read_once_it_is_complete() {
+        // An agent appends to its transcript while catch-up reads it. A pass
+        // that lands mid-write sees a line with no newline yet; that line is
+        // owed to the next pass, not judged and forgotten.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        let slug = tdir.path().join("slug");
+        std::fs::create_dir_all(&slug).unwrap();
+        let file = slug.join("S1.jsonl");
+        let first = assistant_line(
+            repo,
+            "S1",
+            "2026-09-01T12:00:00.000Z",
+            &format!("{repo}/a.rs"),
+        );
+        let second = assistant_line(
+            repo,
+            "S1",
+            "2026-09-01T12:00:01.000Z",
+            &format!("{repo}/b.rs"),
+        );
+        let (head, tail) = second.split_at(second.len() / 2);
+        std::fs::write(&file, format!("{first}\n{head}")).unwrap();
+
+        let (before, after) = with_transcript_root(tdir.path(), || {
+            let before = ingest_transcripts(repo);
+            let mut f = std::fs::File::options().append(true).open(&file).unwrap();
+            std::io::Write::write_all(&mut f, format!("{tail}\n").as_bytes()).unwrap();
+            (before, ingest_transcripts(repo))
+        });
+        assert_eq!(before.recorded, 1);
+        assert_eq!(
+            after.recorded, 1,
+            "the line that finished after the first read was never recorded"
+        );
+    }
+
+    #[test]
+    fn upgrading_does_not_replay_what_the_old_watermark_already_recorded() {
+        // A ledger written by the timestamp watermark holds a `session.edit`
+        // row for the edit in `old.jsonl`. The first pass after an upgrade
+        // must not record that edit a second time.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        transcript_fixture(
+            tdir.path(),
+            repo,
+            "old",
+            "2026-09-01T12:00:00.000Z",
+            &format!("{repo}/src/a.rs"),
+        );
+        backdate_all(tdir.path());
+        ledger::record(Draft {
+            repo_path: repo.to_string(),
+            actor_kind: Some(ActorKind::Agent),
+            actor_id: Some("claude-code".into()),
+            session_id: Some("old".into()),
+            action: "session.edit".into(),
+            object: Some(format!("{repo}/src/a.rs")),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy row");
+        // Written after the legacy row, holding one call the old watermark
+        // already covered and one it did not.
+        let slug = tdir.path().join("project-slug");
+        std::fs::write(
+            slug.join("new.jsonl"),
+            format!(
+                "{}\n{}\n",
+                assistant_line(
+                    repo,
+                    "new",
+                    "2026-09-01T12:00:00.000Z",
+                    &format!("{repo}/x.rs")
+                ),
+                assistant_line(
+                    repo,
+                    "new",
+                    "2099-01-01T00:00:00.000Z",
+                    &format!("{repo}/y.rs")
+                ),
+            ),
+        )
+        .unwrap();
+
+        let out = with_transcript_root(tdir.path(), || ingest_transcripts(repo));
+        assert_eq!(out.error, "");
+        assert_eq!(
+            out.recorded, 1,
+            "expected only the call after the old watermark"
+        );
+        let objects: Vec<_> = ledger::tail(repo, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.object)
+            .collect();
+        assert_eq!(objects.len(), 2, "history was replayed: {objects:?}");
+    }
+
+    #[test]
+    fn a_pass_cut_short_mid_transcript_resumes_at_the_next_line() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        let slug = tdir.path().join("slug");
+        std::fs::create_dir_all(&slug).unwrap();
+        let lines: Vec<String> = (0..3)
+            .map(|i| {
+                assistant_line(
+                    repo,
+                    "S1",
+                    &format!("2026-09-01T12:00:0{i}.000Z"),
+                    &format!("{repo}/f{i}.rs"),
+                )
+            })
+            .collect();
+        std::fs::write(slug.join("S1.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let (first, second, third) = with_transcript_root(tdir.path(), || {
+            // Checks: before the file, before line 1, before line 2 — so the
+            // pass stops with exactly one line read.
+            let mut checks = 0;
+            let first = ingest_transcripts_until(repo, repo, &mut |_| {
+                checks += 1;
+                checks > 2
+            });
+            (first, ingest_transcripts(repo), ingest_transcripts(repo))
+        });
+        assert!(first.truncated);
+        assert_eq!(first.recorded, 1, "the line read before the stop is kept");
+        assert_eq!(second.recorded, 2, "the rest of the transcript is owed");
+        assert_eq!(third.recorded, 0);
+        let mut objects: Vec<_> = ledger::tail(repo, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.object)
+            .collect();
+        objects.sort();
+        assert_eq!(
+            objects,
+            (0..3)
+                .map(|i| format!("{repo}/f{i}.rs"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_advance_overtaken_by_another_pass_records_nothing() {
+        // The app and `gitpulsed` both catch up. Two passes that read the same
+        // bytes from the same offset must not both record what they found.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let advance = || ledger::TranscriptAdvance {
+            file_key: "f".into(),
+            from: None,
+            to: 10,
+            drafts: vec![Draft {
+                repo_path: repo.to_string(),
+                action: "session.edit".into(),
+                object: Some("x".into()),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            ledger::advance_transcripts(repo, repo, vec![advance()]).unwrap(),
+            1
+        );
+        assert_eq!(
+            ledger::advance_transcripts(repo, repo, vec![advance()]).unwrap(),
+            0,
+            "a stale advance recorded its events a second time"
+        );
+        assert_eq!(ledger::tail(repo, 0, 100).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_listed_keeps_its_offsets() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        transcript_fixture(
+            tdir.path(),
+            repo,
+            "S1",
+            "2026-09-01T12:00:00.000Z",
+            &format!("{repo}/src/a.rs"),
+        );
+        let slug = tdir.path().join("project-slug");
+        let set_mode =
+            |mode| std::fs::set_permissions(&slug, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let (first, hidden, back) = with_transcript_root(tdir.path(), || {
+            let first = ingest_transcripts(repo);
+            set_mode(0o000);
+            let hidden = ingest_transcripts(repo);
+            set_mode(0o755);
+            (first, hidden, ingest_transcripts(repo))
+        });
+        assert_eq!(first.recorded, 1);
+        assert_eq!(hidden.recorded, 0);
+        assert_eq!(
+            back.recorded, 0,
+            "a transcript hidden from one listing was forgotten and replayed"
+        );
+        assert_eq!(ledger::tail(repo, 0, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transcript_that_is_gone_is_forgotten() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        transcript_fixture(
+            tdir.path(),
+            "/elsewhere",
+            "S1",
+            "2026-09-01T12:00:00.000Z",
+            "/elsewhere/a",
+        );
+        transcript_fixture(
+            tdir.path(),
+            "/elsewhere",
+            "S2",
+            "2026-09-01T12:00:00.000Z",
+            "/elsewhere/b",
+        );
+        with_transcript_root(tdir.path(), || {
+            ingest_transcripts(repo);
+            assert_eq!(
+                ledger::transcript_progress(repo, repo)
+                    .unwrap()
+                    .offsets
+                    .len(),
+                2
+            );
+            std::fs::remove_file(tdir.path().join("project-slug").join("S1.jsonl")).unwrap();
+            ingest_transcripts(repo);
+        });
+        assert_eq!(
+            ledger::transcript_progress(repo, repo)
+                .unwrap()
+                .offsets
+                .len(),
+            1,
+            "offsets must be bounded by the corpus, not by its history"
         );
     }
 }

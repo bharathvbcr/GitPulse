@@ -47,12 +47,21 @@ pub struct ToolCall {
     pub command: Option<String>,
 }
 
+/// Every ledger action a transcript call can become, and only those.
+///
+/// `session.spawn` shares the prefix but is GitPulse opening a terminal; a
+/// reader asking "what came from transcripts" must match this list, not the
+/// prefix.
+pub const ACTIONS: [&str; 2] = [EDIT, COMMAND];
+const EDIT: &str = "session.edit";
+const COMMAND: &str = "session.command";
+
 impl ToolCall {
     /// The ledger action this call becomes.
     pub fn action(&self) -> &'static str {
         match self.tool.as_str() {
-            "Bash" => "session.command",
-            _ => "session.edit",
+            "Bash" => COMMAND,
+            _ => EDIT,
         }
     }
 

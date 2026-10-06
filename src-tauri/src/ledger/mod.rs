@@ -79,6 +79,16 @@ CREATE TABLE IF NOT EXISTS ledger_family_imports (
   source_label   TEXT NOT NULL,
   source_cursor  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS transcript_cursors (
+  worktree_key   TEXT NOT NULL,
+  file_key       TEXT NOT NULL,
+  byte_offset    INTEGER NOT NULL,
+  PRIMARY KEY (worktree_key, file_key)
+);
+CREATE TABLE IF NOT EXISTS transcript_baselines (
+  worktree_key   TEXT PRIMARY KEY,
+  since_utc      TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pulse_snapshots (
   id             INTEGER PRIMARY KEY,
   day            TEXT NOT NULL,
@@ -876,9 +886,50 @@ fn with_conn<T>(
 
 /// Appends one event and returns its cursor id.
 ///
-/// Redaction happens here rather than at any call site, so a caller cannot
-/// forget it. Every path into the ledger passes through this function.
+/// Redaction happens in [`prepare`] rather than at any call site, so a caller
+/// cannot forget it. Every new event — here, and in the batches
+/// [`advance_transcripts`] commits — passes through [`prepare`] and [`insert`];
+/// only the legacy import copies rows, already redacted when first written.
 pub fn append(draft: Draft) -> Result<i64, LedgerError> {
+    let event = prepare(&draft)?;
+    let result = with_conn(&draft.repo_path, |conn| insert(conn, &event));
+
+    match &result {
+        Ok(cursor) => announce(&draft.repo_path, *cursor),
+        Err(_) => {
+            // Counted, not swallowed. `status()` reports it, and the UI can say
+            // the history it is showing is known to be incomplete.
+            record_dropped_append(&draft.repo_path);
+        }
+    }
+    result
+}
+
+/// A draft validated, stamped and redacted: exactly what one row will hold.
+///
+/// Built before the connection lock is taken, because redaction is the
+/// expensive part of an append and the lock is app-wide.
+struct Prepared {
+    ulid: String,
+    ts: String,
+    repo_path: String,
+    worktree_path: Option<String>,
+    actor_kind: &'static str,
+    actor_id: Option<String>,
+    session_id: Option<String>,
+    task_id: Option<String>,
+    action: String,
+    object: Option<String>,
+    argv: Option<String>,
+    outcome: &'static str,
+    verdict: Option<String>,
+    before_ref: Option<String>,
+    after_ref: Option<String>,
+    duration_ms: Option<i64>,
+    detail: Option<String>,
+}
+
+fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
     if draft.repo_path.is_empty() {
         return Err(LedgerError::new(
             "no_repo",
@@ -897,8 +948,6 @@ pub fn append(draft: Draft) -> Result<i64, LedgerError> {
     let repo_path = canonical_repo(&draft.repo_path);
 
     let ms = ids::now_millis();
-    let ulid = ids::ulid(ms);
-    let ts = ids::iso8601_utc(ms);
 
     // Unspecified actor and outcome are recorded as what they are. Defaulting
     // an unknown outcome to `ok` would be a lie the ledger then preserves.
@@ -908,61 +957,256 @@ pub fn append(draft: Draft) -> Result<i64, LedgerError> {
     // Redact every caller-controlled string at the one write boundary. The
     // verdict repeats the judged command in `target`, so redacting only argv
     // leaves a second full copy of the same credential in the same row.
-    let stored_repo_path = redact::text(&repo_path);
-    let worktree_path = draft.worktree_path.as_deref().map(redact::text);
-    let actor_id = draft.actor_id.as_deref().map(redact::text);
-    let session_id = draft.session_id.as_deref().map(redact::text);
-    let task_id = draft.task_id.as_deref().map(redact::text);
-    let action = redact::text(&draft.action);
-    let object = draft.object.as_deref().map(redact::text);
-    let argv = draft.argv_json.as_deref().map(redact::text);
-    let verdict = draft.verdict_json.as_deref().map(redact::text);
-    let before_ref = draft.before_ref.as_deref().map(redact::text);
-    let after_ref = draft.after_ref.as_deref().map(redact::text);
-    let detail = draft.detail_json.as_deref().map(redact::text);
+    Ok(Prepared {
+        ulid: ids::ulid(ms),
+        ts: ids::iso8601_utc(ms),
+        repo_path: redact::text(&repo_path),
+        worktree_path: draft.worktree_path.as_deref().map(redact::text),
+        actor_kind: actor_kind.as_str(),
+        actor_id: draft.actor_id.as_deref().map(redact::text),
+        session_id: draft.session_id.as_deref().map(redact::text),
+        task_id: draft.task_id.as_deref().map(redact::text),
+        action: redact::text(&draft.action),
+        object: draft.object.as_deref().map(redact::text),
+        argv: draft.argv_json.as_deref().map(redact::text),
+        outcome: outcome.as_str(),
+        verdict: draft.verdict_json.as_deref().map(redact::text),
+        before_ref: draft.before_ref.as_deref().map(redact::text),
+        after_ref: draft.after_ref.as_deref().map(redact::text),
+        duration_ms: draft.duration_ms,
+        detail: draft.detail_json.as_deref().map(redact::text),
+    })
+}
 
-    let result = with_conn(&draft.repo_path, |conn| {
+fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
+    conn.execute(
+        "INSERT INTO events (
+             ulid, ts_utc, schema_version, repo_path, worktree_path,
+             actor_kind, actor_id, session_id, task_id, action, object,
+             argv_json, outcome, verdict_json, before_ref, after_ref,
+             duration_ms, detail_json
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![
+            event.ulid,
+            event.ts,
+            SCHEMA_VERSION,
+            event.repo_path,
+            event.worktree_path,
+            event.actor_kind,
+            event.actor_id,
+            event.session_id,
+            event.task_id,
+            event.action,
+            event.object,
+            event.argv,
+            event.outcome,
+            event.verdict,
+            event.before_ref,
+            event.after_ref,
+            event.duration_ms,
+            event.detail,
+        ],
+    )
+    .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
+    Ok(conn.last_insert_rowid())
+}
+
+// --- transcript catch-up progress --------------------------------------
+//
+// How far transcript catch-up has read, kept in the same database as the
+// events it produced and committed in the same transaction as them, so the
+// two cannot disagree: a crash either keeps both the rows and the advance,
+// or neither.
+//
+// Paths are never stored. Keys are FNV-1a 64 digests of the raw path bytes,
+// the same treatment `ledger_family_imports` gives its sources: a transcript
+// path embeds the agent's working directory, and the events table only ever
+// holds such a string redacted.
+
+/// The persisted key for a worktree or transcript path.
+pub(crate) fn transcript_key(path: &Path) -> String {
+    format!("{:016x}", ids::fnv1a64(path.as_os_str().as_encoded_bytes()))
+}
+
+/// What transcript catch-up has already done for one worktree.
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptProgress {
+    /// Bytes of each transcript already consumed, by [`transcript_key`].
+    pub offsets: HashMap<String, u64>,
+    /// The timestamp watermark that governed catch-up before byte offsets
+    /// existed, frozen the first time this worktree was caught up under
+    /// offsets. `None` until then; empty when there was no watermark.
+    pub baseline: Option<String>,
+}
+
+pub(crate) fn transcript_progress(
+    repo_path: &str,
+    worktree_path: &str,
+) -> Result<TranscriptProgress, LedgerError> {
+    let worktree = transcript_key(Path::new(worktree_path));
+    with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
+        let baseline = conn
+            .query_row(
+                "SELECT since_utc FROM transcript_baselines WHERE worktree_key = ?1",
+                params![worktree],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(failed)?;
+        let mut stmt = conn
+            .prepare("SELECT file_key, byte_offset FROM transcript_cursors WHERE worktree_key = ?1")
+            .map_err(failed)?;
+        let offsets = stmt
+            .query_map(params![worktree], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(failed)?
+            .map(|row| row.map(|(key, offset)| (key, u64::try_from(offset).unwrap_or(0))))
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(failed)?;
+        Ok(TranscriptProgress { offsets, baseline })
+    })
+}
+
+/// Freezes `since` as this worktree's baseline unless one is already frozen,
+/// and returns whichever is in force. The app and `gitpulsed` can race here;
+/// the first writer wins and both then agree.
+pub(crate) fn freeze_transcript_baseline(
+    repo_path: &str,
+    worktree_path: &str,
+    since: &str,
+) -> Result<String, LedgerError> {
+    let worktree = transcript_key(Path::new(worktree_path));
+    with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("baseline_failed", e.to_string());
         conn.execute(
-            "INSERT INTO events (
-                 ulid, ts_utc, schema_version, repo_path, worktree_path,
-                 actor_kind, actor_id, session_id, task_id, action, object,
-                 argv_json, outcome, verdict_json, before_ref, after_ref,
-                 duration_ms, detail_json
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-            params![
-                ulid,
-                ts,
-                SCHEMA_VERSION,
-                stored_repo_path,
-                worktree_path,
-                actor_kind.as_str(),
-                actor_id,
-                session_id,
-                task_id,
-                action,
-                object,
-                argv,
-                outcome.as_str(),
-                verdict,
-                before_ref,
-                after_ref,
-                draft.duration_ms,
-                detail,
-            ],
+            "INSERT INTO transcript_baselines (worktree_key, since_utc) VALUES (?1, ?2)
+             ON CONFLICT(worktree_key) DO NOTHING",
+            params![worktree, since],
         )
-        .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
-        Ok(conn.last_insert_rowid())
-    });
+        .map_err(failed)?;
+        conn.query_row(
+            "SELECT since_utc FROM transcript_baselines WHERE worktree_key = ?1",
+            params![worktree],
+            |row| row.get(0),
+        )
+        .map_err(failed)
+    })
+}
 
-    match &result {
-        Ok(cursor) => announce(&draft.repo_path, *cursor),
-        Err(_) => {
-            // Counted, not swallowed. `status()` reports it, and the UI can say
-            // the history it is showing is known to be incomplete.
-            record_dropped_append(&draft.repo_path);
+/// One transcript read forward from `from` to `to`, with the events found in
+/// the bytes between.
+#[derive(Debug)]
+pub(crate) struct TranscriptAdvance {
+    pub file_key: String,
+    /// The offset this read started from, as [`transcript_progress`] reported
+    /// it; `None` for a transcript never read for this worktree.
+    pub from: Option<u64>,
+    pub to: u64,
+    pub drafts: Vec<Draft>,
+}
+
+/// Records each advance's events and moves its offset, all in one
+/// transaction.
+///
+/// Compare-and-set: an advance whose `from` no longer matches the stored
+/// offset was overtaken by a concurrent pass (the app and `gitpulsed` both
+/// catch up), and is dropped whole — its events are the other pass's to
+/// record, and recording them here too would duplicate them. Returns the
+/// number of events recorded.
+pub(crate) fn advance_transcripts(
+    repo_path: &str,
+    worktree_path: &str,
+    advances: Vec<TranscriptAdvance>,
+) -> Result<i64, LedgerError> {
+    let worktree = transcript_key(Path::new(worktree_path));
+    let prepared = advances
+        .iter()
+        .map(|advance| advance.drafts.iter().map(prepare).collect())
+        .collect::<Result<Vec<Vec<Prepared>>, _>>()?;
+    let result = with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("insert_failed", e.to_string());
+        // IMMEDIATE takes the write lock before the offset is read, so a
+        // second process cannot move it between the check and the write.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(failed)?;
+        let mut recorded = 0i64;
+        let mut newest = None;
+        for (advance, events) in advances.iter().zip(&prepared) {
+            let stored = tx
+                .query_row(
+                    "SELECT byte_offset FROM transcript_cursors
+                     WHERE worktree_key = ?1 AND file_key = ?2",
+                    params![worktree, advance.file_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(failed)?
+                .map(|offset| u64::try_from(offset).unwrap_or(0));
+            if stored != advance.from {
+                continue;
+            }
+            for event in events {
+                newest = Some(insert(&tx, event)?);
+                recorded += 1;
+            }
+            tx.execute(
+                "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(worktree_key, file_key) DO UPDATE SET
+                    byte_offset = excluded.byte_offset",
+                params![
+                    worktree,
+                    advance.file_key,
+                    i64::try_from(advance.to).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(failed)?;
+        }
+        tx.commit().map_err(failed)?;
+        Ok((recorded, newest))
+    });
+    match result {
+        Ok((recorded, newest)) => {
+            if let Some(cursor) = newest {
+                announce(repo_path, cursor);
+            }
+            Ok(recorded)
+        }
+        Err(e) => {
+            for _ in prepared.iter().flatten() {
+                record_dropped_append(repo_path);
+            }
+            Err(e)
         }
     }
-    result
+}
+
+/// Forgets the offsets of transcripts that no longer exist, so the table is
+/// bounded by the corpus rather than by its history.
+pub(crate) fn forget_transcripts(
+    repo_path: &str,
+    worktree_path: &str,
+    file_keys: &[String],
+) -> Result<(), LedgerError> {
+    if file_keys.is_empty() {
+        return Ok(());
+    }
+    let worktree = transcript_key(Path::new(worktree_path));
+    with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("forget_failed", e.to_string());
+        let tx = conn.unchecked_transaction().map_err(failed)?;
+        for key in file_keys {
+            tx.execute(
+                "DELETE FROM transcript_cursors WHERE worktree_key = ?1 AND file_key = ?2",
+                params![worktree, key],
+            )
+            .map_err(failed)?;
+        }
+        tx.commit().map_err(failed)
+    })
 }
 
 /// Appends without propagating failure, for the mutation path.
