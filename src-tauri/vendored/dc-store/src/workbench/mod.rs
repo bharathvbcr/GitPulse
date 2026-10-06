@@ -11,6 +11,7 @@ mod input;
 mod notifications;
 mod runs;
 
+pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
 pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
 
 use crate::Store;

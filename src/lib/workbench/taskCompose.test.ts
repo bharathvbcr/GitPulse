@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  AGENT_COPY_PREAMBLE,
+  AGENT_COPY_COMPLETION,
+  AGENT_GUIDANCE_SECTION,
   MAX_AGENT_COPY_TASKS,
   MAX_SUBTASKS,
   SUBTASK_CAP,
@@ -127,7 +128,9 @@ describe("agent copy", () => {
     });
     expect(copy).toContain("Unsaved GitPulse task draft");
     expect(copy).not.toMatch(/revision \d/);
-    expect(copy).toContain(AGENT_COPY_PREAMBLE);
+    expect(copy?.startsWith(AGENT_COPY_COMPLETION)).toBe(true);
+    // Shaped like the store's brief: the guidance section, then the task.
+    expect(copy).toContain(`${AGENT_GUIDANCE_SECTION}\n\n## Title\nKeep E42`);
     expect(copy).toContain("Keep E42");
     expect(copy).toContain("exact error: E42");
     expect(copy).toContain("- [ ] Both repository checks pass");
@@ -138,10 +141,10 @@ describe("agent copy", () => {
   it("tells the agent how to mark a saved task done, conditionally and never for unfinished work", () => {
     // A copied prompt reaches agents GitPulse did not launch. They learn the
     // task id from the brief's Task: line, which only a saved brief carries.
-    expect(AGENT_COPY_PREAMBLE).toContain("gitpulse_complete_task");
-    expect(AGENT_COPY_PREAMBLE).toContain("Task: line");
-    expect(AGENT_COPY_PREAMBLE).toContain("status review");
-    expect(AGENT_COPY_PREAMBLE).toContain("Never mark done work you did not finish");
+    expect(AGENT_COPY_COMPLETION).toContain("gitpulse_complete_task");
+    expect(AGENT_COPY_COMPLETION).toContain("Task: line");
+    expect(AGENT_COPY_COMPLETION).toContain("status review");
+    expect(AGENT_COPY_COMPLETION).toContain("Never mark done work you did not finish");
   });
 
   it("carries pasted raw logs as a fenced evidence section and omits them when empty", () => {
@@ -176,11 +179,15 @@ describe("agent copy", () => {
   });
 
   it("carries the tool guidance and the preservation rule into every packet", () => {
-    // Both copy paths share one preamble, and both reach an agent that has
-    // never seen this repository: whatever is missing here is missing entirely.
+    // Both copy paths reach an agent that has never seen this repository:
+    // whatever is missing here is missing entirely. A saved brief carries the
+    // store's guidance section itself; a draft renders the same section. The
+    // saved fixture is shaped as the store exports it, guidance first.
     const draft = formatDraftAgentCopy({ title: "Keep E42", description: "exact error: E42" })!;
-    const saved = wrapSavedBriefForAgent("# Task brief v1\n\n## Title\nKeep E42")!;
+    const saved = wrapSavedBriefForAgent(`# Task brief v1\n\n${AGENT_GUIDANCE_SECTION}\n\n## Title\nKeep E42`)!;
     for (const packet of [draft, saved]) {
+      // Exactly once: a copy that added its own would hand over two.
+      expect(packet.split(AGENT_GUIDANCE_SECTION).length - 1).toBe(1);
       expect(packet).toContain("Preserve the author's intent and message");
       expect(packet).toContain("gitpulse-insights");
       expect(packet).toContain("gitpulse-tasks");
@@ -193,7 +200,7 @@ describe("agent copy", () => {
 
   it("wraps a saved brief and refuses empty or hostile markdown", () => {
     const wrapped = wrapSavedBriefForAgent("# Task brief v1\n\n## Title\nKeep E42");
-    expect(wrapped?.startsWith(AGENT_COPY_PREAMBLE)).toBe(true);
+    expect(wrapped?.startsWith(AGENT_COPY_COMPLETION)).toBe(true);
     expect(wrapped).toContain("# Task brief v1");
     expect(wrapSavedBriefForAgent("")).toBeNull();
     expect(wrapSavedBriefForAgent("\u0000")).toBeNull();

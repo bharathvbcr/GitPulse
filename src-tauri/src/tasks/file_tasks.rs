@@ -765,7 +765,15 @@ fn body_sections(lines: &[&str]) -> Result<(Stated, Option<String>), String> {
         Criteria,
         PlannedFiles,
         Logs,
+        Guidance,
     }
+    // The store's export opens with standing agent guidance under this
+    // heading. It is not the task's text: folding it into the description
+    // would make every board → file → board round trip carry another copy.
+    let guidance_heading = dc_store::workbench::AGENT_GUIDANCE_HEADING
+        .trim_start_matches('#')
+        .trim()
+        .to_ascii_lowercase();
     let mut stated = Stated::default();
     let mut section = Section::Preamble;
     let mut title: Option<String> = None;
@@ -838,6 +846,7 @@ fn body_sections(lines: &[&str]) -> Result<(Stated, Option<String>), String> {
                 "task brief v1" | "gitpulse task" | "unsaved gitpulse task draft" => {
                     Some(Section::Preamble)
                 }
+                other if other == guidance_heading => Some(Section::Guidance),
                 _ => None,
             };
             match next {
@@ -916,6 +925,7 @@ fn body_sections(lines: &[&str]) -> Result<(Stated, Option<String>), String> {
                     }
                 }
             }
+            Section::Guidance => {}
             Section::Logs => {
                 if !logs_fenced
                     && !trimmed.starts_with("Pasted evidence")

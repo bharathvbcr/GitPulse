@@ -2,6 +2,7 @@ import { PRIORITY_LABELS } from "./boardDrag";
 import { STATUS_LABELS, type TaskDraft, type TaskStatus } from "./client";
 import { displayTitle } from "./taskDelete";
 import { formatLogsSection } from "./taskLogs";
+import AGENT_GUIDANCE from "../../../src-tauri/vendored/dc-store/src/workbench/agent_guidance.md?raw";
 
 export const MAX_AGENT_COPY_TASKS = 8;
 export const MAX_SUBTASKS = 128;
@@ -169,36 +170,29 @@ export function extractDraftSubtasks(
 
 
 /**
- * The instruction every copied task carries into an agent.
+ * How an agent handed a task is told to work, as the store's brief renders it.
  *
- * This is the whole prompt. A run started from the handoff form sends only
- * `{id, request_id, expected_revision}` to Manvi, and a clipboard copy is
- * pasted into a session that knows nothing about this task — so whatever is
- * not said here is not said at all.
- *
- * Three things it has to do, and the second and third were missing:
- *
- *  1. **Name the field roles.** Without them an agent reads the acceptance
- *     criteria as suggestions.
- *  2. **Keep the author's words intact.** The board's own tests are written
- *     around this ("Preserve E42"): a task's description is evidence, and an
- *     agent that paraphrases a reproduction step into a tidier one has
- *     answered a different question. `improve` already told the on-device
- *     model this; the agent handoff never did.
- *  3. **Point at the tools this project ships.** GitPulse and DevMap both
- *     expose skills and MCP tools that answer "who else is editing this" and
- *     "what calls this" directly, and an agent that does not know they exist
- *     greps instead — or, worse, concludes from silence.
+ * The text is dc-store's own (`dc_store::workbench::AGENT_GUIDANCE`, vendored):
+ * every saved brief opens with it, so a copied saved brief, a terminal launch
+ * and a managed run all carry the same words, recorded with each attempt. A
+ * saved copy therefore adds nothing; only an unsaved draft, which never went
+ * through the store, renders the section here. It names the field roles,
+ * keeps the author's words intact, sends the agent to the repository's own
+ * instructions and code before it writes, points at GitPulse, DevMap and
+ * DevCouncil, and states the engineering and verification rules.
  *
  * Named skills are asserted against the directories that ship them, so a
  * skill added or renamed cannot quietly fall out of this text.
  */
-export const AGENT_COPY_PREAMBLE = [
-  "GitPulse task for an AI agent. Use the title as the goal, the description as context, and the acceptance criteria as the definition of done. Raw logs, when present, are evidence. Do not invent repositories or skip criteria.",
-  "Preserve the author's intent and message. The wording below is evidence: keep error codes, identifiers, paths, versions, commands and quoted text exactly as written, carry the original meaning into whatever you produce, and do not restate the task as a smaller or easier one.",
-  "Orient with the tools this project ships before you edit, and skip any this session does not have. GitPulse — the gitpulse-insights, gitpulse-collisions and gitpulse-tasks skills, and the gitpulse_* MCP tools — for worktrees, in-flight changes, tasks and overlapping edits. DevMap — the devmap, devmap-debugging, devmap-exploring, devmap-impact and devmap-refactoring skills, and the devmap_* MCP tools — for symbols, callers, blast radius and affected tests. Pass the repository's absolute repo_path on every call. A tool that is unavailable, truncated or empty is not evidence that a symbol, caller or collision does not exist; name the check you could not run instead of reporting it as clean.",
-  "When the brief names a saved task on its Task: line and every acceptance criterion is met with your verification passing, mark it done with gitpulse_complete_task: that id, the repo_path, and a short summary of what changed and how you verified it. If anything is unfinished or needs a person's judgement, use status review and say what remains. Never mark done work you did not finish.",
-].join("\n\n");
+export const AGENT_GUIDANCE_SECTION = `## Agent guidance\n${AGENT_GUIDANCE.trim()}`;
+
+/**
+ * The completion rule a copy states for itself. The store's guidance names no
+ * completion step, because a launched attempt's permission mode decides it;
+ * a clipboard copy has no mode, so it says when finishing is allowed here.
+ */
+export const AGENT_COPY_COMPLETION =
+  "When the brief names a saved task on its Task: line and every acceptance criterion is met with your verification passing, mark it done with gitpulse_complete_task: that id, the repo_path, and a short summary of what changed and how you verified it. If anything is unfinished or needs a person's judgement, use status review and say what remains. Never mark done work you did not finish.";
 
 const TITLE_CAP = 300;
 const NOTES_CAP = 65_536;
@@ -358,10 +352,12 @@ export function formatDraftAgentCopy(draft: DraftAgentCopy): string | null {
   const status = draft.status && STATUS_LABELS[draft.status] ? STATUS_LABELS[draft.status] : "Unspecified";
   const priority = PRIORITY_LABELS[(draft.priority ?? 1) as 0 | 1 | 2 | 3] ?? "Unknown";
   const lines = [
-    AGENT_COPY_PREAMBLE,
+    AGENT_COPY_COMPLETION,
     "",
     "# Unsaved GitPulse task draft",
     "This has not been saved. Treat these fields as the author's current intent, not a stored revision.",
+    "",
+    AGENT_GUIDANCE_SECTION,
     "",
     "## Title",
     title,
@@ -390,7 +386,9 @@ export function wrapSavedBriefForAgent(markdown: unknown): string | null {
   if (typeof markdown !== "string") return null;
   const body = markdown.replace(/\u0000/g, "").trim();
   if (!body || body.length > 2 * 1024 * 1024) return null;
-  return `${AGENT_COPY_PREAMBLE}\n\n${body}`;
+  // The saved brief already opens with the agent guidance; adding it again
+  // would hand the agent two copies to reconcile.
+  return `${AGENT_COPY_COMPLETION}\n\n${body}`;
 }
 
 export function suggestionDiffers(current: unknown, proposed: unknown): boolean {

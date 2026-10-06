@@ -218,12 +218,10 @@ export function formatAgentDescription(issue: Partial<IssueInfo>, guidance?: str
     sections.push(guidance.trim());
   }
 
-  sections.push("");
-  sections.push("### Coding Agent Workflow");
-  sections.push("1. **Locate & Audit**: Use DevMap search/explore to find the affected components and review caller impact.");
-  sections.push("2. **Reproduce**: Identify failing behavior or write an automated regression test reproducing the issue.");
-  sections.push("3. **Implement**: Apply a robust, universal fix addressing the root cause rather than a single edge case.");
-  sections.push("4. **Verify**: Run unit tests, type checks, and verify all contract invariants hold before completing.");
+  // How an agent should work is not written into the task. Every brief opens
+  // with the store's agent guidance (dc-store `AGENT_GUIDANCE`), which every
+  // lane delivers; a second, narrower copy stored here would age separately
+  // and be read as part of the issue.
 
   const rawMarkdown = sections.join("\n");
   const encoder = new TextEncoder();

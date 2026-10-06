@@ -584,9 +584,15 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
     Ok((flags, mode == "inspect"))
 }
 
-/// What a launched agent is told about finishing. The brief's first lines
-/// carry `Task: <id> (revision N)`; the tool is `gitpulse_complete_task` on the
-/// GitPulse MCP server, which changes only the status and records the summary.
+/// What a launched agent is told about finishing. How to work is not said
+/// here: the brief file is the store's export, which opens with the agent
+/// guidance every handoff carries (`dc_store::workbench::AGENT_GUIDANCE`), so
+/// a terminal agent and a managed one are told the same thing. The guidance
+/// names no completion step because only this launch knows the mode; the
+/// brief's `Task: <id> (revision N)` line follows it. The tool is
+/// `gitpulse_complete_task` on the GitPulse MCP server, which changes only the
+/// status and records the summary. Manvi's managed lane states the same scope
+/// in `serve.managedTurn`.
 pub(crate) const COMPLETION: &str = "Carry out the saved task within the selected permission mode. When every acceptance criterion is met and your verification passed, mark the task done with the gitpulse_complete_task tool, using the id on the brief's Task: line and a short summary of what changed and how you verified it; if anything is unfinished or needs a person's judgement, use status review instead and say what remains.";
 
 pub(super) fn arguments(
@@ -640,7 +646,7 @@ pub(super) fn arguments(
     } else {
         COMPLETION
     };
-    args.push(format!("Read the UTF-8 task brief at {quoted}. It contains the user's saved task and repository references. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
+    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
     if args.iter().any(|a| a.len() > 16 * 1024 || a.contains('\0')) {
         return Err(error(
             "invalid_input",
@@ -1024,6 +1030,33 @@ mod tests {
             with_launch_flags(Some("codex"), true, None, None).unwrap(),
             notify_flags("codex")
         );
+    }
+
+    /// The brief's guidance is shared by every mode, so it must not carry the
+    /// completion rule: an inspect launch is told not to change the task's
+    /// status, and a brief that also told it to mark the task done would
+    /// contradict its own launch prompt. Only the edit-capable prompt names
+    /// the tool.
+    #[test]
+    fn only_an_edit_capable_launch_is_told_to_complete_the_task() {
+        assert!(!dc_store::workbench::AGENT_GUIDANCE.contains("gitpulse_complete_task"));
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        for provider in ["claude", "codex", "grok", "agy"] {
+            let inspect = arguments(provider, "inspect", false, "/c", &brief.path).unwrap();
+            let prompt = inspect.last().unwrap();
+            assert!(
+                prompt.starts_with("Read the UTF-8 task brief"),
+                "{provider}"
+            );
+            assert!(prompt.contains("DevMap and DevCouncil"), "{provider}");
+            assert!(!prompt.contains("gitpulse_complete_task"), "{provider}");
+            let edit = arguments(provider, "edit", false, "/c", &brief.path).unwrap();
+            assert!(
+                edit.last().unwrap().contains("gitpulse_complete_task"),
+                "{provider}"
+            );
+        }
     }
 
     /// The defect: a task attempt's argv was built only from the policy and

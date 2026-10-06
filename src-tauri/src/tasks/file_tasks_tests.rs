@@ -83,6 +83,43 @@ fn reads_an_agent_written_brief_in_full() {
     assert_eq!(brief.logs, None);
 }
 
+/// The export the board actually produces, not a transcription of it: the
+/// store's brief opens with standing agent guidance, which is not the task's
+/// text and must not come back as part of its description.
+#[test]
+fn a_real_store_export_reads_back_without_its_agent_guidance() {
+    let store = dc_store::Store::open_in_memory().unwrap();
+    for (method, input) in [
+        (
+            "repositories.put",
+            r#"{"id":"r","request_id":"r","expected_revision":0,"name":"GitPulse","identity_key":"local:r"}"#,
+        ),
+        (
+            "items.put",
+            r#"{"id":"t","request_id":"t","expected_revision":0,"title":"Fix crash on startup","description":"Keep E42 exactly.\n\n## Context\nSeen after `$(touch nope)`.","acceptance_criteria":["Reproduce crash"],"repository_ids":["r"],"primary_repository_id":"r"}"#,
+        ),
+    ] {
+        store.workbench_request(method, input).unwrap();
+    }
+    let exported: serde_json::Value = serde_json::from_str(
+        &store
+            .workbench_request("items.brief.get", r#"{"id":"t","expected_revision":1}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    let markdown = exported["item"]["markdown"].as_str().unwrap();
+    assert!(markdown.contains(dc_store::workbench::AGENT_GUIDANCE_HEADING));
+    let brief = parse_brief(markdown).unwrap();
+    assert_eq!(brief.title, "Fix crash on startup");
+    assert_eq!(brief.key.as_deref(), Some("t"));
+    assert_eq!(
+        brief.description,
+        "Keep E42 exactly.\n\n## Context\nSeen after `$(touch nope)`."
+    );
+    assert_eq!(brief.acceptance_criteria, ["Reproduce crash"]);
+    assert_eq!(brief.repositories, ["GitPulse"]);
+}
+
 #[test]
 fn reads_the_board_export_shape_without_frontmatter() {
     let exported = r#"# Task brief v1

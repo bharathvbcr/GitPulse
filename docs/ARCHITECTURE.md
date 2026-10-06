@@ -639,7 +639,13 @@ transaction. It requires the editor's saved revision and includes the exact task
 plus all ordered repository references and the home workspace, each with a
 revision. Copying no longer depends on the frontend's paginated repository list.
 The operation omits repository identities/remotes, refuses stale or incomplete
-snapshots, and starts no model worker.
+snapshots, and starts no model worker. The export opens with an `## Agent guidance`
+section (dc-store `AGENT_GUIDANCE`: read the repository and its code before
+writing, GitPulse / DevMap / DevCouncil, the engineering and verification rules),
+so every lane that delivers it, from a clipboard copy to a terminal launch to a
+managed run, tells the agent the same thing and the run snapshot records it.
+Lanes add only what they alone know (the completion rule for the permission mode),
+and the `tasks/` brief reader skips the section on import.
 
 Schema-five run records retain one immutable brief per attempt, bounded active
 reservations, and a one-use launch claim. A reservation belongs to a checkout

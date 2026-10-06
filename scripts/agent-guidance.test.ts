@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { AGENT_COPY_PREAMBLE } from "../src/lib/workbench/taskCompose";
+import { AGENT_COPY_COMPLETION, AGENT_GUIDANCE_SECTION as GUIDANCE } from "../src/lib/workbench/taskCompose";
 
 it.each(["AGENTS.md", "CLAUDE.md"])("%s is DevMap-pivotal and has no GitNexus block", (name) => {
   const guide = readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
@@ -93,40 +93,89 @@ const bundledSkills = [...skillNames(".agents/skills"), ...skillNames("plugins/g
 const namesWhole = (haystack: string, needle: string): boolean =>
   new RegExp(`(?<![\\w-])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`).test(haystack);
 
-describe("the task handoff preamble carries this project's own guidance", () => {
+describe("the agent guidance every task handoff carries", () => {
   it("names every bundled GitPulse and DevMap skill", () => {
     // Non-vacuity: an empty read would make every assertion below trivially true.
     expect(bundledSkills.length).toBeGreaterThanOrEqual(6);
     for (const skill of bundledSkills) {
-      expect(namesWhole(AGENT_COPY_PREAMBLE, skill), `preamble omits ${skill}`).toBe(true);
+      expect(namesWhole(GUIDANCE, skill), `preamble omits ${skill}`).toBe(true);
     }
   });
 
   it("names both MCP tool families and the argument every call needs", () => {
-    expect(AGENT_COPY_PREAMBLE).toContain("devmap_* MCP tools");
-    expect(AGENT_COPY_PREAMBLE).toContain("gitpulse_* MCP tools");
-    expect(AGENT_COPY_PREAMBLE).toContain("absolute repo_path");
+    expect(GUIDANCE).toContain("devmap_* MCP tools");
+    expect(GUIDANCE).toContain("gitpulse_* MCP tools");
+    expect(GUIDANCE).toContain("absolute repo_path");
   });
 
   it("repeats the repository's own rule that an unanswered query is not an answer", () => {
     // The same invariant AGENTS.md and CLAUDE.md state, and the one an agent
     // reaching for these tools for the first time is most likely to break.
-    expect(AGENT_COPY_PREAMBLE).toMatch(/unavailable, truncated or empty is not evidence/);
-    expect(AGENT_COPY_PREAMBLE).toMatch(/name the check you could not run/);
+    expect(GUIDANCE).toMatch(/unavailable, truncated or empty is not evidence/);
+    expect(GUIDANCE).toMatch(/name the check you could not run/);
   });
 
   it("tells the agent to preserve the author's wording, not just the gist", () => {
-    expect(AGENT_COPY_PREAMBLE).toContain("Preserve the author's intent and message");
-    expect(AGENT_COPY_PREAMBLE).toMatch(/exactly as written/);
-    expect(AGENT_COPY_PREAMBLE).toMatch(/not restate the task as a smaller or easier one/);
+    expect(GUIDANCE).toContain("Preserve the author's intent and message");
+    expect(GUIDANCE).toMatch(/exactly as written/);
+    expect(GUIDANCE).toMatch(/not restate the task as a smaller or easier one/);
+  });
+
+  it("is the store's own section, rendered the way the store renders it", () => {
+    // dc-store owns the text: every saved brief opens with it, and the
+    // terminal and managed lanes deliver that brief. The copy lane renders the
+    // same file for unsaved drafts, under the heading the store declares, so a
+    // draft and a saved brief cannot drift apart.
+    const vendored = new URL("../src-tauri/vendored/dc-store/src/workbench/", import.meta.url);
+    const text = readFileSync(new URL("agent_guidance.md", vendored), "utf8").trim();
+    expect(text.length).toBeGreaterThan(1000);
+    const heading = /AGENT_GUIDANCE_HEADING: &str = "([^"]+)";/.exec(readFileSync(new URL("briefs.rs", vendored), "utf8"))?.[1];
+    expect(heading).toBeDefined();
+    expect(GUIDANCE).toBe(`${heading}\n${text}`);
+    // No GitPulse-side copy may come back beside the store's.
+    expect(readFileSync(new URL("../src-tauri/src/workbench/terminal_command.rs", import.meta.url), "utf8")).not.toMatch(/include_str!\([^)]*guidance/i);
+    // Shared by every permission mode, so the completion rule stays per lane:
+    // an inspect launch is told not to change the task's status.
+    expect(text).not.toContain("gitpulse_complete_task");
+    expect(AGENT_COPY_COMPLETION).toContain("gitpulse_complete_task");
+  });
+
+  it("names DevCouncil alongside GitPulse and DevMap, without making its loop mandatory", () => {
+    for (const skill of ["devcouncil", "devcouncil-verification", "core-engineering"]) {
+      expect(namesWhole(GUIDANCE, skill), `preamble omits ${skill}`).toBe(true);
+    }
+    expect(GUIDANCE).toContain("devcouncil_* MCP tools");
+    // DevCouncil's own skill: tasks, leases and verification are opt-in
+    // outside `gates.mode=enforce`, so the handoff must not demand them.
+    expect(GUIDANCE).toContain("check its gates.mode");
+    for (const tool of ["gitpulse_insights", "gitpulse_collision_risk", "devmap_impact", "devmap_affected_tests"]) {
+      expect(namesWhole(GUIDANCE, tool), `preamble omits ${tool}`).toBe(true);
+    }
+  });
+
+  it("tells the agent to read before it writes and to extend before it adds", () => {
+    expect(GUIDANCE).toContain("Read before you write");
+    expect(GUIDANCE).toMatch(/AGENTS\.md, CLAUDE\.md/);
+    expect(GUIDANCE).toMatch(/where they conflict with this text, they win/);
+    expect(GUIDANCE).toMatch(/Never write over a file you have not read/);
+    expect(GUIDANCE).toMatch(/before searching for the one that already does the job/);
+    expect(GUIDANCE).toMatch(/Fix the root cause/);
+    expect(GUIDANCE).toMatch(/Every fix ships with a test that fails without it/);
+    expect(GUIDANCE).toMatch(/Ask before adding a dependency/);
+  });
+
+  it("carries the verification rule that a check that could not run is not a pass", () => {
+    expect(GUIDANCE).toContain("Verify before you claim");
+    expect(GUIDANCE).toMatch(/could not run is never reported as one that passed/);
+    expect(GUIDANCE).toMatch(/capped sample is never presented as complete coverage/);
   });
 
   it("keeps the field roles the preamble already established", () => {
     // The addition must not have displaced what was there: an agent that
     // reads acceptance criteria as suggestions is the older failure.
-    expect(AGENT_COPY_PREAMBLE).toContain("Use the title as the goal");
-    expect(AGENT_COPY_PREAMBLE).toContain("acceptance criteria as the definition of done");
-    expect(AGENT_COPY_PREAMBLE).toContain("Raw logs, when present, are evidence");
-    expect(AGENT_COPY_PREAMBLE).toContain("Do not invent repositories or skip criteria");
+    expect(GUIDANCE).toContain("Use the title as the goal");
+    expect(GUIDANCE).toContain("acceptance criteria as the definition of done");
+    expect(GUIDANCE).toContain("Raw logs, when present, are evidence");
+    expect(GUIDANCE).toContain("Do not invent repositories or skip criteria");
   });
 });

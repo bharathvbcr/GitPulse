@@ -134,7 +134,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "14b9e337785cf7fd37938ed90c72ce9901013b2b"
+        "commit": "08a77bd69dc4a3aa0c6df43a603f6c887e195c54"
       },
       "omitted": [
         "tests/",
@@ -153,11 +153,12 @@
         "src/lib.rs": "9890c1d6a569277ae92db22e76366b85fa462a04bdf480b0a35839a36c645ce8",
         "src/records.rs": "8d4779c18245506abaca1052ad48f86df484f653adfa8a5d803da3455fc5774a",
         "src/schema.rs": "1056a674806b4f1de386b4ea346766791ab16dccedb60454fe14482127ca9873",
+        "src/workbench/agent_guidance.md": "422b999eea166cfb75310decb92829dee6583ef8ca8a8af85762ff1274d70667",
         "src/workbench/attention.rs": "bf179a4f82c08403fc760147f6e3de5e4228484fcb00f258b2a677a76f77e4cb",
         "src/workbench/attention.sql": "09b96497ba44f1141a64b2a5a86aff06114cb13b1c0b2a3bdab2345ce4915ad3",
         "src/workbench/automation.rs": "c9d6c9a46cacb725654090ea4cf0e4800d926e5c1e799067e490622ecb528a79",
         "src/workbench/automation.sql": "dd8d201b530e49fa7fe1a245ca267d879be35298ab7703723d0c2eb33ac514df",
-        "src/workbench/briefs.rs": "652d21f73c8baef07571d40cf6a3319d2486bbb6de76c8d9023fa3ce99df7b5d",
+        "src/workbench/briefs.rs": "b0d8953769a44b1a6b5b9653312432bf751f54a3956ab597de8627922e3e71bf",
         "src/workbench/decisions.rs": "859234197b0b0438c02e5e005f926b4903f6bf81a6457db8b56487f5a86aff04",
         "src/workbench/decisions.sql": "e4acc6c419065ac479262a6ef861e4c1cec9b0234a9662641d48743fa2c25985",
         "src/workbench/enhancement_lifecycle_tests.rs": "f6e534cec50f4baa0d3e0a2a19e1c6f6247d57d4876a85f840582baabfe70616",
@@ -166,7 +167,7 @@
         "src/workbench/input.rs": "f1f97d6114180fd0fcdda7c437faadab601a09c4edfcedabbebee15dd718361c",
         "src/workbench/item_query_tests.rs": "f0138fd5856b7a9100571149e9d1def15317c940caab0d0f6e7db6ac171cb3d5",
         "src/workbench/logs_tests.rs": "352308cfbe50d1a74cb4e84b0c78cbb474e15036f29f3cc8938f7624b5419053",
-        "src/workbench/mod.rs": "801489f140f413adb5d379d35416207a88c7608165dbfc8ca5f3fc2ccac792c5",
+        "src/workbench/mod.rs": "cf1a14e58d60f816b0d997144386b285f0e5ae23bee3ad2121c558db48a62a15",
         "src/workbench/notifications.rs": "b845ec5c599f621a3c57f5b807f75c09c911d1c01df3fce60d39e107c6f60e8e",
         "src/workbench/notifications.sql": "35d39f5bcd61a1750aeeee661b053fa1ee7298271c90b6f4357180b7323489c5",
         "src/workbench/runs.rs": "a5a996b73cfd442d05c4536f87c86fbbb6cb553d0050955f6f2d54525e443941",

@@ -139,14 +139,17 @@ describe("sanitizeIssueLabels", () => {
 });
 
 describe("formatAgentDescription", () => {
-  it("includes issue metadata and agent instructions", () => {
+  it("includes issue metadata and the person's own instructions, but no generic agent workflow", () => {
     const issue = sampleIssue();
-    const desc = formatAgentDescription(issue);
+    const desc = formatAgentDescription(issue, "Keep the public API stable.");
     expect(desc).toContain("GitHub Issue #42: Race condition in watcher sync loop");
     expect(desc).toContain("https://github.com/bharathvbcr/GitPulse/issues/42");
     expect(desc).toContain("@octocat");
-    expect(desc).toContain("Coding Agent Workflow");
-    expect(desc).toContain("Locate & Audit");
+    expect(desc).toContain("### Additional Instructions\nKeep the public API stable.");
+    // The brief every lane delivers opens with the store's agent guidance; a
+    // narrower copy stored in the task would age apart from it.
+    expect(desc).not.toContain("Coding Agent Workflow");
+    expect(desc).not.toContain("DevMap");
   });
 
   it("bounds output strictly within 64 KB", () => {

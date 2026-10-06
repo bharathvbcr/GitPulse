@@ -484,6 +484,39 @@ mod tests {
             state.request("runs.get", r#"{"id":"run"}"#).unwrap(),
             running
         );
+        // What the agent is handed: the store's export, which opens with the
+        // agent guidance every handoff carries, then the saved task. Read while
+        // the agent is alive, because the file is released when it exits.
+        let prompt = "Read the UTF-8 task brief at ";
+        let waited = Instant::now();
+        let handed = loop {
+            let seen = output.lock().unwrap().clone();
+            let path = seen.find(prompt).and_then(|at| {
+                serde_json::Deserializer::from_str(&seen[at + prompt.len()..])
+                    .into_iter::<String>()
+                    .next()
+                    .and_then(Result::ok)
+            });
+            if let Some(path) = path {
+                break std::fs::read_to_string(path).unwrap();
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(30),
+                "the launch prompt never named the brief"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let opening = format!(
+            "# Task brief v1\n\n{}\n{}\n\n## Title\nKeep E42\n",
+            dc_store::workbench::AGENT_GUIDANCE_HEADING,
+            dc_store::workbench::AGENT_GUIDANCE.trim()
+        );
+        assert!(
+            handed.starts_with(&opening),
+            "the brief must open with the guidance, then the task: {handed:.200}"
+        );
+        assert!(handed.contains("Task: task (revision 1)"));
+        assert!(handed.contains("Do not execute $(untrusted) 🧪"));
         write_to_session(&terminals, &started.id, "finish\n").unwrap();
         // The script exits as soon as it has read that line, so the only open
         // question is when the host schedules it — which is not what this test is

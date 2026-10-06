@@ -6,6 +6,25 @@ use super::input::MAX_LOGS_BYTES;
 use super::{Entity, Error, Input, MAX_INTEGER, MAX_PAGE_DOCUMENTS, Result};
 use rusqlite::{OptionalExtension, params};
 
+/// How an agent handed this brief is told to work: the field roles, the
+/// author's wording, reading the repository and its code before writing,
+/// GitPulse / DevMap / DevCouncil, and the engineering and verification rules.
+///
+/// It lives in the brief because the brief is the one thing every handoff
+/// carries. A copied task, a terminal launch and a managed run all deliver
+/// this export, and a run snapshots it, so the guidance an attempt was given
+/// is recorded with the attempt instead of depending on which host or harness
+/// binary happened to launch it. Hosts must not add their own copy.
+///
+/// It names no completion step: whether an agent may change the task's
+/// status depends on the permission mode it was launched in, which the
+/// launching host states.
+pub const AGENT_GUIDANCE: &str = include_str!("agent_guidance.md");
+
+/// The section heading the guidance is rendered under, so a parser that reads
+/// briefs back can skip it rather than fold it into the description.
+pub const AGENT_GUIDANCE_HEADING: &str = "## Agent guidance";
+
 pub(super) fn get(input: &Input<'_>) -> Result<String> {
     input.fields(&["id", "expected_revision"])?;
     let id = input.id("id")?;
@@ -56,7 +75,8 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     let updated = task.integer("updated_at", None, MAX_INTEGER)?;
     let title = task.required_text("title", 1200)?;
     let mut markdown = format!(
-        "# Task brief v1\n\n## Title\n{title}\n\nTask: {id} (revision {revision})\nUpdated (Unix seconds): {updated}\n"
+        "# Task brief v1\n\n{AGENT_GUIDANCE_HEADING}\n{}\n\n## Title\n{title}\n\nTask: {id} (revision {revision})\nUpdated (Unix seconds): {updated}\n",
+        AGENT_GUIDANCE.trim()
     );
     for (label, key, bound, fallback) in [
         ("Type", "kind", 64, "Unspecified"),
