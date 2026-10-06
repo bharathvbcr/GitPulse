@@ -103,7 +103,50 @@ pub struct AgentDefaults {
     /// The app applies it to its live session registry at start and on save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_terminal_sessions: Option<u32>,
+    /// Which model each agent CLI starts with, keyed by launcher name — for a
+    /// plain agent tab and a task terminal attempt alike. Absent means the
+    /// CLI's own choice (its settings files, its environment, its default),
+    /// which is why an entry is never stored empty.
+    ///
+    /// Model *names* and levels only, like `permission`: which flag carries
+    /// them is `terminal_command::model_control`'s table. The managed lane is
+    /// not affected — Manvi builds that command line.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<String, ModelChoice>,
 }
+
+/// One launcher's model settings. Every field is optional and absent means
+/// "whatever the CLI would choose"; which fields a launcher takes is
+/// `terminal_command::model_fields`, and a field it does not take is refused
+/// at save rather than silently left out of the launch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelChoice {
+    /// The model: an alias (`opus`, `opusplan`, `sonnet[1m]`), a full id, or
+    /// for Antigravity a slug from `agy models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort, one of `terminal_command::EFFORT_LEVELS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Models Claude Code falls back to, in order, when the main one is
+    /// overloaded or unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
+    /// The model Claude Code's server-side advisor tool consults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<String>,
+}
+
+impl ModelChoice {
+    /// Whether nothing is chosen, which is stored as no entry at all.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The most launchers a model map may name; there are four today.
+const MAX_MODEL_ENTRIES: usize = 16;
 
 /// Terminal sessions open at once when nothing is stored.
 pub const DEFAULT_TERMINAL_SESSIONS: u32 = crate::terminal::DEFAULT_PTY_SESSIONS as u32;
@@ -197,7 +240,20 @@ impl AgentDefaults {
                 ));
             }
         }
+        if self.models.len() > MAX_MODEL_ENTRIES {
+            return Err("Too many agent model settings".into());
+        }
+        for (launcher, choice) in &self.models {
+            crate::workbench::terminal_command::validate_model_choice(launcher, choice)?;
+        }
         Ok(())
+    }
+
+    /// The model choice a launch of `launcher` applies, if one is stored.
+    pub fn model_for(&self, launcher: &str) -> Option<&ModelChoice> {
+        self.models
+            .get(launcher.trim())
+            .filter(|choice| !choice.is_empty())
     }
 }
 
@@ -227,6 +283,52 @@ pub struct StoredAgentLaunch {
     pub claude_setting_sources: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_terminal_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<String, ModelChoice>,
+}
+
+/// `agent_launch.models`, read launcher by launcher: an entry this build
+/// cannot read costs that launcher's model setting and nothing else, and a
+/// key inside an entry that a newer build added is skipped rather than
+/// costing the fields this build does know.
+fn lenient_models(
+    value: Option<&serde_json::Value>,
+) -> std::collections::BTreeMap<String, ModelChoice> {
+    let mut models = std::collections::BTreeMap::new();
+    let Some(value) = value else {
+        return models;
+    };
+    let serde_json::Value::Object(entries) = value else {
+        log::warn!(target: "tool_config", "ignoring agent_launch.models: not an object");
+        return models;
+    };
+    for (launcher, entry) in entries {
+        let serde_json::Value::Object(fields) = entry else {
+            log::warn!(target: "tool_config", "ignoring agent_launch.models.{launcher}: not an object");
+            continue;
+        };
+        let known: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .filter(|(key, _)| {
+                let known = crate::workbench::terminal_command::MODEL_FIELDS.contains(&key.as_str());
+                if !known {
+                    log::warn!(target: "tool_config", "ignoring agent_launch.models.{launcher}.{key}: not a field this build knows");
+                }
+                known
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        match serde_json::from_value::<ModelChoice>(serde_json::Value::Object(known)) {
+            Ok(choice) => {
+                models.insert(launcher.clone(), choice);
+            }
+            Err(error) => log::warn!(
+                target: "tool_config",
+                "ignoring unreadable agent_launch.models.{launcher}, keeping the other agent settings: {error}"
+            ),
+        }
+    }
+    models
 }
 
 impl StoredAgentLaunch {
@@ -262,6 +364,7 @@ impl<'de> Deserialize<'de> for StoredAgentLaunch {
             max_live_runs: field(&fields, "max_live_runs"),
             claude_setting_sources: field(&fields, "claude_setting_sources"),
             max_terminal_sessions: field(&fields, "max_terminal_sessions"),
+            models: lenient_models(fields.get("models")),
         })
     }
 }
@@ -729,7 +832,29 @@ pub fn agent_defaults() -> AgentDefaults {
         max_live_runs: cfg.agent_launch.max_live_runs,
         claude_setting_sources: cfg.agent_launch.claude_setting_sources,
         max_terminal_sessions: cfg.agent_launch.max_terminal_sessions,
+        models: cfg.agent_launch.models,
     };
+    if defaults.models.len() > MAX_MODEL_ENTRIES {
+        log::warn!(target: "tool_config", "ignoring oversized agent model settings");
+        defaults.models.clear();
+    }
+    defaults.models.retain(|launcher, choice| {
+        if choice.is_empty() {
+            return false;
+        }
+        match crate::workbench::terminal_command::validate_model_choice(launcher, choice) {
+            Ok(()) => true,
+            Err(error) => {
+                // Costs that launcher's model setting, not a terminal tab:
+                // the launch would refuse a choice it cannot apply in full.
+                log::warn!(
+                    target: "tool_config",
+                    "ignoring stored model setting for {launcher}: {error}"
+                );
+                false
+            }
+        }
+    });
     defaults.permission.retain(|launcher, mode| {
         let ok = crate::workbench::terminal_command::validate_permission_default(launcher, mode)
             .is_ok();
@@ -794,6 +919,11 @@ pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
         max_live_runs: next.max_live_runs,
         claude_setting_sources: sources,
         max_terminal_sessions: next.max_terminal_sessions,
+        models: next
+            .models
+            .into_iter()
+            .filter(|(_, choice)| !choice.is_empty())
+            .collect(),
     };
     save(&cfg)?;
     Ok(())
@@ -1319,6 +1449,252 @@ mod tests {
             invalidate_cache();
             let loaded = load().unwrap();
             assert_eq!(loaded.manvi.source_root.as_deref(), Some("/good/root"));
+        });
+    }
+}
+
+#[cfg(test)]
+mod model_setting_tests {
+    use super::*;
+
+    fn with_temp_config(f: impl FnOnce(&Path)) {
+        let serial = crate::tool_config::lock_config_env();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tools.json");
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(TOOL_CONFIG_ENV, &path)
+            .invalidating(invalidate_cache);
+        f(&path);
+    }
+
+    fn write_raw(path: &Path, json: &str) {
+        fs::write(path, json).unwrap();
+        invalidate_cache();
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn choice(model: &str) -> ModelChoice {
+        ModelChoice {
+            model: Some(model.into()),
+            ..ModelChoice::default()
+        }
+    }
+
+    #[test]
+    fn model_settings_round_trip_where_older_builds_skip_them() {
+        with_temp_config(|path| {
+            let mut defaults = AgentDefaults::default();
+            defaults.permission.insert("claude".into(), "edit".into());
+            defaults.models.insert(
+                "claude".into(),
+                ModelChoice {
+                    model: Some("opus[1m]".into()),
+                    effort: Some("xhigh".into()),
+                    fallback: Some(vec!["sonnet".into(), "haiku".into()]),
+                    advisor: Some("fable".into()),
+                },
+            );
+            defaults.models.insert(
+                "agy".into(),
+                ModelChoice {
+                    model: Some("gemini-3.8-flash-high".into()),
+                    effort: Some("low".into()),
+                    ..ModelChoice::default()
+                },
+            );
+            set_agent_defaults(defaults.clone()).unwrap();
+            assert_eq!(agent_defaults(), defaults);
+            let written = read_json(path);
+            // In `agent_launch`, never in `agent_defaults`: v1.3.5 reads that
+            // block with `deny_unknown_fields`, and one unknown key there
+            // costs it every stored permission default.
+            assert!(
+                written["agent_defaults"].get("models").is_none(),
+                "{written}"
+            );
+            assert_eq!(
+                written["agent_launch"]["models"]["claude"]["advisor"],
+                "fable"
+            );
+            assert_eq!(
+                written["agent_launch"]["models"]["claude"]["fallback"],
+                serde_json::json!(["sonnet", "haiku"])
+            );
+            assert_eq!(
+                agent_defaults().model_for("agy").unwrap().model.as_deref(),
+                Some("gemini-3.8-flash-high")
+            );
+            assert!(agent_defaults().model_for("codex").is_none());
+            // Clearing them removes the key rather than storing an empty map.
+            set_agent_defaults(AgentDefaults {
+                permission: defaults.permission.clone(),
+                ..AgentDefaults::default()
+            })
+            .unwrap();
+            assert!(read_json(path)["agent_launch"].get("models").is_none());
+        });
+    }
+
+    /// An empty choice is "the CLI's own model", which is no entry at all.
+    #[test]
+    fn an_empty_choice_is_stored_as_absence() {
+        with_temp_config(|path| {
+            let mut defaults = AgentDefaults::default();
+            defaults
+                .models
+                .insert("claude".into(), ModelChoice::default());
+            defaults.models.insert("codex".into(), choice("gpt-6"));
+            set_agent_defaults(defaults).unwrap();
+            let written = read_json(path);
+            assert!(written["agent_launch"]["models"].get("claude").is_none());
+            let read = agent_defaults();
+            assert!(read.model_for("claude").is_none());
+            assert_eq!(read.models.len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_choice_a_launch_could_not_apply_in_full_is_refused_at_save() {
+        with_temp_config(|_| {
+            for (launcher, bad) in [
+                (
+                    "codex",
+                    ModelChoice {
+                        effort: Some("high".into()),
+                        ..ModelChoice::default()
+                    },
+                ),
+                (
+                    "agy",
+                    ModelChoice {
+                        advisor: Some("opus".into()),
+                        ..ModelChoice::default()
+                    },
+                ),
+                ("manvi", choice("opus")),
+                ("shell", choice("opus")),
+                ("claude", choice("-x")),
+                ("claude", choice("a,b")),
+                ("claude", choice("")),
+            ] {
+                let mut defaults = AgentDefaults::default();
+                defaults.models.insert(launcher.into(), bad.clone());
+                assert!(
+                    set_agent_defaults(defaults).is_err(),
+                    "{launcher}: {bad:?} was saved"
+                );
+            }
+            let mut many = AgentDefaults::default();
+            for i in 0..=MAX_MODEL_ENTRIES {
+                many.models.insert(format!("launcher{i}"), choice("opus"));
+            }
+            assert!(set_agent_defaults(many).is_err());
+        });
+    }
+
+    /// A hand-edited or newer-build `tools.json` costs the entry it broke and
+    /// nothing else: the other launchers' models, the permission defaults and
+    /// the limits all survive.
+    #[test]
+    fn a_broken_model_entry_degrades_alone() {
+        with_temp_config(|path| {
+            for (models, survivors) in [
+                // Not an object at all.
+                (r#""opus""#, vec![]),
+                (r#"[1,2]"#, vec![]),
+                // One launcher unreadable, one fine.
+                (
+                    r#"{"claude":"opus","codex":{"model":"gpt-6"}}"#,
+                    vec!["codex"],
+                ),
+                (
+                    r#"{"claude":{"model":7},"codex":{"model":"gpt-6"}}"#,
+                    vec!["codex"],
+                ),
+                // Readable but not applicable: the field the CLI lacks.
+                (
+                    r#"{"codex":{"model":"gpt-6","effort":"high"},"grok":{"model":"grok-5"}}"#,
+                    vec!["grok"],
+                ),
+                // Readable but malformed values.
+                (
+                    r#"{"claude":{"model":"--yolo"},"grok":{"model":"grok-5"}}"#,
+                    vec!["grok"],
+                ),
+                (
+                    r#"{"claude":{"fallback":[]},"grok":{"model":"grok-5"}}"#,
+                    vec!["grok"],
+                ),
+                (
+                    r#"{"claude":{"effort":"ultra"},"grok":{"model":"grok-5"}}"#,
+                    vec!["grok"],
+                ),
+                // Not a launcher this build has.
+                (
+                    r#"{"gemini":{"model":"x"},"grok":{"model":"grok-5"}}"#,
+                    vec!["grok"],
+                ),
+                // Empty entries are not stored choices.
+                (r#"{"claude":{},"grok":{"model":"grok-5"}}"#, vec!["grok"]),
+            ] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"devmap":{{"binary":"/opt/devmap"}},"agent_defaults":{{"permission":{{"claude":"edit"}}}},"agent_launch":{{"max_live_runs":9,"models":{models}}}}}"#
+                    ),
+                );
+                let read = agent_defaults();
+                let mut kept: Vec<&str> = read.models.keys().map(String::as_str).collect();
+                kept.sort_unstable();
+                assert_eq!(kept, survivors, "{models}");
+                assert_eq!(read.live_runs(), 9, "{models} took the limit with it");
+                assert_eq!(read.permission.get("claude").unwrap(), "edit", "{models}");
+                assert_eq!(
+                    load().unwrap().devmap.binary.as_deref(),
+                    Some("/opt/devmap"),
+                    "{models} cost the saved devmap path"
+                );
+            }
+        });
+    }
+
+    /// A key a newer build added inside an entry is skipped; the fields this
+    /// build knows in that same entry are kept.
+    #[test]
+    fn a_field_from_a_newer_build_costs_only_that_field() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"agent_launch":{"models":{"claude":{"model":"opus","thinking":"on","effort":"high"}}}}"#,
+            );
+            let read = agent_defaults();
+            let claude = read
+                .model_for("claude")
+                .expect("the whole entry was dropped");
+            assert_eq!(claude.model.as_deref(), Some("opus"));
+            assert_eq!(claude.effort.as_deref(), Some("high"));
+        });
+    }
+
+    #[test]
+    fn an_oversized_model_map_is_dropped_rather_than_rendered() {
+        with_temp_config(|path| {
+            let entries: Vec<String> = (0..=MAX_MODEL_ENTRIES)
+                .map(|i| format!(r#""l{i}":{{"model":"m"}}"#))
+                .collect();
+            write_raw(
+                path,
+                &format!(
+                    r#"{{"version":1,"agent_launch":{{"max_live_runs":5,"models":{{{}}}}}}}"#,
+                    entries.join(",")
+                ),
+            );
+            let read = agent_defaults();
+            assert!(read.models.is_empty());
+            assert_eq!(read.live_runs(), 5);
         });
     }
 }

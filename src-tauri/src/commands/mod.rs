@@ -3711,18 +3711,23 @@ pub async fn cmd_terminal_spawn(
     // an acknowledgement, whatever the frontend did or forgot to do. The
     // notification and setting-source flags go in first so the policy flags
     // land in front of them: policy, launch flags, then the caller's prompt.
+    let defaults = crate::tool_config::agent_defaults();
+    let sources = defaults.claude_setting_sources_arg();
     let args = crate::workbench::terminal_command::apply_permission_mode(
         program.as_deref(),
         permission_mode.as_deref(),
         acknowledged.unwrap_or(false),
         crate::workbench::terminal_command::with_launch_flags(
             program.as_deref(),
-            crate::tool_config::session_alerts().configure_agents,
-            crate::tool_config::agent_defaults()
-                .claude_setting_sources_arg()
-                .as_deref(),
+            &crate::workbench::terminal_command::LaunchOptions {
+                notify: crate::tool_config::session_alerts().configure_agents,
+                setting_sources: sources.as_deref(),
+                model: program
+                    .as_deref()
+                    .and_then(|launcher| defaults.model_for(launcher)),
+            },
             args,
-        ),
+        )?,
     )?;
     off_thread(move || {
         crate::terminal::spawn_session_in(
@@ -4813,17 +4818,7 @@ pub struct SessionAlertsView {
 /// be offering a launch that fails at spawn.
 #[tauri::command(async)]
 pub async fn cmd_agent_defaults() -> Result<AgentDefaultsView, String> {
-    off_thread(|| {
-        Ok(AgentDefaultsView {
-            defaults: crate::tool_config::agent_defaults(),
-            modes: crate::workbench::terminal_command::PERMISSION_MODES
-                .iter()
-                .map(|mode| (*mode).to_owned())
-                .collect(),
-            launchers: crate::workbench::terminal_command::permission_launchers(),
-        })
-    })
-    .await
+    off_thread(|| Ok(agent_defaults_view())).await
 }
 
 #[derive(serde::Serialize)]
@@ -4835,6 +4830,54 @@ pub struct AgentDefaultsView {
     /// `shell` and `manvi` have no policy, and offering them a mode would
     /// produce a refusal at spawn rather than a setting.
     pub launchers: Vec<String>,
+    /// The model fields each launcher takes, derived from the flag table so
+    /// the panel never offers a control a launch would refuse.
+    pub model_fields: std::collections::BTreeMap<String, Vec<String>>,
+    /// Reasoning-effort levels, least first.
+    pub effort_levels: Vec<String>,
+    /// Launchers whose models GitPulse can list (`cmd_agent_models`), and
+    /// how: `listed` by the CLI itself, or `known` from its aliases and the
+    /// user's settings because the CLI publishes no list.
+    pub model_listing: std::collections::BTreeMap<String, String>,
+}
+
+/// The stored defaults read back, with the vocabularies that describe them.
+/// One builder for both the read and the save reply, so the two cannot differ.
+fn agent_defaults_view() -> AgentDefaultsView {
+    use crate::workbench::terminal_command as command;
+    AgentDefaultsView {
+        defaults: crate::tool_config::agent_defaults(),
+        modes: command::PERMISSION_MODES
+            .iter()
+            .map(|mode| (*mode).to_owned())
+            .collect(),
+        launchers: command::permission_launchers(),
+        model_fields: command::model_launchers(),
+        effort_levels: command::EFFORT_LEVELS
+            .iter()
+            .map(|level| (*level).to_owned())
+            .collect(),
+        model_listing: crate::workbench::agent_models::listing_launchers(),
+    }
+}
+
+/// The models `launcher` can be started with, as its CLI says — offered as
+/// suggestions by the model settings; the stored value stays free text.
+///
+/// Antigravity is asked with `agy models` (network, the user's sign-in, run
+/// from the temporary directory, bounded, cached for ten minutes unless
+/// `refresh`). Claude Code publishes no list, so its answer is its aliases
+/// plus the models the user's own Claude settings name. A listing that failed
+/// carries `error` beside an empty list rather than reading as no models.
+#[tauri::command(async)]
+pub async fn cmd_agent_models(
+    launcher: String,
+    refresh: Option<bool>,
+) -> Result<crate::workbench::agent_models::AgentModelCatalog, String> {
+    off_thread(move || {
+        crate::workbench::agent_models::models_for(launcher.trim(), refresh.unwrap_or(false))
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -4849,14 +4892,7 @@ pub async fn cmd_agent_defaults_save(
         // saved limit without a restart. Read back rather than taken from
         // the input, so the registry holds exactly what was stored.
         terminals.apply_stored_limit();
-        Ok(AgentDefaultsView {
-            defaults: crate::tool_config::agent_defaults(),
-            modes: crate::workbench::terminal_command::PERMISSION_MODES
-                .iter()
-                .map(|mode| (*mode).to_owned())
-                .collect(),
-            launchers: crate::workbench::terminal_command::permission_launchers(),
-        })
+        Ok(agent_defaults_view())
     })
     .await
 }

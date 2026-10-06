@@ -96,7 +96,38 @@ Turning off project and local stops a repository's `.claude/settings*.json`
 from widening an agent's permissions, and also drops that repository's
 allow-lists and hooks. Managed sessions always load your user settings only;
 that is Manvi's rule, since project settings could answer the approvals the
-managed lane exists to show you. Claude Code is also given the attempt's id as
+managed lane exists to show you.
+
+**Settings → Agents → Agent models** chooses which model each agent starts
+with, for task attempts and new agent tabs alike; empty means the CLI's own
+choice. Claude Code takes a model (an alias such as `opus`, `opusplan` or
+`sonnet[1m]`, or a full model name), an effort level, up to four fallback
+models (`--fallback-model`) and an advisor model (the `advisorModel` setting,
+passed in the same session-only `--settings` object as the notification
+channel — Claude Code's `--advisor` flag is hidden from its `--help`, and a
+task launch only passes what the installed build can be shown to support).
+Antigravity takes a model (a slug from `agy models`) and an effort level;
+Codex and Grok take a model only, because neither lists the effort values it
+accepts. A task attempt checks that the installed CLI advertises each control
+and the chosen effort level before starting. GitPulse checks that a model name
+is well-formed, not that it exists: the CLI reports one it cannot use, except
+Antigravity, which falls back to its default model with a warning. Managed
+sessions are not affected; Manvi starts those with the CLI's own model.
+
+The model fields suggest names from each CLI where it has them.
+**List models** on the Antigravity row runs `agy models` (from the temporary
+directory, never the repository; it asks Antigravity's service under your
+sign-in, so it is only run when you press the button) and offers that account's
+models; the answer is reused for ten minutes unless you press **Refresh
+models**, and a stored model the list does not contain is flagged. Claude Code
+publishes no model list — it has no command for one, and the API's list needs
+credentials GitPulse does not read — so the Claude row offers its built-in
+aliases plus the models your `~/.claude/settings.json` names (`model`,
+`advisorModel`, `availableModels`). Codex has no model list, and `grok models`
+talks to a background process it may start, so neither is asked. A listing
+that fails says why and keeps the last list it had.
+
+Claude Code is also given the attempt's id as
 its session id and the brief's private folder as a readable directory. An ended
 Claude Code attempt offers **Resume conversation**: GitPulse looks for the
 transcript Claude Code saved for that session and, if it is there, opens a new

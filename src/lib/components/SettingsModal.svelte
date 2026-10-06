@@ -76,6 +76,7 @@
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
   import AgentSettingSourcesSetting from "./AgentSettingSourcesSetting.svelte";
+  import AgentModelSettings from "./AgentModelSettings.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   import HygieneDefaultsPanel from "./HygieneDefaultsPanel.svelte";
 
@@ -1265,6 +1266,9 @@
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
                   <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-models" hidden={!shown("agent-models")}>
+                  <AgentModelSettings active={isOpen && activeSection === "agents"} />
                 </div>
                 <!-- Part of the external-tools entry (it has no catalog row of
                      its own), so it follows that entry's visibility. -->

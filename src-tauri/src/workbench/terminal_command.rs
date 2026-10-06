@@ -5,6 +5,7 @@ use super::WorkbenchError;
 use crate::engine::git_cli::{
     capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
 };
+use crate::tool_config::ModelChoice;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -156,12 +157,262 @@ pub(crate) fn setting_source_flags(provider: &str, sources: Option<&str>) -> Vec
     }
 }
 
+/// The model controls a [`ModelChoice`] can carry, in the order a settings
+/// row shows them. Read by `agentDefaults.contract.test.ts`, which fails if
+/// the frontend's list drifts from this one.
+pub(crate) const MODEL_FIELDS: [&str; 4] = ["model", "effort", "fallback", "advisor"];
+
+/// Reasoning-effort levels, least first. Both CLIs that take `--effort`
+/// (Claude Code 2.1.289, Antigravity 1.2.17) list exactly these in their
+/// `--help`, and [`advertises`] proves the chosen level against the build's
+/// own list before a task launch — a build that offers fewer refuses rather
+/// than reading an unknown level however it likes.
+pub(crate) const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The most fallback models one launch may name. Claude Code tries them in
+/// order on each overloaded turn; a longer list is a typo, not a plan.
+pub(crate) const MAX_FALLBACK_MODELS: usize = 4;
+
+/// The longest model id accepted. Real ids — aliases, `opus[1m]`, dated
+/// full names, Bedrock inference-profile ARNs — are well under this.
+pub(crate) const MAX_MODEL_ID_LEN: usize = 160;
+
+/// Flags whose *value* a build must list in that flag's own `--help` block,
+/// not merely the flag. Only flags with a closed, advertised value set
+/// belong here: a model id is open-ended and no help screen lists them all.
+const VALUE_PROVEN_FLAGS: [&str; 1] = ["--effort"];
+
+/// How one model control reaches one CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelControl {
+    /// An option followed by its value.
+    Flag(&'static str),
+    /// A key in Claude Code's session-scoped `--settings` JSON.
+    ClaudeSetting(&'static str),
+}
+
+/// Which model control means what for which CLI. The only copy: the settings
+/// panel's per-launcher fields ([`model_fields`]), the save-time validation
+/// and the launch argv are all derived from it.
+///
+/// Every arm was read off the installed CLI rather than recalled:
+///
+/// * `claude` 2.1.289 — `--model`, `--effort`, `--fallback-model` (one
+///   comma-separated value) are in `--help`. The advisor is the settings key
+///   `advisorModel` ("Advisor model for the server-side advisor tool", in the
+///   binary's settings schema). The CLI also has `--advisor <model>`, but it
+///   is hidden from `--help`, and a task launch passes only flags the build
+///   can be *shown* to advertise; `--settings` is advertised.
+/// * `agy` 1.2.17 — `--model` (a slug from `agy models`) and `--effort`.
+/// * `codex` 0.153.4 and `grok` 1.0.46 — `--model` only. Both have some
+///   reasoning-effort control, but neither lists its accepted values, so a
+///   level could not be proved before launch and is not offered.
+fn model_control(provider: &str, field: &str) -> Option<ModelControl> {
+    match (provider, field) {
+        ("claude" | "agy" | "codex" | "grok", "model") => Some(ModelControl::Flag("--model")),
+        ("claude" | "agy", "effort") => Some(ModelControl::Flag("--effort")),
+        ("claude", "fallback") => Some(ModelControl::Flag("--fallback-model")),
+        ("claude", "advisor") => Some(ModelControl::ClaudeSetting("advisorModel")),
+        _ => None,
+    }
+}
+
+/// The model fields `provider` takes, in [`MODEL_FIELDS`] order. Derived from
+/// [`model_control`], so a field a CLI gains or loses changes the settings
+/// panel without a second list to update.
+pub(crate) fn model_fields(provider: &str) -> Vec<&'static str> {
+    MODEL_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| model_control(provider, field).is_some())
+        .collect()
+}
+
+/// Every launcher that takes at least one model control, with its fields.
+pub(crate) fn model_launchers() -> std::collections::BTreeMap<String, Vec<String>> {
+    crate::terminal::AGENT_LAUNCHERS
+        .iter()
+        .filter(|launcher| is_terminal_provider(launcher))
+        .map(|launcher| {
+            let fields: Vec<String> = model_fields(launcher)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            ((*launcher).to_owned(), fields)
+        })
+        .filter(|(_, fields)| !fields.is_empty())
+        .collect()
+}
+
+/// Whether `id` has the shape of a model name, which is all GitPulse can know
+/// about it: Claude Code accepts any full model name and Antigravity's list
+/// is per account, so the *truth* of an id is the CLI's to decide at start.
+///
+/// The shape is what keeps the value an argument. It must not begin with `-`
+/// (the CLI would parse it as an option) and must not contain a comma
+/// (`--fallback-model` splits on it), whitespace, or a control character.
+/// It allows what real ids use: `opus[1m]`, `claude-opus-4-1@20250805`,
+/// `arn:aws:bedrock:…:inference-profile/…`.
+pub(crate) fn validate_model_id(what: &str, id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err(format!("The {what} is empty."));
+    }
+    if id.len() > MAX_MODEL_ID_LEN {
+        return Err(format!(
+            "The {what} is longer than {MAX_MODEL_ID_LEN} characters."
+        ));
+    }
+    if !id.as_bytes()[0].is_ascii_alphanumeric() {
+        return Err(format!(
+            "The {what} {id:?} must start with a letter or digit."
+        ));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || "._:/@[]-".contains(*c)))
+    {
+        return Err(format!(
+            "The {what} {id:?} contains {bad:?}; model names use letters, digits and . _ : / @ [ ] -"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `choice` is one a launch of `provider` could apply in full.
+///
+/// A field the CLI does not take is refused rather than dropped: a model the
+/// user picked that a launch silently left out would look applied and not be.
+pub(crate) fn validate_model_choice(provider: &str, choice: &ModelChoice) -> Result<(), String> {
+    if !is_terminal_provider(provider) {
+        return Err(format!("{provider} does not take a model setting."));
+    }
+    for (field, present) in [
+        ("model", choice.model.is_some()),
+        ("effort", choice.effort.is_some()),
+        ("fallback", choice.fallback.is_some()),
+        ("advisor", choice.advisor.is_some()),
+    ] {
+        if present && model_control(provider, field).is_none() {
+            return Err(format!("{provider} does not take a {field} setting."));
+        }
+    }
+    if let Some(model) = &choice.model {
+        validate_model_id("model", model)?;
+    }
+    if let Some(effort) = &choice.effort {
+        if !EFFORT_LEVELS.contains(&effort.as_str()) {
+            return Err(format!(
+                "{effort:?} is not an effort level ({}).",
+                EFFORT_LEVELS.join(", ")
+            ));
+        }
+    }
+    if let Some(fallback) = &choice.fallback {
+        if fallback.is_empty() || fallback.len() > MAX_FALLBACK_MODELS {
+            return Err(format!(
+                "Name between 1 and {MAX_FALLBACK_MODELS} fallback models."
+            ));
+        }
+        for (index, id) in fallback.iter().enumerate() {
+            validate_model_id("fallback model", id)?;
+            if fallback[..index].contains(id) {
+                return Err(format!("The fallback model {id:?} is listed twice."));
+            }
+        }
+    }
+    if let Some(advisor) = &choice.advisor {
+        validate_model_id("advisor model", advisor)?;
+    }
+    Ok(())
+}
+
+/// Keys for Claude Code's session-scoped `--settings` object, with their values.
+type ClaudeSettings = Vec<(&'static str, String)>;
+
+/// A [`ModelChoice`] as `provider`'s own flags, plus any keys that belong in
+/// Claude Code's `--settings` object. Validated first, so nothing a launch
+/// could not apply in full is ever expanded.
+fn model_flags(
+    provider: &str,
+    choice: &ModelChoice,
+) -> Result<(Vec<String>, ClaudeSettings), String> {
+    validate_model_choice(provider, choice)?;
+    let fallback = choice.fallback.as_ref().map(|list| list.join(","));
+    let mut flags = Vec::new();
+    let mut settings = Vec::new();
+    for (field, value) in [
+        ("model", choice.model.as_ref()),
+        ("effort", choice.effort.as_ref()),
+        ("fallback", fallback.as_ref()),
+        ("advisor", choice.advisor.as_ref()),
+    ] {
+        let Some(value) = value else { continue };
+        match model_control(provider, field) {
+            Some(ModelControl::Flag(flag)) => flags.extend([flag.to_owned(), value.clone()]),
+            Some(ModelControl::ClaudeSetting(key)) => settings.push((key, value.clone())),
+            None => return Err(format!("{provider} does not take a {field} setting.")),
+        }
+    }
+    Ok((flags, settings))
+}
+
+/// Adds `entries` to the one `--settings` object in `flags`, or appends one.
+///
+/// One object because `--settings` takes a single value: a second occurrence
+/// would replace the first, and the notification channel would be lost the
+/// moment someone chose an advisor.
+fn merge_claude_settings(flags: &mut Vec<String>, entries: ClaudeSettings) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let (at, mut object) = match flags.iter().position(|flag| flag == "--settings") {
+        Some(at) => {
+            let raw = flags
+                .get(at + 1)
+                .ok_or("--settings is missing its value.")?;
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Object(object)) => (Some(at), object),
+                _ => return Err("--settings is not a JSON object.".into()),
+            }
+        }
+        None => (None, serde_json::Map::new()),
+    };
+    for (key, value) in entries {
+        object.insert(key.to_owned(), serde_json::Value::String(value));
+    }
+    let merged = serde_json::Value::Object(object).to_string();
+    match at {
+        Some(at) => flags[at + 1] = merged,
+        None => flags.extend(["--settings".to_owned(), merged]),
+    }
+    Ok(())
+}
+
+/// What an agent launch adds for the user's settings rather than for its
+/// permission mode. One value so a new setting is one field here, not a new
+/// parameter threaded through every launch path.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LaunchOptions<'a> {
+    /// Whether to add [`notify_flags`].
+    pub notify: bool,
+    /// The user's `--setting-sources` value, if they narrowed it.
+    pub setting_sources: Option<&'a str>,
+    /// The user's model choice for this launcher, if they made one.
+    pub model: Option<&'a ModelChoice>,
+}
+
 /// Every flag an agent launch adds for the user's settings rather than for
 /// its permission mode: the notification flags when `notify`, then the
-/// setting sources. The one list both launch paths pass and the task lane
-/// checks the build for, so the three cannot disagree.
-pub(crate) fn launch_flags(provider: &str, notify: bool, sources: Option<&str>) -> Vec<String> {
-    let mut flags: Vec<String> = if notify {
+/// setting sources, then the model choice. The one list both launch paths
+/// pass and the task lane checks the build for, so the three cannot disagree.
+///
+/// Refuses a model choice the launcher cannot apply in full rather than
+/// passing part of it.
+pub(crate) fn launch_flags(
+    provider: &str,
+    options: &LaunchOptions<'_>,
+) -> Result<Vec<String>, String> {
+    let mut flags: Vec<String> = if options.notify {
         notify_flags(provider)
             .iter()
             .map(|flag| (*flag).to_owned())
@@ -169,8 +420,13 @@ pub(crate) fn launch_flags(provider: &str, notify: bool, sources: Option<&str>) 
     } else {
         Vec::new()
     };
-    flags.extend(setting_source_flags(provider, sources));
-    flags
+    flags.extend(setting_source_flags(provider, options.setting_sources));
+    if let Some(choice) = options.model {
+        let (model, settings) = model_flags(provider, choice)?;
+        flags.extend(model);
+        merge_claude_settings(&mut flags, settings)?;
+    }
+    Ok(flags)
 }
 
 /// A plain agent tab's arguments with the [`launch_flags`] in front.
@@ -181,20 +437,19 @@ pub(crate) fn launch_flags(provider: &str, notify: bool, sources: Option<&str>) 
 /// policy flags in front of these, so the order is policy, launch, caller.
 pub(crate) fn with_launch_flags(
     program: Option<&str>,
-    notify: bool,
-    sources: Option<&str>,
+    options: &LaunchOptions<'_>,
     args: Option<Vec<String>>,
-) -> Option<Vec<String>> {
-    let flags = program
-        .map(str::trim)
-        .map(|provider| launch_flags(provider, notify, sources))
-        .unwrap_or_default();
+) -> Result<Option<Vec<String>>, String> {
+    let flags = match program.map(str::trim) {
+        Some(provider) => launch_flags(provider, options)?,
+        None => Vec::new(),
+    };
     if flags.is_empty() {
-        return args;
+        return Ok(args);
     }
     let mut out = flags;
     out.extend(args.unwrap_or_default());
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Whether `id` is a UUID in the canonical 8-4-4-4-12 hex form, which is the
@@ -218,10 +473,8 @@ pub(super) struct Extras<'a> {
     pub run_id: Option<&'a str>,
     /// The brief's private directory, granted to Claude Code with `--add-dir`.
     pub brief_dir: Option<&'a Path>,
-    /// Whether to add [`notify_flags`].
-    pub notify: bool,
-    /// The user's `--setting-sources` value, if they narrowed it.
-    pub setting_sources: Option<&'a str>,
+    /// The user's launch settings: notifications, setting sources, model.
+    pub launch: LaunchOptions<'a>,
 }
 
 fn error(code: &str, message: impl Into<String>) -> WorkbenchError {
@@ -268,8 +521,7 @@ pub(super) fn check(
     cwd: &str,
     provider: &str,
     mode: &str,
-    notify: bool,
-    sources: Option<&str>,
+    options: &LaunchOptions<'_>,
 ) -> Result<(), WorkbenchError> {
     let version = capture_command(
         program,
@@ -287,7 +539,7 @@ pub(super) fn check(
         &[],
     )
     .map_err(|e| error("capability_error", e))?;
-    advertises(provider, mode, notify, sources, &version, &help)
+    advertises(provider, mode, options, &version, &help)
 }
 
 /// Whether what a build *said* proves it can be launched the way `mode` asks.
@@ -301,12 +553,16 @@ pub(super) fn check(
 ///
 /// Every flag [`arguments`] will pass is proved here, not only the policy
 /// ones: a build that does not know `--add-dir` or `--settings` would refuse
-/// to start, or worse read the flag's value as the prompt.
+/// to start, or worse read the flag's value as the prompt. A flag in
+/// [`VALUE_PROVEN_FLAGS`] must also list the chosen value in its own block.
+///
+/// What this cannot prove: that a model id exists (no help lists them all),
+/// or that a `--settings` key such as `advisorModel` is honoured — `--help`
+/// shows that `--settings` exists, not which keys this build reads.
 fn advertises(
     provider: &str,
     mode: &str,
-    notify: bool,
-    sources: Option<&str>,
+    options: &LaunchOptions<'_>,
     version: &CapturedOutput,
     help: &CapturedOutput,
 ) -> Result<(), WorkbenchError> {
@@ -359,17 +615,24 @@ fn advertises(
         ],
         _ => &[],
     };
-    let chosen = launch_flags(provider, notify, sources);
-    let chosen = chosen
+    let chosen =
+        launch_flags(provider, options).map_err(|message| error("invalid_input", message))?;
+    let chosen_supported = chosen
         .iter()
-        .map(String::as_str)
-        .filter(|flag| flag.starts_with('-'));
+        .enumerate()
+        .filter(|(_, flag)| flag.starts_with('-'))
+        .all(|(index, flag)| {
+            let value = VALUE_PROVEN_FLAGS
+                .contains(&flag.as_str())
+                .then(|| chosen.get(index + 1).map(String::as_str))
+                .flatten();
+            advertised_option(help, flag, value)
+        });
     if !identity
         || !supported
+        || !chosen_supported
         || required
             .iter()
-            .copied()
-            .chain(chosen)
             .any(|flag| !advertised_option(help, flag, None))
     {
         return Err(error(
@@ -615,11 +878,10 @@ pub(super) fn arguments(
         .ok_or_else(|| error("file_error", "Task brief path is not Unicode."))?;
     let quoted = serde_json::to_string(path).map_err(|e| error("file_error", e.to_string()))?;
     let mut args: Vec<String> = flags.into_iter().map(String::from).collect();
-    args.extend(launch_flags(
-        provider,
-        extras.notify,
-        extras.setting_sources,
-    ));
+    args.extend(
+        launch_flags(provider, &extras.launch)
+            .map_err(|message| error("invalid_input", message))?,
+    );
     match provider {
         "codex" => args.extend(["--cd".into(), cwd.into()]),
         "grok" => args.extend(["--cwd".into(), cwd.into()]),
@@ -944,7 +1206,18 @@ mod permission_default_tests {
 mod tests {
     use super::{
         is_canonical_uuid, notify_flags, with_launch_flags, BriefFile, CapturedOutput, Extras,
+        LaunchOptions,
     };
+
+    /// Launch settings with no model choice: what every test written before
+    /// model controls existed was describing.
+    fn opts(notify: bool, setting_sources: Option<&str>) -> LaunchOptions<'_> {
+        LaunchOptions {
+            notify,
+            setting_sources,
+            model: None,
+        }
+    }
 
     /// The launch as these tests mostly want it: no session id, no granted
     /// directory, no notification flags — the argv the policy alone produces.
@@ -1007,7 +1280,7 @@ mod tests {
     #[test]
     fn a_plain_agent_tab_gets_policy_then_notification_then_its_prompt() {
         let prompt = Some(vec!["--".to_owned(), "Fix the failing test".to_owned()]);
-        let with = with_launch_flags(Some("claude"), true, None, prompt.clone());
+        let with = with_launch_flags(Some("claude"), &opts(true, None), prompt.clone()).unwrap();
         let out = super::apply_permission_mode(Some("claude"), Some("edit"), false, with)
             .unwrap()
             .unwrap();
@@ -1019,15 +1292,26 @@ mod tests {
 
         // Off means exactly what the caller sent, including "nothing at all".
         assert_eq!(
-            with_launch_flags(Some("claude"), false, None, prompt.clone()),
+            with_launch_flags(Some("claude"), &opts(false, None), prompt.clone()).unwrap(),
             prompt
         );
-        assert_eq!(with_launch_flags(Some("claude"), false, None, None), None);
-        assert_eq!(with_launch_flags(None, true, None, prompt.clone()), prompt);
-        assert_eq!(with_launch_flags(Some("grok"), true, None, None), None);
+        assert_eq!(
+            with_launch_flags(Some("claude"), &opts(false, None), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            with_launch_flags(None, &opts(true, None), prompt.clone()).unwrap(),
+            prompt
+        );
+        assert_eq!(
+            with_launch_flags(Some("grok"), &opts(true, None), None).unwrap(),
+            None
+        );
         // A promptless Codex tab is flags only.
         assert_eq!(
-            with_launch_flags(Some("codex"), true, None, None).unwrap(),
+            with_launch_flags(Some("codex"), &opts(true, None), None)
+                .unwrap()
+                .unwrap(),
             notify_flags("codex")
         );
     }
@@ -1074,7 +1358,7 @@ mod tests {
                 "/checkout",
                 &brief.path,
                 &Extras {
-                    notify: true,
+                    launch: opts(true, None),
                     ..Extras::default()
                 },
             )
@@ -1107,8 +1391,7 @@ mod tests {
             &Extras {
                 run_id: Some(RUN),
                 brief_dir: Some(&brief.dir),
-                notify: true,
-                setting_sources: None,
+                launch: opts(true, None),
             },
         )
         .unwrap();
@@ -1156,8 +1439,7 @@ mod tests {
                 &Extras {
                     run_id: Some(RUN),
                     brief_dir: Some(&brief.dir),
-                    notify: false,
-                    setting_sources: None,
+                    launch: opts(false, None),
                 },
             )
             .unwrap();
@@ -1194,7 +1476,7 @@ mod tests {
     fn a_claude_build_must_advertise_every_flag_the_launch_will_pass() {
         let version = on_stdout("2.1.289 (Claude Code)\n");
         let help = on_stdout(CLAUDE_HELP);
-        super::advertises("claude", "ask", true, None, &version, &help).unwrap();
+        super::advertises("claude", "ask", &opts(true, None), &version, &help).unwrap();
         for missing in ["--session-id", "--add-dir", "--settings"] {
             let narrower: String = CLAUDE_HELP
                 .lines()
@@ -1202,9 +1484,15 @@ mod tests {
                 .map(|line| format!("{line}\n"))
                 .collect();
             assert_eq!(
-                super::advertises("claude", "ask", true, None, &version, &on_stdout(&narrower))
-                    .unwrap_err()
-                    .code,
+                super::advertises(
+                    "claude",
+                    "ask",
+                    &opts(true, None),
+                    &version,
+                    &on_stdout(&narrower)
+                )
+                .unwrap_err()
+                .code,
                 "unsupported_capability",
                 "{missing}"
             );
@@ -1218,8 +1506,7 @@ mod tests {
         super::advertises(
             "claude",
             "ask",
-            false,
-            None,
+            &opts(false, None),
             &version,
             &on_stdout(&no_settings),
         )
@@ -1243,8 +1530,7 @@ mod tests {
                 &Extras {
                     run_id: Some(RUN),
                     brief_dir: Some(&brief.dir),
-                    notify: true,
-                    setting_sources: sources,
+                    launch: opts(true, sources),
                 },
             )
             .unwrap()
@@ -1268,7 +1554,12 @@ mod tests {
             Some("claude"),
             Some("edit"),
             false,
-            with_launch_flags(Some("claude"), false, Some("user,local"), prompt.clone()),
+            with_launch_flags(
+                Some("claude"),
+                &opts(false, Some("user,local")),
+                prompt.clone(),
+            )
+            .unwrap(),
         )
         .unwrap()
         .unwrap();
@@ -1277,11 +1568,11 @@ mod tests {
         assert!(at(&tab, "--permission-mode").unwrap() < flag, "{tab:?}");
         assert!(flag < at(&tab, "--").unwrap(), "{tab:?}");
         assert_eq!(
-            with_launch_flags(Some("grok"), false, Some("user"), prompt.clone()),
+            with_launch_flags(Some("grok"), &opts(false, Some("user")), prompt.clone()).unwrap(),
             prompt
         );
         assert_eq!(
-            with_launch_flags(None, false, Some("user"), prompt.clone()),
+            with_launch_flags(None, &opts(false, Some("user")), prompt.clone()).unwrap(),
             prompt
         );
     }
@@ -1298,8 +1589,7 @@ mod tests {
         super::advertises(
             "claude",
             "ask",
-            true,
-            Some("user"),
+            &opts(true, Some("user")),
             &version,
             &on_stdout(&with),
         )
@@ -1307,8 +1597,7 @@ mod tests {
         super::advertises(
             "claude",
             "ask",
-            true,
-            None,
+            &opts(true, None),
             &version,
             &on_stdout(CLAUDE_HELP),
         )
@@ -1317,8 +1606,7 @@ mod tests {
             super::advertises(
                 "claude",
                 "ask",
-                true,
-                Some("user"),
+                &opts(true, Some("user")),
                 &version,
                 &on_stdout(CLAUDE_HELP)
             )
@@ -1336,17 +1624,29 @@ mod tests {
         super::advertises(
             "codex",
             "edit",
-            true,
-            None,
+            &opts(true, None),
             &version,
             &on_stdout(&with_config),
         )
         .unwrap();
-        super::advertises("codex", "edit", false, None, &version, &on_stdout(base)).unwrap();
+        super::advertises(
+            "codex",
+            "edit",
+            &opts(false, None),
+            &version,
+            &on_stdout(base),
+        )
+        .unwrap();
         assert_eq!(
-            super::advertises("codex", "edit", true, None, &version, &on_stdout(base))
-                .unwrap_err()
-                .code,
+            super::advertises(
+                "codex",
+                "edit",
+                &opts(true, None),
+                &version,
+                &on_stdout(base)
+            )
+            .unwrap_err()
+            .code,
             "unsupported_capability"
         );
     }
@@ -1397,8 +1697,7 @@ mod tests {
                     root.path().to_str().unwrap(),
                     provider,
                     mode,
-                    true,
-                    None,
+                    &opts(true, None),
                 )
                 .unwrap_or_else(|error| panic!("{provider}/{mode}: {}", error.message));
             }
@@ -1436,9 +1735,9 @@ mod tests {
     fn probe_refuses_a_build_that_advertises_the_flag_without_the_requested_value() {
         let version = on_stdout("2.1.263 (Claude Code)\n");
         let help = on_stdout(CLAUDE_HELP);
-        assert!(super::advertises("claude", "ask", false, None, &version, &help).is_ok());
+        assert!(super::advertises("claude", "ask", &opts(false, None), &version, &help).is_ok());
         assert_eq!(
-            super::advertises("claude", "bypass", false, None, &version, &help)
+            super::advertises("claude", "bypass", &opts(false, None), &version, &help)
                 .unwrap_err()
                 .code,
             "unsupported_capability",
@@ -1650,8 +1949,8 @@ mod tests {
              default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
                       Working directory\n",
         );
-        super::advertises("grok", "ask", false, None, &version, &help).unwrap();
-        super::advertises("grok", "bypass", false, None, &version, &help).unwrap();
+        super::advertises("grok", "ask", &opts(false, None), &version, &help).unwrap();
+        super::advertises("grok", "bypass", &opts(false, None), &version, &help).unwrap();
 
         // The same build without the mode `ask` needs, and without `--cwd`.
         let narrower = on_stdout(
@@ -1659,7 +1958,7 @@ mod tests {
              default, plan]\n",
         );
         assert_eq!(
-            super::advertises("grok", "ask", false, None, &version, &narrower)
+            super::advertises("grok", "ask", &opts(false, None), &version, &narrower)
                 .unwrap_err()
                 .code,
             "unsupported_capability"
@@ -1677,16 +1976,22 @@ mod tests {
              prompt interactively\n  --dangerously-skip-permissions  Auto-approve all tool \
              permission requests\n  --sandbox                       Run in a sandbox\n",
         );
-        super::advertises("agy", "ask", false, None, &version, &help).unwrap();
-        super::advertises("agy", "inspect", false, None, &version, &help).unwrap();
-        super::advertises("agy", "bypass", false, None, &version, &help).unwrap();
+        super::advertises("agy", "ask", &opts(false, None), &version, &help).unwrap();
+        super::advertises("agy", "inspect", &opts(false, None), &version, &help).unwrap();
+        super::advertises("agy", "bypass", &opts(false, None), &version, &help).unwrap();
 
         let without_controls =
             on_stderr("Usage of agy:\n  --prompt-interactive            prompt\n");
         assert_eq!(
-            super::advertises("agy", "ask", false, None, &version, &without_controls)
-                .unwrap_err()
-                .code,
+            super::advertises(
+                "agy",
+                "ask",
+                &opts(false, None),
+                &version,
+                &without_controls
+            )
+            .unwrap_err()
+            .code,
             "unsupported_capability"
         );
     }
@@ -1702,13 +2007,13 @@ mod tests {
              default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
                       Working directory\n",
         );
-        super::advertises("grok", "ask", false, None, &version, &help)
+        super::advertises("grok", "ask", &opts(false, None), &version, &help)
             .expect("the bounded case still passes");
 
         let mut flood = help.clone();
         flood.stdout.resize(128 * 1024 + 1, b' ');
         assert_eq!(
-            super::advertises("grok", "ask", false, None, &version, &flood)
+            super::advertises("grok", "ask", &opts(false, None), &version, &flood)
                 .unwrap_err()
                 .code,
             "capability_error",
@@ -1718,7 +2023,7 @@ mod tests {
         let mut chatty = version.clone();
         chatty.stderr.resize(1025, b' ');
         assert_eq!(
-            super::advertises("grok", "ask", false, None, &chatty, &help)
+            super::advertises("grok", "ask", &opts(false, None), &chatty, &help)
                 .unwrap_err()
                 .code,
             "capability_error"
@@ -1745,6 +2050,637 @@ mod tests {
             stderr: text.as_bytes().to_vec(),
             success: true,
             status_code: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::{
+        advertises, apply_permission_mode, launch_flags, model_fields, model_launchers,
+        validate_model_choice, validate_model_id, with_launch_flags, BriefFile, CapturedOutput,
+        Extras, LaunchOptions, EFFORT_LEVELS, MAX_FALLBACK_MODELS, MAX_MODEL_ID_LEN, MODEL_FIELDS,
+    };
+    use crate::tool_config::ModelChoice;
+
+    fn s(value: &str) -> Option<String> {
+        Some(value.to_owned())
+    }
+
+    fn full_claude() -> ModelChoice {
+        ModelChoice {
+            model: s("opus"),
+            effort: s("high"),
+            fallback: Some(vec!["sonnet".into(), "haiku".into()]),
+            advisor: s("fable"),
+        }
+    }
+
+    fn with_model(choice: &ModelChoice) -> LaunchOptions<'_> {
+        LaunchOptions {
+            model: Some(choice),
+            ..LaunchOptions::default()
+        }
+    }
+
+    fn settings_object(flags: &[String]) -> serde_json::Map<String, serde_json::Value> {
+        let at = flags
+            .iter()
+            .position(|flag| flag == "--settings")
+            .expect("no --settings");
+        match serde_json::from_str(&flags[at + 1]).unwrap() {
+            serde_json::Value::Object(object) => object,
+            other => panic!("--settings was not an object: {other}"),
+        }
+    }
+
+    fn on(text: &str, stderr: bool) -> CapturedOutput {
+        let bytes = text.as_bytes().to_vec();
+        CapturedOutput {
+            stdout: if stderr { Vec::new() } else { bytes.clone() },
+            stderr: if stderr { bytes } else { Vec::new() },
+            success: true,
+            status_code: 0,
+        }
+    }
+
+    /// The options of Claude Code 2.1.289 a model launch uses, laid out the
+    /// way its `--help` lays them out (continuation lines included, because
+    /// that is where `--effort` lists its levels).
+    const CLAUDE_HELP: &str = "  --add-dir <directories...>            Additional directories to allow tool\n                                        access to\n  --effort <level>                      Effort level for the current session\n                                        (low, medium, high, xhigh, max)\n  --fallback-model <model>              Enable automatic fallback to specified\n                                        model(s) when the default model is\n  --model <model>                       Model for the current session.\n  --permission-mode <mode>              Permission mode to use for the session\n                                        (choices: \"acceptEdits\", \"auto\",\n                                        \"bypassPermissions\", \"manual\",\n                                        \"dontAsk\", \"plan\")\n  --session-id <uuid>                   Use a specific session ID for the\n  --settings <file-or-json>             Path to a settings JSON file or a JSON\n";
+
+    /// Antigravity 1.2.17's help, which it writes to stderr.
+    const AGY_HELP: &str = "Usage of agy:\n  --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting\n  --effort                        Reasoning effort for the current CLI session (low|medium|high|xhigh|max)\n  --mode                          Set the agent execution mode for this session (accept-edits, plan)\n  --model                         Model for the current CLI session\n  --prompt-interactive            Run an initial prompt interactively and continue the session\n  --sandbox                       Run in a sandbox with terminal restrictions enabled\n";
+
+    #[test]
+    fn each_launcher_takes_exactly_the_controls_its_cli_advertises() {
+        assert_eq!(model_fields("claude"), MODEL_FIELDS.to_vec());
+        assert_eq!(model_fields("agy"), vec!["model", "effort"]);
+        assert_eq!(model_fields("codex"), vec!["model"]);
+        assert_eq!(model_fields("grok"), vec!["model"]);
+        for none in ["manvi", "shell", "", "Claude", "claude "] {
+            assert!(model_fields(none).is_empty(), "{none:?}");
+        }
+        let launchers = model_launchers();
+        assert_eq!(
+            launchers.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["agy", "claude", "codex", "grok"]
+        );
+        // Every field of every launcher is in the vocabulary, in its order.
+        for fields in launchers.values() {
+            let positions: Vec<usize> = fields
+                .iter()
+                .map(|field| MODEL_FIELDS.iter().position(|f| f == field).unwrap())
+                .collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn a_full_claude_choice_is_its_own_flags_and_one_settings_key() {
+        let choice = full_claude();
+        let flags = launch_flags("claude", &with_model(&choice)).unwrap();
+        assert_eq!(
+            flags,
+            vec![
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--fallback-model",
+                "sonnet,haiku",
+                "--settings",
+                r#"{"advisorModel":"fable"}"#,
+            ]
+        );
+    }
+
+    /// `--settings` takes one value, so a second occurrence would replace the
+    /// first: choosing an advisor must not cost the notification channel.
+    #[test]
+    fn the_advisor_joins_the_notification_settings_rather_than_replacing_them() {
+        let choice = full_claude();
+        let flags = launch_flags(
+            "claude",
+            &LaunchOptions {
+                notify: true,
+                model: Some(&choice),
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(flags.iter().filter(|f| *f == "--settings").count(), 1);
+        let object = settings_object(&flags);
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["advisorModel", "preferredNotifChannel"]);
+        assert_eq!(object["advisorModel"], "fable");
+        assert_eq!(object["preferredNotifChannel"], "terminal_bell");
+
+        // Without an advisor the notification object is untouched: only keys
+        // the user chose are ever written.
+        let plain = ModelChoice {
+            model: s("sonnet"),
+            ..ModelChoice::default()
+        };
+        let flags = launch_flags(
+            "claude",
+            &LaunchOptions {
+                notify: true,
+                model: Some(&plain),
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            settings_object(&flags).keys().collect::<Vec<_>>(),
+            ["preferredNotifChannel"]
+        );
+        // And an advisor alone is the one key.
+        let advisor = ModelChoice {
+            advisor: s("opus"),
+            ..ModelChoice::default()
+        };
+        let flags = launch_flags("claude", &with_model(&advisor)).unwrap();
+        assert_eq!(flags, vec!["--settings", r#"{"advisorModel":"opus"}"#]);
+    }
+
+    #[test]
+    fn a_field_the_cli_does_not_take_is_refused_never_dropped() {
+        for (launcher, choice) in [
+            (
+                "codex",
+                ModelChoice {
+                    effort: s("high"),
+                    ..ModelChoice::default()
+                },
+            ),
+            (
+                "grok",
+                ModelChoice {
+                    fallback: Some(vec!["a".into()]),
+                    ..ModelChoice::default()
+                },
+            ),
+            (
+                "agy",
+                ModelChoice {
+                    advisor: s("opus"),
+                    ..ModelChoice::default()
+                },
+            ),
+            (
+                "agy",
+                ModelChoice {
+                    model: s("gemini-3.8-flash-high"),
+                    fallback: Some(vec!["x".into()]),
+                    ..ModelChoice::default()
+                },
+            ),
+            ("manvi", full_claude()),
+            ("shell", full_claude()),
+        ] {
+            assert!(
+                launch_flags(launcher, &with_model(&choice)).is_err(),
+                "{launcher}: {choice:?} was applied in part"
+            );
+            assert!(validate_model_choice(launcher, &choice).is_err());
+        }
+        // A model alone is fine for every terminal provider.
+        for launcher in ["claude", "agy", "codex", "grok"] {
+            let choice = ModelChoice {
+                model: s("m-1"),
+                ..ModelChoice::default()
+            };
+            assert_eq!(
+                launch_flags(launcher, &with_model(&choice)).unwrap(),
+                vec!["--model", "m-1"],
+                "{launcher}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_choice_adds_nothing() {
+        let empty = ModelChoice::default();
+        for launcher in ["claude", "agy", "codex", "grok"] {
+            assert!(launch_flags(launcher, &with_model(&empty))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn model_names_are_judged_by_shape() {
+        for good in [
+            "opus",
+            "opus[1m]",
+            "opusplan",
+            "claude-opus-5-5",
+            "claude-opus-4-1@20250805",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus",
+            "gemini-3.8-flash-high",
+            "gpt_oss.120b",
+            "9",
+        ] {
+            validate_model_id("model", good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        let long = "a".repeat(MAX_MODEL_ID_LEN + 1);
+        for bad in [
+            "",
+            "-m",
+            "--model",
+            "--",
+            "a,b",
+            "a b",
+            " opus",
+            "opus\n",
+            "op\u{0}us",
+            "op\tus",
+            "ópus",
+            "opus;rm",
+            "$(x)",
+            "`x`",
+            "a\"b",
+            "{\"x\":1}",
+            "[1m]",
+            ".hidden",
+            "/abs",
+            long.as_str(),
+        ] {
+            assert!(validate_model_id("model", bad).is_err(), "{bad:?} passed");
+        }
+        assert!(validate_model_id("model", &"a".repeat(MAX_MODEL_ID_LEN)).is_ok());
+    }
+
+    #[test]
+    fn effort_and_fallback_are_bounded() {
+        for level in EFFORT_LEVELS {
+            let choice = ModelChoice {
+                effort: s(level),
+                ..ModelChoice::default()
+            };
+            validate_model_choice("claude", &choice).unwrap();
+            validate_model_choice("agy", &choice).unwrap();
+        }
+        for bad in [
+            "",
+            "HIGH",
+            "ultra",
+            "ultracode",
+            "high ",
+            "minimal",
+            "-high",
+        ] {
+            let choice = ModelChoice {
+                effort: s(bad),
+                ..ModelChoice::default()
+            };
+            assert!(validate_model_choice("claude", &choice).is_err(), "{bad:?}");
+        }
+        let fallback = |list: Vec<&str>| ModelChoice {
+            fallback: Some(list.into_iter().map(str::to_owned).collect()),
+            ..ModelChoice::default()
+        };
+        assert!(validate_model_choice("claude", &fallback(vec![])).is_err());
+        assert!(validate_model_choice("claude", &fallback(vec!["a", "a"])).is_err());
+        assert!(validate_model_choice("claude", &fallback(vec!["a,b"])).is_err());
+        let most: Vec<String> = (0..MAX_FALLBACK_MODELS).map(|i| format!("m{i}")).collect();
+        let most_refs: Vec<&str> = most.iter().map(String::as_str).collect();
+        validate_model_choice("claude", &fallback(most_refs.clone())).unwrap();
+        let mut over = most_refs;
+        over.push("extra");
+        assert!(validate_model_choice("claude", &fallback(over)).is_err());
+    }
+
+    /// The prompt form `-- <text>` makes everything after it positional, so a
+    /// model flag behind it would be prompt text and the session would run
+    /// on the CLI's own model while looking configured.
+    #[test]
+    fn model_flags_precede_the_prompt_on_both_launch_paths() {
+        let choice = full_claude();
+        // A plain tab: policy, launch flags, then the caller's prompt.
+        let tab = apply_permission_mode(
+            Some("claude"),
+            Some("edit"),
+            false,
+            with_launch_flags(
+                Some("claude"),
+                &LaunchOptions {
+                    notify: true,
+                    setting_sources: Some("user"),
+                    model: Some(&choice),
+                },
+                Some(vec!["--".into(), "Fix the failing test".into()]),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let at = |args: &[String], flag: &str| args.iter().position(|a| a == flag).unwrap();
+        let separator = at(&tab, "--");
+        for flag in [
+            "--permission-mode",
+            "--model",
+            "--effort",
+            "--fallback-model",
+            "--settings",
+            "--setting-sources",
+        ] {
+            assert!(at(&tab, flag) < separator, "{flag} after `--`: {tab:?}");
+        }
+        assert!(
+            at(&tab, "--permission-mode") < at(&tab, "--model"),
+            "{tab:?}"
+        );
+        assert_eq!(tab.last().unwrap(), "Fix the failing test");
+
+        // A task attempt.
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        let args = super::arguments(
+            "claude",
+            "edit",
+            false,
+            "/checkout",
+            &brief.path,
+            &Extras {
+                run_id: None,
+                brief_dir: Some(&brief.dir),
+                launch: LaunchOptions {
+                    notify: true,
+                    setting_sources: None,
+                    model: Some(&choice),
+                },
+            },
+        )
+        .unwrap();
+        let separator = at(&args, "--");
+        assert_eq!(separator, args.len() - 2, "{args:?}");
+        for flag in [
+            "--model",
+            "--effort",
+            "--fallback-model",
+            "--settings",
+            "--add-dir",
+        ] {
+            assert!(at(&args, flag) < separator, "{flag}: {args:?}");
+        }
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+
+        // Antigravity: model flags come before `--prompt-interactive`, whose
+        // value is the prompt.
+        let agy = ModelChoice {
+            model: s("gemini-3.8-flash-high"),
+            effort: s("low"),
+            ..ModelChoice::default()
+        };
+        let args = super::arguments(
+            "agy",
+            "edit",
+            false,
+            "/checkout",
+            &brief.path,
+            &Extras {
+                launch: with_model(&agy),
+                ..Extras::default()
+            },
+        )
+        .unwrap();
+        let prompt = at(&args, "--prompt-interactive");
+        assert!(
+            at(&args, "--model") < prompt && at(&args, "--effort") < prompt,
+            "{args:?}"
+        );
+        assert_eq!(prompt, args.len() - 2);
+    }
+
+    /// The model controls a task launch will pass are the ones it proves.
+    #[test]
+    fn a_build_must_advertise_every_model_control_and_the_chosen_level() {
+        let version = on("2.1.289 (Claude Code)\n", false);
+        let help = on(CLAUDE_HELP, false);
+        let choice = full_claude();
+        advertises("claude", "ask", &with_model(&choice), &version, &help).unwrap();
+
+        for missing in ["--model", "--effort", "--fallback-model", "--settings"] {
+            let narrower: String = CLAUDE_HELP
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(missing))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            assert_eq!(
+                advertises(
+                    "claude",
+                    "ask",
+                    &with_model(&choice),
+                    &version,
+                    &on(&narrower, false)
+                )
+                .unwrap_err()
+                .code,
+                "unsupported_capability",
+                "{missing}"
+            );
+        }
+
+        // A build that lists fewer levels refuses the one it lacks, rather
+        // than reading `xhigh` however it likes.
+        let fewer = CLAUDE_HELP.replace("(low, medium, high, xhigh, max)", "(low, medium, high)");
+        let xhigh = ModelChoice {
+            effort: s("xhigh"),
+            ..ModelChoice::default()
+        };
+        assert_eq!(
+            advertises(
+                "claude",
+                "ask",
+                &with_model(&xhigh),
+                &version,
+                &on(&fewer, false)
+            )
+            .unwrap_err()
+            .code,
+            "unsupported_capability"
+        );
+        let high = ModelChoice {
+            effort: s("high"),
+            ..ModelChoice::default()
+        };
+        advertises(
+            "claude",
+            "ask",
+            &with_model(&high),
+            &version,
+            &on(&fewer, false),
+        )
+        .unwrap();
+
+        // A level named only by a *different* option is not proof.
+        let elsewhere = "  --effort <level>  Effort\n  --other  (xhigh)\n  --permission-mode <mode>  (manual)\n  --session-id <uuid>  id\n  --add-dir <d>  dir\n";
+        assert!(advertises(
+            "claude",
+            "ask",
+            &with_model(&xhigh),
+            &version,
+            &on(elsewhere, false)
+        )
+        .is_err());
+
+        // An invalid choice is refused as input, before any help is read.
+        let bad = ModelChoice {
+            model: s("--dangerously-skip-permissions"),
+            ..ModelChoice::default()
+        };
+        assert_eq!(
+            advertises("claude", "ask", &with_model(&bad), &version, &help)
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+    }
+
+    #[test]
+    fn antigravity_proves_its_model_controls_from_help_on_stderr() {
+        let version = on("1.2.17\n", false);
+        let help = on(AGY_HELP, true);
+        let choice = ModelChoice {
+            model: s("gemini-3.8-flash-high"),
+            effort: s("max"),
+            ..ModelChoice::default()
+        };
+        advertises("agy", "ask", &with_model(&choice), &version, &help).unwrap();
+        let older = on(
+            &AGY_HELP
+                .lines()
+                .filter(|line| !line.contains("--effort") && !line.contains("--model "))
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+            true,
+        );
+        assert!(advertises("agy", "ask", &with_model(&choice), &version, &older).is_err());
+        // Without a model choice the older build is still launchable.
+        advertises("agy", "ask", &LaunchOptions::default(), &version, &older).unwrap();
+    }
+
+    /// The whole grid plus the ways a stored value could be wrong. Every call
+    /// either applies exactly the table's flags or refuses; there is no third
+    /// outcome, and in particular no partial application.
+    #[test]
+    fn every_model_input_either_applies_the_table_or_refuses() {
+        let launchers = [
+            "claude", "agy", "codex", "grok", "manvi", "shell", "", "CLAUDE",
+        ];
+        let values: Vec<String> = [
+            "opus",
+            "opus[1m]",
+            "gemini-3.8-flash-high",
+            "high",
+            "xhigh",
+            "-x",
+            "--",
+            "a,b",
+            "a b",
+            "",
+            "\u{0}",
+            "ópus",
+            "--settings",
+        ]
+        .iter()
+        .map(|v| (*v).to_owned())
+        .chain([
+            "m".repeat(MAX_MODEL_ID_LEN),
+            "m".repeat(MAX_MODEL_ID_LEN + 1),
+            "x".repeat(10 * 1024),
+        ])
+        .collect();
+        let (mut applied, mut refused) = (0usize, 0usize);
+        for launcher in launchers {
+            for field in MODEL_FIELDS {
+                for value in &values {
+                    let mut choice = ModelChoice::default();
+                    match field {
+                        "model" => choice.model = Some(value.clone()),
+                        "effort" => choice.effort = Some(value.clone()),
+                        "fallback" => choice.fallback = Some(vec![value.clone()]),
+                        _ => choice.advisor = Some(value.clone()),
+                    }
+                    let prompt = Some(vec!["--".to_owned(), "PROMPT".to_owned()]);
+                    let Ok(out) = with_launch_flags(Some(launcher), &with_model(&choice), prompt)
+                    else {
+                        refused += 1;
+                        assert!(validate_model_choice(launcher.trim(), &choice).is_err());
+                        continue;
+                    };
+                    let out = out.unwrap();
+                    applied += 1;
+                    // Applied means: the launcher takes the field, the value
+                    // is well-formed, and it sits before the separator.
+                    assert!(
+                        model_fields(launcher).contains(&field),
+                        "{launcher}/{field}"
+                    );
+                    validate_model_choice(launcher, &choice).unwrap();
+                    let separator = out.iter().position(|a| a == "--").unwrap();
+                    assert_eq!(&out[separator..], ["--", "PROMPT"], "{out:?}");
+                    for arg in &out[..separator] {
+                        assert!(!arg.contains('\0') && arg.len() <= 1024, "{arg:?}");
+                    }
+                    let carried = if field == "advisor" {
+                        out[..separator].iter().any(|a| a.contains(value.as_str()))
+                    } else {
+                        out[..separator].contains(value)
+                    };
+                    assert!(carried, "{launcher}/{field}/{value:?} lost: {out:?}");
+                }
+            }
+        }
+        assert!(applied > 0 && refused > 0, "a branch went untested");
+        // Each terminal provider takes each of its fields with each valid
+        // value: model/advisor/fallback take 6 of these values, effort 2.
+        let expected: usize = ["claude", "agy", "codex", "grok"]
+            .iter()
+            .map(|launcher| {
+                model_fields(launcher)
+                    .iter()
+                    .map(|field| if *field == "effort" { 2 } else { 6 })
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(applied, expected);
+    }
+
+    /// Reads the installed CLIs, so it runs only on request. It proves the
+    /// claim the table's comment makes: each advertised control is in the
+    /// real `--help`, and the effort levels are each listed.
+    #[test]
+    #[ignore = "requires installed Claude Code, Codex, Grok and Antigravity; reads --help only"]
+    fn installed_clis_advertise_every_model_control_offered_for_them() {
+        let root = tempfile::tempdir().unwrap();
+        for launcher in ["claude", "agy", "codex", "grok"] {
+            let program = super::program(launcher).unwrap();
+            let fields = model_fields(launcher);
+            let choice = ModelChoice {
+                model: s("probe-model"),
+                effort: fields.contains(&"effort").then(|| "xhigh".to_owned()),
+                fallback: fields
+                    .contains(&"fallback")
+                    .then(|| vec!["probe-fallback".to_owned()]),
+                advisor: fields.contains(&"advisor").then(|| "opus".to_owned()),
+            };
+            super::check(
+                &program,
+                root.path().to_str().unwrap(),
+                launcher,
+                "ask",
+                &LaunchOptions {
+                    notify: true,
+                    setting_sources: None,
+                    model: Some(&choice),
+                },
+            )
+            .unwrap_or_else(|error| panic!("{launcher}: {}", error.message));
         }
     }
 }

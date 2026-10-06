@@ -10,6 +10,7 @@ import {
   CONTRACTS,
   applyRenameAll,
   parseRustStructs,
+  parseTsInterfaces,
   DEFAULT_RUST_SOURCE,
   DEFAULT_TS_SOURCE,
   TERMINAL_RUST_SOURCE,
@@ -290,5 +291,41 @@ describe("wire-shape normalization", () => {
       "P",
     );
     expect([...(fields?.keys() ?? [])].sort()).toEqual(["kept_as_is", "modelInfo"]);
+  });
+
+  /**
+   * A string-keyed map is one JSON object whatever map type wrote it. Before
+   * this rule no map field could ever agree with its TypeScript twin, so a
+   * contract could only cover structs that had none.
+   */
+  it("reads a string-keyed map as the Record its TypeScript twin declares, value type included", () => {
+    const rust = structOf(
+      `pub struct V {
+         pub a: std::collections::BTreeMap<String, Vec<String>>,
+         pub b: HashMap<String, u32>,
+         pub c: BTreeMap<String, crate::tool_config::ModelChoice>,
+         pub d: BTreeMap<u32, String>
+       }`,
+      "V",
+    );
+    expect(rust?.get("a")?.type).toBe("Record<string,string[]>");
+    expect(rust?.get("b")?.type).toBe("Record<string,number>");
+    expect(rust?.get("c")?.type).toBe("Record<string,ModelChoice>");
+    // A non-string key is not claimed to be a string-keyed record.
+    expect(rust?.get("d")?.type).not.toMatch(/^Record</);
+    const ts = parseTsInterfaces(
+      `export interface V {
+         a: Record<string, string[]>;
+         b: { [key: string]: number };
+         c: Record<string, ModelChoice>;
+       }`,
+      ["V"],
+    ).interfaces.get("V")?.props;
+    expect(ts?.get("a")?.type).toBe(rust?.get("a")?.type);
+    expect(ts?.get("b")?.type).toBe(rust?.get("b")?.type);
+    expect(ts?.get("c")?.type).toBe(rust?.get("c")?.type);
+    // The value type still counts: a map of the wrong values is drift.
+    const wrong = parseTsInterfaces(`export interface V { a: Record<string, number[]>; }`, ["V"]).interfaces.get("V")?.props;
+    expect(wrong?.get("a")?.type).not.toBe(rust?.get("a")?.type);
   });
 });

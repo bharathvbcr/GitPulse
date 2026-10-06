@@ -456,6 +456,7 @@ pub fn run() {
             cmd_tool_config_save,
             cmd_agent_defaults,
             cmd_agent_defaults_save,
+            cmd_agent_models,
             cmd_session_alerts,
             cmd_session_alerts_save,
             cmd_session_alerts_visible,
