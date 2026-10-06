@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, tick, untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { ChevronDown, SquareTerminal } from "@lucide/svelte";
@@ -16,7 +16,6 @@
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { observeResize } from "../dom/observeResize";
-  import { get } from "svelte/store";
 
   /**
    * The terminal, docked beneath the active view.
@@ -86,16 +85,7 @@
    * the thing that switches repository tabs. The dock already spans them.
    */
   function goToSession(session: TerminalSessionRecord) {
-    return focusTerminalSession(session, {
-      snapshot: () => {
-        const state = get(repoStore);
-        return { openTabs: state.openTabs, activeTabId: state.activeTabId };
-      },
-      activateTab: (id) => repoStore.activateTab(id),
-      setTerminalOpen: (open) => repoStore.setTerminalOpen(open),
-      openRepo: (path) => repoStore.openRepo(path),
-      afterRender: () => tick(),
-    });
+    return focusTerminalSession(session);
   }
 
   let host: HTMLDivElement | undefined = $state();

@@ -18,24 +18,33 @@
   import { createListenerTracker } from "../dom/listenerTracker";
   import { sessionByNativeId, terminalSessions } from "../terminal/sessionRegistry";
   import { adoptDetachedSessions } from "../terminal/detachedSessions";
+  import { focusTerminalSession } from "../terminal/sessionFocus";
   import { LAYERS } from "../ui/layers";
 
   let missed = $state<string | null>(null);
   let timer: ReturnType<typeof setTimeout> | null = null;
 
-  function open(sessionId: unknown) {
+  /**
+   * Through the same owner as the Sessions list's Go to: switch to the
+   * session's repository, open its dock, then reveal. Calling `reveal`
+   * directly selected the tab in a panel that might be another repository's,
+   * hidden — and for a session adopted after a reload, queued its tab for a
+   * dock nobody opened.
+   */
+  async function open(sessionId: unknown) {
     if (typeof sessionId !== "string" || !sessionId) return;
     const record = sessionByNativeId($terminalSessions, sessionId);
-    if (record?.reveal) {
+    const outcome = await focusTerminalSession(record);
+    if (outcome.ok) {
       missed = null;
-      record.reveal();
       return;
     }
-    missed = record
-      ? "That session is no longer on screen. Open its terminal from the Sessions list."
-      : "That terminal session has ended.";
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => (missed = null), 6000);
+    say(
+      outcome.reason === "no-session"
+        ? "That terminal session has ended."
+        : "That session is no longer on screen. Open its terminal from the Sessions list.",
+      6000,
+    );
   }
 
   function say(message: string, ms: number) {
@@ -55,7 +64,7 @@
       (error: unknown) => say(`Terminal sessions left running before the window reloaded could not be listed: ${String(error)}`, 15000),
     );
     const listeners = createListenerTracker();
-    void listen<string>("gitpulse-session-notification-open", (event) => open(event.payload))
+    void listen<string>("gitpulse-session-notification-open", (event) => void open(event.payload))
       .then((unlisten) => listeners.track(unlisten))
       .catch(() => {
         missed = "Session notification clicks cannot be delivered. Open the terminal directly.";

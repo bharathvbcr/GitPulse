@@ -53,7 +53,22 @@ describe("TerminalDock", () => {
     // where the dock already spans every open repository.
     expect(source).toContain("focusTerminalSession");
     expect(source).toContain("onGoToSession: goToSession");
-    expect(source).toContain("setTerminalOpen: (open) => repoStore.setTerminalOpen(open)");
+    // The store actions are sessionFocus.ts's own default, shared with the
+    // alert bridge, so the two jumps cannot drift into different steps.
+    expect(source).toContain("return focusTerminalSession(session);");
+    const focus = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../terminal/sessionFocus.ts"), "utf8");
+    expect(focus).toContain("setTerminalOpen: (open) => repoStore.setTerminalOpen(open)");
+    expect(focus).toContain('showRepositorySurface: () => interfaceStore.setGlobalSurface("repository")');
+  });
+
+  it("a clicked session alert jumps through the same owner as Go to", () => {
+    // It called `record.reveal()` directly: the tab was selected inside
+    // whichever repository's panel held it, hidden if that was not the
+    // active one, and an adopted session's tab was queued for a dock nobody
+    // opened.
+    const bridge = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "SessionNotificationBridge.svelte"), "utf8");
+    expect(bridge).toContain("await focusTerminalSession(record)");
+    expect(bridge).not.toMatch(/record\.reveal\(\)/);
   });
 
   it("offers the WAI-ARIA splitter, keyboard included", () => {

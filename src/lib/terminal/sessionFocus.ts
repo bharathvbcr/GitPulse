@@ -18,6 +18,10 @@
  * "jump" silently becomes a no-op.
  */
 
+import { tick } from "svelte";
+import { get } from "svelte/store";
+import { interfaceStore } from "../stores/interfaceStore";
+import { repoStore } from "../stores/repoStore";
 import type { TerminalSessionRecord } from "./sessionRegistry";
 
 /** What `focusTerminalSession` needs from the repository store. */
@@ -27,6 +31,12 @@ export interface RepoFocusTarget {
 }
 
 export interface RepoFocusActions {
+  /**
+   * Brings the repository surface forward. The dock lives there, so a jump
+   * made from Tasks or Fleet — an alert clicked while reading the board —
+   * otherwise revealed into a surface nobody could see.
+   */
+  showRepositorySurface(): void;
   snapshot(): RepoFocusTarget;
   activateTab(id: string): Promise<void> | void;
   setTerminalOpen(open: boolean): boolean;
@@ -49,7 +59,7 @@ export type FocusOutcome =
  */
 export async function focusTerminalSession(
   record: Pick<TerminalSessionRecord, "repoPath" | "reveal"> | null | undefined,
-  repo: RepoFocusActions,
+  repo: RepoFocusActions = repoStoreFocus,
 ): Promise<FocusOutcome> {
   if (!record) return { ok: false, reason: "no-session" };
   // Checked BEFORE anything moves. A record with no reveal can never be shown,
@@ -58,6 +68,7 @@ export async function focusTerminalSession(
   // is what starts a shell.
   if (!record.reveal) return { ok: false, reason: "unavailable" };
 
+  repo.showRepositorySurface();
   const before = repo.snapshot();
   const target = before.openTabs.find((tab) => tab.path === record.repoPath);
   let switchedRepo = false;
@@ -86,3 +97,20 @@ export async function focusTerminalSession(
   record.reveal();
   return { ok: true, switchedRepo, openedDock };
 }
+
+/**
+ * The app's own stores, as every caller in the app uses them: the dock's
+ * Sessions list and a clicked session alert. One definition, so the two
+ * cannot drift into doing the steps differently.
+ */
+export const repoStoreFocus: RepoFocusActions = {
+  showRepositorySurface: () => interfaceStore.setGlobalSurface("repository"),
+  snapshot: () => {
+    const state = get(repoStore);
+    return { openTabs: state.openTabs, activeTabId: state.activeTabId };
+  },
+  activateTab: (id) => repoStore.activateTab(id),
+  setTerminalOpen: (open) => repoStore.setTerminalOpen(open),
+  openRepo: (path) => repoStore.openRepo(path),
+  afterRender: () => tick(),
+};

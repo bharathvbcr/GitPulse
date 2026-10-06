@@ -18,6 +18,9 @@ function stub(
   let active = activeTabId;
   let dockOpen = false;
   const actions: RepoFocusActions = {
+    showRepositorySurface: () => {
+      calls.push("surface");
+    },
     snapshot: () => ({ openTabs, activeTabId: active }),
     activateTab: (id) => {
       calls.push(`activate:${id}`);
@@ -59,7 +62,7 @@ describe("focusTerminalSession", () => {
     // reverse order opens the terminal on /r/alpha, the repository the user
     // just left, and leaves /r/beta's dock shut. And the reveal must come
     // after a render, or it focuses an xterm that is still hidden.
-    expect(calls).toEqual(["activate:beta", "dock:true", "render", "reveal"]);
+    expect(calls).toEqual(["surface", "activate:beta", "dock:true", "render", "reveal"]);
     expect(reveal).toHaveBeenCalledOnce();
   });
 
