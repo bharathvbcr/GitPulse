@@ -293,6 +293,14 @@ up as it does any external write. An agent never reopens a task that is already
 Done, and an agent without the GitPulse MCP server configured cannot move it at
 all — the card then stays where it was for you to move.
 
+An agent can also delete a card, with `gitpulse_delete_task`, when the task
+should not exist — a duplicate, or one it merged into another. It must give a
+reason, which is added to the task's **Logs** before the delete, so the task's
+history says why it went. It is the same delete as the board's own: the card
+leaves the board, its id is never reused, and its history stays in your GitPulse
+profile. An agent cannot bring a deleted card back, cannot delete a card of
+another repository, and cannot delete a card linked to more than one repository.
+
 ### Running several tasks at once
 
 One working tree holds one agent; a repository can hold several. Tick **Run in

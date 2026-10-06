@@ -886,6 +886,23 @@ fn find_task(
     task: &str,
 ) -> Result<(String, Value), WorkbenchError> {
     let task = task.trim();
+    for id in task_candidates(repository_id, task) {
+        let Some(item) = get_item(store, &id)? else {
+            continue;
+        };
+        if links(&item, repository_id) {
+            return Ok((id, item));
+        }
+    }
+    Err(WorkbenchError::new(
+        "not_found",
+        format!("No task {task:?} on the board for this repository. Pass the task_id you added it with, or an item_id from gitpulse_list_tasks."),
+    ))
+}
+
+/// The item ids `task` can name: the id derived from a filed task key, and
+/// the text itself as a board item id. Either may be absent.
+fn task_candidates(repository_id: &str, task: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     if file_tasks::validate_task_key(task).is_ok() {
         candidates.push(item_id(repository_id, task));
@@ -898,18 +915,53 @@ fn find_task(
     {
         candidates.push(task.to_string());
     }
-    for id in candidates {
-        let Some(item) = get_item(store, &id)? else {
-            continue;
-        };
-        if links(&item, repository_id) {
-            return Ok((id, item));
+    candidates
+}
+
+/// Every field `items.put` replaces, sent back exactly as read under the
+/// revision it was read at, so a write changes only what its caller sets on
+/// top and a person's edit in between is a conflict rather than overwritten.
+fn resend(item: &Value, id: &str, revision: i64, request: &str) -> Map<String, Value> {
+    let mut input = Map::new();
+    for key in [
+        "title",
+        "description",
+        "kind",
+        "status",
+        "priority",
+        "severity",
+        "owner",
+        "due_at",
+        "labels",
+        "acceptance_criteria",
+        "logs",
+        "repository_ids",
+        "primary_repository_id",
+        "position",
+    ] {
+        if !item[key].is_null() {
+            input.insert(key.into(), item[key].clone());
         }
     }
-    Err(WorkbenchError::new(
-        "not_found",
-        format!("No task {task:?} on the board for this repository. Pass the task_id you added it with, or an item_id from gitpulse_list_tasks."),
-    ))
+    input.insert(
+        "home_workspace_id".into(),
+        item["home_workspace_id"].clone(),
+    );
+    input.insert("id".into(), json!(id));
+    input.insert("request_id".into(), json!(fresh_id(request)));
+    input.insert("expected_revision".into(), json!(revision));
+    input
+}
+
+/// `logs` with `block` appended as its own paragraph, or `None` when the
+/// result would not fit in a task's logs.
+fn append_log(logs: &str, block: &str) -> Option<String> {
+    let joined = if logs.trim().is_empty() {
+        block.to_owned()
+    } else {
+        format!("{}\n\n{block}", logs.trim_end())
+    };
+    (joined.len() <= file_tasks::MAX_TASK_LOGS).then_some(joined)
 }
 
 /// Statuses an agent may move its own task to. `done` is where a finished
@@ -1011,47 +1063,17 @@ pub(crate) fn complete_task(
                 "This task is already done; an agent does not reopen a task a person closed. Ask them to move it back first.",
             ));
         }
-        let mut input = serde_json::Map::new();
-        for key in [
-            "title",
-            "description",
-            "kind",
-            "priority",
-            "severity",
-            "owner",
-            "due_at",
-            "labels",
-            "acceptance_criteria",
-            "repository_ids",
-            "primary_repository_id",
-            "position",
-        ] {
-            if !item[key].is_null() {
-                input.insert(key.into(), item[key].clone());
-            }
-        }
-        input.insert(
-            "home_workspace_id".into(),
-            item["home_workspace_id"].clone(),
-        );
+        let mut input = resend(&item, &id, revision, "complete");
         input.insert("status".into(), json!(status));
         if let Some(block) = &block {
-            let joined = if logs.trim().is_empty() {
-                block.clone()
-            } else {
-                format!("{}\n\n{block}", logs.trim_end())
-            };
-            if joined.len() > file_tasks::MAX_TASK_LOGS {
-                return Err(WorkbenchError::new(
+            let joined = append_log(logs, block).ok_or_else(|| {
+                WorkbenchError::new(
                     "invalid_input",
                     "The task's logs are full; move it without a summary, or shorten the summary.",
-                ));
-            }
+                )
+            })?;
             input.insert("logs".into(), json!(joined));
         }
-        input.insert("id".into(), json!(id));
-        input.insert("request_id".into(), json!(fresh_id("complete")));
-        input.insert("expected_revision".into(), json!(revision));
         match query(store, "items.put", &Value::Object(input).to_string()) {
             Ok(saved) => {
                 return Ok(response(
@@ -1071,6 +1093,228 @@ pub(crate) fn complete_task(
     Err(WorkbenchError::new(
         "revision_conflict",
         "The task kept changing while it was being moved. Re-read it and try again.",
+    ))
+}
+
+/// Bound on the reason an agent gives for deleting a task.
+pub(crate) const MAX_REASON_CHARS: usize = 1000;
+/// Opens the log block a deletion reason is recorded in. Present tense on
+/// purpose: the block is written before the delete, and if the delete is then
+/// refused the task is still there carrying it.
+const DELETION_MARKER: &str = "--- Agent is deleting this task (";
+
+fn deletion_block(reason: &str, at_ms: i64) -> String {
+    let at = crate::ledger::ids::iso8601_utc(u64::try_from(at_ms).unwrap_or_default());
+    format!("{DELETION_MARKER}{at}) ---\n{reason}")
+}
+
+/// The last recorded revision of an item, deleted or not; `None` when the
+/// store has never had it. `items.get` hides deleted items, `items.history`
+/// does not.
+fn last_revision(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
+    let mut after = 0_i64;
+    let mut last = None;
+    for _ in 0..50 {
+        let input = json!({"id": id, "limit": 200, "after_revision": after});
+        let page = match query(store, "items.history", &input.to_string()) {
+            Ok(page) => page,
+            Err(error) if error.code == "not_found" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let revisions = page["items"]
+            .as_array()
+            .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid task history page."))?;
+        if let Some(revision) = revisions.last() {
+            last = Some(revision.clone());
+        }
+        if page["has_more"] != true {
+            return Ok(last);
+        }
+        let next = page["next_cursor"]
+            .as_i64()
+            .filter(|next| *next > after)
+            .ok_or_else(|| {
+                WorkbenchError::new("protocol_error", "Task history cursor did not advance.")
+            })?;
+        after = next;
+    }
+    Err(WorkbenchError::new(
+        "registry_limit",
+        "The task's history is longer than 10,000 revisions; delete it on the board.",
+    ))
+}
+
+/// A deleted board task that was linked to `repository_id`, as last recorded.
+fn deleted_task(
+    store: &Store,
+    repository_id: &str,
+    task: &str,
+) -> Result<Option<(String, Value)>, WorkbenchError> {
+    for id in task_candidates(repository_id, task.trim()) {
+        if let Some(body) = last_revision(store, &id)? {
+            if body["deleted"] == true && links(&body, repository_id) {
+                return Ok(Some((id, body)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Delete a board task on an agent's behalf, through the store's own
+/// `items.delete` — the same soft delete the board's Delete performs. The row
+/// and its revision history stay in the profile, the id is never reused, and
+/// nothing over MCP brings it back: only the person can, from the profile.
+///
+/// The reason is required and is recorded first, as a block appended to the
+/// task's logs; the deleted revision carries those logs, so the reason is in
+/// the task's history and in the deletion event itself. `items.delete` takes no
+/// payload of its own, so that is two store writes, not one: when the task
+/// changes between them nothing is deleted, the task keeps the reason block,
+/// and the call is refused (or, with no `expected_revision`, retried on top of
+/// the person's edit — the block is recognised and not appended twice).
+///
+/// A task linked to more than this repository is refused: deleting it here
+/// would delete it from the others too. A task already deleted is `unchanged`.
+pub(crate) fn delete_task(
+    store: &Store,
+    repo_path: &str,
+    task: &str,
+    expected_revision: Option<i64>,
+    reason: &str,
+) -> Result<Value, WorkbenchError> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "A reason is required: say why this task is being deleted. It is kept in the task's history.",
+        ));
+    }
+    if reason.chars().count() > MAX_REASON_CHARS {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("The reason exceeds {MAX_REASON_CHARS} characters."),
+        ));
+    }
+    let local = resolve_for_agent(repo_path)?;
+    let repository = find(store, &local.identity)?.ok_or_else(|| {
+        WorkbenchError::new(
+            "not_found",
+            "This repository is not on the GitPulse board yet; no task has been filed under it.",
+        )
+    })?;
+    let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
+    let response =
+        |outcome: &str, id: &str, item: &Value, recorded: bool, sequence: Option<u64>| {
+            json!({
+                "ok": true,
+                "outcome": outcome,
+                "item_id": id,
+                "title": item["title"],
+                "status": item["status"],
+                "deleted": true,
+                "revision": item["revision"],
+                "reason_recorded": recorded,
+                "repository": repository_summary(&repository),
+                "sequence": sequence,
+            })
+        };
+    for _ in 0..2 {
+        let (id, item) = match find_task(store, &repository_id, task) {
+            Ok(found) => found,
+            Err(error) if error.code == "not_found" => {
+                return match deleted_task(store, &repository_id, task)? {
+                    Some((id, body)) => {
+                        let recorded = body["logs"].as_str().is_some_and(|logs| {
+                            logs.contains(DELETION_MARKER) && logs.trim_end().ends_with(reason)
+                        });
+                        Ok(response("unchanged", &id, &body, recorded, None))
+                    }
+                    None => Err(error),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        let mut revision = item["revision"].as_i64().unwrap_or_default();
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(WorkbenchError::new(
+                "revision_conflict",
+                format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before deleting it.", expected_revision.unwrap_or_default()),
+            ));
+        }
+        let others = item["repository_ids"].as_array().map_or(0, |ids| {
+            ids.iter()
+                .filter(|v| v.as_str() != Some(&repository_id))
+                .count()
+        });
+        if others > 0 {
+            return Err(WorkbenchError::new(
+                "shared_task",
+                format!("This task is linked to {others} other repositor{} as well, and deleting it here would delete it there too. Ask the person to delete it on the board.", if others == 1 { "y" } else { "ies" }),
+            ));
+        }
+        let logs = item["logs"].as_str().unwrap_or_default();
+        // A retry after a refused delete finds its own reason already there.
+        let recorded = logs.contains(DELETION_MARKER) && logs.trim_end().ends_with(reason);
+        if !recorded {
+            let joined = append_log(logs, &deletion_block(reason, now_millis())).ok_or_else(|| {
+                WorkbenchError::new(
+                    "invalid_input",
+                    "The task's logs are full, so the reason cannot be recorded; shorten the reason.",
+                )
+            })?;
+            let mut input = resend(&item, &id, revision, "delete-reason");
+            input.insert("logs".into(), json!(joined));
+            match query(store, "items.put", &Value::Object(input).to_string()) {
+                Ok(saved) => {
+                    revision = saved["item"]["revision"].as_i64().ok_or_else(|| {
+                        WorkbenchError::new(
+                            "protocol_error",
+                            "The store did not report the task's revision.",
+                        )
+                    })?;
+                }
+                Err(error) if error.code == "revision_conflict" && expected_revision.is_none() => {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let input =
+            json!({"id": id, "request_id": fresh_id("delete"), "expected_revision": revision});
+        match query(store, "items.delete", &input.to_string()) {
+            Ok(receipt) => {
+                // The receipt the board's own delete holds the store to.
+                if receipt["item"]["deleted"] != true
+                    || receipt["item"]["revision"].as_i64() != Some(revision + 1)
+                {
+                    return Err(WorkbenchError::new(
+                        "protocol_error",
+                        "The store's delete receipt does not show the task deleted at the next revision.",
+                    ));
+                }
+                return Ok(response(
+                    "deleted",
+                    &id,
+                    &receipt["item"],
+                    true,
+                    receipt["sequence"].as_u64(),
+                ));
+            }
+            Err(error) if error.code == "revision_conflict" && expected_revision.is_none() => {
+                continue
+            }
+            Err(error) if error.code == "revision_conflict" => {
+                return Err(WorkbenchError::new(
+                    "revision_conflict",
+                    format!("The reason was recorded at revision {revision}, but the task changed before it could be deleted, so nothing was deleted. Re-read it with gitpulse_get_task and try again."),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(WorkbenchError::new(
+        "revision_conflict",
+        "The task kept changing while it was being deleted, so nothing was deleted. Re-read it and try again.",
     ))
 }
 

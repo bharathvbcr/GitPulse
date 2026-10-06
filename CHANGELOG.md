@@ -11,6 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Agents can delete a board task.** `gitpulse_delete_task` on the GitPulse
+  MCP server removes a card through the board's own `items.delete`, by its
+  filed `task_id` or its board `item_id`, with a required reason that is
+  appended to the task's logs first and so stays in its history. It honours
+  `expected_revision`, answers `unchanged` for a task already deleted, refuses
+  another repository's task and a task linked to other repositories too, and
+  needs the repository to be trusted. *Security impact:* this is the first
+  destructive write an agent has on the board, annotated `destructiveHint:
+  true`. The delete is soft — the row and its revisions stay in the profile and
+  the id is never reused — but there is no undelete over MCP.
+
 ## [1.4.0] - 2026-10-05
 
 Stale-branch cleanup with backups, a secret scan that never reads a partial

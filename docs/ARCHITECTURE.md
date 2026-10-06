@@ -661,6 +661,15 @@ The agent moves its own task instead: `gitpulse_complete_task` (MCP,
 review or done, appends the agent's summary to the task logs, honours an
 `expected_revision`, never reopens a done task, and resolves the task through
 the same trusted-repository gate as the other task tools.
+`gitpulse_delete_task` (`intake.rs::delete_task`) is the one destructive task
+tool: it appends the required reason to the task's logs with `items.put`, then
+calls the store's own `items.delete` — the soft delete the board performs — so
+the deleted revision carries the reason. That is two store writes, because
+`items.delete` takes no payload; a change between them leaves the task live
+with the reason and nothing deleted. A task already deleted is found through
+`items.history` (which, unlike `items.get`, still sees it) and answered
+`unchanged`; a task linked to other repositories is refused as `shared_task`.
+There is no undelete over MCP.
 Real Git tests cover linked worktrees, distinct clones, malformed/bare/unavailable
 checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise

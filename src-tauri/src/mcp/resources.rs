@@ -506,7 +506,8 @@ mod tests {
             json!([
                 "gitpulse_add_task",
                 "gitpulse_import_tasks",
-                "gitpulse_complete_task"
+                "gitpulse_complete_task",
+                "gitpulse_delete_task"
             ])
         );
         assert_eq!(

@@ -1,6 +1,6 @@
 ---
 name: gitpulse-tasks
-description: File, import, list, read and complete tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, read a task's brief before implementing it, or mark the task it was launched on done when the work is finished.
+description: File, import, list, read, complete and delete tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, read a task's brief before implementing it, mark the task it was launched on done when the work is finished, or delete a duplicate or merged task with a recorded reason.
 license: MIT
 compatibility: Requires the gitpulse-mcp binary on PATH, an absolute git repository path, and a repository the person has trusted in GitPulse.
 metadata:
@@ -23,10 +23,12 @@ window is shown otherwise.
 | `gitpulse_list_tasks` | read | List the board's tasks for a repository, in board order. |
 | `gitpulse_get_task` | read | Read one task with its canonical agent brief. |
 | `gitpulse_complete_task` | write | Move your task to `done` when the work is finished (or `review`, or `in_progress`), with a summary. |
+| `gitpulse_delete_task` | write, destructive | Delete a task card that should not exist — a duplicate, or one merged into another — with a reason. |
 
 Every write requires the repository to be **trusted** in GitPulse. An untrusted
 repository is refused with `untrusted_repository`; ask the person to open it in
-GitPulse and trust it. No write can delete a task or start an agent run.
+GitPulse and trust it. No write can start an agent run, and only
+`gitpulse_delete_task` removes a card.
 
 ## Before you file a task
 
@@ -165,6 +167,37 @@ verification passed, move it to `done`:
   reopened (`already_done`): ask the person.
 - Do not mark a task done that you did not finish, or whose verification failed.
   Say what is left instead, and use `review`.
+
+## Deleting a task
+
+`gitpulse_delete_task` removes a card from the board — the same delete as the
+board's own **Delete**. Use it only for a task that should not exist: a
+duplicate, or one you merged into another. Never delete a task to finish it;
+move it to `done` instead.
+
+```json
+{
+  "repo_path": "/absolute/path/to/repo",
+  "task_id": "gp-oauth-auth",
+  "reason": "Merged into gp-auth-overhaul, which carries both sets of criteria."
+}
+```
+
+- `task_id` is the key it was filed with, or an `item_id` from
+  `gitpulse_list_tasks`. `reason` is required (at most 1,000 characters).
+- The reason is appended to the task's logs first, so it is in the task's
+  history and in the deletion itself. If the task changes between the two, it
+  is not deleted and keeps the reason; with `expected_revision` that is refused
+  with `revision_conflict`, without it the delete is retried on top of the
+  person's edit and the reason is not appended twice.
+- The delete is soft: the row and its history stay in the GitPulse profile and
+  the id is never reused — filing the same `task_id` again is refused with
+  `deleted_on_board`. There is **no undelete** over MCP; only the person can
+  restore it.
+- A task linked to other repositories too is refused with `shared_task`, since
+  deleting it here deletes it there. Ask the person.
+- The same call twice answers `unchanged`. A task of another repository is
+  `not_found`.
 
 ## Guarantees
 

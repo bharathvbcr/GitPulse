@@ -15,8 +15,10 @@
 //! no `logging/setLevel` in the modern era — neither exists in 2026-07-28.
 //!
 //! Nothing here writes git. The only writes are the task-board tools
-//! (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`),
-//! which write the GitPulse task profile behind the repository trust gate.
+//! (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`,
+//! `gitpulse_delete_task`), which write the GitPulse task profile behind the
+//! repository trust gate. `gitpulse_delete_task` is the one destructive tool:
+//! a soft delete, annotated `destructiveHint: true`.
 //! Any tool that would run a git mutation must go through
 //! `harness::guard_command`, and every writing tool must be added to the
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
@@ -244,6 +246,21 @@ pub(crate) fn mutating_tool(
         "outputSchema": output,
         "annotations": mutating_tool_annotations(idempotent)
     })
+}
+
+/// A mutating tool that removes something. MCP clients gate their own
+/// approval prompt on `destructiveHint`, so it must say so.
+fn destructive_tool(
+    name: &str,
+    title: &str,
+    description: &str,
+    properties: Value,
+    required: &[&str],
+    output: Value,
+) -> Value {
+    let mut tool = mutating_tool(name, title, description, properties, required, output, true);
+    tool["annotations"]["destructiveHint"] = json!(true);
+    tool
 }
 
 pub(crate) fn bounded_string_prop(description: &str, min_len: usize, max_len: usize) -> Value {
@@ -679,6 +696,39 @@ fn build_tools() -> Vec<Value> {
             }),
             true,
         ),
+        destructive_tool(
+            "gitpulse_delete_task",
+            "Delete task",
+            "Delete a task card from the GitPulse task board — the same delete as the board's own Delete. Pass the task_id it was filed with or its board item_id, and a reason: the reason is appended to the task's logs first, so it stays in the task's history. The delete is soft (the row and its history stay in the GitPulse profile and the id is never reused), but there is no undelete over MCP; only the person can bring it back. Use it only for a task that should not exist — a duplicate, or one merged into another — never to finish work (use gitpulse_complete_task). A task linked to other repositories as well is refused (shared_task). Idempotent: a task already deleted is reported as unchanged. With expected_revision, a task that changed since you read it is refused so you can re-read it. Requires the repository to be trusted in GitPulse.",
+            json!({
+                "repo_path": repo_prop(),
+                "task_id": bounded_string_prop("The task_id it was filed with, or its board item_id from gitpulse_list_tasks", 1, 128),
+                "reason": bounded_string_prop("Why the task is being deleted, in a line or two; recorded in its history", 1, crate::workbench::intake::MAX_REASON_CHARS * 4),
+                "expected_revision": {
+                    "type": "integer",
+                    "description": "Only delete it if the task is still at this revision (from gitpulse_list_tasks or gitpulse_get_task); otherwise it is refused so you can re-read it",
+                    "minimum": 1,
+                    "maximum": 9_007_199_254_740_991_i64
+                }
+            }),
+            &["repo_path", "task_id", "reason"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "outcome": { "type": "string", "enum": ["deleted", "unchanged"] },
+                    "item_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "status": { "type": "string" },
+                    "deleted": { "type": "boolean" },
+                    "revision": { "type": "integer" },
+                    "reason_recorded": { "type": "boolean" },
+                    "repository": { "type": "object" },
+                    "sequence": { "type": ["integer", "null"] }
+                },
+                "required": ["ok", "outcome", "item_id", "status", "deleted", "revision", "reason_recorded", "repository"]
+            }),
+        ),
         tool(
             "gitpulse_codeintel_search",
             "Symbol search",
@@ -798,7 +848,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools, which a person sees on the GitPulse board. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
+                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task and gitpulse_delete_task — which a person sees on the GitPulse board. gitpulse_delete_task removes a card (soft, with a required reason kept in its history, and no undelete over MCP); use it only for a task that should not exist, never to finish one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -1103,6 +1153,22 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 status,
                 arguments["expected_revision"].as_i64(),
                 arguments["summary"].as_str(),
+            )
+            .map_err(workbench_message)
+        }
+        "gitpulse_delete_task" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let task = arguments["task_id"].as_str().ok_or("missing task_id")?;
+            let reason = arguments["reason"].as_str().ok_or("missing reason")?;
+            // Reading, not creating: a task to delete has to exist already.
+            let store = open_task_profile(false)?
+                .ok_or("GitPulse has no task board on this machine yet: nothing has been filed.")?;
+            crate::workbench::intake::delete_task(
+                &store,
+                repo,
+                task,
+                arguments["expected_revision"].as_i64(),
+                reason,
             )
             .map_err(workbench_message)
         }
@@ -1984,13 +2050,19 @@ mod tests {
                 assert!(
                     matches!(
                         name,
-                        "gitpulse_add_task" | "gitpulse_import_tasks" | "gitpulse_complete_task"
+                        "gitpulse_add_task"
+                            | "gitpulse_import_tasks"
+                            | "gitpulse_complete_task"
+                            | "gitpulse_delete_task"
                     ),
                     "unexpected mutating tool {name}"
                 );
+                // Deleting a card is the one destructive write, and it must
+                // say so: clients gate their approval prompt on this hint.
                 assert_eq!(
-                    tool["annotations"]["destructiveHint"], false,
-                    "{name} must not be destructive"
+                    tool["annotations"]["destructiveHint"],
+                    name == "gitpulse_delete_task",
+                    "{name} has the wrong destructiveHint"
                 );
                 continue;
             }
@@ -2566,6 +2638,10 @@ mod tests {
             format!("over {} MiB", ft::MAX_BRIEF_BYTES / 1024 / 1024),
             format!("at most {} bytes; default", ft::MAX_KIND_BYTES),
             format!("At most {} bytes. |", ft::MAX_OWNER_BYTES),
+            format!(
+                "`reason` is required (at most {} characters)",
+                grouped(crate::workbench::intake::MAX_REASON_CHARS)
+            ),
         ] {
             assert!(skill.contains(&claim), "SKILL.md does not state {claim:?}");
         }
@@ -2582,7 +2658,7 @@ mod tests {
                 (n.ends_with("_task") || n.ends_with("_tasks")) && n != "gitpulse_task_view"
             })
             .collect();
-        assert_eq!(task_tools.len(), 5, "{task_tools:?}");
+        assert_eq!(task_tools.len(), 6, "{task_tools:?}");
         for name in &task_tools {
             assert!(
                 skill.contains(&format!("| `{name}` |")),
@@ -2858,6 +2934,290 @@ mod tests {
         );
     }
 
+    /// Every revision the store recorded for an item, deleted or not.
+    fn item_history(board: &crate::workbench::WorkbenchState, id: &str) -> Vec<Value> {
+        board
+            .board_request("items.history", &json!({"id": id}).to_string())
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_filed_task_deleted_by_its_task_id_leaves_the_board_and_stays_deleted() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-login", "title": "Fix login (duplicate)", "status": "done" }),
+        );
+        assert!(!error, "{added}");
+        let item_id = added["item_id"].as_str().unwrap().to_owned();
+        let (error, _) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-keep", "title": "Keep me" }),
+        );
+        assert!(!error);
+
+        let reason = "MERGED, NOT COMPLETED: folded into gp-login-overhaul.";
+        let (error, deleted) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-login", "reason": reason }),
+        );
+        assert!(!error, "{deleted}");
+        assert_eq!(deleted["outcome"], "deleted");
+        assert_eq!(deleted["item_id"], item_id.as_str());
+        assert_eq!(deleted["deleted"], true);
+        assert_eq!(deleted["reason_recorded"], true);
+        assert_eq!(deleted["status"], "done");
+        // One write for the reason, one for the delete.
+        assert_eq!(deleted["revision"], 3);
+        assert!(deleted["sequence"].as_u64().is_some(), "{deleted}");
+
+        // The board no longer lists it; its sibling is untouched.
+        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert!(!error, "{listed}");
+        let titles: Vec<&str> = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["Keep me"]);
+        assert_eq!(listed["total"], 1);
+        let (error, gone) = tool_json(
+            "gitpulse_get_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-login" }),
+        );
+        assert!(
+            error && gone.as_str().unwrap().contains("not_found"),
+            "{gone}"
+        );
+
+        // The reason is in the history, on the deleted revision itself.
+        let board =
+            crate::workbench::WorkbenchState::for_profile(&profile.path().join("workbench.sqlite"));
+        let history = item_history(&board, &item_id);
+        let last = history.last().unwrap();
+        assert_eq!(last["deleted"], true);
+        assert_eq!(last["revision"], 3);
+        let logs = last["logs"].as_str().unwrap();
+        assert!(
+            logs.starts_with("--- Agent is deleting this task ("),
+            "{logs}"
+        );
+        assert!(logs.ends_with(reason), "{logs}");
+
+        // A second delete changes nothing and records nothing twice.
+        let (error, again) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": item_id, "reason": reason }),
+        );
+        assert!(!error, "{again}");
+        assert_eq!(again["outcome"], "unchanged");
+        assert_eq!(again["revision"], 3);
+        assert_eq!(again["reason_recorded"], true);
+        assert_eq!(item_history(&board, &item_id).len(), 3);
+
+        // The id is never handed out again.
+        let (error, refiled) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-login", "title": "Fix login again" }),
+        );
+        assert!(
+            error && refiled.as_str().unwrap().contains("deleted_on_board"),
+            "{refiled}"
+        );
+        let (error, overwritten) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-dup-login", "title": "Fix login again", "overwrite": true }),
+        );
+        assert!(
+            error && overwritten.as_str().unwrap().contains("deleted_on_board"),
+            "{overwritten}"
+        );
+        assert_eq!(item_history(&board, &item_id).len(), 3);
+    }
+
+    #[test]
+    fn a_board_task_deleted_by_its_item_id_honours_the_revision_it_was_read_at() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "board-dup-7";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        let before = item_history(&board, id);
+
+        // Read at revision 1, then the person edits it.
+        let mut edit = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        for key in ["revision", "updated_at", "created_at", "locked_fields"] {
+            edit.as_object_mut().unwrap().remove(key);
+        }
+        edit["request_id"] = json!("person-edit");
+        edit["expected_revision"] = json!(1);
+        edit["title"] = json!("Make the importer resumable (kept)");
+        board.board_request("items.put", &edit.to_string()).unwrap();
+
+        let (error, stale) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": id, "reason": "Duplicate.", "expected_revision": 1 }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        // Refused before anything was written: no reason block, no delete.
+        let current = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(current["revision"], 2);
+        assert_eq!(current["logs"], "first trace");
+        assert_eq!(item_history(&board, id).len(), before.len() + 1);
+
+        // Re-read at revision 2, the delete goes through.
+        let (error, deleted) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": id, "reason": "Duplicate of board-1.", "expected_revision": 2 }),
+        );
+        assert!(!error, "{deleted}");
+        assert_eq!(deleted["outcome"], "deleted");
+        assert_eq!(deleted["item_id"], id);
+        assert_eq!(deleted["title"], "Make the importer resumable (kept)");
+        assert_eq!(deleted["revision"], 4);
+        let err = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap_err();
+        assert_eq!(err.code, "not_found");
+        let last = item_history(&board, id).last().unwrap().clone();
+        assert_eq!(last["deleted"], true);
+        let logs = last["logs"].as_str().unwrap();
+        assert!(
+            logs.starts_with("first trace\n\n--- Agent is deleting this task ("),
+            "{logs}"
+        );
+        assert!(logs.ends_with("Duplicate of board-1."), "{logs}");
+    }
+
+    #[test]
+    fn a_reason_left_by_a_refused_delete_is_not_recorded_twice() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let id = "board-dup-8";
+        let (board, _) = board_task(profile.path(), &repo, id);
+        // A previous attempt recorded its reason and was then refused, so the
+        // task is still live and already carries the block.
+        let reason = "Merged into board-1.";
+        let mut edit = board
+            .board_request("items.get", &json!({"id": id}).to_string())
+            .unwrap()["item"]
+            .clone();
+        for key in ["revision", "updated_at", "created_at", "locked_fields"] {
+            edit.as_object_mut().unwrap().remove(key);
+        }
+        edit["request_id"] = json!("earlier-attempt");
+        edit["expected_revision"] = json!(1);
+        edit["logs"] = json!(format!(
+            "first trace\n\n--- Agent is deleting this task (2026-10-06T00:00:00Z) ---\n{reason}"
+        ));
+        board.board_request("items.put", &edit.to_string()).unwrap();
+
+        let (error, deleted) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": id, "reason": reason, "expected_revision": 2 }),
+        );
+        assert!(!error, "{deleted}");
+        assert_eq!(deleted["outcome"], "deleted");
+        // Straight to the delete: no second reason write.
+        assert_eq!(deleted["revision"], 3);
+        let last = item_history(&board, id).last().unwrap().clone();
+        assert_eq!(last["logs"].as_str().unwrap().matches(reason).count(), 1);
+    }
+
+    #[test]
+    fn deletion_never_reaches_a_task_of_another_repository_or_a_shared_one() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let other_repo = other.path().to_string_lossy().into_owned();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", &other_repo])
+            .status()
+            .unwrap()
+            .success());
+        crate::test_support::trust_repo(other.path());
+        let (board, other_id) = board_task(profile.path(), &other_repo, "other-task");
+        let mine = board.board_register(&repo, "mine", "mine-request").unwrap();
+        let mine_id = mine["repository"]["id"].as_str().unwrap().to_owned();
+
+        let (error, message) = tool_json(
+            "gitpulse_delete_task",
+            json!({"repo_path": repo, "task_id": "other-task", "reason": "Not mine."}),
+        );
+        assert!(
+            error && message.as_str().unwrap().contains("not_found"),
+            "{message}"
+        );
+        let survivor = board
+            .board_request("items.get", r#"{"id":"other-task"}"#)
+            .unwrap()["item"]
+            .clone();
+        assert_eq!(survivor["revision"], 1);
+        assert_eq!(survivor["logs"], "first trace");
+
+        // Linked to both: deleting it here would delete it there too.
+        board
+            .board_request(
+                "items.put",
+                &json!({
+                    "id": "shared-task", "request_id": "put-shared", "expected_revision": 0,
+                    "title": "Shared", "status": "ready",
+                    "repository_ids": [mine_id, other_id], "primary_repository_id": mine_id,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let (error, message) = tool_json(
+            "gitpulse_delete_task",
+            json!({"repo_path": repo, "task_id": "shared-task", "reason": "Duplicate."}),
+        );
+        assert!(
+            error && message.as_str().unwrap().contains("shared_task"),
+            "{message}"
+        );
+        assert_eq!(
+            board
+                .board_request("items.get", r#"{"id":"shared-task"}"#)
+                .unwrap()["item"]["revision"],
+            1
+        );
+
+        for (arguments, expected) in [
+            (
+                json!({"repo_path": repo, "task_id": "shared-task", "reason": "   "}),
+                "reason is required",
+            ),
+            (
+                json!({"repo_path": repo, "task_id": "shared-task", "reason": "x".repeat(1001)}),
+                "1000",
+            ),
+            (
+                json!({"repo_path": repo, "task_id": "no-such-task", "reason": "Gone."}),
+                "not_found",
+            ),
+        ] {
+            let (error, message) = tool_json("gitpulse_delete_task", arguments);
+            assert!(error, "{message}");
+            assert!(
+                message.to_string().contains(expected),
+                "{expected}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn task_writes_are_refused_for_an_untrusted_repository() {
         let (_dir, profile, repo) = task_fixture();
@@ -2877,6 +3237,14 @@ mod tests {
         let (error, message) = tool_json(
             "gitpulse_complete_task",
             json!({ "repo_path": repo, "task_id": "anything" }),
+        );
+        assert!(
+            error && message.as_str().unwrap().contains("untrusted_repository"),
+            "{message}"
+        );
+        let (error, message) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": "anything", "reason": "Duplicate." }),
         );
         assert!(
             error && message.as_str().unwrap().contains("untrusted_repository"),
